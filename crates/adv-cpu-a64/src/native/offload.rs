@@ -498,7 +498,6 @@ struct Blocks {
     code: Code,
     signals: Signals,
     submitted: Instant,
-    scoped: bool,
 }
 
 #[derive(Default)]
@@ -724,21 +723,15 @@ impl Blocks {
         context
     }
 
-    /// Moves the last block's frame and ESP back to the real frame, or
-    /// stores the affine frame dwords of a prefix ending before `first`.
-    fn settle(&self, cpu: &mut adv_cpu_core::CpuState, last: Option<u32>, first: u32) {
+    /// Moves the highest completed block's frame and ESP back to the real frame.
+    fn settle(&self, cpu: &mut CpuState, thread: u32) {
         let Some(frame) = self.plan.frame else {
             return;
         };
         let esp = self.start.cpu().regs[ESP];
-        match last {
-            Some(thread) => {
-                let delta = (thread + 1) * frame_stride(frame);
-                self.copy(frame, esp.wrapping_sub(delta), esp);
-                cpu.regs[ESP] = cpu.regs[ESP].wrapping_add(delta);
-            }
-            None => self.slots(esp, first),
-        }
+        let delta = (thread + 1) * frame_stride(frame);
+        self.copy(frame, esp.wrapping_sub(delta), esp);
+        cpu.regs[ESP] = cpu.regs[ESP].wrapping_add(delta);
     }
 
     fn drain(&self, runtime: &mut Runtime, scratch: &mut ExecuteScratch) -> Drained {
@@ -804,14 +797,12 @@ impl Blocks {
             (runtime.scope_written as u16, runtime.scope_gpr_written),
             cpu,
         );
-        if last || self.scoped {
-            out.last = Some(LastBlock {
-                index,
-                done,
-                thread,
-                frame: runtime.scope_frame,
-            });
-        }
+        out.last = Some(LastBlock {
+            index,
+            done,
+            thread,
+            frame: runtime.scope_frame,
+        });
     }
 
     /// Once all claims have drained, publish either the final row or the
@@ -823,31 +814,30 @@ impl Blocks {
         } else {
             claimed * self.size
         };
-        let (mut completion, last, frame) = match total.last.take() {
-            Some(last) => (last.done, Some(last.thread), Some(last.frame)),
-            None => (
+        let Some(last) = total.last.take() else {
+            return (
                 Completion {
                     id,
-                    context: Some(self.at(iterations)),
+                    context: Some(self.start.clone()),
                     retired: 0,
                     optimized: 0,
                     elapsed: Duration::ZERO,
                     helpers: Duration::ZERO,
                     requires_owner: false,
                 },
-                None,
-                None,
-            ),
+                0,
+            );
         };
+        let mut completion = last.done;
         let cpu = completion.context.as_mut().unwrap().cpu_mut();
-        self.settle(cpu, last, iterations);
+        self.settle(cpu, last.thread);
         cpu.mxcsr |= total.sticky;
         completion.id = id;
         completion.retired = total.retired;
         completion.optimized = total.optimized;
         total.publish_scope(
             &self.code,
-            frame.as_ref(),
+            Some(&last.frame),
             self.start.cpu(),
             cpu,
             self.entry.alias,
@@ -1389,7 +1379,6 @@ impl<'a, U, R> Session<'a, U, R> {
             code: code.clone(),
             signals: self.signals.clone(),
             submitted: started,
-            scoped,
         });
         let (send, recv) = sync_channel(helpers);
         let submitted = (0..helpers)
@@ -2791,7 +2780,6 @@ mod tests {
                         pending: (Arc::new(AtomicU32::new(0)), 0),
                     },
                     submitted: Instant::now(),
-                    scoped: true,
                 };
                 let mut runtime = Runtime::new(std::ptr::null_mut(), 0);
                 let mut scratch = ExecuteScratch::default();
@@ -3060,8 +3048,85 @@ mod tests {
                 pending: (Arc::new(AtomicU32::new(0)), 0),
             },
             submitted: Instant::now(),
-            scoped: false,
         }
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn recalled_split_publishes_the_completed_prefix_context() {
+        const STACK: u32 = 0x80_0000;
+        const FRAME: u32 = STACK + 0x1000 - 4;
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.mov(eax, ecx).unwrap();
+        a.mov(dword_ptr(esp - 4), eax).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(edi, 4).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+        a.int3().unwrap();
+        let stop = CODE + a.assemble(u64::from(CODE)).unwrap().len() as u32 - 1;
+        let (mut executor, mut native) = fixture(&mut a);
+        let len = N as usize * 4;
+        let memory = executor.memory_mut();
+        memory.map(OUTPUT, len, READ | WRITE).unwrap();
+        memory.map(STACK, 0x2000, READ | WRITE).unwrap();
+        let initial_slot = 0x1234_5678u32.to_le_bytes();
+        memory.write(FRAME, &initial_slot).unwrap();
+
+        let mut start = state(&mut executor, CODE, OUTPUT, N).unwrap();
+        start.cpu_mut().regs[0] = 0xdead_beef;
+        start.cpu_mut().regs[ESP] = FRAME + 4;
+        start.cpu_mut().eflags = 0x8d7;
+        native.prepare_job(executor.memory_mut(), stop, start.cpu());
+        native.code.sync();
+        let start = Some(start);
+
+        let blocks = stopped_blocks(&executor, &native, &start, 0);
+        let (empty, iterations) = blocks.finish(1, Drained::default());
+        assert_eq!((empty.retired, iterations), (0, 0));
+        assert_eq!(empty.context.unwrap().cpu(), start.as_ref().unwrap().cpu());
+        assert_eq!(executor.memory().read(FRAME, 4).unwrap(), initial_slot);
+
+        let blocks = stopped_blocks(&executor, &native, &start, 2);
+        assert!(blocks.plan.frame.is_some());
+        let (mut first, mut second) = (Drained::default(), Drained::default());
+        let mut runtime = Runtime::new(std::ptr::null_mut(), blocks.entry.window);
+        let mut scratch = ExecuteScratch::default();
+        for (index, drained) in [&mut first, &mut second].into_iter().enumerate() {
+            blocks.run_block(
+                index as u32,
+                index as u32,
+                &mut runtime,
+                &mut scratch,
+                &blocks.signals,
+                drained,
+            );
+        }
+        second.merge(first);
+        let (recalled, iterations) = blocks.finish(1, second);
+        let retired = u64::from(2 * blocks.size * 6);
+        assert_eq!((recalled.retired, iterations), (retired, 2 * blocks.size));
+        assert!(!recalled.requires_owner);
+        let memory = executor.memory();
+        let output = memory.read(OUTPUT, len).unwrap().to_vec();
+        let frame = memory.read(FRAME, 4).unwrap().to_vec();
+
+        executor.restore_context(start.as_ref().unwrap()).unwrap();
+        let memory = executor.memory_mut();
+        memory.fill(OUTPUT, &[0], len).unwrap();
+        memory.write(FRAME, &initial_slot).unwrap();
+        executor.run(stop, retired).unwrap();
+        let mut serial = executor.save_context().unwrap();
+        let mut recalled = recalled.context.unwrap();
+        assert_eq!(recalled.cpu().eip, CODE);
+        assert_eq!(
+            recalled.cpu_mut().capture_architecture(),
+            serial.cpu_mut().capture_architecture()
+        );
+        assert_eq!(executor.memory().read(OUTPUT, len).unwrap(), output);
+        assert_eq!(executor.memory().read(FRAME, 4).unwrap(), frame);
     }
 
     // spec: A64-CTL-7 A64-CTL-8 A64-TR-9
@@ -3113,15 +3178,6 @@ mod tests {
         );
         assert_eq!(retired, u64::from(N) * 8);
         assert_eq!(executor.memory().read(DST, len).unwrap(), expected);
-
-        // A recalled split returns the completed prefix at the head.
-        let prefix = stopped_blocks(&executor, &native, &start, 3).at(3 * N / 8);
-        let cpu = prefix.cpu();
-        assert_eq!((cpu.eip, cpu.regs[1]), (CODE, N - 3 * N / 8));
-        assert_eq!(
-            (cpu.regs[6], cpu.regs[7]),
-            (SRC + 3 * N / 2, DST + 3 * N / 2)
-        );
     }
 
     // spec: A64-OPT-1 A64-OPT-6
@@ -4028,15 +4084,6 @@ mod tests {
         assert_eq!(word(&executor, DST + 4 * (N - 1)), last);
         assert_eq!(word(&executor, ESP_START + 12), SRC + 4 * N);
         assert_eq!(word(&executor, ESP_START - 4), last);
-
-        // A recalled split stores the prefix's affine dwords in the frame.
-        reset(executor.memory_mut());
-        let blocks = stopped_blocks(&executor, &native, &start, 3);
-        assert!(blocks.plan.frame.is_some());
-        let mut prefix = blocks.at(3 * N / 8);
-        blocks.settle(prefix.cpu_mut(), None, 3 * N / 8);
-        assert_eq!(prefix.cpu().regs[4], ESP_START);
-        assert_eq!(word(&executor, ESP_START + 12), SRC + 3 * N / 2);
     }
 
     // spec: A64-TR-9

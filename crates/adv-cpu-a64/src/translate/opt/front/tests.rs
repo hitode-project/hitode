@@ -1248,7 +1248,7 @@ fn a_failure_after_a_grouped_store_resumes_with_the_registers_it_reads() {
 
 // spec: A64-OPT-6
 #[test]
-fn loop_heads_hold_only_live_registers_the_form_changes() {
+fn worker_loop_checkpoints_record_changed_registers() {
     let code = assemble(|a| {
         row(a, |a| {
             a.mov(eax, dword_ptr(esi)).unwrap();
@@ -1263,7 +1263,7 @@ fn loop_heads_hold_only_live_registers_the_form_changes() {
         .map(|h| &func.records[h.record.0 as usize])
         .find(|r| r.eip == CODE)
         .expect("loop head");
-    assert_eq!(head.regs[0], None, "EAX is written before it is read");
+    assert!(head.regs[0].is_some(), "a recalled worker exposes EAX");
     assert_eq!(head.regs[3], None, "EBX keeps its entry value");
     assert!(head.regs[1].is_some(), "ECX counts the rows");
     assert!(head.xmm.iter().all(Option::is_none));

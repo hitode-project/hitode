@@ -167,16 +167,17 @@ pub(crate) fn build_with(
             refused,
         }),
         None,
+        false,
     )
 }
 
 /// Builds the admitted job form.
-pub(crate) fn build(unit: &Unit, facts: &dyn Facts, at: &CpuState) -> Result<Built, Reject> {
-    build_form(unit, facts, at, None, None)
+pub(crate) fn build(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, Reject> {
+    build_form(unit, proof, at, None, None, proof.splits())
 }
 
 pub(crate) fn build_scoped(unit: &Unit, proof: &Proof, at: &CpuState) -> Result<Built, Reject> {
-    build_form(unit, proof, at, None, Some(proof))
+    build_form(unit, proof, at, None, Some(proof), proof.splits())
 }
 
 fn build_form(
@@ -185,6 +186,7 @@ fn build_form(
     at: &CpuState,
     resident: Option<Resident<'_>>,
     scope: Option<&Proof>,
+    split: bool,
 ) -> Result<Built, Reject> {
     let mut cut = vec![false; unit.trace.len()];
     let mut view = None::<Unit>;
@@ -195,6 +197,7 @@ fn build_form(
             at,
             resident.as_ref(),
             scope,
+            split,
         ) {
             Ok((func, assumed, plain_sites)) => {
                 let cuts = cut.iter().filter(|&&c| c).count();
@@ -223,6 +226,7 @@ fn build_trace(
     at: &CpuState,
     resident: Option<&Resident<'_>>,
     scope: Option<&Proof>,
+    split: bool,
 ) -> Result<(Func, Assumed, Vec<u32>), Reject> {
     let scope_access = scope
         .and_then(Proof::scope_frame)
@@ -391,6 +395,10 @@ fn build_trace(
             });
             complete.push(i == 0 || may_fault || from.iter().any(|&p| unit.trace.net(p, i) > 0));
         }
+    } else if split && unit.trace.returns_at_head() {
+        // A worker may stop at the head after completing a block. Even the
+        // values the next iteration will overwrite belong to that checkpoint.
+        complete.push(true);
     }
     let first = model::analyze(unit, at, &offsets, &[], write_through)?;
     let live = live::analyze(unit, facts, &offsets, &frame, &first.models, &complete);
