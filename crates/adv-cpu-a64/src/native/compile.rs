@@ -1,197 +1,208 @@
-//! Builds optimized forms (A64-OPT-1) away from the owner, which installs
-//! each at its next entry if the unit it was built for is still current.
+//! Build entry points and reusable Tier-1 translation buffers (A64A-ROLE-4).
 
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+#[cfg(native)]
+mod pool;
+#[cfg(native)]
+pub(super) use pool::{Compiler, Job, JobForm, Request, ResidentForm, ResidentRecovery, Task};
 
-use adv_cpu_core::CpuState;
+use crate::jit_map::Mark;
+use crate::translate::jit::{self, Code};
+use crate::translate::lower::Site;
+#[cfg(native)]
+pub(super) use crate::translate::{lower::resident::ResidentCold, opt::front::Reject};
 
-use crate::translate::computation::Proof;
-use crate::translate::opt::{back, front};
-use crate::translate::{Trace, Unit};
-
-pub(super) struct Request {
-    pub eip: u32,
-    /// The cache generation and the ordinary computation code the form is
-    /// for: a result for any other is stale.
-    pub generation: u64,
-    pub code: usize,
-    pub trace: Trace,
-    pub proof: Proof,
-    /// The entry state the form takes its facts from.
-    pub at: CpuState,
+#[cfg(native)]
+pub(super) fn stream_sites(unit: &Unit, site: u32) -> impl Iterator<Item = u32> + '_ {
+    let sites = unit.trace.insts.iter().zip(&unit.trace.x86);
+    let key = sites
+        .clone()
+        .find(|(inst, _)| inst.pc == site)
+        .and_then(|(_, summary)| summary.as_ref()?.stream);
+    sites.filter_map(move |(inst, summary)| {
+        (key.is_some() && summary.as_ref()?.stream == key).then_some(inst.pc)
+    })
 }
 
-/// The code of a result no computation matches: it only settles the count
-/// of results the owner awaits.
-const SUPERSEDED: usize = 0;
+#[cfg(native)]
+use crate::facts::Key;
+#[cfg(test)]
+use crate::translate::front::trace::Redirect;
+#[cfg(native)]
+use crate::translate::lower::{InternalLink, Link};
+#[cfg(native)]
+use crate::translate::opt::computation::Proof;
+use crate::translate::{front::Unit, jit::Features, lower::Stubs};
 
-pub(super) struct Compiled {
-    pub eip: u32,
-    pub generation: u64,
-    pub code: usize,
-    pub form: Option<Form>,
+/// The last unit translated, in buffers the next translation reuses.
+#[derive(Default)]
+pub struct Workspace {
+    #[cfg(test)]
+    pub(crate) unit: Unit,
+    pub(crate) code: Code,
+    /// Translate the next entry as cold: one path, no loop trace.
+    #[cfg(test)]
+    pub(crate) cold: bool,
+    #[cfg(test)]
+    pub(crate) resident_links: bool,
 }
 
-pub(super) struct Form {
-    pub built: front::Built,
-    pub lowered: back::Lowered,
-    /// The same form entered from Tier-1 code (A64-OPT-8).
-    pub inline: back::Lowered,
-    /// Instructions the entry region prepays, for the JIT map.
-    pub prepaid: u32,
+impl Workspace {
+    pub fn words(&self) -> &[u32] {
+        self.code.asm.words()
+    }
+
+    /// Byte offset of each site in `words`.
+    pub fn sites(&self) -> &[(usize, Site)] {
+        &self.code.sites
+    }
+
+    /// Instructions the entry prepays: the unit runs only with that much
+    /// countdown.
+    #[cfg(native)]
+    pub fn retired(&self) -> u32 {
+        self.code.retired
+    }
+
+    /// Guest bytes the unit depends on, as sorted
+    /// (address, length) spans.
+    #[cfg(test)]
+    pub fn code(&self) -> &[(u32, u32)] {
+        self.unit.code()
+    }
+
+    #[cfg(native)]
+    pub fn links(&self) -> &[Link] {
+        &self.code.links
+    }
+
+    #[cfg(native)]
+    pub(crate) fn internal_links(&self) -> &[InternalLink] {
+        &self.code.internal_links
+    }
+
+    /// Where each stretch of the unit starts, for samplers.
+    pub fn marks(&self) -> &[Mark] {
+        &self.code.marks
+    }
 }
 
-fn compile(request: Request) -> Compiled {
-    let Request {
+/// Translates the unit at `eip` into `work`, to be placed at host address
+/// `at`. Units end before any of `stops`, the accesses of instructions
+/// `checked` accepts check their page first, and the unit's helpers are
+/// numbered from `helpers`. x87 arithmetic runs natively under the
+/// control word `control`, the guest's at translation. Each translated byte is
+/// registered with `watch_code`, so a store to it reaches the owner.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn translate(
+    work: &mut Workspace,
+    memory: &mut adv_cpu_core::memory::Memory,
+    eip: u32,
+    stops: &[u32],
+    checked: &dyn Fn(u32) -> bool,
+    helpers: u32,
+    features: Features,
+    at: usize,
+    stubs: Stubs,
+    host: &dyn Fn(u32, u32) -> Option<u32>,
+    redirect: &dyn Fn(u32) -> Option<Redirect>,
+    admit: &dyn Fn(u32, &[u8]) -> Vec<adv_cpu_core::native_region::NativeRegion>,
+    control: u16,
+    pe: bool,
+) {
+    work.unit
+        .build(memory, eip, stops, host, redirect, !work.cold);
+    work.unit.prepare_regions(memory, admit);
+    jit::lower_unit(
+        &mut work.code,
+        &work.unit,
         eip,
-        generation,
-        code,
-        trace,
-        proof,
+        checked,
+        helpers,
+        features,
         at,
-    } = request;
-    let started = std::time::Instant::now();
-    let mut unit = Unit::default();
-    unit.trace = trace;
-    let form = match front::build(&unit, &proof, &at) {
-        Ok(built) => {
-            let lowered = back::lower(&built.func);
-            let inline = back::lower_inline(&built.func, &built.assumed, &built.func.entry);
-            let (cuts, us) = (built.cuts, started.elapsed().as_micros());
-            crate::jit_map::optimized(eip, format_args!("built\t{cuts}\t{us}us"));
-            Some(Form {
-                lowered,
-                inline,
-                built,
-                prepaid: unit.trace.prepaid(0),
-            })
+        stubs,
+        control,
+        pe,
+        work.resident_links,
+    );
+}
+
+impl Workspace {
+    #[cfg(native)]
+    pub(super) fn placement(&self) -> crate::translate::lower::Tier1Placement<'_> {
+        crate::translate::lower::Tier1Placement {
+            words: self.words(),
+            sites: self.sites(),
+            marks: self.marks(),
+            retired: self.retired(),
+            version: self.code.version,
+            table_positions: &self.code.table_positions,
+            links: self.links(),
+            internal_links: self.internal_links(),
+            uses_permissions: self.code.uses_permissions,
         }
-        Err(reject) => {
-            let inst = reject.index().and_then(|i| unit.trace.insts.get(i));
-            let (pc, op) = inst.map_or((0, None), |inst| (inst.pc, Some(&inst.op)));
-            crate::jit_map::optimized(eip, format_args!("{reject:?}\t{pc}\t{op:?}"));
-            None
-        }
-    };
-    Compiled {
-        eip,
-        generation,
-        code,
-        form,
+    }
+
+    #[cfg(native)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn lower_tier1(
+        &mut self,
+        unit: &Unit,
+        eip: u32,
+        checked: &dyn Fn(u32) -> bool,
+        helpers: u32,
+        features: Features,
+        at: usize,
+        stubs: Stubs,
+        resident_links: bool,
+        facts: Key,
+        arrivals: usize,
+    ) {
+        jit::lower_tier1(
+            &mut self.code,
+            unit,
+            eip,
+            checked,
+            helpers,
+            features,
+            at,
+            stubs,
+            resident_links,
+            facts,
+            arrivals,
+        );
     }
 }
 
-/// Where requests compile: on a thread of their own, or in place, which
-/// keeps tests deterministic.
-pub(super) enum Compiler {
-    Inline(Vec<Compiled>),
-    Thread {
-        send: Option<Sender<Request>>,
-        recv: Option<Receiver<Compiled>>,
-        pending: usize,
-    },
-}
-
-impl Compiler {
-    pub fn new() -> Self {
-        if cfg!(test) {
-            Self::Inline(Vec::new())
+#[cfg(native)]
+pub(crate) fn lower_computation<'a>(
+    unit: &Unit,
+    code: &'a mut Code,
+    eip: u32,
+    features: Features,
+    at: usize,
+    stubs: Stubs,
+    (control, pe, proof): (u16, bool, Option<&Proof>),
+) -> Option<jit::ComputationCode<'a>> {
+    let assumptions = proof.map(|proof| jit::ComputationFacts {
+        frame_cache: if proof.scope_frame().is_none() {
+            proof.frame_cache()
         } else {
-            Self::background()
-        }
-    }
-
-    /// The thread starts with the first request.
-    pub fn background() -> Self {
-        Self::Thread {
-            send: None,
-            recv: None,
-            pending: 0,
-        }
-    }
-
-    pub fn request(&mut self, request: Request) {
-        match self {
-            Self::Inline(ready) => ready.push(compile(request)),
-            Self::Thread {
-                send,
-                recv,
-                pending,
-            } => {
-                let send = send.get_or_insert_with(|| {
-                    let (send, requests) = channel();
-                    let (done, results) = channel();
-                    *recv = Some(results);
-                    std::thread::Builder::new()
-                        .name("guest compile".into())
-                        .spawn(move || {
-                            set_priority();
-                            let mut queue = std::collections::VecDeque::new();
-                            loop {
-                                if queue.is_empty() {
-                                    let Ok(request) = requests.recv() else {
-                                        return;
-                                    };
-                                    queue.push_back(request);
-                                }
-                                queue.extend(requests.try_iter());
-                                let request: Request = queue.pop_front().unwrap();
-                                // A later request for the same entry, from a
-                                // retranslation, supersedes this one.
-                                let compiled = if queue.iter().any(|r| r.eip == request.eip) {
-                                    Compiled {
-                                        eip: request.eip,
-                                        generation: request.generation,
-                                        code: SUPERSEDED,
-                                        form: None,
-                                    }
-                                } else {
-                                    compile(request)
-                                };
-                                if done.send(compiled).is_err() {
-                                    return;
-                                }
-                            }
-                        })
-                        .expect("compile thread");
-                    send
-                });
-                send.send(request).expect("compile thread");
-                *pending += 1;
-            }
-        }
-    }
-
-    /// A finished result, if any; `wait` blocks for one still pending.
-    pub fn next(&mut self, wait: bool) -> Option<Compiled> {
-        match self {
-            Self::Inline(ready) => ready.pop(),
-            Self::Thread { pending: 0, .. } => None,
-            Self::Thread { recv, pending, .. } => {
-                let recv = recv.as_ref()?;
-                let compiled = if wait {
-                    recv.recv().ok()
-                } else {
-                    match recv.try_recv() {
-                        Ok(compiled) => Some(compiled),
-                        Err(TryRecvError::Empty) => None,
-                        Err(TryRecvError::Disconnected) => panic!("compile thread"),
-                    }
-                };
-                *pending -= usize::from(compiled.is_some());
-                compiled
-            }
-        }
-    }
-}
-
-/// The form sets how fast the owner's frame computes, so the thread runs
-/// at user-initiated QoS: below the interactive owner and computation
-/// workers, above background work.
-fn set_priority() {
-    #[cfg(target_vendor = "apple")]
-    // SAFETY: sets this thread's own QoS class.
-    unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
-    }
+            None
+        },
+        scope_access: proof.scope_frame().map(|frame| frame.access.as_slice()),
+        scope_mmx: proof.scoped_mmx(),
+        scope_gpr_writes: proof.scoped_gpr_writes(),
+        divisions: proof.divisions(),
+    });
+    jit::lower_computation(
+        unit,
+        code,
+        eip,
+        features,
+        at,
+        stubs,
+        (control, pe, assumptions),
+    )
 }

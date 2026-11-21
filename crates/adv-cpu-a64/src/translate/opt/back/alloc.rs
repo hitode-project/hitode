@@ -8,7 +8,10 @@
 //! that stays free for its whole life, or is rebuilt at its uses. Spill
 //! cells are reused once their values are dead.
 
-use super::*;
+use super::{
+    D, E, End, F, Func, Host, Op, RecordId, Reg, T, Type, VReg, Value, VecOp, W, X, int_immediate,
+    loops,
+};
 use std::collections::BTreeSet;
 
 pub(super) struct Allocation {
@@ -19,11 +22,24 @@ pub(super) struct Allocation {
 }
 
 // spec: A64-OPT-6, A64-OPT-7
-pub(super) fn allocate(func: &Func, inline: bool) -> Allocation {
-    let reserved = |r| [9, 16, 17, 18, 28, 29].contains(&r) || inline && r <= 5;
+pub(super) fn allocate(
+    func: &Func,
+    inline: bool,
+    resident: bool,
+    batches: &[loops::Batch],
+) -> Allocation {
+    // Resident access and probation calls use LR while allocated values are live.
+    let reserved = |r| {
+        [9, 16, 17, 18, 28, 29].contains(&r)
+            || (inline || !batches.is_empty()) && r <= 5
+            || resident && matches!(r, 27 | 30)
+    };
     let n = func.types.len();
     let mut operations = vec![None; n];
     let mut vectors = if inline { E.number() as u8 } else { 29 };
+    if !batches.is_empty() {
+        vectors = vectors.min(16);
+    }
     let mut constants = vec![None; n];
     let mut hints = vec![Vec::new(); n];
     for data in &func.blocks {
@@ -122,10 +138,20 @@ pub(super) fn allocate(func: &Func, inline: bool) -> Allocation {
         for v in func.records[region.0 as usize].uses() {
             read(v, position, false, false);
         }
+        if let Some(batch) = batches
+            .iter()
+            .find(|batch| batch.loop_.head.0 as usize == b)
+        {
+            for v in batch.inputs() {
+                read(v, position, true, false);
+            }
+        }
         for (result, op) in &data.insts {
             position += 2;
             if !matches!(op, Op::Flags { kind, .. } if !kind.floating()) {
                 for v in op.uses() {
+                    // Scalar SSE cold checks still need the original inputs.
+                    let position = position + usize::from(resident && matches!(op, Op::Fp32(..)));
                     read(
                         v,
                         position,
@@ -135,7 +161,11 @@ pub(super) fn allocate(func: &Func, inline: bool) -> Allocation {
                 }
             }
             if op.can_fail() {
-                for v in func.records[region.0 as usize].uses() {
+                let record = match op {
+                    Op::FrameDisjoint { record, .. } => *record,
+                    _ => region,
+                };
+                for v in func.records[record.0 as usize].uses() {
                     read(v, position + 1, false, false);
                 }
             }
@@ -227,6 +257,10 @@ pub(super) fn allocate(func: &Func, inline: bool) -> Allocation {
     };
     for i in order {
         active.retain(|&(end, ..)| end >= starts[i]);
+        if matches!(operations[i], Some(Op::Snapshot(_))) {
+            locations[i] = spill(i, &mut cells);
+            continue;
+        }
         if matches!(operations[i], Some(Op::Flags { .. })) {
             locations[i] = Host::Flags(i as u32);
             continue;

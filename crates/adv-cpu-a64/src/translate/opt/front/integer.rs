@@ -1,6 +1,10 @@
-use super::*;
-use crate::translate::decode::{Alu, Narrow8or16, ShiftKind};
-use crate::translate::integer::Integer;
+use super::{
+    Cc, ConditionCode, EBP, ESP, FlagKind, Front, IntOp, IntUnary, M, Mem, Mode, Op, Part, Reject,
+    Src, Type, Value, decode,
+};
+use crate::translate::front::decode::{Alu, Narrow8or16, ShiftKind};
+use crate::translate::front::forms::Integer;
+use crate::translate::front::tags::Mnemonic;
 
 impl Front<'_> {
     pub(super) fn instruction(&mut self) -> Result<(), Reject> {
@@ -17,7 +21,7 @@ impl Front<'_> {
                 let value = self.src(src)?;
                 self.put(dst, value)?;
             }
-            D::Lea(dst, mem) => {
+            D::Lea(dst, mem) if !mem.fs => {
                 self.state.regs[dst as usize] = self.address(mem)?;
             }
             D::Alu(alu, dst, src) => self.alu(alu, part(dst), part(src), 4)?,
@@ -72,7 +76,65 @@ impl Front<'_> {
                     Some(n) => self.imm(n),
                     None => self.state.regs[1],
                 };
-                self.shift(kind, dst, count)?;
+                self.shift(kind, part(dst), count, 4)?;
+            }
+            D::Cmov(cc, dst, src) => {
+                self.cmov(cc, Part::Reg(dst), part(src), 4)?;
+            }
+            D::Setcc(cc, dst) => self.setcc(cc, Part::Reg(dst))?,
+            D::Parts(p) if matches!(p.kind, Mnemonic::Adc | Mnemonic::Sbb) => self.binary(
+                if p.kind == Mnemonic::Adc {
+                    M::Adc
+                } else {
+                    M::Sbb
+                },
+                p.dst,
+                p.source.unwrap().0,
+                p.width,
+            )?,
+            D::Integer(Integer::Cmov(cc, dst, src, width)) => self.cmov(cc, dst, src, width)?,
+            D::Integer(Integer::Set(cc, dst)) => self.setcc(cc, dst)?,
+            D::Integer(Integer::Extend(dst, src, width, dst_width, signed)) => {
+                let value = self.extend(src, width, signed)?;
+                self.put_part(dst, dst_width, value)?;
+            }
+            D::Integer(Integer::TestBit(src, bit)) => {
+                let value = self.src(src)?;
+                let bit = self.imm(u32::from(bit));
+                let value = self.int(IntOp::Shr, value, bit);
+                self.flags(FlagKind::CarryBit, 4, value, value);
+            }
+            D::Integer(Integer::Bswap(dst)) => {
+                self.state.regs[dst as usize] = self.value(Op::IntUnary(
+                    IntUnary::ByteSwap,
+                    self.state.regs[dst as usize],
+                ));
+            }
+            D::Integer(Integer::Multiply(src, signed)) => {
+                let a = self.state.regs[0];
+                let b = self.src(src)?;
+                let high = self.int(
+                    if signed {
+                        IntOp::MulHighSigned
+                    } else {
+                        IntOp::MulHighUnsigned
+                    },
+                    a,
+                    b,
+                );
+                self.state.regs[0] = self.int(IntOp::Mul, a, b);
+                self.state.regs[2] = high;
+                if signed {
+                    self.flags(FlagKind::MulSigned, 4, a, b);
+                } else {
+                    self.flags(FlagKind::MulUnsigned, 4, high, high);
+                }
+            }
+            D::Integer(Integer::NarrowShift(kind, dst, width, count)) => {
+                if count != 0 {
+                    let count = self.imm(count);
+                    self.shift(kind, Part::Reg(dst), count, width)?;
+                }
             }
             D::Push(src) => {
                 let value = self.src(src)?;
@@ -98,8 +160,11 @@ impl Front<'_> {
                 let Mode::Inline(expected) = inst.mode else {
                     unreachable!()
                 };
-                if self.models[self.index].load(mem, 4, &self.offsets[self.index])
-                    != Some(u64::from(expected))
+                if self
+                    .scope_access
+                    .is_none_or(|access| access[self.index].is_none())
+                    && self.models[self.index].load(mem, 4, &self.offsets[self.index])
+                        != Some(u64::from(expected))
                 {
                     return Err(Reject::Dynamic(self.index));
                 }
@@ -133,7 +198,7 @@ impl Front<'_> {
                 let shift = self.constant(Type::I64, 32);
                 let hi = self.int(IntOp::Shl, hi, shift);
                 let dividend = self.int(IntOp::Or, lo, hi);
-                let proved = signed && self.proof.division(self.index).is_some();
+                let proved = signed && self.division_safe[self.index];
                 let quotient = self.value(Op::Div {
                     signed,
                     dividend,
@@ -147,7 +212,7 @@ impl Front<'_> {
                     divisor,
                 });
             }
-            D::Helper(_) | D::Body(_) | D::Syscall => return Err(Reject::Helper(self.index)),
+            D::Value(_) | D::Body(_) | D::Syscall => return Err(Reject::Helper(self.index)),
             D::Simd(s) => self.simd(s)?,
             _ => return Err(Reject::Unsupported(self.index)),
         }
@@ -297,17 +362,61 @@ impl Front<'_> {
         };
         Ok(self.value(Op::IntUnary(op, value)))
     }
-    fn shift(&mut self, kind: ShiftKind, dst: Src, count: Value) -> Result<(), Reject> {
-        let a = self.src(dst)?;
+    fn cmov(&mut self, cc: ConditionCode, dst: Part, src: Part, width: u8) -> Result<(), Reject> {
+        // x86 reads the source even when the condition is false.
+        let a = self.part(src, width)?;
+        let b = self.part(dst, width)?;
+        let cond = self.value(Op::Test {
+            flags: self.state.flags,
+            cond: cc,
+        });
+        let value = self.value(Op::Select { cond, a, b });
+        self.put_part(dst, width, value)
+    }
+
+    fn setcc(&mut self, cc: ConditionCode, dst: Part) -> Result<(), Reject> {
+        let value = self.value(Op::Test {
+            flags: self.state.flags,
+            cond: cc,
+        });
+        self.put_part(dst, 1, value)
+    }
+
+    fn shift(&mut self, kind: ShiftKind, dst: Part, count: Value, width: u8) -> Result<(), Reject> {
+        let a = self.part(dst, width)?;
         let (op, flag) = match kind {
             ShiftKind::Shl => (IntOp::Shl, FlagKind::Shl),
             ShiftKind::Shr => (IntOp::Shr, FlagKind::Shr),
             ShiftKind::Sar => (IntOp::Sar, FlagKind::Sar),
-            _ => return Err(Reject::Unsupported(self.index)),
+            ShiftKind::Rol | ShiftKind::Ror => {
+                let right = if kind == ShiftKind::Rol {
+                    self.value(Op::IntUnary(IntUnary::Neg, count))
+                } else {
+                    count
+                };
+                let result = self.int(IntOp::Ror, a, right);
+                let flag = if kind == ShiftKind::Rol {
+                    FlagKind::Rol
+                } else {
+                    FlagKind::Ror
+                };
+                self.flags(flag, width, result, count);
+                return self.put_part(dst, width, result);
+            }
         };
-        let result = self.int(op, a, count);
-        self.flags(flag, 4, a, count);
-        self.put(dst, result)
+        let input = if kind == ShiftKind::Sar && width < 4 {
+            let extend = if width == 1 {
+                IntUnary::SignExtend8
+            } else {
+                IntUnary::SignExtend16
+            };
+            self.value(Op::IntUnary(extend, a))
+        } else {
+            a
+        };
+        let result = self.int(op, input, count);
+        self.flags(flag, width, a, count);
+        self.put_part(dst, width, result)
     }
     fn push(&mut self, value: Value) -> Result<(), Reject> {
         let mem = Mem {
@@ -339,7 +448,7 @@ impl Front<'_> {
     }
 }
 
-fn part(src: Src) -> Part {
+pub(super) fn part(src: Src) -> Part {
     match src {
         Src::Reg(r) => Part::Reg(r),
         Src::Imm(n) => Part::Imm(n),

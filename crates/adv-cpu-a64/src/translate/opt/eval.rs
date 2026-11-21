@@ -4,9 +4,9 @@
 //! point uses the default FPCR semantics and checks operand and result values
 //! at each operation, recovering to its region start on failure.
 
+use crate::translate::front::tags::Mnemonic as M;
 use adv_cpu_core::Memory;
 use adv_cpu_core::integer::{self, CF, OF, PF, ZF};
-use iced_x86::Mnemonic as M;
 
 use super::ir::{
     Block, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, RecordId, Type, Value, VecOp,
@@ -99,6 +99,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
     let float = |x: f64| Some(u128::from(x.to_bits()));
     Some(match *op {
         Op::Constant(_, bits) => bits,
+        Op::Snapshot(v) => get(v),
         Op::Int(op, a, b) => int(op, get(a) as u64, get(b) as u64, wide(a)),
         Op::IntUnary(op, a) => {
             let x = get(a) as u64;
@@ -114,6 +115,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 IntUnary::SignExtend16 => narrow(x as i16 as u64),
                 IntUnary::Low32 | IntUnary::Widen => narrow(x),
                 IntUnary::High32 => narrow(x >> 32),
+                IntUnary::ByteSwap => u128::from((x as u32).swap_bytes()),
                 IntUnary::SignWiden => u128::from(x as u32 as i32 as i64 as u64),
             }
         }
@@ -167,7 +169,44 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 Type::Flags => unreachable!("no reinterpretation as flags"),
             }
         }
-        Op::Fp(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
+        Op::Fp(op, a, b) | Op::SseFp64(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
+        Op::X87Single(op, a, b) => {
+            let (a, b) = (f(a), f(b));
+            let (sa, sb) = (a as f32, b as f32);
+            if f64::from(sa) != a || f64::from(sb) != b {
+                return None;
+            }
+            let r = match op {
+                FpOp::Add => sa + sb,
+                FpOp::Sub => sa - sb,
+                FpOp::Mul => sa * sb,
+                FpOp::Div => sa / sb,
+            };
+            if r == 0.0 {
+                if !(matches!(op, FpOp::Add | FpOp::Sub) || a == 0.0 || op == FpOp::Mul && b == 0.0)
+                {
+                    return None;
+                }
+            } else if !r.is_normal() || r.abs() == f32::MIN_POSITIVE {
+                return None;
+            }
+            float(f64::from(r))?
+        }
+        Op::Fp32(op, a, b) => {
+            let a = f32::from_bits(get(a) as u32);
+            let b = f32::from_bits(get(b) as u32);
+            let sum = matches!(op, FpOp::Add | FpOp::Sub);
+            let r = match op {
+                FpOp::Add => a + b,
+                FpOp::Sub => a - b,
+                FpOp::Mul => a * b,
+                FpOp::Div => a / b,
+            };
+            if !r.is_finite() || !sum && r.abs() <= f32::MIN_POSITIVE {
+                return None;
+            }
+            u128::from(r.to_bits())
+        }
         Op::FpUnary(op, a) => {
             let x = f(a);
             match op {
@@ -187,7 +226,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             }
             float(n as f64)?
         }
-        Op::ToInt { value, wide } => {
+        Op::ToInt { value, wide, .. } => {
             let x = f(value);
             let (lo, hi) = if wide {
                 (i64::MIN as f64, -(i64::MIN as f64))
@@ -204,6 +243,52 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             } else {
                 u128::from(n as u32)
             }
+        }
+        Op::X87Store {
+            value,
+            width,
+            rounding,
+            integer,
+        } => {
+            let value = f(value);
+            if integer {
+                let rounded = match rounding {
+                    0 => value.round_ties_even(),
+                    1 => value.floor(),
+                    2 => value.ceil(),
+                    _ => value.trunc(),
+                };
+                let limit = (1u64 << (width * 8 - 1)) as f64;
+                if !rounded.is_finite() || rounded.abs() >= limit {
+                    return None;
+                }
+                let n = rounded as i64;
+                if width == 8 {
+                    n as u64 as u128
+                } else {
+                    n as u32 as u128
+                }
+            } else {
+                let rounded = value as f32;
+                if value != 0.0 && (!rounded.is_normal() || rounded.abs() == f32::MIN_POSITIVE) {
+                    return None;
+                }
+                u128::from(rounded.to_bits())
+            }
+        }
+        Op::X87StoreC1 {
+            value,
+            stored,
+            integer,
+        } => {
+            let rounded = if !integer {
+                f64::from(f32::from_bits(get(stored) as u32))
+            } else if wide(stored) {
+                get(stored) as u64 as i64 as f64
+            } else {
+                f64::from(get(stored) as u32 as i32)
+            };
+            u128::from(rounded.abs() > f(value).abs())
         }
         Op::Vec(VecOp::LessF64, a, b) => {
             let mut result = 0;
@@ -283,18 +368,80 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             }
             float(x)?
         }
-        Op::SseInput { a, b, packed } => {
+        Op::SseInput {
+            a,
+            b,
+            packed,
+            single,
+            ..
+        } => {
             for v in [Some(a), b].into_iter().flatten() {
                 let bits = get(v);
-                if f64::from_bits(bits as u64).is_subnormal()
-                    || packed && f64::from_bits((bits >> 64) as u64).is_subnormal()
+                if if single {
+                    f32::from_bits(bits as u32).is_subnormal()
+                } else {
+                    f64::from_bits(bits as u64).is_subnormal()
+                        || packed && f64::from_bits((bits >> 64) as u64).is_subnormal()
+                } {
+                    return None;
+                }
+            }
+            0
+        }
+        Op::PlainPage { addr, bytes, write } => {
+            let addr = get(addr) as u32;
+            #[cfg(unix)]
+            let plain = memory.computation_range(addr, bytes as usize, write);
+            #[cfg(not(unix))]
+            let plain = {
+                use adv_cpu_core::memory::{READ, WRITE};
+                memory.accessible(addr, bytes as usize, if write { WRITE } else { READ })
+                    && !memory.shared_range(addr, bytes as usize)
+            };
+            if !plain {
+                return None;
+            }
+            0
+        }
+        Op::PageCross { addr, width, .. } => {
+            use adv_cpu_core::memory::{EXEC, PAGE_SIZE, WRITE};
+            let addr = get(addr) as u32;
+            let width = usize::from(width);
+            if addr as usize % PAGE_SIZE > PAGE_SIZE - width {
+                #[cfg(unix)]
+                let plain = memory.computation_range(addr, width, true);
+                #[cfg(not(unix))]
+                let plain =
+                    memory.accessible(addr, width, WRITE) && !memory.shared_range(addr, width);
+                if !plain {
+                    return None;
+                }
+                let page = (addr - memory.base) as usize / PAGE_SIZE;
+                if memory.native_permissions()[page..=page + 1]
+                    .iter()
+                    .any(|class| class & (WRITE | EXEC) != WRITE)
                 {
                     return None;
                 }
             }
             0
         }
-        Op::Validate => 0,
+        Op::FrameDisjoint {
+            addr,
+            width,
+            base,
+            lo,
+            hi,
+            ..
+        } => {
+            let start = (get(base) as u32).wrapping_add_signed(lo);
+            let bytes = (i64::from(hi) - i64::from(lo)) as u32;
+            if !super::ir::disjoint_ranges(get(addr) as u32, width.into(), start, bytes) {
+                return None;
+            }
+            0
+        }
+        Op::Validate | Op::ScopeWritten(_) => 0,
     })
 }
 
@@ -321,6 +468,8 @@ fn int(op: IntOp, a: u64, b: u64, wide: bool) -> u128 {
         IntOp::Shl => a << shift,
         IntOp::Shr => a >> shift,
         IntOp::Sar => (sign(a) >> shift) as u64,
+        IntOp::Ror if wide => a.rotate_right(shift),
+        IntOp::Ror => u64::from((a as u32).rotate_right(shift)),
         IntOp::Mul => a.wrapping_mul(b),
         IntOp::MulHighSigned if wide => {
             ((i128::from(a as i64) * i128::from(b as i64)) >> 64) as u64
@@ -336,7 +485,7 @@ fn int(op: IntOp, a: u64, b: u64, wide: bool) -> u128 {
     }
 }
 
-fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32) -> Option<u32> {
+pub(super) fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32) -> Option<u32> {
     let (x, y) = (a as u32, b as u32);
     let mut out = prior;
     match kind {
@@ -367,6 +516,22 @@ fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32) -> Option<u32>
                     _ => M::Sar,
                 };
                 integer::shift(&mut out, kind, x, count, width);
+            }
+        }
+        FlagKind::CarryBit => out = out & !CF | (x & 1),
+        FlagKind::MulUnsigned => {
+            out = out & !(CF | OF) | if x != 0 { CF | OF } else { 0 };
+        }
+        FlagKind::Rol | FlagKind::Ror => {
+            let count = y & 31;
+            if count != 0 {
+                let left = kind == FlagKind::Rol;
+                let carry = (x >> if left { 0 } else { 31 }) & 1;
+                out = out & !CF | carry;
+                if count == 1 {
+                    let overflow = (x >> 31) ^ if left { carry } else { (x >> 30) & 1 };
+                    out = out & !OF | (overflow << 11);
+                }
             }
         }
         FlagKind::MulSigned => {
@@ -466,6 +631,7 @@ fn vec_shift(op: crate::encode::ShiftImm, log2: u8, full: bool, a: u128, count: 
 fn vector_unary(op: VecUnary, a: u128) -> u128 {
     match op {
         VecUnary::ShiftImm(op, log2, count, full) => vec_shift(op, log2, full, a, u64::from(count)),
+        VecUnary::NarrowScalar => u128::from((f64::from_bits(a as u64) as f32).to_bits()),
         VecUnary::Low64 => a & u128::from(u64::MAX),
         VecUnary::High64 => a >> 64,
         VecUnary::Shuffle(log2, imm, full) => {
@@ -737,17 +903,18 @@ pub(crate) fn locate(location: &Location<Value>, values: &[u128]) -> u128 {
     match *location {
         Location::Constant(bits) => u128::from(bits),
         Location::At(v) | Location::Recipe(Recipe::Eflags(v)) => get(v),
-        Location::Recipe(Recipe::C1 { op, a, b }) => u128::from(rounded_up(
+        Location::Recipe(Recipe::C1 { op, a, b, single }) => u128::from(rounded_up(
             op,
             f64::from_bits(get(a) as u64),
             f64::from_bits(get(b) as u64),
+            single,
         )),
     }
 }
 
 /// C1 after a nearest-rounded `a op b` without other exceptions: whether
 /// the magnitude was rounded up.
-pub(crate) fn rounded_up(op: FpOp, a: f64, b: f64) -> bool {
+pub(crate) fn rounded_up(op: FpOp, a: f64, b: f64, single: bool) -> bool {
     let (r, error) = match op {
         FpOp::Add | FpOp::Sub => {
             let b = if op == FpOp::Sub { -b } else { b };
@@ -764,6 +931,15 @@ pub(crate) fn rounded_up(op: FpOp, a: f64, b: f64) -> bool {
             (q, (-q).mul_add(b, a) * b.signum())
         }
     };
+    if single {
+        if r == 0.0 {
+            return false;
+        }
+        let (rounded, grew) = adv_cpu_core::floating::fast::round_single_precision(r);
+        if rounded != r {
+            return grew;
+        }
+    }
     error != 0.0 && error.signum() != r.signum()
 }
 
@@ -779,6 +955,7 @@ mod tests {
             refund: 0,
             regs: [None; 8],
             eflags: None,
+            flag_groups: Vec::new(),
             x87: None,
             xmm: [None; 8],
             mmx: [None; 8],
@@ -803,10 +980,13 @@ mod tests {
         f.push(
             b,
             Op::Store {
+                scope: None,
                 width: 8,
                 addr,
                 value: p,
                 after,
+                checked: false,
+                pc: 0,
             },
         );
         f.end(b, End::Exit(exit));
@@ -863,10 +1043,13 @@ mod tests {
         f.push(
             b,
             Op::Store {
+                scope: None,
                 width: 4,
                 addr: unmapped,
                 value: unmapped,
                 after,
+                checked: false,
+                pc: 0,
             },
         );
         f.end(b, End::Exit(exit));
@@ -940,7 +1123,7 @@ mod tests {
                 head,
                 Op::Test {
                     flags,
-                    cond: iced_x86::ConditionCode::ne,
+                    cond: crate::translate::front::tags::ConditionCode::ne,
                 },
             )
             .unwrap();
@@ -979,10 +1162,10 @@ mod tests {
 
     #[test]
     fn c1_recipes_report_upward_rounding() {
-        assert!(rounded_up(FpOp::Div, 1.0, 10.0));
-        assert!(rounded_up(FpOp::Add, 0.1, 0.2));
-        assert!(!rounded_up(FpOp::Div, 1.0, 3.0));
-        assert!(!rounded_up(FpOp::Mul, 1.5, 2.0));
-        assert!(rounded_up(FpOp::Add, 1.0, f64::EPSILON * 0.75));
+        assert!(rounded_up(FpOp::Div, 1.0, 10.0, false));
+        assert!(rounded_up(FpOp::Add, 0.1, 0.2, false));
+        assert!(!rounded_up(FpOp::Div, 1.0, 3.0, false));
+        assert!(!rounded_up(FpOp::Mul, 1.5, 2.0, false));
+        assert!(rounded_up(FpOp::Add, 1.0, f64::EPSILON * 0.75, false));
     }
 }

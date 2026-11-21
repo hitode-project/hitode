@@ -1,5 +1,4 @@
-//! Opt-in native address maps for samplers. They record placed units, not
-//! execution counts, and never change translation.
+//! Opt-in native address maps and resident execution diagnostics for samplers.
 //!
 //! `ADV_JIT_MAP_DIR` writes `jit-{pid}.tsv` rows for an external sampler,
 //! with mode `a64`, or `a64-opt` for a computation's optimized form;
@@ -7,7 +6,9 @@
 //! stretch of a unit; and `code-{pid}.bin`, the units' code as placed (before
 //! links are patched), concatenated in `jit-{pid}.tsv` row order.
 //! `opt-{pid}.tsv` follows each hot loop from its promotion to the stage
-//! that refused it or to its installed optimized form. [`enable_memory`] keeps the same in process for an
+//! that refused it or to its installed optimized form, and records resident
+//! cold exits at powers of two and probation demotions. Resident forms count
+//! admitted entries for the run report. [`enable_memory`] keeps address maps for an
 //! in-process sampler, with the names of the shared stubs. A cleared cache
 //! reuses addresses, so attribution takes the newest unit placed before the
 //! sample.
@@ -258,6 +259,10 @@ fn files() -> Option<&'static Files> {
     .as_ref()
 }
 
+pub(crate) fn enabled() -> bool {
+    files().is_some()
+}
+
 /// An `opt-{pid}.tsv` row: Unix ns, computation entry, then `outcome`: the
 /// step, an address or count, and an operation. Steps follow a hot loop from
 /// its promotion and extent (or `unlooped`, when no nearby trace has a loop
@@ -269,6 +274,56 @@ pub(crate) fn optimized(eip: u32, outcome: std::fmt::Arguments<'_>) {
         let row = format!("{}\t{eip}\t{outcome}\n", now_ns());
         let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
         let _ = files.3.write_all(row.as_bytes());
+    }
+}
+
+pub(crate) fn demoted(head: u32, version: usize, entries: u64, iterations: u64) {
+    if let Some(files) = files() {
+        let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _ = writeln!(
+            files.3,
+            "demoted\t{head}\t{version}\t{entries}\t{iterations}"
+        );
+    }
+}
+
+#[cfg(native)]
+pub(crate) fn declined(head: u32, reason: crate::translate::lower::resident::ResidentCold) {
+    if let Some(files) = files() {
+        let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _ = writeln!(files.3, "declined\t{head}\t{reason:?}");
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static VECTORIZED: std::cell::RefCell<Option<Vec<(u32, u8)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn collect_vectorized(run: impl FnOnce()) -> Vec<(u32, u8)> {
+    VECTORIZED.with_borrow_mut(|rows| *rows = Some(Vec::new()));
+    run();
+    VECTORIZED.with_borrow_mut(|rows| rows.take().unwrap())
+}
+
+pub(crate) fn vectorized(head: u32, kernel: &str, lanes: u8, streams: usize) {
+    #[cfg(test)]
+    VECTORIZED.with_borrow_mut(|rows| {
+        if let Some(rows) = rows {
+            rows.push((head, lanes));
+        }
+    });
+    if let Some(files) = files() {
+        let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _ = writeln!(files.3, "vectorized\t{head}\t{kernel}\t{lanes}\t{streams}");
+    }
+}
+
+pub(crate) fn loop_reject(head: u32, reason: std::fmt::Arguments<'_>) {
+    if let Some(files) = files() {
+        let mut files = files.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _ = writeln!(files.3, "loopreject\t{head}\t{reason}");
     }
 }
 

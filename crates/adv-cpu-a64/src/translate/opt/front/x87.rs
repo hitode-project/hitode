@@ -1,5 +1,5 @@
-use super::*;
-use crate::translate::x87::X87 as Instruction;
+use super::{FpOp, FpUnary, Front, Location, Mem, Op, Recipe, Reject, Source, Type, Value, model};
+use crate::translate::front::forms::X87 as Instruction;
 use adv_cpu_core::floating::fast::{Fast, Source as Operand};
 
 impl Front<'_> {
@@ -42,21 +42,31 @@ impl Front<'_> {
         let ip = self.location(self.state.ip);
         let opcode = self.location(self.state.opcode);
         args.extend([ip, opcode]);
-        if let model::C1::Round(op) = self.models[to].c1 {
+        if let model::C1::Round(op, single) = self.models[to].c1 {
             let pair = match self.state.c1 {
-                Some(Location::Recipe(Recipe::C1 { op: from, a, b })) if from == op => [a, b],
+                Some(Location::Recipe(Recipe::C1 {
+                    op: from,
+                    single: narrow,
+                    a,
+                    b,
+                })) if from == op && single == narrow => [a, b],
                 Some(Location::Constant(c)) => {
                     let (a, b) = if c == 0 {
                         (1.0, 1.0)
                     } else {
+                        let eps = if single {
+                            f64::from(f32::EPSILON)
+                        } else {
+                            f64::EPSILON
+                        };
                         match op {
-                            FpOp::Add => (1.0, 0.75 * f64::EPSILON),
-                            FpOp::Sub => (1.0, -0.75 * f64::EPSILON),
-                            FpOp::Mul => (1.5, 1.0 + f64::EPSILON),
+                            FpOp::Add => (1.0, 0.75 * eps),
+                            FpOp::Sub => (1.0, -0.75 * eps),
+                            FpOp::Mul => (1.5, 1.0 + eps),
                             FpOp::Div => (1.0, 10.0),
                         }
                     };
-                    debug_assert_eq!(super::super::eval::rounded_up(op, a, b), c != 0);
+                    debug_assert_eq!(super::super::eval::rounded_up(op, a, b, single), c != 0);
                     [
                         self.constant(Type::F64, u128::from(a.to_bits())),
                         self.constant(Type::F64, u128::from(b.to_bits())),
@@ -65,6 +75,9 @@ impl Front<'_> {
                 _ => return Err(Reject::StaticX87(to)),
             };
             args.extend(pair);
+        }
+        if self.models[to].c1 == model::C1::Value {
+            args.push(self.location(self.state.c1.ok_or(Reject::StaticX87(to))?));
         }
         if self.assumed.mmx && self.models[to].mmx_meta.1 != u32::MAX {
             args.push(self.state.mmx_meta);
@@ -112,22 +125,34 @@ impl Front<'_> {
             }
             Fast::Store {
                 width,
-                integer: true,
-                pop: true,
+                integer,
+                pop,
             } => {
-                if self.state.control & 0x0c3f != 0x0c3f {
+                let rounding = (self.state.control >> 10 & 3) as u8;
+                if self.state.control & 0x3f != 0x3f || !integer && rounding != 0 {
                     return Err(Reject::Mode(self.index));
                 }
                 let value = self.st(0)?;
-                let integer = self.value(Op::ToInt {
+                let stored = self.value(Op::X87Store {
                     value,
-                    wide: width == 8,
+                    width,
+                    rounding,
+                    integer,
                 });
                 let mem = x.mem.ok_or(Reject::Unsupported(self.index))?;
-                self.write(mem, width, integer)?;
-                self.x87_pop();
-                // Chopping never rounds the magnitude up.
-                self.state.c1 = Some(Location::Constant(0));
+                self.write(mem, width, stored)?;
+                if pop {
+                    self.x87_pop();
+                }
+                self.state.c1 = Some(if integer && rounding == 3 {
+                    Location::Constant(0)
+                } else {
+                    Location::At(self.value(Op::X87StoreC1 {
+                        value,
+                        stored,
+                        integer,
+                    }))
+                });
             }
             Fast::StoreSt { index, pop } => {
                 let value = self.st(0)?;
@@ -165,17 +190,23 @@ impl Front<'_> {
                 reverse,
                 pop,
             } => {
-                if self.state.control & 0x0f3f != 0x023f {
-                    return Err(Reject::Mode(self.index));
-                }
+                let single = match self.state.control & 0x0f3f {
+                    0x003f => true,
+                    0x023f => false,
+                    _ => return Err(Reject::Mode(self.index)),
+                };
                 let a = self.st(dest)?;
                 let b = self.x87_source(src, x.mem)?;
                 let (a, b) = if reverse { (b, a) } else { (a, b) };
                 let op = model::fp(op);
-                let result = self.value(Op::Fp(op, a, b));
+                let result = self.value(if single {
+                    Op::X87Single(op, a, b)
+                } else {
+                    Op::Fp(op, a, b)
+                });
                 let slot = (self.state.top + dest) & 7;
                 self.state.x87[slot as usize] = Some(result);
-                self.state.c1 = Some(Location::Recipe(Recipe::C1 { op, a, b }));
+                self.state.c1 = Some(Location::Recipe(Recipe::C1 { op, a, b, single }));
                 if pop {
                     self.x87_pop();
                 }
@@ -194,7 +225,7 @@ impl Front<'_> {
                         &self.offsets[self.index],
                     )
                     .ok_or(Reject::Mode(self.index))? as u16;
-                if value & 0x3f != 0x3f {
+                if value & 0x3f != 0x3f || self.at.x87.status & 0x8000 != 0 {
                     return Err(Reject::Mode(self.index));
                 }
                 self.state.control = value;

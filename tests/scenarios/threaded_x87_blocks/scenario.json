@@ -1,0 +1,11 @@
+{
+  "spec": ["A64-TR-9", "A64-OPT-8", "A64-OPT-9"],
+  "exe": "threaded_x87_blocks.exe",
+  "args": ["--sync-compilation"],
+  "seconds": 60,
+  "outputs": ["threaded-x87-blocks.bin"],
+  "steady": {
+    "iterations": [4, 8],
+    "counters": ["owner_retired"]
+  }
+}

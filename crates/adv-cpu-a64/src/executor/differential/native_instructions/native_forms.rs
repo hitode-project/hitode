@@ -22,7 +22,7 @@ fn check(p: &Program, config: Config, permission: Option<u8>, native_only: bool)
         assert!(native.stats.native_entries > 0);
         assert_eq!(native.stats.interpreter_entries, 0, "code={:?}", p.code);
         assert_eq!(
-            native.native.as_ref().unwrap().diagnostics.helpers,
+            native.native.as_ref().unwrap().diagnostics.interprets,
             0,
             "code={:?}",
             p.code
@@ -62,7 +62,8 @@ fn checked_store_rebinds_a_writable_call_slot() {
 }
 
 fn no_operation_calls(p: &Program) {
-    use crate::translate::{Stubs, Workspace, translate};
+    use crate::native::compile::{Workspace, translate};
+    use crate::translate::Stubs;
     let mut memory = Memory::new(BASE, LEN).unwrap();
     load(&mut memory, p);
     let mut work = Workspace::default();
@@ -74,7 +75,6 @@ fn no_operation_calls(p: &Program) {
         lookup_slow: at + 0x1000c,
         ret_miss: at + 0x10010,
         access: at + 0x10014,
-        interpret: at + 0x10018,
         call: at + 0x10020,
         fault: at + 0x10024,
         opt_exit: at + 0x10024,
@@ -102,14 +102,12 @@ fn no_operation_calls(p: &Program) {
         ) || i.has_lock_prefix()
             || i.mnemonic() == iced_x86::Mnemonic::Xchg && i.op0_kind() == iced_x86::OpKind::Memory
     });
-    for (n, &word) in work.words().iter().enumerate() {
-        if !exceptional {
-            assert_ne!(
-                word,
-                crate::encode::bl((stubs.interpret - at) as i32 - n as i32 * 4),
-                "interpret call"
-            );
-        }
+    if !exceptional {
+        assert!(
+            work.words()
+                .iter()
+                .all(|word| word & 0xffff_fc1f != 0xd63f_0000)
+        );
     }
 }
 
@@ -571,7 +569,9 @@ fn native_forms_resume_at_budget_cuts_and_crossing_accesses() {
             let mut oracle = executor(&p, config, true);
             assert_eq!(
                 native.run(p.stop, budget).unwrap(),
-                oracle.run(p.stop, budget).unwrap()
+                oracle
+                    .run(p.stop, budget.saturating_add(native.fuel_debt))
+                    .unwrap()
             );
             same(&native, &oracle);
             assert_eq!(
@@ -580,7 +580,7 @@ fn native_forms_resume_at_budget_cuts_and_crossing_accesses() {
             );
             same(&native, &oracle);
             assert_eq!(
-                native.native.as_ref().unwrap().diagnostics.helpers,
+                native.native.as_ref().unwrap().diagnostics.interprets,
                 0,
                 "code={:?}",
                 p.code
@@ -620,7 +620,7 @@ fn native_forms_resume_at_budget_cuts_and_crossing_accesses() {
                 );
                 same(&native, &oracle);
                 assert_eq!(
-                    native.native.as_ref().unwrap().diagnostics.helpers,
+                    native.native.as_ref().unwrap().diagnostics.interprets,
                     0,
                     "code={:?}",
                     p.code

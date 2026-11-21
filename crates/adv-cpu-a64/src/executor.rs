@@ -11,46 +11,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use adv_cpu_core::instruction_trace::Trace;
-use adv_cpu_core::interpreter::{Interpreter, Step};
+use adv_cpu_core::interpreter::{Execution, Interpreter, Step};
 use adv_cpu_core::tier_verify::VerifyStats;
 #[cfg(native)]
 use adv_cpu_core::tier_verify::{self, Check, Verifier};
 use adv_cpu_core::trap::{Bridge, ExecutionTrap, call_trap};
 use adv_cpu_core::{CpuState, Memory, Region, RunOutcome};
 
-use crate::runtime::Exit;
+pub use crate::runtime::ExecutionContext;
+use crate::runtime::{Event, Exit};
 
-/// Interpreted instructions per decoded block, as in the x64 executor.
-const BLOCK_UNITS: u64 = 256;
-
-/// A saved guest CPU, restored into the same executor.
-#[derive(Clone)]
-pub struct ExecutionContext {
-    cpu: CpuState,
-    offered: Option<u32>,
-    resume: Option<(u32, Exit)>,
-}
-
-impl ExecutionContext {
-    pub fn cpu(&self) -> &CpuState {
-        &self.cpu
-    }
-
-    pub fn cpu_mut(&mut self) -> &mut CpuState {
-        &mut self.cpu
-    }
-
-    #[cfg(native)]
-    pub(crate) fn has_resume(&self) -> bool {
-        self.resume.is_some_and(|(pc, _)| pc == self.cpu.eip)
-    }
-
-    #[cfg(native)]
-    pub(crate) fn finish_computation(&mut self, exit: Exit) {
-        self.offered = (exit == Exit::Recall).then_some(self.cpu.eip);
-        self.resume = matches!(exit, Exit::Interpret | Exit::Fault).then_some((self.cpu.eip, exit));
-    }
-}
+// Interpreted instructions per decoded block, as in the x64 executor.
+use crate::policy::tier1::BLOCK_UNITS;
 
 /// Execution counters. Names match the x64 executor where the meaning is
 /// shared; native and translation counters stay zero without translated code.
@@ -90,8 +62,11 @@ pub struct Executor {
     diagnostics: u8,
     alarm: Option<adv_sync::pending::Deadline>,
     deadline: Option<Instant>,
-    offered: Option<u32>,
+    #[cfg(native)]
+    offered: Option<(u32, Option<crate::runtime::ScopedOffer>)>,
     computation_resume: Option<(u32, Exit)>,
+    /// Retirement past the preceding slice, paid before another unit enters.
+    fuel_debt: u64,
     /// `ADV_INTERP_TRACE_*` observations of an interpreter-only executor.
     pub(crate) instruction_trace: Option<Box<Trace>>,
     /// `ADV_JIT_VERIFY` checks, and how often each entry has been checked.
@@ -174,8 +149,10 @@ impl Executor {
             diagnostics: 0,
             alarm: None,
             deadline: None,
+            #[cfg(native)]
             offered: None,
             computation_resume: None,
+            fuel_debt: 0,
             instruction_trace: (!translate).then(Trace::from_env).flatten(),
             #[cfg(native)]
             verifier: translate.then(Verifier::from_env).flatten(),
@@ -258,21 +235,41 @@ impl Executor {
         self.add_region(region)
     }
 
+    /// Retirement past the last slice, which the next slice pays first.
+    pub fn fuel_debt(&self) -> u64 {
+        self.fuel_debt
+    }
+
     pub fn save_context(&self) -> Result<ExecutionContext, String> {
         let mut cpu = self.state.clone();
         cpu.refresh_mmx();
         Ok(ExecutionContext {
             cpu,
+            #[cfg(native)]
             offered: self.offered,
+            #[cfg(native)]
+            shadow: self
+                .native
+                .as_ref()
+                .and_then(crate::native::Native::save_shadow),
             resume: self.computation_resume,
+            fuel_debt: self.fuel_debt,
         })
     }
 
     pub fn restore_context(&mut self, context: &ExecutionContext) -> Result<(), String> {
+        #[cfg(native)]
+        if let Some(native) = &mut self.native {
+            native.restore_shadow(context.shadow.as_ref())?;
+        }
         self.state = context.cpu.clone();
         self.state.refresh_mmx();
-        self.offered = context.offered;
+        #[cfg(native)]
+        {
+            self.offered = context.offered;
+        }
         self.computation_resume = context.resume;
+        self.fuel_debt = context.fuel_debt;
         Ok(())
     }
 
@@ -305,6 +302,23 @@ impl Executor {
             );
         }
         self.set_deadline(None);
+    }
+
+    pub fn set_async_compilation(&mut self, enabled: bool) {
+        #[cfg(native)]
+        if let Some(native) = &mut self.native {
+            native.set_async_compilation(enabled);
+        }
+        #[cfg(not(native))]
+        let _ = enabled;
+    }
+
+    /// Use ordinary translation for a short-lived machine. Set before execution.
+    pub fn use_tier1_only(&mut self) {
+        #[cfg(native)]
+        if let Some(native) = &mut self.native {
+            native.use_tier1_only();
+        }
     }
 
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
@@ -352,16 +366,34 @@ impl Executor {
         result
     }
 
+    pub(crate) fn worker_retired(&self) -> u64 {
+        #[cfg(native)]
+        if let Some(native) = &self.native {
+            return native.worker_retired();
+        }
+        0
+    }
+
     /// Diagnostic counts of the translated runs, as `name: value` pairs.
     pub fn diagnostics(&self) -> String {
         #[cfg(native)]
         if let Some(native) = &self.native {
-            return format!(
-                "{:?} unchecked faults {} checked {}",
+            let mut report = format!(
+                "{:?} translation_decodes {:?} unchecked faults {} checked {}",
                 native.diagnostics,
+                native.translation_decodes(),
                 native.unchecked_faults,
                 native.checked_count()
             );
+            if let Some(versions) = native.version_diagnostics() {
+                report.push_str(" tier1 versions");
+                report.push_str(&versions);
+            }
+            if let Some(policy) = native.policy_diagnostics() {
+                report.push_str(" optimization policy");
+                report.push_str(&policy);
+            }
+            return report;
         }
         #[cfg(native)]
         if let Some(warning) = &self.native_warning {
@@ -370,13 +402,18 @@ impl Executor {
         String::new()
     }
 
+    #[cfg(all(test, native))]
+    pub(crate) fn value_calls_at(&self, pc: u32) -> u64 {
+        self.native.as_ref().unwrap().value_calls_at(pc)
+    }
+
     /// Slow-path runs by EIP: interpreted after an exit, after a fault, and
-    /// run by helpers. Counts only grow, so callers diff two readings.
+    /// run by value calls. Counts only grow, so callers diff two readings.
     pub fn slow_path_sites(&self) -> Vec<(u32, [u64; 3])> {
         let mut sites = rustc_hash::FxHashMap::<u32, [u64; 3]>::default();
         #[cfg(native)]
         if let Some(native) = &self.native {
-            for (eip, count) in native.helper_histogram() {
+            for (eip, count) in native.value_histogram() {
                 sites.entry(eip).or_default()[2] += count;
             }
         }
@@ -389,27 +426,20 @@ impl Executor {
     }
 
     /// The form of the instruction at `eip` as the code there decodes now.
-    pub fn instruction_form(&self, eip: u32) -> Option<iced_x86::Code> {
-        let mut bytes = [0; 15];
-        let page = (0x1000 - (eip & 0xfff) as usize).min(bytes.len());
-        if self.memory.read_into(eip, &mut bytes).is_err() {
-            self.memory.read_into(eip, &mut bytes[..page]).ok()?;
-        }
-        let mut decoder =
-            iced_x86::Decoder::with_ip(32, &bytes, u64::from(eip), iced_x86::DecoderOptions::NONE);
-        Some(decoder.decode().code())
+    pub fn instruction_form(&self, eip: u32) -> Option<crate::translate::front::tags::Code> {
+        crate::translate::front::instruction_form(&self.memory, eip)
     }
 
     /// Instructions by form, most frequent first, as the code at their
     /// EIPs decodes now: those interpreted after an exit, after a fault, or
-    /// (`which` 2) run by helpers.
-    pub fn interpreted_forms(&self, which: u8) -> Vec<(iced_x86::Code, u64)> {
+    /// (`which` 2) run by value calls.
+    pub fn interpreted_forms(&self, which: u8) -> Vec<(crate::translate::front::tags::Code, u64)> {
         let mut forms = rustc_hash::FxHashMap::<_, u64>::default();
         #[cfg(native)]
         let helpers = self
             .native
             .as_ref()
-            .map(crate::native::Native::helper_histogram)
+            .map(crate::native::Native::value_histogram)
             .unwrap_or_default();
         #[cfg(not(native))]
         let helpers = rustc_hash::FxHashMap::default();
@@ -419,20 +449,9 @@ impl Executor {
             _ => &helpers,
         };
         for (&eip, &count) in histogram {
-            let mut bytes = [0; 15];
-            let page = (0x1000 - (eip & 0xfff) as usize).min(bytes.len());
-            if self.memory.read_into(eip, &mut bytes).is_err()
-                && self.memory.read_into(eip, &mut bytes[..page]).is_err()
-            {
-                continue;
+            if let Some(form) = self.instruction_form(eip) {
+                *forms.entry(form).or_default() += count;
             }
-            let mut decoder = iced_x86::Decoder::with_ip(
-                32,
-                &bytes,
-                u64::from(eip),
-                iced_x86::DecoderOptions::NONE,
-            );
-            *forms.entry(decoder.decode().code()).or_default() += count;
         }
         let mut forms: Vec<_> = forms.into_iter().collect();
         forms.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
@@ -479,7 +498,10 @@ impl Executor {
             native.set_spin_yield(yield_on_spin);
             native.set_computation_offer(
                 self.verifier.is_none() && bridge.handler.is_some(),
-                self.offered.take().filter(|&pc| pc == self.state.eip),
+                self.offered
+                    .take()
+                    .map(|(pc, _)| pc)
+                    .filter(|&pc| pc == self.state.eip),
             );
             native.set_body_services(
                 bridge
@@ -507,7 +529,9 @@ impl Executor {
         let result = self.run_inner(stop, budget, &mut bridge, trace.as_deref_mut());
         #[cfg(native)]
         if let Some(native) = &mut self.native {
-            self.offered = self.offered.or(native.take_offer_skip());
+            self.offered = self
+                .offered
+                .or(native.take_offer_skip().map(|pc| (pc, None)));
         }
         if let Some(trace) = &mut trace {
             trace.boundary(&result, &self.state, &self.memory);
@@ -578,7 +602,7 @@ impl Executor {
                 std::ptr::null_mut(),
             )?;
             if let Some(run) = &run
-                && run.exit != Exit::Stepped
+                && !matches!(run.exit, Exit::FirstVisit | Exit::Untracked)
             {
                 let check = trace.check_retired(run.retired as usize, &self.state, &self.memory);
                 let strict = verifier.strict;
@@ -594,14 +618,22 @@ impl Executor {
         let Some(run) = run? else {
             return Ok(None);
         };
-        self.stats.native_entries += 1;
+        if run.exit != Exit::Untracked {
+            self.stats.native_entries += 1;
+        }
         if run.translated != 0 {
             self.stats.compilations += 1;
             self.stats.native_code_bytes += run.translated as u64;
         }
         self.stats.invalidations = native.diagnostics.dropped_units;
-        self.state.fuel -= u64::from(run.retired);
+        self.charge(run.retired);
         Ok(Some(run.exit))
+    }
+
+    fn charge(&mut self, retired: u32) {
+        let retired = u64::from(retired);
+        self.fuel_debt += retired.saturating_sub(self.state.fuel);
+        self.state.fuel = self.state.fuel.saturating_sub(retired);
     }
 
     /// Whether the wall deadline has passed. Translated runs compare the
@@ -632,7 +664,9 @@ impl Executor {
     ) -> Result<RunOutcome, String> {
         self.interpreter.observe_transfers = trace.is_some();
         self.state.refresh_mmx();
-        self.state.fuel = budget;
+        let paid = self.fuel_debt.min(budget);
+        self.fuel_debt -= paid;
+        self.state.fuel = budget - paid;
         let mut polls = 0u32;
         loop {
             if bridge.parked {
@@ -687,24 +721,56 @@ impl Executor {
             let (units, observed) = trace.as_deref_mut().map_or((units, None), |trace| {
                 trace.prepare(units, &self.state, &self.memory)
             });
-            let resume = self.computation_resume.take().filter(|(pc, exit)| {
-                *pc == self.state.eip && matches!(exit, Exit::Interpret | Exit::Fault)
-            });
-            let (execution, last_units) = if precise_flags || observed.is_some() {
+            let resume = self
+                .computation_resume
+                .take()
+                .filter(|(pc, exit)| *pc == self.state.eip && matches!(exit, Exit::Event(_)));
+            let mut interpreted = true;
+            let (execution, last_units) = if observed.is_some() {
                 let execution = self
                     .interpreter
                     .run_chunk(&mut self.state, &mut self.memory, 1);
                 (execution, execution.units)
             } else if let Some(exit) = match resume {
+                _ if precise_flags => Some(Exit::Event(Event::DebugFlags)),
                 Some((_, exit)) => Some(exit),
                 None => self.run_native(stop, bridge)?,
             } {
                 match exit {
                     Exit::Dispatch | Exit::Budget => continue,
+                    #[cfg(native)]
+                    Exit::FirstVisit => {
+                        let fuel = self.state.fuel.min(crate::native::SLICE) as u32;
+                        let visit = self.interpreter.run_first_visit(
+                            &mut self.state,
+                            &mut self.memory,
+                            stop,
+                            fuel,
+                        );
+                        let diagnostics = &mut self.native.as_mut().unwrap().diagnostics;
+                        diagnostics.first_declined += u64::from(visit.slow);
+                        diagnostics.first_quick_decodes += u64::from(visit.quick_decodes);
+                        diagnostics.first_full_decodes += u64::from(visit.full_decodes);
+                        (visit.execution, visit.last_units)
+                    }
+                    #[cfg(not(native))]
+                    Exit::FirstVisit => unreachable!("no native dispatch"),
+                    Exit::Untracked => self.interpreter.run_block(
+                        &mut self.state,
+                        &mut self.memory,
+                        units,
+                        stop,
+                        None,
+                    ),
                     Exit::Computation => {
-                        self.offered = Some(self.state.eip);
+                        #[cfg(native)]
+                        {
+                            let scoped = self.native.as_mut().unwrap().scoped_offer.take();
+                            self.offered = Some((self.state.eip, scoped));
+                        }
                         return Ok(RunOutcome::Computation);
                     }
+                    Exit::Plan(_) => unreachable!("plan events complete at the native boundary"),
                     Exit::Optimized => {
                         unreachable!("optimized forms run only on computation workers")
                     }
@@ -717,27 +783,49 @@ impl Executor {
                         }
                         continue;
                     }
-                    // The helper ran the instruction; the owner completes it.
-                    #[cfg(native)]
-                    Exit::Stepped => {
-                        let execution = self.native.as_mut().and_then(|n| n.pending.take());
-                        let execution = execution.expect("a pending step");
-                        (execution, execution.units)
-                    }
-                    #[cfg(not(native))]
-                    Exit::Stepped => unreachable!("no translated code"),
-                    // The unit spent the budget; the instruction waits.
-                    Exit::Interpret | Exit::Fault if self.state.fuel == 0 => continue,
-                    Exit::Interpret | Exit::Fault => {
-                        let histogram = if exit == Exit::Interpret {
-                            &mut self.histogram
-                        } else {
-                            &mut self.faults
+                    Exit::Event(Event::Exception(vector)) => {
+                        interpreted = false;
+                        let step = Step::Trap {
+                            pc: self.state.eip,
+                            vector,
                         };
-                        *histogram.entry(self.state.eip).or_default() += 1;
+                        (Execution { step, units: 0 }, 0)
+                    }
+                    Exit::Event(Event::Unsupported(code)) => {
+                        interpreted = false;
+                        let code = crate::translate::front::tags::Code::try_from(usize::from(code))
+                            .expect("prepared instruction form");
+                        let step = Step::Unsupported {
+                            pc: self.state.eip,
+                            code,
+                        };
+                        (Execution { step, units: 0 }, 0)
+                    }
+                    Exit::Event(Event::Software { vector, len }) => {
+                        interpreted = false;
+                        let pc = self.state.eip;
+                        self.state.eip = pc.wrapping_add(u32::from(len));
+                        let step = Step::Trap { pc, vector };
+                        (Execution { step, units: 0 }, 1)
+                    }
+                    Exit::Event(event) => {
+                        let pc = self.state.eip;
+                        match event {
+                            Event::Replay => *self.faults.entry(pc).or_default() += 1,
+                            Event::DebugFlags => (),
+                            _ => *self.histogram.entry(pc).or_default() += 1,
+                        }
                         let execution =
                             self.interpreter
                                 .run_chunk(&mut self.state, &mut self.memory, 1);
+                        #[cfg(native)]
+                        if let Some(native) = &mut self.native {
+                            native.note_interpretation(
+                                pc,
+                                event,
+                                matches!(execution.step, Step::InvalidInstruction { .. }),
+                            );
+                        }
                         (execution, execution.units)
                     }
                 }
@@ -745,18 +833,20 @@ impl Executor {
                 self.interpreter
                     .run_block(&mut self.state, &mut self.memory, units, stop, None)
             };
-            self.stats.interpreter_entries += 1;
-            self.stats.interpreter_instructions += u64::from(execution.units);
+            if interpreted {
+                self.stats.interpreter_entries += 1;
+                self.stats.interpreter_instructions += u64::from(execution.units);
+                bridge
+                    .cliffs
+                    .interpreted(adv_cpu_core::InterpreterReason::Forced, execution.units);
+            }
             #[cfg(native)]
             if execution.units != 0
                 && let Some(native) = &mut self.native
             {
                 native.progressed();
             }
-            bridge
-                .cliffs
-                .interpreted(adv_cpu_core::InterpreterReason::Forced, execution.units);
-            self.state.fuel -= u64::from(execution.units);
+            self.charge(execution.units);
             let step = match execution.step {
                 Step::ReadTimestamp { pc, next } => {
                     let ticks = bridge.read_timestamp();
@@ -878,11 +968,138 @@ mod host_call_tests;
 #[cfg(all(test, native))]
 mod speed_tests {
     use super::*;
+
+    // spec: A64-CTL-4 A64-CTL-5
+    #[test]
+    fn shadow_returns_follow_the_saved_guest_context() {
+        use adv_cpu_core::memory::{EXEC, READ, WRITE};
+
+        const OUTSIDE: u32 = 0x1_0000;
+        const HEAD: u32 = OUTSIDE + 0x4000;
+        const DATA: u32 = 0x2_0000;
+        const SECOND: u32 = OUTSIDE + 0x100;
+        const CALLEE: u32 = OUTSIDE + 0x200;
+        let mut executor = Executor::address_space().unwrap();
+        let memory = &mut executor.memory;
+        memory.map(OUTSIDE, 0x8000, READ | WRITE).unwrap();
+        memory.map(DATA, 0x4000, READ | WRITE).unwrap();
+        for addr in [OUTSIDE, SECOND] {
+            let mut code = vec![0xff, 0xd6, 0xe9]; // call esi; jmp HEAD
+            code.extend((HEAD - (addr + 7)).to_le_bytes());
+            memory.write(addr, &code).unwrap();
+        }
+        let mut callee = vec![0x90; 128];
+        callee.push(0xc3);
+        memory.write(CALLEE, &callee).unwrap();
+        memory.protect(OUTSIDE, 0x8000, READ | EXEC).unwrap();
+        let native = executor.native.as_mut().unwrap();
+        native.count_resident_entries = true;
+        native.first_visits = false;
+        let blank = executor.save_context().unwrap();
+        let suspend = |executor: &mut Executor, entry, stack| {
+            executor.restore_context(&blank).unwrap();
+            executor.state.eip = entry;
+            executor.state.regs[4] = stack;
+            executor.state.regs[6] = CALLEE;
+            let run = executor
+                .native
+                .as_mut()
+                .unwrap()
+                .run(
+                    &mut executor.state,
+                    &mut executor.memory,
+                    HEAD,
+                    1,
+                    std::ptr::null_mut(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!((executor.state.eip, run.retired), (CALLEE, 1));
+            executor.save_context().unwrap()
+        };
+        let a = suspend(&mut executor, OUTSIDE, DATA + 0x1000);
+        let b = suspend(&mut executor, SECOND, DATA + 0x2000);
+        let misses = |native: &crate::native::Native| {
+            native
+                .diagnostics
+                .plan_events
+                .get("lookup_miss")
+                .copied()
+                .unwrap_or_default()
+        };
+        let before = misses(executor.native.as_ref().unwrap());
+        for (saved, stack) in [(&a, DATA + 0x1000), (&b, DATA + 0x2000)] {
+            executor.restore_context(saved).unwrap();
+            let native = executor.native.as_mut().unwrap();
+            let run = native
+                .run(
+                    &mut executor.state,
+                    &mut executor.memory,
+                    HEAD,
+                    4096,
+                    std::ptr::null_mut(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (executor.state.eip, executor.state.regs[4], run.retired),
+                (HEAD, stack, 130)
+            );
+            assert!(native.save_shadow().is_none());
+            assert_eq!(misses(native), before);
+        }
+
+        let saved = suspend(&mut executor, OUTSIDE, DATA + 0x1000);
+        assert!(saved.shadow.is_some());
+        executor.native.as_mut().unwrap().clear();
+        executor.restore_context(&saved).unwrap();
+        let native = executor.native.as_mut().unwrap();
+        assert!(native.save_shadow().is_none());
+        let run = native
+            .run(
+                &mut executor.state,
+                &mut executor.memory,
+                HEAD,
+                4096,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (executor.state.eip, executor.state.regs[4], run.retired),
+            (HEAD, DATA + 0x1000, 130)
+        );
+    }
+
+    // spec: A64-CTL-7 A64-CTL-9
+    #[test]
+    fn slice_debt_follows_the_saved_execution_context() {
+        let mut cpu = Executor::address_space().unwrap();
+        let code = 0x10000;
+        cpu.map(code, 0x4000, 7).unwrap();
+        cpu.write(code, &[0x40; 8]).unwrap(); // INC EAX
+        cpu.native.as_mut().unwrap().first_visits = false;
+        cpu.state.eip = code;
+        assert_eq!(cpu.run(code + 4, 1).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(cpu.state.regs[0], 4);
+        assert_eq!(cpu.fuel_debt, 3);
+
+        let context = cpu.save_context().unwrap();
+        for _ in 0..2 {
+            cpu.restore_context(&context).unwrap();
+            assert_eq!(cpu.run(code + 8, 2).unwrap(), RunOutcome::Budget);
+            assert_eq!(cpu.state.eip, code + 4);
+            assert_eq!(cpu.state.regs[0], 4);
+            assert_eq!(cpu.run(code + 8, 2).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(cpu.state.regs[0], 8);
+        }
+        assert_eq!(cpu.stats.interpreter_entries, 0);
+    }
     use iced_x86::code_asm::*;
 
     // spec: WINE-UI-8, A64-TR-2, A64-TR-4
     #[test]
-    fn speed_retired_forms_join_native_helpers_first_visits_and_rep() {
+    fn speed_retired_forms_join_native_values_first_visits_and_rep() {
         const CODE: u32 = 0x10000;
         const FIRST: u32 = 0x11000;
         const DATA: u32 = 0x20000;
@@ -891,7 +1108,7 @@ mod speed_tests {
         a.mov(ebp, 3).unwrap();
         a.set_label(&mut again).unwrap();
         a.shrd(eax, edx, cl).unwrap(); // native form
-        a.fnop().unwrap(); // interpret helper
+        a.fnop().unwrap();
         a.mov(ecx, 5).unwrap();
         a.rep().movsb().unwrap();
         a.dec(ebp).unwrap();
@@ -928,7 +1145,7 @@ mod speed_tests {
                 [0, 0, 0, 21, 15]
             } else {
                 // Native REP elements count as translated work.
-                [28, 0, 3, 2, 0]
+                [31, 0, 0, 2, 0]
             };
             assert_eq!(
                 cpu.retired_forms(),
@@ -959,11 +1176,11 @@ mod speed_tests {
         cpu.state.regs[1] = 9;
         cpu.state.regs[6] = 0x20000;
         cpu.state.regs[7] = 0x20100;
-        // Native elements count as translated; the cut element is interpreted.
+        // The budget cut leaves after the last translated element.
         assert_eq!(cpu.run(0x10002, 4).unwrap(), RunOutcome::Budget);
-        assert_eq!(cpu.retired_forms(), Some([3, 0, 0, 0, 1]));
+        assert_eq!(cpu.retired_forms(), Some([4, 0, 0, 0, 0]));
         assert_eq!(cpu.run(0x10002, 20).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(cpu.retired_forms(), Some([8, 0, 0, 0, 1]));
+        assert_eq!(cpu.retired_forms(), Some([9, 0, 0, 0, 0]));
         cpu.count_tier0(true);
         cpu.write(0x11000, &[0x90]).unwrap();
         cpu.state.eip = 0x11000;
@@ -974,14 +1191,14 @@ mod speed_tests {
         ));
         assert_eq!(cpu.retired_forms(), Some([0, 0, 0, 1, 0]));
         cpu.count_tier0(true);
-        cpu.write(0x12000, &[0xcc]).unwrap(); // an exit interpreted by the owner
+        cpu.write(0x12000, &[0xcc]).unwrap(); // an event delivered by the owner
         cpu.state.eip = 0x12000;
         cpu.state.eflags &= !(1 << 8);
         assert!(matches!(
             cpu.run(0x12001, 10).unwrap(),
             RunOutcome::Trap { vector: 3, .. }
         ));
-        assert_eq!(cpu.retired_forms(), Some([0, 0, 0, 1, 0]));
+        assert_eq!(cpu.retired_forms(), Some([1, 0, 0, 0, 0]));
     }
 
     // spec: WINE-UI-8, A64-MEM-5

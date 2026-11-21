@@ -1,0 +1,536 @@
+//! The state the head loop's outer iterations carry from one to the next
+//! (A64-TR-9). Each component is invariant, affine in the iteration index,
+//! private to an iteration, or exchanged. A private component is written
+//! before it is read in every iteration and again before the loop exits.
+//! Iterations that exchange nothing else can run as blocks: a block starts
+//! from the entry context with its affine components advanced. Components
+//! are registers, flags, SIMD registers and frame bytes relative to ESP.
+
+use std::sync::Arc;
+
+use crate::translate::front::{
+    summary::Summary,
+    tags::{OpAccess, Register, RflagsBits},
+};
+
+use super::{Division, Graph, Loop};
+use crate::translate::front::decode::Op;
+use crate::translate::front::forms::Integer;
+use crate::translate::front::trace::{Edge, Mode, Next, Trace};
+
+const XMM: u32 = 32;
+const MM: u32 = 40;
+const FLAGS: u32 = 48;
+/// TOP and the tag word, which every MMX instruction but EMMS sets.
+const ENV: u64 = 1 << 55;
+const JOIN_GPR: u64 = u32::MAX as u64;
+const JOIN_MMX: u64 = (0xff << MM) | ENV;
+const FLAG_BITS: [u32; 7] = [
+    RflagsBits::OF,
+    RflagsBits::SF,
+    RflagsBits::ZF,
+    RflagsBits::AF,
+    RflagsBits::CF,
+    RflagsBits::PF,
+    RflagsBits::DF,
+];
+/// The widest frame span the analysis tracks, in bytes.
+const FRAME_SPAN: i32 = 4096;
+
+/// Component sets: word 0 holds the fixed components, the rest frame bytes.
+type Set = Vec<u64>;
+
+#[derive(Clone, Default)]
+struct Use {
+    reads: Set,
+    /// Full definitions: the old value cannot reach the result.
+    defines: Set,
+    writes: Set,
+}
+
+/// One instruction's fixed components, ESP change and frame accesses.
+struct Decoded {
+    reads: u64,
+    defines: u64,
+    writes: u64,
+    stack: i32,
+    frame: Vec<(i32, u32, OpAccess)>,
+}
+
+fn flags(bits: u32) -> Option<u64> {
+    let mut set = 0;
+    let mut rest = bits;
+    for (i, &flag) in FLAG_BITS.iter().enumerate() {
+        if bits & flag != 0 {
+            set |= 1 << (FLAGS + i as u32);
+            rest &= !flag;
+        }
+    }
+    (rest == 0).then_some(set)
+}
+
+fn register(reg: Register) -> Option<u64> {
+    if reg.is_gpr() {
+        let byte = u32::from(matches!(
+            reg,
+            Register::AH | Register::CH | Register::DH | Register::BH
+        ));
+        Some(((1 << reg.size()) - 1) << (4 * reg.full_register32().number() as u32 + byte))
+    } else if reg.is_xmm() {
+        Some(1 << (XMM + reg.number() as u32))
+    } else if reg.is_mm() {
+        Some(1 << (MM + reg.number() as u32))
+    } else {
+        None
+    }
+}
+
+fn gpr_bytes(regs: u8) -> u64 {
+    (0..8).fold(0, |mask, reg| {
+        mask | (0xf * u64::from(regs >> reg & 1)) << (reg * 4)
+    })
+}
+
+/// Effects of one instruction on the components a split block can reproduce.
+fn decoded(ins: &Summary) -> Option<Decoded> {
+    let carried = ins.carried?;
+    let stack = ins.stack?;
+    let mut out = Decoded {
+        reads: 0,
+        defines: 0,
+        writes: 0,
+        stack,
+        frame: Vec::new(),
+    };
+    for used in &ins.memory {
+        if used.base == Register::ESP {
+            let size = used.width;
+            out.frame
+                .push((used.displacement as i32, size, used.access));
+        }
+    }
+    let mut mmx = false;
+    for used in &ins.registers {
+        let reg = used.register;
+        if reg.is_segment_register() && used.access == OpAccess::Read {
+            continue;
+        }
+        // ESP is tracked as the frame offset.
+        if reg == Register::ESP {
+            continue;
+        }
+        let bit = register(reg)?;
+        mmx |= bit >> MM & 0xff != 0;
+        match used.access {
+            OpAccess::Read | OpAccess::CondRead => out.reads |= bit,
+            OpAccess::Write => {
+                out.defines |= bit;
+                out.writes |= bit;
+            }
+            OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite => {
+                if used.access == OpAccess::ReadWrite {
+                    out.defines |= bit;
+                }
+                out.reads |= bit;
+                out.writes |= bit;
+            }
+            OpAccess::None | OpAccess::NoMemAccess => {}
+        }
+    }
+    out.reads |= flags(carried.flags_read)?;
+    let modified = flags(carried.flags_modified)?;
+    if carried.conditional_flags {
+        out.reads |= modified;
+    } else {
+        out.defines |= modified;
+    }
+    out.writes |= modified;
+    if mmx {
+        out.defines |= ENV;
+        out.writes |= ENV;
+    } else if carried.emms {
+        out.writes |= ENV;
+    }
+    Some(out)
+}
+
+fn mark(set: &mut Set, lo: i32, start: i32, len: u32) {
+    for byte in start - lo..start - lo + len as i32 {
+        set[1 + byte as usize / 64] |= 1 << (byte % 64);
+    }
+}
+
+fn any(a: &Set, b: &Set, without: &Set) -> bool {
+    a.iter()
+        .zip(b)
+        .zip(without)
+        .any(|((a, b), c)| a & b & !c != 0)
+}
+
+pub(super) struct Independence {
+    pub frame: Option<(i32, i32)>,
+    pub mmx: u16,
+    pub gpr: u32,
+    pub gpr_writes: Vec<u32>,
+}
+
+/// The frame span `[lo, hi)` the head loop of `trace` writes, relative to
+/// ESP at its head, or `Some(None)` if it writes none, when its iterations
+/// carry only the `affine` registers and the affine dword `slots`, and leave
+/// the loop only at its test. `still` registers and slots marked true step
+/// by zero.
+pub(super) fn independent(
+    trace: &Trace,
+    graph: &Graph,
+    (affine, still): (u8, u8),
+    slots: &[(i32, bool)],
+    divisions: &[Option<Division>],
+    instructions: &[Option<Arc<Summary>>],
+    scope: Option<&[Option<u8>]>,
+) -> Option<Independence> {
+    let scoped = scope.is_some();
+    let lp = &graph.loops[graph.heads[0]?];
+    let n = trace.len();
+    let mut decoded_at: Vec<Option<Decoded>> = (0..n).map(|_| None).collect();
+    for at in (0..n).filter(|&at| lp.inside[at]) {
+        let inst = &trace.insts[at];
+        let inside = |edge: Option<Edge>| match edge {
+            Some(Edge::Internal(to)) => lp.inside[to] || at == lp.test,
+            None => true,
+            _ => at == lp.test,
+        };
+        let next = match inst.next {
+            Next::Fall => None,
+            Next::Edge(edge) => Some(edge),
+            Next::Dynamic => return None,
+        };
+        // A side exit would let a later block run past it.
+        let inline_return =
+            scoped && matches!(inst.mode, Mode::Inline(_)) && matches!(inst.op, Op::Ret(0));
+        if (inst.mode != Mode::Plain && !inline_return)
+            || !inside(next)
+            || !inside(inst.taken)
+            || matches!(inst.op, Op::Integer(Integer::Divide(..)) if divisions[at].is_none())
+        {
+            return None;
+        }
+        decoded_at[at] = Some(decoded(instructions[at].as_deref()?)?);
+    }
+    // ESP relative to the head on entry to each instruction: every path
+    // agrees, and the loop returns to the head with it unchanged.
+    let mut offset: Vec<Option<i32>> = vec![None; n];
+    offset[0] = Some(0);
+    let (mut lo, mut hi) = (0, 0);
+    for &at in graph.order.iter().filter(|&&at| lp.inside[at]) {
+        let here = offset[at]?;
+        let d = decoded_at[at].as_ref()?;
+        for &(disp, size, _) in &d.frame {
+            lo = lo.min(here.checked_add(disp)?);
+            hi = hi.max(here.checked_add(disp)?.checked_add(size as i32)?);
+        }
+        let after = here.checked_add(d.stack)?;
+        for &to in graph.edges[at].iter().flatten() {
+            if !lp.inside[to] {
+                continue;
+            }
+            let expected = if to == 0 { Some(0) } else { offset[to] };
+            match expected {
+                Some(x) if x != after => return None,
+                Some(_) => {}
+                None => offset[to] = Some(after),
+            }
+        }
+    }
+    if hi - lo > FRAME_SPAN {
+        return None;
+    }
+    let words = 1 + (hi - lo) as usize / 64 + 1;
+    let empty = vec![0; words];
+    let mut uses = vec![Use::default(); n];
+    let mut written = empty.clone();
+    for at in (0..n).filter(|&at| lp.inside[at]) {
+        let d = decoded_at[at].as_ref()?;
+        let here = offset[at]?;
+        let mut used = Use {
+            reads: empty.clone(),
+            defines: empty.clone(),
+            writes: empty.clone(),
+        };
+        used.reads[0] = d.reads;
+        used.defines[0] = d.defines;
+        used.writes[0] = d.writes;
+        for &(disp, size, access) in &d.frame {
+            let start = here + disp;
+            match access {
+                OpAccess::Read | OpAccess::CondRead => mark(&mut used.reads, lo, start, size),
+                OpAccess::Write => {
+                    mark(&mut used.defines, lo, start, size);
+                    mark(&mut used.writes, lo, start, size);
+                }
+                OpAccess::None | OpAccess::NoMemAccess => {}
+                _ => {
+                    mark(&mut used.reads, lo, start, size);
+                    mark(&mut used.writes, lo, start, size);
+                }
+            }
+        }
+        for (w, u) in written.iter_mut().zip(&used.writes) {
+            *w |= u;
+        }
+        uses[at] = used;
+    }
+    let mut carried = empty.clone();
+    let mut steady = empty.clone();
+    carried[0] = gpr_bytes(affine);
+    steady[0] = gpr_bytes(still);
+    for &(slot, zero) in slots
+        .iter()
+        .filter(|&&(slot, _)| lo <= slot && slot + 4 <= hi)
+    {
+        mark(&mut carried, lo, slot, 4);
+        if zero {
+            mark(&mut steady, lo, slot, 4);
+        }
+    }
+    let frame_written = written[1..].iter().any(|&w| w != 0);
+    // The last block runs the tail on its private frame too.
+    if frame_written && !scoped {
+        for at in (0..n).filter(|&at| !lp.inside[at]) {
+            instructions[at].as_ref()?.stack?;
+        }
+    }
+    // Components the loop never writes keep their entry value.
+    let invariant: Set = written.iter().zip(&steady).map(|(w, s)| !w | s).collect();
+    let uniform = uniform(graph, lp, &uses, &invariant, scope.unwrap_or_default());
+    let k = uniform.len().min(UNIFORM);
+    // EMMS changes tags without writing TOP. Keep both under the ordinary
+    // proof when an iteration can clear tags.
+    let mut mergeable = 0;
+    if scoped {
+        mergeable = JOIN_GPR;
+        if (0..n).filter(|&at| lp.inside[at]).all(|at| {
+            instructions[at]
+                .as_ref()
+                .and_then(|inst| inst.carried)
+                .is_some_and(|state| !state.emms)
+        }) {
+            mergeable |= JOIN_MMX;
+        }
+    }
+    let mut conditional = 0;
+    // Every iteration of a run takes a uniform branch the same way, so
+    // each choice of their directions is checked on its own.
+    for choice in 0..1u32 << k {
+        let follows = |at: usize, edge: usize| {
+            uniform[..k]
+                .iter()
+                .position(|&u| u == at)
+                .is_none_or(|i| choice >> i & 1 == edge as u32)
+        };
+        conditional |= private(graph, lp, &uses, &carried, mergeable, follows)?;
+    }
+    let mmx = ((conditional >> MM) as u16 & 0xff) | (u16::from(conditional & ENV != 0) << 8);
+    let gpr = conditional as u32;
+    let mut gpr_writes = Vec::new();
+    if gpr != 0 {
+        gpr_writes.resize(n, 0);
+        // Writes in one straight-line block share a mask update at its last
+        // write. Entry and outgoing edges delimit the group.
+        let mut previous = None;
+        for (at, inst) in trace.insts.iter().enumerate() {
+            if trace.merge[at] || trace.head(at) {
+                previous = None;
+            }
+            let mask = uses[at].defines.first().copied().unwrap_or(0) as u32 & gpr;
+            if mask != 0 {
+                gpr_writes[at] = mask | previous.map_or(0, |p| std::mem::take(&mut gpr_writes[p]));
+                previous = Some(at);
+            }
+            if inst.next != Next::Fall || inst.taken.is_some() {
+                previous = None;
+            }
+        }
+    }
+    Some(Independence {
+        frame: frame_written.then_some((lo, hi)),
+        mmx,
+        gpr,
+        gpr_writes,
+    })
+}
+
+/// The most uniform branches whose directions are checked separately.
+const UNIFORM: usize = 4;
+
+fn bits(set: &Set) -> impl Iterator<Item = usize> + '_ {
+    set.iter().enumerate().flat_map(|(w, &word)| {
+        (0..64)
+            .filter(move |b| word >> b & 1 != 0)
+            .map(move |b| w * 64 + b)
+    })
+}
+
+/// The head loop's branches other than its test whose inputs hold the same
+/// value whenever they run, in every iteration: a component's reaching
+/// definition is the entry value of an `invariant` one, or one instruction
+/// whose own inputs are steady. A load from memory is steady with its
+/// address, since admitted iterations never write what another reads.
+fn uniform(
+    graph: &Graph,
+    lp: &Loop,
+    uses: &[Use],
+    invariant: &Set,
+    scope: &[Option<u8>],
+) -> Vec<usize> {
+    const UNSEEN: u16 = u16::MAX - 2;
+    const HEAD: u16 = u16::MAX - 1;
+    const MANY: u16 = u16::MAX;
+    let n = uses.len();
+    let width = invariant.len() * 64;
+    if n >= usize::from(UNSEEN) {
+        return Vec::new();
+    }
+    let inside = || graph.order.iter().copied().filter(|&at| lp.inside[at]);
+    let successors = |at: usize| {
+        graph.edges[at]
+            .into_iter()
+            .flatten()
+            .filter(|&to| lp.inside[to] && to != 0)
+    };
+    // The reaching definitions on entry to each instruction.
+    let mut reaching = vec![UNSEEN; n * width];
+    reaching[..width].fill(HEAD);
+    let mut out = vec![UNSEEN; width];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for at in inside() {
+            out.copy_from_slice(&reaching[at * width..][..width]);
+            for b in bits(&uses[at].writes) {
+                out[b] = at as u16;
+            }
+            for to in successors(at) {
+                for (r, &o) in reaching[to * width..][..width].iter_mut().zip(&out) {
+                    let joined = match (*r, o) {
+                        (_, UNSEEN) => *r,
+                        (UNSEEN, o) => o,
+                        (r, o) if r == o => r,
+                        _ => MANY,
+                    };
+                    changed |= joined != *r;
+                    *r = joined;
+                }
+            }
+        }
+    }
+    // A private cell can hold a different value in every row even when
+    // its guest address is steady.
+    let mut steady: Vec<_> = (0..n)
+        .map(|at| scope.get(at).is_none_or(Option::is_none))
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for at in inside() {
+            let holds = bits(&uses[at].reads).all(|b| match reaching[at * width + b] {
+                HEAD => invariant[b / 64] >> (b % 64) & 1 != 0,
+                UNSEEN | MANY => false,
+                site => steady[usize::from(site)],
+            });
+            if steady[at] && !holds {
+                steady[at] = false;
+                changed = true;
+            }
+        }
+    }
+    inside()
+        .filter(|&at| {
+            at != lp.test
+                && steady[at]
+                && graph.edges[at]
+                    .iter()
+                    .all(|to| to.is_some_and(|to| lp.inside[to] && to != 0))
+        })
+        .collect()
+}
+
+/// Whether, along the edges `follows` keeps, every component an iteration
+/// reads from another is affine, and each exchanged one is defined again
+/// before the loop exits.
+fn private(
+    graph: &Graph,
+    lp: &Loop,
+    uses: &[Use],
+    carried: &Set,
+    mergeable: u64,
+    follows: impl Fn(usize, usize) -> bool,
+) -> Option<u64> {
+    let n = uses.len();
+    let words = carried.len();
+    let mut reached = vec![false; n];
+    reached[0] = true;
+    let mut incoming = vec![Vec::new(); n];
+    let mut written = vec![0; words];
+    for &at in graph.order.iter().filter(|&&at| lp.inside[at]) {
+        if !reached[at] {
+            continue;
+        }
+        for (w, u) in written.iter_mut().zip(&uses[at].writes) {
+            *w |= u;
+        }
+        for (edge, to) in graph.edges[at].into_iter().enumerate() {
+            if let Some(to) = to
+                && lp.inside[to]
+                && to != 0
+                && follows(at, edge)
+            {
+                reached[to] = true;
+                incoming[to].push(at);
+            }
+        }
+    }
+    let exchanged: Set = written.iter().zip(carried).map(|(w, c)| w & !c).collect();
+    // The components every path from the head has defined.
+    let mut defined = vec![vec![u64::MAX; words]; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &at in graph.order.iter().filter(|&&at| reached[at]) {
+            let before = if at == 0 {
+                vec![0; words]
+            } else {
+                incoming[at]
+                    .iter()
+                    .fold(vec![u64::MAX; words], |mut set, &p| {
+                        for (s, d) in set.iter_mut().zip(&defined[p]) {
+                            *s &= d;
+                        }
+                        set
+                    })
+            };
+            if any(&uses[at].reads, &exchanged, &before) {
+                return None;
+            }
+            let after: Set = before
+                .iter()
+                .zip(&uses[at].defines)
+                .map(|(b, d)| b | d)
+                .collect();
+            if after != defined[at] {
+                defined[at] = after;
+                changed = true;
+            }
+        }
+    }
+    if !reached[lp.test] {
+        return Some(0);
+    }
+    let exit = &defined[lp.test];
+    let missing = exchanged[0] & !exit[0];
+    (missing & !mergeable == 0
+        && exchanged[1..]
+            .iter()
+            .zip(&exit[1..])
+            .all(|(w, d)| w & !d == 0))
+    .then_some(missing)
+}

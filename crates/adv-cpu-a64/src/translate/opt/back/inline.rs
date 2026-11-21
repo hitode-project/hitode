@@ -1,8 +1,19 @@
 //! Canonical Tier-1 edges for register-allocated forms.
 
-use super::super::recovery::{self, IrRecord, Location, Recipe, X87};
-use super::*;
-use crate::translate::emit_link_point;
+use super::super::recovery::{
+    self, FlagExpr, FlagGroup, FlagSelect, IrRecord, Location, Recipe, X87,
+};
+use super::{
+    A, ALIAS, Assumed, B, C, Cond, D, E, Emitter, Extend, FlagKind, FlagRecipe, Float, FpOp, Host,
+    Index, IntOp, Label, Lsl, Narrow, Op, RT, Record, RecordId, Reg, Runtime, Source, T, Type, U,
+    Unary, VMem, Value, W, WINDOW, X, add, add_ext, add_imm, and, and_imm, bfi, bic, clz, cmp,
+    cmp_imm, csel, cset, dfloat, eor, fcmp, fcmp_zero, fmov_from_v, fmsub, fnmsub, int_immediate,
+    ldp, ldr, ldr_narrow, ldr_reg, ldrh, ldur, lsl_imm, lsr_imm, mov, movz, mrs_nzcv, msr_nzcv,
+    offset_of, orr, orr_imm, runtime, shiftv, stp, str, str_narrow, str_reg, strh, stur, sub, ubfx,
+    unary, vfneg2d, vldr, vldur, vstur,
+};
+use crate::translate::lower::stubs;
+use crate::translate::lower::{emit_link_point, emit_link_transition};
 
 const CPU: Reg = Reg::new(0);
 const FLAGS: Reg = Reg::new(1);
@@ -10,12 +21,11 @@ const S2: Reg = Reg::new(2);
 const S3: Reg = Reg::new(3);
 const S4: Reg = Reg::new(4);
 const S5: Reg = Reg::new(5);
-const WINDOW: Reg = Reg::new(27);
 const ESP: Reg = Reg::new(23);
 const PF: Reg = Reg::new(10);
 const AF: Reg = Reg::new(11);
 const DF: Reg = Reg::new(12);
-const ENTRY: u32 = offset_of!(Runtime, opt_entry) as u32;
+const ENTRY: u32 = offset_of!(Runtime, recovery.entry) as u32;
 const ENTRY_REGS: u32 = offset_of!(runtime::OptEntryState, regs) as u32;
 const ENTRY_NZCV: i32 = offset_of!(runtime::OptEntryState, nzcv) as i32;
 const ENTRY_AF: i32 = offset_of!(runtime::OptEntryState, af) as i32;
@@ -27,18 +37,91 @@ const WINDOW_BASE: u32 = offset_of!(Runtime, window) as u32;
 impl Emitter<'_> {
     pub(super) fn inline_entry(
         &mut self,
-        assumed: &Assumed,
+        key: crate::facts::Key,
         entry: &[Source],
         bytes: u64,
         miss: Label,
         cold: Label,
+        delay_frames: bool,
     ) {
-        self.asm
-            .emit_all(&[ldr(X, CPU, RT, CPU_PTR), ldr(W, T, CPU, runtime::MMX_MODE)]);
-        self.asm.cbz(W, true, T, cold);
+        self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
+        key.guard_mmx(
+            &mut self.asm,
+            CPU,
+            true,
+            if self.resident {
+                self.mmx_miss.unwrap_or(miss)
+            } else {
+                cold
+            },
+        );
         self.asm.emit(ldr(W, T, RT, REP_PENDING));
         self.asm.cbz(W, true, T, cold);
-        self.entry_facts(assumed, miss);
+        key.guard_resident(&mut self.asm, CPU, miss);
+        self.body = self.asm.offset();
+        if let Some((domain, offer)) = self.domain {
+            let prices = (self.asm.label(), self.asm.label());
+            let head = self.func.records[0].eip;
+            if domain.target().is_none() {
+                self.count(head, super::Counter::RowArrival);
+            }
+            let short = if self.count_entries {
+                self.asm.label()
+            } else {
+                cold
+            };
+            use crate::translate::lower::resident::RowFailure;
+            let failures = [
+                RowFailure::Range,
+                RowFailure::Alias,
+                RowFailure::Parameter,
+                RowFailure::Count,
+                RowFailure::Span,
+            ]
+            .map(|kind| (kind, self.asm.label()));
+            self.row_failures.extend(failures);
+            let leave = offer.then(|| self.asm.label());
+            let strip = self.row_strip.unwrap();
+            let (mut words, bias, sample) = domain.emit(
+                &mut self.asm,
+                (
+                    prices,
+                    strip.count,
+                    strip.shift,
+                    strip.shift == 0 && domain.call_savings() >= strip.saved,
+                ),
+                short,
+                failures,
+                leave,
+            );
+            if self.count_entries {
+                let hit = self.asm.label();
+                self.asm.b(hit);
+                self.asm.bind(short);
+                self.count(head, super::Counter::RowShort);
+                self.asm.b(cold);
+                self.asm.bind(hit);
+            }
+            if let Some(leave) = leave {
+                let (sensor, threshold) = (self.asm.label(), self.asm.label());
+                self.asm.bind(sensor);
+                crate::translate::lower::resident::split_sensor(
+                    &mut self.asm,
+                    Reg::new(7),
+                    threshold,
+                    leave,
+                );
+                self.split = Some((sensor, threshold, leave));
+                words += 3;
+            }
+            self.count(head, super::Counter::RowEntry);
+            if let Some(target) = domain.target() {
+                self.count(target.value, super::Counter::RowEntry);
+            }
+            self.row_budget = Some((prices, bias, words));
+            self.row_sample = Some(sample);
+            self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
+        }
 
         self.stack_frame(bytes, true);
         if entry.iter().any(|s| matches!(s, Source::X87(_))) {
@@ -47,7 +130,7 @@ impl Emitter<'_> {
             self.asm.emit(mrs_nzcv(S5));
             for (&source, &param) in entry.iter().zip(&self.func.blocks[0].params) {
                 if let Source::X87(i) = source {
-                    self.binary64(i, inexact);
+                    crate::facts::guard_binary64(&mut self.asm, i, inexact);
                     self.copy(
                         self.locations[param.0 as usize],
                         Host::Register(T),
@@ -66,11 +149,13 @@ impl Emitter<'_> {
 
         self.save_entry_state();
         if entry.contains(&Source::Eflags) {
-            runtime::emit_read_flags(&mut self.asm);
+            stubs::emit_read_flags(&mut self.asm, Reg::new(0));
             self.asm.emit(mov(W, FLAGS, S4));
         }
-        self.asm
-            .emit_all(&[str(X, ALIAS, RT, SHADOW), ldr(X, ALIAS, RT, runtime::ALIAS)]);
+        if !self.resident {
+            self.asm
+                .emit_all(&[str(X, ALIAS, RT, SHADOW), ldr(X, ALIAS, RT, runtime::ALIAS)]);
+        }
         let mut moves = Vec::new();
         for (&source, &param) in entry.iter().zip(&self.func.blocks[0].params) {
             if let Source::Reg(i) = source {
@@ -89,7 +174,7 @@ impl Emitter<'_> {
             let dst = self.locations[param.0 as usize];
             let ty = self.func.ty(param);
             let src = match source {
-                Source::Reg(_) | Source::X87(_) => continue,
+                Source::Reg(_) | Source::X87(_) | Source::Frame { .. } => continue,
                 Source::Eflags => Host::Register(FLAGS),
                 Source::Xmm(i) => {
                     let out = self.vd(param);
@@ -107,6 +192,11 @@ impl Emitter<'_> {
                         .emit(vldr(VMem::D, out, CPU, runtime::MMX + 8 * u32::from(i)));
                     Host::Vector(out)
                 }
+                Source::FsBase => {
+                    let out = self.rd(param);
+                    self.asm.emit(ldr(W, out, CPU, runtime::FS_BASE));
+                    Host::Register(out)
+                }
                 Source::X87Ip => {
                     let out = self.rd(param);
                     self.asm.emit(ldr(W, out, CPU, runtime::X87_IP));
@@ -117,116 +207,75 @@ impl Emitter<'_> {
                     self.asm.emit(ldrh(out, CPU, runtime::X87_OPCODE));
                     Host::Register(out)
                 }
-                Source::Frame { offset, width } => {
-                    let out = self.rd(param);
-                    self.frame_cell(true, out, offset, width);
-                    Host::Register(out)
-                }
             };
             self.copy(dst, src, ty);
         }
-    }
-
-    fn entry_facts(&mut self, assumed: &Assumed, miss: Label) {
-        if assumed.x87 {
-            for (field, value) in [
-                (runtime::X87_CONTROL, assumed.control),
-                (
-                    runtime::X87_STATUS,
-                    assumed.status | u16::from(assumed.top) << 11,
-                ),
-                (runtime::X87_TAG, assumed.tags),
-            ] {
-                self.asm.emit(ldrh(T, CPU, field));
-                self.imm(U, u64::from(value));
-                self.asm.emit(eor(W, T, T, U, Lsl, 0));
-                self.asm.cbz(W, true, T, miss);
-            }
-        }
-        if assumed.mmx {
-            self.asm.emit(ldrh(T, CPU, runtime::X87_STATUS));
-            self.asm.tbz(true, T, 7, miss);
-        }
-        if assumed.mxcsr_mask != 0 {
-            self.asm.emit(ldr(W, T, CPU, runtime::MXCSR));
-            self.imm(U, u64::from(assumed.mxcsr & assumed.mxcsr_mask));
-            self.asm.emit(eor(W, T, T, U, Lsl, 0));
-            if assumed.mxcsr_mask != u32::MAX {
-                if bitmask(W, u64::from(assumed.mxcsr_mask)).is_some() {
-                    self.asm
-                        .emit(and_imm(W, T, T, u64::from(assumed.mxcsr_mask)));
-                } else {
-                    self.imm(U, u64::from(assumed.mxcsr_mask));
-                    self.asm.emit(and(W, T, T, U, Lsl, 0));
-                }
-            }
-            self.asm.cbz(W, true, T, miss);
-        }
-        if let Some(low) = assumed.esp_low {
-            self.asm.emit(and_imm(W, T, ESP, 15));
-            self.imm(U, u64::from(low));
-            self.asm.emit(eor(W, T, T, U, Lsl, 0));
-            self.asm.cbz(W, true, T, miss);
+        if !delay_frames {
+            self.entry_frames(entry);
         }
     }
 
-    /// Converts the physical x87 input to binary64 bits in T.
-    fn binary64(&mut self, i: u8, miss: Label) {
-        let zero = self.asm.label();
-        let special = self.asm.label();
-        let tiny = self.asm.label();
-        let done = self.asm.label();
+    pub(super) fn entry_frames(&mut self, entry: &[Source]) {
+        for (&source, &param) in entry.iter().zip(&self.func.blocks[0].params) {
+            if let Source::Frame { offset, width } = source {
+                let out = self.rd(param);
+                self.frame_cell(true, out, offset, width);
+                self.copy(
+                    self.locations[param.0 as usize],
+                    Host::Register(out),
+                    source.ty(),
+                );
+            }
+        }
+    }
+
+    /// Leave an entry whose page facts failed in the Tier-1 assignment.
+    pub(super) fn environment_misses(&mut self, bytes: u64, miss: Label, fallback: Label) {
+        let facts = std::mem::take(&mut self.fact_misses);
+        if facts.is_empty() {
+            return;
+        }
+        let restore = self.asm.label();
+        let triggered = self.asm.label();
+        for (ordinal, label) in facts.into_iter().enumerate() {
+            let counter = self.asm.label();
+            let report = self.asm.label();
+            self.asm.bind(label);
+            self.environment.push((self.asm.offset(), counter));
+            runtime::emit_sensor(&mut self.asm, counter, S2, S3, report);
+            self.asm.b(restore);
+            self.asm.bind(report);
+            self.imm(S3, ordinal as u64);
+            self.asm.b(triggered);
+            self.asm.bind(counter);
+            self.asm.emit_all(&[0, 0]);
+        }
+        self.asm.bind(triggered);
+        self.restore_environment(bytes, miss);
+        self.asm.bind(restore);
+        self.restore_environment(bytes, fallback);
+    }
+
+    fn restore_environment(&mut self, bytes: u64, target: Label) {
+        self.asm.emit(add_imm(X, S4, RT, ENTRY, false));
+        for i in (0..8).step_by(2) {
+            self.asm.emit(ldp(
+                W,
+                Index::Offset,
+                guest(i),
+                guest(i + 1),
+                S4,
+                ENTRY_REGS as i32 + 4 * i32::from(i),
+            ));
+        }
         self.asm.emit_all(&[
-            add_imm(X, S4, CPU, runtime::X87_REGS, false),
-            ldur(X, T, S4, 10 * i32::from(i)),
-            ldrh(S2, S4, 10 * u32::from(i) + 8),
-            ubfx(W, S3, S2, 0, 15),
+            ldp(X, Index::Offset, T, PF, S4, ENTRY_NZCV),
+            ldp(X, Index::Offset, AF, DF, S4, ENTRY_AF),
+            msr_nzcv(T),
         ]);
-        self.asm.cbz(X, false, T, zero);
-        self.asm.tbz(false, T, 63, miss);
-        self.imm(U, 0x7fff);
-        self.asm.emit(cmp(W, S3, U, Lsl, 0));
-        self.asm.b_cond(Cond::Eq, special);
-
-        // Biased binary64 exponent. Subnormals use a variable right shift.
-        self.imm(U, 16383 - 1023);
-        self.asm.emit(sub(W, S3, S3, U, Lsl, 0));
-        self.asm.emit(cmp_imm(W, S3, 0, false));
-        self.asm.b_cond(Cond::Le, tiny);
-        self.asm.emit(cmp_imm(W, S3, 0x7ff, false));
-        self.asm.b_cond(Cond::Ge, miss);
-        self.asm.emit(tst_imm(X, T, 0x7ff));
-        self.asm.b_cond(Cond::Ne, miss);
-        self.asm
-            .emit_all(&[ubfx(X, T, T, 11, 52), orr(X, T, T, S3, Lsl, 52)]);
-        self.asm.b(done);
-
-        self.asm.bind(tiny);
-        self.imm(U, 12);
-        self.asm.emit(sub(W, S3, U, S3, Lsl, 0));
-        self.asm.emit(cmp_imm(W, S3, 64, false));
-        self.asm.b_cond(Cond::Hs, miss);
-        self.asm.emit_all(&[
-            shiftv(X, Lsr, U, T, S3),
-            shiftv(X, Lsl, S4, U, S3),
-            cmp(X, S4, T, Lsl, 0),
-        ]);
-        self.asm.b_cond(Cond::Ne, miss);
-        self.asm.emit(mov(X, T, U));
-        self.asm.b(done);
-
-        self.asm.bind(special);
-        self.imm(U, 1 << 63);
-        self.asm.emit(cmp(X, T, U, Lsl, 0));
-        self.asm.b_cond(Cond::Ne, miss);
-        self.imm(T, 0x7ff << 52);
-        self.asm.b(done);
-
-        self.asm.bind(zero);
-        self.asm.cbz(W, true, S3, miss);
-        self.asm.bind(done);
-        self.asm
-            .emit_all(&[ubfx(W, S2, S2, 15, 1), orr(X, T, T, S2, Lsl, 63)]);
+        self.bias_stack();
+        self.stack_frame(bytes, false);
+        self.asm.b(target);
     }
 
     /// Keeps the entry baseline in the runtime for cold recovery and frame access.
@@ -256,6 +305,7 @@ impl Emitter<'_> {
             self.imm(U, u64::from(offset as u32));
             self.asm.emit(add(W, S2, S2, U, Lsl, 0));
         }
+        let base = self.data_view();
         let mut consumed = 0;
         for chunk in [8, 4, 2, 1].into_iter().filter(|chunk| width & chunk != 0) {
             let value = if consumed == 0 { reg } else { S3 };
@@ -263,14 +313,14 @@ impl Emitter<'_> {
                 self.asm.emit(lsr_imm(X, value, reg, consumed * 8));
             }
             self.asm.emit(match (load, chunk) {
-                (true, 1) => ldr_narrow(Narrow::Byte, value, ALIAS, S2),
-                (true, 2) => ldr_narrow(Narrow::Half, value, ALIAS, S2),
-                (true, 4) => ldr_reg(W, value, ALIAS, S2, false),
-                (true, 8) => ldr_reg(X, value, ALIAS, S2, false),
-                (false, 1) => str_narrow(Narrow::Byte, value, ALIAS, S2),
-                (false, 2) => str_narrow(Narrow::Half, value, ALIAS, S2),
-                (false, 4) => str_reg(W, value, ALIAS, S2, false),
-                (false, 8) => str_reg(X, value, ALIAS, S2, false),
+                (true, 1) => ldr_narrow(Narrow::Byte, value, base, S2),
+                (true, 2) => ldr_narrow(Narrow::Half, value, base, S2),
+                (true, 4) => ldr_reg(W, value, base, S2, false),
+                (true, 8) => ldr_reg(X, value, base, S2, false),
+                (false, 1) => str_narrow(Narrow::Byte, value, base, S2),
+                (false, 2) => str_narrow(Narrow::Half, value, base, S2),
+                (false, 4) => str_reg(W, value, base, S2, false),
+                (false, 8) => str_reg(X, value, base, S2, false),
                 _ => unreachable!(),
             });
             if load && consumed != 0 {
@@ -283,7 +333,14 @@ impl Emitter<'_> {
         }
     }
 
-    pub(super) fn inline_exit(&mut self, ir: &IrRecord, assumed: &Assumed, bytes: u64) {
+    pub(super) fn inline_exit(
+        &mut self,
+        ir: &IrRecord,
+        assumed: &Assumed,
+        bytes: u64,
+        arrival: bool,
+    ) {
+        let start = self.asm.offset();
         let record = recovery::lower_record(ir, &self.locations);
         self.asm.emit(ldr(X, CPU, RT, CPU_PTR));
         for &(offset, width, value) in &record.frame {
@@ -308,6 +365,9 @@ impl Emitter<'_> {
             numeric(record.eflags.expect("normal exit has EFLAGS")),
             self.keeps_unmapped_flags(ir.eflags.expect("normal exit has EFLAGS")),
         );
+        for group in &record.flag_groups {
+            self.exit_flag_group(group);
+        }
         self.parallel_moves(
             record
                 .regs
@@ -328,18 +388,42 @@ impl Emitter<'_> {
                 ));
             }
         }
+        if !self.resident {
+            self.asm
+                .emit_all(&[ldr(X, ALIAS, RT, SHADOW), ldr(X, WINDOW, RT, WINDOW_BASE)]);
+        }
+        self.bias_stack();
+        stubs::emit_load_flags(&mut self.asm);
+        self.charge(-i64::from(record.refund), RecordId(0), false);
+        self.stack_frame(bytes, false);
+        let settled_exit_words = self.words_since(start) + 1;
+        if let Some(probation) = &mut self.probation {
+            // A settled exit branches over both the sensor and the tally call.
+            self.exit_words = self.exit_words.max(settled_exit_words);
+            let rows = self.domain.and_then(|(domain, _)| {
+                if record.eip == self.func.records[0].eip {
+                    Some(true)
+                } else {
+                    domain.completes_rows_at(record.eip).then_some(false)
+                }
+            });
+            probation.exit(&mut self.asm, record.eip, rows);
+        }
+        let point = self.asm.offset();
+        self.links.push((point, record.eip));
+        emit_link_point(&mut self.asm, record.eip, false);
+        self.asm.emit(0); // Bound to the Tier-1 dispatch stub on placement.
+        if arrival {
+            let transition = emit_link_transition(&mut self.asm, point);
+            self.transitions.push((point, transition));
+        }
+    }
+
+    fn bias_stack(&mut self) {
         self.asm.emit_all(&[
-            ldr(X, ALIAS, RT, SHADOW),
-            ldr(X, WINDOW, RT, WINDOW_BASE),
             add_ext(X, ESP, WINDOW, ESP, Extend::Uxtw, 0),
             add_ext(X, guest(5), WINDOW, guest(5), Extend::Uxtw, 0),
         ]);
-        runtime::emit_load_flags(&mut self.asm);
-        self.charge(-i64::from(record.refund), RecordId(0), false);
-        self.stack_frame(bytes, false);
-        self.links.push((self.asm.offset(), record.eip));
-        emit_link_point(&mut self.asm, record.eip);
-        self.asm.emit(0); // Bound to the Tier-1 dispatch stub on placement.
     }
 
     /// Flags computed from the entry value preserve every unmapped bit.
@@ -385,6 +469,94 @@ impl Emitter<'_> {
                 str(W, T, CPU, runtime::EFLAGS),
             ]);
         }
+    }
+
+    fn exit_flag_group(&mut self, group: &FlagGroup<Host>) {
+        let done = self.asm.label();
+        let mut arms = group.arms.iter().peekable();
+        while let Some((tag, expr)) = arms.next() {
+            let next = self.asm.label();
+            if arms.peek().is_some() {
+                match group.select {
+                    FlagSelect::Same => unreachable!(),
+                    FlagSelect::Tag(v) => {
+                        let tag_reg = self.gp_at(v, T);
+                        self.imm(U, u64::from(*tag));
+                        self.asm.emit(cmp(W, tag_reg, U, Lsl, 0));
+                    }
+                    FlagSelect::Induction { current, initial } => {
+                        let current = self.gp_at(current, T);
+                        let initial = self.gp_at(initial, U);
+                        self.asm.emit(cmp(W, current, initial, Lsl, 0));
+                    }
+                }
+                self.asm.b_cond(Cond::Ne, next);
+            }
+            for bit in [0, 2, 4, 6, 7, 11] {
+                if group.mask & (1 << bit) != 0 {
+                    self.exit_flag_bit(expr, bit);
+                    self.asm.emit(bfi(W, FLAGS, T, bit, 1));
+                }
+            }
+            if arms.peek().is_some() {
+                self.asm.b(done);
+            }
+            self.asm.bind(next);
+        }
+        self.asm.bind(done);
+    }
+
+    fn exit_flag_bit(&mut self, expr: &FlagExpr<Host>, bit: u32) {
+        let FlagExpr::Produce {
+            kind,
+            width,
+            a,
+            b,
+            prior,
+            adjust,
+        } = expr
+        else {
+            self.bit(flag_operand(expr), bit);
+            return;
+        };
+        let prior = if **prior == FlagExpr::Constant(0) {
+            None
+        } else {
+            let bit = if matches!(kind, FlagKind::AddCarry | FlagKind::SubBorrow) {
+                0
+            } else {
+                bit
+            };
+            self.exit_flag_bit(prior, bit);
+            self.asm.emit(lsl_imm(W, S2, T, bit));
+            Some(Host::Register(S2))
+        };
+        let mut a = flag_operand(a);
+        if *adjust != 0 {
+            let src = self.gp_at(a, T);
+            if let Some(word) = int_immediate(IntOp::Add, W, S3, src, u64::from(*adjust)) {
+                self.asm.emit(word);
+            } else {
+                self.imm(U, u64::from(*adjust));
+                self.asm.emit(add(W, S3, src, U, Lsl, 0));
+            }
+            a = Host::Register(S3);
+        }
+        let b = flag_operand(b);
+        let flags = Host::Flags(self.flags.len() as u32);
+        self.flags.push(Some(FlagRecipe {
+            kind: *kind,
+            width: *width,
+            a,
+            b,
+            prior,
+            immediate: match b {
+                Host::Constant(n) => Some(n as u64),
+                _ => None,
+            },
+        }));
+        self.bit(flags, bit);
+        self.flags.pop();
     }
 
     fn write_mmx(&mut self, record: &Record<Host>, refresh: bool) {
@@ -445,7 +617,7 @@ impl Emitter<'_> {
     fn write_x87(&mut self, x87: &X87<Host>) {
         self.asm.emit_all(&[
             add_imm(X, S4, CPU, runtime::X87_REGS, false),
-            ldrh(S5, CPU, runtime::X87_TAG),
+            movz(W, S5, u16::MAX, 0),
         ]);
         for (i, value) in x87.stack.into_iter().enumerate() {
             if x87.valid >> i & 1 != 0
@@ -464,8 +636,8 @@ impl Emitter<'_> {
             u64::from(x87.status & !0x3a00 | u16::from(x87.top) << 11),
         );
         if let Some(value) = x87.c1 {
-            let value = if let Location::Recipe(Recipe::C1 { op, a, b }) = value {
-                self.c1(op, a, b);
+            let value = if let Location::Recipe(Recipe::C1 { op, a, b, single }) = value {
+                self.c1(op, a, b, single);
                 T
             } else {
                 self.gp_at(numeric(value), T)
@@ -531,7 +703,7 @@ impl Emitter<'_> {
     }
 
     /// Recomputes the rounding direction used by recovery::materialize.
-    fn c1(&mut self, op: FpOp, a: Host, b: Host) {
+    fn c1(&mut self, op: FpOp, a: Host, b: Host, single: bool) {
         use Float::*;
         let a = self.v_at(a, A);
         let mut b = self.v_at(b, B);
@@ -567,10 +739,23 @@ impl Emitter<'_> {
         }
         self.asm
             .emit_all(&[lsr_imm(X, T, T, 63), csel(W, T, Reg::ZR, T, Cond::Eq)]);
+        if single {
+            self.asm.emit_all(&[
+                unary(Unary::Narrow, E, C),
+                unary(Unary::Widen, E, E),
+                unary(Unary::Fabs, E, E),
+                unary(Unary::Fabs, C, C),
+                fcmp(E, C),
+                cset(W, U, Cond::Gt),
+                csel(W, T, T, U, Cond::Eq),
+                fcmp_zero(C),
+                csel(W, T, Reg::ZR, T, Cond::Eq),
+            ]);
+        }
     }
 }
 
-fn guest(i: u8) -> Reg {
+pub(super) fn guest(i: u8) -> Reg {
     Reg::new(19 + i)
 }
 
@@ -579,5 +764,13 @@ fn numeric(location: Location<Host>) -> Host {
         Location::At(host) | Location::Recipe(Recipe::Eflags(host)) => host,
         Location::Constant(bits) => Host::Constant(u128::from(bits)),
         Location::Recipe(Recipe::C1 { .. }) => unreachable!("C1 has its own emission"),
+    }
+}
+
+fn flag_operand(expr: &FlagExpr<Host>) -> Host {
+    match *expr {
+        FlagExpr::At(v) => v,
+        FlagExpr::Constant(bits) => Host::Constant(bits),
+        FlagExpr::Produce { .. } => unreachable!("numeric flag operand"),
     }
 }

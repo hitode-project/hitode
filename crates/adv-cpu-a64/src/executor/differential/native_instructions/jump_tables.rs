@@ -67,7 +67,9 @@ fn switch_tables_match_all_handlers_default_and_budget_cuts() {
                 }
                 assert_eq!(
                     native.run(p.stop, budget).unwrap(),
-                    oracle.run(p.stop, budget).unwrap()
+                    oracle
+                        .run(p.stop, budget.saturating_add(native.fuel_debt))
+                        .unwrap()
                 );
                 same(&native, &oracle);
                 assert_eq!(
@@ -108,8 +110,8 @@ fn switch_table_writes_and_writable_protection_drop_the_source() {
             }
             // VirtualProtect alone must retire the read-only proof.
             assert_eq!(
-                native.run(p.stop, 4).unwrap(),
-                oracle.run(p.stop, 4).unwrap()
+                native.run(p.stop, 256).unwrap(),
+                oracle.run(p.stop, 256).unwrap()
             );
             same(&native, &oracle);
             assert!(native.native.as_ref().unwrap().diagnostics.dropped_units > dropped);

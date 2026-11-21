@@ -20,12 +20,18 @@ use crate::integer::{AF, Address, CF, OF, Operand, PF, Reg, SF, ZF, condition_tr
 use crate::memory::SHARED;
 use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
 
+mod first_visit;
+#[doc(hidden)]
+use crate::memory::accessible;
+use crate::quick::{self, x87_opcode};
 mod registers;
 mod scalar;
 mod simd;
 mod strings;
 #[cfg(test)]
 mod window_tests;
+
+pub use first_visit::FirstVisit;
 
 /// Outcome of one instruction. Fuel accounting belongs to the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +100,11 @@ impl RepContinuation {
             state.rep = None;
             return;
         }
+        Self::record_compare(state, native as u8, state.eflags);
+    }
+
+    pub(crate) fn record_compare(state: &mut CpuState, descriptor: u8, flags: u32) {
+        let native = descriptor & 31;
         debug_assert!((6..18).contains(&native));
         let operation = StringOp {
             kind: if native < 12 {
@@ -106,8 +117,8 @@ impl RepContinuation {
                 1 => 2,
                 _ => 4,
             },
-            word: false,
-            fs: false,
+            word: descriptor & 32 != 0,
+            fs: descriptor & 64 != 0,
             repeat: true,
             unequal: (native - 6) % 6 >= 3,
         };
@@ -118,9 +129,24 @@ impl RepContinuation {
         {
             state.rep = Some(Self {
                 pc: state.eip,
-                flags: state.eflags,
+                flags,
                 operation,
             });
+        }
+    }
+
+    /// Put the comparison's input flags back while executing native REP.
+    /// The loop does not publish comparison flags until it leaves or finishes.
+    pub fn native_input_flags(&self, state: &CpuState) -> u32 {
+        let mask = if self.operation.word {
+            0xffff
+        } else {
+            u32::MAX
+        };
+        if state.regs[1] & mask == 0 {
+            state.eflags
+        } else {
+            self.flags
         }
     }
 }
@@ -554,22 +580,14 @@ fn execute_decoded(
                 .read_data(address, 8)
                 .map_err(|_| Step::ReadFault { pc, address })?;
             let old = u64::from_le_bytes(bytes.as_ref().try_into().unwrap());
-            let equal = old == u64::from(state.regs[0]) | (u64::from(state.regs[2]) << 32);
-            let value = if equal {
-                u64::from(state.regs[3]) | (u64::from(state.regs[1]) << 32)
-            } else {
-                old
-            };
+            let (mut regs, mut flags) = (state.regs, state.eflags);
+            let value = crate::integer::compare_exchange8(&mut regs, &mut flags, old);
             // The failed comparison is still a write access. Commit all eight
             // bytes before publishing registers or ZF, including COW failures.
             memory
                 .write(address, &value.to_le_bytes())
                 .map_err(|_| Step::WriteFault { pc, address })?;
-            if !equal {
-                state.regs[0] = old as u32;
-                state.regs[2] = (old >> 32) as u32;
-            }
-            state.eflags = (state.eflags & !ZF) | if equal { ZF } else { 0 };
+            (state.regs, state.eflags) = (regs, flags);
             state.eip = instruction.next;
             Ok(if debug {
                 Step::Trap { pc, vector: 1 }
@@ -582,6 +600,8 @@ fn execute_decoded(
             step: result.unwrap_or_else(|step| step),
         };
     }
+    #[cfg(test)]
+    first_visit::tests::count(|work| work.transactions += 1);
     let mut tx = Transaction {
         regs: state.regs,
         flags: state.eflags,
@@ -826,42 +846,36 @@ fn fetch_bytes<const BULK: bool>(memory: &mut Memory, pc: u32) -> (Cached, Optio
 
 fn fetch(memory: &mut Memory, pc: u32) -> Cached {
     let (mut entry, denied) = fetch_bytes::<true>(memory, pc);
-    let mut decoder = Decoder::with_ip(
-        32,
-        &entry.bytes[..entry.len as usize],
-        u64::from(pc),
-        DecoderOptions::NONE,
-    );
+    let (decoded, len) = decode_bytes(pc, &entry.bytes[..entry.len as usize], denied);
+    memory.watch_code(pc, len);
+    entry.len = len as u8;
+    entry.decoded = decoded;
+    entry
+}
+
+fn decode_bytes(pc: u32, bytes: &[u8], denied: Option<u32>) -> (Decoded, usize) {
+    let mut decoder = Decoder::with_ip(32, bytes, u64::from(pc), DecoderOptions::NONE);
     let instruction = decoder.decode();
     // A decoded instruction depends on its own bytes; a failed decode on every
     // byte it saw.
-    if !instruction.is_invalid() {
-        entry.len = instruction.len() as u8;
-    }
-    memory.watch_code(pc, entry.len as usize);
-    entry.decoded = if instruction.is_invalid() {
+    if instruction.is_invalid() {
         if decoder.last_error() == DecoderError::NoMoreBytes
             && let Some(address) = denied
         {
-            Decoded::Stop(Step::FetchFault { pc, address })
+            (Decoded::Stop(Step::FetchFault { pc, address }), bytes.len())
         } else {
-            Decoded::Stop(Step::InvalidInstruction { pc })
+            (Decoded::Stop(Step::InvalidInstruction { pc }), bytes.len())
         }
     } else {
-        decode(&instruction, &entry.bytes[..instruction.len()])
-    };
-    entry
+        let len = instruction.len();
+        (decode(&instruction, &bytes[..len]), len)
+    }
 }
 
 /// How the interpreter runs a valid `instruction` encoded as `bytes`.
 fn decode(instruction: &Instruction, bytes: &[u8]) -> Decoded {
     if let Some(action) = predecode(instruction) {
-        let clock = matches!(
-            action,
-            Action::Mov(Operand::Register(_), Operand::Memory(a, _), _)
-                if a.base.is_none() && a.index.is_none() && !a.fs && !a.word
-                    && crate::shared_clock(a.displacement)
-        );
+        let clock = reads_clock(action);
         Decoded::Ready(Predecoded {
             action,
             next: instruction.next_ip32(),
@@ -889,81 +903,19 @@ fn decode(instruction: &Instruction, bytes: &[u8]) -> Decoded {
     }
 }
 
-/// The x87 opcode of an instruction's bytes: the first byte pair whose
-/// first byte is D8 to DF.
-fn x87_opcode(bytes: &[u8]) -> Option<u16> {
-    bytes
-        .windows(2)
-        .find(|bytes| (0xd8..=0xdf).contains(&bytes[0]))
-        .map(|bytes| ((bytes[0] as u16 & 7) << 8) | bytes[1] as u16)
+fn reads_clock(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Mov(Operand::Register(_), Operand::Memory(a, _), _)
+            if a.base.is_none() && a.index.is_none() && !a.fs && !a.word
+                && crate::shared_clock(a.displacement)
+    )
 }
 
-/// One instruction translated code runs through the interpreter without
-/// leaving, decoded when it is translated.
-pub struct Prepared {
-    decoded: Decoded,
-    /// The host-double path of an x87 instruction.
-    x87: Option<crate::floating::NativeX87>,
-}
-
-impl Prepared {
-    /// `instruction`, encoded as `bytes`, unless the interpreter would stop
-    /// at it.
-    pub fn new(instruction: &Instruction, bytes: &[u8]) -> Option<Self> {
-        let decoded = decode(instruction, bytes);
-        let x87 = match decoded {
-            Decoded::Stop(_) => return None,
-            Decoded::Extended(i, crate::floating::Operation::X87, opcode) => {
-                Some(crate::floating::NativeX87 {
-                    instruction: i,
-                    opcode,
-                    fast: crate::floating::fast::classify(&i),
-                })
-            }
-            _ => None,
-        };
-        Some(Self { decoded, x87 })
-    }
-
-    /// Completed instructions and REP elements for diagnostic accounting.
-    pub fn retirement(
-        &self,
-        execution: Execution,
-        state: &CpuState,
-        pc: u32,
-        count: u32,
-    ) -> (u64, u64) {
-        (
-            retired_instruction(&self.decoded, execution, state, pc),
-            rep_elements(&self.decoded, count, state),
-        )
-    }
-
-    /// The x87 opcode (FOP) the instruction records, if it records one.
-    pub fn x87_opcode(&self) -> Option<u16> {
-        self.x87.as_ref().and_then(|op| op.opcode)
-    }
-
-    /// Runs the instruction at `state.eip` as `Interpreter::run_chunk`
-    /// would, a REP for at most `max_units` elements.
-    pub fn execute(&self, state: &mut CpuState, memory: &mut Memory, max_units: u32) -> Execution {
-        if let Some(op) = &self.x87
-            && state.eflags & (1 << 8) == 0
-        {
-            let result = match op.fast {
-                Some(fast) => crate::floating::fast::execute(op, fast, state, memory),
-                None => crate::floating::fast::execute_other(op, state, memory),
-            };
-            if result.is_some() {
-                state.eflags &= !(1 << 16);
-                return Execution {
-                    step: Step::Executed,
-                    units: 1,
-                };
-            }
-        }
-        execute_decoded(&self.decoded, state, memory, max_units, None)
-    }
+/// Whether the interpreter has a semantic implementation of this decoded form.
+#[doc(hidden)]
+pub fn supports(instruction: &Instruction) -> bool {
+    !matches!(decode(instruction, &[]), Decoded::Stop(_))
 }
 
 const BLOCK_INSTRUCTIONS: usize = 64;
@@ -1853,16 +1805,6 @@ pub fn fault_address(memory: &Memory, start: u32, permission: u8) -> u32 {
     }
 }
 
-pub fn accessible(memory: &Memory, address: u32, width: u8, permission: u8) -> bool {
-    memory
-        .committed(address, width as usize)
-        .is_ok_and(|range| {
-            memory.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
-                .iter()
-                .all(|p| p & permission != 0)
-        })
-}
-
 impl Transaction {
     /// Loads a segment register under the protected-mode checks at CPL3.
     /// A null selector loads into every register except SS; other failures
@@ -2189,21 +2131,16 @@ impl Transaction {
                 let source = self.read(memory, src)?;
                 let dst = freeze(dst, self);
                 self.check_write(memory, dst)?;
-                let width = dst.width().unwrap();
-                let accumulator = Reg {
-                    index: 0,
-                    shift: 0,
-                    width,
-                };
-                let old = accumulator.read(&self.regs);
-                self.arithmetic(old, value, 0, width, true);
-                if old == value {
+                if let Some(source) = crate::integer::compare_exchange(
+                    &mut self.regs,
+                    &mut self.flags,
+                    dst.width().unwrap(),
+                    value,
+                    source,
+                ) {
                     self.store(memory, dst, source)?;
-                } else {
-                    if matches!(dst, Operand::Memory(..)) {
-                        self.store(memory, dst, value)?;
-                    }
-                    accumulator.write(&mut self.regs, value);
+                } else if matches!(dst, Operand::Memory(..)) {
+                    self.store(memory, dst, value)?;
                 }
             }
             Action::Multiply(dst, src, immediate, signed) => {

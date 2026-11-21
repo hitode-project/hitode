@@ -1883,12 +1883,21 @@ fn translated(
     program: &Program,
     budget: u64,
     (features, first_visits, checks): Config,
-) -> (RunOutcome, CpuState, Vec<u8>, u64) {
+    baseline_only: bool,
+) -> (
+    RunOutcome,
+    CpuState,
+    Vec<u8>,
+    u64,
+    crate::native::Diagnostics,
+    u64,
+) {
     let mut executor = Executor::new(BASE, LEN).unwrap();
     let native = executor.native.as_mut().unwrap();
     native.features = features;
     native.first_visits = first_visits;
     native.checks = checks;
+    native.set_baseline_only(baseline_only);
     load(executor.memory_mut(), program);
     executor.state = program.state.clone();
     let outcome = executor.run(program.stop, budget).unwrap();
@@ -1898,6 +1907,8 @@ fn translated(
         executor.state.clone(),
         snapshot(executor.memory()),
         native,
+        executor.native.as_ref().unwrap().diagnostics.clone(),
+        executor.fuel_debt,
     )
 }
 
@@ -1906,31 +1917,56 @@ fn translated(
 type Config = (Features, bool, Checks);
 
 #[cfg(native)]
+fn reference_budget(budget: u64, debt: u64, outcome: &RunOutcome) -> u64 {
+    // An admitted unit can attempt a faulting instruction after its last
+    // retired unit. Give the reference room to observe the same event.
+    let event = matches!(
+        outcome,
+        RunOutcome::Trap { .. }
+            | RunOutcome::UnsupportedInstruction { .. }
+            | RunOutcome::InvalidInstruction { .. }
+            | RunOutcome::FetchFault { .. }
+            | RunOutcome::ReadFault { .. }
+            | RunOutcome::WriteFault { .. }
+    );
+    budget.saturating_add(debt).saturating_add(u64::from(event))
+}
+
+#[cfg(native)]
 mod native_instructions;
+
+#[cfg(native)]
+mod resident;
 
 #[cfg(native)]
 fn compare(seed: u64, budget: u64, config: Config) -> u64 {
     let program = program(seed);
-    let (outcome, state, memory) = reference(&program, budget);
-    let (a64_outcome, a64_state, a64_memory, native) = translated(&program, budget, config);
-    let context = format!("seed {seed} budget {budget} {config:?}");
-    assert_eq!(a64_outcome, outcome, "{context}: outcome");
-    assert_eq!(a64_state.regs, state.regs, "{context}: registers");
-    assert_eq!(a64_state.eip, state.eip, "{context}: eip");
-    assert_eq!(
-        a64_state.eflags, state.eflags,
-        "{context}: eflags {:#x} != {:#x}",
-        a64_state.eflags, state.eflags
-    );
-    assert_eq!(a64_state.xmm, state.xmm, "{context}: xmm");
-    assert_eq!(
-        a64_state.mxcsr, state.mxcsr,
-        "{context}: mxcsr {:#x} != {:#x}",
-        a64_state.mxcsr, state.mxcsr
-    );
-    assert_eq!(a64_state.mmx, state.mmx, "{context}: mmx");
-    assert_eq!(a64_state.x87, state.x87, "{context}: x87");
-    assert!(a64_memory == memory, "{context}: memory");
+    let mut native = 0;
+    for baseline_only in [false, true] {
+        let (a64_outcome, a64_state, a64_memory, entries, _, debt) =
+            translated(&program, budget, config, baseline_only);
+        let (outcome, state, memory) =
+            reference(&program, reference_budget(budget, debt, &a64_outcome));
+        let context = format!("seed {seed} budget {budget} {config:?} baseline {baseline_only}");
+        assert_eq!(a64_outcome, outcome, "{context}: outcome");
+        assert_eq!(a64_state.regs, state.regs, "{context}: registers");
+        assert_eq!(a64_state.eip, state.eip, "{context}: eip");
+        assert_eq!(
+            a64_state.eflags, state.eflags,
+            "{context}: eflags {:#x} != {:#x}",
+            a64_state.eflags, state.eflags
+        );
+        assert_eq!(a64_state.xmm, state.xmm, "{context}: xmm");
+        assert_eq!(
+            a64_state.mxcsr, state.mxcsr,
+            "{context}: mxcsr {:#x} != {:#x}",
+            a64_state.mxcsr, state.mxcsr
+        );
+        assert_eq!(a64_state.mmx, state.mmx, "{context}: mmx");
+        assert_eq!(a64_state.x87, state.x87, "{context}: x87");
+        assert!(a64_memory == memory, "{context}: memory");
+        native += entries;
+    }
     native
 }
 
@@ -1957,6 +1993,36 @@ fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
         }
     }
     assert!(native > 1000, "translated code ran: {native} entries");
+}
+
+// spec: A64-OPT-12 A64-OPT-13
+#[cfg(native)]
+#[test]
+fn baseline_switch_matches_tier0_and_common_tier1_path_counts() {
+    for seed in 1..=16 {
+        let program = program(seed);
+        for budget in [13, 40, 120, 400, u64::MAX >> 1] {
+            let config = (Features { flagm: true }, true, Checks::Adaptive);
+            let enabled = translated(&program, budget, config, false);
+            let baseline = translated(&program, budget, config, true);
+            for (outcome, state, memory, _, _, debt) in [&baseline, &enabled] {
+                let expected = reference(&program, reference_budget(budget, *debt, outcome));
+                assert_eq!(*outcome, expected.0);
+                assert_eq!(state.eip, expected.1.eip);
+                assert_eq!(state.regs, expected.1.regs);
+                assert_eq!(state.eflags, expected.1.eflags);
+                assert_eq!(state.mxcsr, expected.1.mxcsr);
+                assert_eq!(state.xmm, expected.1.xmm);
+                assert_eq!(state.mmx, expected.1.mmx);
+                assert_eq!(state.x87, expected.1.x87);
+                assert!(*memory == expected.2);
+            }
+            assert_eq!(baseline.4.resident_entries, 0);
+            assert_eq!(enabled.4.rust_decisions_on_decided_sites, 0);
+            assert_eq!(baseline.3, enabled.3);
+            assert_eq!(baseline.4.tier1_counts(), enabled.4.tier1_counts());
+        }
+    }
 }
 
 /// A loop of the x87 code compilers emit for float expressions, under the
@@ -2074,7 +2140,7 @@ fn x87_loops_run_natively() {
 #[cfg(native)]
 #[test]
 fn x87_directed_store_loops_run_natively() {
-    for control in [0x173f, 0x1b3f, 0x1f3f] {
+    for control in [0x133f, 0x173f, 0x1b3f, 0x1f3f] {
         let mut a = CodeAssembler::new(32).unwrap();
         let mut top = a.create_label();
         for (at, value) in [(0x710, 1.0 + f64::EPSILON), (0x718, 1.0 - f64::EPSILON)] {
@@ -2091,9 +2157,9 @@ fn x87_directed_store_loops_run_natively() {
         a.mov(dword_ptr(ebx + 0x700), ecx).unwrap();
         for (negative, at, source) in [
             (false, 0, 0x710),
-            (true, 0x30, 0x710),
-            (false, 0x60, 0x718),
-            (true, 0x90, 0x718),
+            (true, 0x40, 0x710),
+            (false, 0x80, 0x718),
+            (true, 0xc0, 0x718),
         ] {
             a.fild(dword_ptr(ebx + 0x700)).unwrap();
             a.fmul(qword_ptr(ebx + source)).unwrap();
@@ -2111,11 +2177,21 @@ fn x87_directed_store_loops_run_natively() {
             a.fstp(dword_ptr(edi + at + 20)).unwrap();
             a.fnstsw(ax).unwrap();
             a.mov(word_ptr(edi + at + 24), ax).unwrap();
-            a.fstp(qword_ptr(edi + at + 28)).unwrap();
+            a.fist(word_ptr(edi + at + 28)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(word_ptr(edi + at + 30), ax).unwrap();
+            a.fist(dword_ptr(edi + at + 32)).unwrap();
             a.fnstsw(ax).unwrap();
             a.mov(word_ptr(edi + at + 36), ax).unwrap();
+            a.fld(st0).unwrap();
+            a.fistp(qword_ptr(edi + at + 40)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(word_ptr(edi + at + 48), ax).unwrap();
+            a.fstp(qword_ptr(edi + at + 52)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(word_ptr(edi + at + 60), ax).unwrap();
         }
-        a.add(edi, 0xc0).unwrap();
+        a.add(edi, 0x100).unwrap();
         a.dec(ecx).unwrap();
         a.jnz(top).unwrap();
         a.nop().unwrap();
@@ -2824,8 +2900,8 @@ fn first_divergence() {
     let program = program(seed);
     let config = (Features { flagm: true }, false, Checks::Adaptive);
     for budget in 1..5000 {
-        let (outcome, state, memory) = reference(&program, budget);
-        let (a, b, m, _) = translated(&program, budget, config);
+        let (a, b, m, _, _, debt) = translated(&program, budget, config, false);
+        let (outcome, state, memory) = reference(&program, reference_budget(budget, debt, &a));
         if a != outcome
             || b.regs != state.regs
             || b.eflags != state.eflags
@@ -2853,7 +2929,7 @@ fn first_divergence() {
     println!("no divergence");
 }
 
-// spec: EXEC-CORE-6, EXEC-CORE-7, A64-MEM-11, A64-MEM-13, A64-CTL-10
+// spec: EXEC-CORE-6, EXEC-CORE-7, A64-MEM-11, A64-MEM-13, A64-CTL-10, A64-TR-2
 #[cfg(native)]
 #[test]
 fn shared_code_executes_rewrites_and_non_fetchable_entries_use_blocks() {
@@ -2935,6 +3011,7 @@ fn shared_code_executes_rewrites_and_non_fetchable_entries_use_blocks() {
             );
         }
         assert_eq!(interpreted, if coherent { 0 } else { rounds });
+        assert_eq!(native.diagnostics.untracked, u64::from(interpreted));
         assert!(
             executor.stats.native_entries > 0,
             "translated code or patch"

@@ -114,7 +114,7 @@ fn x87_arithmetic_and_compares_take_full_significands_under_every_control() {
                 same(&native, &oracle);
                 if control & 0x20 != 0 && divisor != 0 {
                     assert_eq!(
-                        native.native.as_ref().unwrap().diagnostics.helpers,
+                        native.native.as_ref().unwrap().diagnostics.interprets,
                         0,
                         "form={form}, case={case}, control={control:#x}, a={a:x?}, b={b:x?}"
                     );
@@ -177,7 +177,7 @@ fn checked_x87_accesses_complete_and_refuse_without_instruction_helpers() {
                 same(&native, &oracle);
                 let diagnostics = &native.native.as_ref().unwrap().diagnostics;
                 assert!(diagnostics.accesses > 0, "form {n} uses access");
-                assert_eq!(diagnostics.helpers, 0, "form {n} avoids interpret");
+                assert_eq!(diagnostics.interprets, 0, "form {n} avoids interpret");
                 assert_eq!(diagnostics.refused, u64::from(address == HOLE), "form {n}");
             }
         }
@@ -234,7 +234,7 @@ fn cached_x87_runs_span_checked_accesses_and_publish_on_refusal() {
                 );
                 same(&native, &oracle);
                 let engine = native.native.as_ref().unwrap();
-                assert_eq!(engine.diagnostics.helpers, 0, "avoids interpret");
+                assert_eq!(engine.diagnostics.interprets, 0, "avoids interpret");
                 assert_eq!(engine.diagnostics.refused, u64::from(fault.is_some()));
                 if checks == Checks::Slow {
                     assert!(engine.diagnostics.accesses > 0, "owner completes accesses");
@@ -308,7 +308,7 @@ fn cached_x87_runs_publish_at_inlined_returns() {
             );
             same(&native, &oracle);
             let engine = native.native.as_ref().unwrap();
-            assert_eq!(engine.diagnostics.helpers, 0, "avoids interpret");
+            assert_eq!(engine.diagnostics.interprets, 0, "avoids interpret");
             let base = engine.unit_address(CODE).unwrap();
             let (_, marks) = units_of(CODE)
                 .into_iter()
@@ -485,7 +485,12 @@ fn balanced_x87_loop_keeps_its_state_through_calls_sse_and_integer_forms() {
             let mut native = executor(&p, config, false);
             let mut oracle = executor(&p, config, true);
             let outcome = native.run(p.stop, budget).unwrap();
-            assert_eq!(outcome, oracle.run(p.stop, budget).unwrap());
+            assert_eq!(
+                outcome,
+                oracle
+                    .run(p.stop, budget.saturating_add(native.fuel_debt))
+                    .unwrap()
+            );
             same(&native, &oracle);
         }
     }
@@ -510,7 +515,7 @@ fn balanced_x87_loop_keeps_its_state_through_calls_sse_and_integer_forms() {
         );
         same(&native, &oracle);
         let engine = native.native.as_ref().unwrap();
-        assert_eq!(engine.diagnostics.helpers, 0);
+        assert_eq!(engine.diagnostics.interprets, 0);
         if fault.is_none() {
             assert_eq!(outcome, RunOutcome::ReachedStop);
         } else {
@@ -646,10 +651,11 @@ fn x87_pe_specialization_checks_entry_and_keeps_observed_c1() {
         );
         same(&native, &oracle);
         assert_ne!(native.state.x87.status & 0x20, 0);
+        let engine = native.native.as_ref().unwrap();
+        assert_eq!(engine.diagnostics.interprets, 0);
         assert_eq!(
-            native.native.as_ref().unwrap().diagnostics.helpers != 0,
-            translate_with_pe,
-            "only the guard on a PE specialization needs an interpreter helper",
+            engine.tier1_versions(CODE),
+            1 + usize::from(translate_with_pe)
         );
     }
 
@@ -931,7 +937,7 @@ fn x87_run_break_nest_keeps_the_steady_path_resident() {
     let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
     let inline = &marks[..marks.iter().position(|m| m.part == Part::Cold).unwrap()];
     assert_eq!(native.stats.compilations, 1);
-    assert_eq!(engine.diagnostics.helpers, 0);
+    assert_eq!(engine.diagnostics.interprets, 0);
     assert_eq!(
         inline.iter().filter(|m| m.part == Part::X87Entry).count(),
         1
@@ -964,11 +970,16 @@ fn x87_run_break_nest_preserves_middle_iteration_exits() {
                 let mut native = executor(&p, config, false);
                 let mut oracle = executor(&p, config, true);
                 let outcome = native.run(p.stop, budget).unwrap();
-                assert_eq!(outcome, oracle.run(p.stop, budget).unwrap());
+                assert_eq!(
+                    outcome,
+                    oracle
+                        .run(p.stop, budget.saturating_add(native.fuel_debt))
+                        .unwrap()
+                );
                 same(&native, &oracle);
                 if budget == 10000 {
                     let diagnostics = &native.native.as_ref().unwrap().diagnostics;
-                    assert_eq!(diagnostics.helpers, 0);
+                    assert_eq!(diagnostics.interprets, 0);
                     if checks == Checks::Slow {
                         assert!(diagnostics.accesses > 0);
                         assert_eq!(diagnostics.refused, u64::from(fault));
@@ -1175,13 +1186,15 @@ fn x87_outside_helper_arrivals_enter_the_merge_cold() {
                 let mut oracle = executor(&p, config, true);
                 assert_eq!(
                     native.run(p.stop, budget).unwrap(),
-                    oracle.run(p.stop, budget).unwrap()
+                    oracle
+                        .run(p.stop, budget.saturating_add(native.fuel_debt))
+                        .unwrap()
                 );
                 same(&native, &oracle);
                 if budget == 500 && !config.1 {
                     assert_eq!(native.stats.compilations, 1);
                     let engine = native.native.as_ref().unwrap();
-                    assert_eq!(engine.diagnostics.helpers, 0);
+                    assert_eq!(engine.diagnostics.interprets, 0);
                     let base = engine.unit_address(CODE).unwrap();
                     let (_, marks) = units_of(CODE).into_iter().rfind(|m| m.0 == base).unwrap();
                     let hot: Vec<_> = marks
@@ -1277,7 +1290,9 @@ fn x87_inner_integer_loop_keeps_the_model_at_every_arrival() {
                     let mut oracle = executor(&p, config, true);
                     assert_eq!(
                         native.run(p.stop, budget).unwrap(),
-                        oracle.run(p.stop, budget).unwrap()
+                        oracle
+                            .run(p.stop, budget.saturating_add(native.fuel_debt))
+                            .unwrap()
                     );
                     same(&native, &oracle);
                     if budget == 1000 {
@@ -1345,4 +1360,201 @@ fn x87_inner_integer_loop_publishes_at_its_deadline_backedge() {
         RunOutcome::Budget
     );
     same(&native, &oracle);
+}
+
+// spec: A64F-FP-7 A64-CTL-7 A64A-ROLE-4 A64A-ROLE-5 A64A-FALL-3 A64A-PLACE-4
+#[test]
+fn tier1_x87_control_versions_join_and_keep_budget() {
+    let mut program = fixture(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.mov(eax, dword_ptr(ebx)).unwrap();
+        a.fld(dword_ptr(ebx)).unwrap();
+        a.fadd(dword_ptr(ebx + 4)).unwrap();
+        a.fstp(dword_ptr(ebx + 8)).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+    });
+    program.data[..4].copy_from_slice(&1.0f32.to_le_bytes());
+    program.data[4..8].copy_from_slice(&0.25f32.to_le_bytes());
+    program.state.regs[1] = 12;
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut actual = executor(&program, config, false);
+    actual.native.as_mut().unwrap().set_baseline_only(true);
+
+    for (control, fuel, versions) in [
+        (0x007f, 100, 1),
+        (0x027f, 6, 2),
+        (0x027f, 100, 2),
+        (0x037f, 100, 3),
+        (0x047f, 100, 3),
+        (0x077f, 100, 3),
+    ] {
+        program.state.x87.set_control(control);
+        actual.state = program.state.clone();
+        let mut reference = executor(&program, config, true);
+        assert_eq!(
+            actual.run(program.stop, fuel).unwrap(),
+            reference.run(program.stop, fuel).unwrap(),
+        );
+        same(&actual, &reference);
+        let native = actual.native.as_ref().unwrap();
+        assert_eq!(native.tier1_versions(CODE), versions);
+        assert_eq!(native.diagnostics.interprets, 0);
+    }
+    actual.memory_mut().protect(CODE, 0x1000, 7).unwrap();
+    actual.memory_mut().write(CODE, &program.code[..1]).unwrap();
+    actual.memory_mut().protect(CODE, 0x1000, 5).unwrap();
+    actual.state = program.state.clone();
+    let mut reference = executor(&program, config, true);
+    assert_eq!(
+        actual.run(program.stop, 100),
+        reference.run(program.stop, 100)
+    );
+    same(&actual, &reference);
+    assert_eq!(actual.native.as_ref().unwrap().tier1_versions(CODE), 1);
+}
+
+// spec: A64A-ROLE-3 A64A-FALL-2 A64F-FP-4 A64F-FP-7
+#[test]
+fn tier1_x87_versions_handle_live_stack_and_deferred_emms() {
+    let mut program = fixture(|a| {
+        a.fld(dword_ptr(ebx)).unwrap();
+        a.fadd(dword_ptr(ebx + 4)).unwrap();
+        a.fstp(dword_ptr(ebx + 8)).unwrap();
+    });
+    program.data[..4].copy_from_slice(&1.0f32.to_le_bytes());
+    program.data[4..8].copy_from_slice(&0.25f32.to_le_bytes());
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut actual = executor(&program, config, false);
+    for (mode, stack) in [(0, false), (0, true), (2, true)] {
+        program.state.x87 = Default::default();
+        if stack {
+            program.state.x87.set_top(3);
+            program
+                .state
+                .x87
+                .push(X87Register::from_parts(1 << 63, 0x3fff));
+        }
+        program.state.refresh_mmx();
+        program.state.mmx_mode = mode;
+        actual.state = program.state.clone();
+        let mut reference = executor(&program, config, true);
+        assert_eq!(
+            reference.run(program.stop, 50).unwrap(),
+            RunOutcome::ReachedStop
+        );
+        // The executor normally commits MMX before native entry. Use the
+        // native entry directly to exercise a checked version with live EMMS.
+        let run = actual
+            .native
+            .as_mut()
+            .unwrap()
+            .run(
+                &mut actual.state,
+                &mut actual.memory,
+                program.stop,
+                50,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.retired, 3);
+        actual.state.fuel = 50 - u64::from(run.retired);
+        same(&actual, &reference);
+        let native = actual.native.as_ref().unwrap();
+        assert_eq!(native.diagnostics.interprets, 0);
+    }
+    assert_eq!(actual.native.as_ref().unwrap().tier1_versions(CODE), 3);
+}
+
+// spec: A64A-FALL-2 A64F-FP-7
+#[test]
+fn tier1_x87_wide_loop_handles_a_full_stack_on_entry() {
+    let mut program = fixture(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.fld(tbyte_ptr(ebx)).unwrap();
+        a.fstp(tbyte_ptr(ebx + 16)).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+    });
+    program.data[..8].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    program.data[8..10].copy_from_slice(&0x3fffu16.to_le_bytes());
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut actual = executor(&program, config, false);
+    assert_eq!(actual.run(program.stop, 50), Ok(RunOutcome::ReachedStop));
+    for _ in 0..8 {
+        program
+            .state
+            .x87
+            .push(X87Register::from_parts(1 << 63, 0x3fff));
+    }
+    actual.state = program.state.clone();
+    let mut reference = executor(&program, config, true);
+    assert_eq!(
+        actual.run(program.stop, 50),
+        reference.run(program.stop, 50)
+    );
+    same(&actual, &reference);
+    let native = actual.native.as_ref().unwrap();
+    assert_eq!(native.tier1_versions(CODE), 2);
+    assert_eq!(native.diagnostics.interprets, 0);
+}
+
+// spec: A64A-FALL-4 A64F-FP-2
+#[test]
+fn tier1_pending_x87_exception_reports_the_waiting_instruction() {
+    let mut program = fixture(|a| {
+        a.mov(eax, ecx).unwrap();
+        a.fnstcw(word_ptr(ebx)).unwrap();
+        a.fld(dword_ptr(ebx + 4)).unwrap();
+    });
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut actual = executor(&program, config, false);
+    assert_eq!(
+        actual.run(program.stop, 50).unwrap(),
+        RunOutcome::ReachedStop
+    );
+    program.state.x87.set_control(0x037e);
+    program.state.x87.status = 0x8081;
+    actual.state = program.state.clone();
+    let mut reference = executor(&program, config, true);
+    // The preceding FNSTCW still writes when an exception is pending.
+    assert_eq!(
+        actual.run(program.stop, 50),
+        reference.run(program.stop, 50)
+    );
+    same(&actual, &reference);
+    assert_eq!(actual.native.as_ref().unwrap().diagnostics.interprets, 0);
+}
+
+// spec: A64A-FALL-2 A64F-FP-5 A64-REG-5
+#[test]
+fn tier1_region_mxcsr_uses_another_version() {
+    let mut program = fixture(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.addss(xmm0, xmm1).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+    });
+    program.state.regs[1] = 12;
+    program.state.xmm[0][..4].copy_from_slice(&1.0f32.to_le_bytes());
+    program.state.xmm[1][..4].copy_from_slice(&(3.0 * 2f32.powi(-25)).to_le_bytes());
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut actual = executor(&program, config, false);
+    for (mxcsr, versions) in [(0x1fa0, 1), (0x3fa0, 2), (0x9fa0, 3)] {
+        program.state.mxcsr = mxcsr;
+        actual.state = program.state.clone();
+        let mut reference = executor(&program, config, true);
+        assert_eq!(
+            actual.run(program.stop, 100),
+            reference.run(program.stop, 100)
+        );
+        same(&actual, &reference);
+        let native = actual.native.as_ref().unwrap();
+        assert_eq!(native.tier1_versions(CODE), versions);
+        assert_eq!(native.diagnostics.interprets, 0);
+    }
 }

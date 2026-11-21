@@ -708,6 +708,11 @@ fn compare(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     outcome
 }
 
+/// Remember the original flags when generated code cuts a REP comparison.
+pub fn commit_budget_compare(state: &mut CpuState, descriptor: u8, flags: u32) {
+    crate::interpreter::RepContinuation::record_compare(state, descriptor, flags);
+}
+
 /// Called only by native code with the Executor's live bridge and saved CpuState.
 pub unsafe extern "C" fn repeat(
     bridge: *mut std::ffi::c_void,

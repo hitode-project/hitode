@@ -2,7 +2,7 @@
 //! records, and the effect-point invariant of A64-OPT-5. A failure is a bug in
 //! the front end or a pass, so translation asserts success.
 
-use super::ir::{Block, End, Func, Op, RecordId, Type, Value};
+use super::ir::{Block, End, Func, MAX_PLAIN_FACTS, Op, RecordId, Source, Type, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
@@ -13,7 +13,7 @@ pub(crate) enum Error {
     Undominated(Value),
     /// An operand of the wrong type, a jump with the wrong arguments, or a
     /// `Flags` parameter outside block 0: flags reach a head only as the
-    /// entry EFLAGS (A64-FLAG-3).
+    /// numeric operands and a recovery selector (A64-FLAG-3).
     Type(Block),
     /// An effect point reached with an unvalidated floating-point result.
     Pending(Block),
@@ -83,19 +83,61 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
         }
         Ok(())
     };
+    let mut charged = vec![false; blocks.len()];
+    charged[0] = func.resident;
+    for target in blocks.iter().flat_map(|b| b.end.targets()) {
+        charged[target.block.0 as usize] |= func.resident && target.charge > 0;
+    }
+    let mut register_only = vec![false; func.types.len()];
+    for (&p, source) in blocks[0].params.iter().zip(&func.entry) {
+        register_only[p.0 as usize] = matches!(source, Source::Reg(_) | Source::FsBase);
+    }
+    let mut fact_prefix = true;
+    let mut plain_count = 0;
     for (b, block) in blocks.iter().enumerate() {
         if let Some(head) = block.head {
-            activate(head.record, (b, 1), false)?;
+            activate(head.record, (b, 1), charged[b])?;
         }
-        for (i, (_, op)) in block.insts.iter().enumerate() {
+        for (i, (result, op)) in block.insts.iter().enumerate() {
             if let Some(v) = op.uses().find(|&v| !available(v, (b, i + 1))) {
                 return Err(Error::Undominated(v));
             }
             if !typed(func, op) {
                 return Err(Error::Type(Block(b as u32)));
             }
-            if let Op::Store { after, .. } = *op {
-                activate(after, (b, i + 2), false)?;
+            if b == 0 {
+                let only = op.pure() && op.uses().all(|v| register_only[v.0 as usize]);
+                if let Some(result) = *result {
+                    register_only[result.0 as usize] = only;
+                }
+                fact_prefix &= !op.effect() && only || matches!(op, Op::PlainPage { .. });
+            }
+            match *op {
+                Op::PlainPage { addr, .. } => {
+                    plain_count += 1;
+                    if b != 0
+                        || !fact_prefix
+                        || plain_count > MAX_PLAIN_FACTS
+                        || !register_only[addr.0 as usize]
+                    {
+                        return Err(Error::Shape(Block(b as u32)));
+                    }
+                }
+                Op::Store { after, .. } => activate(after, (b, i + 2), false)?,
+                Op::PageCross { addr, width, .. } | Op::FrameDisjoint { addr, width, .. } => {
+                    let mut next = i + 1;
+                    if matches!(op, Op::FrameDisjoint { .. })
+                        && matches!(block.insts.get(next), Some((_, Op::PageCross { .. })))
+                    {
+                        next += 1;
+                    }
+                    if !matches!(block.insts.get(next),
+                        Some((_, Op::Store { addr: a, width: w, .. })) if (addr, width) == (*a, *w))
+                    {
+                        return Err(Error::Shape(Block(b as u32)));
+                    }
+                }
+                _ => {}
             }
         }
         let end = (b, block.insts.len() + 1);
@@ -139,6 +181,7 @@ fn typed(func: &Func, op: &Op) -> bool {
     match *op {
         Op::Int(_, a, b) => int(a) && func.ty(a) == func.ty(b),
         Op::IntUnary(_, a) | Op::FromInt(a) => int(a),
+        Op::Snapshot(v) => is(v, Type::I32),
         Op::Div {
             dividend, divisor, ..
         } => is(dividend, Type::I64) && is(divisor, Type::I32),
@@ -152,8 +195,14 @@ fn typed(func: &Func, op: &Op) -> bool {
         }
         Op::Test { flags, .. } => is(flags, Type::Flags),
         Op::Select { cond, a, b } => is(cond, Type::I32) && func.ty(a) == func.ty(b),
-        Op::Fp(_, a, b) => is(a, Type::F64) && is(b, Type::F64),
-        Op::FpUnary(_, a) | Op::ToInt { value: a, .. } => is(a, Type::F64),
+        Op::Fp32(_, a, b) => is(a, Type::V128) && is(b, Type::V128),
+        Op::Fp(_, a, b) | Op::X87Single(_, a, b) | Op::SseFp64(_, a, b) => {
+            is(a, Type::F64) && is(b, Type::F64)
+        }
+        Op::FpUnary(_, a) | Op::ToInt { value: a, .. } | Op::X87Store { value: a, .. } => {
+            is(a, Type::F64)
+        }
+        Op::X87StoreC1 { value, stored, .. } => is(value, Type::F64) && int(stored),
         Op::Vec(_, a, b) => is(a, Type::V128) && is(b, Type::V128),
         Op::VecUnary(_, a) | Op::VecToInt(_, a) => is(a, Type::V128),
         Op::Load { addr, .. } | Op::Store { addr, .. } | Op::Host(addr) => is(addr, Type::I32),
@@ -163,7 +212,11 @@ fn typed(func: &Func, op: &Op) -> bool {
         }
         Op::X87Load { bits, single, .. } => is(bits, if single { Type::I32 } else { Type::I64 }),
         Op::SseInput { a, b, .. } => is(a, Type::V128) && b.is_none_or(|b| is(b, Type::V128)),
-        Op::Constant(..) | Op::Bits { .. } | Op::Validate => true,
+        Op::Constant(..) | Op::Bits { .. } | Op::Validate | Op::ScopeWritten(_) => true,
+        Op::PlainPage { addr, .. } | Op::PageCross { addr, .. } => is(addr, Type::I32),
+        Op::FrameDisjoint {
+            addr, base, lo, hi, ..
+        } => is(addr, Type::I32) && is(base, Type::I32) && lo < hi,
     }
 }
 
@@ -186,6 +239,14 @@ fn effects(func: &Func) -> Result<(), Error> {
         // fail before the heads the block jumps to (A64-OPT-3).
         let mut committed = false;
         for (_, op) in &block.insts {
+            if let Some(record) = op.region_guard() {
+                if record != region {
+                    return Err(Error::Record(record));
+                }
+                if pending {
+                    return Err(Error::Pending(Block(b as u32)));
+                }
+            }
             if let Op::Store { after, .. } = *op {
                 if pending {
                     return Err(Error::Pending(Block(b as u32)));
@@ -240,7 +301,7 @@ fn effects(func: &Func) -> Result<(), Error> {
 
 /// Immediate dominators by the iterative algorithm of Cooper, Harvey and
 /// Kennedy over reverse postorder. Unreachable blocks have none.
-fn dominators(func: &Func) -> Vec<Option<usize>> {
+pub(super) fn dominators(func: &Func) -> Vec<Option<usize>> {
     let n = func.blocks.len();
     let succ = |b: usize| func.blocks[b].end.targets().map(|t| t.block.0 as usize);
     let mut order = Vec::with_capacity(n);
@@ -304,7 +365,7 @@ fn dominators(func: &Func) -> Vec<Option<usize>> {
     idom
 }
 
-fn dominates(idom: &[Option<usize>], a: usize, mut b: usize) -> bool {
+pub(super) fn dominates(idom: &[Option<usize>], a: usize, mut b: usize) -> bool {
     loop {
         if a == b {
             return true;
@@ -328,6 +389,7 @@ mod tests {
             refund: 0,
             regs: regs.map(|r| r.map(Location::At)),
             eflags: Some(Location::Constant(0)),
+            flag_groups: Vec::new(),
             x87: Some(X87 {
                 top: 0,
                 valid: 0,
@@ -386,10 +448,13 @@ mod tests {
         f.push(
             body,
             Op::Store {
+                scope: None,
                 width: 8,
                 addr: eax,
                 value: bits,
                 after,
+                checked: false,
+                pc: 0,
             },
         );
         let exit = f.record(record([Some(eax); 8]));
@@ -431,10 +496,13 @@ mod tests {
         f.push(
             join,
             Op::Store {
+                scope: None,
                 width: 4,
                 addr: eax,
                 value: eax,
                 after,
+                checked: false,
+                pc: 0,
             },
         );
         let exit = f.record(record([Some(eax); 8]));
@@ -502,10 +570,13 @@ mod tests {
             (
                 None,
                 Op::Store {
+                    scope: None,
                     width: 4,
                     addr: eax,
                     value: eax,
                     after: early,
+                    checked: false,
+                    pc: 0,
                 },
             ),
         );

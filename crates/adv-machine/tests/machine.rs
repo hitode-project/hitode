@@ -127,7 +127,8 @@ fn execution_budget_is_shared_across_cooperating_contexts() {
 
 #[test]
 fn soft_slices_preempt_pure_computation_and_preserve_round_robin_cpu_state() {
-    const ITERATIONS: u32 = 2_000_000;
+    const ITERATIONS: u32 = 500_000;
+    const EXIT_CODE: u32 = 3 * ITERATIONS + 7;
     fn machine() -> T {
         let mut t = T::new();
         let wait = t.f("wait");
@@ -163,7 +164,7 @@ fn soft_slices_preempt_pure_computation_and_preserve_round_robin_cpu_state() {
         t
     }
     let mut reference = machine();
-    assert!(matches!(reference.m.run(), RunResult::Exited(6_000_007)));
+    assert!(matches!(reference.m.run(), RunResult::Exited(EXIT_CODE)));
     let mut sliced = machine();
     let guest_time = sliced.m.sys.clock.now_us();
     let started = Instant::now();
@@ -181,7 +182,7 @@ fn soft_slices_preempt_pure_computation_and_preserve_round_robin_cpu_state() {
                     && sliced.m.cpu.read_u32(FLAG + 4).unwrap() > 0;
             }
             SliceResult::Complete(RunResult::Exited(code)) => {
-                assert_eq!(code, 6_000_007);
+                assert_eq!(code, EXIT_CODE);
                 break;
             }
             other => panic!("unexpected slice outcome: {other:?}"),

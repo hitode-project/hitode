@@ -97,7 +97,9 @@ fn pixel_blends_preserve_every_state_at_budget_cuts_overlap_and_side_exits() {
                     let mut oracle = executor(&p, config, true);
                     assert_eq!(
                         native.run(p.stop, budget).unwrap(),
-                        oracle.run(p.stop, budget).unwrap()
+                        oracle
+                            .run(p.stop, budget.saturating_add(native.fuel_debt))
+                            .unwrap()
                     );
                     same(&native, &oracle);
                     assert_eq!(
@@ -296,7 +298,9 @@ fn mixed_register_banks_and_adjacent_pixel_loops_publish_the_same_architecture()
             let mut oracle = executor(&p, config, true);
             assert_eq!(
                 native.run(p.stop, budget).unwrap(),
-                oracle.run(p.stop, budget).unwrap()
+                oracle
+                    .run(p.stop, budget.saturating_add(native.fuel_debt))
+                    .unwrap()
             );
             same(&native, &oracle);
         }

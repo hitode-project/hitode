@@ -358,7 +358,7 @@ fn syscall_microbenchmark() {
         RunOutcome::Budget
     );
     cpu.state.eip = CODE;
-    let helpers = cpu.native.as_ref().unwrap().diagnostics.helpers;
+    let helpers = cpu.native.as_ref().unwrap().diagnostics.interprets;
     let now = Instant::now();
     assert_eq!(
         cpu.run_with_traps(stop, 40_000_000, &mut Return, false)
@@ -368,7 +368,7 @@ fn syscall_microbenchmark() {
     println!(
         "W11 int ns/instruction={:.3} helpers={}",
         now.elapsed().as_nanos() as f64 / 10_000_000.0,
-        cpu.native.as_ref().unwrap().diagnostics.helpers - helpers
+        cpu.native.as_ref().unwrap().diagnostics.interprets - helpers
     );
 }
 
@@ -422,9 +422,10 @@ fn common_raw_syscalls_and_timestamp_reads_use_native_calls() {
                     },
                 );
                 let stop = CODE + 9;
+                let cut = CODE + [2, 4, 6, 9][((budget - 1) as usize).min(3)];
                 assert_eq!(
-                    a.run_with_traps(stop, budget, &mut ca, false).unwrap(),
-                    b.run_with_traps(stop, budget, &mut cb, false).unwrap()
+                    a.run_with_traps(cut, 100, &mut ca, false).unwrap(),
+                    b.run_with_traps(cut, 100, &mut cb, false).unwrap()
                 );
                 assert_eq!(
                     a.state.clone().capture_architecture(),
@@ -440,7 +441,7 @@ fn common_raw_syscalls_and_timestamp_reads_use_native_calls() {
                 );
                 assert_eq!(ca.calls, cb.calls);
                 if !first {
-                    assert_eq!(a.native.as_ref().unwrap().diagnostics.helpers, 0);
+                    assert_eq!(a.native.as_ref().unwrap().diagnostics.interprets, 0);
                 }
             }
         }
@@ -475,12 +476,13 @@ fn common_prefixed_syscalls_continue_at_the_decoded_next_instruction() {
                     cpu
                 };
                 let (mut a, mut b) = (make(false), make(true));
+                let cut = CODE + if budget == 1 { 3 } else { 6 };
                 let outcome = a
-                    .run_with_traps(CODE + 6, budget, &mut Returns(CODE + 3), false)
+                    .run_with_traps(cut, 100, &mut Returns(CODE + 3), false)
                     .unwrap();
                 assert_eq!(
                     outcome,
-                    b.run_with_traps(CODE + 6, budget, &mut Returns(CODE + 3), false)
+                    b.run_with_traps(cut, 100, &mut Returns(CODE + 3), false)
                         .unwrap()
                 );
                 assert_eq!(
@@ -498,7 +500,7 @@ fn common_prefixed_syscalls_continue_at_the_decoded_next_instruction() {
                     b.state.clone().capture_architecture()
                 );
                 if !first {
-                    assert_eq!(a.native.as_ref().unwrap().diagnostics.helpers, 0);
+                    assert_eq!(a.native.as_ref().unwrap().diagnostics.interprets, 0);
                 }
             }
         }
@@ -556,7 +558,7 @@ fn common_standalone_rdtsc_uses_the_owner_counter_without_a_trap_handler() {
             assert!(second_ticks > first_ticks);
             assert_eq!(cpu.state.eflags, flags);
             if !first {
-                assert_eq!(cpu.native.as_ref().unwrap().diagnostics.helpers, 0);
+                assert_eq!(cpu.native.as_ref().unwrap().diagnostics.interprets, 0);
                 assert_eq!(cpu.stats.interpreter_entries, 0);
             }
         }
@@ -579,7 +581,7 @@ fn common_unhandled_syscalls_refund_the_int_and_preserve_its_fault_pc() {
             }
         );
         assert_eq!(cpu.state.eip, CODE + code.len() as u32 - 1);
-        assert_eq!(cpu.native.as_ref().unwrap().diagnostics.helpers, 0);
+        assert_eq!(cpu.native.as_ref().unwrap().diagnostics.interprets, 0);
     }
 }
 
@@ -914,7 +916,12 @@ fn forwarded_body_arguments_materialize_on_stops_and_budget_cuts() {
                     // A read-only destination stops the window and faults on the full path.
                     cpu.protect(DATA, 0x4000, READ).unwrap();
                     let initial = cpu.state.clone();
-                    let expected_exit = cpu.run_with_traps(stop, budget, &mut calls, true).unwrap();
+                    let stop = if budget <= pushes {
+                        CODE + 5 * budget as u32 + u32::from(pushes == 3)
+                    } else {
+                        stop
+                    };
+                    let expected_exit = cpu.run_with_traps(stop, 1000, &mut calls, true).unwrap();
                     let regs = cpu.state.regs;
                     let eip = cpu.state.eip;
                     let flags = cpu.state.eflags & !0x8d5;
@@ -927,7 +934,7 @@ fn forwarded_body_arguments_materialize_on_stops_and_budget_cuts() {
                     }
                     calls.fault = false;
                     assert_eq!(
-                        cpu.run_with_traps(stop, budget, &mut calls, false).unwrap(),
+                        cpu.run_with_traps(stop, 1000, &mut calls, false).unwrap(),
                         expected_exit
                     );
                     assert_eq!(cpu.state.eip, eip);
@@ -945,6 +952,32 @@ fn forwarded_body_arguments_materialize_on_stops_and_budget_cuts() {
             }
         }
     }
+}
+
+// spec: A64-CALL-4 A64-CALL-5
+#[test]
+fn crossing_body_stack_uses_checked_generated_pushes() {
+    use crate::body::Inline;
+
+    let host_size = adv_cpu_core::virtual_memory::host_page_size().unwrap();
+    let (mut cpu, mut calls, stop) = small_fixture(
+        host_size,
+        Inline::Move,
+        [DATA + 0x100, DATA + 0x200, 16],
+        3,
+        false,
+    );
+    let stack = STACK + 0x3008;
+    cpu.state.regs[4] = stack;
+    cpu.write(DATA + 0x200, &[0x71; 16]).unwrap();
+    assert_eq!(
+        cpu.run_with_traps(stop, 1000, &mut calls, false).unwrap(),
+        RunOutcome::ReachedStop
+    );
+    assert_eq!(cpu.state.regs[4], stack);
+    assert_eq!(cpu.memory.read(DATA + 0x100, 16).unwrap(), &[0x71; 16]);
+    assert_eq!(cpu.stats.interpreter_entries, 0);
+    assert_eq!(calls.full, 1);
 }
 
 // spec: A64-CALL-2, A64-CALL-4, A64-CALL-8

@@ -1,73 +1,30 @@
-//! The execution thread's runtime context and the stubs that move guest
-//! state between `CpuState` and the mapped host registers (A64-REG-1).
+//! The execution thread's runtime context and its generated-code ABI.
 //!
-//! `enter` saves the host's callee-saved registers, loads the guest and
-//! branches to translated code. Translated code leaves through `exit` with
-//! the exit reason in w0 and the guest EIP in w1; `exit` stores the guest
-//! back and returns to `enter`'s caller. Translated code charges x9, the
-//! countdown, with the guest instructions it completes.
-//!
-//! Dispatches do not leave: they branch to `dispatch` with the EIP in w1
-//! and in x2 the host address of a link point to patch, or 0. That stub
-//! saves only the caller-saved registers translated code keeps live (x7-x12
-//! and NZCV; the guest GPRs are callee-saved) and calls the owner's helper,
-//! which returns the unit to continue at, or 0 to leave through `exit`.
-//!
-//! Dynamic transfers carry the guest EIP in w16. `lookup` probes the
-//! indirect table (A64-CTL-6), which the helper fills, and `lookup_slow` asks
-//! the helper. A site that misses the table first loads x4 with its
-//! source EIP and kind (`Runtime::branch`) on its cold path, so the owner
-//! records the indirect branch without a cost on hits.
-//! Returns pop the shadow stack (A64-CTL-4) at x28, whose entries
-//! are {host continuation, guest return EIP} and grow down to a guard page;
-//! `ret_miss` resynchronizes with a few entries below the top before it
-//! looks up, and `shadow_reset` empties the stack after an overflow.
-//!
-//! Checked accesses (A64-MEM-7) call `access` when the page class table rules
-//! out the window: it saves every register translated code may keep live,
-//! has the owner's `access` helper perform the access, and returns the
-//! loaded scalar in w0 or vector in `Runtime::access_vector`; refusal
-//! captures v8-v23 as the fault handler does and leaves as for a host fault
-//! at the access, whose site the helper recorded, through its x87 publish
-//! continuation when present. The stub also preserves the x87 run in v24-v31.
-//!
-//! Instructions the translator leaves to the interpreter call `interpret`
-//! with canonical flags: it stores the guest as `exit` does, has the
-//! owner's `interpret` helper run the instruction, loads the guest back as
-//! `enter` does and returns the helper's status, 0 to continue.
-//!
-//! Units cache SIMD in d8-d15 and v16-v23 (`translate::simd`). They publish
-//! dirty registers before stubs other than `access`, which preserves the
-//! cache and v0-v7 temporaries. Arithmetic flags cross the boundary
-//! in the canonical block-exit form of A64-FLAG-1: NZCV in subtraction sense, x10 a
-//! value whose low byte has PF's parity, x11 a value whose bit 4 is AF, and
-//! x12 DF. x87 state stays in `CpuState` outside x87 runs (A64F-FP-1, A64F-FP-7).
-//!
-//! Each admitted execution gets a private runtime. Recall, deadlines and
-//! host notifications are observed only at exhausted instruction budgets.
-//! Optimized forms enter and leave under the canonical host FPCR (A64-OPT-4).
+//! Fixed entry inputs occupy the first cache line. Each admitted execution
+//! gets a private runtime with its own countdown, exit and recovery data.
+//! Compile-time offsets let the emitters use the same layout as the owner.
 
 use std::mem::offset_of;
 
-use adv_cpu_core::CpuState;
+use adv_cpu_core::{CpuState, floating::ValueFrame};
+#[cfg(native)]
+use adv_cpu_core::{IndirectBranch, IndirectBranchKind, Memory};
 
 use crate::asm::Asm;
-use crate::encode::Extend::Uxtw;
-use crate::encode::Index::{Offset, Post, Pre};
-use crate::encode::Shift::{Lsl, Lsr};
-use crate::encode::Size::{W, X};
+use crate::encode::Size::W;
 use crate::encode::*;
 
-/// What `x29` points at while translated code runs.
-#[repr(C)]
+/// What `x29` points at while translated code runs. The fixed entry inputs
+/// and the saved host SP occupy the first cache line.
+#[repr(C, align(64))]
 #[derive(Debug)]
 pub struct Runtime {
     pub cpu: *mut CpuState,
     /// Guest window base, 4 GiB aligned: `x27`.
     pub window: u64,
-    /// Owner shadow return stack or admitted data alias: `x28`.
+    /// Entry shadow stack (also used during dispatch) or worker data alias.
     pub shadow: u64,
-    /// Safepoint countdown: `x9`.
+    /// Initial safepoint countdown: `x9`.
     pub countdown: u64,
     /// Host stack pointer inside `enter`'s frame, for helpers and `exit`.
     pub host_sp: u64,
@@ -81,13 +38,9 @@ pub struct Runtime {
     pub shadow_top: u64,
     /// Where `shadow_reset` resumes.
     pub resume: u64,
-    /// `access(runtime, address, site, value, kind) -> value`, called by
-    /// `access`; vectors use `access_vector`, and bit 32 set refuses with
-    /// the publication continuation in `access_resume`.
+    /// Performs checked scalar accesses and transfers vectors through the
+    /// operand frame. A refusal returns the recovery registers and continuation.
     pub access: u64,
-    /// Where a refused access stores v8-v23, as the fault handler captures
-    /// them from a host fault.
-    pub fault_simd: u64,
     /// The page class table: a byte per guest page, its permissions as
     /// `Memory::native_permissions` has them.
     pub classes: u64,
@@ -98,27 +51,14 @@ pub struct Runtime {
     pub plain_pages: u64,
     pub memory_base: u32,
     pub memory_pages: u32,
-    /// `interpret(runtime, helper, countdown) -> status`, called by
-    /// `interpret`: 0 continues, else the `Exit` + 1 to leave with at the
-    /// EIP in `CpuState`. Bits 32 and up are the instructions it charges
-    /// beyond the one prepaid, signed.
-    pub interpret: u64,
     /// Read the owning bridge's timestamp without publishing guest state.
     pub timestamp: u64,
-    /// The `Exit` that left translated code.
-    pub exit: u32,
-    /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
-    pub temps: [u64; 2],
-    /// The indirect branch that last missed the table: source EIP in the
-    /// low half, `IndirectBranchKind` above; 0 when the owner has taken it.
-    pub branch: u64,
+    /// `lookup_miss(runtime, eip, branch) -> unit or 0`.
+    pub lookup_miss: u64,
     /// `call(runtime, site, countdown) -> status`, called by `call` for
     /// a host call whose site packs EIP, thunk, INT length and recognition:
-    /// statuses and charges as for `interpret`.
+    /// zero resumes and nonzero carries an exit plus one.
     pub call: u64,
-    /// Values of 8- and 16-byte checked accesses, shared with the owner;
-    /// 16-byte aligned for `ldr q`.
-    pub access_vector: [u8; 16],
     /// `Memory::code_lines`, biased to guest zero: which 64-byte lines of
     /// each page hold watched code.
     pub code_lines: u64,
@@ -126,8 +66,8 @@ pub struct Runtime {
     pub channel_batches: u64,
     #[cfg(test)]
     pub native_batches: u64,
-    /// A refused access's x87 publish continuation, or zero for `fault`.
-    pub access_resume: u64,
+    #[cfg(test)]
+    pub vector_regions: u64,
     /// What direct bodies receive in x0: the window and `classes`.
     pub body: adv_cpu_core::body::BodyContext,
     pub body_value: u32,
@@ -150,23 +90,35 @@ pub struct Runtime {
     pub deferred: u32,
     /// Optimized entry parameters, one 16-byte cell per `Func::entry` source.
     pub opt_params: u64,
-    /// Where `opt_exit` saves the form's `opt_cells` spill cells before it
-    /// discards their stack frame.
-    pub opt_save: u64,
-    pub opt_cells: u64,
-    pub opt_record: u32,
-    /// Nonzero when an optimized form left at a checkpoint for a recall.
-    pub opt_recalled: u32,
-    pub opt_dump: RegisterDump,
+    /// Fixed-offset scratch that belongs to this generated invocation.
+    pub recovery: Recovery,
     /// Nonzero while the owner has a REP continuation.
     pub rep_pending: u32,
-    /// Tier-1 state at the last admitted inline entry.
-    pub opt_entry: OptEntryState,
     /// The machine's `OfferGate` that head entry blocks read (A64-OPT-8).
     pub offer_gate: u64,
-    /// The head EIP of the inline form whose cold exit reached `opt_exit`.
-    pub opt_head: u32,
+    /// Owner access stub entry that preserves optimized register values.
+    pub resident_access: u64,
+    /// An observation or a stable patch that returns to the live unit.
+    pub plan_observation: u64,
+    pub resident_entry_counter: u64,
+    pub resident_crossing_counter: u64,
+    pub(crate) value: u64,
+    pub(crate) value_access: u64,
+    pub(crate) locked_access: u64,
+    pub(crate) value_frame: ValueFrame,
+    /// Absolute-page read and write denial summaries.
+    pub window_spans: [u64; 2],
+    pub scope_frame: [u32; SCOPE_CELLS],
+    /// Scoped chunk's actual MMX writes, plus its TOP and tag change.
+    pub scope_written: u32,
+    /// Bytes actually written in the scoped chunk, four bits per GPR.
+    pub scope_gpr_written: u32,
+    pub row_work: u32,
+    pub row_count: u32,
+    pub row_suppressed: u64,
 }
+
+const _: () = assert!(offset_of!(Runtime, host_sp) + size_of::<u64>() <= 64);
 
 impl Runtime {
     pub fn new(cpu: *mut CpuState, window: u64) -> Self {
@@ -178,9 +130,10 @@ impl Runtime {
             channel_batches: 0,
             #[cfg(test)]
             native_batches: 0,
+            #[cfg(test)]
+            vector_regions: 0,
             cpu,
             window,
-            access_vector: [0; 16],
             shadow: 0,
             countdown: u64::MAX >> 1,
             host_sp: 0,
@@ -190,8 +143,6 @@ impl Runtime {
             shadow_top: 0,
             resume: 0,
             access: 0,
-            access_resume: 0,
-            fault_simd: 0,
             classes: 0,
             alias: 0,
             alias_classes: 0,
@@ -199,10 +150,7 @@ impl Runtime {
             memory_base: 0,
             memory_pages: 0,
             code_lines: 0,
-            interpret: 0,
-            exit: 0,
-            temps: [0; 2],
-            branch: 0,
+            lookup_miss: 0,
             body: adv_cpu_core::body::BodyContext::default(),
             body_value: 0,
             body_stack: 0,
@@ -216,15 +164,24 @@ impl Runtime {
             head_exit: 0,
             deferred: 0,
             opt_params: 0,
-            opt_save: 0,
-            opt_cells: 0,
-            opt_record: 0,
-            opt_recalled: 0,
-            opt_dump: RegisterDump::default(),
+            recovery: Recovery::default(),
             rep_pending: 0,
-            opt_entry: OptEntryState::default(),
             offer_gate: 0,
-            opt_head: 0,
+            resident_access: 0,
+            plan_observation: 0,
+            resident_entry_counter: 0,
+            resident_crossing_counter: 0,
+            value: 0,
+            value_access: 0,
+            locked_access: 0,
+            value_frame: ValueFrame::default(),
+            window_spans: [0; 2],
+            scope_frame: [0; SCOPE_CELLS],
+            scope_written: 0,
+            scope_gpr_written: 0,
+            row_work: 0,
+            row_count: 0,
+            row_suppressed: 0,
         }
     }
 }
@@ -249,73 +206,398 @@ pub struct OptEntryState {
     pub df: u64,
 }
 
+/// Registers used by a precise fault's side-table recipe.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FaultRegisters {
+    pub simd: [[u8; 16]; 16],
+    pub temps: [u64; 2],
+}
+
+#[cfg(native)]
+#[repr(C)]
+pub(crate) struct AccessResult {
+    /// The loaded scalar, or the x87 publication continuation on refusal.
+    pub value: u64,
+    /// Null on success. On refusal the checked-access stub captures registers here.
+    pub recovery: *mut FaultRegisters,
+}
+
+/// Optimized recovery payload. Generated code copies spills out before
+/// unwinding its stack. Only a recovery exit exposes this data to Rust.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct Recovery {
+    pub entry: OptEntryState,
+    pub dump: RegisterDump,
+    pub saved: u64,
+    pub cells: u64,
+    pub record: u32,
+    pub recalled: u32,
+    pub head: u32,
+    pub version: u32,
+    pub detail: u64,
+}
+
+/// An event at a precise guest instruction boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// Instruction fetch failed or the encoding was invalid.
+    Fetch,
+    /// TF or RF requires an exact instruction boundary.
+    DebugFlags,
+    /// The fault capture and side table identify the instruction to replay.
+    Replay,
+    CheckedAccess,
+    /// A waiting x87 instruction has an unmasked exception pending.
+    PendingX87,
+    /// An event answered by the guest system profile.
+    System,
+    /// An architectural exception, with any state changes already committed.
+    Exception(u8),
+    /// A core semantic gap, with the decoded instruction form.
+    Unsupported(u16),
+    /// A software interrupt completed; the owner supplies the trap action.
+    Software {
+        vector: u8,
+        len: u8,
+    },
+}
+
+/// A plan decision that must be applied after leaving generated code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanEvent {
+    BodyStack,
+    ResidentRecovery,
+    DiscoverBackEdge,
+    EnvironmentMiss,
+    OfferReady,
+    /// A proved row domain at its canonical resident entry.
+    ResidentSplitOffer(u8),
+    RowTargetMiss,
+    RowGuardMiss,
+    /// The high word names the resident head, independently of the exit EIP.
+    Probation(u8),
+    /// A detached computation transferred indirectly. The high word holds the source EIP.
+    WorkerBranch(u8),
+}
+
+#[cfg(native)]
+impl PlanEvent {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::BodyStack => "body_stack",
+            Self::ResidentRecovery => "resident_recovery",
+            Self::DiscoverBackEdge => "external_discovery",
+            Self::EnvironmentMiss => "environment_miss",
+            Self::OfferReady => "offer_ready",
+            Self::ResidentSplitOffer(_) => "resident_split_offer",
+            Self::RowTargetMiss => "row_target_miss",
+            Self::RowGuardMiss => "row_guard_miss",
+            Self::Probation(_) => "probation",
+            Self::WorkerBranch(_) => "worker_branch",
+        }
+    }
+}
+
+pub(crate) const DISCOVER_INTERNAL: u16 = 0;
+pub(crate) const RESIDENT_LINK_SAMPLE: u16 = 1;
+#[cfg(native)]
+pub(crate) const RESIDENT_VERSION_MISS: u16 = 3;
+#[cfg(native)]
+pub(crate) const CHECK_OFFER: u16 = 2;
+
+/// The generated entry point's return registers, x0 through x3.
+#[cfg(native)]
+pub(crate) struct RawExit {
+    pub reason: u64,
+    /// The countdown minus completed refills, which can wrap below zero.
+    pub remaining: u64,
+    pub shadow: u64,
+    pub deferred: u64,
+}
+
+#[cfg(native)]
+#[derive(Clone, Copy)]
+pub(crate) struct Enter(pub usize);
+
+#[cfg(native)]
+impl Enter {
+    /// Enters a published stub and unit with the platform call-preserved map.
+    pub(crate) unsafe fn run(self, runtime: *mut Runtime, unit: usize) -> RawExit {
+        let (reason, remaining, shadow, deferred);
+        // SAFETY: the caller keeps the generated code and runtime live. Both
+        // entry stubs preserve the C ABI and return four caller-saved words.
+        unsafe {
+            std::arch::asm!(
+                "blr x16",
+                in("x16") self.0,
+                inlateout("x0") runtime => reason,
+                inlateout("x1") unit => remaining,
+                lateout("x2") shadow,
+                lateout("x3") deferred,
+                clobber_abi("C"),
+            );
+        }
+        RawExit {
+            reason,
+            remaining,
+            shadow,
+            deferred,
+        }
+    }
+}
+
+pub(crate) const REP_BUDGET: u16 = 0x3000;
+pub(crate) const VALUE_MODEL_DISPATCH: u16 = 1;
+
+#[cfg(native)]
+impl RawExit {
+    pub(crate) fn commit_repeat(&self, cpu: &mut CpuState) {
+        if self.reason as u32 & !0xff == u32::from(REP_BUDGET) {
+            adv_cpu_core::strings::commit_budget_compare(
+                cpu,
+                self.reason as u8,
+                (self.reason >> 32) as u32,
+            );
+        }
+    }
+}
+
 /// Why translated code returned to the owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
 pub enum Exit {
-    /// Interpret the instruction at EIP, then dispatch.
-    Interpret = 0,
     /// Look up or translate the unit at EIP.
-    Dispatch = 1,
-    /// A host fault at a side-table site. EIP is not set; the owner takes it
-    /// from the site, where guest state is exactly that before the
-    /// instruction (A64-FLAG-4).
-    Fault = 2,
-    /// The `interpret` helper left a step for the owner to complete.
-    Stepped = 3,
+    Dispatch,
+    Plan(PlanEvent),
+    Event(Event),
     /// A completed service call requests an execution-owner yield.
-    Yield = 4,
+    Yield,
     /// A completed spin backedge requests a productive handoff.
-    Reschedule = 5,
-    Recall = 6,
-    Computation = 7,
+    Reschedule,
+    Recall,
+    Computation,
     /// An ordinary unit exhausted its instruction budget at EIP. The owner
     /// samples EIP, then dispatches.
-    Budget = 8,
+    Budget,
     /// An optimized record and register dump await materialization.
-    Optimized = 9,
+    Optimized,
+    /// Owner dispatch selected a first visit in the core interpreter.
+    FirstVisit,
+    /// Owner dispatch selected a mapping whose writes cannot invalidate code.
+    Untracked,
 }
 
 impl Exit {
+    pub const fn word(self) -> u16 {
+        match self {
+            Self::Event(Event::Fetch) => 0,
+            Self::Dispatch => 1,
+            Self::Event(Event::Replay) => 2,
+            Self::Event(Event::DebugFlags) => 3,
+            Self::Yield => 4,
+            Self::Reschedule => 5,
+            Self::Recall => 6,
+            Self::Computation => 7,
+            Self::Budget => 8,
+            Self::Optimized => 9,
+            Self::FirstVisit => 10,
+            Self::Untracked => 15,
+            Self::Event(Event::PendingX87) => 11,
+            Self::Plan(PlanEvent::BodyStack) => 12,
+            Self::Plan(PlanEvent::ResidentRecovery) => 15,
+            Self::Plan(PlanEvent::DiscoverBackEdge) => 16,
+            Self::Plan(PlanEvent::EnvironmentMiss) => 18,
+            Self::Plan(PlanEvent::OfferReady) => 19,
+            Self::Plan(PlanEvent::RowTargetMiss) => 20,
+            Self::Plan(PlanEvent::RowGuardMiss) => 21,
+            Self::Plan(PlanEvent::ResidentSplitOffer(version)) => 0x4200 | version as u16,
+            Self::Plan(PlanEvent::Probation(version)) => 0x4100 | version as u16,
+            Self::Plan(PlanEvent::WorkerBranch(kind)) => 0x4000 | kind as u16,
+            Self::Event(Event::CheckedAccess) => 13,
+            Self::Event(Event::System) => 14,
+            Self::Event(Event::Exception(vector)) => 0x100 | vector as u16,
+            Self::Event(Event::Unsupported(code)) => 0x8000 | code,
+            Self::Event(Event::Software { vector, len }) => {
+                0x2000 | (len as u16) << 8 | vector as u16
+            }
+        }
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.word() as u32
+    }
+
     pub fn from_raw(raw: u32) -> Option<Self> {
         match raw {
-            0 => Some(Self::Interpret),
+            0 => Some(Self::Event(Event::Fetch)),
+            3 => Some(Self::Event(Event::DebugFlags)),
             1 => Some(Self::Dispatch),
-            2 => Some(Self::Fault),
-            3 => Some(Self::Stepped),
+            2 => Some(Self::Event(Event::Replay)),
             4 => Some(Self::Yield),
             5 => Some(Self::Reschedule),
             6 => Some(Self::Recall),
             7 => Some(Self::Computation),
             8 => Some(Self::Budget),
             9 => Some(Self::Optimized),
+            11 => Some(Self::Event(Event::PendingX87)),
+            12 => Some(Self::Plan(PlanEvent::BodyStack)),
+            13 => Some(Self::Event(Event::CheckedAccess)),
+            14 => Some(Self::Event(Event::System)),
+            15 => Some(Self::Plan(PlanEvent::ResidentRecovery)),
+            16 => Some(Self::Plan(PlanEvent::DiscoverBackEdge)),
+            18 => Some(Self::Plan(PlanEvent::EnvironmentMiss)),
+            19 => Some(Self::Plan(PlanEvent::OfferReady)),
+            20 => Some(Self::Plan(PlanEvent::RowTargetMiss)),
+            21 => Some(Self::Plan(PlanEvent::RowGuardMiss)),
+            0x100..=0x1ff => Some(Self::Event(Event::Exception(raw as u8))),
+            0x8000..=0xffff => Some(Self::Event(Event::Unsupported((raw & 0x7fff) as u16))),
+            0x2000..=0x2fff => Some(Self::Event(Event::Software {
+                vector: raw as u8,
+                len: (raw >> 8 & 15) as u8,
+            })),
+            0x3000..=0x30ff => Some(Self::Budget),
+            0x4001..=0x4003 => Some(Self::Plan(PlanEvent::WorkerBranch(raw as u8))),
+            0x4100..=0x41ff => Some(Self::Plan(PlanEvent::Probation(raw as u8))),
+            0x4200..=0x42ff => Some(Self::Plan(PlanEvent::ResidentSplitOffer(raw as u8))),
             _ => None,
         }
     }
 }
 
-/// Byte offsets of the stubs in their code.
-pub struct Stubs {
-    pub code: Vec<u32>,
-    pub enter: usize,
-    pub opt_enter: usize,
-    pub opt_exit: usize,
-    pub exit: usize,
-    /// Where the fault handler resumes a faulting site.
-    pub fault: usize,
-    /// Where translated code dispatches without leaving.
-    pub dispatch: usize,
-    pub lookup: usize,
-    pub lookup_slow: usize,
-    pub ret_miss: usize,
-    /// Where the fault handler resumes a shadow stack overflow.
-    pub shadow_reset: usize,
-    /// Where a checked access the window cannot take calls the owner.
-    pub access: usize,
-    /// Where translated code has the owner interpret an instruction.
-    pub interpret: usize,
-    /// Where translated code calls an INT 0x2e handler.
-    pub call: usize,
+/// A saved guest CPU and its continuation between the owner and workers.
+/// Identifies the worker that admitted a resident checkpoint.
+#[cfg(native)]
+#[derive(Clone, Copy)]
+pub(crate) struct ScopedOffer {
+    pub(crate) version: u8,
+    pub(crate) row_work: u32,
+    pub(crate) entry: usize,
+    pub(crate) generation: u64,
+}
+
+/// The shadow return stack: entries of {host continuation, guest EIP}
+/// growing down from sentinels that never match, over guard pages.
+#[cfg(native)]
+pub(crate) struct ShadowStack {
+    base: usize,
+    len: usize,
+    guard: usize,
+}
+
+#[cfg(native)]
+impl ShadowStack {
+    const ENTRIES: usize = 1 << 16;
+
+    pub(crate) fn new() -> Result<Self, String> {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let guard = page.max(16 << 10);
+        let len = guard + (Self::ENTRIES + SHADOW_SENTINELS) * 16;
+        let len = len.next_multiple_of(page);
+        // SAFETY: a fresh anonymous mapping.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err("cannot map the shadow stack".into());
+        }
+        let stack = Self {
+            base: base as usize,
+            len,
+            guard,
+        };
+        // SAFETY: inside the mapping just made.
+        let protected = unsafe {
+            libc::mprotect(
+                base.cast::<u8>().add(guard).cast(),
+                len - guard,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        };
+        if protected != 0 {
+            return Err("cannot protect the shadow stack".into());
+        }
+        let top = stack.top() as *mut u64;
+        for k in 0..SHADOW_SENTINELS {
+            // SAFETY: the sentinels are the last entries of the mapping.
+            unsafe {
+                top.add(2 * k).write(0);
+                top.add(2 * k + 1).write(u64::MAX);
+            }
+        }
+        Ok(stack)
+    }
+
+    /// The empty stack pointer, just below the sentinels.
+    pub(crate) fn top(&self) -> u64 {
+        (self.base + self.len - SHADOW_SENTINELS * 16) as u64
+    }
+
+    pub(crate) fn guard(&self) -> (usize, usize) {
+        (self.base, self.base + self.guard)
+    }
+}
+
+#[cfg(native)]
+impl Drop for ShadowStack {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `new` made.
+        unsafe { libc::munmap(self.base as *mut libc::c_void, self.len) };
+    }
+}
+
+#[derive(Clone)]
+pub struct ExecutionContext {
+    pub(crate) cpu: CpuState,
+    #[cfg(native)]
+    pub(crate) offered: Option<(u32, Option<ScopedOffer>)>,
+    #[cfg(native)]
+    pub(crate) shadow: Option<SavedShadow>,
+    pub(crate) resume: Option<(u32, Exit)>,
+    pub(crate) fuel_debt: u64,
+}
+
+/// A suspended owner's return predictions in their own guarded mapping.
+#[cfg(native)]
+#[derive(Clone)]
+pub(crate) struct SavedShadow {
+    pub(crate) stack: std::sync::Arc<ShadowStack>,
+    pub(crate) generation: std::sync::Arc<()>,
+    pub(crate) pointer: u64,
+}
+
+impl ExecutionContext {
+    pub fn cpu(&self) -> &CpuState {
+        &self.cpu
+    }
+
+    pub fn cpu_mut(&mut self) -> &mut CpuState {
+        &mut self.cpu
+    }
+
+    #[cfg(native)]
+    pub(crate) fn has_resume(&self) -> bool {
+        self.resume.is_some_and(|(pc, _)| pc == self.cpu.eip)
+    }
+
+    #[cfg(native)]
+    pub(crate) fn scoped_offer(&self) -> Option<ScopedOffer> {
+        self.offered.filter(|&(pc, _)| pc == self.cpu.eip)?.1
+    }
+
+    #[cfg(native)]
+    pub(crate) fn finish_computation(&mut self, exit: Exit) {
+        self.offered = (exit == Exit::Recall).then_some((self.cpu.eip, None));
+        self.resume = matches!(exit, Exit::Event(_)).then_some((self.cpu.eip, exit));
+    }
 }
 
 /// Indirect table entries; the slot folds high EIP bits into the low bits.
@@ -333,40 +615,11 @@ pub const SHADOW_SENTINELS: usize = 4;
 pub const ACCESS_STORE: u32 = 32;
 pub const ACCESS_SIGNED: u32 = 64;
 
-const fn r(number: u8) -> Reg {
-    Reg::new(number)
-}
-
-const fn v(number: u8) -> VReg {
-    VReg::new(number)
-}
-
-const SP: Reg = Reg::new(31);
-const RUNTIME: Reg = Reg::new(29);
-const WINDOW: Reg = Reg::new(27);
-const FRAME: i32 = 160;
-
-const fn field(offset: usize) -> u32 {
+pub(crate) const fn field(offset: usize) -> u32 {
     offset as u32
 }
 
-const CPU: u32 = field(offset_of!(Runtime, cpu));
-const WINDOW_BASE: u32 = field(offset_of!(Runtime, window));
-const SHADOW: u32 = field(offset_of!(Runtime, shadow));
-const COUNTDOWN: u32 = field(offset_of!(Runtime, countdown));
-const HOST_SP: u32 = field(offset_of!(Runtime, host_sp));
-const EXIT: u32 = field(offset_of!(Runtime, exit));
-const HELPER: u32 = field(offset_of!(Runtime, helper));
 pub(crate) const TABLE: u32 = field(offset_of!(Runtime, table));
-const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
-const RESUME: u32 = field(offset_of!(Runtime, resume));
-const ACCESS: u32 = field(offset_of!(Runtime, access));
-const ACCESS_RESUME: u32 = field(offset_of!(Runtime, access_resume));
-pub(crate) const ACCESS_VECTOR: u32 = field(offset_of!(Runtime, access_vector));
-const _: () = assert!(ACCESS_VECTOR.is_multiple_of(16));
-const FAULT_SIMD: u32 = field(offset_of!(Runtime, fault_simd));
-const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
-const CALL: u32 = field(offset_of!(Runtime, call));
 pub(crate) const TIMESTAMP: u32 = field(offset_of!(Runtime, timestamp));
 #[cfg(test)]
 pub(crate) const CHANNEL_BATCHES: u32 = field(offset_of!(Runtime, channel_batches));
@@ -386,24 +639,27 @@ pub(crate) const COMPUTATION_PENDING_MASK: u32 =
     field(offset_of!(Runtime, computation_pending_mask));
 pub(crate) const COMPLETED: u32 = field(offset_of!(Runtime, completed));
 pub(crate) const COMPLETED_LIMIT: u32 = field(offset_of!(Runtime, completed_limit));
+pub(crate) const SCOPE_CELLS: usize = 8;
+pub(crate) const SCOPE_FRAME: u32 = field(offset_of!(Runtime, scope_frame));
+pub(crate) const SCOPE_GPR_WRITTEN: u32 = field(offset_of!(Runtime, scope_gpr_written));
+pub(crate) const SCOPE_WRITTEN: u32 = field(offset_of!(Runtime, scope_written));
+pub(crate) const ROW_WORK: u32 = field(offset_of!(Runtime, row_work));
+pub(crate) const ROW_COUNT: u32 = field(offset_of!(Runtime, row_count));
+#[cfg(native)]
+pub(crate) const ROW_SUPPRESSED: u32 = field(offset_of!(Runtime, row_suppressed));
 pub(crate) const HEAD_EXIT: u32 = field(offset_of!(Runtime, head_exit));
-pub(crate) const OPT_RECALLED: u32 = field(offset_of!(Runtime, opt_recalled));
-pub(crate) const OPT_CELLS: u32 = field(offset_of!(Runtime, opt_cells));
-pub(crate) const OPT_HEAD: u32 = field(offset_of!(Runtime, opt_head));
+pub(crate) const RECOVERY_RECALLED: u32 = field(offset_of!(Runtime, recovery.recalled));
+pub(crate) const RECOVERY_CELLS: u32 = field(offset_of!(Runtime, recovery.cells));
+pub(crate) const RECOVERY_HEAD: u32 = field(offset_of!(Runtime, recovery.head));
 pub(crate) const OFFER_GATE: u32 = field(offset_of!(Runtime, offer_gate));
 pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
 /// Inner checkpoints a recall waits through before it leaves where it is:
 /// a few outer iterations of a hot computation.
-pub(crate) const RECALL_GRACE: u32 = 64;
-pub(crate) const COMPUTATION_SLICE: u32 = 1 << 16;
-pub(crate) const INDIRECT_BRANCH: u32 = BRANCH;
+pub(crate) use crate::policy::worker::{COMPUTATION_SLICE, RECALL_GRACE};
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CODE_LINES: u32 = field(offset_of!(Runtime, code_lines));
-pub(crate) const CPU_STATE: u32 = CPU;
-const TEMPS: i32 = offset_of!(Runtime, temps) as i32;
-const BRANCH: u32 = field(offset_of!(Runtime, branch));
-const REGS: i32 = offset_of!(CpuState, regs) as i32;
+pub(crate) const CPU_STATE: u32 = field(offset_of!(Runtime, cpu));
 pub(crate) const EIP: u32 = field(offset_of!(CpuState, eip));
 pub(crate) const CLOCK_READ: u32 = field(offset_of!(CpuState, clock_read));
 pub(crate) const FS_BASE: u32 = field(offset_of!(CpuState, fs_base));
@@ -423,704 +679,65 @@ pub(crate) const SEGMENTS: u32 = field(offset_of!(CpuState, segments.selectors))
 /// CF PF AF ZF SF DF OF: the flags the stubs map.
 pub const MAPPED_FLAGS: u32 = 0xcd5;
 
-/// Host callee-saved registers, in frame order after x29/x30.
-const SAVED: [(u8, u8); 5] = [(19, 20), (21, 22), (23, 24), (25, 26), (27, 28)];
-const SAVED_V: [(u8, u8); 4] = [(8, 9), (10, 11), (12, 13), (14, 15)];
+#[cfg(native)]
+pub(crate) const RECOVERY_VERSION: u32 = field(offset_of!(Runtime, recovery.version));
+pub(crate) const PLAN_OBSERVATION: u32 = field(offset_of!(Runtime, plan_observation));
 
-/// Guest register pairs by `CpuState::regs` index.
-const GUEST: [(u8, u8); 4] = [(19, 20), (21, 22), (23, 24), (25, 26)];
+/// Byte offsets from a backward link's patch word.
+pub(crate) const BACK_COUNT: usize = 20;
+pub(crate) const SENSOR_BYTES: usize = 5 * 4;
+pub(crate) const BACK_UNIT: usize = BACK_COUNT + SENSOR_BYTES;
+pub(crate) const BACK_COUNTER: usize = BACK_UNIT + 4;
+pub(crate) const BACK_END: usize = BACK_COUNTER + 8 + 16;
 
-pub fn stubs() -> Stubs {
-    let mut asm = Asm::new();
-    let enter = asm.offset();
-    emit_enter(&mut asm);
-    let opt_enter = asm.offset();
-    emit_opt_enter(&mut asm);
-    let exit_label = asm.label();
-    asm.bind(exit_label);
-    let exit = asm.offset();
-    emit_exit(&mut asm);
-    let fault_label = asm.label();
-    asm.bind(fault_label);
-    let fault = asm.offset();
-    asm.emit_all(&[movz(W, r(0), Exit::Fault as u16, 0), movz(W, r(1), 0, 0)]);
-    asm.b(exit_label);
-    let dispatch_label = asm.label();
-    asm.bind(dispatch_label);
-    let dispatch = asm.offset();
-    emit_dispatch(&mut asm, exit_label);
-    let (lookup_label, slow_label) = (asm.label(), asm.label());
-    asm.bind(lookup_label);
-    let lookup = asm.offset();
-    emit_probe(&mut asm, slow_label);
-    asm.bind(slow_label);
-    let lookup_slow = asm.offset();
+/// A64A-PLACE-3. Only scratch registers are live here. Neither the active
+/// countdown nor its one-word replacement changes the guest NZCV image.
+pub(crate) fn emit_sensor(
+    asm: &mut Asm,
+    counter: crate::asm::Label,
+    address: Reg,
+    value: Reg,
+    trigger: crate::asm::Label,
+) {
+    asm.ldr_literal(address, counter);
     asm.emit_all(&[
-        str(X, r(4), RUNTIME, BRANCH),
-        mov(W, r(1), r(16)),
-        movz(X, r(2), 0, 0),
+        ldr(W, value, address, 0),
+        sub_imm(W, value, value, 1, false),
+        str(W, value, address, 0),
     ]);
-    asm.b(dispatch_label);
-    let ret_miss = asm.offset();
-    emit_ret_miss(&mut asm, lookup_label);
-    let shadow_reset = asm.offset();
-    asm.emit_all(&[
-        ldr(X, r(28), RUNTIME, SHADOW_TOP),
-        ldr(X, Reg::LR, RUNTIME, RESUME),
-        br(Reg::LR),
-    ]);
-    let access = asm.offset();
-    emit_access(&mut asm, fault_label);
-    let interpret = asm.offset();
-    emit_interpret(&mut asm, INTERPRET);
-    let call = asm.offset();
-    emit_interpret(&mut asm, CALL);
-    let opt_exit = asm.offset();
-    emit_opt_exit(&mut asm);
-    Stubs {
-        call,
-        code: asm.finish(),
-        enter,
-        opt_enter,
-        opt_exit,
-        exit,
-        fault,
-        dispatch,
-        lookup,
-        lookup_slow,
-        ret_miss,
-        shadow_reset,
-        access,
-        interpret,
-    }
+    asm.cbz(W, false, value, trigger);
 }
 
-/// `interpret` or `call`, by the runtime function at `slot`, called with
-/// x1 its argument and canonical flags. Keeps x7-x9 and x27-x29; the guest
-/// registers and flags are what the owner left in `CpuState`, x0-x6 and
-/// x13-x17 are free.
-fn emit_interpret(asm: &mut Asm, slot: u32) {
-    asm.emit_all(&[
-        stp(X, Pre, r(7), r(8), SP, -32),
-        stp(X, Offset, r(9), Reg::LR, SP, 16),
-        mov(X, r(6), r(1)),
-        ldr(X, r(0), RUNTIME, CPU),
-    ]);
-    emit_store_guest(asm);
-    asm.emit_all(&[
-        mov(X, r(0), RUNTIME),
-        mov(X, r(1), r(6)),
-        mov(X, r(2), r(9)),
-        ldr(X, r(16), RUNTIME, slot),
-        // The frame chain records the guest return address for samplers.
-        stp(X, Pre, RUNTIME, Reg::LR, SP, -16),
-        add_imm(X, RUNTIME, SP, 0, false),
-        blr(r(16)),
-        ldp(X, Post, RUNTIME, Reg::LR, SP, 16),
-        mov(X, r(6), r(0)),
-        ldr(X, r(0), RUNTIME, CPU),
-    ]);
-    emit_load_guest(asm);
-    asm.emit_all(&[
-        ldp(X, Offset, r(9), Reg::LR, SP, 16),
-        ldp(X, Post, r(7), r(8), SP, 32),
-        sbfx(X, r(1), r(6), 32, 32),
-        sub(X, r(9), r(9), r(1), Lsl, 0),
-        mov(W, r(0), r(6)),
-        ret(Reg::LR),
-    ]);
+pub(crate) const VALUE_ACCESS_REFUSED: u32 = 1 << 9;
+pub(crate) const VALUE_STORE_READY: u32 = 1 << 8;
+pub(crate) const VALUE_UNSUPPORTED: u32 = 1 << 15;
+pub(crate) const VALUE_ADDRESS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, address));
+pub(crate) const VALUE_OPERAND: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, operand));
+pub(crate) const VALUE_XMM: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, xmm));
+pub(crate) const VALUE_MMX: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, mmx));
+pub(crate) const VALUE_REGS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, regs));
+pub(crate) const VALUE_EFLAGS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, eflags));
+pub(crate) const VALUE_MXCSR: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, mxcsr));
+const VALUE_FRAME: u32 = field(offset_of!(Runtime, value_frame));
+
+/// Host base of the alias data view relative to guest address zero.
+#[cfg(native)]
+pub(crate) fn alias_base(memory: &Memory) -> u64 {
+    (memory.ptr.as_ptr() as usize).wrapping_sub(memory.base as usize) as u64
 }
 
-/// Saves what light helpers keep (A64-REG-4): x5-x17, NZCV, LR and the
-/// XMM registers units cache.
-fn emit_save_light(asm: &mut Asm) {
-    asm.emit_all(&[
-        stp(X, Pre, r(5), r(6), SP, -128),
-        stp(X, Offset, r(7), r(8), SP, 16),
-        stp(X, Offset, r(9), r(10), SP, 32),
-        stp(X, Offset, r(11), r(12), SP, 48),
-        stp(X, Offset, r(13), r(14), SP, 64),
-        stp(X, Offset, r(15), r(16), SP, 80),
-        mrs_nzcv(r(16)),
-        stp(X, Offset, r(17), r(16), SP, 96),
-        str(X, Reg::LR, SP, 112),
-        stp_v(VSize::Q, Pre, v(16), v(17), SP, -128),
-        stp_v(VSize::Q, Offset, v(18), v(19), SP, 32),
-        stp_v(VSize::Q, Offset, v(20), v(21), SP, 64),
-        stp_v(VSize::Q, Offset, v(22), v(23), SP, 96),
-    ]);
-}
-
-/// Restores what `emit_save_light` saved; uses x1.
-fn emit_restore_light(asm: &mut Asm) {
-    asm.emit_all(&[
-        ldp_v(VSize::Q, Offset, v(22), v(23), SP, 96),
-        ldp_v(VSize::Q, Offset, v(20), v(21), SP, 64),
-        ldp_v(VSize::Q, Offset, v(18), v(19), SP, 32),
-        ldp_v(VSize::Q, Post, v(16), v(17), SP, 128),
-        ldr(X, Reg::LR, SP, 112),
-        ldp(X, Offset, r(17), r(1), SP, 96),
-        msr_nzcv(r(1)),
-        ldp(X, Offset, r(15), r(16), SP, 80),
-        ldp(X, Offset, r(13), r(14), SP, 64),
-        ldp(X, Offset, r(11), r(12), SP, 48),
-        ldp(X, Offset, r(9), r(10), SP, 32),
-        ldp(X, Offset, r(7), r(8), SP, 16),
-        ldp(X, Post, r(5), r(6), SP, 128),
-    ]);
-}
-
-/// `access`, called with w1 the guest address, x2 the site, w3 a value to
-/// store and w4 the kind. Keeps x5-x17 and NZCV; x0-x4 and x30 are free
-/// wherever translated code accesses memory.
-/// Also preserves v0-v7 temporaries, the v16-v23 cache and v24-v31 x87 pairs;
-/// AAPCS64 keeps the MMX halves of v8-v15.
-fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
-    emit_save_light(asm);
-    asm.emit_all(&[
-        stp_v(VSize::Q, Pre, v(0), v(1), SP, -256),
-        stp_v(VSize::Q, Offset, v(2), v(3), SP, 32),
-        stp_v(VSize::Q, Offset, v(4), v(5), SP, 64),
-        stp_v(VSize::Q, Offset, v(6), v(7), SP, 96),
-        stp_v(VSize::Q, Offset, v(24), v(25), SP, 128),
-        stp_v(VSize::Q, Offset, v(26), v(27), SP, 160),
-        stp_v(VSize::Q, Offset, v(28), v(29), SP, 192),
-        stp_v(VSize::Q, Offset, v(30), v(31), SP, 224),
-        mov(X, r(0), RUNTIME),
-        ldr(X, r(16), RUNTIME, ACCESS),
-        // The frame chain records the guest return address for samplers.
-        stp(X, Pre, RUNTIME, Reg::LR, SP, -16),
-        add_imm(X, RUNTIME, SP, 0, false),
-        blr(r(16)),
-        ldp(X, Post, RUNTIME, Reg::LR, SP, 16),
-        ldp_v(VSize::Q, Offset, v(30), v(31), SP, 224),
-        ldp_v(VSize::Q, Offset, v(28), v(29), SP, 192),
-        ldp_v(VSize::Q, Offset, v(26), v(27), SP, 160),
-        ldp_v(VSize::Q, Offset, v(24), v(25), SP, 128),
-        ldp_v(VSize::Q, Offset, v(6), v(7), SP, 96),
-        ldp_v(VSize::Q, Offset, v(4), v(5), SP, 64),
-        ldp_v(VSize::Q, Offset, v(2), v(3), SP, 32),
-        ldp_v(VSize::Q, Post, v(0), v(1), SP, 256),
-    ]);
-    emit_restore_light(asm);
-    let refused = asm.label();
-    asm.tbz(true, r(0), 32, refused);
-    asm.emit(ret(Reg::LR));
-    // Refused: the site faults, with the state exactly that before it,
-    // dirty SIMD registers included.
-    asm.bind(refused);
-    asm.emit(ldr(X, r(16), RUNTIME, FAULT_SIMD));
-    for n in 0..8u8 {
-        let (low, high) = (v(8 + 2 * n), v(9 + 2 * n));
-        asm.emit(stp_v(VSize::Q, Offset, low, high, r(16), 32 * i32::from(n)));
-    }
-    asm.emit(ldr(X, r(0), RUNTIME, ACCESS_RESUME));
-    asm.cbz(X, false, r(0), fault);
-    asm.emit(br(r(0)));
-}
-
-/// The indirect table probe for the EIP in w16: branches to its unit, or to
-/// `miss` with w16 intact. Uses x6 and x17.
-fn emit_probe(asm: &mut Asm, miss: crate::asm::Label) {
-    asm.emit_all(&[
-        ldr(X, r(17), RUNTIME, TABLE),
-        // `table_slot`: fold the high half into the low 16 bits.
-        eor(W, r(6), r(16), r(16), Lsr, 16),
-        ubfx(W, r(6), r(6), 0, 16),
-        add(X, r(17), r(17), r(6), Lsl, 4),
-        ldp(X, Offset, r(6), r(17), r(17), 0),
-        sub(X, r(6), r(6), r(16), Lsl, 0),
-    ]);
-    asm.cbz(X, true, r(6), miss);
-    asm.emit(br(r(17)));
-}
-
-/// A return to the EIP in w16 missed the top shadow entry: returns through
-/// the first of the next entries that matches, popping it and those above,
-/// or looks the EIP up and leaves the stack alone.
-fn emit_ret_miss(asm: &mut Asm, lookup: crate::asm::Label) {
-    let hits: Vec<_> = (1..SHADOW_SENTINELS).map(|_| asm.label()).collect();
-    for (depth, &hit) in (1u32..).zip(&hits) {
-        asm.emit_all(&[
-            ldr(X, r(17), r(28), 16 * depth + 8),
-            sub(X, r(17), r(17), r(16), Lsl, 0),
-        ]);
-        asm.cbz(X, false, r(17), hit);
-    }
-    asm.b(lookup);
-    for (depth, hit) in (1u32..).zip(hits) {
-        asm.bind(hit);
-        asm.emit_all(&[
-            ldr(X, Reg::LR, r(28), 16 * depth),
-            add_imm(X, r(28), r(28), 16 * (depth + 1), false),
-            ret(Reg::LR),
-        ]);
-    }
-}
-
-/// `dispatch`: w1 the guest EIP, x2 a link point or 0. Calls the helper with
-/// the runtime, and continues at the unit it returns or leaves with
-/// `Exit::Dispatch` when it returns 0.
-fn emit_dispatch(asm: &mut Asm, exit: crate::asm::Label) {
-    asm.emit_all(&[
-        // The helper may empty the shadow stack.
-        str(X, r(28), RUNTIME, SHADOW),
-        stp(X, Pre, r(1), r(2), SP, -80),
-        stp(X, Offset, r(7), r(8), SP, 16),
-        stp(X, Offset, r(9), r(10), SP, 32),
-        stp(X, Offset, r(11), r(12), SP, 48),
-        mrs_nzcv(r(17)),
-        stp(X, Offset, r(17), Reg::LR, SP, 64),
-        mov(X, r(0), RUNTIME),
-        ldr(X, r(16), RUNTIME, HELPER),
-        blr(r(16)),
-        ldp(X, Offset, r(17), Reg::LR, SP, 64),
-        msr_nzcv(r(17)),
-        ldp(X, Offset, r(11), r(12), SP, 48),
-        ldp(X, Offset, r(9), r(10), SP, 32),
-        ldp(X, Offset, r(7), r(8), SP, 16),
-        ldp(X, Post, r(1), r(2), SP, 80),
-        ldr(X, r(28), RUNTIME, SHADOW),
-    ]);
-    let leave = asm.label();
-    asm.cbz(X, false, r(0), leave);
-    asm.emit(br(r(0)));
-    asm.bind(leave);
-    asm.emit(movz(W, r(0), Exit::Dispatch as u16, 0));
-    asm.b(exit);
-}
-
-fn emit_enter_frame(asm: &mut Asm) {
-    asm.emit(stp(X, Pre, r(29), Reg::LR, SP, -FRAME));
-    for (i, (a, b)) in SAVED.into_iter().enumerate() {
-        asm.emit(stp(X, Offset, r(a), r(b), SP, 16 + 16 * i as i32));
-    }
-    for (i, (a, b)) in SAVED_V.into_iter().enumerate() {
-        asm.emit(stp_v(VSize::D, Offset, v(a), v(b), SP, 96 + 16 * i as i32));
-    }
-    asm.emit_all(&[
-        mov_sp(RUNTIME, r(0)),
-        mov_sp(r(16), SP),
-        str(X, r(16), RUNTIME, HOST_SP),
-        mov(X, r(17), r(1)),
-    ]);
-}
-
-/// `enter(runtime: *mut Runtime, target: usize)` in x0 and x1.
-fn emit_enter(asm: &mut Asm) {
-    emit_enter_frame(asm);
-    asm.emit_all(&[
-        ldr(X, WINDOW, RUNTIME, WINDOW_BASE),
-        ldr(X, r(28), RUNTIME, SHADOW),
-        ldr(X, r(9), RUNTIME, COUNTDOWN),
-        ldr(X, r(0), RUNTIME, CPU),
-    ]);
-    emit_load_guest(asm);
-    asm.emit(br(r(17)));
-}
-
-/// `opt_enter(runtime: *mut Runtime, target: usize)` for optimized forms,
-/// which load all live state from `opt_params` and need no guest register setup.
-fn emit_opt_enter(asm: &mut Asm) {
-    emit_enter_frame(asm);
-    asm.emit_all(&[
-        ldr(X, r(28), RUNTIME, SHADOW),
-        ldr(X, r(9), RUNTIME, COUNTDOWN),
-        br(r(17)),
-    ]);
-}
-
-/// Loads the guest registers and flags from the `CpuState` at x0; uses x1
-/// to x3 and x16.
-fn emit_load_guest(asm: &mut Asm) {
-    for (i, (a, b)) in GUEST.into_iter().enumerate() {
-        if a == 23 {
-            // ESP and EBP live biased by the window base.
-            asm.emit_all(&[
-                ldp(W, Offset, r(16), r(1), r(0), REGS + 8 * i as i32),
-                add_ext(X, r(23), WINDOW, r(16), Uxtw, 0),
-                add_ext(X, r(24), WINDOW, r(1), Uxtw, 0),
-            ]);
-        } else {
-            asm.emit(ldp(W, Offset, r(a), r(b), r(0), REGS + 8 * i as i32));
-        }
-    }
-    asm.emit(ldr(W, r(1), r(0), EFLAGS));
-    emit_load_flags(asm);
-}
-
-/// Establish canonical NZCV and lazy PF, AF and DF from w1.
-pub(crate) fn emit_load_flags(asm: &mut Asm) {
-    asm.emit_all(&[
-        // NZCV in subtraction sense: SF ZF !CF OF.
-        and_imm(W, r(2), r(1), 0xc0),
-        ubfx(W, r(3), r(1), 0, 1),
-        eor_imm(W, r(3), r(3), 1),
-        orr(W, r(2), r(2), r(3), Lsl, 5),
-        ubfx(W, r(3), r(1), 11, 1),
-        orr(W, r(2), r(2), r(3), Lsl, 4),
-        lsl_imm(W, r(2), r(2), 24),
-        msr_nzcv(r(2)),
-        // 0 has even parity and 1 odd, so x10 = !PF reproduces PF.
-        ubfx(W, r(10), r(1), 2, 1),
-        eor_imm(W, r(10), r(10), 1),
-        and_imm(W, r(11), r(1), 0x10),
-        ubfx(W, r(12), r(1), 10, 1),
-    ]);
-}
-
-/// Translated code arrives with the `Exit` in w0 and the guest EIP in w1.
-fn emit_exit(asm: &mut Asm) {
-    asm.emit_all(&[
-        str(W, r(0), RUNTIME, EXIT),
-        stp(X, Offset, r(7), r(8), RUNTIME, TEMPS),
-        ldr(X, r(0), RUNTIME, CPU),
-        str(W, r(1), r(0), EIP),
-    ]);
-    emit_store_guest(asm);
-    asm.emit_all(&[
-        str(X, r(9), RUNTIME, COUNTDOWN),
-        str(X, r(28), RUNTIME, SHADOW),
-        ldr(X, r(16), RUNTIME, HOST_SP),
-        mov_sp(SP, r(16)),
-    ]);
-    for (i, (a, b)) in SAVED_V.into_iter().enumerate() {
-        asm.emit(ldp_v(VSize::D, Offset, v(a), v(b), SP, 96 + 16 * i as i32));
-    }
-    for (i, (a, b)) in SAVED.into_iter().enumerate() {
-        asm.emit(ldp(X, Offset, r(a), r(b), SP, 16 + 16 * i as i32));
-    }
-    asm.emit_all(&[ldp(X, Post, r(29), Reg::LR, SP, FRAME), ret(Reg::LR)]);
-}
-
-// spec: A64-OPT-4, A64-OPT-6, A64-OPT-7
-fn emit_opt_exit(asm: &mut Asm) {
-    let dump = offset_of!(Runtime, opt_dump) as u32;
-    // Capture before borrowing any allocatable register. x16/x17 are emission scratch.
-    for n in 0..31 {
-        asm.emit(str(X, r(n), RUNTIME, dump + 8 * u32::from(n)));
-    }
-    let vectors = dump + offset_of!(RegisterDump, v) as u32;
-    for n in 0..32 {
-        asm.emit(str_v(VSize::Q, v(n), RUNTIME, vectors + 16 * u32::from(n)));
-    }
-    // The dump holds every register now; save the spill cells, which the
-    // caller's next frames would overwrite.
-    let (copy, done) = (asm.label(), asm.label());
-    asm.emit_all(&[
-        mov_sp(r(16), SP),
-        str(
-            X,
-            r(16),
-            RUNTIME,
-            dump + offset_of!(RegisterDump, sp) as u32,
-        ),
-        ldr(X, r(15), RUNTIME, offset_of!(Runtime, opt_save) as u32),
-        ldr(X, r(17), RUNTIME, offset_of!(Runtime, opt_cells) as u32),
-    ]);
-    asm.bind(copy);
-    asm.cbz(X, false, r(17), done);
-    asm.emit_all(&[
-        ldp(X, Post, r(0), r(1), r(16), 16),
-        stp(X, Post, r(0), r(1), r(15), 16),
-        sub_imm(X, r(17), r(17), 1, false),
-    ]);
-    asm.b(copy);
-    asm.bind(done);
-    asm.emit_all(&[
-        movz(W, r(16), Exit::Optimized as u16, 0),
-        str(W, r(16), RUNTIME, EXIT),
-        str(X, r(9), RUNTIME, COUNTDOWN),
-        ldr(X, r(16), RUNTIME, HOST_SP),
-        mov_sp(SP, r(16)),
-    ]);
-    for (i, (a, b)) in SAVED_V.into_iter().enumerate() {
-        asm.emit(ldp_v(VSize::D, Offset, v(a), v(b), SP, 96 + 16 * i as i32));
-    }
-    for (i, (a, b)) in SAVED.into_iter().enumerate() {
-        asm.emit(ldp(X, Offset, r(a), r(b), SP, 16 + 16 * i as i32));
-    }
-    asm.emit_all(&[ldp(X, Post, r(29), Reg::LR, SP, FRAME), ret(Reg::LR)]);
-}
-
-/// Stores the guest registers and flags to the `CpuState` at x0; uses x1
-/// to x5.
-fn emit_store_guest(asm: &mut Asm) {
-    for (i, (a, b)) in GUEST.into_iter().enumerate() {
-        // The low halves of x23 and x24 are ESP and EBP themselves.
-        asm.emit(stp(W, Offset, r(a), r(b), r(0), REGS + 8 * i as i32));
-    }
-    emit_read_flags(asm);
-    asm.emit(str(W, r(4), r(0), EFLAGS));
-}
-
-/// Assemble EFLAGS in w4 using the unmapped bits in the CpuState at x0.
-pub(crate) fn emit_read_flags(asm: &mut Asm) {
-    asm.emit_all(&[
-        mrs_nzcv(r(1)),
-        // N and Z land on SF and ZF; C is !CF and V is OF.
-        lsr_imm(W, r(2), r(1), 24),
-        and_imm(W, r(3), r(2), 0xc0),
-        ubfx(W, r(4), r(2), 5, 1),
-        eor_imm(W, r(4), r(4), 1),
-        orr(W, r(3), r(3), r(4), Lsl, 0),
-        ubfx(W, r(4), r(2), 4, 1),
-        orr(W, r(3), r(3), r(4), Lsl, 11),
-        and_imm(W, r(4), r(11), 0x10),
-        orr(W, r(3), r(3), r(4), Lsl, 0),
-        // Fold the low byte of x10 to its parity in bit 0.
-        eor(W, r(4), r(10), r(10), Lsr, 4),
-        eor(W, r(4), r(4), r(4), Lsr, 2),
-        eor(W, r(4), r(4), r(4), Lsr, 1),
-        and_imm(W, r(4), r(4), 1),
-        eor_imm(W, r(4), r(4), 1),
-        orr(W, r(3), r(3), r(4), Lsl, 2),
-        orr(W, r(3), r(3), r(12), Lsl, 10),
-        ldr(W, r(4), r(0), EFLAGS),
-        movz(W, r(5), MAPPED_FLAGS as u16, 0),
-        bic(W, r(4), r(4), r(5), Lsl, 0),
-        orr(W, r(4), r(4), r(3), Lsl, 0),
-    ]);
-}
-
-#[cfg(all(test, emulator))]
-mod tests {
-    use super::*;
-    use crate::emulator::{CODE, Emulator};
-
-    const DATA: u64 = 0x2000_0000;
-    const STATE: u64 = DATA + 0x100;
-    const STACK_TOP: u64 = 0x3001_0000;
-    const BASE: u64 = 7 << 32;
-    const XMM: u32 = field(offset_of!(CpuState, xmm));
-
-    /// Bytes of a `Runtime` for the emulator, whose `cpu` is at `STATE`.
-    fn runtime_bytes() -> Vec<u8> {
-        let runtime = Runtime::new(std::ptr::null_mut(), BASE);
-        let mut bytes = vec![0; size_of::<Runtime>()];
-        bytes[CPU as usize..][..8].copy_from_slice(&STATE.to_le_bytes());
-        bytes[WINDOW_BASE as usize..][..8].copy_from_slice(&runtime.window.to_le_bytes());
-        bytes[SHADOW as usize..][..8].copy_from_slice(&0x5000u64.to_le_bytes());
-        bytes[COUNTDOWN as usize..][..8].copy_from_slice(&runtime.countdown.to_le_bytes());
-        bytes
-    }
-
-    /// The fields the stubs touch, at their `CpuState` offsets.
-    fn state_bytes(cpu: &CpuState) -> Vec<u8> {
-        let mut bytes = vec![0; size_of::<CpuState>()];
-        for (i, reg) in cpu.regs.iter().enumerate() {
-            bytes[REGS as usize + 4 * i..][..4].copy_from_slice(&reg.to_le_bytes());
-        }
-        bytes[EIP as usize..][..4].copy_from_slice(&cpu.eip.to_le_bytes());
-        bytes[EFLAGS as usize..][..4].copy_from_slice(&cpu.eflags.to_le_bytes());
-        bytes[XMM as usize..][..128].copy_from_slice(cpu.xmm.as_flattened());
-        bytes
-    }
-
-    struct Run {
-        regs: [u32; 8],
-        eip: u32,
-        eflags: u32,
-        xmm: [[u8; 16]; 8],
-        exit: u32,
-        countdown: u64,
-    }
-
-    /// Enters `body` (translated code that must end at `exit`) with `cpu`.
-    fn run(cpu: &CpuState, body: impl FnOnce(&mut Asm, crate::asm::Label)) -> (Emulator, Run) {
-        let stubs = stubs();
-        let mut asm = Asm::new();
-        asm.emit_all(&stubs.code);
-        let exit = asm.label();
-        let target = asm.offset();
-        body(&mut asm, exit);
-        // `exit` is a jump back to the exit stub.
-        let tail = asm.offset();
-        asm.bind(exit);
-        asm.emit(b(stubs.exit as i32 - tail as i32));
-        let code = asm.finish();
-
-        let mut emu = Emulator::new();
-        emu.map(DATA, 0x1000);
-        emu.map(STACK_TOP - 0x1_0000, 0x1_0000);
-        emu.write(DATA, &runtime_bytes());
-        emu.write(STATE, &state_bytes(cpu));
-        emu.set_sp(STACK_TOP);
-        emu.set_x(r(0), DATA);
-        emu.set_x(r(1), CODE + target as u64);
-        for n in 19..=29 {
-            emu.set_x(r(n), 0xC0DE_0000_0000_0000 | n as u64);
-        }
-        for n in 8..16 {
-            emu.set_q(n, 0xF00D_0000_0000_0000 | n as u128);
-        }
-        emu.call_at(&code, stubs.enter)
-            .expect("stubs run to completion");
-
-        assert_eq!(emu.sp(), STACK_TOP, "host SP restored");
-        for n in 19..=29 {
-            assert_eq!(
-                emu.x(r(n)),
-                0xC0DE_0000_0000_0000 | n as u64,
-                "x{n} restored"
-            );
-        }
-        for n in 8..16 {
-            // AAPCS64 preserves only the low 64 bits of v8-v15.
-            assert_eq!(
-                emu.q(n) as u64,
-                0xF00D_0000_0000_0000 | n as u64,
-                "d{n} restored"
-            );
-        }
-        let state = emu.read(STATE, size_of::<CpuState>());
-        let word = |offset: usize| u32::from_le_bytes(state[offset..][..4].try_into().unwrap());
-        let mut regs = [0; 8];
-        for (i, reg) in regs.iter_mut().enumerate() {
-            *reg = word(REGS as usize + 4 * i);
-        }
-        let mut xmm = [[0; 16]; 8];
-        for (i, lane) in xmm.iter_mut().enumerate() {
-            lane.copy_from_slice(&state[XMM as usize + 16 * i..][..16]);
-        }
-        let runtime = emu.read(DATA, size_of::<Runtime>());
-        let run = Run {
-            regs,
-            eip: word(EIP as usize),
-            eflags: word(EFLAGS as usize),
-            xmm,
-            exit: u32::from_le_bytes(runtime[EXIT as usize..][..4].try_into().unwrap()),
-            countdown: u64::from_le_bytes(runtime[COUNTDOWN as usize..][..8].try_into().unwrap()),
+/// Publish the source and kind saved in the generated branch payload.
+#[cfg(native)]
+pub(crate) fn record_branch(cpu: &mut CpuState, branch: u64, target: u32) {
+    if branch != 0 {
+        cpu.last_indirect_branch = IndirectBranch {
+            source: branch as u32,
+            target,
+            kind: match branch >> 32 {
+                1 => IndirectBranchKind::Call,
+                2 => IndirectBranchKind::Jump,
+                _ => IndirectBranchKind::Return,
+            },
         };
-        (emu, run)
-    }
-
-    fn guest() -> CpuState {
-        let mut cpu = CpuState {
-            regs: [
-                0x1111_1111,
-                0x2222_2222,
-                0x3333_3333,
-                0x4444_4444,
-                0x0012_ff80,
-                0xffff_fffc,
-                0x6666_6666,
-                0x7777_7777,
-            ],
-            eip: 0x40_1000,
-            ..CpuState::default()
-        };
-        for (i, lane) in cpu.xmm.iter_mut().enumerate() {
-            *lane = [0x10 + i as u8; 16];
-            lane[15] = 0xa0 + i as u8;
-        }
-        cpu
-    }
-
-    fn leave(asm: &mut Asm, exit: crate::asm::Label, reason: Exit, eip: u32) {
-        asm.emit_all(&[
-            movz(W, r(0), reason as u16, 0),
-            movz(W, r(1), eip as u16, 0),
-            movk(W, r(1), (eip >> 16) as u16, 16),
-        ]);
-        asm.b(exit);
-    }
-
-    // spec: A64-REG-2, A64-REG-3
-    #[test]
-    fn every_mapped_flag_combination_and_register_round_trips() {
-        for bits in 0..1u32 << 7 {
-            let mut cpu = guest();
-            // Spread the seven bits over CF PF AF ZF SF DF OF; keep IF and bit 1.
-            let flags = [0, 2, 4, 6, 7, 10, 11]
-                .into_iter()
-                .enumerate()
-                .fold(0x202, |acc, (i, bit)| acc | (bits >> i & 1) << bit);
-            cpu.eflags = flags;
-            let (_, run) = run(&cpu, |asm, exit| {
-                leave(asm, exit, Exit::Dispatch, 0x40_2345)
-            });
-            assert_eq!(run.eflags, flags, "flags {flags:#x}");
-            assert_eq!(run.regs, cpu.regs);
-            assert_eq!(run.xmm, cpu.xmm);
-            assert_eq!(run.eip, 0x40_2345);
-            assert_eq!(run.exit, Exit::Dispatch as u32);
-        }
-    }
-
-    // spec: A64-REG-1
-    #[test]
-    fn translated_code_sees_the_register_map() {
-        let cpu = guest();
-        let (emu, run) = run(&cpu, |asm, exit| {
-            // Capture the mapping in temporaries the exit stub leaves alone.
-            asm.emit_all(&[
-                mov(X, r(6), r(23)),
-                mov(X, r(7), r(24)),
-                mov(X, r(8), WINDOW),
-                sub(X, r(17), r(23), WINDOW, Lsl, 0),
-                // push: ESP -= 4 through the biased register.
-                sub_imm(X, r(23), r(23), 4, false),
-                add_imm(W, r(19), r(19), 1, false),
-                sub_imm(X, r(9), r(9), 1, false),
-            ]);
-            leave(asm, exit, Exit::Interpret, 0x40_1003);
-        });
-        assert_eq!(emu.x(r(6)), BASE + 0x0012_ff80);
-        assert_eq!(emu.x(r(7)), BASE + 0xffff_fffc);
-        assert_eq!(emu.x(r(8)), BASE);
-        assert_eq!(emu.x(r(17)), 0x0012_ff80);
-        let mut expected = cpu.regs;
-        expected[0] += 1;
-        expected[4] -= 4;
-        assert_eq!(run.regs, expected);
-        assert_eq!(run.exit, Exit::Interpret as u32);
-        assert_eq!(run.countdown, (u64::MAX >> 1) - 1);
-    }
-
-    /// `cmp ecx, edx` in subtraction sense, with the canonical PF/AF sources,
-    /// must leave the eflags the interpreter computes for the same compare.
-    // spec: A64-REG-3
-    #[test]
-    fn a_native_compare_exits_with_the_interpreters_flags() {
-        let pairs = [
-            (0, 0),
-            (1, 2),
-            (2, 1),
-            (0x8000_0000, 1),
-            (0x7fff_ffff, 0xffff_ffff),
-            (0x10, 0x01),
-            (0xff, 0x0f),
-        ];
-        for (ecx, edx) in pairs {
-            let mut cpu = guest();
-            cpu.regs[1] = ecx;
-            cpu.regs[2] = edx;
-            cpu.eflags = 0x202 | 0x400;
-            let (_, run) = run(&cpu, |asm, exit| {
-                asm.emit_all(&[
-                    sub(W, r(10), r(20), r(21), Lsl, 0),
-                    eor(W, r(11), r(20), r(21), Lsl, 0),
-                    eor(W, r(11), r(11), r(10), Lsl, 0),
-                    cmp(W, r(20), r(21), Lsl, 0),
-                ]);
-                leave(asm, exit, Exit::Dispatch, 0x40_1002);
-            });
-            assert_eq!(run.eflags, interpreted_compare(&cpu), "{ecx:#x} - {edx:#x}");
-        }
-    }
-
-    fn interpreted_compare(cpu: &CpuState) -> u32 {
-        const CODE: u32 = 0x40_1000;
-        let mut executor = crate::Executor::new(CODE, 0x1000).unwrap();
-        executor.write(CODE, &[0x39, 0xd1]).unwrap(); // cmp ecx, edx
-        executor
-            .protect(CODE, 0x1000, adv_cpu_core::READ | adv_cpu_core::EXEC)
-            .unwrap();
-        executor.state = cpu.clone();
-        executor.state.eip = CODE;
-        let outcome = executor.run(CODE + 2, 1).unwrap();
-        assert_eq!(outcome, adv_cpu_core::RunOutcome::ReachedStop);
-        executor.state.eflags
     }
 }

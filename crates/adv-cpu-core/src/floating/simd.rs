@@ -32,12 +32,12 @@ fn read(
     i: &Instruction,
     n: u32,
     tx: &Transaction,
-    memory: &Memory,
+    memory: Operands<'_>,
     width: usize,
 ) -> Result<[u8; 16], Step> {
     let mut bytes = [0; 16];
     if i.op_kind(n) == OpKind::Memory {
-        let address = tx.address(i)?;
+        let address = tx.address(i, memory)?;
         bytes[..width].copy_from_slice(&tx.read(memory, address, width)?);
     } else if let Some(slot) = xmm(i.op_register(n)) {
         bytes = tx.state.xmm[slot];
@@ -53,12 +53,12 @@ fn read(
 fn write(
     i: &Instruction,
     tx: &mut Transaction,
-    memory: &Memory,
+    memory: Operands<'_>,
     bytes: &[u8],
     width: usize,
 ) -> Result<(), Step> {
     if i.op0_kind() == OpKind::Memory {
-        let address = tx.address(i)?;
+        let address = tx.address(i, memory)?;
         tx.store(memory, address, &bytes[..width])?;
     } else if let Some(slot) = xmm(i.op0_register()) {
         tx.state.xmm[slot][..width].copy_from_slice(&bytes[..width]);
@@ -261,7 +261,11 @@ pub(super) fn supported(i: &Instruction) -> bool {
     ) || matches!(m, M::Movss | M::Movsd | M::Cmpss | M::Cmpsd)
         && (i.op0_kind() == OpKind::Memory || xmm(i.op0_register()).is_some())
 }
-pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {
+pub(super) fn execute(
+    i: &Instruction,
+    tx: &mut Transaction,
+    memory: Operands<'_>,
+) -> Result<(), Step> {
     let m = i.mnemonic();
     let uses_mmx = matches!(m, M::Emms | M::Femms)
         || (0..i.op_count()).any(|op| mmx(i.op_register(op)).is_some());
@@ -286,7 +290,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
         return Ok(());
     }
     if m == M::Clflush {
-        tx.read(memory, tx.address(i)?, 1)?;
+        tx.read(memory, tx.address(i, memory)?, 1)?;
         return Ok(());
     }
     if matches!(m, M::Emms | M::Femms) {
@@ -294,7 +298,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
         return Ok(());
     }
     if matches!(m, M::Ldmxcsr | M::Stmxcsr) {
-        let address = tx.address(i)?;
+        let address = tx.address(i, memory)?;
         if m == M::Ldmxcsr {
             let value =
                 u32::from_le_bytes(tx.read(memory, address, 4)?.as_ref().try_into().unwrap());
@@ -304,17 +308,18 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
                     vector: 13,
                 });
             }
-            tx.state.mxcsr = value;
+            *tx.state.mxcsr = value;
         } else {
             tx.store(memory, address, &tx.state.mxcsr.to_le_bytes())?;
         }
         return Ok(());
     }
-    if i.memory_size().size() == 16
+    if matches!(memory, Operands::Guest(_))
+        && i.memory_size().size() == 16
         && !matches!(m, M::Movups | M::Movupd | M::Movdqu)
         && (i.op0_kind() == OpKind::Memory || i.op1_kind() == OpKind::Memory)
     {
-        let address = tx.address(i)?;
+        let address = tx.address(i, memory)?;
         if address & 15 != 0 {
             return Err(Step::Trap {
                 pc: tx.pc,
@@ -406,7 +411,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
                 let slot = xmm(i.op1_register()).ok_or(tx.unsupported(i))?;
                 let high = matches!(m, M::Movhps | M::Movhpd);
                 let bytes = tx.state.xmm[slot];
-                let address = tx.address(i)?;
+                let address = tx.address(i, memory)?;
                 tx.store(memory, address, &bytes[if high { 8..16 } else { 0..8 }])?;
             } else {
                 let slot = xmm(i.op0_register()).ok_or(tx.unsupported(i))?;
@@ -542,7 +547,7 @@ fn denormal(a: u64, width: usize) -> bool {
 }
 fn input(tx: &mut Transaction, mut a: u64, width: usize) -> u64 {
     if denormal(a, width) {
-        if tx.state.mxcsr & 0x40 != 0 {
+        if *tx.state.mxcsr & 0x40 != 0 {
             a &= if width == 4 { 1 << 31 } else { 1 << 63 };
         } else {
             finish(tx, 2);
@@ -551,8 +556,8 @@ fn input(tx: &mut Transaction, mut a: u64, width: usize) -> u64 {
     a
 }
 fn finish(tx: &mut Transaction, flags: u16) {
-    tx.state.mxcsr |= flags as u32;
-    let pending = (flags as u32 & 0x3f) & !(tx.state.mxcsr >> 7);
+    *tx.state.mxcsr |= flags as u32;
+    let pending = (flags as u32 & 0x3f) & !(*tx.state.mxcsr >> 7);
     if pending != 0 {
         tx.sse_exception = true;
     }
@@ -580,7 +585,7 @@ fn comparison(a: u64, b: u64, width: usize) -> u8 {
         }
     }
 }
-fn floating(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {
+fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Result<(), Step> {
     let m = i.mnemonic();
     let double = matches!(
         m,
@@ -609,7 +614,7 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<()
             | M::Cmppd
     );
     let width = if double { 8 } else { 4 };
-    sf::configure_sse(tx.state.mxcsr);
+    sf::configure_sse(*tx.state.mxcsr);
     if matches!(
         m,
         M::Cvtsi2ss
@@ -644,12 +649,12 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<()
         let rc = if matches!(m, M::Cvttss2si | M::Cvttsd2si) {
             1
         } else {
-            sf::rounding((tx.state.mxcsr >> 13) as u16)
+            sf::rounding((*tx.state.mxcsr >> 13) as u16)
         };
         let mut result = sf::sse_convert(a, from, to, rc);
         finish(tx, sf::flags());
         let target_width = if to == 1 { 8 } else { 4 };
-        if to != 2 && tx.state.mxcsr & 0x8000 != 0 && denormal(result, target_width) {
+        if to != 2 && *tx.state.mxcsr & 0x8000 != 0 && denormal(result, target_width) {
             finish(tx, 0x30);
             result &= if target_width == 4 { 1 << 31 } else { 1 << 63 };
         }
@@ -695,7 +700,7 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<()
                 finish(tx, 1);
             }
             let c = comparison(a, b, width);
-            tx.state.eflags = (tx.state.eflags & !0x8d5)
+            *tx.state.eflags = (*tx.state.eflags & !0x8d5)
                 | match c {
                     0 => 0x40,
                     1 => 1,
@@ -755,7 +760,7 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<()
         };
         finish(tx, sf::flags());
         let mut result = result;
-        if tx.state.mxcsr & 0x8000 != 0 && denormal(result, width) {
+        if *tx.state.mxcsr & 0x8000 != 0 && denormal(result, width) {
             finish(tx, 0x30);
             result &= if width == 4 { 1 << 31 } else { 1 << 63 };
         }
@@ -767,7 +772,11 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<()
 fn signed(value: u64, width: usize) -> i64 {
     ((value << (64 - width * 8)) as i64) >> (64 - width * 8)
 }
-fn packed_conversion(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {
+fn packed_conversion(
+    i: &Instruction,
+    tx: &mut Transaction,
+    memory: Operands<'_>,
+) -> Result<(), Step> {
     let m = i.mnemonic();
     let from = match m {
         M::Cvtdq2ps | M::Cvtdq2pd | M::Cvtpi2ps | M::Cvtpi2pd => 2,
@@ -792,10 +801,10 @@ fn packed_conversion(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> 
     let rc = if truncation {
         1
     } else {
-        sf::rounding((tx.state.mxcsr >> 13) as u16)
+        sf::rounding((*tx.state.mxcsr >> 13) as u16)
     };
     for lane in 0..count {
-        sf::configure_sse(tx.state.mxcsr);
+        sf::configure_sse(*tx.state.mxcsr);
         let offset = lane * source_width;
         let mut a = bits(&source[offset..offset + source_width]);
         if from != 2 {
@@ -803,7 +812,7 @@ fn packed_conversion(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> 
         }
         let mut result = sf::sse_convert(a, from, to, rc);
         finish(tx, sf::flags());
-        if to != 2 && tx.state.mxcsr & 0x8000 != 0 && denormal(result, target_width) {
+        if to != 2 && *tx.state.mxcsr & 0x8000 != 0 && denormal(result, target_width) {
             finish(tx, 0x30);
             result &= if target_width == 4 { 1 << 31 } else { 1 << 63 };
         }
@@ -818,7 +827,7 @@ fn packed_conversion(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> 
     };
     write(i, tx, memory, &out, width)
 }
-fn approximate(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {
+fn approximate(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Result<(), Step> {
     let m = i.mnemonic();
     let count = if matches!(m, M::Rcpps | M::Rsqrtps) {
         4
@@ -865,7 +874,7 @@ fn approximate(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result
 fn integer(
     i: &Instruction,
     tx: &mut Transaction,
-    memory: &Memory,
+    memory: Operands<'_>,
     width: usize,
 ) -> Result<(), Step> {
     let m = i.mnemonic();

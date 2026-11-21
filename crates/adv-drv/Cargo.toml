@@ -17,6 +17,9 @@ adv-sync = { path = "../adv-sync" }
 adv-nt = { path = "../adv-nt" }
 adv-unix = { path = "../adv-unix" }
 
+[dev-dependencies]
+adv-device = { path = "../adv-device", features = ["test-support"] }
+
 [target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dev-dependencies]
 adv-wineserver = { path = "../adv-wineserver" }
 

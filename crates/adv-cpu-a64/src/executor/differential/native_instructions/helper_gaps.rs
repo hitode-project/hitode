@@ -145,7 +145,7 @@ fn checked_simd_moves_use_ordinary_aliases_and_follow_permission_changes() {
                     cpu.protect(DATA, 4096, permissions).unwrap();
                     cpu.state = p.state.clone();
                 }
-                let before = native.native.as_ref().unwrap().diagnostics.helpers;
+                let before = native.native.as_ref().unwrap().diagnostics.interprets;
                 let interpreted = native.stats.interpreter_entries;
                 assert_eq!(
                     native.run(p.stop, 100).unwrap(),
@@ -153,7 +153,10 @@ fn checked_simd_moves_use_ordinary_aliases_and_follow_permission_changes() {
                 );
                 same(&native, &oracle);
                 if permissions == 3 && checks != Checks::Slow {
-                    assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, before);
+                    assert_eq!(
+                        native.native.as_ref().unwrap().diagnostics.interprets,
+                        before
+                    );
                     assert_eq!(native.stats.interpreter_entries, interpreted);
                 }
             }
@@ -190,12 +193,20 @@ fn check(program: &Program, config: Config, budget: u64, native_only: bool) {
         let mut native = executor_on_host(program, config, false, host);
         let mut oracle = executor_on_host(program, config, true, host);
         let actual = native.run(program.stop, budget).unwrap();
-        assert_eq!(actual, oracle.run(program.stop, budget).unwrap());
+        assert_eq!(
+            actual,
+            oracle
+                .run(
+                    program.stop,
+                    reference_budget(budget, native.fuel_debt, &actual)
+                )
+                .unwrap()
+        );
         same(&native, &oracle);
         if native_only && !config.1 && actual == RunOutcome::ReachedStop {
             assert!(native.stats.native_entries > 0);
             assert_eq!(native.stats.interpreter_entries, 0);
-            assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+            assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
         }
         if actual == RunOutcome::Budget {
             assert_eq!(
@@ -387,6 +398,28 @@ fn packed_doubles_check_both_lanes_exceptions_and_mxcsr() {
     }
 }
 
+// spec: A64F-FP-2 A64F-FP-3 A64-VER-1
+#[test]
+fn x87_fsqrt_value_preserves_rounded_state() {
+    for input in [4.0f64, 2.0, -2.0] {
+        let mut program = fixture(|a| {
+            a.fld(qword_ptr(ebx)).unwrap();
+            a.fsqrt().unwrap();
+            a.fnstsw(ax).unwrap();
+            a.fstp(qword_ptr(ebx + 8)).unwrap();
+        });
+        program.state.x87.control = 0x037f;
+        program.data[..8].copy_from_slice(&input.to_le_bytes());
+        let config = (Features::default(), false, Checks::Adaptive);
+        let mut native = executor(&program, config, false);
+        let mut oracle = executor(&program, config, true);
+        assert_eq!(native.run(program.stop, 100), oracle.run(program.stop, 100));
+        same(&native, &oracle);
+        assert_eq!(native.stats.interpreter_entries, 0);
+        assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
+    }
+}
+
 // spec: A64F-FP-1, A64F-FP-2, A64F-FP-3, A64-VER-1
 #[test]
 fn x87_round_scale_and_examine_match_all_rounding_modes_and_specials() {
@@ -530,7 +563,7 @@ fn common_forms_microbenchmark() {
         // Compile before measuring.
         assert_eq!(cpu.run(p.stop, 100).unwrap(), RunOutcome::Budget);
         cpu.state = p.state.clone();
-        let helpers = cpu.native.as_ref().unwrap().diagnostics.helpers;
+        let helpers = cpu.native.as_ref().unwrap().diagnostics.interprets;
         let now = Instant::now();
         assert_eq!(
             cpu.run(p.stop, 50_000_000).unwrap(),
@@ -539,7 +572,7 @@ fn common_forms_microbenchmark() {
         println!(
             "W11 form={form} ns/roundtrip={:.3} helpers={}",
             now.elapsed().as_nanos() as f64 / 10_000_000.0,
-            cpu.native.as_ref().unwrap().diagnostics.helpers - helpers
+            cpu.native.as_ref().unwrap().diagnostics.interprets - helpers
         );
     }
 }
@@ -867,8 +900,9 @@ fn common_locked_forms_use_memory_for_shared_pages_and_native_private_pages() {
         .into_iter()
         .filter(|host| host % unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize == 0)
     {
-        for form in 0..6 {
+        for form in 0..8 {
             let mut p = fixture(|a| {
+                a.pxor(xmm7, xmm1).unwrap();
                 a.add(edx, ecx).unwrap();
                 match form {
                     0 => a.lock().cmpxchg(dword_ptr(ebx), ecx),
@@ -876,10 +910,13 @@ fn common_locked_forms_use_memory_for_shared_pages_and_native_private_pages() {
                     2 => a.lock().xadd(dword_ptr(ebx), ecx),
                     3 => a.lock().adc(dword_ptr(ebx), ecx),
                     4 => a.lock().inc(byte_ptr(ebx)),
-                    _ => a.lock().bts(dword_ptr(ebx), ecx),
+                    5 => a.lock().bts(dword_ptr(ebx), ecx),
+                    6 => a.lock().xadd(dword_ptr(ebx + 3), ecx),
+                    _ => a.lock().cmpxchg8b(qword_ptr(ebx + 4093)),
                 }
                 .unwrap();
                 a.adc(edi, 0).unwrap();
+                a.pxor(xmm7, xmm2).unwrap();
             });
             p.data[..8].copy_from_slice(&0x8765432181234567u64.to_le_bytes());
             if form == 5 {
@@ -910,10 +947,11 @@ fn common_locked_forms_use_memory_for_shared_pages_and_native_private_pages() {
                     );
                     same(&a, &b);
                     if !config.1 && !shared && config.2 != Checks::Slow {
-                        assert_eq!(a.native.as_ref().unwrap().diagnostics.helpers, 0);
+                        assert_eq!(a.native.as_ref().unwrap().diagnostics.interprets, 0);
                     }
                     if !config.1 && shared {
-                        assert!(a.native.as_ref().unwrap().diagnostics.helpers > 0);
+                        assert_eq!(a.stats.interpreter_entries, 0);
+                        assert_eq!(a.value_calls_at(CODE + 6), 1);
                     }
                 }
             }
@@ -948,7 +986,7 @@ fn common_partial_stacks_and_segment_reads_match_on_both_host_sizes() {
                 let mut b = make(true);
                 assert_eq!(
                     a.run(p.stop, budget).unwrap(),
-                    b.run(p.stop, budget).unwrap()
+                    b.run(p.stop, budget.saturating_add(a.fuel_debt)).unwrap()
                 );
                 assert_eq!(
                     a.state.regs, b.state.regs,
@@ -1234,7 +1272,7 @@ fn common_strings_preserve_partial_state_at_blocked_pages() {
                             }
                             assert_eq!(
                                 a.run(p.stop, budget).unwrap(),
-                                b.run(p.stop, budget).unwrap()
+                                b.run(p.stop, budget.saturating_add(a.fuel_debt)).unwrap()
                             );
                             same(&a, &b);
                             for cpu in [&mut a, &mut b] {
@@ -1539,6 +1577,85 @@ fn common_pop_flags_setting_tf_single_steps_the_next_instruction() {
             for budget in [1, 2, 3, 100] {
                 check(&p, config, budget, false);
             }
+        }
+    }
+}
+
+// spec: A64A-EXIT-1, A64A-FALL-4, A64-VER-1
+#[test]
+fn system_and_software_events_keep_the_core_outcomes() {
+    for (bytes, interpreted) in [
+        (&[0x0f, 0x01, 0x03][..], 1), // SGDT [EBX]
+        (&[0x0f, 0x01, 0x0b][..], 1), // SIDT [EBX]
+        (&[0x0f, 0x00, 0x03][..], 1), // SLDT [EBX]
+        (&[0xfa][..], 1),             // CLI
+        (&[0xfb][..], 1),             // STI
+        (&[0xcc][..], 0),             // INT3
+        (&[0xcd, 0x80][..], 0),       // INT 0x80
+        (&[0x0f, 0x01, 0xe0][..], 0), // SMSW EAX
+        (&[0x0f, 0x00, 0xc8][..], 0), // STR EAX
+        (&[0x27][..], 0),             // DAA
+        (&[0xd4, 0x0a][..], 0),       // AAM
+    ] {
+        let p = fixture(|a| a.db(bytes).unwrap());
+        let config = (Features::default(), false, Checks::Adaptive);
+        let mut native = executor(&p, config, false);
+        let mut oracle = executor(&p, config, true);
+        assert_eq!(native.run(p.stop, 100), oracle.run(p.stop, 100));
+        same(&native, &oracle);
+        assert_eq!(
+            native.stats.interpreter_entries, interpreted,
+            "{bytes:02x?}"
+        );
+        assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
+    }
+}
+
+// spec: A64A-FALL-4, A64-TR-4, A64-VER-1
+#[test]
+fn rep_word_comparison_carries_restart_flags_across_a_slice() {
+    use adv_cpu_core::{EXEC, READ, WRITE};
+
+    let code = [0x64, 0x67, 0xf3, 0xa6]; // REPE CMPSB with FS and word addresses
+    let stop = CODE + code.len() as u32;
+    for blocked in [false, true] {
+        let mut native = Executor::address_space().unwrap();
+        let mut oracle = Executor::interpreted_address_space().unwrap();
+        native.native.as_mut().unwrap().first_visits = false;
+        for cpu in [&mut native, &mut oracle] {
+            cpu.map(CODE, 4096, READ | WRITE | EXEC).unwrap();
+            cpu.map(0, 0x4000, READ | WRITE).unwrap();
+            cpu.map(DATA, 0x10000, READ | WRITE).unwrap();
+            cpu.write(CODE, &code).unwrap();
+            cpu.write(DATA + 0xffff, &[0x83]).unwrap();
+            cpu.write(DATA, &[0x91, 0xb0, 0xa8]).unwrap();
+            cpu.write(0x900, &[0x83, 0x91, 0xb0, 0xa8]).unwrap();
+            cpu.state.eip = CODE;
+            cpu.state.eflags = 0x897;
+            cpu.state.fs_base = DATA;
+            cpu.state.regs[1] = 0xab00_0004;
+            cpu.state.regs[6] = 0xabcd_ffff;
+            cpu.state.regs[7] = 0xcdef_0900;
+            assert_eq!(cpu.run(stop, 1).unwrap(), RunOutcome::Budget);
+            assert_eq!(cpu.state.regs[1], 0xab00_0003);
+            assert_eq!(cpu.state.regs[6], 0xabcd_0000);
+            assert_eq!(cpu.state.regs[7], 0xcdef_0901);
+            assert!(cpu.state.rep.is_some());
+            if blocked {
+                cpu.protect(DATA, 4096, 0).unwrap();
+            }
+        }
+        assert_eq!(native.state.eflags, oracle.state.eflags);
+        assert_eq!(native.state.rep, oracle.state.rep);
+        assert_eq!(native.stats.interpreter_entries, 0);
+        assert_eq!(native.run(stop, 3), oracle.run(stop, 3));
+        assert_eq!(native.state.regs, oracle.state.regs);
+        assert_eq!(native.state.eflags, oracle.state.eflags);
+        assert!(native.state.rep.is_none());
+        if blocked {
+            assert_eq!(native.state.eflags, 0x897);
+        } else {
+            assert_eq!(native.stats.interpreter_entries, 0);
         }
     }
 }

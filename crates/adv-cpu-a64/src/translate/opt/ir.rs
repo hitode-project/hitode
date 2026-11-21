@@ -5,12 +5,20 @@
 //! only through `Load` and `Store`. Guest addresses are 32-bit values that
 //! emission offsets by the private alias base.
 
-use iced_x86::ConditionCode;
+use crate::translate::front::tags::ConditionCode;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::recovery::IrRecord;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Value(pub u32);
+
+pub(crate) use crate::policy::resident::MAX_PLAIN_FACTS;
+
+/// Disjoint byte ranges in wrapping 32-bit guest address arithmetic.
+pub(crate) fn disjoint_ranges(a: u32, aw: u32, b: u32, bw: u32) -> bool {
+    b.wrapping_sub(a) >= aw && a.wrapping_sub(b) >= bw
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Block(pub u32);
@@ -39,6 +47,7 @@ pub(crate) enum IntOp {
     Shl,
     Shr,
     Sar,
+    Ror,
     Mul,
     MulHighSigned,
     MulHighUnsigned,
@@ -60,6 +69,7 @@ pub(crate) enum IntUnary {
     Widen,
     /// An I32 sign-extended to I64.
     SignWiden,
+    ByteSwap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +116,8 @@ pub(crate) enum VecOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VecUnary {
     ShiftImm(crate::encode::ShiftImm, u8, u8, bool),
+    /// Narrows a binary64 scalar to binary32.
+    NarrowScalar,
     /// Zeroes bits 64..128 of a V128 value.
     Low64,
     /// Copies bits 64..128 to bits 0..64 and zeroes bits 64..128.
@@ -142,6 +154,10 @@ pub(crate) enum FlagKind {
     UnorderedCompare,
     /// `comisd`: the same flags, but a quiet NaN also raises invalid.
     OrderedCompare,
+    CarryBit,
+    MulUnsigned,
+    Rol,
+    Ror,
 }
 
 impl FlagKind {
@@ -155,7 +171,12 @@ impl FlagKind {
     pub(crate) fn reads_b(self) -> bool {
         !matches!(
             self,
-            FlagKind::Logic | FlagKind::Increment | FlagKind::Decrement | FlagKind::Negate
+            FlagKind::Logic
+                | FlagKind::Increment
+                | FlagKind::Decrement
+                | FlagKind::Negate
+                | FlagKind::CarryBit
+                | FlagKind::MulUnsigned
         )
     }
 }
@@ -163,6 +184,8 @@ impl FlagKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
     Constant(Type, u128),
+    /// Keep a form-entry induction value in a recovery spill cell.
+    Snapshot(Value),
     Int(IntOp, Value, Value),
     IntUnary(IntUnary, Value),
     /// The quotient of the I64 `dividend` by the I32 `divisor`. Unless
@@ -208,6 +231,10 @@ pub(crate) enum Op {
         value: Value,
     },
     Fp(FpOp, Value, Value),
+    /// x87 precision 24 when both inputs are exact in binary32.
+    X87Single(FpOp, Value, Value),
+    Fp32(FpOp, Value, Value),
+    SseFp64(FpOp, Value, Value),
     FpUnary(FpUnary, Value),
     /// A signed integer as F64; fails when it is not exactly representable.
     FromInt(Value),
@@ -215,23 +242,71 @@ pub(crate) enum Op {
     ToInt {
         value: Value,
         wide: bool,
+        sse: bool,
+    },
+    /// Round to a signed integer or binary32 under an x87 control word.
+    X87Store {
+        value: Value,
+        width: u8,
+        rounding: u8,
+        integer: bool,
+    },
+    /// Whether a checked store increased the magnitude of its operand.
+    X87StoreC1 {
+        value: Value,
+        stored: Value,
+        integer: bool,
     },
     Vec(VecOp, Value, Value),
     VecUnary(VecUnary, Value),
     VecToInt(VecToInt, Value),
-    /// A load of `width` bytes outside the frame, zero-extended to `ty`.
+    /// A memory load of `width` bytes, zero-extended to `ty`.
     Load {
         ty: Type,
         width: u8,
         addr: Value,
+        /// Tests page classes first, as Tier-1 checked accesses do.
+        checked: bool,
+        pc: u32,
+        scope: Option<u8>,
+        /// A shared clock observation stays at its original instruction.
+        clock: bool,
     },
-    /// A store outside the frame: an effect point. Region `after` starts at
+    /// A memory store: an effect point. Region `after` starts at
     /// the guest boundary after it.
     Store {
         width: u8,
         addr: Value,
         value: Value,
         after: RecordId,
+        /// Tests page classes first, as Tier-1 checked accesses do.
+        checked: bool,
+        pc: u32,
+        scope: Option<u8>,
+    },
+    /// An entry fact of a resident form: the pages `addr..addr + bytes`
+    /// are ordinary (A64-MEM-14). Only the entry block holds these, before
+    /// any effect; a failure is an environment miss.
+    PlainPage {
+        addr: Value,
+        bytes: u32,
+        write: bool,
+    },
+    /// Protects a crossing store whose region already read those bytes.
+    /// Recovers to `record` if either page is not ordinary and writable.
+    PageCross {
+        addr: Value,
+        width: u8,
+        record: RecordId,
+    },
+    /// Recovers to the store's region start if its bytes intersect the frame.
+    FrameDisjoint {
+        addr: Value,
+        width: u8,
+        base: Value,
+        lo: i32,
+        hi: i32,
+        record: RecordId,
     },
     /// The host address of a guest address: the base frame accesses add
     /// their offsets to.
@@ -259,12 +334,16 @@ pub(crate) enum Op {
         denormal: bool,
         single: bool,
     },
-    /// Checks raw SSE binary64 lanes for denormals when MXCSR.DE is clear.
+    /// Checks raw SSE lanes for denormals when MXCSR.DE is clear.
     SseInput {
         a: Value,
         b: Option<Value>,
         packed: bool,
+        single: bool,
+        pc: u32,
     },
+    /// Accumulate actual writes for the owner's scoped GPR join.
+    ScopeWritten(u32),
     /// Effect boundary for floating-point checks.
     Validate,
 }
@@ -272,23 +351,35 @@ pub(crate) enum Op {
 impl Op {
     pub(crate) fn uses(&self) -> impl Iterator<Item = Value> {
         let list: [Option<Value>; 3] = match *self {
-            Op::Constant(..) | Op::Validate => [None; 3],
+            Op::Constant(..) | Op::Validate | Op::ScopeWritten(_) => [None; 3],
             Op::SseInput { a, b, .. } => [Some(a), b, None],
-            Op::IntUnary(_, a)
+            Op::Snapshot(a)
+            | Op::IntUnary(_, a)
             | Op::Bits { value: a, .. }
             | Op::FpUnary(_, a)
             | Op::VecUnary(_, a)
             | Op::VecToInt(_, a)
             | Op::FromInt(a)
             | Op::ToInt { value: a, .. }
+            | Op::X87Store { value: a, .. }
             | Op::Load { addr: a, .. }
+            | Op::PlainPage { addr: a, .. }
+            | Op::PageCross { addr: a, .. }
             | Op::Host(a)
             | Op::FrameLoad { base: a, .. }
             | Op::X87Load { bits: a, .. }
             | Op::Test { flags: a, .. } => [Some(a), None, None],
             Op::Int(_, a, b)
             | Op::Fp(_, a, b)
+            | Op::X87Single(_, a, b)
+            | Op::Fp32(_, a, b)
+            | Op::SseFp64(_, a, b)
             | Op::Vec(_, a, b)
+            | Op::X87StoreC1 {
+                value: a,
+                stored: b,
+                ..
+            }
             | Op::Div {
                 dividend: a,
                 divisor: b,
@@ -299,6 +390,9 @@ impl Op {
             }
             | Op::FrameStore {
                 base: a, value: b, ..
+            }
+            | Op::FrameDisjoint {
+                addr: a, base: b, ..
             } => [Some(a), Some(b), None],
             Op::Flags { a, b, prior, .. } => [Some(a), Some(b), prior],
             Op::Select { cond, a, b }
@@ -314,7 +408,13 @@ impl Op {
     /// Whether the operation requires validation before an effect point.
     pub(crate) fn floating(&self) -> bool {
         match *self {
-            Op::Fp(..) | Op::ToInt { .. } | Op::Vec(VecOp::LessF64, ..) => true,
+            Op::Fp(..)
+            | Op::X87Single(..)
+            | Op::Fp32(..)
+            | Op::SseFp64(..)
+            | Op::ToInt { .. }
+            | Op::X87Store { .. }
+            | Op::Vec(VecOp::LessF64, ..) => true,
             Op::Flags { kind, .. } => kind.floating(),
             _ => false,
         }
@@ -327,6 +427,8 @@ impl Op {
                 self,
                 Op::Div { proved: false, .. }
                     | Op::FromInt(_)
+                    | Op::PageCross { .. }
+                    | Op::FrameDisjoint { .. }
                     | Op::Load { .. }
                     | Op::Store { .. }
                     | Op::X87Load { .. }
@@ -334,9 +436,20 @@ impl Op {
             )
     }
 
+    pub(crate) fn region_guard(&self) -> Option<RecordId> {
+        match *self {
+            Op::PageCross { record, .. } | Op::FrameDisjoint { record, .. } => Some(record),
+            _ => None,
+        }
+    }
+
     /// Whether the operation must stay although nothing uses its result.
     pub(crate) fn effect(&self) -> bool {
-        self.can_fail() || matches!(self, Op::FrameStore { .. } | Op::Validate)
+        self.can_fail()
+            || matches!(
+                self,
+                Op::FrameStore { .. } | Op::Validate | Op::PlainPage { .. } | Op::ScopeWritten(_)
+            )
     }
 
     /// Whether the result depends only on the operands, so that equal
@@ -396,8 +509,8 @@ pub(crate) struct BlockData {
     pub insts: Vec<(Option<Value>, Op)>,
     pub end: End,
     pub head: Option<Head>,
-    /// The guest instruction the block translates, for profiles.
-    pub eip: Option<u32>,
+    /// Guest instructions translated by this block, in execution order.
+    pub pcs: Vec<u32>,
 }
 
 /// Where a parameter of block 0 comes from when the job enters. Admission
@@ -417,6 +530,7 @@ pub(crate) enum Source {
     /// The x87 last instruction pointer and opcode, I32.
     X87Ip,
     X87Opcode,
+    FsBase,
     /// Frame bytes at entry ESP plus `offset`: I32 for 4 bytes, I64 for 8.
     /// Narrower accesses extract from these.
     Frame {
@@ -428,7 +542,7 @@ pub(crate) enum Source {
 impl Source {
     pub(crate) fn ty(self) -> Type {
         match self {
-            Source::Reg(_) | Source::X87Ip | Source::X87Opcode => Type::I32,
+            Source::Reg(_) | Source::X87Ip | Source::X87Opcode | Source::FsBase => Type::I32,
             Source::Frame { width, .. } if width <= 4 => Type::I32,
             Source::Frame { .. } => Type::I64,
             Source::Eflags => Type::Flags,
@@ -453,6 +567,14 @@ pub(crate) struct Func {
     /// (bits 16–23) the form never writes: records leave them at their entry
     /// values.
     pub kept: u32,
+    /// Charged heads in resident forms leave through complete records.
+    pub resident: bool,
+    /// Block parameters introduced solely to carry lazy EFLAGS recipes.
+    pub flag_params: BTreeSet<Value>,
+    /// Guest calls and returns translated into the SSA form.
+    pub calls: Vec<u32>,
+    /// Guest EIPs of resident checks whose operations produce a value.
+    pub cold_pcs: BTreeMap<Value, u32>,
 }
 
 impl Func {
@@ -462,7 +584,7 @@ impl Func {
             insts: Vec::new(),
             end: End::Unset,
             head,
-            eip: None,
+            pcs: Vec::new(),
         });
         Block(self.blocks.len() as u32 - 1)
     }
@@ -470,6 +592,12 @@ impl Func {
     pub(crate) fn param(&mut self, block: Block, ty: Type) -> Value {
         let value = self.value(ty);
         self.blocks[block.0 as usize].params.push(value);
+        value
+    }
+
+    pub(crate) fn flag_param(&mut self, block: Block, ty: Type) -> Value {
+        let value = self.param(block, ty);
+        self.flag_params.insert(value);
         value
     }
 
@@ -511,14 +639,29 @@ impl Func {
             Op::IntUnary(_, a) => self.ty(a),
             Op::Div { .. }
             | Op::Remainder { .. }
+            | Op::Snapshot(_)
             | Op::Test { .. }
             | Op::ToInt { wide: false, .. }
+            | Op::X87Store { width: 2 | 4, .. }
+            | Op::X87StoreC1 { .. }
             | Op::VecToInt(..) => Type::I32,
-            Op::ToInt { wide: true, .. } => Type::I64,
+            Op::ToInt { wide: true, .. } | Op::X87Store { .. } => Type::I64,
             Op::Flags { .. } => Type::Flags,
-            Op::Fp(..) | Op::FpUnary(..) | Op::FromInt(_) | Op::X87Load { .. } => Type::F64,
-            Op::Vec(..) | Op::VecUnary(..) => Type::V128,
-            Op::Store { .. } | Op::FrameStore { .. } | Op::SseInput { .. } | Op::Validate => {
+            Op::Fp(..)
+            | Op::X87Single(..)
+            | Op::SseFp64(..)
+            | Op::FpUnary(..)
+            | Op::FromInt(_)
+            | Op::X87Load { .. } => Type::F64,
+            Op::Vec(..) | Op::VecUnary(..) | Op::Fp32(..) => Type::V128,
+            Op::Store { .. }
+            | Op::FrameStore { .. }
+            | Op::SseInput { .. }
+            | Op::Validate
+            | Op::ScopeWritten(_)
+            | Op::PlainPage { .. }
+            | Op::PageCross { .. }
+            | Op::FrameDisjoint { .. } => {
                 return None;
             }
         })

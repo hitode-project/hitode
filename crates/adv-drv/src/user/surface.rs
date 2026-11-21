@@ -707,6 +707,7 @@ mod tests {
             memory,
             completed: |_, _| None,
         });
+        let mut frames = adv_device::surface::PresentedFrames::new();
         let mut store = SurfaceStore::new(4, 2, 0x500000, 65536, Snapshot::default()).unwrap();
         let video = store
             .create(4, 2, false, PixelFormat::Bgra32, &mut memory(&mut m.cpu))
@@ -716,6 +717,7 @@ mod tests {
         store
             .present(video, &memory(&mut m.cpu), store[video].rect())
             .unwrap();
+        frames.update(&mut store);
         m.ext.insert(store);
         let hwnd = 7;
         m.ext.get_or_default::<super::super::Windows>().0.insert(
@@ -746,7 +748,7 @@ mod tests {
         super::super::input::presented(&m.ext);
         let gdi_pixels = [40, 50, 60, 255].repeat(12);
         m.cpu.write(0x410000, &gdi_pixels).unwrap();
-        let compose = |m: &mut Machine<JitCpu>, drawn| {
+        let mut compose = |m: &mut Machine<JitCpu>, drawn| {
             super::compose(
                 &mut Env {
                     context: m.sys.current,
@@ -758,6 +760,7 @@ mod tests {
                 drawn,
             )
             .unwrap();
+            frames.update(m.ext.get_mut::<SurfaceStore>());
         };
         // Geometry-only recomposition and nonclient dirt keep the current video.
         compose(&mut m, None);

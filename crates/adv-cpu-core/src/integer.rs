@@ -180,6 +180,164 @@ impl Operand {
     }
 }
 
+/// A prepared read-modify-write with its address supplied by the caller.
+#[derive(Clone, Copy)]
+pub struct LockedOperation {
+    width: u8,
+    kind: LockedKind,
+}
+
+#[derive(Clone, Copy)]
+enum LockedKind {
+    Binary(M, Operand),
+    Unary(M),
+    Bit(M, Operand),
+    Exchange(Reg),
+    ExchangeAdd(Reg),
+    CompareExchange(Reg),
+    CompareExchange8,
+}
+
+impl LockedOperation {
+    pub fn new(i: &Instruction) -> Option<Self> {
+        if i.op0_kind() != OpKind::Memory || !(i.has_lock_prefix() || i.mnemonic() == M::Xchg) {
+            return None;
+        }
+        let source = || Operand::decode(i, 1);
+        let register = || Reg::decode(i.op1_register());
+        let kind = match i.mnemonic() {
+            m @ (M::Add | M::Adc | M::Sub | M::Sbb | M::And | M::Or | M::Xor) => {
+                LockedKind::Binary(m, source()?)
+            }
+            m @ (M::Inc | M::Dec | M::Neg | M::Not) => LockedKind::Unary(m),
+            m @ (M::Bts | M::Btr | M::Btc) => LockedKind::Bit(m, source()?),
+            M::Xchg => LockedKind::Exchange(register()?),
+            M::Xadd => LockedKind::ExchangeAdd(register()?),
+            M::Cmpxchg => LockedKind::CompareExchange(register()?),
+            M::Cmpxchg8b => LockedKind::CompareExchange8,
+            _ => return None,
+        };
+        Some(Self {
+            width: i.memory_size().size() as u8,
+            kind,
+        })
+    }
+
+    /// Registers read and written by the semantics, outside the address calculation.
+    pub fn registers(self) -> (u8, u8) {
+        match self.kind {
+            LockedKind::Binary(_, src) | LockedKind::Bit(_, src) => {
+                let read = match src {
+                    Operand::Register(reg) => 1 << reg.index,
+                    _ => 0,
+                };
+                (read, 0)
+            }
+            LockedKind::Unary(_) => (0, 0),
+            LockedKind::Exchange(reg) | LockedKind::ExchangeAdd(reg) => {
+                let bit = 1 << reg.index;
+                (bit, bit)
+            }
+            LockedKind::CompareExchange(reg) => (1 | (1 << reg.index), 1),
+            LockedKind::CompareExchange8 => (0x0f, 0x05),
+        }
+    }
+
+    /// Commit registers and flags only after the corresponding memory update.
+    pub fn update(
+        self,
+        memory: &mut crate::Memory,
+        address: u32,
+        regs: &mut [u32; 8],
+        flags: &mut u32,
+    ) -> Result<(), String> {
+        let (mut next_regs, mut next_flags) = (*regs, *flags);
+        memory.update_locked(address, usize::from(self.width), |old| {
+            (next_regs, next_flags) = (*regs, *flags);
+            self.evaluate(old, &mut next_regs, &mut next_flags)
+        })?;
+        (*regs, *flags) = (next_regs, next_flags);
+        Ok(())
+    }
+
+    fn evaluate(self, old: u64, regs: &mut [u32; 8], flags: &mut u32) -> u64 {
+        if matches!(self.kind, LockedKind::CompareExchange8) {
+            return compare_exchange8(regs, flags, old);
+        }
+        let old = old as u32;
+        let width = self.width;
+        let read = |src| match src {
+            Operand::Register(reg) => reg.read(regs),
+            Operand::Immediate(value) => value,
+            Operand::Memory(..) => unreachable!("LOCK takes one memory operand"),
+        };
+        u64::from(match self.kind {
+            LockedKind::Binary(kind, src) => binary(flags, kind, old, read(src), width),
+            LockedKind::Unary(kind) => unary(flags, kind, old, width),
+            LockedKind::Bit(kind, src) => {
+                let bit = 1 << (read(src) & (u32::from(width) * 8 - 1));
+                flag(flags, CF, old & bit != 0);
+                match kind {
+                    M::Bts => old | bit,
+                    M::Btr => old & !bit,
+                    M::Btc => old ^ bit,
+                    _ => unreachable!(),
+                }
+            }
+            LockedKind::Exchange(reg) => {
+                let source = reg.read(regs);
+                reg.write(regs, old);
+                source
+            }
+            LockedKind::ExchangeAdd(reg) => {
+                let source = reg.read(regs);
+                reg.write(regs, old);
+                arithmetic(flags, old, source, 0, width, false)
+            }
+            LockedKind::CompareExchange(reg) => {
+                let source = reg.read(regs);
+                compare_exchange(regs, flags, width, old, source).unwrap_or(old)
+            }
+            LockedKind::CompareExchange8 => unreachable!(),
+        })
+    }
+}
+
+pub(crate) fn compare_exchange(
+    regs: &mut [u32; 8],
+    flags: &mut u32,
+    width: u8,
+    old: u32,
+    source: u32,
+) -> Option<u32> {
+    let accumulator = Reg {
+        index: 0,
+        shift: 0,
+        width,
+    };
+    let expected = accumulator.read(regs);
+    arithmetic(flags, expected, old, 0, width, true);
+    if expected == old {
+        Some(source)
+    } else {
+        accumulator.write(regs, old);
+        None
+    }
+}
+
+pub(crate) fn compare_exchange8(regs: &mut [u32; 8], flags: &mut u32, old: u64) -> u64 {
+    let pair = |low: u32, high: u32| u64::from(low) | (u64::from(high) << 32);
+    let equal = old == pair(regs[0], regs[2]);
+    flag(flags, ZF, equal);
+    if equal {
+        pair(regs[3], regs[1])
+    } else {
+        regs[0] = old as u32;
+        regs[2] = (old >> 32) as u32;
+        old
+    }
+}
+
 pub(crate) fn flag(flags: &mut u32, bit: u32, value: bool) {
     *flags = (*flags & !bit) | if value { bit } else { 0 };
 }

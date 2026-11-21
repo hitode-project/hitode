@@ -33,12 +33,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "wine"))
 import probes  # noqa: E402
+from work import estimate as estimate_work  # noqa: E402
 
 SCENARIOS = Path("tests/scenarios")
 # Per-iteration growth a steady counter may gain on head over base: the
 # larger of an absolute floor and a share of the base rate.
 STEADY_SLACK = (0.01, 0.05)
 COUNTER = re.compile(r"\b(\w+): (\d+)\b")
+EXIT_COUNTS = re.compile(r"\bexit_counts: \{([^}]*)\}")
 
 
 def load(tree: Path, gpu: bool = False) -> dict[str, dict]:
@@ -82,8 +84,11 @@ def build(scenario: dict, into: Path) -> None:
 
 
 def counters(report: dict) -> dict[str, int]:
-    found = {k: int(v) for k, v in COUNTER.findall(report.get("a64_diagnostics") or "")}
-    for key in ("compilations", "host_calls", "interpreter_instructions", "peak_rss"):
+    diagnostics = report.get("a64_diagnostics") or ""
+    found = {k: int(v) for k, v in COUNTER.findall(diagnostics)}
+    if exits := EXIT_COUNTS.search(diagnostics):
+        found["native_exits"] = sum(int(n) for n in re.findall(r": (\d+)", exits[1]))
+    for key in ("compilations", "host_calls", "native_entries", "interpreter_instructions", "peak_rss"):
         if isinstance(report.get(key), int):
             found[key] = report[key]
     return found
@@ -102,6 +107,9 @@ def execute(scenario: dict, binary: Path, wine: Path, work: Path, iterations: in
         *scenario.get("args", []), "--exe", str(game / scenario["exe"]),
     ]
     env = dict(os.environ, ADV_AUDIO_MUTE_DEVICE="1")
+    layout = scenario.get("steady", {}).get("kernel_work")
+    if layout:
+        env["ADV_JIT_MAP_DIR"] = str(work / "jit")
     log = work / "log.txt"
     with log.open("w") as sink:
         process = subprocess.Popen(command, stdout=sink, stderr=subprocess.STDOUT, env=env)
@@ -145,6 +153,15 @@ def run_one(scenario: dict, binary: Path, wine: Path) -> dict:
             return {"passed": False, "exit": None, "stop": "error", "outputs": {},
                     "counters": {}, "log": str(error)}
         result["passed"] = result["passed"] and first["passed"]
+        if result["passed"] and (layout := steady.get("kernel_work")):
+            directory = Path(scratch)
+            runs = [(n, json.loads((directory / p / "report.json").read_text()))
+                    for n, p in ((low, "low"), (high, "high"))]
+            high_run = directory / "high"
+            prices = estimate_work(high_run / "jit", high_run / "game" / scenario["exe"],
+                                   probes.COMPILER, layout, runs)
+            for run, counts in zip((first, result), prices):
+                run["counters"].update(counts)
         result["levels"] = {n: result["counters"].get(n, 0) for n in scenario.get("levels", [])}
         result["steady"] = {
             name: (result["counters"].get(name, 0) - first["counters"].get(name, 0)) / (high - low)

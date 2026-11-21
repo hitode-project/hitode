@@ -15,9 +15,15 @@ pub use cache::{code_pool_state, prepare_code_pool_after_attach, prepare_code_po
 mod cpu;
 pub mod encode;
 mod executor;
+mod facts;
 pub mod jit_map;
 #[cfg(native)]
 mod native;
+#[cfg(all(not(native), test, emulator))]
+mod native {
+    pub(crate) mod compile;
+}
+mod policy;
 pub mod runtime;
 pub mod translate;
 

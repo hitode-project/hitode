@@ -4,19 +4,34 @@
 //! Floating point runs under the canonical FPCR and validates by value
 //! (A64-OPT-4).
 mod alloc;
+mod batch;
+
+use super::computation::rows::Domain;
+use crate::translate::lower::resident::Counter;
+mod cost;
 mod flags;
 mod inline;
+mod resident;
 
-use super::front::Assumed;
+#[cfg(any(native, test))]
+pub(crate) use resident::access_stub;
+
 use super::ir::*;
+use super::loops;
 use super::recovery::{FlagRecipe, Host, Record};
 use crate::asm::{Asm, Label};
 use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
+use crate::facts::{Assumed, Key};
 use crate::jit_map::{Mark, Part};
 use crate::runtime::{self, Runtime};
-use crate::translate::{Carry, Overflow, Sense, Site, fp_class};
+use crate::translate::lower::access::{CheckedEmitter, Value as AccessReg, page_crossing};
+use crate::translate::lower::flags::{Carry, Overflow, Sense};
+use crate::translate::lower::fp_class;
+use crate::translate::lower::resident::ResidentCold;
+use crate::translate::lower::{Site, WINDOW, X0, X1, X2, X3};
+pub(super) use batch::BatchEmitter;
 use std::mem::offset_of;
 
 const T: Reg = Reg::new(16);
@@ -32,16 +47,35 @@ const A: VReg = VReg::new(29);
 const B: VReg = VReg::new(30);
 const C: VReg = VReg::new(31);
 const PARAMS: u32 = offset_of!(Runtime, opt_params) as u32;
-const RECORD: u32 = offset_of!(Runtime, opt_record) as u32;
+const RECORD: u32 = offset_of!(Runtime, recovery.record) as u32;
+const DETAIL: u32 = offset_of!(Runtime, recovery.detail) as u32;
 
 pub(crate) struct Lowered {
     /// The inline entry, miss and cold branch words.
     pub entry: usize,
+    pub key: Key,
+    pub body: usize,
     pub miss: usize,
+    /// The branch word a failed `PlainPage` entry fact takes (A64-OPT-9).
+    pub env_miss: usize,
+    pub environment: Vec<(usize, usize)>,
     pub cold: usize,
+    /// Static costs of the resident entry, longest normal exit, and a loop iteration.
+    pub entry_words: u32,
+    pub exit_words: u32,
+    pub iteration_words: u32,
+    pub iteration_retired: u32,
+    pub iteration_pcs: Vec<u32>,
+    /// Entry snapshot and normal exit accounting calls, patched to NOP after probation.
+    pub probation: Vec<usize>,
+    /// Two words holding the address of the probation counters, bound at placement.
+    pub probation_slot: usize,
+    pub probation_sensor: Option<(Vec<usize>, usize, usize)>,
     /// Tier-1 link points as (byte offset, guest EIP). The fourth word
     /// of each link is bound to the dispatch stub during placement.
     pub links: Vec<(usize, u32)>,
+    /// Ordinary exits eligible for another resident head, as (link, transition) offsets.
+    pub transitions: Vec<(usize, usize)>,
     pub words: Vec<u32>,
     pub sites: Vec<(usize, Site)>,
     pub marks: Vec<Mark>,
@@ -52,6 +86,13 @@ pub(crate) struct Lowered {
     /// The word job and cold inline exits leave through. Placement binds
     /// it to `opt_exit`.
     pub exit: usize,
+    pub counters: Vec<(u32, Counter, usize)>,
+    rows: bool,
+    pub row_price: Option<crate::policy::proved::RowPrice>,
+    pub row_sample: Option<(usize, usize)>,
+    pub row_failures: Vec<(crate::translate::lower::resident::RowFailure, usize)>,
+    pub row_target: Option<crate::translate::lower::resident::RowTarget>,
+    pub split: Option<crate::translate::lower::resident::SplitPoint>,
 }
 
 impl Lowered {
@@ -63,30 +104,108 @@ impl Lowered {
 
 /// Code at any address; `Lowered::place` binds its exit. Entry cells are
 /// 16 bytes.
+impl Lowered {
+    pub(crate) fn has_rows(&self) -> bool {
+        self.rows
+    }
+}
+
 pub(crate) fn lower(func: &Func) -> Lowered {
-    lower_form(func, None)
+    lower_form(func, None, false, false, None)
 }
 
 /// Code entered and linked in the Tier-1 register assignment.
 pub(crate) fn lower_inline(func: &Func, assumed: &Assumed, entry: &[Source]) -> Lowered {
     debug_assert_eq!(func.entry, entry);
-    lower_form(func, Some((assumed, entry)))
+    lower_form(func, Some((assumed, entry)), false, false, None)
 }
 
-fn lower_form(func: &Func, inline: Option<(&Assumed, &[Source])>) -> Lowered {
+/// A resident form entered from patchable links, accessing guest memory
+/// through the window (A64-OPT-9).
+pub(crate) fn lower_resident(
+    func: &Func,
+    assumed: &Assumed,
+    entry: &[Source],
+    count_entries: bool,
+) -> Lowered {
+    debug_assert_eq!(func.entry, entry);
+    lower_form(func, Some((assumed, entry)), true, count_entries, None)
+}
+
+pub(crate) fn lower_rows(
+    func: &Func,
+    assumed: &Assumed,
+    domain: &Domain,
+    count_entries: bool,
+    offer: bool,
+) -> Option<Lowered> {
+    let lowered = lower_form(
+        func,
+        Some((assumed, &func.entry)),
+        true,
+        count_entries,
+        Some((domain, offer)),
+    );
+    lowered.rows.then_some(lowered)
+}
+
+fn entry_key(assumed: &Assumed, entry: &[Source]) -> Key {
+    let exact = entry.iter().fold(0, |exact, source| match source {
+        Source::X87(slot) => exact | 1 << slot,
+        _ => exact,
+    });
+    Key::resident(assumed, exact)
+}
+
+fn lower_form(
+    func: &Func,
+    inline: Option<(&Assumed, &[Source])>,
+    resident: bool,
+    count_entries: bool,
+    domain: Option<(&Domain, bool)>,
+) -> Lowered {
     assert_eq!(super::verify::verify(func), Ok(()));
-    let allocation = alloc::allocate(func, inline.is_some());
+    let mut batches = loops::plan(func, &[&loops::vector::Vector]);
     let mut asm = Asm::new();
-    // A bit test whose target lands out of range is emitted wide, and the
-    // form again, as the ordinary translator does.
-    let (mut e, exit, miss, cold) = loop {
-        let (mut e, exit, miss, cold) = emit(func, &allocation, asm, inline);
-        if !e.asm.widen_bit_tests() {
-            break (e, exit, miss, cold);
+    let (mut e, exit, miss, cold, spill_cells) = loop {
+        let allocation = alloc::allocate(func, inline.is_some(), resident, &batches);
+        let (mut e, exit, miss, cold) = emit(
+            func,
+            &allocation,
+            asm,
+            inline,
+            (resident, count_entries, domain),
+            &batches,
+        );
+        if !e.unpriced.is_empty() {
+            batches.retain(|batch| {
+                let head = batch.loop_.head;
+                if e.unpriced.contains(&head) {
+                    crate::jit_map::loop_reject(
+                        batch.loop_.eip,
+                        format_args!("{:?}", loops::Reject::Cost),
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            asm = Asm::new();
+        } else if e.asm.widen_bit_tests() {
+            asm = e.asm;
+            asm.rewind();
+        } else {
+            break (e, exit, miss, cold, allocation.spill_cells);
         }
-        asm = e.asm;
-        asm.rewind();
     };
+    for batch in &batches {
+        crate::jit_map::vectorized(
+            batch.loop_.eip,
+            batch.plan.name,
+            batch.plan.lanes,
+            batch.loop_.streams.len(),
+        );
+    }
     // A host fault leaves through its region's record like a failed check.
     for (offset, site) in &mut e.sites {
         let cold = e.cold[site.opt_record.expect("optimized site") as usize];
@@ -100,21 +219,80 @@ fn lower_form(func: &Func, inline: Option<(&Assumed, &[Source])>) -> Lowered {
     let exit = e.asm.position(exit) / 4;
     let miss = miss.map_or(0, |label| e.asm.position(label) / 4);
     let cold = cold.map_or(0, |label| e.asm.position(label) / 4);
+    let env_miss = e.env_miss.map_or(miss, |label| e.asm.position(label) / 4);
+    let environment = e
+        .environment
+        .iter()
+        .map(|&(sensor, counter)| (sensor, e.asm.position(counter) / 4))
+        .collect();
+    let probation_slot = e
+        .probation
+        .as_ref()
+        .map_or(0, |p| e.asm.position(p.slot) / 4);
+    let probation_sensor = e.probation.as_ref().map(|p| {
+        (
+            p.sensors.clone(),
+            e.asm.position(p.counter) / 4,
+            e.asm.position(p.leave) / 4,
+        )
+    });
+    let counters = e
+        .counters
+        .iter()
+        .map(|&(head, kind, label)| (head, kind, e.asm.position(label) / 4))
+        .collect();
+    let rows = e.row_budget.is_some();
+    let split =
+        e.split.map(
+            |(sensor, threshold, leave)| crate::translate::lower::resident::SplitPoint {
+                sensor: e.asm.position(sensor) / 4,
+                threshold: e.asm.position(threshold) / 4,
+                leave: e.asm.position(leave) / 4 + 1,
+            },
+        );
+    let row_failures = e
+        .row_failures
+        .iter()
+        .map(|&(reason, label)| (reason, e.asm.position(label) / 4))
+        .collect();
+    let row_sample = e
+        .row_sample
+        .map(|(word, label)| (word, e.asm.position(label) / 4));
     let words = e.asm.finish();
     #[cfg(test)]
     assert_no_fp_state(&words);
     Lowered {
         entry: 0,
+        body: e.body,
+        key: inline.map_or_else(Key::default, |(assumed, entry)| entry_key(assumed, entry)),
         miss,
+        env_miss,
+        environment,
         cold,
+        entry_words: e.entry_words,
+        exit_words: e.exit_words,
+        iteration_words: e.iteration.words,
+        iteration_retired: e.iteration.retired,
+        iteration_pcs: e.iteration.pcs,
+        probation: e.probation.map_or_else(Vec::new, |p| p.calls),
+        probation_slot,
+        probation_sensor,
         links: e.links,
+        transitions: e.transitions,
         exit,
         words,
         sites: e.sites,
         marks: e.marks,
         records,
         flags: e.flags,
-        spill_cells: allocation.spill_cells,
+        spill_cells,
+        counters,
+        rows,
+        row_price: e.row_price,
+        row_sample,
+        row_failures,
+        row_target: e.domain.and_then(|(domain, _)| domain.target()),
+        split,
     }
 }
 
@@ -140,10 +318,13 @@ fn emit<'a>(
     allocation: &alloc::Allocation,
     mut asm: Asm,
     inline: Option<(&Assumed, &[Source])>,
+    (resident, count_entries, domain): (bool, bool, Option<(&'a Domain, bool)>),
+    batches: &[loops::Batch],
 ) -> (Emitter<'a>, Label, Option<Label>, Option<Label>) {
     let flags = super::recovery::lower_flags(&allocation.defs, &allocation.locations);
     let blocks = func.blocks.iter().map(|_| asm.label()).collect();
     let cold = func.records.iter().map(|_| asm.label()).collect();
+    let cold_detail = resident.then(|| func.records.iter().map(|_| asm.label()).collect());
     let mut branch_only = vec![true; func.types.len()];
     for v in func
         .blocks
@@ -158,11 +339,87 @@ fn emit<'a>(
     {
         branch_only[v.0 as usize] = false;
     }
+    let env_miss = resident.then(|| asm.label());
+    let row_strip = domain.and_then(|(domain, _)| {
+        let batch = batches
+            .iter()
+            .filter_map(|batch| Some((batch, domain.strip_count(batch.loop_.eip)?)))
+            .max_by_key(|(batch, _)| {
+                batch
+                    .loop_
+                    .streams
+                    .iter()
+                    .map(|stream| u32::from(stream.width))
+                    .sum::<u32>()
+            })
+            .map(|(batch, count)| RowStrip {
+                head: batch.loop_.eip,
+                count,
+                shift: batch.plan.lanes.trailing_zeros(),
+                saved: 0,
+                setup_batches: 0,
+                row_savings: 0,
+            });
+        batch.or_else(|| {
+            domain
+                .alignment_strip()
+                .map(|(head, count, _, saved)| RowStrip {
+                    head,
+                    count,
+                    shift: 0,
+                    saved,
+                    setup_batches: 0,
+                    row_savings: 0,
+                })
+        })
+    });
+    let domain = domain.filter(|_| row_strip.is_some());
+    let span_search = [false, true].map(|backwards| {
+        (resident && domain.is_none() && batches.iter().any(|batch| batch.backwards == backwards))
+            .then(|| asm.label())
+    });
+    let mut batch_backedges = vec![None; func.blocks.len()];
+    for batch in batches {
+        batch_backedges[batch.loop_.latch.0 as usize] = Some((batch.loop_.head, asm.label()));
+    }
+    let probation = resident.then(|| {
+        resident::Probation::new(&mut asm, domain.map(|(domain, _)| domain.row_counter()))
+    });
+    let last_fact = resident
+        .then(|| {
+            func.blocks[0]
+                .insts
+                .iter()
+                .rposition(|(_, op)| matches!(op, Op::PlainPage { .. }))
+        })
+        .flatten();
+    let mmx_miss = (resident && count_entries).then(|| asm.label());
     let mut e = Emitter {
         func,
         asm,
         blocks,
         cold,
+        cold_detail,
+        failures: Vec::new(),
+        normal: if inline.is_some() {
+            vec![[None; 2]; func.records.len()]
+        } else {
+            Vec::new()
+        },
+        resident,
+        env_miss,
+        probation,
+        entry_words: 0,
+        body: 0,
+        exit_words: 0,
+        iteration: cost::Iteration::default(),
+        fact_misses: Vec::new(),
+        environment: Vec::new(),
+        checked_accesses: Vec::new(),
+        page_cross: None,
+        page_crossings: Vec::new(),
+        batch_backedges,
+        guest_eip: 0,
         locations: allocation.locations.clone(),
         defs: allocation.defs.clone(),
         flags,
@@ -171,8 +428,27 @@ fn emit<'a>(
         region: RecordId(0),
         checkpoints: Vec::new(),
         fp_checks: Vec::new(),
+        invalid_ints: Vec::new(),
+        mxcsr: inline
+            .filter(|_| resident)
+            .map(|(assumed, _)| assumed.mxcsr),
         edges: Vec::new(),
         links: Vec::new(),
+        transitions: Vec::new(),
+        unpriced: Vec::new(),
+        reciprocals: Vec::new(),
+        reciprocal_division: false,
+        class_prices: Vec::new(),
+        counters: Vec::new(),
+        count_entries,
+        mmx_miss,
+        domain,
+        row_strip,
+        row_budget: None,
+        row_price: None,
+        row_sample: None,
+        row_failures: Vec::new(),
+        split: None,
     };
     let first = func.blocks[0].head.unwrap().record;
     // spec: A64-OPT-7
@@ -181,38 +457,96 @@ fn emit<'a>(
     let (miss, cold) = if let Some((assumed, entry)) = inline {
         let miss = e.asm.label();
         let cold = e.asm.label();
-        e.inline_entry(assumed, entry, bytes, miss, cold);
+        e.inline_entry(
+            entry_key(assumed, entry),
+            entry,
+            bytes,
+            miss,
+            cold,
+            last_fact.is_some(),
+        );
         (Some(miss), Some(cold))
     } else {
         e.stack_frame(bytes, true);
         e.job_entry();
         (None, None)
     };
-    let mut normal = if inline.is_some() {
-        vec![None; func.records.len()]
-    } else {
-        Vec::new()
-    };
-    let refund = func.records[first.0 as usize].refund;
-    e.charge(i64::from(refund), first, false);
+    if last_fact.is_none() {
+        e.begin_body(first, count_entries);
+    }
+    let mut costs = vec![cost::BlockCost::default(); func.blocks.len()];
+    let mut head_batch = None;
+    let mut prices = Vec::new();
     for (b, data) in func.blocks.iter().enumerate() {
         if e.through(Block(b as u32)).is_some() {
             continue;
         }
-        e.asm.bind(e.blocks[b]);
+        let delayed = b == 0 && last_fact.is_some();
+        if !delayed {
+            e.asm.bind(e.blocks[b]);
+        }
+        let mut start = e.asm.offset();
         e.region = allocation.regions[b];
         e.mark(
             Part::Body,
-            data.eip.unwrap_or(func.records[e.region.0 as usize].eip),
+            data.pcs
+                .first()
+                .copied()
+                .unwrap_or(func.records[e.region.0 as usize].eip),
         );
-        for &(result, op) in &data.insts {
+        if let Some(batch) = batches
+            .iter()
+            .find(|batch| batch.loop_.head.0 as usize == b)
+        {
+            let (_, backedge) = e.batch_backedges[batch.loop_.latch.0 as usize].unwrap();
+            let (words, price) =
+                e.batch(batch, span_search[usize::from(batch.backwards)], backedge);
+            if let Some(price) = price {
+                prices.push((batch, words, 0, Some(price)));
+            } else if e
+                .row_strip
+                .is_some_and(|strip| strip.head == batch.loop_.eip)
+            {
+                prices.push((batch, words, e.words_since(start) - words, None));
+            }
+            if func.head_exit == Some(batch.loop_.head) {
+                head_batch = Some((words, u32::from(batch.plan.lanes)));
+            }
+            start = e.asm.offset();
+        }
+        for (i, &(result, op)) in data.insts.iter().enumerate() {
             if matches!(op, Op::Test { .. }) && result.is_some_and(|v| branch_only[v.0 as usize]) {
                 continue;
             }
+            e.guest_eip = if op.region_guard().is_some() {
+                data.insts[i + 1..]
+                    .iter()
+                    .take(2)
+                    .find_map(|&(_, next)| match next {
+                        Op::Store { pc, .. } => Some(pc),
+                        _ => None,
+                    })
+                    .expect("store guard precedes its store")
+            } else {
+                result
+                    .and_then(|value| func.cold_pcs.get(&value).copied())
+                    .unwrap_or(func.records[e.region.0 as usize].eip)
+            };
             e.op(result, op);
+            if b == 0 && last_fact == Some(i) {
+                e.entry_frames(&func.entry);
+                e.begin_body(first, count_entries);
+                e.asm.bind(e.blocks[b]);
+                start = e.asm.offset();
+            }
         }
         match &data.end {
-            End::Jump(t) => e.edge(t, b + 1),
+            End::Jump(t) => {
+                let edge = e.asm.offset();
+                e.edge(t, b + 1, b);
+                costs[b].edges[0] = e.words_since(edge);
+                costs[b].body = ((edge - start) / 4) as u32;
+            }
             End::Branch { cond, taken, fall } => {
                 let test = if let Some(Op::Test { flags, cond: cc }) = e.defs[cond.0 as usize]
                     && branch_only[cond.0 as usize]
@@ -236,47 +570,96 @@ fn emit<'a>(
                     e.blocks[jump.block.0 as usize]
                 } else {
                     let label = e.asm.label();
-                    e.edges.push((label, jump.clone()));
+                    e.edges.push((label, jump.clone(), b, usize::from(!when)));
                     label
                 };
                 match test {
                     Ok(c) => e.asm.b_cond(if when { c } else { c.invert() }, target),
                     Err(r) => e.asm.cbz(W, when, r, target),
                 }
-                e.edge(inline, b + 1);
+                let edge = e.asm.offset();
+                e.edge(inline, b + 1, b);
+                costs[b].edges[usize::from(when)] = e.words_since(edge);
+                costs[b].body = ((edge - start) / 4) as u32;
             }
             End::Exit(id) => {
-                let i = id.0 as usize;
-                let label = if inline.is_some() {
-                    *normal[i].get_or_insert_with(|| e.asm.label())
+                let exit = if inline.is_some() {
+                    e.normal_exit(*id, false)
                 } else {
-                    e.cold[i]
+                    e.cold[id.0 as usize]
                 };
-                e.asm.b(label);
+                e.asm.b(exit);
             }
             End::Unset => unreachable!(),
         }
     }
-    for (label, target) in std::mem::take(&mut e.edges) {
+    for (label, target, block, index) in std::mem::take(&mut e.edges) {
         e.asm.bind(label);
-        e.edge(&target, usize::MAX);
+        let start = e.asm.offset();
+        e.edge(&target, usize::MAX, block);
+        costs[block].edges[index] = e.words_since(start);
+    }
+    if resident {
+        e.iteration = cost::iteration(func, &costs);
+        if let Some((words, lanes)) = head_batch {
+            e.iteration.words = words.div_ceil(lanes);
+        }
+        e.checkpoints();
     }
     if let Some((assumed, _)) = inline {
-        for (i, label) in normal.into_iter().enumerate() {
-            if let Some(label) = label {
-                e.asm.bind(label);
-                e.mark(Part::Body, func.records[i].eip);
-                e.inline_exit(&func.records[i], assumed, bytes);
+        let head = func.blocks[0].head.unwrap().record;
+        let head = func.records[head.0 as usize].eip;
+        for (i, [normal, checkpoint]) in std::mem::take(&mut e.normal).into_iter().enumerate() {
+            let record = &func.records[i];
+            for (label, arrival) in [
+                (normal, resident && record.eip != head),
+                (checkpoint, false),
+            ] {
+                if let Some(label) = label {
+                    e.asm.bind(label);
+                    e.mark(Part::Body, record.eip);
+                    e.inline_exit(record, assumed, bytes, arrival);
+                }
             }
         }
     }
-    e.checkpoints();
+    if !resident {
+        e.checkpoints();
+    }
     e.fp_checks();
+    for (check, dst, resume) in std::mem::take(&mut e.invalid_ints) {
+        e.asm.bind(check);
+        e.asm.emit(movz(W, dst, 0x8000, 16));
+        e.asm.b(resume);
+    }
+    e.checked_accesses();
+    e.page_crossings(count_entries);
+    for (backwards, search) in [false, true].into_iter().zip(span_search) {
+        if let Some(search) = search {
+            crate::facts::batch_span_search(&mut e.asm, search, backwards);
+        }
+    }
+    for (label, record, reason, pc) in std::mem::take(&mut e.failures) {
+        e.asm.bind(label);
+        e.mark(Part::Cold, pc);
+        e.cold_exit(record, reason, pc);
+    }
+    if let Some(probation) = &e.probation {
+        probation.emit(&mut e.asm);
+    }
+    if let Some(miss) = env_miss {
+        e.environment_misses(bytes, miss, cold.unwrap());
+    }
     // spec: A64-OPT-6
     let exit = e.asm.label();
     for (i, record) in func.records.iter().enumerate() {
         e.asm.bind(e.cold[i]);
         e.mark(Part::Cold, record.eip);
+        if let Some(detail) = &e.cold_detail {
+            e.asm.emit(movz(X, U, 0, 0));
+            e.asm.bind(detail[i]);
+            e.asm.emit(str(X, U, RT, DETAIL));
+        }
         e.imm(T, i as u64);
         e.asm.emit(str(W, T, RT, RECORD));
         e.asm.b(exit);
@@ -284,20 +667,125 @@ fn emit<'a>(
     e.asm.bind(exit);
     // Permanently undefined until placed.
     e.asm.emit(0);
-    for label in [miss, cold].into_iter().flatten() {
+    for label in [miss, cold, env_miss].into_iter().flatten() {
         e.asm.bind(label);
         e.asm.emit(0);
     }
+    if let Some(label) = e.mmx_miss {
+        e.asm.bind(label);
+        e.count(func.records[first.0 as usize].eip, Counter::MmxMiss);
+        e.asm.b(miss.unwrap());
+    }
+    for &(_, _, label) in &e.counters {
+        e.asm.bind(label);
+        e.asm.emit_all(&[0, 0]);
+    }
+    for (batch, words, prefix, price) in prices {
+        let saved = cost::batch_savings(func, &costs, batch, words, price.as_ref());
+        if saved == 0 {
+            e.unpriced.push(batch.loop_.head);
+        } else {
+            let prefix = price.as_ref().map_or(prefix, |price| price.admission);
+            if let Some(price) = price {
+                e.asm.bind(price.label);
+                e.asm.emit_all(&[
+                    crate::policy::proved::minimum_work(prefix, saved).unwrap(),
+                    0,
+                ]);
+            }
+            if let Some(strip) = e
+                .row_strip
+                .as_mut()
+                .filter(|strip| strip.head == batch.loop_.eip)
+            {
+                strip.saved = saved;
+                let call = e.domain.unwrap().0.call_savings();
+                strip.setup_batches =
+                    crate::policy::proved::minimum_work(prefix.saturating_sub(call), saved)
+                        .unwrap();
+                strip.row_savings = strip.setup_batches * saved + call - prefix;
+            }
+        }
+    }
+    if let Some(((minimum, exact), bias, words)) = e.row_budget {
+        let domain = e.domain.unwrap().0;
+        let strip = e.row_strip.unwrap();
+        if let Some(extra) = domain.call_savings().checked_div(strip.saved) {
+            // The final logical iteration runs scalar. Round strip setup
+            // up to whole batches so the credited work covers that cost.
+            if let Some(bias) = bias {
+                let count = Reg::new(0);
+                e.asm.words_mut()[bias] = if strip.shift == 0 {
+                    add_imm(W, count, count, extra, false)
+                } else {
+                    sub_imm(
+                        X,
+                        count,
+                        count,
+                        1 + (strip.setup_batches << strip.shift),
+                        false,
+                    )
+                };
+            }
+            let price = crate::policy::proved::RowPrice {
+                guard: words,
+                saved: strip.saved,
+                row_savings: if strip.shift == 0 {
+                    domain.call_savings() % strip.saved
+                } else {
+                    strip.row_savings
+                },
+                count_register: domain.count_register(),
+            };
+            e.row_price = Some(price);
+            e.asm.bind(minimum);
+            e.asm.emit_all(&[
+                crate::policy::proved::minimum_work(price.guard, price.saved).unwrap(),
+                0,
+            ]);
+            e.asm.bind(exact);
+            e.asm
+                .emit_all(&[price.saved, price.row_savings, price.guard]);
+        }
+    }
+    for &(_, failure) in &e.row_failures {
+        e.asm.bind(failure);
+        e.asm.emit(0);
+    }
+    if let Some((_, threshold, _)) = e.split {
+        e.asm.bind(threshold);
+        e.asm.emit_all(&[u32::MAX, u32::MAX]);
+    }
+    for (value, label) in std::mem::take(&mut e.reciprocals) {
+        e.asm.bind(label);
+        e.asm.emit_all(&[value as u32, (value >> 32) as u32]);
+    }
     (e, exit, miss, cold)
+}
+
+/// A batch whose saved work pays for the row proof. Any narrower
+/// strips apply their own batch minimum when reached.
+#[derive(Clone, Copy)]
+struct RowStrip {
+    head: u32,
+    count: usize,
+    shift: u32,
+    saved: u32,
+    setup_batches: u32,
+    row_savings: u32,
 }
 
 struct FpCheck {
     op: FpOp,
     a: VReg,
     b: VReg,
+    result: VReg,
+    double: bool,
+    sse: bool,
     check: Label,
     resume: Label,
     region: RecordId,
+    fail: Label,
 }
 
 struct Emitter<'a> {
@@ -305,6 +793,23 @@ struct Emitter<'a> {
     asm: Asm,
     blocks: Vec<Label>,
     cold: Vec<Label>,
+    cold_detail: Option<Vec<Label>>,
+    failures: Vec<(Label, RecordId, ResidentCold, u32)>,
+    normal: Vec<[Option<Label>; 2]>,
+    resident: bool,
+    env_miss: Option<Label>,
+    probation: Option<resident::Probation>,
+    entry_words: u32,
+    body: usize,
+    exit_words: u32,
+    iteration: cost::Iteration,
+    fact_misses: Vec<Label>,
+    environment: Vec<(usize, Label)>,
+    checked_accesses: Vec<resident::CheckedAccess>,
+    page_cross: Option<RecordId>,
+    page_crossings: Vec<resident::PageCrossing>,
+    batch_backedges: Vec<Option<(Block, Label)>>,
+    guest_eip: u32,
     locations: Vec<Host>,
     defs: Vec<Option<Op>>,
     flags: Vec<Option<FlagRecipe>>,
@@ -313,11 +818,87 @@ struct Emitter<'a> {
     region: RecordId,
     checkpoints: Vec<(Label, RecordId, Label)>,
     fp_checks: Vec<FpCheck>,
-    edges: Vec<(Label, Target)>,
+    invalid_ints: Vec<(Label, Reg, Label)>,
+    mxcsr: Option<u32>,
+    edges: Vec<(Label, Target, usize, usize)>,
     links: Vec<(usize, u32)>,
+    transitions: Vec<(usize, usize)>,
+    unpriced: Vec<Block>,
+    reciprocals: Vec<(u64, Label)>,
+    reciprocal_division: bool,
+    class_prices: Vec<batch::ClassPrice>,
+    counters: Vec<(u32, Counter, Label)>,
+    count_entries: bool,
+    mmx_miss: Option<Label>,
+    domain: Option<(&'a Domain, bool)>,
+    row_strip: Option<RowStrip>,
+    row_budget: Option<((Label, Label), Option<usize>, u32)>,
+    row_price: Option<crate::policy::proved::RowPrice>,
+    row_sample: Option<(usize, Label)>,
+    row_failures: Vec<(crate::translate::lower::resident::RowFailure, Label)>,
+    split: Option<(Label, Label, Label)>,
+}
+
+impl CheckedEmitter for Emitter<'_> {
+    fn access_asm(&mut self) -> &mut Asm {
+        &mut self.asm
+    }
+
+    fn access_site(&mut self) {
+        self.site(true);
+    }
 }
 
 impl<'a> Emitter<'a> {
+    fn data_view(&self) -> Reg {
+        if self.resident { WINDOW } else { ALIAS }
+    }
+
+    fn normal_exit(&mut self, record: RecordId, checkpoint: bool) -> Label {
+        *self.normal[record.0 as usize][usize::from(checkpoint)]
+            .get_or_insert_with(|| self.asm.label())
+    }
+
+    fn words_since(&self, start: usize) -> u32 {
+        ((self.asm.offset() - start) / 4) as u32
+    }
+
+    fn count(&mut self, head: u32, counter: Counter) {
+        if self.count_entries {
+            let address = self.asm.label();
+            self.counters.push((head, counter, address));
+            self.asm.ldr_literal(U, address);
+            self.asm
+                .emit_all(&[ldr(X, T, U, 0), add_imm(X, T, T, 1, false), str(X, T, U, 0)]);
+        }
+    }
+
+    fn begin_body(&mut self, record: RecordId, count_entries: bool) {
+        let start = self.asm.offset();
+        if count_entries {
+            self.count(self.func.records[record.0 as usize].eip, Counter::Entry);
+            let entries = offset_of!(Runtime, resident_entry_counter) as u32;
+            self.asm.emit_all(&[
+                ldr(X, U, RT, entries),
+                ldr(X, T, U, 0),
+                add_imm(X, T, T, 1, false),
+                str(X, T, U, 0),
+            ]);
+        }
+        let diagnostic_words = self.words_since(start);
+        if let Some(probation) = &mut self.probation {
+            probation.entry(&mut self.asm);
+        }
+        self.charge(
+            i64::from(self.func.records[record.0 as usize].refund),
+            record,
+            false,
+        );
+        if self.resident {
+            self.entry_words = self.words_since(0) - diagnostic_words;
+        }
+    }
+
     fn stack_frame(&mut self, bytes: u64, enter: bool) {
         if bytes == 0 {
             return;
@@ -488,7 +1069,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn edge(&mut self, target: &Target, next: usize) {
+    fn edge(&mut self, target: &Target, next: usize, from: usize) {
         self.parallel_moves(self.moves(target));
         if target.charge != 0 {
             let record = self.func.blocks[target.block.0 as usize]
@@ -502,7 +1083,11 @@ impl<'a> Emitter<'a> {
             );
         }
         if let Some(through) = self.through(target.block) {
-            self.edge(through, next);
+            self.edge(through, next, from);
+        } else if let Some((head, backedge)) = self.batch_backedges[from]
+            && target.block == head
+        {
+            self.asm.b(backedge);
         } else if target.block.0 as usize != next {
             self.asm.b(self.blocks[target.block.0 as usize]);
         }
@@ -510,19 +1095,7 @@ impl<'a> Emitter<'a> {
     /// A head that only names the record of one charged arrival and jumps on
     /// with charge 0. Its code is laid out inline on that arrival's edge.
     fn through(&self, block: Block) -> Option<&'a Target> {
-        let data = &self.func.blocks[block.0 as usize];
-        match &data.end {
-            End::Jump(t)
-                if data.head.is_some()
-                    && block.0 != 0
-                    && data.params.is_empty()
-                    && data.insts.is_empty()
-                    && t.charge == 0 =>
-            {
-                Some(t)
-            }
-            _ => None,
-        }
+        loops::through(self.func, block)
     }
     /// A frame cell access at `offset` from the host address in `base`,
     /// through U when the offset needs computing.
@@ -577,8 +1150,29 @@ impl<'a> Emitter<'a> {
             self.frame(false, X, T, base, offset);
         }
     }
-    fn fail(&self) -> Label {
-        self.cold[self.region.0 as usize]
+    fn failure(&mut self, record: RecordId, reason: ResidentCold) -> Label {
+        if !self.resident {
+            return self.cold[record.0 as usize];
+        }
+        let label = self.asm.label();
+        self.failures.push((label, record, reason, self.guest_eip));
+        label
+    }
+
+    fn fail(&mut self) -> Label {
+        self.failure(self.region, ResidentCold::Validation)
+    }
+
+    fn cold_exit(&mut self, record: RecordId, reason: ResidentCold, pc: u32) {
+        let index = record.0 as usize;
+        let target = if let Some(detail) = &self.cold_detail {
+            let target = detail[index];
+            self.imm(U, (reason as u64) << 32 | u64::from(pc));
+            target
+        } else {
+            self.cold[index]
+        };
+        self.asm.b(target);
     }
 
     fn charge(&mut self, charge: i64, record: RecordId, head_exit: bool) {
@@ -601,7 +1195,12 @@ impl<'a> Emitter<'a> {
             }
         };
         self.asm.emit(instruction);
-        if head_exit {
+        if head_exit && (!self.resident || self.domain.is_some()) {
+            let leave = if self.resident {
+                self.normal_exit(record, true)
+            } else {
+                self.cold[record.0 as usize]
+            };
             let resume = self.asm.label();
             self.asm.emit(ldr(W, T, RT, runtime::HEAD_EXIT));
             self.asm.cbz(W, false, T, resume);
@@ -609,7 +1208,7 @@ impl<'a> Emitter<'a> {
                 sub_imm(W, T, T, 1, false),
                 str(W, T, RT, runtime::HEAD_EXIT),
             ]);
-            self.asm.cbz(W, false, T, self.cold[record.0 as usize]);
+            self.asm.cbz(W, false, T, leave);
             self.asm.bind(resume);
         }
         if charge > 0 {
@@ -628,7 +1227,8 @@ impl<'a> Emitter<'a> {
             // A recall leaves through the record as the ordinary form's
             // budget exit does.
             let leave = self.asm.label();
-            let recalled = if self.func.head_exit.is_some() {
+            let defer_recall = self.func.head_exit.is_some() && !self.resident;
+            let recalled = if defer_recall {
                 self.asm.label()
             } else {
                 leave
@@ -649,7 +1249,7 @@ impl<'a> Emitter<'a> {
                 ]);
                 self.asm.cbz(W, true, T, recalled);
             }
-            if self.func.head_exit.is_some() {
+            if defer_recall {
                 self.asm.b(refill);
                 self.asm.bind(recalled);
                 self.asm.emit_all(&[
@@ -677,66 +1277,180 @@ impl<'a> Emitter<'a> {
             self.imm(COUNT, u64::from(runtime::COMPUTATION_SLICE - refund));
             self.asm.b(resume);
             self.asm.bind(leave);
-            self.asm
-                .emit_all(&[movz(W, T, 1, 0), str(W, T, RT, runtime::OPT_RECALLED)]);
-            self.asm.b(self.cold[record.0 as usize]);
+            if self.resident {
+                let exit = self.normal_exit(record, true);
+                self.asm.b(exit);
+            } else {
+                self.asm
+                    .emit_all(&[movz(W, T, 1, 0), str(W, T, RT, runtime::RECOVERY_RECALLED)]);
+                self.asm.b(self.cold[record.0 as usize]);
+            }
         }
     }
 
     // spec: A64-OPT-4
-    fn fp(&mut self, op: FpOp, dst: VReg, a: VReg, b: VReg) {
+    fn fp(&mut self, op: FpOp, dst: VReg, [a, b]: [VReg; 2], double: bool, sse: bool) {
         // A cold check may still need an operand after the arithmetic.
-        let result = if dst == a || dst == b { C } else { dst };
-        self.asm.emit(dfloat(
-            match op {
-                FpOp::Add => Float::Fadd,
-                FpOp::Sub => Float::Fsub,
-                FpOp::Mul => Float::Fmul,
-                FpOp::Div => Float::Fdiv,
-            },
-            result,
-            a,
-            b,
-        ));
-        let check = self.asm.label();
+        let result = if double && (dst == a || dst == b) {
+            C
+        } else {
+            dst
+        };
+        let float = match op {
+            FpOp::Add => Float::Fadd,
+            FpOp::Sub => Float::Fsub,
+            FpOp::Mul => Float::Fmul,
+            FpOp::Div => Float::Fdiv,
+        };
+        self.asm.emit(if double {
+            dfloat(float, result, a, b)
+        } else {
+            sfloat(float, result, a, b)
+        });
+        let fail = self.fail();
+        let sse = sse && self.resident;
+        let check = if double || sse {
+            self.asm.label()
+        } else {
+            fail
+        };
         let resume = self.asm.label();
         let sum = matches!(op, FpOp::Add | FpOp::Sub);
-        fp_class::result_bits(&mut self.asm, true, result, T, U, sum.then_some(U));
-        if sum {
+        fp_class::result_bits(
+            &mut self.asm,
+            double,
+            result,
+            T,
+            U,
+            (double && sum).then_some(U),
+        );
+        if sum && double {
             self.asm.cbz(W, false, U, check);
+        } else if sum {
+            self.asm.tbz(true, U, 8, check);
         } else {
-            // Exponents 2 through 2046 are safely normal.
-            self.asm
-                .emit_all(&[sub_imm(W, U, U, 3, false), cmp_imm(W, U, 2045, false)]);
+            // Exclude zero, the smallest normal binade, infinities and NaNs.
+            self.asm.emit_all(&[
+                sub_imm(W, U, U, 3, false),
+                cmp_imm(W, U, if double { 2045 } else { 253 }, false),
+            ]);
             self.asm.b_cond(Cond::Hs, check);
         }
         self.asm.bind(resume);
         if dst != result {
             self.asm.emit(vmov(false, dst, result));
         }
-        self.fp_checks.push(FpCheck {
-            op,
-            a,
-            b,
-            check,
-            resume,
-            region: self.region,
-        });
+        if check != fail {
+            self.fp_checks.push(FpCheck {
+                op,
+                a,
+                b,
+                result,
+                double,
+                sse,
+                check,
+                resume,
+                region: self.region,
+                fail,
+            });
+        }
+    }
+
+    fn x87_single(&mut self, op: FpOp, dst: VReg, [a, b]: [VReg; 2]) {
+        let fail = self.fail();
+        for (value, single) in [(a, D), (b, E)] {
+            self.asm.emit_all(&[
+                unary(Unary::Narrow, single, value),
+                unary(Unary::Widen, C, single),
+                fcmp(value, C),
+            ]);
+            self.asm.b_cond(Cond::Ne, fail);
+        }
+        let float = match op {
+            FpOp::Add => Float::Fadd,
+            FpOp::Sub => Float::Fsub,
+            FpOp::Mul => Float::Fmul,
+            FpOp::Div => Float::Fdiv,
+        };
+        let valid = self.asm.label();
+        self.asm.emit_all(&[
+            sfloat(float, C, D, E),
+            fmov_from_v(W, T, C),
+            ubfx(W, U, T, 23, 8),
+            sub_imm(W, U, U, 2, false),
+            cmp_imm(W, U, 253, false),
+        ]);
+        self.asm.b_cond(Cond::Lo, valid);
+        self.asm.emit(lsl_imm(W, T, T, 1));
+        self.asm.cbz(W, true, T, fail);
+        // A zero sum of two binary32 operands cannot be a rounded zero.
+        // For a product or quotient, require a zero factor or dividend.
+        if matches!(op, FpOp::Mul | FpOp::Div) {
+            self.asm.emit(fcmp_zero(a));
+            if op == FpOp::Mul {
+                self.asm.b_cond(Cond::Eq, valid);
+                self.asm.emit(fcmp_zero(b));
+            }
+            self.asm.b_cond(Cond::Ne, fail);
+        }
+        self.asm.bind(valid);
+        self.asm.emit(unary(Unary::Widen, dst, C));
     }
 
     fn fp_checks(&mut self) {
+        let exact = self.asm.label();
+        let mut uses_exact = false;
         for FpCheck {
             op,
             a,
             b,
+            result,
+            double,
+            sse,
             check,
             resume,
             region,
+            fail,
         } in std::mem::take(&mut self.fp_checks)
         {
             self.asm.bind(check);
             self.mark(Part::Cold, self.func.records[region.0 as usize].eip);
-            let fail = self.cold[region.0 as usize];
+            if sse {
+                uses_exact = true;
+                let size = if double { X } else { W };
+                // Silence commonly comes here. A zero factor or dividend
+                // already produced the exact signed zero.
+                let slow = self.asm.label();
+                self.asm.emit(lsl_imm(size, T, T, 1));
+                self.asm.cbz(size, true, T, slow);
+                if matches!(op, FpOp::Add | FpOp::Sub) {
+                    self.asm.b(resume);
+                } else {
+                    for operand in [Some(a), (op == FpOp::Mul).then_some(b)]
+                        .into_iter()
+                        .flatten()
+                    {
+                        self.asm
+                            .emit_all(&[fmov_from_v(size, T, operand), lsl_imm(size, T, T, 1)]);
+                        self.asm.cbz(size, false, T, resume);
+                    }
+                }
+                self.asm.bind(slow);
+                self.asm
+                    .emit_all(&[fmov_from_v(size, X0, a), fmov_from_v(size, X1, b)]);
+                self.imm(X2, op as u64);
+                self.imm(X3, if double { 8 } else { 4 });
+                self.asm.bl(exact);
+                let missing = !self.mxcsr.unwrap() & 0x3f;
+                if missing != 0 {
+                    self.imm(U, u64::from(missing));
+                    self.asm.emit(and(W, T, X1, U, Lsl, 0));
+                    self.asm.cbz(W, true, T, fail);
+                }
+                self.asm.emit(fmov_to_v(size, result, X0));
+                self.asm.b(resume);
+                continue;
+            }
             let nonfinite = self.asm.label();
             self.asm.emit_all(&[
                 lsl_imm(X, T, T, 1),
@@ -787,21 +1501,29 @@ impl<'a> Emitter<'a> {
             }
             self.asm.b(fail);
         }
+        if uses_exact {
+            self.asm.bind(exact);
+            resident::preserve_call(&mut self.asm, exact_sse as *const () as u64);
+        }
     }
 
-    fn site(&mut self) {
+    fn site(&mut self, checked: bool) {
         let record = &self.func.records[self.region.0 as usize];
         self.sites.push((
             self.asm.offset(),
             Site {
-                eip: record.eip,
+                eip: if self.resident {
+                    self.guest_eip
+                } else {
+                    record.eip
+                },
                 refund: record.refund,
                 sense: Sense::Subtraction,
                 carry: Carry::Host,
-                recipe: crate::translate::Recipe::Canonical,
+                recipe: crate::translate::lower::flags::Recipe::Canonical,
                 nz: None,
                 overflow: Overflow::Host,
-                checked: false,
+                checked,
                 simd_dirty: 0,
                 resume: 0,
                 opt_record: Some(self.region.0),
@@ -810,11 +1532,39 @@ impl<'a> Emitter<'a> {
     }
 
     fn op(&mut self, result: Option<Value>, op: Op) {
+        if let Op::Snapshot(v) = op {
+            self.copy(
+                self.locations[result.unwrap().0 as usize],
+                self.locations[v.0 as usize],
+                Type::I32,
+            );
+            return;
+        }
         let out = result.unwrap_or(Value(0));
         let loc = result.map(|v| self.locations[v.0 as usize]);
         let d = result.map_or(T, |v| self.rd(v));
-        let q = result.map_or(A, |v| self.vd(v));
+        let q = if self.resident
+            && matches!(op, Op::Fp32(..))
+            && matches!(loc, Some(Host::Spill(..)))
+        {
+            C
+        } else {
+            result.map_or(A, |v| self.vd(v))
+        };
         match op {
+            Op::PlainPage { addr, bytes, write } => self.plain_page(addr, bytes, write),
+            Op::PageCross { record, .. } => self.page_cross = Some(record),
+            Op::FrameDisjoint {
+                addr,
+                width,
+                base,
+                lo,
+                hi,
+                record,
+            } => {
+                let fail = self.failure(record, ResidentCold::FrameDisjoint);
+                self.frame_disjoint(addr, width, base, lo, hi, fail);
+            }
             Op::Constant(_, bits) => {
                 if !matches!(loc, Some(Host::Constant(_))) {
                     self.copy(loc.unwrap(), Host::Constant(bits), self.func.ty(out));
@@ -825,6 +1575,9 @@ impl<'a> Emitter<'a> {
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 self.asm.emit(compare(kind, a, b));
+                if self.mxcsr.is_some_and(|mxcsr| mxcsr & 1 != 0) {
+                    return;
+                }
                 let fail = self.fail();
                 if kind == FlagKind::OrderedCompare {
                     self.asm.b_cond(Cond::Vs, fail);
@@ -836,7 +1589,7 @@ impl<'a> Emitter<'a> {
                     self.asm.bind(ordered);
                 }
             }
-            Op::Flags { .. } => {}
+            Op::Flags { .. } | Op::Snapshot(_) => {}
             Op::Test { flags, cond } => {
                 let c = self.condition(self.locations[flags.0 as usize], cond);
                 self.asm.emit(cset(W, d, c));
@@ -861,6 +1614,7 @@ impl<'a> Emitter<'a> {
                         IntOp::Shl => shiftv(size, Lsl, d, a, b),
                         IntOp::Shr => shiftv(size, Lsr, d, a, b),
                         IntOp::Sar => shiftv(size, Asr, d, a, b),
+                        IntOp::Ror => rorv(size, d, a, b),
                         IntOp::Mul => mul(size, d, a, b),
                         IntOp::MulHighSigned if size == X => smulh(d, a, b),
                         IntOp::MulHighUnsigned if size == X => umulh(d, a, b),
@@ -888,6 +1642,7 @@ impl<'a> Emitter<'a> {
                     IntUnary::SignExtend16 => sbfx(W, d, a, 0, 16),
                     IntUnary::High32 => lsr_imm(X, d, a, 32),
                     IntUnary::SignWiden => sbfx(X, d, a, 0, 32),
+                    IntUnary::ByteSwap => rev(W, d, a),
                     _ => mov(W, d, a),
                 });
             }
@@ -899,8 +1654,9 @@ impl<'a> Emitter<'a> {
             } => {
                 let n = self.gp(dividend, T);
                 let mut b = self.gp(divisor, U);
-                if !proved {
-                    self.asm.cbz(W, false, b, self.fail());
+                let fail = (!proved).then(|| self.failure(self.region, ResidentCold::Division));
+                if let Some(fail) = fail {
+                    self.asm.cbz(W, false, b, fail);
                 }
                 if signed {
                     self.asm.emit(sbfx(X, U, b, 0, 32));
@@ -911,14 +1667,14 @@ impl<'a> Emitter<'a> {
                 } else {
                     udiv(X, d, n, b)
                 });
-                if !proved {
+                if let Some(fail) = fail {
                     self.asm.emit(if signed {
                         sbfx(X, U, d, 0, 32)
                     } else {
                         mov(W, U, d)
                     });
                     self.asm.emit(cmp(X, d, U, Lsl, 0));
-                    self.asm.b_cond(Cond::Ne, self.fail());
+                    self.asm.b_cond(Cond::Ne, fail);
                 }
                 if signed {
                     self.asm.emit(mov(W, d, d));
@@ -993,10 +1749,21 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            Op::Fp(op, a, b) => {
+            Op::Fp(fp, a, b) | Op::SseFp64(fp, a, b) | Op::Fp32(fp, a, b) => {
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
-                self.fp(op, q, a, b);
+                self.fp(
+                    fp,
+                    q,
+                    [a, b],
+                    !matches!(op, Op::Fp32(..)),
+                    !matches!(op, Op::Fp(..)),
+                );
+            }
+            Op::X87Single(op, a, b) => {
+                let a = self.vr(a, A);
+                let b = self.vr(b, B);
+                self.x87_single(op, q, [a, b]);
             }
             Op::FpUnary(op, a) => {
                 let a = self.vr(a, A);
@@ -1024,10 +1791,11 @@ impl<'a> Emitter<'a> {
                         add(W, T, T, U, Lsl, 0),
                         cmp_imm(W, T, 64 - 53, false),
                     ]);
-                    self.asm.b_cond(Cond::Lo, self.fail());
+                    let fail = self.fail();
+                    self.asm.b_cond(Cond::Lo, fail);
                 }
             }
-            Op::ToInt { value, wide } => {
+            Op::ToInt { value, wide, sse } => {
                 let a = self.vr(value, A);
                 // Compare the magnitude to the exclusive limit for the
                 // operand's sign. NaNs and infinities also exceed either limit.
@@ -1040,13 +1808,89 @@ impl<'a> Emitter<'a> {
                     and_imm(X, T, T, i64::MAX as u64),
                     cmp(X, T, U, Lsl, 0),
                 ]);
-                self.asm.b_cond(Cond::Hs, self.fail());
+                let bound = if sse && self.mxcsr.is_some_and(|mxcsr| mxcsr & 1 != 0) {
+                    let (check, resume) = (self.asm.label(), self.asm.label());
+                    self.invalid_ints.push((check, d, resume));
+                    (check, Some(resume))
+                } else {
+                    (self.fail(), None)
+                };
+                self.asm.b_cond(Cond::Hs, bound.0);
                 self.asm
                     .emit(fcvt_int(if wide { X } else { W }, true, d, a));
+                if let Some(resume) = bound.1 {
+                    self.asm.bind(resume);
+                }
+            }
+            Op::X87Store {
+                value,
+                width,
+                rounding,
+                integer,
+            } => {
+                let a = self.vr(value, A);
+                let fail = self.fail();
+                if integer {
+                    let rounded = match rounding {
+                        0 => Unary::Frintn,
+                        1 => Unary::Frintm,
+                        2 => Unary::Frintp,
+                        _ => Unary::Frintz,
+                    };
+                    let operand = if rounding == 3 {
+                        a
+                    } else {
+                        self.asm.emit(unary(rounded, C, a));
+                        C
+                    };
+                    self.asm.emit_all(&[
+                        fmov_from_v(X, T, operand),
+                        ubfx(X, T, T, 52, 11),
+                        cmp_imm(W, T, 1023 + u32::from(width) * 8 - 1, false),
+                    ]);
+                    self.asm.b_cond(Cond::Hs, fail);
+                    self.asm
+                        .emit(fcvt_int(if width == 8 { X } else { W }, true, d, operand));
+                } else {
+                    let good = self.asm.label();
+                    self.asm.emit_all(&[
+                        unary(Unary::Narrow, C, a),
+                        fmov_from_v(W, d, C),
+                        ubfx(W, U, d, 23, 8),
+                        sub_imm(W, U, U, 2, false),
+                        cmp_imm(W, U, 253, false),
+                    ]);
+                    self.asm.b_cond(Cond::Lo, good);
+                    // Zero is exact only when the source was also zero.
+                    self.asm.emit(fcmp_zero(a));
+                    self.asm.b_cond(Cond::Ne, fail);
+                    self.asm.bind(good);
+                }
+            }
+            Op::X87StoreC1 {
+                value,
+                stored,
+                integer,
+            } => {
+                let a = self.vr(value, A);
+                let r = self.gp(stored, T);
+                if integer {
+                    self.asm.emit(scvtf(self.size(stored), B, r));
+                } else {
+                    self.asm
+                        .emit_all(&[fmov_to_v(W, B, r), unary(Unary::Widen, B, B)]);
+                }
+                self.asm.emit_all(&[
+                    unary(Unary::Fabs, C, a),
+                    unary(Unary::Fabs, B, B),
+                    fcmp(B, C),
+                    cset(W, d, Cond::Gt),
+                ]);
             }
             Op::VecUnary(op, a) => {
                 let a = self.vr(a, A);
                 match op {
+                    VecUnary::NarrowScalar => self.asm.emit(unary(Unary::Narrow, q, a)),
                     VecUnary::Low64 => self.asm.emit(vmov(false, q, a)),
                     VecUnary::High64 => {
                         self.asm.emit_all(&[vins(3, q, 0, a, 1), vmov(false, q, q)])
@@ -1323,36 +2167,73 @@ impl<'a> Emitter<'a> {
                         }
                     }
                     VecOp::LessF64 => {
-                        let fail = self.fail();
-                        fp_class::nan_operands(
-                            &mut self.asm,
-                            false,
-                            true,
-                            &[a, b],
-                            T,
-                            [C, D],
-                            fail,
-                        );
+                        if self.mxcsr.is_none_or(|mxcsr| mxcsr & 1 == 0) {
+                            let fail = self.fail();
+                            fp_class::nan_operands(
+                                &mut self.asm,
+                                false,
+                                true,
+                                &[a, b],
+                                T,
+                                [C, D],
+                                fail,
+                            );
+                        }
                         self.asm.emit(vcompare(Float::Fcmgt, false, true, q, b, a));
                     }
                 }
             }
-            Op::Load { ty, width, addr } => {
+            Op::Load {
+                ty,
+                width,
+                addr,
+                checked,
+                pc,
+                clock,
+                scope,
+            } => {
+                if let Some(cell) = scope {
+                    let offset = runtime::SCOPE_FRAME + 4 * u32::from(cell);
+                    let source = if matches!(ty, Type::I32 | Type::I64) {
+                        self.asm.emit(ldr(W, d, RT, offset));
+                        Host::Register(d)
+                    } else {
+                        self.asm.emit(vldr(VMem::S, q, RT, offset));
+                        Host::Vector(q)
+                    };
+                    if let Some(loc) = loc {
+                        self.copy(loc, source, ty);
+                    }
+                    return;
+                }
+                self.guest_eip = pc;
                 let addr = self.gp(addr, U);
-                self.site();
-                if matches!(ty, Type::I32 | Type::I64) {
-                    self.asm.emit(match width {
-                        1 => ldr_narrow(Narrow::Byte, d, ALIAS, addr),
-                        2 => ldr_narrow(Narrow::Half, d, ALIAS, addr),
-                        _ => ldr_reg(if width == 8 { X } else { W }, d, ALIAS, addr, false),
-                    });
+                let base = self.data_view();
+                let (word, reg) = if matches!(ty, Type::I32 | Type::I64) {
+                    (
+                        match width {
+                            1 => ldr_narrow(Narrow::Byte, d, base, addr),
+                            2 => ldr_narrow(Narrow::Half, d, base, addr),
+                            _ => ldr_reg(if width == 8 { X } else { W }, d, base, addr, false),
+                        },
+                        AccessReg::Scalar(d),
+                    )
                 } else {
-                    self.asm.emit(vldr_reg(mem_size(width), q, ALIAS, addr));
+                    let size = mem_size(width);
+                    (vldr_reg(size, q, base, addr), AccessReg::Vector(size, q))
+                };
+                self.memory_access(addr, width, reg, word, false, checked);
+                if clock {
+                    self.asm.emit_all(&[
+                        ldr(X, U, RT, runtime::CPU_STATE),
+                        str(X, RT, U, runtime::CLOCK_READ),
+                    ]);
                 }
             }
             Op::Host(addr) => {
                 let addr = self.gp(addr, U);
-                self.asm.emit(add_ext(X, d, ALIAS, addr, Extend::Uxtw, 0));
+                self.asm
+                    .emit(add_ext(X, d, self.data_view(), addr, Extend::Uxtw, 0));
             }
             Op::FrameLoad { ty, base, offset } => {
                 let base = self.gp(base, U);
@@ -1383,21 +2264,44 @@ impl<'a> Emitter<'a> {
                 addr,
                 value,
                 after,
+                checked,
+                pc,
+                scope,
             } => {
-                let addr = self.gp(addr, U);
-                if matches!(self.func.ty(value), Type::I32 | Type::I64) {
-                    let value = self.gp(value, T);
-                    self.site();
-                    self.asm.emit(match width {
-                        1 => str_narrow(Narrow::Byte, value, ALIAS, addr),
-                        2 => str_narrow(Narrow::Half, value, ALIAS, addr),
-                        _ => str_reg(if width == 8 { X } else { W }, value, ALIAS, addr, false),
-                    });
-                } else {
-                    let value = self.vr(value, A);
-                    self.site();
-                    self.asm.emit(vstr_reg(mem_size(width), value, ALIAS, addr));
+                if let Some(cell) = scope {
+                    let offset = runtime::SCOPE_FRAME + 4 * u32::from(cell);
+                    let word = if matches!(self.func.ty(value), Type::I32 | Type::I64) {
+                        str(W, self.gp(value, T), RT, offset)
+                    } else {
+                        vstr(VMem::S, self.vr(value, A), RT, offset)
+                    };
+                    self.asm.emit(word);
+                    self.region = after;
+                    self.mark(Part::Body, self.func.records[after.0 as usize].eip);
+                    return;
                 }
+                self.guest_eip = pc;
+                let addr = self.gp(addr, U);
+                let base = self.data_view();
+                let (word, reg) = if matches!(self.func.ty(value), Type::I32 | Type::I64) {
+                    let src = self.gp(value, T);
+                    (
+                        match width {
+                            1 => str_narrow(Narrow::Byte, src, base, addr),
+                            2 => str_narrow(Narrow::Half, src, base, addr),
+                            _ => str_reg(if width == 8 { X } else { W }, src, base, addr, false),
+                        },
+                        AccessReg::Scalar(src),
+                    )
+                } else {
+                    let src = self.vr(value, A);
+                    let size = mem_size(width);
+                    (
+                        vstr_reg(size, src, base, addr),
+                        AccessReg::Vector(size, src),
+                    )
+                };
+                self.memory_access(addr, width, reg, word, true, checked);
                 self.region = after;
                 self.mark(Part::Body, self.func.records[after.0 as usize].eip);
             }
@@ -1406,6 +2310,7 @@ impl<'a> Emitter<'a> {
                 denormal,
                 single,
             } => {
+                let fail = self.fail();
                 let r = self.gp(bits, U);
                 let nan = self.asm.label();
                 let done = self.asm.label();
@@ -1423,19 +2328,26 @@ impl<'a> Emitter<'a> {
                 if denormal {
                     self.asm.cbz(W, true, T, done);
                     self.asm.emit(lsl_imm(size, T, r, 1));
-                    self.asm.cbz(size, true, T, self.fail());
+                    self.asm.cbz(size, true, T, fail);
                 }
                 self.asm.b(done);
                 self.asm.bind(nan);
                 self.asm.emit(lsl_imm(size, T, r, high));
-                self.asm.cbz(size, true, T, self.fail());
+                self.asm.cbz(size, true, T, fail);
                 self.asm.bind(done);
                 self.asm.emit(fmov_to_v(size, q, r));
                 if single {
                     self.asm.emit(unary(Unary::Widen, q, q));
                 }
             }
-            Op::SseInput { a, b, packed } => {
+            Op::SseInput {
+                a,
+                b,
+                packed,
+                single,
+                pc,
+            } => {
+                self.guest_eip = pc;
                 let a = self.vr(a, A);
                 let b = b.map(|b| self.vr(b, B));
                 let fail = self.fail();
@@ -1453,7 +2365,7 @@ impl<'a> Emitter<'a> {
                     for input in [Some(a), b].into_iter().flatten() {
                         fp_class::scalar_denormal(
                             &mut self.asm,
-                            true,
+                            !single,
                             input,
                             T,
                             U,
@@ -1462,6 +2374,9 @@ impl<'a> Emitter<'a> {
                         );
                     }
                 }
+            }
+            Op::ScopeWritten(mask) => {
+                crate::translate::lower::access::scope_written(&mut self.asm, RT, T, U, mask)
             }
             Op::Validate => {}
         }
@@ -1477,6 +2392,25 @@ impl<'a> Emitter<'a> {
             self.copy(loc, src, ty);
         }
     }
+}
+
+#[repr(C)]
+struct SseResult {
+    bits: u64,
+    flags: u64,
+}
+
+extern "C" fn exact_sse(a: u64, b: u64, op: u8, width: u8) -> SseResult {
+    use adv_cpu_core::floating::softfloat;
+    softfloat::configure_sse(0x1f80);
+    let bits = softfloat::sse_binary(a, b, op, width);
+    let mut flags = u64::from(softfloat::flags());
+    // The double-precision input pass relies on validated arithmetic
+    // producing normal or zero values when DE is clear.
+    if width == 8 && f64::from_bits(bits).is_subnormal() {
+        flags |= 2;
+    }
+    SseResult { bits, flags }
 }
 
 fn add_immediate(n: u64) -> Option<(u32, bool)> {
@@ -1516,12 +2450,13 @@ fn int_immediate(op: IntOp, size: Size, d: Reg, a: Reg, n: u64) -> Option<u32> {
                 _ => eor_imm(size, d, a, n),
             }
         }
-        IntOp::Shl | IntOp::Shr | IntOp::Sar => {
+        IntOp::Shl | IntOp::Shr | IntOp::Sar | IntOp::Ror => {
             let n = (n & if size == X { 63 } else { 31 }) as u32;
             match op {
                 IntOp::Shl => lsl_imm(size, d, a, n),
                 IntOp::Shr => lsr_imm(size, d, a, n),
-                _ => asr_imm(size, d, a, n),
+                IntOp::Sar => asr_imm(size, d, a, n),
+                _ => ror_imm(size, d, a, n),
             }
         }
         _ => return None,

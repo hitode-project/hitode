@@ -1,5 +1,8 @@
 //! Constants proven on every arrival, independently of SSA identities.
-use super::*;
+use super::{
+    BTreeMap, Cc, CpuState, EBP, ESP, Edge, FpOp, M, Mem, Next, Part, Reject, Src, Unit, decode,
+    frame_offset,
+};
 use adv_cpu_core::floating::fast::{Fast, Op as Arithmetic};
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -7,8 +10,8 @@ use std::rc::Rc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum C1 {
     Constant(bool),
-    Round(FpOp),
-    Unknown,
+    Round(FpOp, bool),
+    Value,
 }
 /// The frame sets are shared between the models of consecutive
 /// instructions and copied only where one changes.
@@ -54,6 +57,12 @@ fn overwrite(m: &mut Model, p: i32, width: u8) {
     }
 }
 
+pub(super) struct Analysis {
+    pub models: Vec<Model>,
+    pub reachable: Vec<bool>,
+    pub branch: Vec<Option<bool>>,
+}
+
 /// `kept` gives, for a loop head whose arrivals commit frame cells, the
 /// frame bytes that may stay dirty on arrival (A64-OPT-3).
 pub(super) fn analyze(
@@ -61,7 +70,8 @@ pub(super) fn analyze(
     at: &CpuState,
     offsets: &[[Option<i32>; 8]],
     kept: &[Option<BTreeSet<i32>>],
-) -> Result<Vec<Model>, Reject> {
+    write_through: bool,
+) -> Result<Analysis, Reject> {
     let entry = Model {
         top: at.x87.top() as u8,
         valid: (0..8).fold(0, |v, i| v | (u8::from(at.x87.physical_tag(i) != 3) << i)),
@@ -77,12 +87,13 @@ pub(super) fn analyze(
         flags: None,
     };
     let mut states = vec![None; unit.trace.len()];
+    let mut branches = vec![None; unit.trace.len()];
     states[0] = Some(entry.clone());
     let mut work = vec![0];
     while let Some(i) = work.pop() {
         let mut m = states[i].clone().unwrap();
         let inst = unit.trace.insts[i];
-        if inst.effects.writes != crate::translate::flags::FlagSet::NONE {
+        if inst.effects.writes != crate::translate::front::flags::FlagSet::NONE {
             m.flags = None;
         }
         m.step(inst.op, &offsets[i], i)?;
@@ -101,12 +112,16 @@ pub(super) fn analyze(
                 &offsets[i],
             );
         }
+        if write_through {
+            m.dirty = Default::default();
+        }
         let branch = match inst.op {
             decode::Op::Jcc(Cc::Flags(cc), _) => m
                 .flags
                 .map(|flags| adv_cpu_core::integer::condition_true(cc, flags)),
             _ => None,
         };
+        branches[i] = branch;
         let fall = match inst.next {
             Next::Fall => Some(Edge::Internal(i + 1)),
             Next::Edge(e) => Some(e),
@@ -162,19 +177,26 @@ pub(super) fn analyze(
             }
         }
     }
-    Ok(states
+    let reachable = states.iter().map(Option::is_some).collect();
+    let models = states
         .into_iter()
         .map(|m| m.unwrap_or_else(|| entry.clone()))
-        .collect())
+        .collect();
+    Ok(Analysis {
+        models,
+        reachable,
+        branch: branches,
+    })
 }
 
 fn merge_c1(a: C1, b: C1, i: usize) -> Result<C1, Reject> {
     Ok(match (a, b) {
         (a, b) if a == b => a,
-        (C1::Unknown, _) | (_, C1::Unknown) => C1::Unknown,
-        (C1::Round(a), C1::Round(b)) if a != b => return Err(Reject::StaticX87(i)),
-        (C1::Round(op), _) | (_, C1::Round(op)) => C1::Round(op),
-        _ => C1::Round(FpOp::Add),
+        (C1::Value, C1::Constant(_)) | (C1::Constant(_), C1::Value) => C1::Value,
+        (C1::Value, _) | (_, C1::Value) => return Err(Reject::StaticX87(i)),
+        (C1::Round(..), C1::Round(..)) => return Err(Reject::StaticX87(i)),
+        (round @ C1::Round(..), _) | (_, round @ C1::Round(..)) => round,
+        _ => C1::Round(FpOp::Add, false),
     })
 }
 
@@ -237,6 +259,7 @@ impl Model {
         }
     }
     fn step(&mut self, op: decode::Op, offsets: &[Option<i32>; 8], i: usize) -> Result<(), Reject> {
+        use crate::translate::front::forms::Integer;
         use decode::Op as D;
         let part = |s| match s {
             Src::Reg(r) => Part::Reg(r),
@@ -273,7 +296,11 @@ impl Model {
                         self.valid |= 1 << top;
                         self.c1 = C1::Constant(false);
                     }
-                    Fast::Store { pop, integer, .. } => {
+                    Fast::Store {
+                        pop,
+                        integer,
+                        width,
+                    } => {
                         need(self.top)?;
                         if pop {
                             self.valid &= !(1 << self.top);
@@ -281,29 +308,24 @@ impl Model {
                         }
                         // Chopping never rounds the magnitude up.
                         let chop = self.control.is_some_and(|c| c & 0x0c00 == 0x0c00);
-                        self.c1 = if integer && !chop {
-                            C1::Unknown
+                        self.c1 = if integer && !chop || !integer && width == 4 {
+                            C1::Value
                         } else {
                             C1::Constant(false)
                         };
-                        if let Some(mem) = x.mem {
-                            let width = if let Fast::Store { width, .. } = x.fast {
-                                width
-                            } else {
-                                unreachable!()
-                            };
-                            if let Some(p) = frame_offset(mem, offsets) {
-                                overwrite(self, p, width);
-                                if self.bytes.range(p..p + i32::from(width)).next().is_some() {
-                                    let bytes = Rc::make_mut(&mut self.bytes);
-                                    for b in 0..i32::from(width) {
-                                        bytes.remove(&(p + b));
-                                    }
+                        if let Some(mem) = x.mem
+                            && let Some(p) = frame_offset(mem, offsets)
+                        {
+                            overwrite(self, p, width);
+                            if self.bytes.range(p..p + i32::from(width)).next().is_some() {
+                                let bytes = Rc::make_mut(&mut self.bytes);
+                                for b in 0..i32::from(width) {
+                                    bytes.remove(&(p + b));
                                 }
-                                if !integer && width == 8 {
-                                    Rc::make_mut(&mut self.floats).insert(p);
-                                    Rc::make_mut(&mut self.stored).insert(p);
-                                }
+                            }
+                            if !integer && width == 8 {
+                                Rc::make_mut(&mut self.floats).insert(p);
+                                Rc::make_mut(&mut self.stored).insert(p);
                             }
                         }
                     }
@@ -327,7 +349,7 @@ impl Model {
                         if let adv_cpu_core::floating::fast::Source::St(s) = source {
                             need(slot(s))?;
                         }
-                        self.c1 = C1::Round(fp(op));
+                        self.c1 = C1::Round(fp(op), self.control.is_some_and(|c| c & 0x300 == 0));
                         if pop {
                             self.valid &= !(1 << self.top);
                             self.top = (self.top + 1) & 7;
@@ -362,15 +384,15 @@ impl Model {
                 self.valid |= 1 << top;
                 self.c1 = C1::Constant(false);
             }
-            D::Simd(s) if s.kind == crate::translate::simd::Kind::StoreControl => {
+            D::Simd(s) if s.kind == crate::translate::front::forms::SimdKind::StoreControl => {
                 self.write(Part::Mem(s.mem), 4, Some(self.mxcsr), offsets);
             }
             D::Simd(s) => {
-                if s.kind == crate::translate::simd::Kind::Emms {
+                if s.kind == crate::translate::front::forms::SimdKind::Emms {
                     self.mmx_meta.0 = (self.mmx_meta.0 & !0x300) | 0x200;
                     self.mmx_meta.1 |= 0x300;
                 } else if s.mmx() {
-                    let write_bit = if let crate::translate::simd::Loc::Mmx(n) = s.dst {
+                    let write_bit = if let crate::translate::front::forms::Loc::Mmx(n) = s.dst {
                         1u32 << n
                     } else {
                         0
@@ -378,10 +400,10 @@ impl Model {
                     self.mmx_meta.0 = (self.mmx_meta.0 & !0x300) | 0x500 | write_bit;
                     self.mmx_meta.1 |= 0x700 | write_bit;
                 }
-                if s.dst == crate::translate::simd::Loc::Mem {
+                if s.dst == crate::translate::front::forms::Loc::Mem {
                     self.write(Part::Mem(s.mem), s.width, None, offsets);
                 }
-                if let crate::translate::simd::Loc::Gpr(r) = s.dst {
+                if let crate::translate::front::forms::Loc::Gpr(r) = s.dst {
                     self.regs[r as usize] = (0, 0);
                 }
             }
@@ -405,7 +427,27 @@ impl Model {
                 });
                 self.write(dst, width, v, offsets);
             }
-            D::Shift(_, dst, _) => self.write(part(dst), 4, None, offsets),
+            D::Shift(_, dst, _) => {
+                self.write(part(dst), 4, None, offsets);
+                self.flags = None;
+            }
+            D::Cmov(_, dst, _) | D::Integer(Integer::Bswap(dst)) => {
+                self.write(Part::Reg(dst), 4, None, offsets);
+            }
+            D::Setcc(_, dst) => self.write(Part::Reg(dst), 1, None, offsets),
+            D::Integer(Integer::Set(_, dst)) => self.write(dst, 1, None, offsets),
+            D::Integer(Integer::Cmov(_, dst, _, width) | Integer::Extend(dst, _, _, width, _)) => {
+                self.write(dst, width, None, offsets)
+            }
+            D::Integer(Integer::NarrowShift(_, dst, width, count)) if count != 0 => {
+                self.write(Part::Reg(dst), width, None, offsets);
+                self.flags = None;
+            }
+            D::Integer(Integer::TestBit(..)) => self.flags = None,
+            D::Parts(p) if matches!(p.kind, M::Adc | M::Sbb) => {
+                self.write(p.dst, p.width, None, offsets);
+                self.flags = None;
+            }
             D::Pop(r) => {
                 let v = self.read(
                     Part::Mem(Mem {
@@ -419,9 +461,13 @@ impl Model {
                     4,
                     offsets,
                 );
+                self.regs[ESP as usize] = (0, 0);
                 self.write(Part::Reg(r), 4, v, offsets);
             }
-            D::Leave => self.regs[EBP as usize] = (0, 0),
+            D::Leave => {
+                self.regs[ESP as usize] = (0, 0);
+                self.regs[EBP as usize] = (0, 0);
+            }
             D::Extend(dst, src, signed) => {
                 let (src, width) = match src {
                     decode::Narrow8or16::Byte(r) => (Part::Reg(r), 1),
@@ -451,7 +497,12 @@ impl Model {
                     (0, 0)
                 }
             }
-            D::Integer(crate::translate::integer::Integer::Divide(..)) => {
+            D::Integer(Integer::Multiply(..)) => {
+                self.regs[0] = (0, 0);
+                self.regs[2] = (0, 0);
+                self.flags = None;
+            }
+            D::Integer(Integer::Divide(..)) => {
                 self.regs[0] = (0, 0);
                 self.regs[2] = (0, 0);
             }
@@ -470,8 +521,9 @@ impl Model {
                     value,
                     offsets,
                 );
+                self.regs[ESP as usize] = (0, 0);
             }
-            D::Call(_) => {}
+            D::Call(_) | D::Ret(_) => self.regs[ESP as usize] = (0, 0),
             _ => {}
         }
         Ok(())

@@ -35,9 +35,15 @@ fn cuts(program: &Program, budgets: &[u64]) {
         for &budget in budgets {
             let mut native = executor(program, config, false);
             let mut oracle = executor(program, config, true);
+            let outcome = native.run(program.stop, budget).unwrap();
             assert_eq!(
-                native.run(program.stop, budget).unwrap(),
-                oracle.run(program.stop, budget).unwrap()
+                outcome,
+                oracle
+                    .run(
+                        program.stop,
+                        reference_budget(budget, native.fuel_debt, &outcome)
+                    )
+                    .unwrap()
             );
             same(&native, &oracle);
             assert_eq!(
@@ -115,6 +121,40 @@ fn mmx_prefix_is_visible_to_helpers_x87_emms_and_saved_contexts() {
             a.movq(qword_ptr((DATA + 1024) as i32), mm7).unwrap();
         }));
         cuts(&program, &[1, 7, 8, 9, 10, 100]);
+    }
+}
+
+// spec: A64F-FP-2 A64-REG-5 A64-MEM-7 A64-VER-1
+#[test]
+fn x87_value_images_cross_guest_pages_with_live_xmm() {
+    for fx in [false, true] {
+        let at = DATA + 0xff0;
+        let mut program = fixture(|a| {
+            a.pxor(xmm7, xmm1).unwrap();
+            a.fld1().unwrap();
+            if fx {
+                a.fxsave(ptr(at as i32)).unwrap();
+            } else {
+                a.fnsave(ptr(at as i32)).unwrap();
+            }
+            a.fldz().unwrap();
+            if fx {
+                a.fxrstor(ptr(at as i32)).unwrap();
+            } else {
+                a.frstor(ptr(at as i32)).unwrap();
+            }
+            a.fnstsw(ax).unwrap();
+            a.movups(xmmword_ptr((DATA + 0x300) as i32), xmm7).unwrap();
+        });
+        program.state.xmm[1] = [0x29; 16];
+        program.state.xmm[7] = [0x92; 16];
+        let config = (Features::default(), false, Checks::Adaptive);
+        let mut native = executor(&program, config, false);
+        let mut oracle = executor(&program, config, true);
+        assert_eq!(native.run(program.stop, 100), oracle.run(program.stop, 100));
+        same(&native, &oracle);
+        assert_eq!(native.stats.interpreter_entries, 0);
+        assert_eq!(native.native.as_ref().unwrap().diagnostics.interprets, 0);
     }
 }
 
@@ -251,7 +291,7 @@ fn checked_simd_accesses_complete_and_refuse_without_instruction_helpers() {
                 same(&native, &oracle);
                 let diagnostics = &native.native.as_ref().unwrap().diagnostics;
                 assert!(diagnostics.accesses > 0, "form {n} uses access");
-                assert_eq!(diagnostics.helpers, 0, "form {n} avoids interpret");
+                assert_eq!(diagnostics.interprets, 0, "form {n} avoids interpret");
                 assert_eq!(diagnostics.refused, u64::from(address == HOLE), "form {n}");
                 assert_eq!(
                     matches!(
@@ -332,7 +372,9 @@ fn write_first_and_appended_mmx_loops_avoid_interpret_and_recover_cuts_and_fault
                         let mut native = executor(&p, config, false);
                         let mut oracle = executor(&p, config, true);
                         let got = native.run(p.stop, budget).unwrap();
-                        let expected = oracle.run(p.stop, budget).unwrap();
+                        let expected = oracle
+                            .run(p.stop, budget.saturating_add(native.fuel_debt))
+                            .unwrap();
                         assert_eq!(
                             got, expected,
                             "appended={appended} fault={fault} acc={accumulator} budget={budget}"
@@ -357,4 +399,32 @@ fn write_first_and_appended_mmx_loops_avoid_interpret_and_recover_cuts_and_fault
             }
         }
     }
+}
+
+// spec: A64A-FALL-2 A64F-FP-4 A64-REG-5
+#[test]
+fn tier1_mmx_region_loads_canonical_x87_aliases() {
+    let mut program = fixture(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.movd(mm0, dword_ptr(ebx)).unwrap();
+        a.paddd(mm0, mm2).unwrap();
+        a.movd(dword_ptr(ebx + 4), mm0).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(head).unwrap();
+    });
+    program.state.regs[1] = 10;
+    program.state.x87.regs[2] =
+        adv_cpu_core::X87Register::from_parts(0x8000_0000_0000_0001, 0x3fff);
+    program.state.refresh_mmx();
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut actual = executor(&program, config, false);
+    let mut reference = executor(&program, config, true);
+    assert_eq!(
+        actual.run(program.stop, 100),
+        reference.run(program.stop, 100)
+    );
+    same(&actual, &reference);
+    let native = actual.native.as_ref().unwrap();
+    assert_eq!(native.diagnostics.interprets, 0);
 }

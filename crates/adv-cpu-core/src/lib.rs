@@ -38,6 +38,7 @@ pub mod memory;
 pub mod native_region;
 #[doc(hidden)]
 pub mod perf_map;
+pub mod quick;
 #[doc(hidden)]
 pub mod shared_memory;
 #[doc(hidden)]

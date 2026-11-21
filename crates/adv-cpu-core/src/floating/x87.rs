@@ -214,9 +214,9 @@ fn is_integer(m: M) -> bool {
             | M::Ficomp
     )
 }
-fn source(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<Ext, Step> {
+fn source(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Result<Ext, Step> {
     if i.op0_kind() == OpKind::Memory {
-        let address = tx.address(i)?;
+        let address = tx.address(i, memory)?;
         let width = i.memory_size().size();
         let bytes = tx.read(memory, address, width)?;
         let value = match width {
@@ -263,7 +263,7 @@ fn source(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<Ext,
 }
 fn reset(tx: &mut Transaction) {
     let regs = tx.state.x87.regs;
-    tx.state.x87 = X87State {
+    *tx.state.x87 = X87State {
         control: 0x37f,
         regs,
         ..X87State::default()
@@ -275,10 +275,9 @@ fn metadata(tx: &mut Transaction) {
         tx.state.x87.opcode = opcode;
     }
 }
-pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {
-    let m = i.mnemonic();
-    let no_wait = matches!(
-        m,
+pub(super) fn waits(mnemonic: M) -> bool {
+    !matches!(
+        mnemonic,
         M::Fninit
             | M::Fnclex
             | M::Fnstcw
@@ -287,8 +286,16 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             | M::Fnsave
             | M::Fxsave
             | M::Fxrstor
-    );
-    if !no_wait && tx.state.x87.status & 0x80 != 0 {
+    )
+}
+
+pub(super) fn execute(
+    i: &Instruction,
+    tx: &mut Transaction,
+    memory: Operands<'_>,
+) -> Result<(), Step> {
+    let m = i.mnemonic();
+    if waits(m) && tx.state.x87.status & 0x80 != 0 {
         return Err(Step::Trap {
             pc: tx.pc,
             vector: 16,
@@ -300,12 +307,12 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
         M::Fninit | M::Finit => reset(tx),
         M::Fnclex | M::Fclex => tx.state.x87.status &= !0x80ff,
         M::Fldcw => {
-            let addr = tx.address(i)?;
+            let addr = tx.address(i, memory)?;
             let cw = u16::from_le_bytes(tx.read(memory, addr, 2)?.as_ref().try_into().unwrap());
             tx.state.x87.set_control(cw);
         }
         M::Fnstcw | M::Fstcw => {
-            let addr = tx.address(i)?;
+            let addr = tx.address(i, memory)?;
             tx.store(memory, addr, &tx.state.x87.control.to_le_bytes())?;
         }
         M::Fnstsw | M::Fstsw => {
@@ -313,7 +320,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             if i.op0_kind() == OpKind::Register {
                 tx.state.regs[0] = (tx.state.regs[0] & 0xffff0000) | value as u32;
             } else {
-                let addr = tx.address(i)?;
+                let addr = tx.address(i, memory)?;
                 tx.store(memory, addr, &value.to_le_bytes())?;
             }
         }
@@ -352,7 +359,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
         M::Fst | M::Fstp | M::Fist | M::Fistp | M::Fisttp => {
             metadata(tx);
             let address = if i.op0_kind() == OpKind::Memory {
-                let addr = tx.address(i)?;
+                let addr = tx.address(i, memory)?;
                 tx.check(memory, addr, i.memory_size().size(), true)?;
                 Some(addr)
             } else {
@@ -562,7 +569,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
         | M::Fcmovnu
         | M::Fcmovu => {
             metadata(tx);
-            let flags = tx.state.eflags;
+            let flags = *tx.state.eflags;
             let taken = match m {
                 M::Fcmovb => flags & 1 != 0,
                 M::Fcmovnb => flags & 1 == 0,
@@ -621,7 +628,7 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             let comparison = sf::compare(a, b, !quiet);
             exceptions(tx, sf::flags());
             if matches!(m, M::Fcomi | M::Fcomip | M::Fucomi | M::Fucomip) {
-                tx.state.eflags = (tx.state.eflags & !0x8d5)
+                *tx.state.eflags = (*tx.state.eflags & !0x8d5)
                     | match comparison {
                         0 => 0x40,
                         1 => 1,
@@ -651,8 +658,8 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
     Ok(())
 }
 
-fn bcd(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {
-    let address = tx.address(i)?;
+fn bcd(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Result<(), Step> {
+    let address = tx.address(i, memory)?;
     metadata(tx);
     if i.mnemonic() == M::Fbld {
         let bytes = tx.read(memory, address, 10)?;
@@ -708,8 +715,8 @@ fn bcd(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Ste
     tx.dp = Some(address);
     Ok(())
 }
-fn environment(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {
-    let address = tx.address(i)?;
+fn environment(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Result<(), Step> {
+    let address = tx.address(i, memory)?;
     let m = i.mnemonic();
     let total = i.memory_size().size();
     let size = if matches!(total, 14 | 94) { 14 } else { 28 };
@@ -786,8 +793,8 @@ fn environment(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result
     }
     Ok(())
 }
-fn fx_environment(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Result<(), Step> {
-    let address = tx.address(i)?;
+fn fx_environment(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Result<(), Step> {
+    let address = tx.address(i, memory)?;
     if address & 15 != 0 {
         return Err(Step::Trap {
             pc: tx.pc,
@@ -829,7 +836,7 @@ fn fx_environment(i: &Instruction, tx: &mut Transaction, memory: &Memory) -> Res
                 },
             );
         }
-        tx.state.mxcsr = mxcsr;
+        *tx.state.mxcsr = mxcsr;
         for (slot, xmm) in tx.state.xmm.iter_mut().enumerate() {
             xmm.copy_from_slice(&bytes[160 + slot * 16..176 + slot * 16]);
         }

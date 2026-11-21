@@ -1,4 +1,8 @@
-//! The optimizing tier for admitted computation.
+//! Optimized lowering for worker jobs and resident forms (A64A-ROLE-4).
+//!
+//! Compile passes an owned CPU snapshot and the arbiter's build configuration.
+//! The optimizer derives the form's entry facts from that snapshot and builds
+//! from the decoded unit, explicit assumptions and configuration.
 //!
 //! An optimized form lowers the same `Unit` as the ordinary computation form,
 //! but through an SSA IR ([`ir`]) whose values hold the whole guest state:
@@ -36,7 +40,9 @@
 //! no failure returns past it.
 //!
 //! **Floating point (A64-OPT-4).** Under the default FPCR and x87 precision
-//! 53, AArch64 and x87 round once to the same precision. The value checks
+//! 53, AArch64 and x87 round once to the same precision. Precision 24 uses
+//! binary32 when both inputs fit exactly and the result fits its exponent range.
+//! The value checks
 //! exclude exceptions other than PE, assumed at entry, and results near the
 //! binary64 range limits that could differ from x87's wider exponent range.
 //! Recovery recomputes C1. x87 operands stay non-NaN: admission and loads
@@ -62,15 +68,17 @@
 //! depend only on its trace index; a record holds that refund.
 
 pub(crate) mod back;
+pub(crate) mod computation;
 pub(crate) mod eval;
 pub(crate) mod front;
 pub(crate) mod ir;
+mod loops;
 pub(crate) mod recovery;
 pub(crate) mod verify;
 
 use adv_cpu_core::CpuState;
 
-use front::Assumed;
+pub(crate) use crate::facts::Assumed;
 use ir::Source;
 
 /// Fills `out` with the entry cells of an optimized form when `cpu` meets the
@@ -100,11 +108,12 @@ pub(crate) fn admit_into(
     for &source in entry {
         let cell = match source {
             Source::Reg(i) => u128::from(cpu.regs[usize::from(i)]),
+            Source::FsBase => u128::from(cpu.fs_base),
             Source::Eflags => u128::from(cpu.eflags),
             Source::Xmm(i) => u128::from_le_bytes(cpu.xmm[usize::from(i)]),
             Source::Mmx(i) => u128::from(cpu.mmx[usize::from(i)]),
             Source::X87(i) => {
-                let Some(value) = recovery::binary64(x87.regs[usize::from(i)]) else {
+                let Some(value) = crate::facts::binary64(x87.regs[usize::from(i)]) else {
                     return false;
                 };
                 u128::from(value)

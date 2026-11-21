@@ -17,6 +17,7 @@ enum Fixup {
     Cbz(Size, bool, Reg),
     Tbz(bool, Reg, u32, usize),
     Adr(Reg),
+    LdrLiteral(Reg),
 }
 
 impl Fixup {
@@ -28,6 +29,7 @@ impl Fixup {
             Self::Cbz(size, nonzero, rt) => encode::cbz(size, nonzero, rt, offset),
             Self::Tbz(nonzero, rt, bit, _) => encode::tbz(nonzero, rt, bit, offset),
             Self::Adr(rd) => encode::adr(rd, offset),
+            Self::LdrLiteral(rt) => encode::ldr_literal(rt, offset),
         }
     }
 }
@@ -103,6 +105,10 @@ impl Asm {
 
     pub fn adr(&mut self, rd: Reg, label: Label) {
         self.refer(label, Fixup::Adr(rd));
+    }
+
+    pub fn ldr_literal(&mut self, rt: Reg, label: Label) {
+        self.refer(label, Fixup::LdrLiteral(rt));
     }
 
     /// Byte offset of a bound label.

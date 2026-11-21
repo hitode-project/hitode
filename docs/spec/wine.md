@@ -828,6 +828,9 @@ A front end input wake MUST return control to the front end at the next session 
 
 `tools/wine/prefix-template.sh` makes the template with standard Wine's `wineboot --init`. The restart creates the volatile keys and known DLLs for the server's lifetime. RunOnce and pending rename operations run at that boot boundary. The template is a distribution artifact, made where standard Wine runs, and not part of the repository.
 
+The transient boot machine uses Tier-1 translation. Its policy is independent
+of the application's resident optimization and computation policy.
+
 ### WINE-SES-4 Fixed identity
 
 **Rule**: What a guest learns about its user and machine MUST NOT come from the host: the user MUST be `Player` and the computer `HITODE`. The firmware tables MUST name the virtual machine and the emulated processor, with no serial numbers or UUID. Name resolution through `getaddrinfo` MUST fail.
