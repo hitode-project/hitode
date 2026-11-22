@@ -35,7 +35,7 @@
     <Icon name="chart" /><span>{t("游玩统计")}</span>
   </button>
   <div style="flex: 1"></div>
-  <button class="nav" class:on={route.name === "settings" || route.name === "game-storage"} onclick={() => nav.go({ name: "settings" })}>
+  <button class="nav" class:on={route.name === "settings" || route.name === "game-storage" || route.name === "gamepad"} onclick={() => nav.go({ name: "settings" })}>
     <Icon name="sliders" /><span>{t("设置")}</span>
   </button>
 </nav>

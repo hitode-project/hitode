@@ -18,11 +18,13 @@ import {
 const STORAGE_KEY = "hitode.gamepad.preview";
 
 function loadPreviewSnapshot(): GamepadSnapshot {
+  const simulate =
+    typeof location !== "undefined" && new URLSearchParams(location.search).has("gamepad");
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as GamepadSnapshot;
-      if (parsed?.config) {
+      if (parsed?.config && (!simulate || parsed.config.devices.length > 0)) {
         return {
           config: normalizeGamepadConfig(parsed.config),
           connectedIds: Array.isArray(parsed.connectedIds) ? parsed.connectedIds : [],
@@ -31,6 +33,33 @@ function loadPreviewSnapshot(): GamepadSnapshot {
     }
   } catch {
     // Ignore invalid preview storage.
+  }
+  if (simulate) {
+    return {
+      config: normalizeGamepadConfig({
+        ...defaultGamepadConfig(),
+        unlocked: true,
+        devices: [
+          {
+            id: "preview-xbox",
+            name: "Xbox Wireless Controller",
+            detectedStyle: "xbox",
+            glyphOverride: "auto",
+            swapConfirmCancel: false,
+            defaultProfileId: null,
+          },
+          {
+            id: "preview-switch",
+            name: "Nintendo Switch Pro",
+            detectedStyle: "switch",
+            glyphOverride: "auto",
+            swapConfirmCancel: true,
+            defaultProfileId: null,
+          },
+        ],
+      }),
+      connectedIds: ["preview-xbox", "preview-switch"],
+    };
   }
   return {
     config: defaultGamepadConfig(),

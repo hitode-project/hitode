@@ -646,7 +646,7 @@
     background: #34c759;
   }
   .card {
-    background: var(--bg2);
+    background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 12px;
     overflow: hidden;
@@ -763,7 +763,7 @@
     white-space: nowrap;
   }
   .seg button.on {
-    background: var(--bg2);
+    background: var(--pop);
     color: var(--fg);
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
   }
@@ -772,7 +772,7 @@
     align-items: center;
     gap: 8px;
     flex: 1 1 0;
-    max-width: 200px;
+    max-width: 210px;
     justify-content: flex-end;
   }
   .speed-box input[type="range"] {
@@ -782,8 +782,11 @@
   .speed-val {
     font-size: 12px;
     color: var(--fg2);
-    width: 34px;
+    min-width: 42px;
+    flex: none;
+    white-space: nowrap;
     text-align: right;
+    font-variant-numeric: tabular-nums;
   }
   .group-block {
     display: flex;
@@ -919,7 +922,7 @@
     font-weight: 600;
   }
   .danger {
-    color: #e5484d;
+    color: var(--danger);
   }
   .compact-footer {
     display: flex;

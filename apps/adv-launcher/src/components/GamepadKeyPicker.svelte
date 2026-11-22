@@ -148,10 +148,10 @@
     padding: 0;
     border: 1px solid var(--line);
     border-radius: 14px;
-    background: var(--bg2);
+    background: var(--pop);
     color: var(--fg);
     width: min(560px, calc(100vw - 32px));
-    max-height: min(520px, calc(100vh - 48px));
+    max-height: min(540px, calc(100vh - 48px));
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
     overflow: hidden;
   }
@@ -163,7 +163,8 @@
   .dialog-inner {
     display: flex;
     flex-direction: column;
-    max-height: min(520px, calc(100vh - 48px));
+    background: var(--pop);
+    max-height: min(540px, calc(100vh - 48px));
   }
   .head {
     display: flex;
@@ -223,7 +224,7 @@
     border-radius: 7px;
   }
   .danger {
-    color: #e5484d;
+    color: var(--danger);
   }
   .tabs {
     display: flex;
@@ -261,12 +262,15 @@
     gap: 6px;
     padding: 12px;
     overflow-y: auto;
-    flex: 1 1 0;
-    min-height: 0;
+    flex: 0 1 auto;
+    max-height: 320px;
     align-content: start;
   }
   .grid.inline-grid {
     grid-template-columns: repeat(auto-fill, minmax(66px, 1fr));
+    flex: 1 1 0;
+    min-height: 0;
+    max-height: none;
   }
   .kbtn {
     all: unset;
@@ -327,7 +331,7 @@
     cursor: pointer;
   }
   .seg button.on {
-    background: var(--bg2);
+    background: var(--pop);
     color: var(--fg);
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
   }

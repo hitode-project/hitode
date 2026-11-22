@@ -31,8 +31,7 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    min-height: 44px;
-    padding: 4px 0;
+    min-height: 38px;
   }
   .t {
     font-size: 14px;
