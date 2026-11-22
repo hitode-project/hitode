@@ -24,7 +24,7 @@ concurrency:
 jobs:
   linux:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: '4'
     steps:

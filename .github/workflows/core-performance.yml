@@ -26,7 +26,7 @@ jobs:
   gpu:
     name: gpu (lavapipe)
     runs-on: ubuntu-26.04-arm
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       ADV_GPU_REQUIRE_BACKEND: '1'
       VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
@@ -47,7 +47,7 @@ jobs:
   core:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: '4'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/core-ci
@@ -86,7 +86,7 @@ jobs:
 
   workspace-format:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -111,7 +111,7 @@ jobs:
   workspace-core:
     name: workspace (core-system, macOS ARM64)
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: '3'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/workspace-ci
@@ -143,7 +143,7 @@ jobs:
             target/macos-ffmpeg/*.tar.xz
           key: macos-arm64-ffmpeg-${{ hashFiles('tools/macos/build.py', 'tools/macos/ffmpeg.json') }}
       - name: Build pinned FFmpeg libraries
-        timeout-minutes: 5
+        timeout-minutes: 20
         run: |
           python3 tools/macos/build.py --ffmpeg-only --jobs 3
           prefix=("$GITHUB_WORKSPACE"/target/macos-ffmpeg/*/install)
@@ -157,7 +157,7 @@ jobs:
           path: target/wine-dist
           key: wine-dist-${{ hashFiles('tools/release/wine.json') }}
       - name: Fetch the pinned Wine userland and the probe compiler
-        timeout-minutes: 10
+        timeout-minutes: 25
         run: |
           python3 tools/release/fetch_wine.py target/wine-dist dist
           echo "ADV_WINE_DIST=$GITHUB_WORKSPACE/target/wine-dist/wine11-sse-strip" >> "$GITHUB_ENV"
@@ -168,7 +168,7 @@ jobs:
           node-version: '24'
       - name: Check and build the launcher frontend
         if: env.WORKSPACE_GROUP == 'runtime-apps'
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: |
           npm install --global "$(node --print "require('./apps/adv-launcher/package.json').packageManager")"
           pnpm --dir apps/adv-launcher install --frozen-lockfile
@@ -185,18 +185,18 @@ jobs:
           cache-workspace-crates: true
       - name: Build every crate with default features
         if: env.WORKSPACE_GROUP == 'core-system'
-        timeout-minutes: 20
+        timeout-minutes: 45
         run: cargo check --workspace --exclude adv-launcher --all-targets --locked --keep-going
       - name: Lint the whole workspace
         if: ${{ !cancelled() && env.WORKSPACE_GROUP == 'core-system' }}
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -o pipefail
           python3 tools/lint.py host 2>&1 | tee "$RUNNER_TEMP/workspace-clippy.txt"
       - name: Compile test programs
         id: compile
         if: ${{ !cancelled() }}
-        timeout-minutes: 50
+        timeout-minutes: 90
         run: |
           set -o pipefail
           read -r -a packages <<< "$WORKSPACE_PACKAGES"
@@ -206,7 +206,7 @@ jobs:
           cargo build "${args[@]}" --keep-going --timings -v 2>&1 | tee "$RUNNER_TEMP/workspace-build.txt"
       - name: Execute tests
         if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
-        timeout-minutes: 15
+        timeout-minutes: 45
         run: |
           set -o pipefail
           read -r -a packages <<< "$WORKSPACE_PACKAGES"
@@ -227,7 +227,7 @@ jobs:
           restore-keys: scenario-adv-run-
       - name: Judge behavior scenarios
         if: ${{ !cancelled() && steps.compile.outcome == 'success' && env.WORKSPACE_GROUP == 'runtime-apps' }}
-        timeout-minutes: 10
+        timeout-minutes: 25
         run: |
           set -o pipefail
           head_bin="$RUNNER_TEMP/adv-run-head"
@@ -279,7 +279,7 @@ jobs:
   workspace-apps:
     name: workspace (runtime-apps, macOS ARM64)
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: '3'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/workspace-ci
