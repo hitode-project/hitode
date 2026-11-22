@@ -181,6 +181,7 @@ export async function pickStorageFolder(options?: FolderPickOptions): Promise<st
 }
 
 export function storageSize(bytes: number): string {
+  if (bytes <= 0) return "0 B";
   if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(1)} GB`;
   if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
   return `${Math.ceil(bytes / 1024)} KB`;

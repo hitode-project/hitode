@@ -80,6 +80,8 @@ fn run(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Application Support, not Caches: the system may purge caches, and a
     // fresh download may be impossible while LocalDevVPN holds the VPN slot.
     let cache = PathBuf::from(std::env::var("HOME")?).join("Library/Application Support/HitodeJIT");
+    let _ = std::fs::create_dir_all(&cache);
+    exclude_from_backup(&cache);
     let output = std::sync::Mutex::new(stream);
     let send = |stage: &str, error: Option<String>, port: Option<u16>| {
         let message = serde_json::json!({"stage": stage, "error": error, "port": port});
@@ -136,4 +138,17 @@ fn run(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => send("finished", Some(error), None),
     }
     Ok(())
+}
+
+fn exclude_from_backup(path: &std::path::Path) {
+    use objc2_foundation::{NSNumber, NSURL, NSURLIsExcludedFromBackupKey};
+    let Some(text) = path.to_str() else {
+        return;
+    };
+    let url = NSURL::fileURLWithPath(&NSString::from_str(text));
+    let value = NSNumber::new_bool(true);
+    // SAFETY: NSURLIsExcludedFromBackupKey expects a boolean NSNumber.
+    let _ = unsafe {
+        url.setResourceValue_forKey_error(Some(value.as_ref()), NSURLIsExcludedFromBackupKey)
+    };
 }

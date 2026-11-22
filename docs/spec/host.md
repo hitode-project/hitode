@@ -291,7 +291,7 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 
 ### HOST-LIB-8 Cache clearing
 
-**Rule**: Clearing the launcher cache MUST remove only the per-game graphics cache directories. It MUST NOT follow symbolic links or modify game files, saves, or library records.
+**Rule**: Clearing the launcher cache MUST remove rebuildable graphics caches, obsolete runtimes and crash staging directories without following symbolic links. It MUST NOT modify game files, saves, covers or library records.
 **Applies to**: Launcher
 **Verification**: Test
 

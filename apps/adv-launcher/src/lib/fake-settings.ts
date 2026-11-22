@@ -112,6 +112,29 @@ export function saveGameSetup(gameId: string, setup: GameSetup): void {
   localStorage.setItem(SETUP_KEY, JSON.stringify(Object.fromEntries(setups)));
 }
 
+/** Returns whether the saved run setup of `gameId` references `path` as a disc or font file. */
+export function setupUsesFile(gameId: string, path: string): boolean {
+  const setup = setups.get(gameId);
+  return !!setup && (setup.discs.includes(path) || setup.fontFiles.includes(path));
+}
+
+/** Removes a deleted imported file path from every saved game setup. */
+export function removeFileFromSetups(path: string): void {
+  let changed = false;
+  for (const setup of setups.values()) {
+    const discs = setup.discs.filter((item) => item !== path);
+    const fonts = setup.fontFiles.filter((item) => item !== path);
+    if (discs.length !== setup.discs.length || fonts.length !== setup.fontFiles.length) {
+      setup.discs = discs;
+      setup.fontFiles = fonts;
+      changed = true;
+    }
+  }
+  if (changed) {
+    localStorage.setItem(SETUP_KEY, JSON.stringify(Object.fromEntries(setups)));
+  }
+}
+
 /** Host action: drop cached thumbnails and shader caches. */
 export function clearCache(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 400));

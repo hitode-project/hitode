@@ -279,6 +279,7 @@ fn ddi_variant(cryptex: bool) -> (&'static str, Vec<&'static str>) {
 /// Whether every file of the DDI set is already downloaded.
 pub fn ddi_present(cache: &Path, cryptex: bool) -> bool {
     let (variant, files) = ddi_variant(cryptex);
+    crate::prune_stale_ddi(cache, DDI_REVISION, variant);
     let directory = cache.join(DDI_REVISION).join(variant);
     files.iter().all(|file| directory.join(file).is_file())
 }
@@ -291,6 +292,7 @@ pub async fn download_ddi(
     progress: &impl Fn(&str),
 ) -> Result<PathBuf> {
     let (variant, files) = ddi_variant(cryptex);
+    crate::prune_stale_ddi(cache, DDI_REVISION, variant);
     let directory = cache.join(DDI_REVISION).join(variant);
     std::fs::create_dir_all(&directory)?;
     // Image.dmg is about 16 MB; slow links need minutes, not seconds.

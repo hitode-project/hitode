@@ -1,9 +1,6 @@
 import { t } from "./i18n.svelte";
 import {
-  CACHE_GB,
   GAME_DEFAULTS,
-  SAVES_GB,
-  clearCache,
   codepagePreview,
   fakeReports,
   fakeRoots,
@@ -36,22 +33,12 @@ export const ACCENTS: { value: Accent; label: string; color: string }[] = [
   { value: "graphite", get label() { return t("石墨"); }, color: "#3F3F44" },
 ];
 
-const gb = (v: number) => `${v.toFixed(1)} GB`;
-
-/** Library folders, storage and sent reports; kept for the session. */
+/** Library folders and sent reports; kept for the session. */
 class GeneralSettings {
   roots = $state<LibraryRoot[]>(fakeRoots.map((r) => ({ ...r })));
-  cache = $state<"full" | "clearing" | "cleared">("full");
   withdrawn = $state<Record<string, boolean>>({});
   keyReset = $state(false);
 
-  readonly cacheGb = $derived(this.cache === "cleared" ? 0 : CACHE_GB);
-  readonly totalGb = $derived(SAVES_GB + this.cacheGb);
-  readonly totalLabel = $derived(gb(this.totalGb));
-  readonly cacheLabel = $derived(this.cache === "cleared" ? "0 MB" : gb(CACHE_GB));
-  /** Widths of the saves and cache segments of the usage bar, in percent. */
-  readonly savesPct = $derived(Math.max(2, (SAVES_GB / this.totalGb) * 100));
-  readonly cachePct = $derived((this.cacheGb / this.totalGb) * 100);
   readonly reports = $derived(
     fakeReports.map((r) => ({ ...r, title: library.get(r.gameId)?.title ?? t("已移除的游戏") })),
   );
@@ -63,12 +50,6 @@ class GeneralSettings {
 
   removeRoot(id: string): void {
     this.roots = this.roots.filter((r) => r.id !== id);
-  }
-
-  async clearCache(): Promise<void> {
-    this.cache = "clearing";
-    await clearCache();
-    this.cache = "cleared";
   }
 }
 
