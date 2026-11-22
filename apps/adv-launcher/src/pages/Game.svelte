@@ -801,7 +801,7 @@
     {#if !stopping}
       <TouchControls layout={effectiveLayout} latchCtrl={ff === "toggle"} onlibrary={leave} onmenu={() => openMenu()} onkeyboard={openTextBar} />
     {/if}
-  {:else if phone && !touchHidden}
+  {:else if phone && !prefs.hideControls}
     <button
       class="grip fade"
       class:left={preferredSide === "left"}
