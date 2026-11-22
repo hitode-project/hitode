@@ -18,7 +18,9 @@
   import { drawerEdgeInset, preferredDrawerSide, type DrawerSide } from "../lib/touch-layout";
   import { tap } from "../lib/tap";
   import CustomKeys from "../components/CustomKeys.svelte";
+  import GamepadPanel from "../components/GamepadPanel.svelte";
   import TouchControls from "../components/TouchControls.svelte";
+  import { gamepad } from "../lib/gamepad.svelte";
   import GuestDialogs, { type GuestDialog } from "../components/GuestDialogs.svelte";
   import GuestMenuSheet, { type GuestMenu } from "../components/GuestMenu.svelte";
   import {
@@ -43,9 +45,13 @@
 
   const game = $derived(library.get(gameId));
 
-  type View = "closed" | "menu" | "confirm";
+  type View = "closed" | "menu" | "gamepad" | "confirm";
   let view = $state<View>(untrack(() => runs.takePauseAfterReport(gameId)) ? "menu" : "closed");
+  let gamepadPicking = $state(false);
   let editingKeys = $state(false);
+  const touchHidden = $derived(
+    prefs.hideControls || (gamepad.hasConnected && gamepad.config.autoHideTouch),
+  );
   const activeProfileId = $derived(phone ? gameKeyProfileId(gameId) : null);
   const activeProfile = $derived(phone ? gameKeyProfile(gameId) : null);
   const customWithoutMenu = $derived(
@@ -257,6 +263,7 @@
     else if (editingKeys) editingKeys = false;
     else if (forceAsk) forceAsk = false;
     else if (view === "confirm") view = "menu";
+    else if (view === "gamepad") view = "menu";
     else if (view === "menu") view = "closed";
     else return false;
     return true;
@@ -282,6 +289,12 @@
 
   $effect(() => {
     if (view === "closed") drawerSide = preferredSide;
+  });
+
+  $effect(() => {
+    if (view === "gamepad" && !gamepad.showInPauseMenu) {
+      view = "menu";
+    }
   });
 
   $effect(() => {
@@ -324,6 +337,14 @@
       void call("set_title_bar", { title }, null).catch(() => {});
     }
     const stopPause = onHostEvent("pause", () => togglePause(false));
+    const stopGamepadSys = onHostEvent<string>("gamepad_sys", (action) => {
+      if (action === "menu") togglePause(false);
+      else if (action === "kbd") openTextBar();
+      else if (action === "hide") {
+        prefs.hideControls = !prefs.hideControls;
+        savePrefs();
+      }
+    });
     // A three-finger tap on the game asks for the keyboard.
     const stopKeyboard = onHostEvent("game_keyboard", () => openTextBar());
     const stopDialogs = onHostEvent<GuestDialog[]>("game_dialogs", (value) => (dialogs = value));
@@ -345,6 +366,7 @@
       void call("set_pause_available", { available: false }, null).catch(() => {});
       if (titleBar) void call("set_title_bar", { title: null }, null).catch(() => {});
       stopPause();
+      stopGamepadSys();
       stopKeyboard();
       stopDialogs();
       stopMenu();
@@ -662,6 +684,12 @@
             {#if guestMenu && !guestMenu.popup}
               <button class="qrow" onclick={() => { view = "closed"; menuOpen = true; }}>{t("游戏菜单…")}</button>
             {/if}
+            {#if gamepad.showInPauseMenu}
+              <button class="qrow" onclick={() => (view = "gamepad")}>
+                <span>{t("手柄按键…")}</span>
+                <span class="end"><Icon name="sliders" /></span>
+              </button>
+            {/if}
             {#if phone}
               <button class="qrow" onclick={openKeyEditor}>
                 <span>{t("自定义键位…")}</span>
@@ -681,6 +709,37 @@
           <div class="sep"></div>
           <div class="group" style="padding-bottom: 10px">
             <button class="qrow danger" onclick={() => (view = "confirm")}>{t("退出游戏")}</button>
+          </div>
+        </div>
+      {:else if view === "gamepad"}
+        <div
+          class="panel gamepad"
+          class:pop={!phone}
+          class:slide={phone}
+          class:left={phone && drawerSide === "left"}
+          style={phone ? `--drawer-inset: ${drawerInset}px` : undefined}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="pz-gp-title"
+        >
+          {#if !(phone && gamepadPicking)}
+            <div class="head gp-head">
+              <div class="gp-head-left">
+                <button type="button" class="quiet gp-back" onclick={() => (view = "menu")}>
+                  <Icon name="chevron-left" size={14} />{t("返回")}
+                </button>
+                <h2 id="pz-gp-title">{t("手柄按键")}</h2>
+              </div>
+              <button class="primary" onclick={() => (view = "closed")}>{t("继续")}</button>
+            </div>
+          {/if}
+          <div class="middle gp-body" class:gp-picking={phone && gamepadPicking}>
+            <GamepadPanel
+              {gameId}
+              inPause
+              compact={phone}
+              onpickingchange={(v) => (gamepadPicking = v)}
+            />
           </div>
         </div>
       {:else}
@@ -725,7 +784,7 @@
       onkeyboard={openTextBar}
       ondone={() => (editingKeys = false)}
     />
-  {:else if phone && !prefs.hideControls && activeProfile}
+  {:else if phone && !touchHidden && activeProfile}
     {#if !stopping}
       <CustomKeys
         {gameId}
@@ -738,11 +797,11 @@
         ondone={() => (editingKeys = false)}
       />
     {/if}
-  {:else if phone && !prefs.hideControls && effectiveLayout}
+  {:else if phone && !touchHidden && effectiveLayout}
     {#if !stopping}
       <TouchControls layout={effectiveLayout} latchCtrl={ff === "toggle"} onlibrary={leave} onmenu={() => openMenu()} onkeyboard={openTextBar} />
     {/if}
-  {:else if phone && !prefs.hideControls}
+  {:else if phone && !touchHidden}
     <button
       class="grip fade"
       class:left={preferredSide === "left"}
@@ -1372,6 +1431,52 @@
     padding-right: 0;
     border-radius: 0 16px 16px 0;
     box-shadow: 16px 0 48px rgba(0, 0, 0, 0.45);
+  }
+  .panel.gamepad {
+    width: min(680px, calc(100vw - 48px));
+    max-height: min(620px, calc(100vh - 48px));
+    display: flex;
+    flex-direction: column;
+  }
+  .phone .panel.gamepad {
+    --panel-w: 420px;
+    max-height: none;
+  }
+  .gp-head {
+    align-items: center;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 10px;
+  }
+  .gp-head-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .gp-head-left h2 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .gp-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 4px 6px 4px 2px;
+    color: var(--accent);
+  }
+  .gp-body {
+    padding: 12px 14px 16px;
+    overflow-y: auto;
+    flex: 1 1 0;
+    min-height: 0;
+  }
+  .gp-body.gp-picking {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
   .phone .head {
     padding: 14px 16px 8px;
