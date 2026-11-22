@@ -92,7 +92,10 @@ pub struct Options {
     gpu_software: bool,
     headless_gpu: bool,
     d3d9_sm3: bool,
-    d3d9_shader_cache: Option<PathBuf>,
+    /// Per-game D3D9 shader and native GPU pipeline cache directory.
+    pub d3d9_shader_cache: Option<PathBuf>,
+    /// Shared GPU adapter health and crash-sentinel directory; defaults to `gpu_cache_dir()`.
+    pub gpu_health_dir: Option<PathBuf>,
     width: u32,
     height: u32,
     frames: Option<u64>,
@@ -121,6 +124,13 @@ impl Options {
         self.d3d9_shader_cache
             .clone()
             .unwrap_or_else(|| self.data_dir.join("artifacts/gpu"))
+    }
+
+    #[cfg(any(host_view, feature = "gpu"))]
+    pub(crate) fn gpu_health_dir(&self) -> PathBuf {
+        self.gpu_health_dir
+            .clone()
+            .unwrap_or_else(|| self.gpu_cache_dir())
     }
 
     /// Host execution policy, shared by both personalities before guest execution.
@@ -336,6 +346,7 @@ impl Options {
             headless_gpu: false,
             d3d9_sm3: false,
             d3d9_shader_cache: None,
+            gpu_health_dir: None,
             width: 640,
             height: 480,
             frames: None,

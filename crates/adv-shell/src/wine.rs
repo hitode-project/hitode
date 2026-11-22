@@ -128,7 +128,7 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
             options.gpu_software,
             (options.width, options.height),
             wake.clone(),
-            Some(options.gpu_cache_dir()),
+            Some(options.gpu_health_dir()),
         )?;
         if display_timings_requested(options) {
             display_startup.set_timings(true);

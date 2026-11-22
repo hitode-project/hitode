@@ -701,13 +701,14 @@ struct Disk {
     version: u32,
     identity: String,
     recipes: VecDeque<Recipe>,
-    driver: Vec<u8>,
 }
+const ARCHIVE_VERSION: u32 = 3;
+const ARCHIVE_HEADER: usize = 8 + 32 + 4;
 fn load_archive(path: &Path, identity: &str) -> Option<(VecDeque<Recipe>, Vec<u8>)> {
     use std::io::Read;
     let file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
-    if !(40..=ARCHIVE_LIMIT as u64).contains(&len) {
+    if !(ARCHIVE_HEADER as u64..=ARCHIVE_LIMIT as u64).contains(&len) {
         return None;
     }
     let mut bytes = Vec::with_capacity(len as usize);
@@ -720,15 +721,20 @@ fn load_archive(path: &Path, identity: &str) -> Option<(VecDeque<Recipe>, Vec<u8
     {
         return None;
     }
-    let disk: Disk = serde_json::from_slice(&bytes[40..]).ok()?;
-    if disk.version != 2
+    let meta_len = u32::from_le_bytes(bytes[40..44].try_into().ok()?) as usize;
+    let meta_end = ARCHIVE_HEADER.checked_add(meta_len)?;
+    if meta_end > bytes.len() {
+        return None;
+    }
+    let disk: Disk = serde_json::from_slice(&bytes[ARCHIVE_HEADER..meta_end]).ok()?;
+    if disk.version != ARCHIVE_VERSION
         || disk.identity != identity
         || disk.recipes.len() > MAX_PIPELINES
         || disk.recipes.iter().any(|r| !valid_recipe(r))
     {
         return None;
     }
-    Some((disk.recipes, disk.driver))
+    Some((disk.recipes, bytes[meta_end..].to_vec()))
 }
 fn valid_recipe(recipe: &Recipe) -> bool {
     !recipe.colors.is_empty()
@@ -780,16 +786,25 @@ fn save_archive(
     cache: &p::PipelineCache,
 ) -> std::io::Result<()> {
     use std::io::Write;
-    let disk = Disk {
-        version: 2,
+    let meta = serde_json::to_vec(&Disk {
+        version: ARCHIVE_VERSION,
         identity: identity.to_owned(),
         recipes: recipes.clone(),
-        driver: cache.serialize().map_err(std::io::Error::other)?,
-    };
-    let bytes = serde_json::to_vec(&disk)?;
-    if bytes.len() + 40 > ARCHIVE_LIMIT {
+    })?;
+    let driver = cache.serialize().map_err(std::io::Error::other)?;
+    let meta_len = u32::try_from(meta.len()).map_err(|_| std::io::ErrorKind::InvalidData)?;
+    if ARCHIVE_HEADER
+        .saturating_add(meta.len())
+        .saturating_add(driver.len())
+        > ARCHIVE_LIMIT
+    {
         return Err(std::io::ErrorKind::InvalidData.into());
     }
+    let mut hash = Sha256::new();
+    hash.update(meta_len.to_le_bytes());
+    hash.update(&meta);
+    hash.update(&driver);
+    let checksum = hash.finalize();
     let directory = path.parent().unwrap();
     std::fs::create_dir_all(directory)?;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -804,8 +819,10 @@ fn save_archive(
             .create_new(true)
             .open(&temporary)?;
         file.write_all(MAGIC)?;
-        file.write_all(&Sha256::digest(&bytes))?;
-        file.write_all(&bytes)?;
+        file.write_all(&checksum)?;
+        file.write_all(&meta_len.to_le_bytes())?;
+        file.write_all(&meta)?;
+        file.write_all(&driver)?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, path)
@@ -1998,6 +2015,16 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
             });
         let (path, identity, saved_recipes) = rx.recv().unwrap();
         let (loaded, driver) = load_archive(&path, &identity).unwrap();
+        let expected_meta = serde_json::to_vec(&Disk {
+            version: ARCHIVE_VERSION,
+            identity: identity.clone(),
+            recipes: loaded.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (ARCHIVE_HEADER + expected_meta.len() + driver.len()) as u64
+        );
         assert_eq!(loaded.len(), 2);
         assert_eq!(gpu.stats().persisted_pipelines, loaded.len() as u64);
         assert!(load_archive(&path, "another driver").is_none());
@@ -2054,16 +2081,32 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         *source = "invalid WGSL".into();
         // Keep a valid driver blob and checksum while corrupting a recipe.
         let disk = Disk {
-            version: 2,
+            version: ARCHIVE_VERSION,
             identity: identity.clone(),
             recipes: malformed,
-            driver,
         };
-        let payload = serde_json::to_vec(&disk).unwrap();
-        let checksum = Sha256::digest(&payload);
+        let meta = serde_json::to_vec(&disk).unwrap();
+        let meta_len = (meta.len() as u32).to_le_bytes();
+        let body = [meta_len.as_slice(), &meta, &driver].concat();
+        let checksum = Sha256::digest(&body);
         std::fs::write(
             &path,
-            [MAGIC.as_slice(), checksum.as_slice(), &payload].concat(),
+            [MAGIC.as_slice(), checksum.as_slice(), &body].concat(),
+        )
+        .unwrap();
+        assert!(load_archive(&path, &identity).is_none());
+        // Legacy version-2 JSON archives are rejected cleanly.
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "identity": identity,
+            "recipes": [],
+            "driver": [1, 2, 3],
+        }))
+        .unwrap();
+        let checksum = Sha256::digest(&legacy);
+        std::fs::write(
+            &path,
+            [MAGIC.as_slice(), checksum.as_slice(), &legacy].concat(),
         )
         .unwrap();
         assert!(load_archive(&path, &identity).is_none());
