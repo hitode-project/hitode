@@ -479,6 +479,9 @@ pub async fn pause_game(window: WebviewWindow, paused: bool) -> Result<(), Strin
             host.lifecycle.set_overlay_pause(paused);
         })?;
         HOST.with_borrow(Host::apply_pause);
+        if paused {
+            crate::gamepad::on_pause_or_stop();
+        }
         Ok(())
     })
     .await
