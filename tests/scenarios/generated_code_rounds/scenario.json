@@ -1,7 +1,8 @@
 {
   "spec": ["A64-OPT-8"],
   "exe": "generated_code_rounds.exe",
+  "args": ["--sync-compilation"],
   "seconds": 120,
   "outputs": ["generated-code-rounds.bin"],
-  "levels": ["peak_rss"]
+  "levels": ["peak_heap_bytes", "live_heap_bytes"]
 }

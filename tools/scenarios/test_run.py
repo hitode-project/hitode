@@ -7,13 +7,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run  # noqa: E402
 
 
-def scenario(spec, digest="d"):
-    return {"spec": spec, "digest": digest}
+def scenario(spec, digest="d", min_counters=None, steady_min=None):
+    data = {"spec": spec, "digest": digest}
+    if min_counters is not None:
+        data["min"] = min_counters
+    if steady_min is not None:
+        data["steady"] = {"min": steady_min}
+    return data
 
 
-def result(passed=True, outputs=None, steady=None, levels=None):
+def result(passed=True, outputs=None, steady=None, levels=None, min_counters=None, steady_min=None):
     return {"passed": passed, "exit": 0 if passed else 64, "stop": "guest_exit",
-            "outputs": outputs or {"out.bin": "a"}, "steady": steady or {}, "levels": levels or {}}
+            "outputs": outputs or {"out.bin": "a"}, "steady": steady or {}, "levels": levels or {},
+            "min": min_counters or {}, "steady_min": steady_min or {}}
 
 
 def judge(base, head, base_on_base, base_on_head, changed_on_base=None, changed_on_head=None, again=None):
@@ -99,6 +105,14 @@ class Judge(unittest.TestCase):
         self.assertEqual(judge(base, base, {"s": result(steady={"accesses": 3.0})},
                                {"s": result(steady={"accesses": 0.0})}), [])
 
+    def test_negative_steady_baseline_clamps_to_zero(self):
+        base = {"s": scenario(["A64-1"])}
+        self.assertEqual(judge(base, base, {"s": result(steady={"helper_exits": -0.125})},
+                               {"s": result(steady={"helper_exits": 0.0})}), [])
+        failures = judge(base, base, {"s": result(steady={"helper_exits": -0.125})},
+                         {"s": result(steady={"helper_exits": 0.125})})
+        self.assertIn("steady helper_exits rose", failures[0])
+
     def test_levels_never_rise_beyond_their_slack(self):
         base = {"s": scenario(["A64-1"])}
         mib = 1 << 20
@@ -114,11 +128,63 @@ class Judge(unittest.TestCase):
                          changed_on_head={"t": result()}, again={"t": result(outputs={"out.bin": "c"})})
         self.assertIn("differ between two head runs", failures[0])
 
+    def test_unstable_steady_or_level_counters_cannot_enter_or_claim(self):
+        base = {"s": scenario(["A64-1"])}
+        head = {"s": base["s"], "t": scenario(["A64-1"])}
+        failures = judge(
+            base, head,
+            {"s": result()}, {"s": result(False)},
+            changed_on_base={"t": result(False)},
+            changed_on_head={"t": result(steady={"owner_retired": 200.0})},
+            again={"t": result(steady={"owner_retired": 260.0})},
+        )
+        self.assertEqual(len(failures), 2)
+        self.assertIn("steady owner_retired differs between two head runs", failures[0])
+        self.assertIn("s: passed on base", failures[1])
+
+        failures = judge(
+            {}, {"t": scenario(["A64-1"])}, {}, {},
+            changed_on_base={"t": result(False)},
+            changed_on_head={"t": result(levels={"peak_heap_bytes": 100.0})},
+            again={"t": result(levels={"peak_heap_bytes": 120.0})},
+        )
+        self.assertIn("levels peak_heap_bytes differs between two head runs", failures[0])
+
     def test_a_new_scenario_must_pass_on_head(self):
         head = {"t": scenario(["GFX-1"])}
         failures = judge({}, head, {}, {}, changed_on_base={"t": result(False)},
                          changed_on_head={"t": result(False)})
         self.assertIn("fails on head", failures[0])
+
+    def test_floor_invariants_must_hold_on_head(self):
+        base = {"s": scenario(["A64-1"], min_counters={"split_proofs": 1}, steady_min={"splits": 0.5})}
+        self.assertEqual(
+            judge(
+                base, base,
+                {"s": result(min_counters={"split_proofs": 1}, steady_min={"splits": 1.0})},
+                {"s": result(min_counters={"split_proofs": 1}, steady_min={"splits": 0.75})},
+            ),
+            [],
+        )
+        failures = judge(
+            base, base,
+            {"s": result(min_counters={"split_proofs": 1}, steady_min={"splits": 1.0})},
+            {"s": result(min_counters={"split_proofs": 0}, steady_min={"splits": 0.25})},
+        )
+        self.assertEqual(len(failures), 2)
+        self.assertIn("split_proofs fell below 1.000", failures[0])
+        self.assertIn("steady splits fell below 0.500", failures[1])
+
+    def test_new_scenario_floor_must_hold_on_both_head_runs(self):
+        head = {"t": scenario(["A64-1"], steady_min={"splits": 0.5})}
+        failures = judge(
+            {}, head, {}, {},
+            changed_on_base={"t": result(False)},
+            changed_on_head={"t": result(steady_min={"splits": 1.0})},
+            again={"t": result(steady_min={"splits": 0.0})},
+        )
+        self.assertIn("steady splits fell below 0.500", failures[0])
+        self.assertIn("second head run", failures[0])
 
 
 if __name__ == "__main__":

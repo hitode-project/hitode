@@ -47,9 +47,10 @@ A scenario pins observable behavior of a whole build. It is a directory `tests/s
 | `exe`, `args`, `seconds` | The guest program `adv-run` starts, extra `adv-run` options and the time limit. |
 | `outputs` | Files the guest writes. Their bytes are compared between builds. |
 | `frame` | When true, the last presented frame's hash is compared too. |
-| `steady` | `iterations` (two counts written to `scenario-input.txt`) and the report `counters` whose growth per iteration is compared. On AArch64, `owner_retired` counts guest instructions completed on the owner, including its share of split jobs. |
+| `steady` | `iterations` (two counts written to `scenario-input.txt`), report `counters` whose growth per iteration is compared, and optional `min` per-iteration floors. On AArch64, `retired` counts all retired guest instructions, `owner_retired` counts owner work including its share of split jobs, `worker_retired` counts worker work, `split_retired` counts guest instructions retired in split jobs, and `whole_worker_jobs` counts completed whole worker jobs. |
 | `steady.kernel_work` | Optional emitted host-word estimate for fixture kernels with fixed trip counts. It combines JIT map word counts and resident entry counts outside execution. Use `--sync-compilation` to make the form selection independent of background compilation progress. |
-| `levels` | Report counters compared by their final value, such as `peak_rss`, the build's peak resident memory. |
+| `levels` | Report counters compared by their final value, such as `peak_heap_bytes`, `live_heap_bytes` or `peak_rss`. |
+| `min` | Optional minimum values that named final report counters MUST reach on the change. |
 | `gpu` | When true, the scenario pins behavior of the target GPUs. CI runners lack them, so CI skips it by name; run it with `--gpu` on a target device when a change touches the GPU path. |
 
 A `kernel_work` layout supplies `calls` per iteration, `rows` per call, and pairs of `[symbol, columns]` in `kernels`.
@@ -63,8 +64,9 @@ The guest judges its own result: exit status 0 means the pinned behavior holds. 
 
 - Every scenario of the base MUST pass on the change, with byte-identical outputs.
 - An output may differ, or a base scenario may fail, only when the change adds or edits a scenario that fails on the base, passes on the change and shares a spec ID with it. The base's `spec` list decides that ID.
-- Steady counter growth per iteration and level counters MUST NOT rise beyond 5 percent of the base value, whatever the change claims.
-- A new or edited scenario MUST pass twice on the change with identical outputs, and every ID it names MUST exist.
+- Steady counter growth per iteration and level counters MUST NOT rise beyond 5 percent of the clamped non-negative base value, and `min` floors MUST hold, whatever the change claims.
+- A new or edited scenario MUST pass twice on the change with identical outputs, stable `steady` and `levels` counters, and satisfied `min` floors, and every ID it names MUST exist.
+- Scenarios that check `steady`, `levels` or `min` counters run one at a time so concurrent scenarios do not perturb each other.
 
 To change pinned behavior, edit the rule and the scenario together, so the edited scenario fails on the base. To widen what a rule's claims cover, first add the ID to scenarios in a change that keeps behavior.
 
