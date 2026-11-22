@@ -445,6 +445,10 @@ fn report(
         format!("\"scene_gate\": {}", metrics.gate.json()),
         format!("\"wine_boundaries\": {}", session.boundaries().json(24)),
     ];
+    if let Some((live, peak)) = crate::heap::usage() {
+        fields.push(format!("\"live_heap_bytes\": {live}"));
+        fields.push(format!("\"peak_heap_bytes\": {peak}"));
+    }
     #[cfg(feature = "gpu")]
     if let Some(counters) = adv_runtime::d3d9_counters(&session.machine.ext) {
         let frames = counters.presents.max(1) as f64;
