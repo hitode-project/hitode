@@ -374,6 +374,14 @@ impl Executor {
         0
     }
 
+    pub(crate) fn whole_worker_jobs(&self) -> u64 {
+        #[cfg(native)]
+        if let Some(native) = &self.native {
+            return native.whole_worker_jobs();
+        }
+        0
+    }
+
     /// Diagnostic counts of the translated runs, as `name: value` pairs.
     pub fn diagnostics(&self) -> String {
         #[cfg(native)]
