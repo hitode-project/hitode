@@ -336,9 +336,15 @@ pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativePause(
 pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeBack(
     _env: JNIEnv<'_>,
     _activity: JObject<'_>,
+    edge: jint,
 ) {
+    let side = match edge {
+        0 => Some("left"),
+        1 => Some("right"),
+        _ => None,
+    };
     if let Some(app) = APP.get() {
-        let _ = app.emit("edge_back", ());
+        let _ = app.emit("edge_back", side);
     }
 }
 
@@ -393,4 +399,84 @@ fn forward_resume() {
 
 fn forward_audio_focus(active: bool) {
     crate::game::audio_focus(active);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeGamepadConnected(
+    mut env: JNIEnv<'_>,
+    _activity: JObject<'_>,
+    id: jni::objects::JString<'_>,
+    name: jni::objects::JString<'_>,
+    style: jint,
+) {
+    let Ok(id) = env.get_string(&id) else {
+        return;
+    };
+    let Ok(name) = env.get_string(&name) else {
+        return;
+    };
+    let style = match style {
+        1 => adv_shell::gamepad::GamepadStyle::PlayStation,
+        2 => adv_shell::gamepad::GamepadStyle::Switch,
+        _ => adv_shell::gamepad::GamepadStyle::Xbox,
+    };
+    crate::gamepad::on_device_connected(id.into(), name.into(), style);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeGamepadDisconnected(
+    mut env: JNIEnv<'_>,
+    _activity: JObject<'_>,
+    id: jni::objects::JString<'_>,
+) {
+    let Ok(id) = env.get_string(&id) else {
+        return;
+    };
+    let id: String = id.into();
+    crate::gamepad::on_device_disconnected(&id);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeGamepadButton(
+    mut env: JNIEnv<'_>,
+    _activity: JObject<'_>,
+    id: jni::objects::JString<'_>,
+    button_idx: jint,
+    down: jboolean,
+) {
+    let Ok(id) = env.get_string(&id) else {
+        return;
+    };
+    let Some(&button) = usize::try_from(button_idx)
+        .ok()
+        .and_then(|i| adv_shell::gamepad::GamepadButton::ALL.get(i))
+    else {
+        return;
+    };
+    let id: String = id.into();
+    crate::gamepad::on_button(&id, button, down != 0);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeGamepadStick(
+    mut env: JNIEnv<'_>,
+    _activity: JObject<'_>,
+    id: jni::objects::JString<'_>,
+    right_stick: jboolean,
+    x: jfloat,
+    y: jfloat,
+) -> jboolean {
+    let Ok(id) = env.get_string(&id) else {
+        return 0;
+    };
+    let id: String = id.into();
+    crate::gamepad::on_stick(&id, right_stick != 0, x, y).into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeGamepadTick(
+    _env: JNIEnv<'_>,
+    _activity: JObject<'_>,
+) -> jboolean {
+    crate::gamepad::on_tick().into()
 }

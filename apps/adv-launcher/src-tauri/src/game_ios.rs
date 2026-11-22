@@ -39,6 +39,7 @@ struct Host {
     container: Option<Retained<GameContainer>>,
     view: Option<Rc<GameView>>,
     session: Option<Session>,
+    game_id: Option<String>,
     playback: Option<Playback>,
     /// Shared lifecycle, audio focus and overlay pause gates.
     lifecycle: adv_shell::mobile::Lifecycle,
@@ -89,7 +90,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         let webview = unsafe { &*native.inner().cast::<UIView>() };
         let router = handle.state::<OverlayState>().router.clone();
         let back = handle.clone();
-        let container = match GameContainer::new(webview, router, move || {
+        let container = match GameContainer::new(webview, router, move |edge| {
             // Wake a hidden WebView so it can publish the new overlay.
             HOST.with_borrow_mut(|host| {
                 if let Some(container) = &host.container {
@@ -97,7 +98,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                     container.set_overlay_visible(true);
                 }
             });
-            let _ = back.emit("edge_back", ());
+            let _ = back.emit("edge_back", edge);
         }) {
             Ok(container) => container,
             Err(error) => {
@@ -148,6 +149,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
             host.container = Some(container);
             host.observers = observers;
         });
+        crate::gamepad_apple::setup();
         // Games sound like other media, whatever the silent switch says.
         if let Some(playback) = unsafe { AVAudioSessionCategoryPlayback } {
             let session = unsafe { AVAudioSession::sharedInstance() };
@@ -368,6 +370,7 @@ pub async fn start_game(
             host.view = Some(view.clone());
             let finished_window = host_window.clone();
             let started_at = Instant::now();
+            let game_id_for_host = id.clone();
             let session = Session::new_with_execution(
                 view,
                 options,
@@ -376,12 +379,14 @@ pub async fn start_game(
                     // Dropped after the borrow: teardown must not run inside it.
                     let ended = HOST.with_borrow_mut(|host| {
                         host.playback.take();
+                        host.game_id = None;
                         if let Some(container) = &host.container {
                             container.set_game(None);
                         }
                         (host.session.take(), host.view.take())
                     });
                     drop(ended);
+                    crate::gamepad::on_pause_or_stop();
                     set_game_mode(false);
                     crate::play::finished(&finished_window, id, result, started_at.elapsed());
                 }),
@@ -399,6 +404,7 @@ pub async fn start_game(
             session.set_upscaler(filter);
             playback.apply(&session)?;
             host.session = Some(session);
+            host.game_id = Some(game_id_for_host);
             host.playback = Some(playback);
             host.lifecycle.set_overlay_pause(false);
             host.apply_pause();
@@ -473,6 +479,9 @@ pub async fn pause_game(window: WebviewWindow, paused: bool) -> Result<(), Strin
             host.lifecycle.set_overlay_pause(paused);
         })?;
         HOST.with_borrow(Host::apply_pause);
+        if paused {
+            crate::gamepad::on_pause_or_stop();
+        }
         Ok(())
     })
     .await
@@ -585,4 +594,40 @@ pub async fn game_wheel(window: WebviewWindow, notches: i32) -> Result<(), Strin
         })
     })
     .await
+}
+
+pub(crate) fn gamepad_game_state() -> (Option<String>, bool) {
+    HOST.with_borrow(|host| {
+        if host.session.is_some() {
+            (host.game_id.clone(), host.lifecycle.paused())
+        } else {
+            (None, false)
+        }
+    })
+}
+
+pub(crate) fn wake_overlay_for_gamepad() {
+    HOST.with_borrow(|host| {
+        if let Some(container) = &host.container {
+            container.set_overlay_visible(true);
+        }
+    });
+}
+
+pub(crate) fn dispatch_gamepad_output(output: adv_shell::gamepad::GamepadOutput) {
+    use adv_shell::gamepad::GamepadOutput;
+    HOST.with_borrow(|host| {
+        let Some(session) = host.session.as_ref() else {
+            return;
+        };
+        match output {
+            GamepadOutput::Key { vk, down } => session.synthetic_key(vk, down),
+            GamepadOutput::MouseButton { button, down } => {
+                session.synthetic_mouse_button(button, down);
+            }
+            GamepadOutput::Wheel { notches } => session.synthetic_wheel(notches),
+            GamepadOutput::MouseMove { dx, dy } => session.synthetic_cursor_delta(dx, dy),
+            GamepadOutput::System(_) => {}
+        }
+    });
 }

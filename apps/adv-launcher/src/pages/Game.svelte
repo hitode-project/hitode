@@ -15,9 +15,12 @@
   import { canReveal, reveal } from "../lib/reveal";
   import { modal, onOverlayInput, region, shown, type Rect } from "../lib/overlay";
   import { screen, trackScreen, type GameLayout } from "../lib/screen.svelte";
+  import { drawerEdgeInset, preferredDrawerSide, type DrawerSide } from "../lib/touch-layout";
   import { tap } from "../lib/tap";
   import CustomKeys from "../components/CustomKeys.svelte";
+  import GamepadPanel from "../components/GamepadPanel.svelte";
   import TouchControls from "../components/TouchControls.svelte";
+  import { gamepad } from "../lib/gamepad.svelte";
   import GuestDialogs, { type GuestDialog } from "../components/GuestDialogs.svelte";
   import GuestMenuSheet, { type GuestMenu } from "../components/GuestMenu.svelte";
   import {
@@ -42,9 +45,13 @@
 
   const game = $derived(library.get(gameId));
 
-  type View = "closed" | "menu" | "confirm";
+  type View = "closed" | "menu" | "gamepad" | "confirm";
   let view = $state<View>(untrack(() => runs.takePauseAfterReport(gameId)) ? "menu" : "closed");
+  let gamepadPicking = $state(false);
   let editingKeys = $state(false);
+  const touchHidden = $derived(
+    prefs.hideControls || (gamepad.hasConnected && gamepad.config.autoHideTouch),
+  );
   const activeProfileId = $derived(phone ? gameKeyProfileId(gameId) : null);
   const activeProfile = $derived(phone ? gameKeyProfile(gameId) : null);
   const customWithoutMenu = $derived(
@@ -54,7 +61,11 @@
       ),
   );
   /** The menu was opened by the back gesture; shows the edge hint briefly. */
-  let backHint = $state(false);
+  let backHint = $state<DrawerSide | null>(null);
+  const preferredSide = $derived(preferredDrawerSide(screen.layout));
+  let drawerSide = $state<DrawerSide>("right");
+  const drawerInset = $derived(drawerEdgeInset(screen.layout, drawerSide));
+  const gripInset = $derived(drawerEdgeInset(screen.layout, preferredSide));
   let pendingRecallHint = $state(false);
   let recallHint = $state(false);
   let textBar = $state(false);
@@ -227,7 +238,8 @@
       : undefined,
   );
 
-  function openMenu() {
+  function openMenu(side?: DrawerSide) {
+    drawerSide = side ?? preferredSide;
     textBar = false;
     editingKeys = false;
     view = "menu";
@@ -251,16 +263,17 @@
     else if (editingKeys) editingKeys = false;
     else if (forceAsk) forceAsk = false;
     else if (view === "confirm") view = "menu";
+    else if (view === "gamepad") view = "menu";
     else if (view === "menu") view = "closed";
     else return false;
     return true;
   }
 
   /** ⌘. and Back step through the launcher overlay before opening it. */
-  function togglePause(fromBack: boolean) {
+  function togglePause(fromBack: boolean, edge?: DrawerSide) {
     if (dismissLayer()) return;
-    openMenu();
-    backHint = fromBack;
+    openMenu(edge);
+    backHint = fromBack ? (edge ?? drawerSide) : null;
   }
 
   function openReport() {
@@ -270,8 +283,18 @@
 
   $effect(() => {
     if (!backHint) return;
-    const timer = setTimeout(() => (backHint = false), 900);
+    const timer = setTimeout(() => (backHint = null), 900);
     return () => clearTimeout(timer);
+  });
+
+  $effect(() => {
+    if (view === "closed") drawerSide = preferredSide;
+  });
+
+  $effect(() => {
+    if (view === "gamepad" && !gamepad.showInPauseMenu) {
+      view = "menu";
+    }
   });
 
   $effect(() => {
@@ -314,6 +337,14 @@
       void call("set_title_bar", { title }, null).catch(() => {});
     }
     const stopPause = onHostEvent("pause", () => togglePause(false));
+    const stopGamepadSys = onHostEvent<string>("gamepad_sys", (action) => {
+      if (action === "menu") togglePause(false);
+      else if (action === "kbd") openTextBar();
+      else if (action === "hide") {
+        prefs.hideControls = !prefs.hideControls;
+        savePrefs();
+      }
+    });
     // A three-finger tap on the game asks for the keyboard.
     const stopKeyboard = onHostEvent("game_keyboard", () => openTextBar());
     const stopDialogs = onHostEvent<GuestDialog[]>("game_dialogs", (value) => (dialogs = value));
@@ -326,8 +357,8 @@
       ([id, ratios]) => { if (id === gameId) damageRatios = ratios; },
     );
     const stopScreen = trackScreen();
-    const stopBack = nav.onBack(() => {
-      togglePause(true);
+    const stopBack = nav.onBack((edge) => {
+      togglePause(true, edge);
       return true;
     });
     return () => {
@@ -335,6 +366,7 @@
       void call("set_pause_available", { available: false }, null).catch(() => {});
       if (titleBar) void call("set_title_bar", { title: null }, null).catch(() => {});
       stopPause();
+      stopGamepadSys();
       stopKeyboard();
       stopDialogs();
       stopMenu();
@@ -538,7 +570,16 @@
   {#if view !== "closed"}
     <div class="scrim fade" {@attach modal}>
       {#if view === "menu"}
-        <div class="panel" class:pop={!phone} class:slide={phone} role="dialog" aria-modal="true" aria-labelledby="pz-title">
+        <div
+          class="panel"
+          class:pop={!phone}
+          class:slide={phone}
+          class:left={phone && drawerSide === "left"}
+          style={phone ? `--drawer-inset: ${drawerInset}px` : undefined}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="pz-title"
+        >
           <div class="head">
             <div class="title">
               <h2 id="pz-title" lang="ja">{game?.title ?? t("游戏")}</h2>
@@ -643,6 +684,12 @@
             {#if guestMenu && !guestMenu.popup}
               <button class="qrow" onclick={() => { view = "closed"; menuOpen = true; }}>{t("游戏菜单…")}</button>
             {/if}
+            {#if gamepad.showInPauseMenu}
+              <button class="qrow" onclick={() => (view = "gamepad")}>
+                <span>{t("手柄按键…")}</span>
+                <span class="end"><Icon name="sliders" /></span>
+              </button>
+            {/if}
             {#if phone}
               <button class="qrow" onclick={openKeyEditor}>
                 <span>{t("自定义键位…")}</span>
@@ -664,8 +711,49 @@
             <button class="qrow danger" onclick={() => (view = "confirm")}>{t("退出游戏")}</button>
           </div>
         </div>
+      {:else if view === "gamepad"}
+        <div
+          class="panel gamepad"
+          class:pop={!phone}
+          class:slide={phone}
+          class:left={phone && drawerSide === "left"}
+          style={phone ? `--drawer-inset: ${drawerInset}px` : undefined}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="pz-gp-title"
+        >
+          {#if !(phone && gamepadPicking)}
+            <div class="head gp-head">
+              <div class="gp-head-left">
+                <button type="button" class="quiet gp-back" onclick={() => (view = "menu")}>
+                  <Icon name="chevron-left" size={14} />{t("返回")}
+                </button>
+                <h2 id="pz-gp-title">{t("手柄按键")}</h2>
+              </div>
+              <button class="primary" onclick={() => (view = "closed")}>{t("继续")}</button>
+            </div>
+          {/if}
+          <div class="middle gp-body" class:gp-picking={phone && gamepadPicking}>
+            <GamepadPanel
+              {gameId}
+              inPause
+              compact={phone}
+              onpickingchange={(v) => (gamepadPicking = v)}
+            />
+          </div>
+        </div>
       {:else}
-        <div class="panel confirm" class:pop={!phone} class:slide={phone} role="alertdialog" aria-modal="true" aria-labelledby="pz-quit" aria-describedby="pz-quit-d">
+        <div
+          class="panel confirm"
+          class:pop={!phone}
+          class:slide={phone}
+          class:left={phone && drawerSide === "left"}
+          style={phone ? `--drawer-inset: ${drawerInset}px` : undefined}
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="pz-quit"
+          aria-describedby="pz-quit-d"
+        >
           <h2 id="pz-quit">{t("退出游戏？")}</h2>
           <p id="pz-quit-d">{t("未在游戏内保存的进度会丢失")}</p>
           {#if phone}
@@ -692,11 +780,11 @@
       layout={effectiveLayout}
       editing={true}
       latchCtrl={ff === "toggle"}
-      onmenu={openMenu}
+      onmenu={() => openMenu()}
       onkeyboard={openTextBar}
       ondone={() => (editingKeys = false)}
     />
-  {:else if phone && !prefs.hideControls && activeProfile}
+  {:else if phone && !touchHidden && activeProfile}
     {#if !stopping}
       <CustomKeys
         {gameId}
@@ -704,19 +792,26 @@
         layout={effectiveLayout}
         editing={false}
         latchCtrl={ff === "toggle"}
-        onmenu={openMenu}
+        onmenu={() => openMenu()}
         onkeyboard={openTextBar}
         ondone={() => (editingKeys = false)}
       />
     {/if}
-  {:else if phone && !prefs.hideControls && effectiveLayout}
+  {:else if phone && !touchHidden && effectiveLayout}
     {#if !stopping}
-      <TouchControls layout={effectiveLayout} latchCtrl={ff === "toggle"} onlibrary={leave} onmenu={openMenu} onkeyboard={openTextBar} />
+      <TouchControls layout={effectiveLayout} latchCtrl={ff === "toggle"} onlibrary={leave} onmenu={() => openMenu()} onkeyboard={openTextBar} />
     {/if}
   {:else if phone && !prefs.hideControls}
-    <button class="grip fade" aria-label={t("暂停菜单")} {...tap(openMenu)} {@attach region}><span></span></button>
+    <button
+      class="grip fade"
+      class:left={preferredSide === "left"}
+      style={`--grip-inset: ${gripInset}px`}
+      aria-label={t("暂停菜单")}
+      {...tap(() => openMenu())}
+      {@attach region}
+    ><span></span></button>
   {:else if !phone && !titleBar}
-    <button class="float fade" aria-label={t("暂停菜单")} onclick={openMenu} {@attach region}>
+    <button class="float fade" aria-label={t("暂停菜单")} onclick={() => openMenu()} {@attach region}>
       <Icon name="pause" />
     </button>
   {/if}
@@ -739,7 +834,9 @@
   {/if}
 
   {#if backHint}
-    <div class="back" aria-hidden="true" {@attach shown}><Icon name="chevron-left" size={18} stroke={1.8} /></div>
+    <div class="back" class:right={backHint === "right"} aria-hidden="true" {@attach shown}>
+      <Icon name="chevron-left" size={18} stroke={1.8} />
+    </div>
   {/if}
 
   {#if textBar}
@@ -1307,22 +1404,98 @@
       opacity: 1;
     }
   }
-  /* Phone (landscape): the menu is a sheet on the right edge, with larger targets. */
+  /* Phone (landscape): the menu is a side sheet clearing camera cutouts, with larger targets. */
   .phone .scrim {
     place-items: stretch;
   }
   .phone .panel {
+    --panel-w: 300px;
     position: absolute;
     top: 0;
     right: 0;
     bottom: 0;
-    width: calc(300px + var(--safe-right));
-    padding-right: var(--safe-right);
+    width: min(100%, calc(var(--panel-w) + max(var(--safe-right), var(--drawer-inset, 0px))));
+    padding-right: max(var(--safe-right), var(--drawer-inset, 0px));
+    padding-bottom: var(--safe-bottom);
     display: flex;
     flex-direction: column;
     border: none;
     border-radius: 16px 0 0 16px;
     box-shadow: -16px 0 48px rgba(0, 0, 0, 0.45);
+  }
+  .phone .panel.left {
+    left: 0;
+    right: auto;
+    width: min(100%, calc(var(--panel-w) + max(var(--safe-left), var(--drawer-inset, 0px))));
+    padding-left: max(var(--safe-left), var(--drawer-inset, 0px));
+    padding-right: 0;
+    border-radius: 0 16px 16px 0;
+    box-shadow: 16px 0 48px rgba(0, 0, 0, 0.45);
+  }
+  .panel.gamepad {
+    max-height: min(620px, calc(100vh - 48px));
+    display: flex;
+    flex-direction: column;
+  }
+  .game:not(.phone) .panel.gamepad {
+    width: min(680px, calc(100vw - 48px));
+  }
+  .phone .panel.gamepad {
+    --panel-w: 420px;
+    max-height: none;
+  }
+  .panel.gamepad .gp-head {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    border-bottom: 1px solid var(--line);
+    padding: 12px 16px;
+  }
+  .panel.gamepad .gp-head .primary {
+    height: 34px;
+    min-width: 72px;
+    padding: 0 18px;
+    border-radius: 999px;
+    font-size: 13px;
+    flex: none;
+  }
+  .phone .panel.gamepad .gp-head .primary {
+    height: 36px;
+    min-width: 78px;
+    padding: 0 20px;
+    font-size: 14px;
+  }
+  .gp-head-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .gp-head-left h2 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .gp-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 4px 6px 4px 2px;
+    color: var(--accent);
+  }
+  .gp-body {
+    padding: 12px 14px 16px;
+    overflow-y: auto;
+    flex: 1 1 0;
+    min-height: 0;
+  }
+  .gp-body.gp-picking {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
   .phone .head {
     padding: 14px 16px 8px;
@@ -1521,7 +1694,7 @@
     all: unset;
     box-sizing: border-box;
     position: absolute;
-    right: var(--safe-right);
+    right: max(var(--safe-right), var(--grip-inset, 0px));
     top: 50%;
     transform: translateY(-50%);
     width: 44px;
@@ -1529,6 +1702,10 @@
     display: grid;
     place-items: center;
     cursor: pointer;
+  }
+  .grip.left {
+    left: max(var(--safe-left), var(--grip-inset, 0px));
+    right: auto;
   }
   .grip span {
     display: block;
@@ -1561,6 +1738,17 @@
     box-sizing: border-box;
     animation: back 0.5s cubic-bezier(0.2, 0.8, 0.2, 1);
   }
+  .back.right {
+    left: auto;
+    right: 0;
+    border-radius: 38px 0 0 38px;
+    padding-right: 0;
+    padding-left: 4px;
+    animation: back-right 0.5s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .back.right :global(svg) {
+    transform: rotate(180deg);
+  }
   @keyframes back {
     from {
       transform: translateX(-34px);
@@ -1569,13 +1757,34 @@
       transform: none;
     }
   }
+  @keyframes back-right {
+    from {
+      transform: translateX(34px);
+    }
+    to {
+      transform: none;
+    }
+  }
   .slide {
     animation: slide 0.2s ease;
+  }
+  .slide.left {
+    animation: slide-left 0.2s ease;
   }
   @keyframes slide {
     from {
       opacity: 0;
       transform: translateX(32px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  @keyframes slide-left {
+    from {
+      opacity: 0;
+      transform: translateX(-32px);
     }
     to {
       opacity: 1;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { tap } from "./tap.ts";
-import { arrange } from "./touch-layout.ts";
+import { arrange, drawerEdgeInset, preferredDrawerSide } from "./touch-layout.ts";
 import type { GameLayout } from "./screen.svelte.ts";
 
 test("iOS controls stay outside system gesture strips", () => {
@@ -70,4 +70,33 @@ test("an edge button commits only an uncancelled tap", () => {
   assert.equal(actions, 1);
   button.onclick({ detail: 0 } as MouseEvent);
   assert.equal(actions, 2);
+});
+
+test("preferredDrawerSide avoids a right-edge camera and computes cutout clearance", () => {
+  const base: GameLayout = {
+    width: 844, height: 390, game: { x: 112, y: 0, width: 620, height: 390 },
+    cutouts: [], cornerRadius: 44, gestures: { left: 0, right: 0, top: 0, bottom: 21 },
+  };
+  assert.equal(preferredDrawerSide(null), "right");
+  assert.equal(preferredDrawerSide(base), "right");
+  assert.equal(drawerEdgeInset(base, "left"), 0);
+  assert.equal(drawerEdgeInset(base, "right"), 0);
+
+  // Dynamic Island on the right edge (clockwise landscape) -> default drawer to left.
+  const rightCam: GameLayout = {
+    ...base,
+    cutouts: [{ x: 785, y: 132, width: 48, height: 126 }],
+  };
+  assert.equal(preferredDrawerSide(rightCam), "left");
+  assert.equal(drawerEdgeInset(rightCam, "left"), 0);
+  assert.equal(drawerEdgeInset(rightCam, "right"), 59);
+
+  // Dynamic Island on the left edge (counter-clockwise landscape) -> default drawer to right.
+  const leftCam: GameLayout = {
+    ...base,
+    cutouts: [{ x: 11, y: 132, width: 48, height: 126 }],
+  };
+  assert.equal(preferredDrawerSide(leftCam), "right");
+  assert.equal(drawerEdgeInset(leftCam, "left"), 59);
+  assert.equal(drawerEdgeInset(leftCam, "right"), 0);
 });

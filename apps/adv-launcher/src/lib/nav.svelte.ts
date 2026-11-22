@@ -3,6 +3,9 @@ import { inTauri } from "./bridge";
 import { device } from "./device.svelte";
 import type { LibraryFilter } from "./types";
 
+/** Which screen edge triggered a mobile swipe-back gesture, when known. */
+export type BackEdge = "left" | "right";
+
 /** Every screen of the launcher; the game screen hosts the in-game overlay. */
 export type Route =
   | { name: "library"; filter: LibraryFilter }
@@ -11,6 +14,7 @@ export type Route =
   | { name: "scan" }
   | { name: "install" }
   | { name: "settings" }
+  | { name: "gamepad" }
   | { name: "game-storage" }
   | { name: "game-files"; gameId: string }
   | { name: "game-settings"; gameId: string }
@@ -20,7 +24,7 @@ export type Route =
 
 const HOME: Route = { name: "library", filter: "all" };
 const FILTERS = ["all", "recent", "favorite", "unstarted"];
-const PLAIN = ["stats", "import", "scan", "settings", "game-storage"];
+const PLAIN = ["stats", "import", "scan", "settings", "gamepad", "game-storage"];
 const PER_GAME = ["game-settings", "game-files", "report", "launch", "game"];
 
 /** The screen a location hash names: `#/settings`, `#/library/recent`, `#/launch/g1`. */
@@ -56,7 +60,7 @@ class Navigator {
   route = $state<Route>(typeof location === "undefined" ? HOME : parseHash(location.hash));
   canGoBack = $state(false);
   #history: Route[] = [];
-  #handlers: (() => boolean)[] = [];
+  #handlers: ((edge?: BackEdge) => boolean)[] = [];
   #guarded = false;
   #ignorePop = false;
   /** The latest screen asked for; `route` follows once a transition captures the old one. */
@@ -86,9 +90,9 @@ class Navigator {
   }
 
   /** User Back dismisses the top layer before leaving a screen. */
-  requestBack(): boolean {
+  requestBack(edge?: BackEdge): boolean {
     for (let i = this.#handlers.length - 1; i >= 0; i--) {
-      if (this.#handlers[i]?.()) return true;
+      if (this.#handlers[i]?.(edge)) return true;
     }
     if (!this.#history.length) return false;
     this.back();
@@ -121,7 +125,7 @@ class Navigator {
    * Lets the current screen handle the system back gesture first; `handler`
    * returns true when it consumed the gesture. Returns the unregister function.
    */
-  onBack(handler: () => boolean): () => void {
+  onBack(handler: (edge?: BackEdge) => boolean): () => void {
     this.#handlers.push(handler);
     this.#sync();
     return () => {

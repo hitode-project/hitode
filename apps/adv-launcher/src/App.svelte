@@ -16,6 +16,7 @@
   import { prefs } from "./lib/prefs.svelte";
   import { updates } from "./lib/updates.svelte";
   import Game from "./pages/Game.svelte";
+  import Gamepad from "./pages/Gamepad.svelte";
   import GameStorage from "./pages/GameStorage.svelte";
   import GameSettings from "./pages/GameSettings.svelte";
   import Import from "./pages/Import.svelte";
@@ -36,7 +37,9 @@
 
   let backupError = $state("");
   $effect(() => onHostEvent<string>("backup_failed", (error) => backupError = error));
-  $effect(() => onHostEvent("edge_back", () => { nav.requestBack(); }));
+  $effect(() => onHostEvent<string | null>("edge_back", (edge) => {
+    nav.requestBack(edge === "left" || edge === "right" ? edge : undefined);
+  }));
   $effect(() => {
     const platform = device.platform;
     if (platform === "ios" || platform === "android") {
@@ -136,6 +139,8 @@
         {#if phonePage}<PhoneScan />{:else}<Scan />{/if}
       {:else if route.name === "settings"}
         {#if phonePage}<PhoneSettings />{:else}<Settings />{/if}
+      {:else if route.name === "gamepad"}
+        <Gamepad />
       {:else if route.name === "game-storage" || route.name === "game-files"}
         <GameStorage gameId={route.name === "game-files" ? route.gameId : undefined} />
       {:else if route.name === "game-settings"}

@@ -384,7 +384,7 @@ pub struct ContainerState {
     game: RefCell<Option<Retained<HostView>>>,
     edge_swipes: [Retained<UIScreenEdgePanGestureRecognizer>; 2],
     launcher_back: Cell<bool>,
-    on_edge_swipe: Box<dyn Fn()>,
+    on_edge_swipe: Box<dyn Fn(&'static str)>,
 }
 
 define_class!(
@@ -412,7 +412,12 @@ define_class!(
         #[unsafe(method(edgeSwipe:))]
         fn edge_swipe(&self, gesture: &UIScreenEdgePanGestureRecognizer) {
             if gesture.state() == UIGestureRecognizerState::Ended {
-                (self.ivars().on_edge_swipe)();
+                let side = if gesture.edges().contains(UIRectEdge::Left) {
+                    "left"
+                } else {
+                    "right"
+                };
+                (self.ivars().on_edge_swipe)(side);
             }
         }
         #[unsafe(method(layoutSubviews))]
@@ -446,7 +451,7 @@ impl GameContainer {
     pub fn new(
         webview: &UIView,
         router: Arc<Mutex<Router>>,
-        on_edge_swipe: impl Fn() + 'static,
+        on_edge_swipe: impl Fn(&'static str) + 'static,
     ) -> Result<Retained<Self>, String> {
         let mtm = MainThreadMarker::new().ok_or("the container must run on the main thread")?;
         let parent = webview.superview().ok_or("the webview has no parent")?;

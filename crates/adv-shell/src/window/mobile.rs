@@ -68,6 +68,8 @@ pub struct GameView {
     /// The mouse position in canvas pixels: the last touch in direct mode,
     /// the cursor in trackpad mode.
     cursor: Cell<(f32, f32)>,
+    /// True while a gamepad stick moved the cursor, so it renders even in direct touch mode.
+    gamepad_cursor: Cell<bool>,
     /// MK_ flags of buttons held through `mouse_button`.
     buttons: Cell<u32>,
     listener: RefCell<Option<Listener>>,
@@ -119,6 +121,7 @@ impl GameView {
             gestures: RefCell::new(Gestures::default()),
             mode: Cell::new(TouchMode::Direct),
             cursor: Cell::new((0.0, 0.0)),
+            gamepad_cursor: Cell::new(false),
             buttons: Cell::new(0),
             listener: RefCell::new(None),
             dialogs: RefCell::default(),
@@ -258,6 +261,9 @@ impl GameView {
         if self.paused.get() {
             return;
         }
+        if self.mode.get() == TouchMode::Direct && self.gamepad_cursor.replace(false) {
+            self.show_cursor();
+        }
         let now = self.now();
         let gestures = self
             .gestures
@@ -297,6 +303,7 @@ impl GameView {
             self.gesture(gesture);
         }
         self.release_buttons();
+        self.gamepad_cursor.set(false);
         if self.mode.replace(mode) != mode && mode == TouchMode::Trackpad {
             let (width, height) = self.canvas.get();
             self.cursor.set((width as f32 / 2.0, height as f32 / 2.0));
@@ -362,6 +369,23 @@ impl GameView {
             self.gesture(Gesture::Scroll(notches));
         }
     }
+    /// Moves the virtual cursor by a delta in canvas pixels (e.g. from a gamepad stick).
+    pub fn move_cursor_delta(&self, dx: f32, dy: f32) {
+        if self.paused.get() {
+            return;
+        }
+        let canvas = self.canvas.get();
+        if canvas.0 == 0 || canvas.1 == 0 {
+            return;
+        }
+        let (x, y) = self.cursor.get();
+        let nx = (x + dx).clamp(0.0, canvas.0.saturating_sub(1) as f32);
+        let ny = (y + dy).clamp(0.0, canvas.1.saturating_sub(1) as f32);
+        self.cursor.set((nx, ny));
+        self.gamepad_cursor.set(true);
+        self.show_cursor();
+        self.mouse(0x200, self.buttons.get(), self.cursor_position());
+    }
     fn release_buttons(&self) {
         for (flag, button) in [(1, 0), (2, 1), (0x10, 2)] {
             if self.buttons.get() & flag != 0 {
@@ -417,12 +441,18 @@ impl GameView {
         let (x, y) = self.cursor.get();
         (x as u32 & 0xffff) | (y as u32) << 16
     }
-    /// Shows the trackpad cursor at the mouse position, or hides it.
+    /// Shows the trackpad or gamepad cursor at the mouse position, or hides it.
     fn show_cursor(&self) {
-        let point = (self.mode.get() == TouchMode::Trackpad).then(|| {
-            let (x, y) = self.cursor.get();
-            crate::mobile::touch::client_point_in(self.frame_rectangle(), self.canvas.get(), x, y)
-        });
+        let point =
+            (self.mode.get() == TouchMode::Trackpad || self.gamepad_cursor.get()).then(|| {
+                let (x, y) = self.cursor.get();
+                crate::mobile::touch::client_point_in(
+                    self.frame_rectangle(),
+                    self.canvas.get(),
+                    x,
+                    y,
+                )
+            });
         #[cfg(target_os = "ios")]
         if let Some(host) = self.host.borrow().as_ref() {
             host.set_cursor(point);

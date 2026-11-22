@@ -358,6 +358,22 @@ impl Session {
     pub fn set_fast_forward_toggle(&self, toggle: bool) {
         self.driver.view.set_fast_forward_toggle(toggle);
     }
+    /// Presses or releases a Win32 virtual key from a synthetic source (e.g. gamepad).
+    pub fn synthetic_key(&self, code: u32, down: bool) {
+        self.driver.view.overlay_key(code, down);
+    }
+    /// Presses or releases left (`0`), right (`1`), or middle (`2`) mouse button synthetically.
+    pub fn synthetic_mouse_button(&self, button: u8, down: bool) {
+        self.driver.view.mouse_button_code(button, down);
+    }
+    /// Turns the scroll wheel synthetically at the cursor position.
+    pub fn synthetic_wheel(&self, notches: i32) {
+        self.driver.view.wheel(notches);
+    }
+    /// Moves the cursor by a delta in canvas pixels.
+    pub fn synthetic_cursor_delta(&self, dx: f32, dy: f32) {
+        self.driver.view.move_cursor_delta(dx, dy);
+    }
     pub fn fps(&self) -> f64 {
         self.driver.ui.borrow().as_ref().map_or(0.0, |ui| ui.fps())
     }

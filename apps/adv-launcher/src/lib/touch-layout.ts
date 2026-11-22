@@ -111,3 +111,38 @@ export function keyHeight(height: number, count: number, fixed: number, gap = 6)
   const fit = (height - fixed - gap * count) / count;
   return Math.max(32, Math.min(KEY, Math.floor(fit)));
 }
+
+export type DrawerSide = "left" | "right";
+
+function sideCutoutDepth(layout: GameLayout, which: DrawerSide): number {
+  if (layout.width <= 0) return 0;
+  let depth = 0;
+  for (const c of layout.cutouts) {
+    if (c.width <= 0 || c.height <= 0) continue;
+    const center = c.x + c.width / 2;
+    // Ignore horizontally centered top/bottom cutouts (e.g. portrait notches).
+    if (which === "left" && center < layout.width * 0.35) {
+      depth = Math.max(depth, Math.ceil(c.x + c.width));
+    } else if (which === "right" && center > layout.width * 0.65) {
+      depth = Math.max(depth, Math.ceil(layout.width - c.x));
+    }
+  }
+  return depth;
+}
+
+/**
+ * Default side for the mobile in-game drawer: clears a camera cutout when
+ * only the right edge has one, otherwise defaults to the right edge.
+ */
+export function preferredDrawerSide(layout: GameLayout | null): DrawerSide {
+  if (!layout) return "right";
+  const rightCutout = sideCutoutDepth(layout, "right") > 0;
+  const leftCutout = sideCutoutDepth(layout, "left") > 0;
+  return rightCutout && !leftCutout ? "left" : "right";
+}
+
+/** Horizontal inset in CSS px needed on `side` so interactive drawer content clears cutouts. */
+export function drawerEdgeInset(layout: GameLayout | null, which: DrawerSide): number {
+  if (!layout) return 0;
+  return sideCutoutDepth(layout, which);
+}

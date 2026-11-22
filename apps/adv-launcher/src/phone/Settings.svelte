@@ -2,6 +2,7 @@
   import { t } from "../lib/i18n.svelte";
   import { device } from "../lib/device.svelte";
   import AndroidStorageSetting from "../components/AndroidStorageSetting.svelte";
+  import GamepadSettingRow from "../components/GamepadSettingRow.svelte";
   import GameStorageSetting from "../components/GameStorageSetting.svelte";
   import ClearCacheSetting from "../components/ClearCacheSetting.svelte";
   import StorageUsage from "../components/StorageUsage.svelte";
@@ -74,6 +75,7 @@
       {#if jit.active}
         <JitRow />
       {/if}
+      <GamepadSettingRow />
       {#if device.gameView || preview}
         <div class="row">
           <span class="t">{t("缩放")}</span>
