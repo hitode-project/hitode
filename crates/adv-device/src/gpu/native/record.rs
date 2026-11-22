@@ -682,6 +682,8 @@ struct WorkerState {
     facades: HashMap<u64, FacadeState>,
     shared: Arc<WorkerShared>,
     owner_waker: Option<super::stream::Waker>,
+    pending_cmds: usize,
+    pending_bytes: usize,
 }
 
 fn worker_loop(
@@ -698,6 +700,8 @@ fn worker_loop(
         facades: HashMap::new(),
         shared: shared.clone(),
         owner_waker,
+        pending_cmds: 0,
+        pending_bytes: 0,
     };
     loop {
         let batch = {
@@ -744,12 +748,21 @@ impl WorkerState {
             .and_then(|f| f.failure.lock().unwrap().clone())
     }
 
+    fn release_queued(&mut self) {
+        let cmds = std::mem::take(&mut self.pending_cmds);
+        let bytes = std::mem::take(&mut self.pending_bytes);
+        if cmds > 0 {
+            self.shared.queued_cmds.fetch_sub(cmds, Ordering::AcqRel);
+        }
+        if bytes > 0 {
+            self.shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
     fn process_batch(&mut self, batch: &mut Vec<WorkerItemEntry>) {
-        let mut drained_cmds = 0usize;
-        let mut drained_bytes = 0usize;
         for entry in batch.drain(..) {
-            drained_cmds += 1;
-            drained_bytes += entry.bytes;
+            self.pending_cmds += 1;
+            self.pending_bytes += entry.bytes;
             if let Err((facade, error)) = self.execute(entry.item)
                 && let Some(state) = self.facades.get(&facade)
             {
@@ -759,12 +772,7 @@ impl WorkerState {
                 }
             }
         }
-        self.shared
-            .queued_cmds
-            .fetch_sub(drained_cmds, Ordering::AcqRel);
-        self.shared
-            .queued_bytes
-            .fetch_sub(drained_bytes, Ordering::AcqRel);
+        self.release_queued();
     }
 
     fn execute(&mut self, item: WorkerItem) -> Result<(), (u64, Error)> {
@@ -785,6 +793,7 @@ impl WorkerState {
                     );
                     (jobs, counters)
                 });
+                self.release_queued();
                 let _ = reply.send(result);
             }
             WorkerItem::DropFacade(id) => {
@@ -988,6 +997,7 @@ impl WorkerState {
                 worker,
                 mut transfer,
             } => {
+                self.release_queued();
                 if let Some(error) = self.facade_failure(facade) {
                     transfer.finish(Err(error));
                     return Ok(());
@@ -1024,6 +1034,7 @@ impl WorkerState {
             }
             WorkerItem::Capture(tx) => {
                 self.stream.flush_chunk();
+                self.release_queued();
                 if let Some(waker) = &self.owner_waker {
                     waker.enqueue_capture(tx);
                 }
@@ -1038,6 +1049,7 @@ impl WorkerState {
                     .get_mut(&facade)
                     .map(|f| f.pipelines.open_cache(&self.device, directory.as_deref()))
                     .unwrap_or_default();
+                self.release_queued();
                 let _ = reply.send(jobs);
             }
             WorkerItem::FlushPipelineCache { facade, reply } => {
@@ -1046,6 +1058,7 @@ impl WorkerState {
                 } else {
                     Ok(())
                 };
+                self.release_queued();
                 let _ = reply.send(result);
             }
             WorkerItem::Stats { facade, reply } => {
@@ -1062,10 +1075,12 @@ impl WorkerState {
                     stats.discarded_pipelines = cache.discarded_pipelines;
                     stats
                 });
+                self.release_queued();
                 let _ = reply.send(stats);
             }
             WorkerItem::Drain { reply } => {
                 self.stream.flush_chunk();
+                self.release_queued();
                 let _ = reply.send(());
             }
             #[cfg(test)]
@@ -1073,6 +1088,7 @@ impl WorkerState {
                 if let Some(state) = self.facades.get_mut(&facade) {
                     f(&mut state.pipelines, &self.device);
                 }
+                self.release_queued();
                 let _ = reply.send(());
             }
         }
@@ -3628,5 +3644,34 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) alpha:f32 }
         )
         .unwrap();
         assert_eq!(gpu.draw_count(), gpu.stats().draws);
+    }
+
+    // spec: GFX-REC-1
+    #[test]
+    fn drain_worker_releases_queued_counters_before_returning() {
+        let Some(mut gpu) = executor() else {
+            return;
+        };
+        let target = gpu.target(2, 2, false).unwrap();
+        for _ in 0..200 {
+            gpu.clear(&target, Some([0., 0., 0., 1.]), None).unwrap();
+            gpu.drain_worker();
+            assert_eq!(
+                gpu.execution
+                    .worker
+                    .shared
+                    .queued_cmds
+                    .load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(
+                gpu.execution
+                    .worker
+                    .shared
+                    .queued_bytes
+                    .load(Ordering::Acquire),
+                0
+            );
+        }
     }
 }
