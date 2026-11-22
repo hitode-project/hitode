@@ -59,21 +59,33 @@
   <div class="head">
     <div class="head-left">
       {#if inline}
-        <button type="button" class="quiet back-btn" onclick={onclose}>
-          <Icon name="chevron-left" size={14} />{t(backLabel)}
+        <button
+          type="button"
+          class="back-btn"
+          aria-label={t(backLabel)}
+          title={t(backLabel)}
+          onclick={onclose}
+        >
+          <Icon name="chevron-left" size={16} />
         </button>
       {/if}
-      <span class="badge" class:round={glyph.shape === "round"} class:pill={glyph.shape === "pill"}>
+      <span class="badge" class:round={glyph.shape === "round"} class:wide={glyph.shape === "pill"}>
         {glyph.glyph}
       </span>
       <span class="title">{t(glyph.name)}</span>
     </div>
     <div class="head-right">
+      {#if canLatch && entry}
+        <div class="seg" role="radiogroup" aria-label={t("触发方式")}>
+          <button type="button" class:on={!entry.latch} onclick={() => onlatch(false)}>{t("按住")}</button>
+          <button type="button" class:on={entry.latch} onclick={() => onlatch(true)}>{t("切换")}</button>
+        </div>
+      {/if}
       {#if entry}
-        <button type="button" class="quiet danger" onclick={onclear}>{t("清除")}</button>
+        <button type="button" class="head-btn danger" onclick={onclear}>{t("清除")}</button>
       {/if}
       {#if !inline}
-        <button type="button" class="quiet" onclick={onclose}>{t("完成")}</button>
+        <button type="button" class="head-btn" onclick={onclose}>{t("完成")}</button>
       {/if}
     </div>
   </div>
@@ -106,16 +118,6 @@
       </button>
     {/each}
   </div>
-
-  {#if canLatch && entry}
-    <div class="foot">
-      <span class="foot-label">{t("触发方式")}</span>
-      <div class="seg" role="radiogroup" aria-label={t("触发方式")}>
-        <button type="button" class:on={!entry.latch} onclick={() => onlatch(false)}>{t("按住")}</button>
-        <button type="button" class:on={entry.latch} onclick={() => onlatch(true)}>{t("切换")}</button>
-      </div>
-    </div>
-  {/if}
 {/snippet}
 
 {#if inline}
@@ -184,15 +186,44 @@
   .head-right {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
     flex: none;
   }
   .back-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
+    all: unset;
+    box-sizing: border-box;
+    display: inline-grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
     color: var(--accent);
-    padding: 4px 6px 4px 2px;
+    cursor: pointer;
+    flex: none;
+  }
+  .back-btn:hover {
+    background: var(--hover);
+  }
+  .back-btn:focus-visible {
+    outline: 2px solid var(--accent);
+  }
+  .head-btn {
+    all: unset;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    border-radius: 7px;
+    font-size: 13px;
+    color: var(--fg2);
+    white-space: nowrap;
+    cursor: pointer;
+    flex: none;
+  }
+  .head-btn:hover {
+    background: var(--hover);
+    color: var(--fg);
+  }
+  .head-btn:focus-visible {
+    outline: 2px solid var(--accent);
   }
   .title {
     font-size: 14px;
@@ -217,13 +248,13 @@
     height: 26px;
     border-radius: 50%;
   }
-  .badge.pill {
+  .badge.wide {
     min-width: 34px;
     height: 24px;
     padding: 0 7px;
     border-radius: 7px;
   }
-  .danger {
+  .head-btn.danger {
     color: var(--danger);
   }
   .tabs {
@@ -263,7 +294,7 @@
     padding: 12px;
     overflow-y: auto;
     flex: 0 1 auto;
-    max-height: 320px;
+    max-height: 380px;
     align-content: start;
   }
   .grid.inline-grid {
@@ -297,37 +328,23 @@
     background: var(--accent);
     color: var(--on-accent);
   }
-  .foot {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 10px 14px;
-    border-top: 1px solid var(--line);
-    background: var(--bg);
-    flex: none;
-  }
-  .foot-label {
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--fg);
-  }
   .seg {
     display: inline-flex;
     padding: 2px;
-    border-radius: 9px;
+    border-radius: 8px;
     background: var(--field);
     gap: 2px;
   }
   .seg button {
     all: unset;
     box-sizing: border-box;
-    height: 28px;
-    padding: 0 12px;
-    border-radius: 7px;
+    height: 26px;
+    padding: 0 9px;
+    border-radius: 6px;
     font-size: 12px;
     font-weight: 500;
     color: var(--fg2);
+    white-space: nowrap;
     cursor: pointer;
   }
   .seg button.on {
@@ -335,13 +352,17 @@
     color: var(--fg);
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
   }
+  :global(:root[data-touch]) .back-btn {
+    width: 34px;
+    height: 34px;
+  }
   :global(:root[data-touch]) .kbtn {
     min-height: 40px;
     font-size: 13px;
   }
   :global(:root[data-touch]) .seg button {
-    height: 34px;
-    padding: 0 14px;
-    font-size: 13px;
+    height: 30px;
+    padding: 0 10px;
+    font-size: 12.5px;
   }
 </style>

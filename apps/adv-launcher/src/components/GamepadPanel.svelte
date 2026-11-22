@@ -343,7 +343,7 @@
               onclick={() => (pickingButton = btnId)}
             >
               <span class="map-left">
-                <span class="badge" class:round={g.shape === "round"} class:pill={g.shape === "pill"}>
+                <span class="badge" class:round={g.shape === "round"} class:wide={g.shape === "pill"}>
                   {g.glyph}
                 </span>
                 <span class="btn-name">{t(g.name)}</span>
@@ -893,7 +893,7 @@
     height: 26px;
     border-radius: 50%;
   }
-  .badge.pill {
+  .badge.wide {
     min-width: 36px;
     height: 24px;
     padding: 0 7px;
