@@ -171,7 +171,10 @@ pub(crate) struct Diagnostics {
     pub refused: u64,
     /// Faults at checked sites, refusals included.
     pub checked_faults: u64,
+    /// Host calls that left translated code because guest state or mappings changed.
     pub helper_exits: u64,
+    /// Clean host calls that left translated code only due to a deadline or pending work.
+    pub helper_preemptions: u64,
     /// Generated exits by raw reason when the JIT map is enabled.
     pub exit_counts: std::collections::BTreeMap<u16, u64>,
     pub x87_value_completions: u64,
@@ -500,24 +503,36 @@ unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> 
     cpu.eip = next;
     let before = (memory.epoch, memory.dirty_pages.len());
     let thunk = (site >> 32 & 0xffff) as u32;
-    if host(native, memory, bridge, cpu, before, next, |b, c| {
+    match host(native, memory, bridge, cpu, before, next, |b, c| {
         if site >> 63 != 0 {
             call_trap(b, c, 0x2e)
         } else {
             call_host(b, c, thunk)
         }
     }) {
-        0
-    } else {
-        native.diagnostics.helper_exits += 1;
-        u64::from(LEAVE)
+        HostOutcome::Continue => 0,
+        HostOutcome::Exit => {
+            native.diagnostics.helper_exits += 1;
+            u64::from(LEAVE)
+        }
+        HostOutcome::Preempted => {
+            native.diagnostics.helper_preemptions += 1;
+            u64::from(LEAVE)
+        }
     }
 }
 
+enum HostOutcome {
+    Continue,
+    Exit,
+    Preempted,
+}
+
 /// Makes a host call from translated code with `call`, the guest in `cpu`.
-/// True continues at `next`: the call returned there and changed no code
-/// or mapping, and no deadline, interrupt or stop is due. Otherwise the
-/// unit leaves for wherever the call went.
+/// `Continue` resumes at `next`: the call returned there and changed no code
+/// or mapping, and no deadline, interrupt or stop is due. `Preempted` means
+/// only a deadline or pending work prevented continuation; `Exit` means the
+/// call itself changed guest state, mappings or status.
 fn host(
     native: &mut Native,
     memory: &mut Memory,
@@ -526,7 +541,7 @@ fn host(
     (epoch, dirty): (u64, usize),
     next: u32,
     call: impl FnOnce(&mut Bridge<'_>, &mut CpuState) -> u32,
-) -> bool {
+) -> HostOutcome {
     // Generated accesses are paused. Let host mapping changes update the
     // raw permissions in place instead of copying the whole table.
     let status = call(bridge, cpu);
@@ -538,12 +553,14 @@ fn host(
             std::sync::atomic::Ordering::Release,
         );
     }
-    status == 0
-        && memory.epoch == epoch
-        && memory.dirty_pages.len() == dirty
-        && cpu.eip == next
-        && !native.pending_work()
-        && !native.past()
+    if status != 0 || memory.epoch != epoch || memory.dirty_pages.len() != dirty || cpu.eip != next
+    {
+        HostOutcome::Exit
+    } else if native.pending_work() || native.past() {
+        HostOutcome::Preempted
+    } else {
+        HostOutcome::Continue
+    }
 }
 
 /// Read the owner's counter without synchronizing guest architectural state.
@@ -995,6 +1012,10 @@ impl Native {
 
     pub(crate) fn worker_retired(&self) -> u64 {
         self.offload.worker_retired
+    }
+
+    pub(crate) fn whole_worker_jobs(&self) -> u64 {
+        self.offload.whole_worker_jobs
     }
 
     pub(crate) fn set_body_services(&mut self, services: adv_cpu_core::body::Services) {

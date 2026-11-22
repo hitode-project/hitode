@@ -326,8 +326,9 @@ impl JobPlan {
             return;
         }
         // Short jobs do not amortize admission and queueing. Give them
-        // another trial after about one ordinary slice.
-        if completion.elapsed < SHORT_JOB {
+        // another trial after about one ordinary slice. A deadline recall
+        // ended early because the slice closed, not because the job was short.
+        if !deadline_recall && completion.elapsed < SHORT_JOB {
             let skip = (u64::from(slice) / completion.retired.max(1)) as u32;
             self.back_off(skip.max(REOFFER));
         }
@@ -361,6 +362,16 @@ impl WakeEstimate {
         let ns = ns.max(1);
         self.ns = ns.clamp(older.min(newer), older.max(newer));
         self.recent = [newer, ns];
+    }
+
+    /// Relaxes an elevated estimate after a skipped split so a transient
+    /// stall cannot wedge splitting for the rest of the run.
+    pub fn decay(&mut self) {
+        if self.ns > WAKE_NS {
+            let next = (self.ns / 2).max(WAKE_NS);
+            self.ns = next;
+            self.recent = [next, next];
+        }
     }
 }
 
@@ -935,5 +946,46 @@ impl std::fmt::Display for Decline {
             Decline::Cold(reason) => write!(out, "{reason:?}"),
             Decline::CacheFull => out.write_str("CacheFull"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+
+    // spec: A64-TR-9
+    #[test]
+    fn deadline_recall_does_not_trigger_short_job_backoff() {
+        let plan = JobPlan::new(true, true);
+        let completion = Completion {
+            id: 0,
+            context: None,
+            retired: 1,
+            optimized: 0,
+            elapsed: Duration::from_nanos(1),
+            helpers: Duration::ZERO,
+            requires_owner: false,
+        };
+        plan.observe(0x1000, false, true, &completion, COMPUTATION_SLICE);
+        let gate = OfferGate {
+            stale: AtomicU32::new(1),
+            split_over: AtomicU32::new(0),
+            split_deadline: AtomicU64::new(u64::MAX),
+        };
+        assert!(plan.offer_due(&gate, || 0, 0));
+    }
+
+    // spec: A64-TR-9
+    #[test]
+    fn wake_estimate_decays_after_transient_stall() {
+        let mut wake = WakeEstimate::default();
+        wake.record(2_000_000);
+        wake.record(2_000_000);
+        assert_eq!(wake.ns, 2_000_000);
+        for _ in 0..8 {
+            wake.decay();
+        }
+        assert_eq!(wake.ns, WAKE_NS);
     }
 }

@@ -35,6 +35,7 @@ pub(super) struct Offload {
     pub(super) admission: Admission,
     pub(super) enabled: bool,
     pub(super) worker_retired: u64,
+    pub(super) whole_worker_jobs: u64,
     wake: WakeEstimate,
 }
 
@@ -474,6 +475,8 @@ pub(crate) struct SplitCounts {
     pub idle_wakes: u64,
     /// Total time from split setup to drain entry for helpers that claimed a block.
     pub claim_ns: u64,
+    /// Guest instructions retired across owner and helper blocks in split jobs.
+    pub split_retired: u64,
 }
 
 enum Job {
@@ -1222,6 +1225,7 @@ pub(super) struct Session<'a, U, R> {
     admission: &'a mut Admission,
     retired: &'a mut u64,
     worker_retired: &'a mut u64,
+    whole_worker_jobs: &'a mut u64,
     forms: &'a mut Option<[u64; 5]>,
     pool: &'static Pool,
     active: Vec<ActiveTask>,
@@ -1262,6 +1266,7 @@ impl<'a, U, R> Session<'a, U, R> {
             admission: &mut offload.admission,
             retired,
             worker_retired: &mut offload.worker_retired,
+            whole_worker_jobs: &mut offload.whole_worker_jobs,
             forms,
             pool,
             wake: notifications.wake,
@@ -1347,13 +1352,28 @@ impl<'a, U, R> Session<'a, U, R> {
         pace: Pace,
     ) -> Option<Done> {
         let most = self.pool.idle().min(plan.iterations as usize - 1);
-        let (helpers, size) = super::plan::split_work(
+        let Some((helpers, size)) = super::plan::split_work(
             plan.iterations,
             (retired, ns),
             self.wake_estimate.ns,
             pace,
             most,
-        )?;
+        ) else {
+            if most > 0
+                && self.wake_estimate.ns > super::plan::WAKE_NS
+                && super::plan::split_work(
+                    plan.iterations,
+                    (retired, ns),
+                    super::plan::WAKE_NS,
+                    pace,
+                    most,
+                )
+                .is_some()
+            {
+                self.wake_estimate.decay();
+            }
+            return None;
+        };
         let count = plan.iterations.div_ceil(size);
         // Private frames lie below ESP, one stride per thread.
         if let Some(frame) = plan.frame {
@@ -1401,7 +1421,7 @@ impl<'a, U, R> Session<'a, U, R> {
                     && self.pool.submit(Job::Blocks(blocks.clone(), send.clone()))
             })
             .count();
-        if scoped && submitted == 0 {
+        if submitted == 0 {
             return None;
         }
         let mut total = blocks.drain(&mut self.runtime, &mut ExecuteScratch::default());
@@ -1412,6 +1432,8 @@ impl<'a, U, R> Session<'a, U, R> {
             policy.scope_splits.set(policy.scope_splits.get() + 1);
         }
         self.counts.wakes += submitted as u64;
+        let mut wakes = [0u64; adv_cpu_core::PROCESSORS as usize];
+        let mut claimed = 0usize;
         for _ in 0..submitted {
             let drained = recv.recv().expect("block helper");
             if drained.blocks == 0 {
@@ -1419,15 +1441,24 @@ impl<'a, U, R> Session<'a, U, R> {
             } else {
                 let ns = drained.claimed_after.as_nanos() as u64;
                 self.counts.claim_ns += ns;
-                self.wake_estimate.record(ns);
+                if claimed < wakes.len() {
+                    wakes[claimed] = ns;
+                    claimed += 1;
+                }
             }
             helped += drained.elapsed;
             *self.worker_retired += drained.retired;
             total.merge(drained);
         }
+        if claimed > 0 {
+            let wakes = &mut wakes[..claimed];
+            wakes.sort_unstable();
+            self.wake_estimate.record(wakes[claimed / 2]);
+        }
         self.counts.blocks += u64::from(total.blocks);
         let execution = total.execution;
         let (mut completion, iterations) = blocks.finish(id, total);
+        self.counts.split_retired += completion.retired;
         completion.elapsed = started.elapsed();
         completion.helpers = helped;
         JobPlan::learn(
@@ -1439,7 +1470,7 @@ impl<'a, U, R> Session<'a, U, R> {
         );
         Some(Done {
             completion,
-            deadline_recall: false,
+            deadline_recall: blocks.stop.load(Ordering::Acquire),
             admitted: None,
             rows: if scoped { iterations } else { 0 },
             scope: None,
@@ -1507,6 +1538,9 @@ impl<'a, U, R> Session<'a, U, R> {
         let job = self.active.swap_remove(index);
         self.admission.spare.push(job.ranges);
         *self.worker_retired += done.completion.retired;
+        if done.completion.retired > 0 {
+            *self.whole_worker_jobs += 1;
+        }
         self.account(job.entry, job.iteration, job.row_work, done)
     }
 }
@@ -3473,6 +3507,7 @@ mod tests {
             );
             assert!(retired > 0);
             assert_eq!(native.offload.worker_retired, retired);
+            assert_eq!(native.offload.whole_worker_jobs, 1);
             assert_eq!(
                 executor.memory().read(DST, BYTES as usize).unwrap(),
                 expected

@@ -6,10 +6,12 @@ mod debug;
 mod execution;
 mod frame_pacer;
 mod frontend;
+mod heap;
 #[cfg(host_view)]
 pub use adv_runtime::system_font_families;
 #[cfg(host_view)]
 pub use execution::Execution;
+pub use heap::CountingAllocator;
 #[cfg(host_view)]
 mod logging;
 pub mod mobile;

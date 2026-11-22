@@ -859,9 +859,12 @@ impl Engine for Cpu {
             stats.native_code_bytes,
             stats.verification.json(),
             json(&format!(
-                "{} owner_retired: {}",
+                "{} owner_retired: {} retired: {} worker_retired: {} whole_worker_jobs: {}",
                 self.inner.diagnostics(),
                 self.retired - self.inner.worker_retired(),
+                self.retired,
+                self.inner.worker_retired(),
+                self.inner.whole_worker_jobs(),
             )),
             self.inner
                 .retired_forms()

@@ -88,7 +88,8 @@ def counters(report: dict) -> dict[str, int]:
     found = {k: int(v) for k, v in COUNTER.findall(diagnostics)}
     if exits := EXIT_COUNTS.search(diagnostics):
         found["native_exits"] = sum(int(n) for n in re.findall(r": (\d+)", exits[1]))
-    for key in ("compilations", "host_calls", "native_entries", "interpreter_instructions", "peak_rss"):
+    for key in ("compilations", "host_calls", "native_entries", "interpreter_instructions",
+                "peak_rss", "live_heap_bytes", "peak_heap_bytes"):
         if isinstance(report.get(key), int):
             found[key] = report[key]
     return found
@@ -145,6 +146,7 @@ def run_one(scenario: dict, binary: Path, wine: Path) -> dict:
             if not steady:
                 result = execute(scenario, binary, wine, Path(scratch) / "run", None)
                 result["levels"] = {n: result["counters"].get(n, 0) for n in scenario.get("levels", [])}
+                result["min"] = {n: result["counters"].get(n, 0) for n in scenario.get("min", {})}
                 return result
             low, high = steady["iterations"]
             first = execute(scenario, binary, wine, Path(scratch) / "low", low)
@@ -163,9 +165,14 @@ def run_one(scenario: dict, binary: Path, wine: Path) -> dict:
             for run, counts in zip((first, result), prices):
                 run["counters"].update(counts)
         result["levels"] = {n: result["counters"].get(n, 0) for n in scenario.get("levels", [])}
+        result["min"] = {n: result["counters"].get(n, 0) for n in scenario.get("min", {})}
         result["steady"] = {
             name: (result["counters"].get(name, 0) - first["counters"].get(name, 0)) / (high - low)
-            for name in steady["counters"]
+            for name in steady.get("counters", [])
+        }
+        result["steady_min"] = {
+            name: (result["counters"].get(name, 0) - first["counters"].get(name, 0)) / (high - low)
+            for name in steady.get("min", {})
         }
         return result
 
@@ -174,18 +181,69 @@ def run_all(scenarios: dict[str, dict], binary: Path, wine: Path) -> dict[str, d
     return run_sets({"run": (scenarios, binary)}, wine)["run"]
 
 
+def is_measured(scenario: dict) -> bool:
+    return bool(scenario.get("steady") or scenario.get("levels") or scenario.get("min"))
+
+
 def run_sets(sets: dict[str, tuple[dict[str, dict], Path]], wine: Path) -> dict[str, dict[str, dict]]:
-    """Runs every scenario of every set at once, one process per core."""
+    """Run unmeasured scenarios concurrently and measured scenarios one at a time.
+
+    Scenarios that gate steady rates or resource levels run serially so host CPU
+    and memory contention between processes cannot perturb their counters.
+    """
+    results: dict[str, dict[str, dict]] = {key: {} for key in sets}
     with ThreadPoolExecutor(os.cpu_count()) as pool:
-        futures = {key: {name: pool.submit(run_one, scenario, binary, wine)
-                         for name, scenario in scenarios.items()}
-                   for key, (scenarios, binary) in sets.items()}
-    return {key: {name: future.result() for name, future in runs.items()}
-            for key, runs in futures.items()}
+        futures = {
+            key: {
+                name: pool.submit(run_one, scenario, binary, wine)
+                for name, scenario in scenarios.items()
+                if not is_measured(scenario)
+            }
+            for key, (scenarios, binary) in sets.items()
+        }
+    for key, runs in futures.items():
+        for name, future in runs.items():
+            results[key][name] = future.result()
+
+    # Interleave measured scenarios by name so base and head runs execute back to back.
+    measured_names = sorted({
+        name
+        for scenarios, _ in sets.values()
+        for name, scenario in scenarios.items()
+        if is_measured(scenario)
+    })
+    for name in measured_names:
+        for key, (scenarios, binary) in sets.items():
+            if name in scenarios and is_measured(scenarios[name]):
+                results[key][name] = run_one(scenarios[name], binary, wine)
+    return results
+
+
+def exceeds(before: float, value: float) -> bool:
+    baseline = max(0.0, before)
+    return value > baseline + max(STEADY_SLACK[0], STEADY_SLACK[1] * baseline)
+
+
+def check_floors(name: str, scenario: dict, res: dict, suffix: str = "") -> list[str]:
+    errors = []
+    for kind, spec_floors, unit in (
+        ("min", scenario.get("min", {}), ""),
+        ("steady_min", scenario.get("steady", {}).get("min", {}), " per iteration"),
+    ):
+        values = res.get(kind, {})
+        for counter, floor in spec_floors.items():
+            value = values.get(counter, 0)
+            if value < floor:
+                label = "steady " if kind == "steady_min" else ""
+                errors.append(
+                    f"{name}: {label}{counter} fell below {floor:.3f} "
+                    f"(got {value:.3f}{unit}){suffix}"
+                )
+    return errors
 
 
 def judge(base: dict[str, dict], head: dict[str, dict], results: dict) -> list[str]:
-    """Return the gate's failures. `results` holds four runs keyed
+    """Return the gate's failures. `results` holds five runs keyed
     base_on_base, base_on_head, changed_on_base, changed_on_head, changed_again."""
     failures = []
     changed = {n: s for n, s in head.items() if n not in base or base[n]["digest"] != s["digest"]}
@@ -194,8 +252,23 @@ def judge(base: dict[str, dict], head: dict[str, dict], results: dict) -> list[s
         now, again, before = (results[k][name] for k in ("changed_on_head", "changed_again", "changed_on_base"))
         if not now["passed"]:
             failures.append(f"{name}: fails on head (exit {now['exit']}, {now['stop']})")
-        elif now["outputs"] != again["outputs"]:
+            continue
+        if now["outputs"] != again["outputs"]:
             failures.append(f"{name}: outputs differ between two head runs")
+            continue
+        problems = []
+        problems.extend(check_floors(name, scenario, now))
+        problems.extend(check_floors(name, scenario, again, " on second head run"))
+        for kind, unit in (("steady", " per iteration"), ("levels", "")):
+            for counter, first in now.get(kind, {}).items():
+                second = again.get(kind, {}).get(counter, 0)
+                if exceeds(first, second) or exceeds(second, first):
+                    problems.append(
+                        f"{name}: {kind} {counter} differs between two head runs "
+                        f"({first:.3f} vs {second:.3f}{unit})"
+                    )
+        if problems:
+            failures.extend(problems)
         elif not before["passed"]:
             claimed.update(base.get(name, scenario)["spec"])
     for name, scenario in base.items():
@@ -209,10 +282,11 @@ def judge(base: dict[str, dict], head: dict[str, dict], results: dict) -> list[s
         elif new["outputs"] != old["outputs"] and not mine:
             keys = sorted(k for k in old["outputs"] if old["outputs"][k] != new["outputs"].get(k))
             failures.append(f"{name}: outputs {keys} changed with no claiming scenario for {sorted(scenario['spec'])}")
+        failures.extend(check_floors(name, scenario, new))
         for kind, unit in (("steady", " per iteration"), ("levels", "")):
             for counter, value in new.get(kind, {}).items():
                 before = old.get(kind, {}).get(counter, 0)
-                if value > before + max(STEADY_SLACK[0], STEADY_SLACK[1] * abs(before)):
+                if exceeds(before, value):
                     failures.append(f"{name}: {kind} {counter} rose {before:.3f} -> {value:.3f}{unit}")
     return failures
 
@@ -277,9 +351,15 @@ def main(argv: list[str]) -> int:
     results = run_all(scenarios, args.adv_run, args.wine)
     if args.out:
         args.out.write_text(json.dumps(results, indent=1))
+    ok = True
     for name, result in results.items():
-        print(f"{'ok  ' if result['passed'] else 'FAIL'}  {name} (exit {result['exit']}, {result['stop']})")
-    return 0 if all(r["passed"] for r in results.values()) else 1
+        floor_errors = check_floors(name, scenarios[name], result) if result["passed"] else []
+        passed = result["passed"] and not floor_errors
+        ok = ok and passed
+        print(f"{'ok  ' if passed else 'FAIL'}  {name} (exit {result['exit']}, {result['stop']})")
+        for error in floor_errors:
+            print(f"FAIL  {error}")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

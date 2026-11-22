@@ -247,6 +247,9 @@ fn deadline_and_interrupt_leave_before_the_instruction_after_a_call() {
         assert_eq!(executor.state.eip, THUNK + 7);
         assert_eq!(read_word(&executor.memory, DATA + 40).unwrap(), 0);
         assert_eq!(calls.direct, 2);
+        let diagnostics = &executor.native.as_ref().unwrap().diagnostics;
+        assert_eq!(diagnostics.helper_exits, 0);
+        assert_eq!(diagnostics.helper_preemptions, 1);
     }
 }
 
