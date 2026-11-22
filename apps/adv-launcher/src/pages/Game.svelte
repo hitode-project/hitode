@@ -1433,19 +1433,38 @@
     box-shadow: 16px 0 48px rgba(0, 0, 0, 0.45);
   }
   .panel.gamepad {
-    width: min(680px, calc(100vw - 48px));
     max-height: min(620px, calc(100vh - 48px));
     display: flex;
     flex-direction: column;
+  }
+  .game:not(.phone) .panel.gamepad {
+    width: min(680px, calc(100vw - 48px));
   }
   .phone .panel.gamepad {
     --panel-w: 420px;
     max-height: none;
   }
-  .gp-head {
+  .panel.gamepad .gp-head {
+    flex-direction: row;
     align-items: center;
+    justify-content: space-between;
+    gap: 10px;
     border-bottom: 1px solid var(--line);
-    padding-bottom: 10px;
+    padding: 12px 16px;
+  }
+  .panel.gamepad .gp-head .primary {
+    height: 34px;
+    min-width: 72px;
+    padding: 0 18px;
+    border-radius: 999px;
+    font-size: 13px;
+    flex: none;
+  }
+  .phone .panel.gamepad .gp-head .primary {
+    height: 36px;
+    min-width: 78px;
+    padding: 0 20px;
+    font-size: 14px;
   }
   .gp-head-left {
     display: flex;

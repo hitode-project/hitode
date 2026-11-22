@@ -709,12 +709,12 @@
     white-space: nowrap;
   }
   .profile-select {
-    height: 30px;
-    padding: 0 8px;
+    padding: 5px 10px;
     border-radius: 8px;
     border: 1px solid var(--line);
     background: var(--field);
     color: var(--fg);
+    font: inherit;
     font-size: 12px;
     max-width: 200px;
   }
@@ -938,7 +938,7 @@
     font-size: 13px;
   }
   :global(:root[data-touch]) .profile-select {
-    height: 36px;
+    padding: 7px 10px;
     font-size: 13px;
   }
 </style>
