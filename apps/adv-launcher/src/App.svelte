@@ -36,7 +36,9 @@
 
   let backupError = $state("");
   $effect(() => onHostEvent<string>("backup_failed", (error) => backupError = error));
-  $effect(() => onHostEvent("edge_back", () => { nav.requestBack(); }));
+  $effect(() => onHostEvent<string | null>("edge_back", (edge) => {
+    nav.requestBack(edge === "left" || edge === "right" ? edge : undefined);
+  }));
   $effect(() => {
     const platform = device.platform;
     if (platform === "ios" || platform === "android") {

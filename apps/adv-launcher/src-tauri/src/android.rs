@@ -336,9 +336,15 @@ pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativePause(
 pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeBack(
     _env: JNIEnv<'_>,
     _activity: JObject<'_>,
+    edge: jint,
 ) {
+    let side = match edge {
+        0 => Some("left"),
+        1 => Some("right"),
+        _ => None,
+    };
     if let Some(app) = APP.get() {
-        let _ = app.emit("edge_back", ());
+        let _ = app.emit("edge_back", side);
     }
 }
 

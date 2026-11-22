@@ -20,6 +20,7 @@ import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.webkit.WebView
+import androidx.activity.BackEventCompat
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.OnBackPressedCallback
 import androidx.annotation.Keep
@@ -31,7 +32,21 @@ import androidx.core.view.WindowInsetsControllerCompat
 class MainActivity : TauriActivity() {
     private var container: GameContainer? = null
     private val launcherBack = object : OnBackPressedCallback(false) {
-        override fun handleOnBackPressed() = nativeBack()
+        private var swipeEdge = -1
+
+        override fun handleOnBackStarted(backEvent: BackEventCompat) {
+            swipeEdge = backEvent.swipeEdge
+        }
+
+        override fun handleOnBackCancelled() {
+            swipeEdge = -1
+        }
+
+        override fun handleOnBackPressed() {
+            val edge = swipeEdge
+            swipeEdge = -1
+            nativeBack(edge)
+        }
     }
     private var gameMode = false
     private var resumed = false
@@ -256,7 +271,7 @@ class MainActivity : TauriActivity() {
     external fun nativeRouteTouch(xCss: Float, yCss: Float): Boolean
     external fun nativeTouch(pointer: Int, action: Int, x: Float, y: Float)
     external fun nativePause()
-    external fun nativeBack()
+    external fun nativeBack(edge: Int)
     external fun nativeResume()
     external fun nativeAudioFocus(active: Boolean)
     external fun nativeTrimMemory()

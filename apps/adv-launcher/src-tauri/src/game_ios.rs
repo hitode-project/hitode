@@ -89,7 +89,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         let webview = unsafe { &*native.inner().cast::<UIView>() };
         let router = handle.state::<OverlayState>().router.clone();
         let back = handle.clone();
-        let container = match GameContainer::new(webview, router, move || {
+        let container = match GameContainer::new(webview, router, move |edge| {
             // Wake a hidden WebView so it can publish the new overlay.
             HOST.with_borrow_mut(|host| {
                 if let Some(container) = &host.container {
@@ -97,7 +97,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                     container.set_overlay_visible(true);
                 }
             });
-            let _ = back.emit("edge_back", ());
+            let _ = back.emit("edge_back", edge);
         }) {
             Ok(container) => container,
             Err(error) => {
