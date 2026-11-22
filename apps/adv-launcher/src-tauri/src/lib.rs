@@ -5,6 +5,7 @@
 pub mod android;
 #[cfg(any(target_os = "macos", test))]
 mod close;
+mod covers;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod distribution;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
@@ -90,7 +91,33 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .manage(overlay::OverlayState::default())
         .manage(game_storage::Activity::default())
-        .plugin(tauri_plugin_opener::init());
+        .plugin(tauri_plugin_opener::init())
+        .register_uri_scheme_protocol("cover", |ctx, request| {
+            use tauri::Manager;
+            let response = ctx
+                .app_handle()
+                .path()
+                .app_data_dir()
+                .ok()
+                .and_then(|dir| covers::read_for_protocol(&dir, request.uri().path()))
+                .map(|(mime, bytes)| {
+                    tauri::http::Response::builder()
+                        .status(200)
+                        .header(tauri::http::header::CONTENT_TYPE, mime)
+                        .header(
+                            tauri::http::header::CACHE_CONTROL,
+                            "public, max-age=31536000, immutable",
+                        )
+                        .body(bytes)
+                });
+            match response {
+                Some(Ok(reply)) => reply,
+                _ => tauri::http::Response::builder()
+                    .status(404)
+                    .body(Vec::new())
+                    .unwrap(),
+            }
+        });
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_storage::init());
     let builder = builder.setup(|app| {
@@ -104,6 +131,7 @@ pub fn run() {
         app.manage(adv_shell::Execution::new(distribution::path(
             &app.path().app_data_dir()?,
         ))?);
+        game_storage::startup_maintenance(app.handle());
         #[cfg(desktop)]
         {
             let menu = menu::build(app.handle())?;
@@ -161,7 +189,11 @@ pub fn run() {
                 library::library_reorder,
                 haptics::haptic_tick,
                 game_storage::list_game_copies,
+                game_storage::storage_summary,
                 game_storage::clear_game_cache,
+                game_storage::clear_single_game_cache,
+                game_storage::list_imported_files,
+                game_storage::delete_imported_file,
                 game_storage::game_file_location,
                 game_storage::reveal_game_files,
                 game_storage::delete_game_copy,
@@ -195,7 +227,11 @@ pub fn run() {
         library::library_restore,
         library::library_reorder,
         game_storage::list_game_copies,
+        game_storage::storage_summary,
         game_storage::clear_game_cache,
+        game_storage::clear_single_game_cache,
+        game_storage::list_imported_files,
+        game_storage::delete_imported_file,
         game_storage::game_file_location,
         game_storage::reveal_game_files,
         game_storage::delete_game_copy,
@@ -246,7 +282,11 @@ pub fn run() {
         haptics::haptic_tick,
         library::library_reorder,
         game_storage::list_game_copies,
+        game_storage::storage_summary,
         game_storage::clear_game_cache,
+        game_storage::clear_single_game_cache,
+        game_storage::list_imported_files,
+        game_storage::delete_imported_file,
         game_storage::game_file_location,
         game_storage::reveal_game_files,
         game_storage::delete_game_copy,
@@ -302,7 +342,11 @@ pub fn run() {
         library::library_restore,
         library::library_reorder,
         game_storage::list_game_copies,
+        game_storage::storage_summary,
         game_storage::clear_game_cache,
+        game_storage::clear_single_game_cache,
+        game_storage::list_imported_files,
+        game_storage::delete_imported_file,
         game_storage::game_file_location,
         game_storage::reveal_game_files,
         game_storage::delete_game_copy,

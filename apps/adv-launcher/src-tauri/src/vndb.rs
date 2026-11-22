@@ -1,11 +1,11 @@
 //! VNDB Kana lookup keeps downloaded metadata separate from the library display title.
-use crate::library::{Library, LibraryGame};
-use base64::Engine;
+use crate::library::{Library, LibraryGame, present_game};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     io::Read,
+    path::Path,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -137,7 +137,7 @@ fn lookup(query: &str, page: u32) -> Result<Results, String> {
     }
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
-fn cache_cover(novel: &mut Novel) -> Result<(), String> {
+fn cache_cover(novel: &mut Novel, data_dir: &Path) -> Result<(), String> {
     let Some(image) = &novel.image else {
         return Ok(());
     };
@@ -170,10 +170,9 @@ fn cache_cover(novel: &mut Novel) -> Result<(), String> {
     if bytes.len() > 2 * 1024 * 1024 {
         return Err("VNDB cover is too large".into());
     }
-    novel.cover = Some(format!(
-        "data:{mime};base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    ));
+    let name =
+        crate::covers::store(data_dir, &novel.id, &mime, &bytes).map_err(|e| e.to_string())?;
+    novel.cover = Some(name);
     Ok(())
 }
 #[tauri::command]
@@ -196,18 +195,21 @@ pub async fn vndb_apply(
     if identifier(&vn)?.is_none() {
         return Err("Select a VNDB entry".into());
     }
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut novel = lookup(&vn, 1)?
             .results
             .into_iter()
             .next()
             .ok_or("VNDB entry not found")?;
-        cache_cover(&mut novel)?;
-        app.state::<Mutex<Library>>()
+        cache_cover(&mut novel, &data_dir)?;
+        let game = app
+            .state::<Mutex<Library>>()
             .lock()
             .unwrap()
             .set_metadata(&id, Some(novel), Some(title))
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(present_game(game))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -221,6 +223,7 @@ pub fn vndb_unlink(
         .lock()
         .unwrap()
         .set_metadata(&id, None, None)
+        .map(present_game)
         .map_err(|e| e.to_string())
 }
 #[cfg(test)]
@@ -229,14 +232,18 @@ mod tests {
     #[test]
     #[ignore = "requests public VNDB metadata and a thumbnail"]
     fn public_api_metadata_and_cover_round_trip() {
+        let dir = std::env::temp_dir().join(format!("adv-vndb-cover-{}", std::process::id()));
         let mut results = lookup("https://vndb.org/v17", 1).unwrap();
         assert!(!results.more);
         let novel = &mut results.results[0];
         assert_eq!(novel.id, "v17");
-        cache_cover(novel).unwrap();
-        assert!(novel.cover.as_ref().unwrap().starts_with("data:image/"));
+        cache_cover(novel, &dir).unwrap();
+        let name = novel.cover.as_ref().unwrap();
+        assert!(crate::covers::valid_name(name));
+        assert!(crate::covers::directory(&dir).join(name).is_file());
         let by_name = lookup(&novel.title, 1).unwrap();
         assert!(by_name.results.iter().any(|vn| vn.id == "v17"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // spec: HOST-VNDB-1

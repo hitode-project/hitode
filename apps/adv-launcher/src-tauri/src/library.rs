@@ -2,7 +2,7 @@
 use chrono::{Duration, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs,
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -66,6 +66,23 @@ pub struct Library {
     #[serde(skip)]
     path: PathBuf,
 }
+pub(crate) fn present_game(mut game: LibraryGame) -> LibraryGame {
+    if let Some(vndb) = &mut game.vndb
+        && let Some(cover) = &mut vndb.cover
+    {
+        *cover = crate::covers::url_for(cover);
+    }
+    game
+}
+
+fn normalize_game(game: &mut LibraryGame) {
+    if let Some(vndb) = &mut game.vndb
+        && let Some(cover) = &mut vndb.cover
+    {
+        *cover = crate::covers::normalize_stored(cover);
+    }
+}
+
 impl Library {
     pub fn load(dir: PathBuf) -> io::Result<Self> {
         let path = dir.join("library.json");
@@ -89,6 +106,22 @@ impl Library {
                             }
                             migrated = true;
                         }
+                        if let Some(vndb) = &mut game.vndb
+                            && let Some(cover) = &mut vndb.cover
+                        {
+                            if let Some(file) =
+                                crate::covers::migrate_data_uri(&dir, &vndb.id, cover)
+                            {
+                                *cover = file;
+                                migrated = true;
+                            } else {
+                                let normalized = crate::covers::normalize_stored(cover);
+                                if normalized != *cover {
+                                    *cover = normalized;
+                                    migrated = true;
+                                }
+                            }
+                        }
                     }
                     lib.track_play_time = saved.track_play_time;
                     lib.games = saved.games;
@@ -107,11 +140,37 @@ impl Library {
         }
         Ok(lib)
     }
+    fn data_dir(&self) -> &Path {
+        self.path.parent().unwrap()
+    }
+    pub(crate) fn game_ids(&self) -> HashSet<String> {
+        self.games.iter().map(|g| g.id.clone()).collect()
+    }
+    pub(crate) fn referenced_covers(&self) -> HashSet<String> {
+        self.games
+            .iter()
+            .filter_map(|g| g.vndb.as_ref()?.cover.as_deref())
+            .map(crate::covers::normalize_stored)
+            .filter(|name| crate::covers::valid_name(name))
+            .collect()
+    }
     pub(crate) fn save(&self) -> io::Result<()> {
-        fs::create_dir_all(self.path.parent().unwrap())?;
+        fs::create_dir_all(self.data_dir())?;
         let mut value = serde_json::to_value(self)?;
         for game in value["games"].as_array_mut().unwrap() {
-            game.as_object_mut().unwrap().remove("offline");
+            let object = game.as_object_mut().unwrap();
+            object.remove("offline");
+            if let Some(cover) = object
+                .get_mut("vndb")
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|vndb| vndb.get_mut("cover"))
+                && let Some(text) = cover.as_str()
+            {
+                let normalized = crate::covers::normalize_stored(text);
+                if normalized != text {
+                    *cover = serde_json::Value::String(normalized);
+                }
+            }
         }
         let tmp = self.path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec(&value)?).and_then(|()| fs::rename(tmp, &self.path))
@@ -128,12 +187,23 @@ impl Library {
     pub(crate) fn set_metadata(
         &mut self,
         id: &str,
-        novel: Option<crate::vndb::Novel>,
+        mut novel: Option<crate::vndb::Novel>,
         title: Option<String>,
     ) -> io::Result<LibraryGame> {
+        let dir = self.data_dir().to_path_buf();
+        if let Some(next) = &mut novel
+            && let Some(cover) = &mut next.cover
+        {
+            if let Some(file) = crate::covers::migrate_data_uri(&dir, &next.id, cover) {
+                *cover = file;
+            } else {
+                *cover = crate::covers::normalize_stored(cover);
+            }
+        }
         let index = self.game(id)?;
         let game = &mut self.games[index];
         let before = game.clone();
+        let old_cover = before.vndb.as_ref().and_then(|old| old.cover.clone());
         if let Some(next) = &novel
             && game.vndb.as_ref().map(|old| &old.id) != Some(&next.id)
             && next.image.as_ref().is_some_and(|image| image.sexual >= 1.0)
@@ -147,6 +217,10 @@ impl Library {
         if let Err(error) = self.save() {
             self.games[index] = before;
             return Err(error);
+        }
+        if let Some(old_cover) = old_cover {
+            let referenced = self.referenced_covers();
+            crate::covers::remove_if_unused(&dir, &old_cover, &referenced);
         }
         self.metadata_target(id)
     }
@@ -212,10 +286,11 @@ impl Library {
         self.save()?;
         Ok(game)
     }
-    fn restore(&mut self, game: LibraryGame, index: usize) -> io::Result<()> {
+    fn restore(&mut self, mut game: LibraryGame, index: usize) -> io::Result<()> {
         if self.games.iter().any(|g| g.id == game.id) {
             return Err(io::Error::other("game id already exists"));
         }
+        normalize_game(&mut game);
         self.games.insert(index.min(self.games.len()), game);
         self.save()
     }
@@ -572,7 +647,7 @@ pub async fn library_list(_app: AppHandle, state: Store<'_>) -> Reply<Vec<Librar
     if library.prune(now()) {
         library.save().map_err(|e| e.to_string())?;
     }
-    let mut games = library.games.clone();
+    let mut games: Vec<_> = library.games.iter().cloned().map(present_game).collect();
     for game in &mut games {
         game.offline = offline(&game.folder);
     }
@@ -601,7 +676,7 @@ pub fn library_add(
     codepage: u32,
     title: String,
 ) -> Reply<LibraryGame> {
-    reply(state.lock().unwrap().add(&folder, &exe, codepage, &title))
+    reply(state.lock().unwrap().add(&folder, &exe, codepage, &title)).map(present_game)
 }
 #[tauri::command]
 pub fn library_update(state: Store<'_>, id: String, patch: GamePatch) -> Reply<LibraryGame> {
@@ -617,13 +692,13 @@ pub fn library_update(state: Store<'_>, id: String, patch: GamePatch) -> Reply<L
     if let Some(exe) = patch.exe {
         game.exe = exe.replace('\\', "/");
     }
-    let game = game.clone();
+    let game = present_game(game.clone());
     library.save().map_err(|e| e.to_string())?;
     Ok(game)
 }
 #[tauri::command]
 pub fn library_remove(state: Store<'_>, id: String) -> Reply<LibraryGame> {
-    reply(state.lock().unwrap().remove(&id))
+    reply(state.lock().unwrap().remove(&id)).map(present_game)
 }
 #[tauri::command]
 pub fn library_reorder(state: Store<'_>, ids: Vec<String>) -> Reply<()> {
@@ -663,16 +738,51 @@ mod tests {
         assert_eq!(loaded.games[0].title, "My title");
         assert!(loaded.games[0].nsfw);
         loaded.games[0].nsfw = false;
-        assert_eq!(loaded.games[0].vndb.as_ref().unwrap().cover, vn.cover);
+        let stored_cover = loaded.games[0]
+            .vndb
+            .as_ref()
+            .unwrap()
+            .cover
+            .clone()
+            .unwrap();
+        assert!(crate::covers::valid_name(&stored_cover));
+        let cover_path = crate::covers::directory(&dir.join("app")).join(&stored_cover);
+        assert_eq!(fs::read(&cover_path).unwrap(), &[0]);
+        let presented = present_game(loaded.games[0].clone());
+        assert_eq!(
+            presented.vndb.as_ref().unwrap().cover.as_deref(),
+            Some(crate::covers::url_for(&stored_cover).as_str())
+        );
+        // Legacy inline data URI in library.json migrates out to covers/ on load.
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("app/library.json")).unwrap()).unwrap();
+        raw["games"][0]["vndb"]["cover"] =
+            serde_json::Value::String("data:image/png;base64,AA==".into());
+        fs::write(
+            dir.join("app/library.json"),
+            serde_json::to_vec(&raw).unwrap(),
+        )
+        .unwrap();
+        let migrated = Library::load(dir.join("app")).unwrap();
+        assert_eq!(
+            migrated.games[0].vndb.as_ref().unwrap().cover.as_deref(),
+            Some(stored_cover.as_str())
+        );
+        assert!(
+            !fs::read_to_string(dir.join("app/library.json"))
+                .unwrap()
+                .contains("data:image/")
+        );
         loaded
             .set_metadata(&game.id, Some(vn), Some("Custom name".into()))
             .unwrap();
         assert_eq!(loaded.games[0].title, "Custom name");
         assert!(!loaded.games[0].nsfw);
         assert!(loaded.games[0].vndb.is_some());
-        // Unlinking keeps the display name and game files.
+        // Unlinking keeps the display name and game files, and drops the unreferenced cover file.
         loaded.set_metadata(&game.id, None, None).unwrap();
         assert!(loaded.games[0].vndb.is_none());
+        assert!(!cover_path.exists());
         assert_eq!(loaded.games[0].title, "Custom name");
         assert_eq!(loaded.games[0].folder, game.folder);
         assert_eq!(loaded.games[0].exe, game.exe);

@@ -12,12 +12,54 @@ pub(crate) fn path(data: &Path) -> PathBuf {
     data.join("runtime").join(ID)
 }
 
+pub(crate) fn current_id() -> Option<&'static str> {
+    (!FILES.is_empty()).then_some(ID)
+}
+
 pub(crate) fn prepare(root: &Path) -> Result<(), String> {
     if FILES.is_empty() {
         return Err("Wine runtime is missing from this player build".into());
     }
     let _guard = PREPARING.lock().unwrap();
     unpack(root, FILES, ARCHIVE).map_err(|e| format!("prepare Wine distribution: {e}"))
+}
+
+/// Prepares the embedded Wine runtime under `<data_dir>/runtime/<ID>` and
+/// prunes obsolete runtime revisions beside it.
+pub(crate) fn prepare_in(data_dir: &Path) -> Result<PathBuf, String> {
+    let root = path(data_dir);
+    prepare(&root)?;
+    let runtime_root = data_dir.join("runtime");
+    #[cfg(target_os = "ios")]
+    crate::game_storage::exclude_from_backup(&runtime_root);
+    let _ = prune_stale(&runtime_root, ID);
+    Ok(root)
+}
+
+/// Removes obsolete unpacked Wine runtimes beside `keep_id` without following symlinks.
+pub(crate) fn prune_stale(runtime_root: &Path, keep_id: &str) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(runtime_root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    for entry in std::fs::read_dir(runtime_root)? {
+        let entry = entry?;
+        if entry.file_name().to_str() == Some(keep_id) {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else if kind.is_file() {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn unpack(root: &Path, files: &[(&str, Option<u64>)], archive: &[u8]) -> std::io::Result<()> {
@@ -88,8 +130,13 @@ mod tests {
         if FILES.is_empty() {
             return;
         }
-        let root = std::env::temp_dir().join(format!("adv-wine-embedded-{}", std::process::id()));
-        prepare(&root).unwrap();
+        let base = std::env::temp_dir().join(format!("adv-wine-embedded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let stale = base.join("runtime/old-revision");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("ntdll.dll"), b"stale").unwrap();
+        let root = prepare_in(&base).unwrap();
+        assert!(!stale.exists());
         assert!(
             std::fs::read(root.join("lib/wine/i386-windows/ntdll.dll"))
                 .unwrap()
@@ -105,6 +152,30 @@ mod tests {
                 .unwrap()
                 .starts_with("WINE REGISTRY")
         );
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    // spec: HOST-SES-12
+    #[test]
+    fn stale_runtime_installations_are_pruned_without_following_links() {
+        let base = std::env::temp_dir().join(format!("adv-runtime-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let runtime = base.join("runtime");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(runtime.join("current")).unwrap();
+        std::fs::create_dir_all(runtime.join("old-build")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(runtime.join("current/.ready"), []).unwrap();
+        std::fs::write(runtime.join("old-build/ntdll.dll"), b"old").unwrap();
+        std::fs::write(outside.join("keep"), b"keep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, runtime.join("linked")).unwrap();
+
+        prune_stale(&runtime, "current").unwrap();
+
+        assert!(runtime.join("current/.ready").is_file());
+        assert!(!runtime.join("old-build").exists());
+        assert!(outside.join("keep").is_file());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

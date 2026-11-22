@@ -19,7 +19,9 @@
         android:theme="@style/Theme.adv_launcher"
         android:usesCleartextTraffic="${usesCleartextTraffic}"
         android:requestLegacyExternalStorage="true"
-        android:hasFragileUserData="true">
+        android:hasFragileUserData="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules">
         <activity
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|density|fontScale|layoutDirection|navigation|touchscreen|colorMode"
             android:launchMode="singleTask"

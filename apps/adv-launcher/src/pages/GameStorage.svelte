@@ -9,12 +9,18 @@
   import { androidStorage } from "../lib/android-access.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
-  import { gameStorage, type GameCopy, type GameLocation } from "../lib/game-storage.svelte";
+  import {
+    gameStorage,
+    type GameCopy,
+    type GameLocation,
+    type ImportedFile,
+  } from "../lib/game-storage.svelte";
 
   let { gameId }: { gameId: string | undefined } = $props();
   let expanded = $state<string | null>(null);
-  let operation = $state<"delete" | "copy" | "copied" | "open">("open");
+  let operation = $state<"delete" | "delete-file" | "delete-orphans" | "copy" | "copied" | "open">("open");
   let active = $state<GameCopy>();
+  let activeFile = $state<ImportedFile>();
   let path = $state("");
   let dialog: HTMLDialogElement;
   let dialogOpen = $state(false);
@@ -23,6 +29,7 @@
   let location = $state<GameLocation | null>(null);
   let loading = $state(true);
   let busy = $state(false);
+  let clearingCache = $state(false);
   let problem = $state("");
   let exportedPath = $state<string | null>(null);
   const locationLabel = $derived(blocked ? "需要文件访问权限"
@@ -30,7 +37,12 @@
     : game?.offline ? location?.kind === "copy" ? "文件已移除" : "找不到文件夹"
     : location?.kind === "copy" ? "Hitode 内部副本" : location?.kind === "documents" ? "Hitode 文件夹" : "外部文件夹");
   const gameFolder = $derived(game?.offline ? null : location?.copy);
+  const linkedFolders = $derived(gameStorage.folders.filter((folder) => gameStorage.linked(folder).length > 0));
+  const linkedFiles = $derived(gameStorage.files.filter((file) => gameStorage.linkedFile(file).length > 0));
+  const attachedFiles = $derived(game ? gameStorage.filesForGame(game.id) : []);
   const displayCopy = (folder: GameCopy) => preview ? folder.directory : "Hitode/imports/" + folder.id;
+  const displayFile = (file: ImportedFile) => preview ? file.path : `Hitode/files/${file.id}/${file.name}`;
+  const fileKindLabel = (file: ImportedFile) => file.kind === "disc" ? t("光盘镜像") : file.kind === "font" ? t("字体") : t("文件");
 
   $effect(() => {
     const id = gameId;
@@ -40,7 +52,9 @@
     loading = true;
     problem = "";
     location = null;
-    const load = id ? gameStorage.location(id) : gameStorage.refresh();
+    const load = id
+      ? Promise.all([gameStorage.location(id), gameStorage.refresh()]).then(([loc]) => loc)
+      : gameStorage.refresh().then(() => null);
     void load.then((value) => {
       if (current) location = value ?? null;
     }).catch((error) => {
@@ -60,9 +74,10 @@
     }
   });
 
-  function show(next: typeof operation, location: string, folder?: GameCopy) {
+  function show(next: typeof operation, target: string, folder?: GameCopy, file?: ImportedFile) {
     active = folder;
-    path = location;
+    activeFile = file;
+    path = target;
     operation = next;
     dialog.showModal();
     dialogOpen = true;
@@ -106,6 +121,35 @@
       dialog.close();
       if (expanded === folder.id) expanded = null;
     });
+  }
+
+  function deleteFile(file: ImportedFile) {
+    void run(async () => {
+      await gameStorage.deleteFile(file);
+      dialog.close();
+    });
+  }
+
+  function deleteOrphans() {
+    void run(async () => {
+      await gameStorage.deleteOrphans();
+      dialog.close();
+      expanded = null;
+    });
+  }
+
+  async function clearOneCache(id: string) {
+    if (clearingCache || !location || location.cacheBytes === 0) return;
+    clearingCache = true;
+    problem = "";
+    try {
+      await gameStorage.clearGameCache(id);
+      if (location) location = { ...location, cacheBytes: 0 };
+    } catch (error) {
+      problem = String(error);
+    } finally {
+      clearingCache = false;
+    }
   }
 
   function openGame(id: string) {
@@ -153,10 +197,67 @@
         {#if gameFolder}<p class="sub">{storageSize(gameFolder.bytes)} · {t("关联 {0} 个游戏", gameStorage.linked(gameFolder).length)}</p>{/if}
         {@render actions(location.displayPath, gameFolder, location.canReveal)}
       {/if}
+      {#if attachedFiles.length}
+        <section class="group">
+          <h3>{t("已导入的光盘与字体")}</h3>
+          {#each attachedFiles as file (file.id)}
+            <div class="file-row">
+              <div class="file-info">
+                <strong>{file.name}</strong>
+                <span class="sub">{fileKindLabel(file)}</span>
+              </div>
+              <span class="size">{storageSize(file.bytes)}</span>
+              <button class="quiet destructive" disabled={busy} onclick={() => show("delete-file", displayFile(file), undefined, file)}>{t("移除")}</button>
+            </div>
+          {/each}
+        </section>
+      {/if}
+      {#if location}
+        <div class="cache-row">
+          <span class="cache-title">{t("图形缓存")}</span>
+          <span class="size">{location.cacheBytes > 0 ? storageSize(location.cacheBytes) : t("无缓存")}</span>
+          <button class="quiet" disabled={busy || clearingCache || location.cacheBytes === 0} onclick={() => void clearOneCache(game.id)}>
+            {clearingCache ? t("正在清除…") : t("清除")}
+          </button>
+        </div>
+      {/if}
     {:else if !gameId && !loading}
-      <div class="summary"><strong>{storageSize(gameStorage.total)}</strong><span>{t("Hitode 内部副本")}</span></div>
+      <div class="summary"><strong>{storageSize(gameStorage.total)}</strong><span>{t("Hitode 游戏存储")}</span></div>
+
+      {#if gameStorage.orphanBytes > 0}
+        <section class="orphans">
+          <div class="orphans-head">
+            <div>
+              <strong>{t("未关联游戏")} · {storageSize(gameStorage.orphanBytes)}</strong>
+              <p class="sub">{t("这些内部副本或导入文件已不在游戏库中使用，可安全释放。")}</p>
+            </div>
+            <button class="primary destructive-button" disabled={busy} onclick={() => show("delete-orphans", storageSize(gameStorage.orphanBytes))}>{t("全部清理")}</button>
+          </div>
+          {#each gameStorage.orphanFolders as folder (folder.id)}
+            <div class="file-row">
+              <div class="file-info">
+                <strong>{folder.name}</strong>
+                <span class="sub">{t("Hitode 内部副本")}</span>
+              </div>
+              <span class="size">{storageSize(folder.bytes)}</span>
+              <button class="quiet destructive" disabled={busy} onclick={() => show("delete", displayCopy(folder), folder)}>{t("删除")}</button>
+            </div>
+          {/each}
+          {#each gameStorage.orphanFiles as file (file.id)}
+            <div class="file-row">
+              <div class="file-info">
+                <strong>{file.name}</strong>
+                <span class="sub">{fileKindLabel(file)}</span>
+              </div>
+              <span class="size">{storageSize(file.bytes)}</span>
+              <button class="quiet destructive" disabled={busy} onclick={() => show("delete-file", displayFile(file), undefined, file)}>{t("删除")}</button>
+            </div>
+          {/each}
+        </section>
+      {/if}
+
       <div class="folders">
-        {#each gameStorage.folders as folder (folder.id)}
+        {#each linkedFolders as folder (folder.id)}
           {@const linked = gameStorage.linked(folder)}
           {@const stack = linked.slice(0, 3)}
           {@const open = expanded === folder.id}
@@ -169,7 +270,7 @@
                   <span class="fan-card" style:transform={`translateX(${offset * 16}px) rotate(${offset * 26}deg)`} style:z-index={stack.length - i}><Cover game={item} /></span>
                 {/each}
               </span>
-              <span class="folder-name"><strong>{folder.name}</strong><span class="sub">{linked.length ? t("关联 {0} 个游戏", linked.length) : t("未关联游戏")}</span></span>
+              <span class="folder-name"><strong>{folder.name}</strong><span class="sub">{t("关联 {0} 个游戏", linked.length)}</span></span>
               <span class="size">{storageSize(folder.bytes)}</span>
               <Icon name={open ? "chevron-down" : "chevron-right"} size={15} />
             </button>
@@ -191,15 +292,38 @@
             {/if}
           </section>
         {/each}
-        {#if !gameStorage.folders.length}<p class="sub">{t("没有内部副本")}</p>{/if}
+        {#if linkedFiles.length}
+          <section class="group">
+            <h3>{t("已导入的光盘与字体")}</h3>
+            {#each linkedFiles as file (file.id)}
+              {@const linked = gameStorage.linkedFile(file)}
+              <div class="file-row">
+                <div class="file-info">
+                  <strong>{file.name}</strong>
+                  <span class="sub">{fileKindLabel(file)} · {linked.map((item) => item.title).join("、")}</span>
+                </div>
+                <span class="size">{storageSize(file.bytes)}</span>
+                <button class="quiet destructive" disabled={busy} onclick={() => show("delete-file", displayFile(file), undefined, file)}>{t("移除")}</button>
+              </div>
+            {/each}
+          </section>
+        {/if}
+        {#if !gameStorage.folders.length && !gameStorage.files.length}<p class="sub">{t("没有内部副本")}</p>{/if}
       </div>
     {/if}
   </div>
 </main>
 
 <dialog bind:this={dialog} onclose={() => { dialogOpen = false; }} aria-labelledby="storage-dialog-title" oncancel={(e) => { if (busy) e.preventDefault(); }}>
-  <h2 id="storage-dialog-title">{t(operation === "delete" ? "删除本地副本" : operation === "copy" ? "复制到其他位置…" : operation === "copied" ? "复制完成" : "打开所在文件夹")}</h2>
-  <div class="mono path">{path}</div>
+  <h2 id="storage-dialog-title">{t(
+    operation === "delete" ? "删除本地副本"
+    : operation === "delete-file" ? "删除导入的文件"
+    : operation === "delete-orphans" ? "清理未关联文件"
+    : operation === "copy" ? "复制到其他位置…"
+    : operation === "copied" ? "复制完成"
+    : "打开所在文件夹"
+  )}</h2>
+  {#if operation !== "delete-orphans"}<div class="mono path">{path}</div>{/if}
   {#if problem}<p role="alert" class="destructive">{problem}</p>{/if}
   {#if busy}<p role="status" class="sub">{t("正在处理…")}</p>{/if}
   {#if operation === "delete" && active}
@@ -208,6 +332,13 @@
     <p>{t("此文件夹里的存档和补丁也会一起删除。")}</p>
     {#if linked.length}<p>{t("这些游戏会保留在库中：{0}", linked.map((item) => item.title).join("、"))}</p>{/if}
     <div class="actions"><button class="secondary" disabled={busy} onclick={() => dialog.close()}>{t("取消")}</button><button class="primary destructive-button" disabled={busy} onclick={() => deleteCopy(folder)}>{t("删除本地副本")}</button></div>
+  {:else if operation === "delete-file" && activeFile}
+    {@const file = activeFile}
+    <p>{t("将删除此导入副本（{0}）。", storageSize(file.bytes))}</p>
+    <div class="actions"><button class="secondary" disabled={busy} onclick={() => dialog.close()}>{t("取消")}</button><button class="primary destructive-button" disabled={busy} onclick={() => deleteFile(file)}>{t("删除")}</button></div>
+  {:else if operation === "delete-orphans"}
+    <p>{t("将删除所有未关联游戏的内部副本与导入文件，共释放 {0}。", path)}</p>
+    <div class="actions"><button class="secondary" disabled={busy} onclick={() => dialog.close()}>{t("取消")}</button><button class="primary destructive-button" disabled={busy} onclick={() => deleteOrphans()}>{t("全部清理")}</button></div>
   {:else if operation === "copy"}
     <div class="actions"><button class="secondary" disabled={busy} onclick={() => dialog.close()}>{t("取消")}</button><button class="primary" onclick={() => operation = "copied"}>{t("复制到这里")}</button></div>
   {:else if operation === "copied" && active}
@@ -230,18 +361,28 @@
   .page { box-sizing: border-box; max-width: 760px; margin: 0 auto; padding: 26px 28px 40px; }
   h1 { margin: 0 0 18px; font-size: 25px; }
   h2 { margin: 0; font-size: 17px; }
+  h3 { margin: 22px 0 8px; font-size: 12px; font-weight: 500; color: var(--fg3); letter-spacing: 0.04em; }
   .back { display: inline-flex; align-items: center; gap: 3px; margin: 0 0 10px -7px; }
   .game, .summary, .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
   .game { margin-bottom: 14px; }
   .sub, .summary span { color: var(--fg3); font-size: 13px; }
   .summary { align-items: baseline; margin-bottom: 18px; }
   .summary strong { font-size: 24px; font-variant-numeric: tabular-nums; }
+  .orphans { margin-bottom: 20px; padding: 14px 16px; border-radius: 12px; background: var(--field); }
+  .orphans-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .orphans-head p { margin: 4px 0 0; }
+  .group { margin-top: 12px; }
+  .file-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+  .file-info { flex: 1; min-width: 0; display: grid; gap: 2px; overflow-wrap: anywhere; }
+  .cache-row { margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
+  .cache-title { flex: 1; font-size: 14px; }
+  .cache-row button[disabled] { cursor: default; color: var(--fg3); background: transparent; }
   .folder { border-top: 1px solid var(--line); }
   .folder-row { width: 100%; border: 0; background: transparent; color: var(--fg); display: grid; grid-template-columns: 60px minmax(0,1fr) auto 15px; align-items: center; gap: 10px; padding: 8px 4px; text-align: start; cursor: pointer; }
   .folder-row:hover { background: var(--hover); }
   .folder-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .folder-name { display: grid; overflow-wrap: anywhere; }
-  .size { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .size { white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--fg3); font-size: 13px; }
   .stack { display: grid; place-items: center; position: relative; height: 52px; color: var(--fg3); }
   .fan-card { width: 30px; position: absolute; }
   .expanded { padding: 6px 4px 16px; }

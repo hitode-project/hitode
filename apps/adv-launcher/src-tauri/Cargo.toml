@@ -28,6 +28,7 @@ adv-report = { path = "../../../crates/adv-report" }
 getrandom = "0.3"
 reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
 base64 = "0.23"
+sha2 = "0.10.9"
 fontdb = { version = "0.24", default-features = false, features = ["fs"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
 tauri = { version = "=2.12.3", features = ["macos-private-api"] }

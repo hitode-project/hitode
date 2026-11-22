@@ -35,6 +35,55 @@ fn scan_ports(tried: &[u16]) -> Vec<u16> {
         .collect()
 }
 
+/// Removes stale DDI revisions, inactive variants, and interrupted `.download`
+/// files from the helper's Application Support directory without following links.
+#[cfg(any(target_os = "ios", test))]
+fn prune_stale_ddi(cache: &std::path::Path, keep_revision: &str, keep_variant: &str) {
+    let Ok(entries) = std::fs::read_dir(cache) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if entry.file_name().to_str() == Some(keep_revision) && kind.is_dir() {
+            let Ok(variants) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for variant in variants.flatten() {
+                let Ok(vkind) = variant.file_type() else {
+                    continue;
+                };
+                if vkind.is_symlink() {
+                    continue;
+                }
+                if variant.file_name().to_str() == Some(keep_variant) && vkind.is_dir() {
+                    if let Ok(files) = std::fs::read_dir(variant.path()) {
+                        for file in files.flatten() {
+                            if file.file_type().is_ok_and(|t| t.is_file())
+                                && file.path().extension().is_some_and(|ext| ext == "download")
+                            {
+                                let _ = std::fs::remove_file(file.path());
+                            }
+                        }
+                    }
+                } else if vkind.is_dir() {
+                    let _ = std::fs::remove_dir_all(variant.path());
+                } else {
+                    let _ = std::fs::remove_file(variant.path());
+                }
+            }
+        } else if kind.is_dir() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        } else {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // spec: IOS-JIT-2
@@ -57,6 +106,31 @@ mod tests {
             super::describe(&error),
             "device socket io failed: early eof"
         );
+    }
+
+    // spec: IOS-JIT-2
+    #[test]
+    fn prune_stale_ddi_keeps_active_set_and_removes_old_revisions_and_partials() {
+        let root = std::env::temp_dir().join(format!("adv-ddi-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let active = root.join("rev-new/Xcode_iOS_DDI_Cryptex");
+        let old_variant = root.join("rev-new/Xcode_iOS_DDI_Personalized");
+        let old_rev = root.join("rev-old/Xcode_iOS_DDI_Cryptex");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::create_dir_all(&old_variant).unwrap();
+        std::fs::create_dir_all(&old_rev).unwrap();
+        std::fs::write(active.join("Image.dmg"), b"ok").unwrap();
+        std::fs::write(active.join("Image.dmg.download"), b"partial").unwrap();
+        std::fs::write(old_variant.join("Image.dmg"), b"old-variant").unwrap();
+        std::fs::write(old_rev.join("Image.dmg"), b"old-rev").unwrap();
+
+        super::prune_stale_ddi(&root, "rev-new", "Xcode_iOS_DDI_Cryptex");
+
+        assert!(active.join("Image.dmg").is_file());
+        assert!(!active.join("Image.dmg.download").exists());
+        assert!(!old_variant.exists());
+        assert!(!old_rev.exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 

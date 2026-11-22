@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+  <exclude domain="root" path="runtime" />
+  <exclude domain="root" path="imports" />
+  <exclude domain="root" path="files" />
+  <exclude domain="root" path="games" />
+  <exclude domain="root" path="wine" />
+  <exclude domain="root" path="covers" />
+  <exclude domain="file" path="runtime" />
+  <exclude domain="file" path="imports" />
+  <exclude domain="file" path="files" />
+  <exclude domain="file" path="games" />
+  <exclude domain="file" path="wine" />
+  <exclude domain="file" path="covers" />
+</full-backup-content>

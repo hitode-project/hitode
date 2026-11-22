@@ -4,6 +4,7 @@
   import AndroidStorageSetting from "../components/AndroidStorageSetting.svelte";
   import GameStorageSetting from "../components/GameStorageSetting.svelte";
   import ClearCacheSetting from "../components/ClearCacheSetting.svelte";
+  import StorageUsage from "../components/StorageUsage.svelte";
   import { preview } from "../lib/bridge";
   import SettingsAccent from "../components/SettingsAccent.svelte";
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
@@ -12,9 +13,10 @@
   import SettingsSwitch from "../components/SettingsSwitch.svelte";
   import JitRow from "../components/JitRow.svelte";
   import { jit } from "../lib/jit.svelte";
-  import { DATA_DIR, reportContents } from "../lib/fake-settings";
+  import { reportContents } from "../lib/fake-settings";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
+  import { revealC } from "../lib/reveal";
   import { general, setPref as set } from "../lib/settings-form.svelte";
 
   let contentsOpen = $state(false);
@@ -163,22 +165,13 @@
 
     <section class="sec" aria-labelledby="g-store">
       <h2 id="g-store">{t("存储")}</h2>
+      <StorageUsage />
       <AndroidStorageSetting />
       <GameStorageSetting />
-      {#if preview}
-        <div class="store">
-          <div style="display: flex; align-items: baseline; gap: 12px; min-width: 0">
-            <span class="total">{general.totalLabel}</span>
-            {#if !device.touch}<span class="datadir" title={DATA_DIR}>{DATA_DIR}</span>{/if}
-          </div>
-          <div class="usage" role="img" aria-label={t("存档 128 MB，缓存 {0}", general.cacheLabel)}>
-            <span style:width="{general.savesPct}%" style:background="var(--accent)"></span>
-            <span style:width="{general.cachePct}%" class="cache"></span>
-          </div>
-          <div style="display: flex; gap: 18px; flex-wrap: wrap">
-            <span class="key"><i style:background="var(--accent)"></i>{t("存档 128 MB")}</span>
-            <span class="key"><i class="cache"></i>{t("缓存")} {general.cacheLabel}</span>
-          </div>
+      {#if device.gameView || preview}
+        <div class="row">
+          <span class="t">{t("Windows C 盘")}</span>
+          <button class="quiet" onclick={revealC}>{t("打开")}</button>
         </div>
       {/if}
       <ClearCacheSetting />
@@ -321,58 +314,6 @@
     background: transparent;
   }
 
-  .store {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    padding: 16px 0 18px;
-    border-bottom: 1px solid var(--line);
-  }
-  .total {
-    flex: 1;
-    font-size: 22px;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-  }
-  .datadir {
-    min-width: 0;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--fg3);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .usage {
-    display: flex;
-    height: 6px;
-    border-radius: 3px;
-    overflow: hidden;
-    background: var(--field);
-    gap: 2px;
-  }
-  .usage span {
-    transition: width 0.3s ease;
-  }
-  .cache {
-    background: var(--fg3);
-    opacity: 0.5;
-  }
-  .key {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: var(--fg2);
-    font-variant-numeric: tabular-nums;
-  }
-  .key i {
-    width: 6px;
-    height: 6px;
-    border-radius: 3px;
-    display: block;
-  }
-
   .contents {
     padding: 4px 16px 14px;
     margin-bottom: 0;
@@ -405,11 +346,6 @@
     color: var(--fg3);
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    .usage span {
-      transition: none;
-    }
-  }
   .credit {
     margin: 6px 0 4px;
     font-size: 11px;

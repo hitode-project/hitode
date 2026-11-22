@@ -44,6 +44,8 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
         .map_err(|e| e.to_string())?
         .join("files");
     std::fs::create_dir_all(&files).map_err(|e| e.to_string())?;
+    #[cfg(target_os = "ios")]
+    crate::game_storage::exclude_from_backup(&files);
     let Some(mut path) = app.storage().pick_file(&files).await?.path else {
         return Ok(None);
     };
@@ -52,6 +54,7 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
         .and_then(|e| e.to_str())
         .is_some_and(|e| extensions.contains(&e.to_ascii_lowercase().as_str()));
     if !matches {
+        cleanup_rejected_pick(&files, &path, cfg!(target_os = "ios"));
         return Err(format!("choose a .{} file", extensions.join(" / .")));
     }
     if cfg!(target_os = "ios") {
@@ -61,6 +64,31 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
         path = target;
     }
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Removes a private copy created by the mobile picker when validation rejects it,
+/// without touching files that live outside `<app_data_dir>/files` on Android.
+#[cfg(any(mobile, test))]
+fn cleanup_rejected_pick(files_dir: &std::path::Path, path: &std::path::Path, remove_inbox: bool) {
+    if let Ok(files_dir) = files_dir.canonicalize()
+        && let Ok(canonical) = path.canonicalize()
+        && let Ok(relative) = canonical.strip_prefix(&files_dir)
+    {
+        if let Some(std::path::Component::Normal(first)) = relative.components().next() {
+            let entry = files_dir.join(first);
+            if let Ok(meta) = std::fs::symlink_metadata(&entry) {
+                if meta.is_dir() {
+                    let _ = std::fs::remove_dir_all(entry);
+                } else if meta.is_file() {
+                    let _ = std::fs::remove_file(entry);
+                }
+            }
+        }
+        return;
+    }
+    if remove_inbox && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// A new folder under `parent`, so a kept copy keeps its original name.
@@ -96,4 +124,35 @@ pub async fn font_families(path: Option<PathBuf>) -> Result<Vec<String>, String>
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_pick_cleanup_removes_private_copy_and_keeps_external_files() {
+        let base = std::env::temp_dir().join(format!("hitode-pick-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let files = base.join("files");
+        let copy_dir = files.join("file-123");
+        let copy = copy_dir.join("wrong.txt");
+        let external = base.join("external.txt");
+        let inbox = base.join("inbox.txt");
+        std::fs::create_dir_all(&copy_dir).unwrap();
+        std::fs::write(&copy, b"copy").unwrap();
+        std::fs::write(&external, b"external").unwrap();
+        std::fs::write(&inbox, b"inbox").unwrap();
+
+        cleanup_rejected_pick(&files, &copy, false);
+        assert!(!copy_dir.exists());
+
+        cleanup_rejected_pick(&files, &external, false);
+        assert!(external.is_file());
+
+        cleanup_rejected_pick(&files, &inbox, true);
+        assert!(!inbox.exists());
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

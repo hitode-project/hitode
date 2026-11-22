@@ -109,11 +109,17 @@ impl Playback {
                 });
             }
         }
-        let mut options = self.options(exe, data_dir, codepage)?;
+        let mut options = self.options(exe, data_dir.clone(), codepage)?;
         crate::drive::apply(app, &mut options)?;
-        let distribution =
-            crate::distribution::path(&app.path().app_data_dir().map_err(|e| e.to_string())?);
-        tauri::async_runtime::spawn_blocking(move || crate::distribution::prepare(&distribution))
+        if let Ok(cache_root) = app.path().app_cache_dir() {
+            let gpu_root = cache_root.join("gpu");
+            options.gpu_health_dir = Some(gpu_root.clone());
+            if let Some(game_id) = data_dir.file_name() {
+                options.d3d9_shader_cache = Some(gpu_root.join(game_id));
+            }
+        }
+        let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        tauri::async_runtime::spawn_blocking(move || crate::distribution::prepare_in(&app_data))
             .await
             .map_err(|e| e.to_string())??;
         Ok(options)

@@ -131,7 +131,7 @@ impl Session {
             let (startup, display) = view.create_display(
                 options.gpu_software,
                 ui.wake(),
-                Some(options.gpu_cache_dir()),
+                Some(options.gpu_health_dir()),
             )?;
             #[cfg(target_os = "macos")]
             {
