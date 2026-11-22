@@ -20,6 +20,7 @@ struct Host {
     surface: Option<Surface>,
     view: Option<Rc<GameView>>,
     session: Option<Session>,
+    game_id: Option<String>,
     playback: Option<Playback>,
     /// Shared lifecycle, audio focus and overlay pause gates.
     lifecycle: adv_shell::mobile::Lifecycle,
@@ -213,6 +214,7 @@ pub async fn start_game(
             host.attach();
             let finished_window = host_window.clone();
             let started_at = Instant::now();
+            let game_id_for_host = id.clone();
             let session = Session::new_with_execution(
                 view,
                 options,
@@ -221,9 +223,11 @@ pub async fn start_game(
                     // Dropped after the borrow: teardown must not run inside it.
                     let ended = HOST.with_borrow_mut(|host| {
                         host.playback.take();
+                        host.game_id = None;
                         (host.session.take(), host.view.take())
                     });
                     drop(ended);
+                    crate::gamepad::on_pause_or_stop();
                     if let Err(error) = android::set_game_mode(finished_window.app_handle(), false)
                     {
                         log::error!("leaving game mode: {error}");
@@ -243,6 +247,7 @@ pub async fn start_game(
             session.set_upscaler(filter);
             playback.apply(&session)?;
             host.session = Some(session);
+            host.game_id = Some(game_id_for_host);
             host.playback = Some(playback);
             host.lifecycle.set_overlay_pause(false);
             host.apply_pause();
@@ -429,4 +434,34 @@ pub async fn game_wheel(window: WebviewWindow, notches: i32) -> Result<(), Strin
         })
     })
     .await
+}
+
+pub(crate) fn gamepad_game_state() -> (Option<String>, bool) {
+    HOST.with_borrow(|host| {
+        if host.session.is_some() {
+            (host.game_id.clone(), host.lifecycle.paused())
+        } else {
+            (None, false)
+        }
+    })
+}
+
+pub(crate) fn wake_overlay_for_gamepad() {}
+
+pub(crate) fn dispatch_gamepad_output(output: adv_shell::gamepad::GamepadOutput) {
+    use adv_shell::gamepad::GamepadOutput;
+    HOST.with_borrow(|host| {
+        let Some(session) = host.session.as_ref() else {
+            return;
+        };
+        match output {
+            GamepadOutput::Key { vk, down } => session.synthetic_key(vk, down),
+            GamepadOutput::MouseButton { button, down } => {
+                session.synthetic_mouse_button(button, down);
+            }
+            GamepadOutput::Wheel { notches } => session.synthetic_wheel(notches),
+            GamepadOutput::MouseMove { dx, dy } => session.synthetic_cursor_delta(dx, dy),
+            GamepadOutput::System(_) => {}
+        }
+    });
 }

@@ -60,6 +60,7 @@ thread_local! {
 struct Host {
     container: Retained<GameContainer>,
     session: Option<Session>,
+    game_id: Option<String>,
     playback: Option<Playback>,
     paused: bool,
     /// The exit code the application quits with once the game has closed.
@@ -216,6 +217,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
             *host = Some(Host {
                 container,
                 session: None,
+                game_id: None,
                 playback: None,
                 paused: false,
                 exit: None,
@@ -225,6 +227,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                 overlay_change: 0,
             })
         });
+        crate::gamepad_apple::setup();
     })?;
     let handle = app.handle().clone();
     app.state::<OverlayState>().on_change(move |input, change| {
@@ -301,11 +304,13 @@ pub async fn start_game(
                         let exit = HOST.with_borrow_mut(|host| {
                             let host = host.as_mut().unwrap();
                             host.session.take();
+                            host.game_id = None;
                             host.container.set_game(None);
                             host.focus(Target::Overlay);
                             host.asked = None;
                             host.exit.take()
                         });
+                        crate::gamepad::on_pause_or_stop();
                         let elapsed = started_at.elapsed();
                         crate::play::finished(&finished_window, id, result, elapsed);
                         if let Some(code) = exit {
@@ -330,10 +335,12 @@ pub async fn start_game(
                         session.set_upscaler(filter);
                         playback.apply(&session)?;
                         let damage_window = host_window.clone();
+                        let damage_id_for_host = damage_id.clone();
                         session.observe_damage(move |ratios| {
                             let _ = damage_window.emit("game_damage_ratios", (&damage_id, ratios));
                         });
                         host.session = Some(session);
+                        host.game_id = Some(damage_id_for_host);
                         host.playback = Some(playback);
                         host.paused = false;
                         host.apply_pause();
@@ -437,6 +444,9 @@ pub async fn pause_game(window: WebviewWindow, paused: bool) -> Result<(), Strin
                 host.apply_pause();
                 Ok(())
             });
+            if paused {
+                crate::gamepad::on_pause_or_stop();
+            }
             let _ = reply.send(done);
         })
         .map_err(|error| error.to_string())?;
@@ -564,4 +574,37 @@ pub fn game_fps() -> f64 {
             .and_then(|host| host.session.as_ref())
             .map_or(0.0, Session::fps)
     })
+}
+
+pub(crate) fn gamepad_game_state() -> (Option<String>, bool) {
+    HOST.with_borrow(|host| match host.as_ref() {
+        Some(h) if h.session.is_some() => (h.game_id.clone(), h.paused),
+        _ => (None, false),
+    })
+}
+
+pub(crate) fn wake_overlay_for_gamepad() {
+    HOST.with_borrow_mut(|host| {
+        if let Some(host) = host {
+            host.container.set_overlay_visible(true);
+        }
+    });
+}
+
+pub(crate) fn dispatch_gamepad_output(output: adv_shell::gamepad::GamepadOutput) {
+    use adv_shell::gamepad::GamepadOutput;
+    HOST.with_borrow(|host| {
+        let Some(session) = host.as_ref().and_then(|h| h.session.as_ref()) else {
+            return;
+        };
+        match output {
+            GamepadOutput::Key { vk, down } => session.synthetic_key(vk, down),
+            GamepadOutput::MouseButton { button, down } => {
+                session.synthetic_mouse_button(button, down);
+            }
+            GamepadOutput::Wheel { notches } => session.synthetic_wheel(notches),
+            GamepadOutput::MouseMove { dx, dy } => session.synthetic_cursor_delta(dx, dy),
+            GamepadOutput::System(_) => {}
+        }
+    });
 }

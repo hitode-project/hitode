@@ -15,6 +15,9 @@ mod drive;
 #[cfg_attr(target_os = "ios", path = "game_ios.rs")]
 mod game;
 mod game_storage;
+mod gamepad;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod gamepad_apple;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod haptics;
 #[cfg(target_os = "ios")]
@@ -124,9 +127,9 @@ pub fn run() {
         use tauri::Manager;
         #[cfg(target_os = "android")]
         android::setup(app.handle().clone());
-        app.manage(std::sync::Mutex::new(library::Library::load(
-            app.path().app_data_dir()?,
-        )?));
+        let data_dir = app.path().app_data_dir()?;
+        gamepad::init(app.handle().clone(), &data_dir);
+        app.manage(std::sync::Mutex::new(library::Library::load(data_dir)?));
         #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
         app.manage(adv_shell::Execution::new(distribution::path(
             &app.path().app_data_dir()?,
@@ -200,7 +203,9 @@ pub fn run() {
                 game_storage::export_game_copy,
                 game_storage::use_game_copy,
                 drive::reveal_drive,
-                library::reveal_path
+                library::reveal_path,
+                gamepad::gamepad_get_state,
+                gamepad::gamepad_save_config
             ]);
     #[cfg(all(desktop, not(target_os = "macos")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -237,7 +242,9 @@ pub fn run() {
         game_storage::delete_game_copy,
         game_storage::export_game_copy,
         game_storage::use_game_copy,
-        library::reveal_path
+        library::reveal_path,
+        gamepad::gamepad_get_state,
+        gamepad::gamepad_save_config
     ]);
     #[cfg(target_os = "android")]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -293,7 +300,9 @@ pub fn run() {
         game_storage::export_game_copy,
         game_storage::use_game_copy,
         drive::reveal_drive,
-        library::reveal_path
+        library::reveal_path,
+        gamepad::gamepad_get_state,
+        gamepad::gamepad_save_config
     ]);
     #[cfg(target_os = "ios")]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -353,7 +362,9 @@ pub fn run() {
         game_storage::export_game_copy,
         game_storage::use_game_copy,
         drive::reveal_drive,
-        library::reveal_path
+        library::reveal_path,
+        gamepad::gamepad_get_state,
+        gamepad::gamepad_save_config
     ]);
     let app = builder
         .build(tauri::generate_context!())

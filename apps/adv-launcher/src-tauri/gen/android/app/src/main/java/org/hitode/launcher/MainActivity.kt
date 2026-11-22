@@ -4,6 +4,7 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Color
+import android.hardware.input.InputManager
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -16,6 +17,9 @@ import android.os.Looper
 import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import java.io.File
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
@@ -52,6 +56,36 @@ class MainActivity : TauriActivity() {
     private var resumed = false
     private var previousOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     private var previousKeepScreenOn = false
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
+    private val inputManager by lazy { getSystemService(InputManager::class.java) }
+    private val trackedGamepads = LinkedHashMap<Int, TrackedGamepad>()
+    private var gamepadTicking = false
+    private val gamepadTickRunnable = object : Runnable {
+        override fun run() {
+            if (!gamepadTicking) return
+            if (nativeGamepadTick()) {
+                mainHandler.postDelayed(this, 16L)
+            } else {
+                gamepadTicking = false
+            }
+        }
+    }
+    private val gamepadListener = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) = syncGamepadDevice(deviceId)
+        override fun onInputDeviceChanged(deviceId: Int) = syncGamepadDevice(deviceId)
+        override fun onInputDeviceRemoved(deviceId: Int) = removeGamepadDevice(deviceId)
+    }
+
+    private data class TrackedGamepad(
+        val stableId: String,
+        val name: String,
+        var hatUp: Boolean = false,
+        var hatDown: Boolean = false,
+        var hatLeft: Boolean = false,
+        var hatRight: Boolean = false,
+        var trigL: Boolean = false,
+        var trigR: Boolean = false,
+    )
     private val audioManager by lazy { getSystemService(AudioManager::class.java) }
     private val audioRequest by lazy {
         AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -71,12 +105,14 @@ class MainActivity : TauriActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        inputManager?.registerInputDeviceListener(gamepadListener, mainHandler)
     }
 
     override fun onWebViewCreate(webView: WebView) {
         super.onWebViewCreate(webView)
         webView.setBackgroundColor(Color.TRANSPARENT)
         container = GameContainer(this, webView)
+        scanGamepads()
     }
 
     fun setLauncherBack(enabled: Boolean) {
@@ -158,10 +194,12 @@ class MainActivity : TauriActivity() {
         resumed = true
         if (gameMode) requestAudioFocus()
         nativeResume()
+        scanGamepads()
     }
 
     override fun onPause() {
         resumed = false
+        stopGamepadTick()
         nativePause()
         if (gameMode) abandonAudioFocus()
         super.onPause()
@@ -179,8 +217,144 @@ class MainActivity : TauriActivity() {
     }
 
     override fun onDestroy() {
+        stopGamepadTick()
+        inputManager?.unregisterInputDeviceListener(gamepadListener)
         if (gameMode) abandonAudioFocus()
         super.onDestroy()
+    }
+
+    private fun isRealGamepad(device: InputDevice): Boolean {
+        if (device.isVirtual) return false
+        val src = device.sources
+        val hasGamepad = (src and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+        if (hasGamepad) return true
+        val hasJoystick = (src and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+        if (!hasJoystick) return false
+        return device.hasKeys(
+            KeyEvent.KEYCODE_BUTTON_A,
+            KeyEvent.KEYCODE_BUTTON_B,
+            KeyEvent.KEYCODE_BUTTON_X,
+            KeyEvent.KEYCODE_BUTTON_Y,
+        ).any { it }
+    }
+
+    private fun detectGamepadStyle(device: InputDevice): Int {
+        val name = device.name.orEmpty().lowercase()
+        return when {
+            device.vendorId == 0x054c || name.contains("dualsense") || name.contains("dualshock") || name.contains("playstation") -> 1
+            device.vendorId == 0x057e || name.contains("nintendo") || name.contains("switch") || name.contains("joy-con") || name.contains("pro controller") -> 2
+            else -> 0
+        }
+    }
+
+    private fun scanGamepads() {
+        val ids = inputManager?.inputDeviceIds ?: return
+        for (id in ids) syncGamepadDevice(id)
+    }
+
+    private fun syncGamepadDevice(deviceId: Int) {
+        val device = InputDevice.getDevice(deviceId)
+        if (device == null || !isRealGamepad(device)) {
+            removeGamepadDevice(deviceId)
+            return
+        }
+        if (trackedGamepads.containsKey(deviceId)) return
+        val name = device.name?.takeIf { it.isNotBlank() } ?: "Game Controller"
+        val baseId = "android:%04x:%04x:%s".format(device.vendorId, device.productId, name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-'))
+        val existingIds = trackedGamepads.values.map { it.stableId }.toSet()
+        var stableId = baseId
+        var idx = 2
+        while (existingIds.contains(stableId)) {
+            stableId = "$baseId#$idx"
+            idx++
+        }
+        trackedGamepads[deviceId] = TrackedGamepad(stableId, name)
+        nativeGamepadConnected(stableId, name, detectGamepadStyle(device))
+    }
+
+    private fun removeGamepadDevice(deviceId: Int) {
+        val removed = trackedGamepads.remove(deviceId) ?: return
+        nativeGamepadDisconnected(removed.stableId)
+        if (trackedGamepads.isEmpty()) stopGamepadTick()
+    }
+
+    private fun updateGamepadTick(needed: Boolean) {
+        if (needed && !gamepadTicking) {
+            gamepadTicking = true
+            mainHandler.postDelayed(gamepadTickRunnable, 16L)
+        } else if (!needed && gamepadTicking) {
+            stopGamepadTick()
+        }
+    }
+
+    private fun stopGamepadTick() {
+        gamepadTicking = false
+        mainHandler.removeCallbacks(gamepadTickRunnable)
+    }
+
+    private fun mapGamepadKeyCode(keyCode: Int): Int = when (keyCode) {
+        KeyEvent.KEYCODE_BUTTON_A -> 0
+        KeyEvent.KEYCODE_BUTTON_B -> 1
+        KeyEvent.KEYCODE_BUTTON_X -> 2
+        KeyEvent.KEYCODE_BUTTON_Y -> 3
+        KeyEvent.KEYCODE_BUTTON_L1 -> 4
+        KeyEvent.KEYCODE_BUTTON_R1 -> 5
+        KeyEvent.KEYCODE_BUTTON_L2 -> 6
+        KeyEvent.KEYCODE_BUTTON_R2 -> 7
+        KeyEvent.KEYCODE_BUTTON_THUMBL -> 8
+        KeyEvent.KEYCODE_BUTTON_THUMBR -> 9
+        KeyEvent.KEYCODE_DPAD_UP -> 10
+        KeyEvent.KEYCODE_DPAD_DOWN -> 11
+        KeyEvent.KEYCODE_DPAD_LEFT -> 12
+        KeyEvent.KEYCODE_DPAD_RIGHT -> 13
+        KeyEvent.KEYCODE_BUTTON_START -> 14
+        KeyEvent.KEYCODE_BUTTON_SELECT -> 15
+        else -> -1
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val tracked = trackedGamepads[event.deviceId]
+        if (tracked != null) {
+            val idx = mapGamepadKeyCode(event.keyCode)
+            if (idx >= 0) {
+                if (event.repeatCount == 0 && (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP)) {
+                    nativeGamepadButton(tracked.stableId, idx, event.action == KeyEvent.ACTION_DOWN)
+                }
+                return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        val tracked = trackedGamepads[event.deviceId]
+        if (tracked != null && event.action == MotionEvent.ACTION_MOVE) {
+            val lx = event.getAxisValue(MotionEvent.AXIS_X)
+            val ly = event.getAxisValue(MotionEvent.AXIS_Y)
+            val rx = event.getAxisValue(MotionEvent.AXIS_Z)
+            val ry = event.getAxisValue(MotionEvent.AXIS_RZ)
+            val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+            val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+            val lTrig = maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE)) > 0.35f
+            val rTrig = maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS)) > 0.35f
+
+            val up = hatY < -0.5f
+            val down = hatY > 0.5f
+            val left = hatX < -0.5f
+            val right = hatX > 0.5f
+            if (up != tracked.hatUp) { tracked.hatUp = up; nativeGamepadButton(tracked.stableId, 10, up) }
+            if (down != tracked.hatDown) { tracked.hatDown = down; nativeGamepadButton(tracked.stableId, 11, down) }
+            if (left != tracked.hatLeft) { tracked.hatLeft = left; nativeGamepadButton(tracked.stableId, 12, left) }
+            if (right != tracked.hatRight) { tracked.hatRight = right; nativeGamepadButton(tracked.stableId, 13, right) }
+            if (lTrig != tracked.trigL) { tracked.trigL = lTrig; nativeGamepadButton(tracked.stableId, 6, lTrig) }
+            if (rTrig != tracked.trigR) { tracked.trigR = rTrig; nativeGamepadButton(tracked.stableId, 7, rTrig) }
+
+            val needL = nativeGamepadStick(tracked.stableId, false, lx, ly)
+            val needR = nativeGamepadStick(tracked.stableId, true, rx, ry)
+            updateGamepadTick(needL || needR)
+            return true
+        }
+        return super.dispatchGenericMotionEvent(event)
     }
 
     external fun nativeSurfaceCreated(surface: Surface, width: Int, height: Int)
@@ -273,6 +447,11 @@ class MainActivity : TauriActivity() {
     external fun nativePause()
     external fun nativeBack(edge: Int)
     external fun nativeResume()
+    external fun nativeGamepadConnected(id: String, name: String, style: Int)
+    external fun nativeGamepadDisconnected(id: String)
+    external fun nativeGamepadButton(id: String, buttonIdx: Int, down: Boolean)
+    external fun nativeGamepadStick(id: String, rightStick: Boolean, x: Float, y: Float): Boolean
+    external fun nativeGamepadTick(): Boolean
     external fun nativeAudioFocus(active: Boolean)
     external fun nativeTrimMemory()
 }
