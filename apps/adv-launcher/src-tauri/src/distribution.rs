@@ -21,13 +21,19 @@ pub(crate) fn prepare(root: &Path) -> Result<(), String> {
         return Err("Wine runtime is missing from this player build".into());
     }
     let _guard = PREPARING.lock().unwrap();
-    unpack(root, FILES, ARCHIVE).map_err(|e| format!("prepare Wine distribution: {e}"))?;
-    if let Some(parent) = root.parent() {
-        #[cfg(target_os = "ios")]
-        crate::game_storage::exclude_from_backup(parent);
-        let _ = prune_stale(parent, ID);
-    }
-    Ok(())
+    unpack(root, FILES, ARCHIVE).map_err(|e| format!("prepare Wine distribution: {e}"))
+}
+
+/// Prepares the embedded Wine runtime under `<data_dir>/runtime/<ID>` and
+/// prunes obsolete runtime revisions beside it.
+pub(crate) fn prepare_in(data_dir: &Path) -> Result<PathBuf, String> {
+    let root = path(data_dir);
+    prepare(&root)?;
+    let runtime_root = data_dir.join("runtime");
+    #[cfg(target_os = "ios")]
+    crate::game_storage::exclude_from_backup(&runtime_root);
+    let _ = prune_stale(&runtime_root, ID);
+    Ok(root)
 }
 
 /// Removes obsolete unpacked Wine runtimes beside `keep_id` without following symlinks.
@@ -124,8 +130,13 @@ mod tests {
         if FILES.is_empty() {
             return;
         }
-        let root = std::env::temp_dir().join(format!("adv-wine-embedded-{}", std::process::id()));
-        prepare(&root).unwrap();
+        let base = std::env::temp_dir().join(format!("adv-wine-embedded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let stale = base.join("runtime/old-revision");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("ntdll.dll"), b"stale").unwrap();
+        let root = prepare_in(&base).unwrap();
+        assert!(!stale.exists());
         assert!(
             std::fs::read(root.join("lib/wine/i386-windows/ntdll.dll"))
                 .unwrap()
@@ -141,7 +152,7 @@ mod tests {
                 .unwrap()
                 .starts_with("WINE REGISTRY")
         );
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     // spec: HOST-SES-12

@@ -118,9 +118,8 @@ impl Playback {
                 options.d3d9_shader_cache = Some(gpu_root.join(game_id));
             }
         }
-        let distribution =
-            crate::distribution::path(&app.path().app_data_dir().map_err(|e| e.to_string())?);
-        tauri::async_runtime::spawn_blocking(move || crate::distribution::prepare(&distribution))
+        let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        tauri::async_runtime::spawn_blocking(move || crate::distribution::prepare_in(&app_data))
             .await
             .map_err(|e| e.to_string())??;
         Ok(options)
