@@ -6,6 +6,7 @@ mod debug;
 mod execution;
 mod frame_pacer;
 mod frontend;
+pub mod gamepad;
 mod heap;
 #[cfg(host_view)]
 pub use adv_runtime::system_font_families;

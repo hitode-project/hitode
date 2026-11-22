@@ -17,6 +17,8 @@ pub struct Input {
     modifiers: usize,
     toggle_control: bool,
     control_latched: bool,
+    synth_cursor: Option<(f64, f64)>,
+    synth_buttons: u32,
 }
 
 define_class!(
@@ -47,6 +49,7 @@ define_class!(
         fn resign_first_responder(&self) -> bool {
             let mut input = self.ivars().borrow_mut();
             input.control_latched = false;
+            input.synth_buttons = 0;
             input.hub.push(Event::FocusLost);
             if input.cursor_hidden { NSCursor::unhide(); input.cursor_hidden = false; }
             true
@@ -335,6 +338,8 @@ impl GameView {
             modifiers: 0,
             toggle_control: false,
             control_latched: false,
+            synth_cursor: None,
+            synth_buttons: 0,
         }));
         let view: Retained<Self> = unsafe {
             msg_send![super(this), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(f64::from(width.max(1)), f64::from(height.max(1))))]
@@ -393,6 +398,136 @@ impl GameView {
         let mut input = self.ivars().borrow_mut();
         input.regions = regions;
         input.update_cursor(self, None);
+    }
+
+    fn resolve_synth_cursor(&self, input: &mut Input) -> (f64, f64) {
+        if let Some(pos) = input.synth_cursor {
+            return pos;
+        }
+        let w = f64::from(input.width.max(1));
+        let h = f64::from(input.height.max(1));
+        if let Some(window) = self.window() {
+            let loc = self.convertPoint_fromView(window.mouseLocationOutsideOfEventStream(), None);
+            let (cw, ch) = self.client();
+            let (x, y) = (loc.x, ch - loc.y);
+            if x >= 0.0 && y >= 0.0 && x < cw && y < ch {
+                let viewport = self.viewport((input.width, input.height), &input.hub);
+                let (gx, gy) = viewport.position(x, y, input.width, input.height);
+                if gx >= 0 && gy >= 0 && gx < input.width as i32 && gy < input.height as i32 {
+                    let pos = (f64::from(gx), f64::from(gy));
+                    input.synth_cursor = Some(pos);
+                    return pos;
+                }
+            }
+        }
+        let center = (w / 2.0, h / 2.0);
+        input.synth_cursor = Some(center);
+        center
+    }
+
+    fn canvas_to_client(&self, input: &Input, gx: f64, gy: f64) -> ((f64, f64), (f64, f64)) {
+        let viewport = self.viewport((input.width, input.height), &input.hub);
+        let w = f64::from(input.width.max(1));
+        let h = f64::from(input.height.max(1));
+        let cx = viewport.x + (gx / w) * viewport.width;
+        let cy = viewport.y + (gy / h) * viewport.height;
+        let backing = self.window().map_or(1.0, |win| win.backingScaleFactor());
+        ((cx, cy), (cx * backing, cy * backing))
+    }
+
+    /// Presses or releases a Win32 virtual key from a synthetic source (e.g. gamepad).
+    pub fn overlay_key(&self, code: u32, down: bool) {
+        let hub = self.hub();
+        if !hub.main_enabled.get() {
+            return;
+        }
+        let Some((key, scan)) = crate::mobile::overlay_key(code) else {
+            return;
+        };
+        let (message, wparam, lparam) = crate::mobile::key_message(key, scan, down, false, false);
+        hub.push(Event::Input {
+            message,
+            wparam,
+            lparam,
+        });
+    }
+
+    /// Presses or releases left (`0`), right (`1`), or middle (`2`) mouse button synthetically.
+    pub fn mouse_button_code(&self, button: u8, down: bool) {
+        let (flag, message) = match (button, down) {
+            (0, true) => (1u32, 0x201u32),
+            (0, false) => (1, 0x202),
+            (1, true) => (2, 0x204),
+            (1, false) => (2, 0x205),
+            (2, true) => (0x10, 0x207),
+            (2, false) => (0x10, 0x208),
+            _ => return,
+        };
+        let mut input = self.ivars().borrow_mut();
+        let held = input.synth_buttons;
+        if down == (held & flag != 0) {
+            return;
+        }
+        let buttons = if down { held | flag } else { held & !flag };
+        input.synth_buttons = buttons;
+        let (gx, gy) = self.resolve_synth_cursor(&mut input);
+        let (_, at) = self.canvas_to_client(&input, gx, gy);
+        let position = u32::from(gx as u16) | (u32::from(gy as u16) << 16);
+        input.hub.mouse(0x200, held, at, position);
+        input.hub.mouse(message, buttons, at, position);
+    }
+
+    /// Sends a synthetic scroll wheel event at the current cursor position.
+    pub fn wheel(&self, notches: i32) {
+        if notches == 0 {
+            return;
+        }
+        let mut input = self.ivars().borrow_mut();
+        let (gx, gy) = self.resolve_synth_cursor(&mut input);
+        let (_, at) = self.canvas_to_client(&input, gx, gy);
+        let delta = (notches * 120).clamp(-32768, 32767) as i16;
+        let wparam = (u32::from(delta as u16) << 16) | (input.synth_buttons & 0x1f);
+        let position = u32::from(gx as u16) | (u32::from(gy as u16) << 16);
+        input.hub.mouse(0x20a, wparam, at, position);
+    }
+
+    /// Moves the cursor by a delta in canvas pixels and warps the macOS pointer when focused.
+    pub fn move_cursor_delta(&self, dx: f32, dy: f32) {
+        let mut input = self.ivars().borrow_mut();
+        if input.width == 0 || input.height == 0 {
+            return;
+        }
+        let (gx, gy) = self.resolve_synth_cursor(&mut input);
+        let nx = (gx + f64::from(dx)).clamp(0.0, f64::from(input.width.saturating_sub(1)));
+        let ny = (gy + f64::from(dy)).clamp(0.0, f64::from(input.height.saturating_sub(1)));
+        input.synth_cursor = Some((nx, ny));
+        let ((cx, cy), at) = self.canvas_to_client(&input, nx, ny);
+        let position = u32::from(nx as u16) | (u32::from(ny as u16) << 16);
+        let buttons = input.synth_buttons;
+        input.hub.mouse(0x200, buttons, at, position);
+        if let Some(window) = self.window()
+            && window.isKeyWindow()
+        {
+            let (_, ch) = self.client();
+            let view_pt = NSPoint::new(cx, ch - cy);
+            let win_pt = self.convertPoint_toView(view_pt, None);
+            let screen_rect =
+                window.convertRectToScreen(NSRect::new(win_pt, NSSize::new(0.0, 0.0)));
+            let mtm = self.mtm();
+            if let Some(primary) = objc2_app_kit::NSScreen::screens(mtm).firstObject() {
+                let primary_h = primary.frame().size.height;
+                let cg_pt = objc2_core_foundation::CGPoint::new(
+                    screen_rect.origin.x,
+                    primary_h - screen_rect.origin.y,
+                );
+                unsafe extern "C" {
+                    fn CGWarpMouseCursorPosition(point: objc2_core_foundation::CGPoint) -> i32;
+                }
+                unsafe {
+                    let _ = CGWarpMouseCursorPosition(cg_pt);
+                }
+            }
+        }
     }
 }
 impl Drop for Input {
@@ -590,6 +725,9 @@ impl Input {
             buttons
         };
         let position = u32::from(gx as u16) | (u32::from(gy as u16) << 16);
+        if inside && on_canvas {
+            self.synth_cursor = Some((f64::from(gx), f64::from(gy)));
+        }
         self.hub.mouse(message, wparam, at, position);
     }
 
@@ -682,6 +820,8 @@ mod tests {
             modifiers: 0,
             toggle_control: true,
             control_latched: false,
+            synth_cursor: None,
+            synth_buttons: 0,
         };
         input.modifier(0x3b, LEFT_CONTROL, LEFT_CONTROL);
         input.modifier(0x3b, 0, LEFT_CONTROL);
