@@ -2648,3 +2648,145 @@ fn c1_merges_compact_constants_and_accept_value_with_round() {
         });
     }
 }
+
+// spec: A64-OPT-3, A64-OPT-9
+#[test]
+fn resident_hoists_invariant_x87_frame_loads_with_vector_budget() {
+    // 10 invariant x87 frame loads (> CARRIED GPRs) after an indexed store
+    // (write_through = true, protected by FrameDisjoint), plus one written frame
+    // slot that must stay inside the loop.
+    let code = resident_loop(|a| {
+        a.mov(dword_ptr(edi + ecx * 4), eax).unwrap();
+        for k in 0..5i32 {
+            a.fld(qword_ptr(esp + 0x20 + 8 * k)).unwrap();
+            a.fadd(dword_ptr(esp + 0x60 + 4 * k)).unwrap();
+            a.faddp(st1, st0).unwrap();
+        }
+        a.fstp(dword_ptr(esp + 0x90)).unwrap();
+        a.fld(dword_ptr(esp + 0x90)).unwrap();
+    });
+    let unit = resident_unit(&code);
+    let mut at = initial();
+    at.regs[1] = 3;
+    at.x87.status = 0x20;
+    at.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+    let built = build_with(&unit, None, &at, &|_| false, &|_| false).unwrap();
+
+    // Every invariant FrameLoad + X87Load (5 f64 + 5 f32) moves into Block(0),
+    // leaving only the written cell's X87Load inside the loop body.
+    let block0_x87 = built.func.blocks[0]
+        .insts
+        .iter()
+        .filter(|(_, op)| matches!(op, Op::X87Load { .. }))
+        .count();
+    let body_frame_loads: usize = built.func.blocks[1..]
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|(_, op)| matches!(op, Op::FrameLoad { .. }))
+        .count();
+    assert_eq!(block0_x87, 10);
+    assert_eq!(body_frame_loads, 0);
+    for &(res, op) in &built.func.blocks[0].insts {
+        if matches!(op, Op::X87Load { .. }) {
+            let val = res.unwrap();
+            assert!(
+                built.func.cold_pcs.contains_key(&val),
+                "hoisted X87Load must preserve its original cold_pc"
+            );
+        }
+    }
+
+    let init_memory = |nan_slot: bool| {
+        let mut memory = resident_memory();
+        for k in 0..5u32 {
+            let d = if nan_slot && k == 2 {
+                f64::NAN
+            } else {
+                f64::from(k + 1)
+            };
+            let s = f32::from((k + 1) as u8) * 0.5;
+            memory
+                .write(FRAME + 0x20 + 8 * k, &d.to_le_bytes())
+                .unwrap();
+            memory
+                .write(FRAME + 0x60 + 4 * k, &s.to_le_bytes())
+                .unwrap();
+        }
+        memory
+    };
+
+    // Normal execution: 3 iterations * sum_{k=1..=5}(k + 0.5*k) = 3 * 22.5 = 67.5.
+    let mut memory = init_memory(false);
+    let run = eval::run(
+        &built.func,
+        &params(&built.func, &at, &mut memory),
+        &mut memory,
+        1000,
+    );
+    let eval::Outcome::Exit(id) = run.outcome else {
+        panic!("expected normal exit, got {:?}", run.outcome);
+    };
+    let x87 = built.func.records[id.0 as usize].x87.as_ref().unwrap();
+    let top_val = eval::locate(x87.stack[x87.top as usize].as_ref().unwrap(), &run.values);
+    assert_eq!(f64::from_bits(top_val as u64), 67.5);
+
+    // NaN in a hoisted frame slot fails cleanly to RecordId(0) before any store.
+    let mut memory = init_memory(true);
+    let run = eval::run(
+        &built.func,
+        &params(&built.func, &at, &mut memory),
+        &mut memory,
+        1000,
+    );
+    assert_eq!(run.outcome, eval::Outcome::Fail(RecordId(0)));
+
+    // Indexed store aliasing the frame triggers FrameDisjoint before modifying it.
+    let mut alias_at = at.clone();
+    alias_at.regs[7] = FRAME + 0x20;
+    let mut memory = init_memory(false);
+    let run = eval::run(
+        &built.func,
+        &params(&built.func, &alias_at, &mut memory),
+        &mut memory,
+        1000,
+    );
+    assert!(matches!(run.outcome, eval::Outcome::Fail(_)));
+    let mut untouched = [0u8; 8];
+    memory.read_into(FRAME + 0x20, &mut untouched).unwrap();
+    assert_eq!(f64::from_le_bytes(untouched), 1.0);
+
+    // Beyond CARRIED (>20 live GPRs + frame cells), cells are not Block(0)
+    // Source::Frame parameters; they emit FrameLoad + X87Load in the loop, and
+    // hoisting moves both into Block(0) under the vector register budget.
+    let overflow_carried = resident_loop(|a| {
+        a.mov(dword_ptr(edi + ecx * 4), eax).unwrap();
+        for k in 0..8i32 {
+            a.fld(qword_ptr(esp + 0x20 + 8 * k)).unwrap();
+            a.fadd(dword_ptr(esp + 0x60 + 4 * k)).unwrap();
+            a.faddp(st1, st0).unwrap();
+        }
+        for k in 0..5i32 {
+            a.add(eax, dword_ptr(esp + 0xa0 + 4 * k)).unwrap();
+        }
+    });
+    let unit2 = resident_unit(&overflow_carried);
+    let built2 = build_with(&unit2, None, &at, &|_| false, &|_| false).unwrap();
+    let block0_xl = built2.func.blocks[0]
+        .insts
+        .iter()
+        .filter(|(_, op)| matches!(op, Op::X87Load { .. }))
+        .count();
+    let body_xl: usize = built2.func.blocks[1..]
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|(_, op)| matches!(op, Op::X87Load { .. }))
+        .count();
+    let body_fl: usize = built2.func.blocks[1..]
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|(_, op)| matches!(op, Op::FrameLoad { .. }))
+        .count();
+    assert_eq!(block0_xl, 16);
+    assert_eq!(body_xl, 0);
+    assert_eq!(body_fl, 0);
+}
