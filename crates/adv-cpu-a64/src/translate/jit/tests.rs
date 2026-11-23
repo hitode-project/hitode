@@ -4061,6 +4061,91 @@ pub(in crate::translate) mod opt_back {
         );
     }
 
+    // spec: A64-OPT-2, A64F-FP-5
+    #[test]
+    fn opt_back_sse_packed_conversions_match_reference() {
+        let mut h = harness();
+        let pack_f32 = |a: f32, b: f32, c: f32, d: f32| {
+            u128::from(a.to_bits())
+                | (u128::from(b.to_bits()) << 32)
+                | (u128::from(c.to_bits()) << 64)
+                | (u128::from(d.to_bits()) << 96)
+        };
+        let pack_f64 = |a: f64, b: f64| u128::from(a.to_bits()) | (u128::from(b.to_bits()) << 64);
+
+        // 1) SsePackedToInt (.4s and .2d, truncating and nearest-even),
+        // including subnormals, exact -2^31, +2^31, NaN, and Inf bailouts.
+        for double in [false, true] {
+            for truncate in [false, true] {
+                let (mut f, b, p, _) = start(&[Type::V128]);
+                let v = f
+                    .push(
+                        b,
+                        Op::SsePackedToInt {
+                            value: p[0],
+                            double,
+                            truncate,
+                        },
+                    )
+                    .unwrap();
+                finish(&mut f, b, v);
+                let cases: Vec<u128> = if double {
+                    vec![
+                        pack_f64(2.5, -3.5),
+                        pack_f64(-0.0, f64::from_bits(1)),
+                        pack_f64(2_147_483_647.9, -2_147_483_648.0),
+                        pack_f64(2_147_483_648.0, 1.0),
+                        pack_f64(1.0, f64::NAN),
+                        pack_f64(f64::NEG_INFINITY, 0.0),
+                    ]
+                } else {
+                    vec![
+                        pack_f32(2.5, -3.5, 1.25, -0.75),
+                        pack_f32(-0.0, f32::from_bits(1), 2147483520.0, -2147483520.0),
+                        pack_f32(1.0, -2147483648.0, 2.0, 3.0),
+                        pack_f32(1.0, 2.0, 2147483648.0, 3.0),
+                        pack_f32(1.0, 2.0, 3.0, f32::NAN),
+                        pack_f32(f32::INFINITY, 0.0, 0.0, 0.0),
+                    ]
+                };
+                for arg in cases {
+                    compare(&f, &[arg], &mut h);
+                }
+            }
+        }
+
+        // 2) VecUnary::{WidenScalar, FromInt4s, FromInt2d}.
+        let (mut f, b, p, _) = start(&[Type::V128]);
+        let v = f
+            .push(b, Op::VecUnary(VecUnary::WidenScalar, p[0]))
+            .unwrap();
+        finish(&mut f, b, v);
+        for x in [
+            0.0f32,
+            -0.0,
+            1.5,
+            -2147483648.0,
+            f32::from_bits(1),
+            f32::INFINITY,
+        ] {
+            compare(&f, &[u128::from(x.to_bits())], &mut h);
+        }
+
+        let (mut f, b, p, _) = start(&[Type::V128]);
+        let v = f.push(b, Op::VecUnary(VecUnary::FromInt4s, p[0])).unwrap();
+        finish(&mut f, b, v);
+        let ints = u128::from(0u32)
+            | (u128::from((-1i32) as u32) << 32)
+            | (u128::from(i32::MAX as u32) << 64)
+            | (u128::from(i32::MIN as u32) << 96);
+        compare(&f, &[ints], &mut h);
+
+        let (mut f, b, p, _) = start(&[Type::V128]);
+        let v = f.push(b, Op::VecUnary(VecUnary::FromInt2d, p[0])).unwrap();
+        finish(&mut f, b, v);
+        compare(&f, &[ints], &mut h);
+    }
+
     // spec: A64-OPT-6, A64-OPT-7
     #[test]
     fn opt_back_integer_operations_and_conversions_match_reference() {

@@ -159,15 +159,33 @@ impl Front<'_> {
                     self.value(Op::Vec(VecOp::MoveLow32, dst, result))
                 }
             }
-            Kind::ScalarToInt(true, true) => {
-                // CVTTSD2SI never raises DE under DAZ = 0 (assumed.mxcsr & 0xffc0 == 0x1f80).
-                let value = self.bits(Type::F64, src);
+            Kind::ScalarToInt(double, true) => {
+                // CVTTSD2SI / CVTTSS2SI never raise DE under DAZ = 0 (assumed.mxcsr & 0xffc0 == 0x1f80).
+                let value = if double {
+                    self.bits(Type::F64, src)
+                } else {
+                    let widened = self.value(Op::VecUnary(VecUnary::WidenScalar, src));
+                    self.bits(Type::F64, widened)
+                };
                 self.value(Op::ToInt {
                     value,
                     wide: false,
                     sse: true,
                 })
             }
+            Kind::PackedToInt(truncate, double) if !s.mmx() => {
+                // CVTTPS2DQ / CVTPS2DQ / CVTTPD2DQ / CVTPD2DQ never raise DE;
+                // assumed.mxcsr enforces default RC/DAZ and PE = 1.
+                self.value(Op::SsePackedToInt {
+                    value: src,
+                    double,
+                    truncate,
+                })
+            }
+            Kind::FromInt(false) if !s.mmx() && s.width == 16 => {
+                self.value(Op::VecUnary(VecUnary::FromInt4s, src))
+            }
+            Kind::FromInt(true) if !s.mmx() => self.value(Op::VecUnary(VecUnary::FromInt2d, src)),
             Kind::FlagCompare(true, ordered) => {
                 self.sse_input(dst, Some(src), false, false);
                 let a = self.bits(Type::F64, dst);

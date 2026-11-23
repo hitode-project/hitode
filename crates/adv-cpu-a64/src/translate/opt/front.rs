@@ -298,9 +298,13 @@ fn build_trace(
         return Err(Reject::Mode(i));
     }
     let mmx = !x87 && mmx_index.is_some();
-    let floating = insts
-        .iter()
-        .position(|i| matches!(i.op, decode::Op::Simd(s) if s.floating()));
+    let floating = insts.iter().position(|i| {
+        matches!(
+            i.op,
+            decode::Op::Simd(s)
+                if s.floating() || matches!(s.kind, crate::translate::front::forms::SimdKind::PackedToInt(..))
+        )
+    });
     // SSE floating point runs with MXCSR's default control: exceptions
     // masked, nearest rounding, no DAZ or FTZ (A64F-FP-5).
     if let Some(i) = floating

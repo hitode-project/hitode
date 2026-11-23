@@ -1330,7 +1330,7 @@ fn a_refused_instruction_on_a_cold_path_leaves_there() {
         });
         a.jmp(done).unwrap();
         a.set_label(&mut cold).unwrap();
-        a.cvttss2si(eax, xmm0).unwrap();
+        a.cvtss2si(eax, xmm0).unwrap();
         a.jmp(back).unwrap();
         a.set_label(&mut done).unwrap();
         a.nop().unwrap();

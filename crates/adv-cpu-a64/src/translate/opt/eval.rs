@@ -318,6 +318,51 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 u128::from(n as u32)
             }
         }
+        Op::SsePackedToInt {
+            value,
+            double,
+            truncate,
+        } => {
+            let v = get(value);
+            if double {
+                let hi_limit = if truncate {
+                    0x41e0_0000u32
+                } else {
+                    0x41df_0000u32
+                };
+                let mut out = 0u128;
+                for lane in 0..2usize {
+                    let bits = (v >> (lane * 64)) as u64;
+                    if ((bits >> 32) & 0x7fff_ffff) as u32 >= hi_limit {
+                        return None;
+                    }
+                    let x = f64::from_bits(bits);
+                    let r = if truncate {
+                        x.trunc()
+                    } else {
+                        x.round_ties_even()
+                    };
+                    out |= u128::from((r as i32) as u32) << (lane * 32);
+                }
+                out
+            } else {
+                let mut out = 0u128;
+                for lane in 0..4usize {
+                    let bits = (v >> (lane * 32)) as u32;
+                    if (bits << 1) >= 0x9e00_0000 {
+                        return None;
+                    }
+                    let x = f32::from_bits(bits);
+                    let r = if truncate {
+                        x.trunc()
+                    } else {
+                        x.round_ties_even()
+                    };
+                    out |= u128::from((r as i32) as u32) << (lane * 32);
+                }
+                out
+            }
+        }
         Op::X87Store {
             value,
             width,
@@ -755,6 +800,20 @@ fn vector_unary(op: VecUnary, a: u128) -> u128 {
     match op {
         VecUnary::ShiftImm(op, log2, count, full) => vec_shift(op, log2, full, a, u64::from(count)),
         VecUnary::NarrowScalar => u128::from((f64::from_bits(a as u64) as f32).to_bits()),
+        VecUnary::WidenScalar => u128::from(f64::from(f32::from_bits(a as u32)).to_bits()),
+        VecUnary::FromInt4s => {
+            let mut out = 0u128;
+            for lane in 0..4usize {
+                let n = ((a >> (lane * 32)) as u32) as i32;
+                out |= u128::from((n as f32).to_bits()) << (lane * 32);
+            }
+            out
+        }
+        VecUnary::FromInt2d => {
+            let n0 = (a as u32) as i32;
+            let n1 = ((a >> 32) as u32) as i32;
+            u128::from((f64::from(n0)).to_bits()) | (u128::from((f64::from(n1)).to_bits()) << 64)
+        }
         VecUnary::Low64 => a & u128::from(u64::MAX),
         VecUnary::High64 => a >> 64,
         VecUnary::Shuffle(log2, imm, full) => {
