@@ -284,6 +284,7 @@ fn emission_fixture_words(compare: impl Fn(&str, &[u32])) {
             &[CODE + code.len() as u32],
             &|_, _| None,
             &|_| None,
+            &|_| false,
             (!cold, None),
             &mut decodes,
         );

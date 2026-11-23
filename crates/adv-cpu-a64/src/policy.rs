@@ -7,6 +7,7 @@ pub(crate) mod tier1 {
     pub const LOOP_LIMIT: usize = 1024;
     pub const WIDE_WEIGHT: usize = 4;
     pub const MAX_DEPTH: u8 = 8;
+    pub const COLD_MAX_DEPTH: u8 = 1;
     pub const INLINE_ROOM: usize = 24;
     pub const INLINE_BODY_BYTES: u32 = 64;
     pub const NATIVE_REGION_MIN: u32 = 128;

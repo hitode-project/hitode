@@ -257,6 +257,21 @@ impl<R> ResidentVersion<R> {
     }
 }
 
+/// Bitmask of the 64-byte lines within `page` covered by `start..start+len`.
+pub(super) fn page_line_mask(page: u32, start: u32, len: u64) -> u64 {
+    let page_start = u64::from(page);
+    let from = u64::from(start).max(page_start) - page_start;
+    let to = (u64::from(start) + len - 1).min(page_start + 4095) - page_start;
+    let first = (from >> 6) as u32;
+    let last = (to >> 6) as u32;
+    let count = last - first + 1;
+    if count == 64 {
+        u64::MAX
+    } else {
+        ((1u64 << count) - 1) << first
+    }
+}
+
 pub(super) struct CodeStore<R> {
     pub(super) resident_exit: usize,
     /// Switch-table slots by guest target: source entry, host slot and
@@ -279,8 +294,8 @@ pub(super) struct CodeStore<R> {
     pub(super) slow_paths: Option<SlowPaths>,
     #[cfg(test)]
     pub(super) value_counts: FxHashMap<u32, u64>,
-    /// Unit entries by the guest pages their code came from.
-    pub(super) pages: FxHashMap<u32, Vec<u32>>,
+    /// Unit entries and their watched 64-byte line masks by guest page.
+    pub(super) pages: FxHashMap<u32, Vec<(u32, u64)>>,
     pub(super) pages_by_unit: FxHashMap<u32, Vec<u32>>,
     /// Patched link points, with the words they held, by the unit they
     /// branch to: the head of a list in `linked`.
@@ -1361,7 +1376,7 @@ impl<R> CodeStore<R> {
                     self.pages.entry(page)
                 {
                     let units = entry.get_mut();
-                    if let Some(index) = units.iter().position(|&unit| unit == eip) {
+                    if let Some(index) = units.iter().position(|&(unit, _)| unit == eip) {
                         units.swap_remove(index);
                     }
                     if units.is_empty() {
@@ -1417,17 +1432,30 @@ impl<R> CodeStore<R> {
             memory.watch_code(from, (to - u64::from(from)) as usize);
         }
         let pages = self.pages_by_unit.entry(eip).or_default();
-        let mut last = None;
         for &(start, len) in spans.iter().filter(|&&(_, len)| len != 0) {
             let end = (u64::from(start) + u64::from(len) - 1).min(u64::from(u32::MAX));
-            for page in (start & !0xfff..=end as u32 & !0xfff).step_by(4096) {
-                if last.is_none_or(|last| last < page) {
-                    last = Some(page);
-                    if let Err(index) = pages.binary_search(&page) {
+            let mut page = start & !0xfff;
+            let last_page = end as u32 & !0xfff;
+            loop {
+                let mask = page_line_mask(page, start, u64::from(len));
+                let units = self.pages.entry(page).or_default();
+                match pages.binary_search(&page) {
+                    Ok(_) => {
+                        if let Some(entry) = units.iter_mut().find(|(unit, _)| *unit == eip) {
+                            entry.1 |= mask;
+                        } else {
+                            units.push((eip, mask));
+                        }
+                    }
+                    Err(index) => {
                         pages.insert(index, page);
-                        self.pages.entry(page).or_default().push(eip);
+                        units.push((eip, mask));
                     }
                 }
+                if page == last_page {
+                    break;
+                }
+                page = page.wrapping_add(4096);
             }
         }
     }

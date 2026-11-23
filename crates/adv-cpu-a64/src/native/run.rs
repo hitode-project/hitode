@@ -768,12 +768,41 @@ impl Native {
     /// that branch to them.
     pub(super) fn invalidate(&mut self, memory: &mut Memory) {
         if memory.dirty_pages.is_empty() {
+            if !memory.dirty_lines.is_empty() {
+                memory.dirty_lines.clear();
+            }
+            if memory.dirty_ranges.as_ref().is_none_or(|r| !r.is_empty()) {
+                memory.dirty_ranges = Some(Vec::new());
+            }
             return;
         }
+        let dirty_pages = std::mem::take(&mut memory.dirty_pages);
+        let dirty_lines = std::mem::take(&mut memory.dirty_lines);
+        if memory.dirty_ranges.as_ref().is_none_or(|r| !r.is_empty()) {
+            memory.dirty_ranges = Some(Vec::new());
+        }
         let mut dropped = false;
-        for page in std::mem::take(&mut memory.dirty_pages).into_keys() {
+        for page in dirty_pages.into_keys() {
             self.decodes.invalidate(page);
-            for eip in self.code.pages.remove(&page).unwrap_or_default() {
+            let mask = dirty_lines.get(&page).copied().unwrap_or(u64::MAX);
+            let affected: Vec<u32> = if mask == u64::MAX {
+                self.code
+                    .pages
+                    .remove(&page)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(eip, _)| eip)
+                    .collect()
+            } else if let Some(units) = self.code.pages.get(&page) {
+                units
+                    .iter()
+                    .filter(|&&(_, lines)| lines & mask != 0)
+                    .map(|&(eip, _)| eip)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for eip in affected {
                 let unit = self.drop_unit(eip);
                 self.diagnostics.dropped_units += u64::from(unit);
                 dropped |= unit;
@@ -829,7 +858,7 @@ impl Native {
         let end = u64::from(end).max(u64::from(start) + 1);
         let mut dropped = false;
         for page in (u64::from(start & !0xfff)..end).step_by(4096) {
-            for eip in self.code.pages.remove(&(page as u32)).unwrap_or_default() {
+            for (eip, _) in self.code.pages.remove(&(page as u32)).unwrap_or_default() {
                 dropped |= self.drop_unit(eip);
             }
         }

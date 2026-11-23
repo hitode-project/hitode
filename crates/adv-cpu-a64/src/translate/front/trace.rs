@@ -28,7 +28,7 @@ use crate::translate::front::flags::FlagSet;
 
 /// Longest trace without a loop, in weighted guest instructions.
 pub use crate::policy::tier1::MAX_INSTRUCTIONS;
-use crate::policy::tier1::{INLINE_ROOM, LOOP_LIMIT, MAX_DEPTH, WIDE_WEIGHT};
+use crate::policy::tier1::{COLD_MAX_DEPTH, INLINE_ROOM, LOOP_LIMIT, MAX_DEPTH, WIDE_WEIGHT};
 const SLOTS: usize = 2 * LOOP_LIMIT;
 
 /// Where control goes from an instruction.
@@ -279,6 +279,11 @@ fn forwarded_body(
 }
 
 type RowObservation<'a> = Option<&'a [u32; 8]>;
+type Callbacks<'a> = (
+    &'a dyn Fn(u32, u32) -> Option<u32>,
+    &'a dyn Fn(u32) -> Option<Redirect>,
+    &'a dyn Fn(u32) -> bool,
+);
 
 impl Trace {
     /// Traces from `entry`, ending before any of `stops` except at the
@@ -304,6 +309,7 @@ impl Trace {
             stops,
             host,
             redirect,
+            &|_| false,
             (loops, None),
             &mut decodes,
         );
@@ -317,6 +323,7 @@ impl Trace {
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
+        existing: &dyn Fn(u32) -> bool,
         (loops, observed): (bool, Option<&[u32; 8]>),
         decodes: &mut Decodes,
     ) {
@@ -326,8 +333,7 @@ impl Trace {
             memory,
             entry,
             stops,
-            host,
-            redirect,
+            (host, redirect, existing),
             (limit, None, observed),
             decodes,
         ) {
@@ -336,8 +342,7 @@ impl Trace {
                     memory,
                     entry,
                     stops,
-                    host,
-                    redirect,
+                    (host, redirect, existing),
                     (LOOP_LIMIT, Some(end), observed),
                     decodes,
                 );
@@ -347,8 +352,7 @@ impl Trace {
                     memory,
                     entry,
                     stops,
-                    host,
-                    redirect,
+                    (host, redirect, existing),
                     (MAX_INSTRUCTIONS, None, observed),
                     decodes,
                 );
@@ -550,8 +554,7 @@ impl Trace {
         memory: &mut Memory,
         entry: u32,
         stops: &[u32],
-        host: &dyn Fn(u32, u32) -> Option<u32>,
-        redirect: &dyn Fn(u32) -> Option<Redirect>,
+        callbacks: Callbacks<'_>,
         bounds: (usize, Option<(u32, u16)>, RowObservation<'_>),
         decodes: &mut Decodes,
     ) -> Option<(u32, u16)> {
@@ -580,8 +583,7 @@ impl Trace {
             &mut weight,
             (&mut *memory, &mut fetcher, decodes),
             bounds,
-            host,
-            redirect,
+            callbacks,
         );
         self.primary = self.insts.len();
         if limit == LOOP_LIMIT
@@ -613,8 +615,7 @@ impl Trace {
                         &mut weight,
                         (&mut *memory, &mut fetcher, decodes),
                         bounds,
-                        host,
-                        redirect,
+                        callbacks,
                     ) {
                         // Reverse insertion order preserves the slot probe chains.
                         while self.insts.len() > start {
@@ -650,8 +651,7 @@ impl Trace {
         weight: &mut usize,
         (memory, fetcher, decodes): (&mut Memory, &mut Fetcher, &mut Decodes),
         (limit, stops, stop, observed): (usize, &Stops<'_>, Option<(u32, u16)>, RowObservation<'_>),
-        host: &dyn Fn(u32, u32) -> Option<u32>,
-        redirect: &dyn Fn(u32) -> Option<Redirect>,
+        (host, redirect, existing): Callbacks<'_>,
     ) -> bool {
         let start = self.insts.len();
         loop {
@@ -660,7 +660,10 @@ impl Trace {
                 Some(Edge::Exit(pc))
             } else if let Some(index) = self.find(pc, frame) {
                 Some(Edge::Internal(index))
-            } else if len == limit || *weight >= limit {
+            } else if len == limit
+                || *weight >= limit
+                || (len > 0 && frame == 0 && limit != LOOP_LIMIT && existing(pc))
+            {
                 Some(Edge::Exit(pc))
             } else {
                 None
@@ -869,7 +872,7 @@ impl Trace {
             self.code.extend(watched);
             // A continuation must be new to the trace and leave room after it.
             let continuation = || {
-                len + 4 < limit
+                *weight + 4 < limit
                     && !stops.contains(next_pc)
                     && stop != Some((next_pc, frame))
                     && self.find(next_pc, frame).is_none()
@@ -880,9 +883,15 @@ impl Trace {
                 Op::Call(target) if target == next_pc => Some((next_pc, frame)),
                 Op::Call(target) => {
                     let depth = self.frames[usize::from(frame)].depth;
-                    if depth < MAX_DEPTH
-                        && len + 1 + INLINE_ROOM <= limit
+                    let max_depth = if limit == LOOP_LIMIT {
+                        MAX_DEPTH
+                    } else {
+                        COLD_MAX_DEPTH
+                    };
+                    if depth < max_depth
+                        && *weight + 1 + INLINE_ROOM <= limit
                         && !stops.contains(target)
+                        && (limit == LOOP_LIMIT || !existing(target))
                     {
                         Some((target, self.callee(frame, next_pc, depth)))
                     } else if continuation() {

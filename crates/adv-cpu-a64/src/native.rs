@@ -1141,6 +1141,7 @@ impl Native {
         };
         let unit = Arc::get_mut(&mut storage).unwrap();
         unit.images.clone_from(&self.images.borrow());
+        let existing = &|pc| !loops && !summarize && self.code.tier1(pc).is_some();
         unit.build_cached(
             memory,
             eip,
@@ -1156,6 +1157,7 @@ impl Native {
                     body: handler.direct_body(pc),
                 })
             },
+            existing,
             (loops, observed),
             decodes,
         );
@@ -3409,5 +3411,95 @@ mod tests {
             assert_eq!(read_i32s(&memory, 16), want);
             assert_eq!(native.diagnostics.resident_cold_exits, 0);
         }
+    }
+
+    // spec: A64-CTL-10
+    #[test]
+    fn same_page_invalidation_keeps_untouched_cache_lines() {
+        use adv_cpu_core::memory::EXEC;
+
+        let (mut memory, mut native) = native();
+        native.first_visits = false;
+        let first = HEAD;
+        let second = HEAD + 0x100;
+        let stop_a = first + 2;
+        let stop_b = second + 2;
+        memory.map(HEAD, 0x1000, READ | WRITE).unwrap();
+        // Two independent units on different 64-byte lines of the same page:
+        // inc eax; inc eax; int3
+        memory.write(first, &[0x40, 0x40, 0xcc]).unwrap();
+        memory.write(second, &[0x40, 0x40, 0xcc]).unwrap();
+        memory.protect(HEAD, 0x1000, READ | WRITE | EXEC).unwrap();
+        native.observe_stop(stop_a);
+        native.observe_stop(stop_b);
+
+        for (entry, stop) in [(first, stop_a), (second, stop_b)] {
+            let mut state = cpu(entry, 0x8000, 0);
+            native
+                .run(&mut state, &mut memory, stop, SLICE, std::ptr::null_mut())
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.eip, stop);
+        }
+        assert!(native.code.tier1(first).is_some());
+        assert!(native.code.tier1(second).is_some());
+
+        // Write more than DIRTY_RANGES times to the first unit's 64-byte line only.
+        for i in 0..(adv_cpu_core::memory::DIRTY_RANGES + 16) {
+            let byte = if i % 2 == 0 { 0x40 } else { 0x90 };
+            memory.write(first, &[byte]).unwrap();
+        }
+        assert!(memory.dirty_ranges.is_none());
+        native.invalidate(&mut memory);
+        assert!(native.code.tier1(first).is_none());
+        assert!(native.code.tier1(second).is_some());
+        assert_eq!(native.diagnostics.dropped_units, 1);
+    }
+
+    // spec: A64-TR-3
+    #[test]
+    fn cold_traces_stop_at_existing_units_and_keep_promoted_loops_whole() {
+        use adv_cpu_core::memory::EXEC;
+
+        let (mut memory, mut native) = native();
+        native.first_visits = false;
+        let entry_a = HEAD;
+        let entry_b = HEAD + 8;
+        let stop = HEAD + 24;
+        memory.map(HEAD, 0x1000, READ | WRITE).unwrap();
+        // 24 x `inc eax` followed by `int3`
+        let mut code = vec![0x40; 24];
+        code.push(0xcc);
+        memory.write(entry_a, &code).unwrap();
+        memory.protect(HEAD, 0x1000, READ | EXEC).unwrap();
+        native.observe_stop(stop);
+
+        // Compile `entry_b` first.
+        let mut state_b = cpu(entry_b, 0x8000, 0);
+        state_b.regs[0] = 0;
+        native
+            .run(&mut state_b, &mut memory, stop, SLICE, std::ptr::null_mut())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state_b.regs[0], 16);
+        assert!(native.code.tier1(entry_b).is_some());
+
+        // Building `entry_a` cold must stop at `entry_b` instead of duplicating all 16 tail ops.
+        let cold = native.front_unit(&mut memory, entry_a, false, false, None);
+        assert_eq!(cold.trace.len(), 8);
+        // Promoted loop builds ignore existing Tier-1 boundaries.
+        let promoted = native.front_unit(&mut memory, entry_a, true, false, None);
+        assert_eq!(promoted.trace.len(), 24);
+
+        // Running `entry_a` still executes all 24 increments cleanly via direct link to `entry_b`.
+        let mut state_a = cpu(entry_a, 0x8000, 0);
+        state_a.regs[0] = 0;
+        while state_a.eip != stop {
+            native
+                .run(&mut state_a, &mut memory, stop, SLICE, std::ptr::null_mut())
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(state_a.regs[0], 24);
     }
 }

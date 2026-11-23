@@ -56,6 +56,7 @@ impl Unit {
             stops,
             host,
             redirect,
+            &|_| false,
             (loops, None),
             &mut decodes,
         );
@@ -69,13 +70,15 @@ impl Unit {
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
+        existing: &dyn Fn(u32) -> bool,
         layout: (bool, Option<&[u32; 8]>),
         decodes: &mut Decodes,
     ) {
         self.regions.clear();
         self.resident_links.take();
-        self.trace
-            .build_cached(memory, eip, stops, host, redirect, layout, decodes);
+        self.trace.build_cached(
+            memory, eip, stops, host, redirect, existing, layout, decodes,
+        );
         tables::prepare(self, memory);
         self.table_target = tables::image(&self.images, eip, 1)
             && memory.committed(eip, 15).is_ok()
