@@ -217,6 +217,7 @@ d51b443f	msr fpsr, xzr
 2e21e820	frint32x v0.2s, v1.2s
 6e61e820	frint32x v0.2d, v1.2d
 4ee1b820	fcvtzs v0.2d, v1.2d
+4e61a820	fcvtns v0.2d, v1.2d
 0ea12820	xtn v0.2s, v1.2d
 7ea2e420	fcmgt s0, s1, s2
 2ea2e420	fcmgt v0.2s, v1.2s, v2.2s

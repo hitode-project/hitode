@@ -1162,6 +1162,11 @@ pub const fn vfcvtzs_2d(rd: VReg, rn: VReg) -> u32 {
     0x4EE1_B800 | rn.number() << 5 | rd.number()
 }
 
+/// `fcvtns vd.2d, vn.2d`.
+pub const fn vfcvtns_2d(rd: VReg, rn: VReg) -> u32 {
+    0x4E61_A800 | rn.number() << 5 | rd.number()
+}
+
 /// `xtn vd.2s, vn.2d` (extract low 32 bits of each 64-bit lane, zeroing upper 64 bits).
 pub const fn vxtn_2s(rd: VReg, rn: VReg) -> u32 {
     0x0EA1_2800 | rn.number() << 5 | rd.number()
@@ -1741,6 +1746,7 @@ mod tests {
                 "frint32x v0.2d, v1.2d",
             ),
             (vfcvtzs_2d(v(0), v(1)), "fcvtzs v0.2d, v1.2d"),
+            (vfcvtns_2d(v(0), v(1)), "fcvtns v0.2d, v1.2d"),
             (vxtn_2s(v(0), v(1)), "xtn v0.2s, v1.2d"),
             (sfcmgt(v(0), v(1), v(2)), "fcmgt s0, s1, s2"),
             (

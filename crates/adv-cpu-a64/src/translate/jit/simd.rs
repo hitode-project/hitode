@@ -900,15 +900,80 @@ impl Translator<'_> {
         };
         self.cpu();
         self.emit(ldr(W, X13, X5, runtime::MXCSR));
-        let done = self.features.frintts.then(|| {
-            let (slow, done) = (self.asm.label(), self.asm.label());
-            // Fast path requires DAZ = 0, PM = 1, and (for non-truncating forms) RC = Nearest.
-            self.asm.tbz(true, X13, 6, slow);
-            self.asm.tbz(false, X13, 12, slow);
-            if !truncate {
-                self.emit(and_imm(W, X17, X13, 0x6000));
-                self.asm.cbz(W, true, X17, slow);
+        let (slow, done) = (self.asm.label(), self.asm.label());
+        // Fast paths require DAZ = 0, PM = 1, and (for non-truncating forms) RC = Nearest.
+        self.asm.tbz(true, X13, 6, slow);
+        self.asm.tbz(false, X13, 12, slow);
+        if !truncate {
+            self.emit(and_imm(W, X17, X13, 0x6000));
+            self.asm.cbz(W, true, X17, slow);
+        }
+        // Tier A (zero-FPSR): when PE is already raised and every lane is finite and
+        // strictly within the non-overflowing signed 32-bit range, convert directly in
+        // NEON without serializing FPSR accesses.
+        let after_zero_fpsr = if self.features.frintts {
+            self.asm.label()
+        } else {
+            slow
+        };
+        if !self.vector.guards.fp_pe {
+            self.asm.tbz(false, X13, 5, after_zero_fpsr);
+        }
+        if double {
+            let hi_imm = if truncate { 0x41e0 } else { 0x41df };
+            self.emit_all(&[
+                movz(W, X14, hi_imm, 16),
+                vumov(3, X16, s, 0),
+                ubfx(X, X16, X16, 32, 31),
+                sub(X, X16, X16, X14, Shift::Lsl, 0),
+            ]);
+            self.asm.tbz(false, X16, 63, after_zero_fpsr);
+            self.emit_all(&[
+                vumov(3, X17, s, 1),
+                ubfx(X, X17, X17, 32, 31),
+                sub(X, X17, X17, X14, Shift::Lsl, 0),
+            ]);
+            self.asm.tbz(false, X17, 63, after_zero_fpsr);
+            let cvt = if truncate {
+                vfcvtzs_2d(V0, s)
+            } else {
+                vfcvtns_2d(V0, s)
+            };
+            self.emit_all(&[cvt, vxtn_2s(V0, V0)]);
+        } else {
+            let full = !matches!(simd.dst, Loc::Mmx(_));
+            if full {
+                self.emit_all(&[
+                    vshift(ShiftImm::Shl, Arr::S4, V2, s, 1),
+                    umaxv(V2, V2),
+                    fmov_from_v(W, X17, V2),
+                    movz(W, X16, 0x9e00, 16),
+                    sub(X, X17, X17, X16, Shift::Lsl, 0),
+                ]);
+                self.asm.tbz(false, X17, 63, after_zero_fpsr);
+            } else {
+                // Only inspect the low two lanes; upper lanes of XMM may hold NaN/Inf.
+                self.emit_all(&[
+                    movz(W, X14, 0x9e00, 16),
+                    vumov(2, X16, s, 0),
+                    lsl_imm(W, X16, X16, 1),
+                    sub(X, X16, X16, X14, Shift::Lsl, 0),
+                ]);
+                self.asm.tbz(false, X16, 63, after_zero_fpsr);
+                self.emit_all(&[
+                    vumov(2, X17, s, 1),
+                    lsl_imm(W, X17, X17, 1),
+                    sub(X, X17, X17, X14, Shift::Lsl, 0),
+                ]);
+                self.asm.tbz(false, X17, 63, after_zero_fpsr);
             }
+            self.emit(vtoint(truncate, full, V0, s));
+        }
+        self.asm.b(done);
+        if self.features.frintts {
+            // Tier B (FEAT_FRINTTS): handles PE = 0 and exact -2^31 in one vector
+            // FRINT32Z/FRINT32X + FCVTZS pair and one FPSR read instead of per-lane.
+            self.asm.bind(after_zero_fpsr);
             self.emit(msr_fpsr(Reg::ZR));
             if double {
                 self.emit_all(&[
@@ -924,8 +989,6 @@ impl Translator<'_> {
                 ]);
             }
             self.emit(mrs_fpsr(X17));
-            // Any NaN, infinity, or out-of-range lane sets IOC (bit 0) and falls back
-            // to the per-lane path for integer indefinite and #XM arbitration.
             self.asm.tbz(true, X17, 0, slow);
             if !self.vector.guards.fp_pe {
                 // FPSR.IXC (bit 4) maps directly to MXCSR.PE (bit 5).
@@ -936,9 +999,8 @@ impl Translator<'_> {
                 ]);
             }
             self.asm.b(done);
-            self.asm.bind(slow);
-            done
-        });
+        }
+        self.asm.bind(slow);
         self.emit(movz(W, X0, 0, 0));
         let temp = VReg::new(3);
         self.emit(vzero(true, V0));
@@ -1021,9 +1083,7 @@ impl Translator<'_> {
             str(W, X13, X5, runtime::MXCSR),
         ]);
         self.asm.cbz(W, true, X2, bail);
-        if let Some(done) = done {
-            self.asm.bind(done);
-        }
+        self.asm.bind(done);
         let d = self.destination(simd.dst, false);
         self.emit(vmov(simd.full(), d, V0));
         self.written(simd.dst);
