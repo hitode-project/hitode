@@ -528,6 +528,88 @@ fn packed_lane_reads_preserve_width_endianness_and_unaligned_input() {
         }
     }
 }
+
+#[cfg(test)]
+#[test]
+fn sse_minmax_qnan_raises_ie_and_float_to_int_skips_de() {
+    use crate::{CpuState, Memory, READ, WRITE};
+    use iced_x86::{Decoder, DecoderOptions};
+    let run = |bytes: &[u8], mxcsr: u32, xmm0: [u8; 16], xmm1: [u8; 16]| {
+        let mut decoder = Decoder::with_ip(32, bytes, 0x1000, DecoderOptions::NONE);
+        let insn = decoder.decode();
+        let op = operation(&insn).unwrap();
+        let mut state = CpuState {
+            eip: 0x1000,
+            mxcsr,
+            ..CpuState::default()
+        };
+        state.xmm[0] = xmm0;
+        state.xmm[1] = xmm1;
+        let mut mem = Memory::new(0x1000, 0x2000).unwrap();
+        mem.protect(0x1000, 0x2000, READ | WRITE).unwrap();
+        let step = super::execute(&insn, op, None, &mut state, &mut mem, false);
+        (step, state)
+    };
+
+    // Quiet NaN in MIN*/MAX* raises IE (bit 0) and selects the second operand.
+    let mut q32 = [0u8; 16];
+    let mut one32 = [0u8; 16];
+    for lane in 0..4 {
+        q32[lane * 4..lane * 4 + 4].copy_from_slice(&0x7fc0_0001u32.to_le_bytes());
+        one32[lane * 4..lane * 4 + 4].copy_from_slice(&1.0f32.to_le_bytes());
+    }
+    let mut q64 = [0u8; 16];
+    let mut one64 = [0u8; 16];
+    for lane in 0..2 {
+        q64[lane * 8..lane * 8 + 8].copy_from_slice(&0x7ff8_0000_0000_0001u64.to_le_bytes());
+        one64[lane * 8..lane * 8 + 8].copy_from_slice(&1.0f64.to_le_bytes());
+    }
+    for (bytes, a, b, width) in [
+        (&[0xf3, 0x0f, 0x5d, 0xc1][..], q32, one32, 4), // minss
+        (&[0xf3, 0x0f, 0x5f, 0xc1][..], q32, one32, 4), // maxss
+        (&[0x0f, 0x5d, 0xc1][..], q32, one32, 16),      // minps
+        (&[0x0f, 0x5f, 0xc1][..], q32, one32, 16),      // maxps
+        (&[0xf2, 0x0f, 0x5d, 0xc1][..], q64, one64, 8), // minsd
+        (&[0xf2, 0x0f, 0x5f, 0xc1][..], q64, one64, 8), // maxsd
+        (&[0x66, 0x0f, 0x5d, 0xc1][..], q64, one64, 16), // minpd
+        (&[0x66, 0x0f, 0x5f, 0xc1][..], q64, one64, 16), // maxpd
+    ] {
+        let (step, st) = run(bytes, 0x1f80, a, b);
+        assert_eq!(step, Step::Executed);
+        assert_eq!(st.mxcsr & 0x3f, 0x01);
+        let mut want = a;
+        want[..width].copy_from_slice(&b[..width]);
+        assert_eq!(st.xmm[0], want);
+    }
+
+    // Float-to-int conversions never raise DE: DAZ=0 sets PE=1 (no #XM when DM=0),
+    // DAZ=1 flushes subnormals to 0 (PE=0, DE=0).
+    let mut sub32 = [0u8; 16];
+    for lane in 0..4 {
+        sub32[lane * 4..lane * 4 + 4].copy_from_slice(&1u32.to_le_bytes());
+    }
+    let mut sub64 = [0u8; 16];
+    for lane in 0..2 {
+        sub64[lane * 8..lane * 8 + 8].copy_from_slice(&1u64.to_le_bytes());
+    }
+    for (bytes, src) in [
+        (&[0xf3, 0x0f, 0x5b, 0xc1][..], sub32), // cvttps2dq
+        (&[0x66, 0x0f, 0x5b, 0xc1][..], sub32), // cvtps2dq
+        (&[0x66, 0x0f, 0xe6, 0xc1][..], sub64), // cvttpd2dq
+        (&[0xf2, 0x0f, 0xe6, 0xc1][..], sub64), // cvtpd2dq
+        (&[0xf3, 0x0f, 0x2c, 0xc1][..], sub32), // cvttss2si
+        (&[0xf3, 0x0f, 0x2d, 0xc1][..], sub32), // cvtss2si
+        (&[0xf2, 0x0f, 0x2c, 0xc1][..], sub64), // cvttsd2si
+        (&[0xf2, 0x0f, 0x2d, 0xc1][..], sub64), // cvtsd2si
+    ] {
+        let (step, st) = run(bytes, 0x1e80, [0; 16], src); // DAZ=0, DM=0
+        assert_eq!(step, Step::Executed);
+        assert_eq!(st.mxcsr & 0x3f, 0x20);
+        let (step, st) = run(bytes, 0x1ec0, [0; 16], src); // DAZ=1, DM=0
+        assert_eq!(step, Step::Executed);
+        assert_eq!(st.mxcsr & 0x3f, 0x00);
+    }
+}
 fn nan(a: u64, width: usize) -> bool {
     if width == 4 {
         a & 0x7f80_0000 == 0x7f80_0000 && a & 0x7fffff != 0
@@ -552,6 +634,15 @@ fn input(tx: &mut Transaction, mut a: u64, width: usize) -> u64 {
         } else {
             finish(tx, 2);
         }
+    }
+    a
+}
+/// Denormal handling for SSE float-to-integer conversions: `DAZ = 1` flushes
+/// subnormals to signed zero (`PE = 0`), while `DAZ = 0` converts subnormals
+/// without raising `DE` (Intel SDM Vol. 2 `CVT*2SI`/`CVT*2DQ`/`CVT*2PI`).
+fn input_to_int(tx: &Transaction, mut a: u64, width: usize) -> u64 {
+    if denormal(a, width) && *tx.state.mxcsr & 0x40 != 0 {
+        a &= if width == 4 { 1 << 31 } else { 1 << 63 };
     }
     a
 }
@@ -644,7 +735,11 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
         let source = read(i, 1, tx, memory, source_width)?;
         let mut a = bits(&source[..source_width]);
         if from != 2 {
-            a = input(tx, a, source_width);
+            a = if to == 2 {
+                input_to_int(tx, a, source_width)
+            } else {
+                input(tx, a, source_width)
+            };
         }
         let rc = if matches!(m, M::Cvttss2si | M::Cvttsd2si) {
             1
@@ -733,7 +828,7 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
             m,
             M::Minss | M::Minsd | M::Minps | M::Minpd | M::Maxss | M::Maxsd | M::Maxps | M::Maxpd
         ) {
-            if signaling(a, width) || signaling(b, width) {
+            if nan(a, width) || nan(b, width) {
                 finish(tx, 1);
             }
             let c = comparison(a, b, width);
@@ -808,7 +903,11 @@ fn packed_conversion(
         let offset = lane * source_width;
         let mut a = bits(&source[offset..offset + source_width]);
         if from != 2 {
-            a = input(tx, a, source_width);
+            a = if to == 2 {
+                input_to_int(tx, a, source_width)
+            } else {
+                input(tx, a, source_width)
+            };
         }
         let mut result = sf::sse_convert(a, from, to, rc);
         finish(tx, sf::flags());

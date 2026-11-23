@@ -153,7 +153,7 @@ impl Front<'_> {
                 }
             }
             Kind::ScalarToInt(true, true) => {
-                self.sse_input(src, None, false, false);
+                // CVTTSD2SI never raises DE under DAZ = 0 (assumed.mxcsr & 0xffc0 == 0x1f80).
                 let value = self.bits(Type::F64, src);
                 self.value(Op::ToInt {
                     value,

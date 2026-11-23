@@ -907,29 +907,21 @@ impl Translator<'_> {
         } else {
             4
         } {
-            let (normal, daz, converted, invalid) = (
-                self.asm.label(),
-                self.asm.label(),
-                self.asm.label(),
-                self.asm.label(),
-            );
-            self.emit_all(&[
-                vumov(if double { 3 } else { 2 }, X16, s, lane),
-                ubfx(
-                    if double { X } else { W },
-                    X17,
-                    X16,
-                    if double { 52 } else { 23 },
-                    if double { 11 } else { 8 },
-                ),
-            ]);
+            let (normal, converted, invalid) =
+                (self.asm.label(), self.asm.label(), self.asm.label());
+            self.emit(vumov(if double { 3 } else { 2 }, X16, s, lane));
+            // Float-to-int conversions never raise DE; only DAZ=1 flushes subnormals to ±0.
+            self.asm.tbz(false, X13, 6, normal);
+            self.emit(ubfx(
+                if double { X } else { W },
+                X17,
+                X16,
+                if double { 52 } else { 23 },
+                if double { 11 } else { 8 },
+            ));
             self.asm.cbz(W, true, X17, normal);
             self.emit(lsl_imm(if double { X } else { W }, X17, X16, 1));
             self.asm.cbz(if double { X } else { W }, false, X17, normal);
-            self.asm.tbz(true, X13, 6, daz);
-            self.emit(orr_imm(W, X0, X0, 2));
-            self.asm.b(normal);
-            self.asm.bind(daz);
             self.emit(and_imm(
                 if double { X } else { W },
                 X16,
@@ -1458,7 +1450,10 @@ impl Translator<'_> {
     /// `floating` reads is a nonzero subnormal. Scalar upper lanes are
     /// ignored. Uses x16, x17 and v0 and v4-v6.
     fn denormals(&mut self, simd: Simd, operands: Operands, to: Option<Label>) {
-        if matches!(simd.kind, Kind::FromInt(_) | Kind::ScalarFromInt(_)) {
+        if matches!(
+            simd.kind,
+            Kind::FromInt(_) | Kind::ScalarFromInt(_) | Kind::ScalarToInt(..)
+        ) {
             return;
         }
         let (v4, v5, v6) = (VReg::new(4), VReg::new(5), VReg::new(6));
