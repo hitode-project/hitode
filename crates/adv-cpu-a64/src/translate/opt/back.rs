@@ -1582,9 +1582,11 @@ impl<'a> Emitter<'a> {
                 ]);
                 self.asm.cbz(W, true, T, fail);
                 // Do not resume with a subnormal result so downstream SseInput
-                // elimination remains sound when MXCSR.DE is clear.
+                // elimination remains sound when MXCSR.DE is clear. A raised DE
+                // is sticky, so the elided checks could not change it.
                 let not_subnormal = self.asm.label();
                 let exp_shift = if double { 53 } else { 24 };
+                self.asm.tbz(true, U, 1, not_subnormal);
                 self.asm.emit(lsl_imm(size, T, X0, 1));
                 self.asm.cbz(size, false, T, not_subnormal);
                 self.asm.emit(lsr_imm(size, U, T, exp_shift));

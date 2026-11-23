@@ -28,7 +28,6 @@ const F32_SAFE_MIN_F64: f64 = 2.350_988_701_644_575e-38; // f32::from_bits(0x010
 const WIDEN_LIMIT: u8 = 3;
 const MAX_DOMAIN_TRIP_COUNT: u32 = 1 << 20;
 const MAX_GUARDED_INPUTS: usize = 24;
-const MIN_DOMAIN_SAVED_PER_ITER: u32 = 12;
 const MAX_BOUND_DEGREE: u8 = 3;
 const F64_WIN_MIN_EXP: i16 = -240;
 const F64_WIN_MAX_EXP: i16 = 240;
@@ -2837,8 +2836,10 @@ pub(super) fn infer_domain_guards(
 
     // Simulate fixpoint with the planned domain guards to verify profitability.
     let (_, guarded_fp) = analyze_fixpoint(func, &defs, &seeds);
+    // The guard's price is settled at run time on its own ledger (policy::resident),
+    // so the pass exports any positive saving instead of gating on a threshold.
     let (_, saved_per_iter) = apply_proved(func, &defs, &guarded_fp, Some(&in_loop), false);
-    if saved_per_iter < MIN_DOMAIN_SAVED_PER_ITER {
+    if saved_per_iter == 0 {
         return None;
     }
 
@@ -2912,10 +2913,6 @@ pub(super) fn infer_domain_guards(
                     _ => {}
                 }
             }
-        }
-        if fma_pairs < 2 {
-            fma_exact_inputs.clear();
-            fma_pairs = 0;
         }
     }
 

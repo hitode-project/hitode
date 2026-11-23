@@ -3114,9 +3114,15 @@ fn resident_domain_guards_prove_affine_x87_loop_and_respect_refusal() {
         let built = build_with_domains(&unit, None, &at, &|_| false, &|_| false, &|_| false)
             .expect("resident domain-guarded build");
         assert_eq!(verify::verify(&built.func), Ok(()));
-        assert_eq!(built.func.domain_guards.len(), 1);
-        assert_eq!(built.func.domain_saved_per_iter.len(), 1);
+        // At PC = 53, ordinal 1 guards the binary32 exactness of the single
+        // FMUL -> FADD pair; its one-word saving is priced at run time.
+        let guards = if pc_ctrl == 0x023f { 2 } else { 1 };
+        assert_eq!(built.func.domain_guards.len(), guards);
+        assert_eq!(built.func.domain_saved_per_iter.len(), guards);
         assert!(built.func.domain_saved_per_iter[0] >= 12);
+        if guards == 2 {
+            assert_eq!(built.func.domain_saved_per_iter[1], 1);
+        }
         assert!(
             built.func.blocks[0]
                 .insts
