@@ -104,7 +104,14 @@ fn x87_arithmetic_and_compares_take_full_significands_under_every_control() {
         for control in controls {
             program.state.x87.set_control(control);
             for flagm in [false, true] {
-                let config = (Features { flagm }, false, Checks::Adaptive);
+                let config = (
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
+                    false,
+                    Checks::Adaptive,
+                );
                 let mut native = executor(&program, config, false);
                 let mut oracle = executor(&program, config, true);
                 assert_eq!(
@@ -169,7 +176,14 @@ fn checked_x87_accesses_complete_and_refuse_without_instruction_helpers() {
                 .x87
                 .push(X87Register::from_parts(1 << 63, 0x4000));
             for flagm in [false, true] {
-                let config = (Features { flagm }, false, Checks::Slow);
+                let config = (
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
+                    false,
+                    Checks::Slow,
+                );
                 let mut native = executor(&program, config, false);
                 let mut oracle = executor(&program, config, true);
                 let outcome = native.run(program.stop, 100).unwrap();
@@ -224,7 +238,14 @@ fn cached_x87_runs_span_checked_accesses_and_publish_on_refusal() {
         program.state.x87.status |= 0x220;
         for checks in [Checks::All, Checks::Slow] {
             for flagm in [false, true] {
-                let config = (Features { flagm }, false, checks);
+                let config = (
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
+                    false,
+                    checks,
+                );
                 let mut native = executor(&program, config, false);
                 let mut oracle = executor(&program, config, true);
                 assert_eq!(
@@ -298,7 +319,14 @@ fn cached_x87_runs_publish_at_inlined_returns() {
         }
         program.state.xmm[1][..8].copy_from_slice(&4.0f64.to_le_bytes());
         for checks in [Checks::All, Checks::Slow] {
-            let config = (Features { flagm: false }, false, checks);
+            let config = (
+                Features {
+                    flagm: false,
+                    ..Features::default()
+                },
+                false,
+                checks,
+            );
             let mut native = executor(&program, config, false);
             let mut oracle = executor(&program, config, true);
             assert_eq!(
@@ -352,7 +380,14 @@ fn parity_exits_from_long_runs_reach_their_publication() {
             program.data[at..at + 8].copy_from_slice(&value.to_le_bytes());
         }
         program.state.x87.control = 0x037f;
-        let config = (Features { flagm: false }, false, Checks::All);
+        let config = (
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
+            false,
+            Checks::All,
+        );
         let mut native = executor(&program, config, false);
         let mut oracle = executor(&program, config, true);
         assert_eq!(
@@ -504,7 +539,14 @@ fn balanced_x87_loop_keeps_its_state_through_calls_sse_and_integer_forms() {
         if let Some(middle) = fault {
             p.state.regs[6] = DATA + DATA_LEN as u32 - 8 * (36 + u32::from(middle));
         }
-        let config = (Features { flagm: false }, false, checks);
+        let config = (
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
+            false,
+            checks,
+        );
         let mut native = executor(&p, config, false);
         let mut oracle = executor(&p, config, true);
         let outcome = native.run(p.stop, 5000).unwrap();
@@ -545,7 +587,14 @@ fn balanced_x87_loop_keeps_its_state_through_calls_sse_and_integer_forms() {
     let (mut p, _) = pixel_loop(true, false);
     p.state.mxcsr &= !0x20;
     p.data[0x1000..0x1008].copy_from_slice(&64.0f64.to_le_bytes());
-    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     let mut native = executor(&p, config, false);
     let mut oracle = executor(&p, config, true);
     assert_eq!(
@@ -561,7 +610,14 @@ fn balanced_x87_loop_publishes_at_the_deadline_slice_backedge() {
     use std::time::{Duration, Instant};
 
     let (mut p, _) = pixel_loop(false, false);
-    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     let mut native = executor(&p, config, false);
     assert_eq!(native.run(p.stop, 5000).unwrap(), RunOutcome::ReachedStop);
     p.state.regs[1] = 100_000;
@@ -613,7 +669,14 @@ fn unbalanced_x87_loop_ends_the_run_at_its_head() {
         a.jnz(top).unwrap();
     });
     p.state.regs[1] = 3;
-    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     let mut native = executor(&p, config, false);
     let mut oracle = executor(&p, config, true);
     assert_eq!(
@@ -634,7 +697,14 @@ fn unbalanced_x87_loop_ends_the_run_at_its_head() {
 // spec: A64F-FP-3 A64F-FP-7
 #[test]
 fn x87_pe_specialization_checks_entry_and_keeps_observed_c1() {
-    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     for translate_with_pe in [false, true] {
         let (mut p, _) = pixel_loop(true, false);
         let mut native = executor(&p, config, false);
@@ -771,7 +841,14 @@ fn x87_run_break_sse_back_jumps_agree_with_merge_guards() {
     p.state.regs[7] = 6;
     p.state.x87.set_control(0x027f);
     for checks in [Checks::Adaptive, Checks::Slow] {
-        let config = (Features { flagm: false }, false, checks);
+        let config = (
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
+            false,
+            checks,
+        );
         let mut native = executor(&p, config, false);
         let mut oracle = executor(&p, config, true);
         assert_eq!(native.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
@@ -924,7 +1001,14 @@ fn x87_run_break_nest_keeps_the_steady_path_resident() {
     use crate::jit_map::{Part, enable_memory, units_of};
     enable_memory();
     let (p, _) = run_break_nest();
-    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     let mut native = executor(&p, config, false);
     let mut oracle = executor(&p, config, true);
     assert_eq!(
@@ -965,7 +1049,14 @@ fn x87_run_break_nest_preserves_middle_iteration_exits() {
             p.state.regs[6] = DATA + DATA_LEN as u32 - 36;
         }
         for flagm in [false, true] {
-            let config = (Features { flagm }, false, checks);
+            let config = (
+                Features {
+                    flagm,
+                    ..Features::default()
+                },
+                false,
+                checks,
+            );
             for budget in [31, 117, 10000] {
                 let mut native = executor(&p, config, false);
                 let mut oracle = executor(&p, config, true);
@@ -1014,7 +1105,14 @@ fn x87_run_break_nest_publishes_at_the_deadline_backedge() {
     let bytes = replacement.assemble(add.ip()).unwrap();
     assert_eq!(bytes.len(), add.len());
     p.code[(add.ip32() - CODE) as usize..(add.next_ip32() - CODE) as usize].copy_from_slice(&bytes);
-    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     let mut native = executor(&p, config, false);
     assert_eq!(native.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
     p.state.regs[2] = 100_000;
@@ -1056,7 +1154,14 @@ fn x87_run_break_nest_publishes_only_when_the_fallback_is_taken() {
     // The control check takes the fallback once, executes FRNDINT, then leaves.
     p.state.x87.set_control(0x023f);
     for checks in [Checks::Adaptive, Checks::Slow] {
-        let config = (Features { flagm: false }, false, checks);
+        let config = (
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
+            false,
+            checks,
+        );
         let mut native = executor(&p, config, false);
         let mut oracle = executor(&p, config, true);
         assert_eq!(native.run(p.stop, 10000).unwrap(), RunOutcome::ReachedStop);
@@ -1091,7 +1196,14 @@ fn x87_run_break_return_and_control_exit_keep_the_integer_tail() {
             a.set_label(&mut done).unwrap();
         });
         p.state.x87.set_control(0x027f);
-        let config = (Features { flagm: false }, false, checks);
+        let config = (
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
+            false,
+            checks,
+        );
         let mut native = executor(&p, config, false);
         let mut oracle = executor(&p, config, true);
         assert_eq!(
@@ -1325,7 +1437,14 @@ fn x87_inner_integer_loop_publishes_at_its_deadline_backedge() {
     use std::time::{Duration, Instant};
     let (mut p, head) = integer_loop_run();
     p.state.regs[1] = 1;
-    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     let mut native = executor(&p, config, false);
     assert_eq!(native.run(p.stop, 1000).unwrap(), RunOutcome::ReachedStop);
     p.state.regs[1] = 100_000;

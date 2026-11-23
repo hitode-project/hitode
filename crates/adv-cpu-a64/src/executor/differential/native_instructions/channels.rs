@@ -111,8 +111,19 @@ fn channel_batches_leave_the_exact_prefix_at_later_read_and_write_faults() {
         p.state.regs[if store { 6 } else { 3 }] =
             DATA + DATA_LEN as u32 - 65 * if store { 4 } else { 1 };
         for flagm in [false, true] {
-            let (mut native, mut oracle) =
-                pair(&p, (Features { flagm }, false, Checks::Adaptive), 130, 4);
+            let (mut native, mut oracle) = pair(
+                &p,
+                (
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
+                    false,
+                    Checks::Adaptive,
+                ),
+                130,
+                4,
+            );
             let outcome = native.run(p.stop, 10000).unwrap();
             assert!(matches!(
                 outcome,
@@ -160,7 +171,14 @@ fn channel_aliases_bound_writes_page_crossings_and_code_barriers_use_scalar_sema
         }
         let (mut native, mut oracle) = pair(
             &p,
-            (Features { flagm: true }, false, Checks::Adaptive),
+            (
+                Features {
+                    flagm: true,
+                    ..Features::default()
+                },
+                false,
+                Checks::Adaptive,
+            ),
             130,
             4,
         );
@@ -191,7 +209,14 @@ fn channel_code_changes_and_stops_disable_invalid_batch_plans() {
     let p = program(4, 0);
     let (mut native, mut oracle) = pair(
         &p,
-        (Features { flagm: false }, false, Checks::Adaptive),
+        (
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
+            false,
+            Checks::Adaptive,
+        ),
         130,
         4,
     );
@@ -235,7 +260,14 @@ fn channel_code_changes_and_stops_disable_invalid_batch_plans() {
 fn a_faulting_loop_bound_is_read_only_after_the_original_pixel_stores() {
     let mut p = program(4, 0);
     p.state.regs[5] = DATA + DATA_LEN as u32 + 2;
-    let config = (Features { flagm: true }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: true,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     let mut native = executor(&p, config, false);
     let mut oracle = executor(&p, config, true);
     let outcome = native.run(p.stop, 10000).unwrap();

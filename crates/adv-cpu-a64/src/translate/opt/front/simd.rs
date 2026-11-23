@@ -23,7 +23,14 @@ impl Front<'_> {
             return Err(Reject::Unsupported(self.index));
         }
         if s.kind == Kind::StoreControl {
-            let value = self.imm(self.assumed.mxcsr);
+            let live = *self.mxcsr.get_or_insert_with(|| {
+                self.func.entry.push(super::Source::Mxcsr);
+                self.func.param(super::Block(0), Type::I32)
+            });
+            let mask = self.imm(0x3f);
+            let sticky = self.int(IntOp::And, live, mask);
+            let control = self.imm(self.assumed.mxcsr & !0x3f);
+            let value = self.int(IntOp::Or, control, sticky);
             return self.write(s.mem, 4, value);
         }
         let full = matches!(s.dst, Loc::Xmm(_));
@@ -153,7 +160,7 @@ impl Front<'_> {
                 }
             }
             Kind::ScalarToInt(true, true) => {
-                self.sse_input(src, None, false, false);
+                // CVTTSD2SI never raises DE under DAZ = 0 (assumed.mxcsr & 0xffc0 == 0x1f80).
                 let value = self.bits(Type::F64, src);
                 self.value(Op::ToInt {
                     value,
@@ -229,19 +236,17 @@ impl Front<'_> {
         }
     }
     fn sse_input(&mut self, a: Value, b: Option<Value>, packed: bool, single: bool) {
-        if self.assumed.mxcsr & 2 == 0 {
-            let pc = self.func.blocks[self.block.0 as usize].pcs[0];
-            self.func.push(
-                self.block,
-                Op::SseInput {
-                    a,
-                    b,
-                    packed,
-                    single,
-                    pc,
-                },
-            );
-        }
+        let pc = self.func.blocks[self.block.0 as usize].pcs[0];
+        self.func.push(
+            self.block,
+            Op::SseInput {
+                a,
+                b,
+                packed,
+                single,
+                pc,
+            },
+        );
     }
 
     fn low(&mut self, dst: Value, src: Value) -> Value {

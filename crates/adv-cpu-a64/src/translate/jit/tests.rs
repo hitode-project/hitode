@@ -292,7 +292,10 @@ fn emission_fixture_words(compare: impl Fn(&str, &[u32])) {
             CODE,
             &|_| checked,
             3,
-            Features { flagm: true },
+            Features {
+                flagm: true,
+                ..Features::default()
+            },
             host,
             stubs,
             0x037f,
@@ -362,7 +365,10 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             fault: host,
             opt_exit: host,
         };
-        let features = Features { flagm: false };
+        let features = Features {
+            flagm: false,
+            ..Features::default()
+        };
         let no_calls = |_, _| None;
         translate(
             &mut work,
@@ -422,7 +428,10 @@ fn bytecode_vm_dispatch_instruction_gate() {
         &[],
         &|_| false,
         0,
-        Features { flagm: false },
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
         HOST_CODE as usize,
         stubs,
         &|_, _| None,
@@ -448,7 +457,10 @@ fn bytecode_vm_dispatch_instruction_gate() {
         &[],
         &|_| false,
         0,
-        Features { flagm: false },
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
         HOST_CODE as usize,
         stubs,
         &|_, _| None,
@@ -949,7 +961,10 @@ impl Harness {
             &[end],
             &|_| false,
             0,
-            Features { flagm },
+            Features {
+                flagm,
+                ..Features::default()
+            },
             addr(at),
             stubs,
             &|_, _| None,
@@ -988,7 +1003,10 @@ impl Harness {
                     &work.unit,
                     &mut computation_code,
                     CODE,
-                    Features { flagm },
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
                     addr(at),
                     stubs,
                     (initial.x87.control, false, Some(&proof)),
@@ -1504,7 +1522,10 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
                 &[],
                 &|_| false,
                 0,
-                Features { flagm: false },
+                Features {
+                    flagm: false,
+                    ..Features::default()
+                },
                 HOST_CODE as usize,
                 stubs,
                 &|_, _| None,
@@ -1574,7 +1595,10 @@ fn j1_unit(code: &[u8]) -> Workspace {
         &[CODE + code.len() as u32],
         &|_| false,
         0,
-        Features { flagm: false },
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
         at,
         Stubs {
             call: at,
@@ -1618,7 +1642,10 @@ fn register_value_call_preserves_cache_within_the_helper_path_count() {
         CODE,
         &|_| false,
         0,
-        Features { flagm: false },
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
         at,
         Stubs {
             call: at,
@@ -1672,7 +1699,10 @@ fn shared_lock_value_calls_fit_the_helper_path_count_with_live_xmm() {
             CODE,
             &|_| false,
             0,
-            Features { flagm: false },
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
             at,
             Stubs {
                 call: at,
@@ -1897,7 +1927,10 @@ fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites()
                 &work.unit,
                 &mut code,
                 CODE,
-                Features { flagm: false },
+                Features {
+                    flagm: false,
+                    ..Features::default()
+                },
                 at,
                 stubs,
                 (0x037f, false, facts),
@@ -3634,7 +3667,8 @@ pub(in crate::translate) mod opt_back {
                             _ => None,
                         })
                         .collect();
-                    assert_eq!(checks.len(), usize::from(mxcsr & 2 == 0));
+                    assert_eq!(built.assumed.mxcsr_mask, 0xffe0);
+                    assert_eq!(checks.len(), 1);
                     assert!(checks.iter().all(|b| b.is_none()));
                 }
                 let extra = [
@@ -3662,7 +3696,9 @@ pub(in crate::translate) mod opt_back {
                     let failed =
                         guest_fp_pair(&mut h, &code, &built, &at, &data, &rhs.to_le_bytes());
                     if op == 4 && (lhs.is_subnormal() || rhs.is_subnormal()) {
-                        assert_eq!(failed, mxcsr & 2 == 0);
+                        // Standalone eval has no live MXCSR, so Op::SseInput always fails on
+                        // subnormals; resident dynamic DE=1 handling is verified in resident.rs.
+                        assert!(failed);
                     }
                 }
             }

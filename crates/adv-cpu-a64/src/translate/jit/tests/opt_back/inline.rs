@@ -120,7 +120,10 @@ impl InlineRun {
             &[eip + len as u32],
             &|_| false,
             0,
-            Features { flagm: false },
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
             addr(at),
             stubs,
             &|_, _| None,

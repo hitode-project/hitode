@@ -116,34 +116,12 @@ pub(crate) enum Checks {
     Slow,
 }
 
-/// Host features from the OS.
+/// Host features from the OS (with `ADV_HOST_FEATURES` override applied).
 fn features() -> Features {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        const HWCAP_FLAGM: u64 = 1 << 35;
-        // SAFETY: getauxval has no preconditions.
-        let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) } as u64;
-        Features {
-            flagm: hwcap & HWCAP_FLAGM != 0,
-        }
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        let mut value: libc::c_int = 0;
-        let mut len = std::mem::size_of_val(&value);
-        // SAFETY: a valid name, and an output buffer of `len` bytes.
-        let found = unsafe {
-            libc::sysctlbyname(
-                c"hw.optional.arm.FEAT_FlagM".as_ptr(),
-                (&raw mut value).cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        } == 0;
-        Features {
-            flagm: found && value != 0,
-        }
+    let host = adv_cpu_core::HostFeatures::get();
+    Features {
+        flagm: host.contains(adv_cpu_core::HostFeatures::FLAGM),
+        frintts: host.contains(adv_cpu_core::HostFeatures::FRINTTS),
     }
 }
 
@@ -2564,22 +2542,26 @@ mod tests {
     // spec: A64-OPT-8
     #[test]
     fn rejected_resident_append_rearms_the_tail_retry() {
-        // addss xmm0,xmm1; dec ecx; jne HEAD; int3
-        let (mut memory, mut native, stop) =
-            resident_loop(&[0xf3, 0x0f, 0x58, 0xc1, 0x49, 0x75, 0xf9, 0xcc]);
+        // fldz; fstp st(0); addss xmm0,xmm1; dec ecx; jne HEAD; int3
+        let (mut memory, mut native, stop) = resident_loop(&[
+            0xd9, 0xee, 0xdd, 0xd8, 0xf3, 0x0f, 0x58, 0xc1, 0x49, 0x75, 0xf5, 0xcc,
+        ]);
         native.promotion = 0;
         native.count_resident_entries = true;
         let mut at = resident_cpu(HEAD, 4);
         at.mxcsr = 0x1fa0;
+        at.x87.status = 0x20;
         assert!(native.force_resident_at(&mut memory, at));
-        let mut invoke = |native: &mut Native, mxcsr| {
+        let mut invoke = |native: &mut Native, mxcsr, control| {
             let mut state = resident_cpu(OUTSIDE, 4);
             state.mxcsr = mxcsr;
+            state.x87.control = control;
+            state.x87.status = 0x20;
             let run = enter(native, &mut memory, stop, &mut state);
-            assert_eq!((state.eip, run.retired), (stop, 14));
+            assert_eq!((state.eip, run.retired), (stop, 22));
         };
         for _ in 0..plan::MISSES {
-            invoke(&mut native, 0x3fa0);
+            invoke(&mut native, 0x3fa0, 0x027f);
         }
         native.install_optimized(true);
         let site = native.code.resident(HEAD).unwrap();
@@ -2592,7 +2574,7 @@ mod tests {
 
         let before = native.diagnostics.resident_entries;
         for _ in 0..32 {
-            invoke(&mut native, 0x1fa1);
+            invoke(&mut native, 0x1fa0, 0x037f);
         }
         assert_eq!(native.code.resident(HEAD).unwrap().versions.len(), 2);
         assert!(native.diagnostics.resident_entries > before);

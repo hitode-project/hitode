@@ -380,7 +380,14 @@ fn rejected_wide_side_path_preserves_the_loop_exit() {
     p.stop = pc(&p, stop);
     p.state.regs[1] = 1;
     p.state.regs[2] = 1;
-    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     let mut native = executor(&p, config, false);
     let mut oracle = executor(&p, config, true);
     assert_eq!(

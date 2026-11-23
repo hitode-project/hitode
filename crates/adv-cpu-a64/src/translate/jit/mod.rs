@@ -87,6 +87,7 @@ use trace::{Edge, Next, Trace};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Features {
     pub flagm: bool,
+    pub frintts: bool,
 }
 
 impl Unit {

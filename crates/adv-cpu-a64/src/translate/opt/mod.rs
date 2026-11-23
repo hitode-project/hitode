@@ -109,6 +109,7 @@ pub(crate) fn admit_into(
         let cell = match source {
             Source::Reg(i) => u128::from(cpu.regs[usize::from(i)]),
             Source::FsBase => u128::from(cpu.fs_base),
+            Source::Mxcsr => u128::from(cpu.mxcsr),
             Source::Eflags => u128::from(cpu.eflags),
             Source::Xmm(i) => u128::from_le_bytes(cpu.xmm[usize::from(i)]),
             Source::Mmx(i) => u128::from(cpu.mmx[usize::from(i)]),
