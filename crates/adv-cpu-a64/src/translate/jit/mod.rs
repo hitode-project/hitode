@@ -467,6 +467,10 @@ struct Translator<'a> {
     /// MMX registers checked for loading (`simd::Translator::register`).
     aliased: u8,
     facts: Key,
+    /// Known architectural x87 control word along a straight-line prefix from
+    /// the guarded Tier-1 entry, cleared at merges, secondary heads, and any
+    /// instruction that may change `CpuState.x87.control`.
+    x87_control_known: Option<u16>,
     tier1: bool,
     computation: bool,
     resident_links: bool,
@@ -646,6 +650,7 @@ impl Jit<'_> {
             unloadable: None,
             aliased: 0,
             facts: self.facts,
+            x87_control_known: self.tier1.then(|| self.facts.control()).flatten(),
             tier1: self.tier1,
             computation,
             resident_links: *resident_links && !computation,
@@ -857,6 +862,9 @@ impl Translator<'_> {
             self.asm.b(target);
             self.asm.bind(next);
         }
+        if index != 0 && (trace.head(index) || trace.merge[index]) {
+            self.x87_control_known = None;
+        }
         if trace.head(index) {
             // Arrivals are canonical: the entry, or a return.
             let prepaid = trace.prepaid(index);
@@ -915,6 +923,21 @@ impl Translator<'_> {
             }
         }
         self.op(inst);
+        if matches!(
+            inst.op,
+            decode::Op::X87(x) if x.fast == adv_cpu_core::floating::fast::Fast::LoadControl
+        ) || matches!(
+            inst.op,
+            decode::Op::Value(_)
+                | decode::Op::Body(_)
+                | decode::Op::Syscall
+                | decode::Op::Call(_)
+                | decode::Op::CallIndirect(_)
+                | decode::Op::Ret(_)
+                | decode::Op::JmpIndirect(_)
+        ) {
+            self.x87_control_known = None;
+        }
         #[cfg(native)]
         if let Some(&mask) = self
             .computation_facts

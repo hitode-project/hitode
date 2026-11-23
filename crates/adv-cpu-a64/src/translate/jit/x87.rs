@@ -875,6 +875,30 @@ impl Translator<'_> {
         pop: bool,
         slow: Label,
     ) {
+        let known = self.x87_control_known;
+        if let Some(ctrl) = known {
+            let pc = (ctrl >> 8) & 3;
+            let rc = (ctrl >> 10) & 3;
+            if pc == 1 {
+                self.asm.b(slow);
+                return;
+            }
+            if pc == 3 || rc != 0 {
+                // Constant PC=64 or directed rounding always takes the integer
+                // path; skip emitting the unreachable binary64/TwoSum path.
+                if !matches!(source, Source::St(_)) {
+                    self.memory_operand(source, V1, None, slow);
+                }
+                self.remark(Part::X87Wide);
+                self.x87_wide(op, dest, source, reverse, slow, known);
+                self.remark(Part::Body);
+                self.st_write(dest, X0, X1);
+                if pop {
+                    self.pop();
+                }
+                return;
+            }
+        }
         let range = RANGE as u32;
         if !matches!(source, Source::St(_)) {
             self.memory_operand(source, V1, Some(range), slow);
@@ -995,7 +1019,7 @@ impl Translator<'_> {
         self.asm.b(end);
         self.asm.bind(wide);
         self.remark(Part::X87Wide);
-        self.x87_wide(op, dest, source, reverse, slow);
+        self.x87_wide(op, dest, source, reverse, slow, known);
         self.asm.bind(end);
         self.remark(Part::Body);
         self.st_write(dest, X0, X1);
@@ -1009,7 +1033,15 @@ impl Translator<'_> {
     /// leaves the significand in x0 with its top bit set, the bits below
     /// it in x7 (any lost bits ORed into bit 0), the biased exponent in w17
     /// and the sign in bit 15 of w1, or x1 the sign of a zero result.
-    fn x87_wide(&mut self, op: Arith, dest: u8, source: Source, reverse: bool, slow: Label) {
+    fn x87_wide(
+        &mut self,
+        op: Arith,
+        dest: u8,
+        source: Source,
+        reverse: bool,
+        slow: Label,
+        known_control: Option<u16>,
+    ) {
         match source {
             Source::St(index) => self.read(index, X2, X3, slow),
             _ => self.extended(V1, X2, X3),
@@ -1017,12 +1049,12 @@ impl Translator<'_> {
         self.ordinary(X2, X3, slow);
         self.read(dest, X0, X1, slow);
         self.ordinary(X0, X1, slow);
-        self.wide_ops(op, reverse, slow);
+        self.wide_ops(op, reverse, slow, known_control);
     }
 
     /// `x87_wide` on the destination in x0 and x1 and the source in x2
     /// and x3, both zeros or normals.
-    fn wide_ops(&mut self, op: Arith, reverse: bool, slow: Label) {
+    fn wide_ops(&mut self, op: Arith, reverse: bool, slow: Label, known_control: Option<u16>) {
         if reverse {
             for (a, b) in [(X0, X2), (X1, X3)] {
                 self.emit_all(&[mov(X, X16, a), mov(X, a, b), mov(X, b, X16)]);
@@ -1037,7 +1069,7 @@ impl Translator<'_> {
             Arith::Div => self.wide_div(round, zero, slow),
         }
         self.asm.bind(round);
-        self.wide_round(slow);
+        self.wide_round(slow, known_control);
         self.asm.b(store);
         self.asm.bind(zero);
         self.emit(movz(X, X0, 0, 0));
@@ -1307,8 +1339,88 @@ impl Translator<'_> {
 
     /// Rounds x0:x7 to the precision and rounding control, sets PE and C1,
     /// and packs the result into x0 and x1; slow when PE is unmasked or
-    /// the exponent leaves the normal range.
-    fn wide_round(&mut self, slow: Label) {
+    /// the exponent leaves the normal range. When `known_control` is `Some`,
+    /// specializes away runtime PC/RC/PM dispatch while keeping exact half-way
+    /// parity rounding, carry-out, exponent checks, and live C1.
+    fn wide_round(&mut self, slow: Label, known_control: Option<u16>) {
+        if let Some(ctrl) = known_control {
+            let pc = (ctrl >> 8) & 3;
+            let rc = (ctrl >> 10) & 3;
+            let pm = ctrl & 0x20 != 0;
+            if pc == 1 {
+                self.asm.b(slow);
+                return;
+            }
+            let drop = match pc {
+                0 => 40,
+                2 => 11,
+                _ => 0,
+            };
+            if drop != 0 {
+                self.emit_all(&[
+                    cmp_imm(X, X7, 0, false),
+                    cset(W, X3, Cond::Ne),
+                    lsl_imm(X, X7, X0, 64 - drop),
+                    orr(X, X7, X7, X3, Lsl, 0),
+                    lsr_imm(X, X0, X0, drop),
+                ]);
+            }
+            let (exact, ranged) = (self.asm.label(), self.asm.label());
+            self.asm.cbz(X, false, X7, exact);
+            if !pm {
+                self.asm.b(slow);
+            } else if rc == 3 {
+                // Chop never rounds the magnitude up, so it cannot carry out.
+                self.emit(orr_imm(W, X13, X13, u64::from(PE)));
+                self.clear_c1();
+                if drop != 0 {
+                    self.emit(lsl_imm(X, X0, X0, drop));
+                }
+                self.asm.b(ranged);
+            } else {
+                match rc {
+                    0 => {
+                        let decided = self.asm.label();
+                        self.emit_all(&[
+                            movz(X, X3, 0x8000, 48),
+                            cmp(X, X7, X3, Lsl, 0),
+                            cset(W, X3, Cond::Hi),
+                        ]);
+                        self.asm.b_cond(Cond::Ne, decided);
+                        self.emit(and_imm(W, X3, X0, 1));
+                        self.asm.bind(decided);
+                    }
+                    1 => self.emit(ubfx(W, X3, X1, 15, 1)),
+                    _ => self.emit_all(&[ubfx(W, X3, X1, 15, 1), eor_imm(W, X3, X3, 1)]),
+                }
+                self.emit_all(&[
+                    orr_imm(W, X13, X13, u64::from(PE)),
+                    bfi(W, X13, X3, 9, 1),
+                    add(X, X0, X0, X3, Lsl, 0),
+                ]);
+                if drop != 0 {
+                    self.emit(lsl_imm(X, X0, X0, drop));
+                }
+                self.asm.cbz(X, true, X0, ranged);
+                self.emit_all(&[movz(X, X0, 0x8000, 48), add_imm(W, X17, X17, 1, false)]);
+                self.asm.b(ranged);
+            }
+            self.asm.bind(exact);
+            self.clear_c1();
+            if drop != 0 {
+                self.emit(lsl_imm(X, X0, X0, drop));
+            }
+            self.asm.bind(ranged);
+            // Underflow and overflow take the interpreter.
+            self.emit_all(&[
+                sub_imm(W, X16, X17, 1, false),
+                movz(W, X3, 0x7ffd, 0),
+                cmp(W, X16, X3, Lsl, 0),
+            ]);
+            self.asm.b_cond(Cond::Hi, slow);
+            self.emit(orr(W, X1, X1, X17, Lsl, 0));
+            return;
+        }
         // w2 the bits below the precision: 40, 11 or 0. Below 64 bits,
         // x7 becomes the dropped bits with the old x7 ORed into bit 0.
         let full = self.asm.label();

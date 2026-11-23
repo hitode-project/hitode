@@ -2101,6 +2101,99 @@ fn j1_x87_run_admits_sahf_and_guards_once_until_control_changes() {
     }
 }
 
+// spec: A64F-FP-3, A64F-FP-7
+#[test]
+fn phase4_pc64_specializes_wide_round_and_admits_delphi_0x1332() {
+    let tier1_with = |code: &[u8], facts: facts::Key| -> Vec<u32> {
+        let work = j1_unit(code);
+        let mut out = Code::default();
+        let at = HOST_CODE as usize;
+        lower_tier1(
+            &mut out,
+            &work.unit,
+            CODE,
+            &|_| false,
+            0,
+            Features::default(),
+            at,
+            Stubs {
+                call: at,
+                exit: at,
+                dispatch: at,
+                lookup: at,
+                lookup_slow: at,
+                ret_miss: at,
+                access: at,
+                fault: at,
+                opt_exit: at,
+                x87: None,
+            },
+            false,
+            facts,
+            0,
+        );
+        out.asm.words().to_vec()
+    };
+
+    // 1) Delphi 0x1332 (PC=64, RC=Nearest, PM=1, IM=0/ZM=0/OM=0) must enter the
+    // native pair_extended double-double register cache rather than falling
+    // straight through to pair_generic.
+    let delphi_chain = bytes(|a| {
+        a.fld1().unwrap();
+        a.fld1().unwrap();
+        a.fmul_2(st0, st1).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(qword_ptr(ebx)).unwrap();
+    });
+    let words_1332 = tier1_with(&delphi_chain, facts::Key::x87(0x1332, false));
+    let words_037f = tier1_with(&delphi_chain, facts::Key::x87(0x037f, false));
+    // Both 0x1332 and 0x037f emit native pair_extended (FMA/FNMSUB on doubles).
+    let has_fnmsub = |words: &[u32]| words.iter().any(|&w| w & 0xffe0_8000 == 0x1f60_8000);
+    assert!(
+        has_fnmsub(&words_1332) && has_fnmsub(&words_037f),
+        "0x1332 should use the same native pair_extended double-double path as 0x037f"
+    );
+
+    // 2) Straight-line single-op PC=64 with directed rounding (Chop 0x0f7f,
+    // precision() == None) specializes wide_round via control_stable at start=0.
+    let single_fadd = bytes(|a| {
+        a.fadd_2(st0, st1).unwrap();
+    });
+    let words_unknown = tier1_with(&single_fadd, facts::Key::default());
+    let words_chop = tier1_with(&single_fadd, facts::Key::x87(0x0f7f, false));
+    assert!(
+        words_chop.len() + 15 < words_unknown.len(),
+        "expected constant Chop wide_round to shrink code: chop={} vs unknown={}",
+        words_chop.len(),
+        words_unknown.len()
+    );
+
+    // 3) Directed-rounding PC=64 cyclic run specializes wide_round in pair_generic.
+    let directed_loop = bytes(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fmul_2(st0, st1).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+    });
+    let loop_unknown = tier1_with(&directed_loop, facts::Key::default());
+    let loop_chop = tier1_with(&directed_loop, facts::Key::x87(0x0f7f, false));
+    let loop_down = tier1_with(&directed_loop, facts::Key::x87(0x077f, false));
+    assert!(
+        loop_chop.len() + 50 < loop_unknown.len(),
+        "expected cyclic Chop PC=64 run to specialize pair_generic wide_round: chop={} vs unknown={}",
+        loop_chop.len(),
+        loop_unknown.len()
+    );
+    assert!(
+        loop_down.len() + 40 < loop_unknown.len(),
+        "expected cyclic Down PC=64 run to specialize pair_generic wide_round: down={} vs unknown={}",
+        loop_down.len(),
+        loop_unknown.len()
+    );
+}
+
 /// Runs `code` with ESP inside the data window and sticky PE, comparing x87,
 /// MMX, integer and SSE state with the interpreter; wide bodies trap.
 fn double_loop(h: &mut Harness, code: &[u8], data: &[u8], control: u16) {
