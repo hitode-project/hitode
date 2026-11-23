@@ -390,7 +390,7 @@ The pinned Wine source carries both through `tools/wine/patches`.
 
 ### WINE-THR-3 Suspension
 
-**Rule**: Suspending a thread MUST stop its context before the caller next runs. Resuming it to a zero count MUST let it run.
+**Rule**: Suspending a thread MUST stop its context before the caller next runs. Resuming it to a zero count MUST let it run. A suspend wait MUST NOT consume or lose a concurrent server select wake-up.
 **Verification**: Test
 
 ### WINE-THR-4 Termination
