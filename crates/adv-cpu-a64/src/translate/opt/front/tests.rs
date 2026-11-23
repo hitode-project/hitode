@@ -3072,3 +3072,90 @@ fn fp_range_binary32_store_reload_and_adversarial_bounds() {
         );
     }
 }
+
+// spec: A64-OPT-2, A64-OPT-9
+#[test]
+fn resident_domain_guards_prove_affine_x87_loop_and_respect_refusal() {
+    let code = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        // Affine x87 loop mirroring _name_col:
+        // st(0) = x, st(1) = step; frame [esp+0x20] = slope (f64), [esp+0x28] = base (f32).
+        a.fld(qword_ptr(esp + 0x20)).unwrap();
+        a.fmul_2(st0, st1).unwrap();
+        a.fadd(dword_ptr(esp + 0x28)).unwrap();
+        a.fistp(dword_ptr(esp + 0x10)).unwrap();
+        a.mov(eax, dword_ptr(esp + 0x10)).unwrap();
+        a.mov(dword_ptr(edi + edx * 4), eax).unwrap();
+        a.fst(dword_ptr(esp + 0x40 + edx * 4)).unwrap();
+        a.fld(dword_ptr(esp + 0x40 + edx * 4)).unwrap();
+        a.fsub(dword_ptr(esp + 0x40 + edx * 4)).unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(dword_ptr(esp + 0x18)).unwrap();
+        a.fld(dword_ptr(esp + 0x18)).unwrap();
+        a.inc(edx).unwrap();
+        a.cmp(edx, ebx).unwrap();
+        a.jl(head).unwrap();
+    });
+    let unit = resident_unit(&code);
+
+    for pc_ctrl in [0x023fu16, 0x003fu16] {
+        let mut at = initial();
+        at.regs[2] = 0; // edx = 0
+        at.regs[3] = 8; // ebx = 8
+        at.x87.control = pc_ctrl;
+        at.x87.status = 0x20;
+        at.x87
+            .push(adv_cpu_core::floating::fast::extended(1.0 / 64.0));
+        at.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+
+        let built = build_with_domains(&unit, None, &at, &|_| false, &|_| false, &|_| false)
+            .expect("resident domain-guarded build");
+        assert_eq!(verify::verify(&built.func), Ok(()));
+        assert_eq!(built.func.domain_guards.len(), 1);
+        assert!(built.func.domain_saved_per_iter >= 12);
+        assert!(
+            built.func.blocks[0]
+                .insts
+                .iter()
+                .any(|(_, op)| matches!(op, Op::DomainGuard { .. })),
+            "expected Block(0) DomainGuard for pc={pc_ctrl:#x}"
+        );
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::Validate)),
+            0,
+            "all inner x87 ops should be proved for pc={pc_ctrl:#x}"
+        );
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::Fp(.., false))),
+            0,
+            "no unproved Op::Fp should remain for pc={pc_ctrl:#x}"
+        );
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::X87Store { proved: false, .. }
+            )),
+            0,
+            "no unproved Op::X87Store should remain for pc={pc_ctrl:#x}"
+        );
+
+        // Verify refusal removes only domain guards and leaves plain_sites intact.
+        let guard_id = built.func.domain_guards[0];
+        let refused = build_with_domains(&unit, None, &at, &|_| false, &|_| false, &|id| {
+            id == guard_id
+        })
+        .expect("refused-domain rebuild");
+        assert_eq!(verify::verify(&refused.func), Ok(()));
+        assert!(refused.func.domain_guards.is_empty());
+        assert_eq!(
+            count(&refused, |op| matches!(op, Op::DomainGuard { .. })),
+            0
+        );
+        assert_eq!(
+            refused.plain_sites, built.plain_sites,
+            "refusing domain guard must not alter plain_sites"
+        );
+    }
+}

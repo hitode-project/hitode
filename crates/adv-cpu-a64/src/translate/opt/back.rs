@@ -59,6 +59,13 @@ pub(crate) struct Lowered {
     /// The branch word a failed `PlainPage` entry fact takes (A64-OPT-9).
     pub env_miss: usize,
     pub environment: Vec<(usize, usize)>,
+    /// The branch words a failed `DomainGuard` takes: reporting to owner vs
+    /// falling back to a general resident version or Tier-1.
+    pub domain_miss: Option<usize>,
+    pub domain_fallback: Option<usize>,
+    pub domain_sensors: Vec<(u8, usize, usize)>,
+    pub domain_misses_slot: Option<usize>,
+    pub domain_guard_words: u32,
     pub cold: usize,
     /// Static costs of the resident entry, longest normal exit, and a loop iteration.
     pub entry_words: u32,
@@ -225,6 +232,14 @@ fn lower_form(
         .iter()
         .map(|&(sensor, counter)| (sensor, e.asm.position(counter) / 4))
         .collect();
+    let domain_miss = e.domain_miss.map(|label| e.asm.position(label) / 4);
+    let domain_fallback = e.domain_fallback.map(|label| e.asm.position(label) / 4);
+    let domain_sensors = e
+        .domain_sensors
+        .iter()
+        .map(|&(ordinal, sensor, counter)| (ordinal, sensor, e.asm.position(counter) / 4))
+        .collect();
+    let domain_misses_slot = e.domain_misses_slot.map(|label| e.asm.position(label) / 4);
     let probation_slot = e
         .probation
         .as_ref()
@@ -268,6 +283,11 @@ fn lower_form(
         miss,
         env_miss,
         environment,
+        domain_miss,
+        domain_fallback,
+        domain_sensors,
+        domain_misses_slot,
+        domain_guard_words: e.domain_guard_words,
         cold,
         entry_words: e.entry_words,
         exit_words: e.exit_words,
@@ -340,6 +360,8 @@ fn emit<'a>(
         branch_only[v.0 as usize] = false;
     }
     let env_miss = resident.then(|| asm.label());
+    let domain_miss = (resident && !func.domain_guards.is_empty()).then(|| asm.label());
+    let domain_fallback = (resident && !func.domain_guards.is_empty()).then(|| asm.label());
     let row_strip = domain.and_then(|(domain, _)| {
         let batch = batches
             .iter()
@@ -408,6 +430,8 @@ fn emit<'a>(
         },
         resident,
         env_miss,
+        domain_miss,
+        domain_fallback,
         probation,
         entry_words: 0,
         body: 0,
@@ -415,6 +439,10 @@ fn emit<'a>(
         iteration: cost::Iteration::default(),
         fact_misses: Vec::new(),
         environment: Vec::new(),
+        domain_guard_misses: vec![None; func.domain_guards.len()],
+        domain_sensors: Vec::new(),
+        domain_misses_slot: None,
+        domain_guard_words: 0,
         checked_accesses: Vec::new(),
         page_cross: None,
         page_crossings: Vec::new(),
@@ -600,6 +628,7 @@ fn emit<'a>(
         costs[block].edges[index] = e.words_since(start);
     }
     if resident {
+        e.entry_words += costs[0].body;
         e.iteration = cost::iteration(func, &costs);
         if let Some((words, lanes)) = head_batch {
             e.iteration.words = words.div_ceil(lanes);
@@ -650,6 +679,10 @@ fn emit<'a>(
     if let Some(miss) = env_miss {
         e.environment_misses(bytes, miss, cold.unwrap());
     }
+    if let (Some(d_miss), Some(d_fallback)) = (domain_miss, domain_fallback) {
+        let refund = func.records[first.0 as usize].refund;
+        e.domain_misses_tail(bytes, refund, d_miss, d_fallback);
+    }
     // spec: A64-OPT-6
     let exit = e.asm.label();
     for (i, record) in func.records.iter().enumerate() {
@@ -667,7 +700,10 @@ fn emit<'a>(
     e.asm.bind(exit);
     // Permanently undefined until placed.
     e.asm.emit(0);
-    for label in [miss, cold, env_miss].into_iter().flatten() {
+    for label in [miss, cold, env_miss, domain_miss, domain_fallback]
+        .into_iter()
+        .flatten()
+    {
         e.asm.bind(label);
         e.asm.emit(0);
     }
@@ -798,6 +834,8 @@ struct Emitter<'a> {
     normal: Vec<[Option<Label>; 2]>,
     resident: bool,
     env_miss: Option<Label>,
+    domain_miss: Option<Label>,
+    domain_fallback: Option<Label>,
     probation: Option<resident::Probation>,
     entry_words: u32,
     body: usize,
@@ -805,6 +843,10 @@ struct Emitter<'a> {
     iteration: cost::Iteration,
     fact_misses: Vec<Label>,
     environment: Vec<(usize, Label)>,
+    domain_guard_misses: Vec<Option<Label>>,
+    domain_sensors: Vec<(u8, usize, Label)>,
+    domain_misses_slot: Option<Label>,
+    domain_guard_words: u32,
     checked_accesses: Vec<resident::CheckedAccess>,
     page_cross: Option<RecordId>,
     page_crossings: Vec<resident::PageCrossing>,
@@ -1562,6 +1604,7 @@ impl<'a> Emitter<'a> {
         };
         match op {
             Op::PlainPage { addr, bytes, write } => self.plain_page(addr, bytes, write),
+            Op::DomainGuard { kind, ordinal } => self.domain_guard(kind, ordinal),
             Op::PageCross { record, .. } => self.page_cross = Some(record),
             Op::FrameDisjoint {
                 addr,

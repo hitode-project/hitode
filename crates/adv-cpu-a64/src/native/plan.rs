@@ -682,6 +682,10 @@ pub(super) struct ResidentPlan {
     pub probation: Vec<Option<Probation>>,
     pub checked: FxHashSet<u32>,
     pub refused: FxHashSet<u32>,
+    /// Refused `Block(0)` numerical entry domain guard IDs (separate from `refused` page sites).
+    pub refused_domains: FxHashSet<u32>,
+    /// Archived `(in_domain_entries, in_domain_iterations)` per version after probation settles.
+    pub domain_history: Vec<(u64, u64)>,
     pub cuts: FxHashSet<u32>,
     pub cold_counts: FxHashMap<(u32, ResidentCold), u64>,
     pub(super) cold_window: Option<ColdWindow>,
@@ -716,6 +720,8 @@ impl ResidentPlan {
             probation: Vec::new(),
             checked: FxHashSet::default(),
             refused: FxHashSet::default(),
+            refused_domains: FxHashSet::default(),
+            domain_history: Vec::new(),
             cuts: FxHashSet::default(),
             cold_counts: FxHashMap::default(),
             cold_window: None,
@@ -871,6 +877,29 @@ impl ResidentPlan {
             self.rebuilds |= 1 << index;
         }
         true
+    }
+
+    pub(super) fn refuse_domain(
+        &mut self,
+        guard_id: u32,
+        affected: impl Iterator<Item = usize>,
+    ) -> bool {
+        if !self.refused_domains.insert(guard_id) {
+            return false;
+        }
+        for index in affected {
+            self.rebuilds |= 1 << index;
+        }
+        true
+    }
+
+    pub(super) fn archive_domain(&mut self, index: usize, entries: u64, iterations: u64) {
+        if self.domain_history.len() <= index {
+            self.domain_history.resize(index + 1, (0, 0));
+        }
+        let (e, i) = &mut self.domain_history[index];
+        *e = (*e).max(entries);
+        *i = (*i).max(iterations);
     }
 
     pub(super) fn needs_rebuild(&self) -> bool {

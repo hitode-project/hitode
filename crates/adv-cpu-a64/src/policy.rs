@@ -26,6 +26,7 @@ pub(crate) mod tier1 {
 
 pub(crate) mod resident {
     pub const MAX_PLAIN_FACTS: usize = 8;
+    pub const MAX_DOMAIN_GUARDS: usize = 4;
 
     #[cfg(native)]
     pub const HOT: u32 = 64;
@@ -33,6 +34,8 @@ pub(crate) mod resident {
     pub const VERSIONS: usize = 3;
     #[cfg(native)]
     pub const MISSES: u32 = 4;
+    #[cfg(native)]
+    pub const DOMAIN_MISS_SAMPLE: u32 = 4;
     #[cfg(native)]
     pub const SAMPLE: u32 = 8;
     #[cfg(native)]
@@ -49,6 +52,26 @@ pub(crate) mod resident {
         const CUT_WORDS: u64 = 32;
         const RECOVERY_WORDS: u64 = 256;
         exits >= 2 && exits * RECOVERY_WORDS > visits * CUT_WORDS
+    }
+
+    /// Whether a Block(0) entry domain guard remains cumulatively profitable:
+    /// saved work across in-domain iterations must cover the entry guard cost
+    /// on all arrivals plus the extra fallback cost on out-of-domain misses.
+    #[cfg(native)]
+    pub fn domain_guard_pays(
+        in_domain_entries: u64,
+        in_domain_iterations: u64,
+        misses: u64,
+        guard_words: u32,
+        saved_per_iter: u32,
+    ) -> bool {
+        const FALLBACK_WORDS: u64 = 32;
+        let saved = in_domain_iterations.saturating_mul(u64::from(saved_per_iter));
+        let guard_cost = in_domain_entries
+            .saturating_add(misses)
+            .saturating_mul(u64::from(guard_words));
+        let miss_cost = misses.saturating_mul(FALLBACK_WORDS);
+        saved >= guard_cost.saturating_add(miss_cost)
     }
 }
 

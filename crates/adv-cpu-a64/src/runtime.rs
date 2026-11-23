@@ -271,6 +271,7 @@ pub enum PlanEvent {
     ResidentRecovery,
     DiscoverBackEdge,
     EnvironmentMiss,
+    DomainGuardMiss,
     OfferReady,
     /// A proved row domain at its canonical resident entry.
     ResidentSplitOffer(u8),
@@ -290,6 +291,7 @@ impl PlanEvent {
             Self::ResidentRecovery => "resident_recovery",
             Self::DiscoverBackEdge => "external_discovery",
             Self::EnvironmentMiss => "environment_miss",
+            Self::DomainGuardMiss => "domain_guard_miss",
             Self::OfferReady => "offer_ready",
             Self::ResidentSplitOffer(_) => "resident_split_offer",
             Self::RowTargetMiss => "row_target_miss",
@@ -411,6 +413,7 @@ impl Exit {
             Self::Plan(PlanEvent::OfferReady) => 19,
             Self::Plan(PlanEvent::RowTargetMiss) => 20,
             Self::Plan(PlanEvent::RowGuardMiss) => 21,
+            Self::Plan(PlanEvent::DomainGuardMiss) => 22,
             Self::Plan(PlanEvent::ResidentSplitOffer(version)) => 0x4200 | version as u16,
             Self::Plan(PlanEvent::Probation(version)) => 0x4100 | version as u16,
             Self::Plan(PlanEvent::WorkerBranch(kind)) => 0x4000 | kind as u16,
@@ -450,6 +453,7 @@ impl Exit {
             19 => Some(Self::Plan(PlanEvent::OfferReady)),
             20 => Some(Self::Plan(PlanEvent::RowTargetMiss)),
             21 => Some(Self::Plan(PlanEvent::RowGuardMiss)),
+            22 => Some(Self::Plan(PlanEvent::DomainGuardMiss)),
             0x100..=0x1ff => Some(Self::Event(Event::Exception(raw as u8))),
             0x8000..=0xffff => Some(Self::Event(Event::Unsupported((raw & 0x7fff) as u16))),
             0x2000..=0x2fff => Some(Self::Event(Event::Software {

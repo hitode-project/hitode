@@ -8,8 +8,16 @@
 //! - Folding `X87Load(X87Store(v)) -> v` and `X87StoreC1 -> 0` requires `v` to be
 //!   proved finite, exact in binary32, and normal or signed zero (preserving `-0.0`).
 
-use super::{Func, IntOp, IntUnary, Op, Type, Value, apply_aliases};
-use crate::translate::opt::ir::{FpOp, FpUnary, SINGLE_A, SINGLE_B, SINGLE_EXACT, SINGLE_RESULT};
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::{
+    Block, End, FlagKind, Func, IntOp, IntUnary, Op, Type, Value, apply_aliases, dominators,
+};
+use crate::translate::front::tags::ConditionCode;
+use crate::translate::opt::ir::{
+    DomainGuardKind, FpOp, FpUnary, MAX_DOMAIN_GUARDS, SINGLE_A, SINGLE_B, SINGLE_EXACT,
+    SINGLE_RESULT,
+};
 
 const ZERO_Q: i16 = i16::MAX;
 const F32_MAX_F64: f64 = f32::MAX as f64;
@@ -17,6 +25,16 @@ const F32_MIN_NORMAL_F64: f64 = f32::MIN_POSITIVE as f64;
 /// `2^-125`, the lowest value strictly above the binary32 minimum normal binade.
 const F32_SAFE_MIN_F64: f64 = 2.350_988_701_644_575e-38; // f32::from_bits(0x0100_0000) as f64
 const WIDEN_LIMIT: u8 = 3;
+const MAX_DOMAIN_TRIP_COUNT: u32 = 1 << 20;
+const MAX_GUARDED_INPUTS: usize = 24;
+const MIN_DOMAIN_SAVED_PER_ITER: u32 = 12;
+const MAX_BOUND_DEGREE: u8 = 3;
+const F64_WIN_MIN_EXP: i16 = -240;
+const F64_WIN_MAX_EXP: i16 = 240;
+const F32_STORE_MIN_EXP: i16 = -125;
+const F32_STORE_MAX_EXP: i16 = 126;
+const F32_EXACT_MIN_EXP: i16 = -48;
+const F32_EXACT_MAX_EXP: i16 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct IntRange {
@@ -77,6 +95,9 @@ struct FpFact {
     /// Sound finite interval `[lo, hi]` when `finite == true`.
     lo: f64,
     hi: f64,
+    /// Sound lower bound on `|x|` for all nonzero values when `finite == true`
+    /// (`0.0` if unknown, `f64::INFINITY` if identically zero).
+    min_nonzero: f64,
     /// Exact dyadic scale `q`: every value is `k * 2^q` for integer `k`.
     /// `Some(ZERO_Q)` means identically `±0.0`. Valid only when `finite`.
     dyadic_q: Option<i16>,
@@ -90,8 +111,22 @@ impl FpFact {
         f32_safe_nonzero: false,
         lo: f64::NEG_INFINITY,
         hi: f64::INFINITY,
+        min_nonzero: 0.0,
         dyadic_q: None,
     };
+
+    fn zero() -> Self {
+        Self {
+            finite: true,
+            binary32_exact: true,
+            f32_normal_or_zero: true,
+            f32_safe_nonzero: true,
+            lo: 0.0,
+            hi: 0.0,
+            min_nonzero: f64::INFINITY,
+            dyadic_q: Some(ZERO_Q),
+        }
+    }
 
     fn is_zero(self) -> bool {
         self.finite && self.lo == 0.0 && self.hi == 0.0
@@ -106,7 +141,7 @@ impl FpFact {
         if !self.finite {
             return 0.0;
         }
-        let mut bound = 0.0f64;
+        let mut bound = self.min_nonzero;
         if self.lo > 0.0 {
             bound = bound.max(self.lo);
         } else if self.hi < 0.0 {
@@ -147,14 +182,15 @@ impl FpFact {
 
     fn join(self, other: Self) -> Self {
         let finite = self.finite && other.finite;
-        let (lo, hi, dyadic_q) = if finite {
+        let (lo, hi, min_nonzero, dyadic_q) = if finite {
             (
                 self.lo.min(other.lo),
                 self.hi.max(other.hi),
+                self.min_nonzero_abs().min(other.min_nonzero_abs()),
                 dyadic_min(self.dyadic_q, other.dyadic_q),
             )
         } else {
-            (f64::NEG_INFINITY, f64::INFINITY, None)
+            (f64::NEG_INFINITY, f64::INFINITY, 0.0, None)
         };
         Self {
             finite,
@@ -163,6 +199,47 @@ impl FpFact {
             f32_safe_nonzero: self.f32_safe_nonzero && other.f32_safe_nonzero,
             lo,
             hi,
+            min_nonzero,
+            dyadic_q,
+        }
+    }
+
+    /// Intersects `self` with an additional proved invariant `other`.
+    fn meet(self, other: Self) -> Self {
+        let finite = self.finite || other.finite;
+        let (lo, hi, min_nonzero, dyadic_q) = if self.finite && other.finite {
+            let lo = self.lo.max(other.lo);
+            let hi = self.hi.min(other.hi);
+            let (lo, hi) = if lo <= hi {
+                (lo, hi)
+            } else {
+                (other.lo, other.hi)
+            };
+            (
+                lo,
+                hi,
+                self.min_nonzero_abs().max(other.min_nonzero_abs()),
+                self.dyadic_q.or(other.dyadic_q),
+            )
+        } else if self.finite {
+            (self.lo, self.hi, self.min_nonzero_abs(), self.dyadic_q)
+        } else if other.finite {
+            (other.lo, other.hi, other.min_nonzero_abs(), other.dyadic_q)
+        } else {
+            (f64::NEG_INFINITY, f64::INFINITY, 0.0, None)
+        };
+        Self {
+            finite,
+            binary32_exact: self.binary32_exact || other.binary32_exact,
+            f32_normal_or_zero: self.f32_normal_or_zero
+                || other.f32_normal_or_zero
+                || min_nonzero >= F32_MIN_NORMAL_F64,
+            f32_safe_nonzero: self.f32_safe_nonzero
+                || other.f32_safe_nonzero
+                || min_nonzero >= F32_SAFE_MIN_F64,
+            lo,
+            hi,
+            min_nonzero,
             dyadic_q,
         }
     }
@@ -185,6 +262,7 @@ impl FpFact {
                     f32_safe_nonzero: joined.f32_safe_nonzero,
                     lo: -F32_MAX_F64,
                     hi: F32_MAX_F64,
+                    min_nonzero: joined.min_nonzero,
                     dyadic_q: None,
                 }
             } else {
@@ -195,6 +273,7 @@ impl FpFact {
                     f32_safe_nonzero: joined.f32_safe_nonzero,
                     lo: f64::NEG_INFINITY,
                     hi: f64::INFINITY,
+                    min_nonzero: 0.0,
                     dyadic_q: None,
                 }
             }
@@ -321,9 +400,27 @@ fn peel_i32_bits(defs: &[Option<Op>], mut v: Value) -> Value {
 }
 
 /// Evaluates `Op::Fp` abstractly and returns `(proved, fact)`.
-fn eval_fp(op: FpOp, a: FpFact, b: FpFact) -> (bool, FpFact) {
+fn eval_fp(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (bool, FpFact) {
     if !a.finite || !b.finite {
         return (false, FpFact::TOP);
+    }
+    if same_operands && op == FpOp::Sub {
+        // Any finite x satisfies x - x == +0.0 with no overflow or subnormal.
+        return (true, FpFact::zero());
+    }
+    if op == FpOp::Add && b.is_zero() {
+        let proved = a.binary32_exact
+            || a.f32_normal_or_zero
+            || a.dyadic_q.is_some_and(|q| q >= -1022)
+            || a.min_nonzero_abs() >= f64::MIN_POSITIVE;
+        return (proved, a);
+    }
+    if op == FpOp::Add && a.is_zero() {
+        let proved = b.binary32_exact
+            || b.f32_normal_or_zero
+            || b.dyadic_q.is_some_and(|q| q >= -1022)
+            || b.min_nonzero_abs() >= f64::MIN_POSITIVE;
+        return (proved, b);
     }
     let both_f32 = a.binary32_exact && b.binary32_exact;
     let (mut lo, mut hi, q_cand) = match op {
@@ -375,10 +472,15 @@ fn eval_fp(op: FpOp, a: FpFact, b: FpFact) -> (bool, FpFact) {
     }
 
     let max_abs = lo.abs().max(hi.abs());
+    let ma = a.min_nonzero_abs();
+    let mb = b.min_nonzero_abs();
+    let m_in = ma.min(mb);
+    let f64_add_safe_min = pow2_f64(-968);
     let proved = match op {
         FpOp::Add | FpOp::Sub => {
             both_f32
                 || q_cand.is_some_and(|q| q >= -1022)
+                || m_in >= f64_add_safe_min
                 || lo >= f64::MIN_POSITIVE
                 || hi <= -f64::MIN_POSITIVE
                 || (lo == 0.0 && hi == 0.0)
@@ -388,12 +490,46 @@ fn eval_fp(op: FpOp, a: FpFact, b: FpFact) -> (bool, FpFact) {
                 || a.is_zero()
                 || b.is_zero()
                 || q_cand.is_some_and(|q| q >= -1021)
-                || a.min_nonzero_abs() * b.min_nonzero_abs() > f64::MIN_POSITIVE
+                || ma * mb > 2.0 * f64::MIN_POSITIVE
         }
         FpOp::Div => {
             a.is_zero()
                 || (exact_f64 && q_cand.is_some_and(|q| q >= -1021))
-                || a.min_nonzero_abs() / b.max_abs() > f64::MIN_POSITIVE
+                || ma / b.max_abs() > 2.0 * f64::MIN_POSITIVE
+        }
+    };
+
+    let min_nonzero = match op {
+        FpOp::Add | FpOp::Sub => {
+            let no_cancel = (op == FpOp::Add
+                && ((a.lo >= 0.0 && b.lo >= 0.0) || (a.hi <= 0.0 && b.hi <= 0.0)))
+                || (op == FpOp::Sub
+                    && ((a.lo >= 0.0 && b.hi <= 0.0) || (a.hi <= 0.0 && b.lo >= 0.0)));
+            if no_cancel {
+                m_in
+            } else if m_in >= f64_add_safe_min {
+                m_in * pow2_f64(-53)
+            } else {
+                0.0
+            }
+        }
+        FpOp::Mul => {
+            if a.is_zero() || b.is_zero() {
+                f64::INFINITY
+            } else if ma * mb >= pow2_f64(-1020) {
+                0.5 * (ma * mb)
+            } else {
+                0.0
+            }
+        }
+        FpOp::Div => {
+            if a.is_zero() {
+                f64::INFINITY
+            } else if b.max_abs() > 0.0 && ma / b.max_abs() >= pow2_f64(-1020) {
+                0.5 * (ma / b.max_abs())
+            } else {
+                0.0
+            }
         }
     };
 
@@ -402,10 +538,12 @@ fn eval_fp(op: FpOp, a: FpFact, b: FpFact) -> (bool, FpFact) {
         && max_abs <= F32_MAX_F64
         && dyadic_q.is_some_and(|q| q >= -126 && fits_mantissa_bits(max_abs, q, 24));
     let f32_normal_or_zero = dyadic_q.is_some_and(|q| q >= -126)
+        || min_nonzero >= F32_MIN_NORMAL_F64
         || lo >= F32_MIN_NORMAL_F64
         || hi <= -F32_MIN_NORMAL_F64
         || (lo == 0.0 && hi == 0.0);
     let f32_safe_nonzero = dyadic_q.is_some_and(|q| q >= -125)
+        || min_nonzero >= F32_SAFE_MIN_F64
         || lo >= F32_SAFE_MIN_F64
         || hi <= -F32_SAFE_MIN_F64
         || (lo == 0.0 && hi == 0.0);
@@ -417,19 +555,32 @@ fn eval_fp(op: FpOp, a: FpFact, b: FpFact) -> (bool, FpFact) {
         f32_safe_nonzero,
         lo,
         hi,
+        min_nonzero,
         dyadic_q,
     };
     (proved, fact)
 }
 
 /// Evaluates `Op::X87Single` abstractly and returns `(proved_flags, fact)`.
-fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact) -> (u8, FpFact) {
+fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (u8, FpFact) {
     let mut flags = 0u8;
     if a.binary32_exact {
         flags |= SINGLE_A;
     }
     if b.binary32_exact {
         flags |= SINGLE_B;
+    }
+    if same_operands && op == FpOp::Sub && a.finite && a.binary32_exact {
+        return (
+            SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT,
+            FpFact::zero(),
+        );
+    }
+    if op == FpOp::Add && b.is_zero() && a.finite && a.binary32_exact && a.f32_safe_nonzero {
+        return (SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT, a);
+    }
+    if op == FpOp::Add && a.is_zero() && b.finite && b.binary32_exact && b.f32_safe_nonzero {
+        return (SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT, b);
     }
 
     // Even when unproved, a succeeding Op::X87Single always produces a finite,
@@ -441,6 +592,7 @@ fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact) -> (u8, FpFact) {
         f32_safe_nonzero: false,
         lo: -F32_MAX_F64,
         hi: F32_MAX_F64,
+        min_nonzero: F32_MIN_NORMAL_F64,
         dyadic_q: None,
     };
 
@@ -497,6 +649,7 @@ fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact) -> (u8, FpFact) {
             f32_safe_nonzero: true,
             lo: raw_lo,
             hi: raw_hi,
+            min_nonzero: F32_SAFE_MIN_F64,
             dyadic_q: q_cand,
         };
         return (flags, fact);
@@ -517,26 +670,61 @@ fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact) -> (u8, FpFact) {
         return (flags, base_fact);
     }
 
+    let ma = a.min_nonzero_abs();
+    let mb = b.min_nonzero_abs();
+    let m_in = ma.min(mb);
+    let f32_add_safe_min = pow2_f64(-101);
     let result_safe = match op {
         FpOp::Add | FpOp::Sub => {
             q_cand.is_some_and(|q| q >= -125)
+                || m_in >= f32_add_safe_min
                 || lo >= F32_SAFE_MIN_F64
                 || hi <= -F32_SAFE_MIN_F64
                 || (lo == 0.0 && hi == 0.0)
         }
-        FpOp::Mul => {
-            a.is_zero()
-                || b.is_zero()
-                || a.min_nonzero_abs() * b.min_nonzero_abs() >= F32_SAFE_MIN_F64
-        }
-        FpOp::Div => a.is_zero() || a.min_nonzero_abs() / b.max_abs() >= F32_SAFE_MIN_F64,
+        FpOp::Mul => a.is_zero() || b.is_zero() || ma * mb >= F32_SAFE_MIN_F64,
+        FpOp::Div => a.is_zero() || ma / b.max_abs() >= F32_SAFE_MIN_F64,
     };
 
     if result_safe {
         flags |= SINGLE_RESULT;
     }
 
+    let min_nonzero = match op {
+        FpOp::Add | FpOp::Sub => {
+            let no_cancel = (op == FpOp::Add
+                && ((a.lo >= 0.0 && b.lo >= 0.0) || (a.hi <= 0.0 && b.hi <= 0.0)))
+                || (op == FpOp::Sub
+                    && ((a.lo >= 0.0 && b.hi <= 0.0) || (a.hi <= 0.0 && b.lo >= 0.0)));
+            if no_cancel {
+                m_in
+            } else if m_in >= f32_add_safe_min {
+                m_in * pow2_f64(-24)
+            } else {
+                F32_MIN_NORMAL_F64
+            }
+        }
+        FpOp::Mul => {
+            if a.is_zero() || b.is_zero() {
+                f64::INFINITY
+            } else if ma * mb >= F32_SAFE_MIN_F64 {
+                0.5 * (ma * mb)
+            } else {
+                F32_MIN_NORMAL_F64
+            }
+        }
+        FpOp::Div => {
+            if a.is_zero() {
+                f64::INFINITY
+            } else if b.max_abs() > 0.0 && ma / b.max_abs() >= F32_SAFE_MIN_F64 {
+                0.5 * (ma / b.max_abs())
+            } else {
+                F32_MIN_NORMAL_F64
+            }
+        }
+    };
     let f32_safe_nonzero = result_safe
+        || min_nonzero >= F32_SAFE_MIN_F64
         || lo >= F32_SAFE_MIN_F64
         || hi <= -F32_SAFE_MIN_F64
         || (lo == 0.0 && hi == 0.0);
@@ -547,6 +735,7 @@ fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact) -> (u8, FpFact) {
         f32_safe_nonzero,
         lo,
         hi,
+        min_nonzero,
         dyadic_q: None,
     };
     (flags, fact)
@@ -684,23 +873,19 @@ fn eval_int_op(
     }
 }
 
-pub(super) fn run(func: &mut Func) -> bool {
-    let has_x87 = func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
-        matches!(
-            op,
-            Op::Fp(..)
-                | Op::X87Single(..)
-                | Op::X87Load { .. }
-                | Op::X87Store { .. }
-                | Op::X87StoreC1 { .. }
-        )
-    });
-    if !has_x87 {
-        return false;
-    }
+#[derive(Default)]
+struct DomainSeeds {
+    inputs: BTreeMap<Value, FpFact>,
+    params: BTreeMap<Value, FpFact>,
+    values: BTreeMap<Value, (f64, Option<f64>)>,
+}
 
+fn analyze_fixpoint(
+    func: &Func,
+    defs: &[Option<Op>],
+    seeds: &DomainSeeds,
+) -> (Vec<Option<IntRange>>, Vec<Option<FpFact>>) {
     let n = func.types.len();
-    let defs = super::definitions(func);
     let mut int_facts: Vec<Option<IntRange>> = vec![None; n];
     let mut fp_facts: Vec<Option<FpFact>> = vec![None; n];
     let mut param_updates = vec![0u8; n];
@@ -708,10 +893,35 @@ pub(super) fn run(func: &mut Func) -> bool {
     for &p in &func.blocks[0].params {
         match func.ty(p) {
             Type::I32 | Type::I64 => int_facts[p.0 as usize] = Some(IntRange::top(func.ty(p))),
-            Type::F64 => fp_facts[p.0 as usize] = Some(FpFact::TOP),
+            Type::F64 => {
+                let base = seeds.inputs.get(&p).copied().unwrap_or(FpFact::TOP);
+                fp_facts[p.0 as usize] = Some(base);
+            }
             _ => {}
         }
     }
+
+    let clamp_value = |v: Value, mut f: FpFact| -> FpFact {
+        if let Some(&seed) = seeds.inputs.get(&v) {
+            f = f.meet(seed);
+        }
+        if let Some(&(bound, min_nz)) = seeds.values.get(&v)
+            && f.finite
+        {
+            f.lo = f.lo.max(-bound);
+            f.hi = f.hi.min(bound);
+            if f.lo > f.hi {
+                f.lo = -bound;
+                f.hi = bound;
+            }
+            if let Some(mn) = min_nz {
+                f.min_nonzero = f.min_nonzero.max(mn);
+                f.f32_normal_or_zero |= mn >= F32_MIN_NORMAL_F64;
+                f.f32_safe_nonzero |= mn >= F32_SAFE_MIN_F64;
+            }
+        }
+        f
+    };
 
     // Forward fixed-point analysis.
     loop {
@@ -728,7 +938,8 @@ pub(super) fn run(func: &mut Func) -> bool {
                         }
                     }
                     Type::F64 => {
-                        let next = eval_fp_op(op, func, &defs, &int_facts, &fp_facts);
+                        let next =
+                            clamp_value(r, eval_fp_op(op, func, defs, &int_facts, &fp_facts));
                         if fp_facts[r.0 as usize] != Some(next) {
                             fp_facts[r.0 as usize] = Some(next);
                             changed = true;
@@ -770,7 +981,7 @@ pub(super) fn run(func: &mut Func) -> bool {
                             let Some(a) = fp_facts[arg.0 as usize] else {
                                 continue;
                             };
-                            let next = match fp_facts[param.0 as usize] {
+                            let mut next = match fp_facts[param.0 as usize] {
                                 None => a,
                                 Some(cur) => {
                                     let joined = cur.join(a);
@@ -786,6 +997,9 @@ pub(super) fn run(func: &mut Func) -> bool {
                                     }
                                 }
                             };
+                            if let Some(&inv) = seeds.params.get(&param) {
+                                next = next.meet(inv);
+                            }
                             if fp_facts[param.0 as usize] != Some(next) {
                                 fp_facts[param.0 as usize] = Some(next);
                                 changed = true;
@@ -800,31 +1014,70 @@ pub(super) fn run(func: &mut Func) -> bool {
             break;
         }
     }
+    (int_facts, fp_facts)
+}
 
-    // Apply proved flags and Step 1.2B store-reload / C1 folds.
+fn apply_proved(
+    func: &mut Func,
+    defs: &[Option<Op>],
+    fp_facts: &[Option<FpFact>],
+    loop_blocks: Option<&[bool]>,
+    commit: bool,
+) -> (bool, u32) {
+    let n = func.types.len();
+    let get_fp = |v: Value| {
+        fp_facts
+            .get(v.0 as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(FpFact::TOP)
+    };
     let mut changed = false;
+    let mut saved_per_iter = 0u32;
     let mut alias: Vec<Value> = (0..n).map(|i| Value(i as u32)).collect();
     let mut aliased = false;
 
-    for block in &mut func.blocks {
+    for (b, block) in func.blocks.iter_mut().enumerate() {
+        let in_loop = loop_blocks.is_none_or(|lb| lb.get(b).copied().unwrap_or(false));
         for (result, op) in &mut block.insts {
             match *op {
-                Op::Fp(fp_op, a, b, false) => {
-                    let fa = fp_facts[a.0 as usize].unwrap_or(FpFact::TOP);
-                    let fb = fp_facts[b.0 as usize].unwrap_or(FpFact::TOP);
-                    let (proved, _) = eval_fp(fp_op, fa, fb);
+                Op::Fp(fp_op, a, b_val, false) => {
+                    let fa = get_fp(a);
+                    let fb = get_fp(b_val);
+                    let (proved, _) = eval_fp(fp_op, fa, fb, a == b_val);
                     if proved {
-                        *op = Op::Fp(fp_op, a, b, true);
+                        if in_loop {
+                            saved_per_iter = saved_per_iter.saturating_add(5);
+                        }
+                        if commit {
+                            *op = Op::Fp(fp_op, a, b_val, true);
+                        }
                         changed = true;
                     }
                 }
-                Op::X87Single(fp_op, a, b, cur) => {
-                    let fa = fp_facts[a.0 as usize].unwrap_or(FpFact::TOP);
-                    let fb = fp_facts[b.0 as usize].unwrap_or(FpFact::TOP);
-                    let (proved, _) = eval_x87_single(fp_op, fa, fb);
+                Op::X87Single(fp_op, a, b_val, cur) => {
+                    let fa = get_fp(a);
+                    let fb = get_fp(b_val);
+                    let (proved, _) = eval_x87_single(fp_op, fa, fb, a == b_val);
                     let merged = cur | proved;
                     if merged != cur {
-                        *op = Op::X87Single(fp_op, a, b, merged);
+                        if in_loop {
+                            let added = merged & !cur;
+                            let mut w = 0u32;
+                            if added & SINGLE_A != 0 {
+                                w += 3;
+                            }
+                            if added & SINGLE_B != 0 {
+                                w += 3;
+                            }
+                            if added & SINGLE_RESULT != 0 {
+                                w += 8;
+                            }
+                            saved_per_iter = saved_per_iter.saturating_add(w);
+                        }
+                        if commit {
+                            *op = Op::X87Single(fp_op, a, b_val, merged);
+                        }
                         changed = true;
                     }
                 }
@@ -834,37 +1087,47 @@ pub(super) fn run(func: &mut Func) -> bool {
                     single,
                     proved,
                 } => {
-                    if let Some(const_bits) = const_x87_load(&defs, bits, denormal, single) {
-                        *op = Op::Constant(Type::F64, u128::from(const_bits));
+                    if let Some(const_bits) = const_x87_load(defs, bits, denormal, single) {
+                        if commit {
+                            *op = Op::Constant(Type::F64, u128::from(const_bits));
+                        }
                         changed = true;
                         continue;
                     }
                     if single {
-                        let src_bits = peel_i32_bits(&defs, bits);
+                        let src_bits = peel_i32_bits(defs, bits);
                         if let Some(Op::X87Store {
                             value,
                             width: 4,
                             integer: false,
                             ..
-                        }) = defs[src_bits.0 as usize]
+                        }) = defs.get(src_bits.0 as usize).copied().flatten()
                         {
-                            let fv = fp_facts[value.0 as usize].unwrap_or(FpFact::TOP);
+                            let fv = get_fp(value);
                             if fv.finite && fv.binary32_exact && fv.f32_normal_or_zero {
                                 // Step 1.2B: exact normal-or-zero binary32 round-trip
                                 // preserves all bits including -0.0.
-                                if let Some(r) = *result {
+                                if in_loop {
+                                    saved_per_iter = saved_per_iter.saturating_add(4);
+                                }
+                                if commit && let Some(r) = *result {
                                     alias[r.0 as usize] = value;
                                     aliased = true;
-                                    changed = true;
                                 }
+                                changed = true;
                             } else if !proved {
                                 // Step 1.2A: X87Store already validated finite normal-or-zero f32.
-                                *op = Op::X87Load {
-                                    bits,
-                                    denormal,
-                                    single: true,
-                                    proved: true,
-                                };
+                                if in_loop {
+                                    saved_per_iter = saved_per_iter.saturating_add(3);
+                                }
+                                if commit {
+                                    *op = Op::X87Load {
+                                        bits,
+                                        denormal,
+                                        single: true,
+                                        proved: true,
+                                    };
+                                }
                                 changed = true;
                             }
                         }
@@ -877,7 +1140,7 @@ pub(super) fn run(func: &mut Func) -> bool {
                     integer,
                     proved: false,
                 } => {
-                    let fv = fp_facts[value.0 as usize].unwrap_or(FpFact::TOP);
+                    let fv = get_fp(value);
                     let ok = if integer {
                         let limit = (1u64 << (width * 8 - 1)) as f64;
                         if fv.finite {
@@ -894,25 +1157,32 @@ pub(super) fn run(func: &mut Func) -> bool {
                             && ((fv.binary32_exact && fv.f32_normal_or_zero) || fv.f32_safe_nonzero)
                     };
                     if ok {
-                        *op = Op::X87Store {
-                            value,
-                            width,
-                            rounding,
-                            integer,
-                            proved: true,
-                        };
+                        if in_loop {
+                            saved_per_iter = saved_per_iter.saturating_add(6);
+                        }
+                        if commit {
+                            *op = Op::X87Store {
+                                value,
+                                width,
+                                rounding,
+                                integer,
+                                proved: true,
+                            };
+                        }
                         changed = true;
                     }
                 }
                 Op::X87StoreC1 { value, integer, .. } => {
-                    let fv = fp_facts[value.0 as usize].unwrap_or(FpFact::TOP);
+                    let fv = get_fp(value);
                     let exact = if integer {
                         fv.finite && fv.dyadic_q.is_some_and(|q| q >= 0)
                     } else {
                         fv.finite && fv.binary32_exact && fv.f32_normal_or_zero
                     };
                     if exact {
-                        *op = Op::Constant(Type::I32, 0);
+                        if commit {
+                            *op = Op::Constant(Type::I32, 0);
+                        }
                         changed = true;
                     }
                 }
@@ -921,7 +1191,7 @@ pub(super) fn run(func: &mut Func) -> bool {
         }
     }
 
-    if aliased {
+    if commit && aliased {
         for block in &mut func.blocks {
             block
                 .insts
@@ -930,7 +1200,27 @@ pub(super) fn run(func: &mut Func) -> bool {
         apply_aliases(func, &alias);
     }
 
-    changed
+    (changed, saved_per_iter)
+}
+
+pub(super) fn run(func: &mut Func) -> bool {
+    let has_x87 = func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
+        matches!(
+            op,
+            Op::Fp(..)
+                | Op::X87Single(..)
+                | Op::X87Load { .. }
+                | Op::X87Store { .. }
+                | Op::X87StoreC1 { .. }
+        )
+    });
+    if !has_x87 {
+        return false;
+    }
+
+    let defs = super::definitions(func);
+    let (_, fp_facts) = analyze_fixpoint(func, &defs, &DomainSeeds::default());
+    apply_proved(func, &defs, &fp_facts, None, true).0
 }
 
 fn const_x87_load(defs: &[Option<Op>], bits: Value, denormal: bool, single: bool) -> Option<u64> {
@@ -958,6 +1248,7 @@ fn fp_fact_of_const(bits: u64) -> FpFact {
             f32_safe_nonzero: x == 0.0 || x.abs() >= F32_SAFE_MIN_F64,
             lo: x,
             hi: x,
+            min_nonzero: if x == 0.0 { f64::INFINITY } else { x.abs() },
             dyadic_q: Some(exact_dyadic_q(bits)),
         }
     } else if x.is_infinite() {
@@ -968,6 +1259,7 @@ fn fp_fact_of_const(bits: u64) -> FpFact {
             f32_safe_nonzero: false,
             lo: f64::NEG_INFINITY,
             hi: f64::INFINITY,
+            min_nonzero: 0.0,
             dyadic_q: None,
         }
     } else {
@@ -999,6 +1291,7 @@ fn eval_fp_op(
                 f32_safe_nonzero: true,
                 lo,
                 hi,
+                min_nonzero: if q == ZERO_Q { f64::INFINITY } else { 1.0 },
                 dyadic_q: Some(q),
             }
         }
@@ -1022,8 +1315,8 @@ fn eval_fp_op(
                 }
             }
         }
-        Op::Fp(fp_op, a, b, _) => eval_fp(fp_op, get_fp(a), get_fp(b)).1,
-        Op::X87Single(fp_op, a, b, _) => eval_x87_single(fp_op, get_fp(a), get_fp(b)).1,
+        Op::Fp(fp_op, a, b, _) => eval_fp(fp_op, get_fp(a), get_fp(b), a == b).1,
+        Op::X87Single(fp_op, a, b, _) => eval_x87_single(fp_op, get_fp(a), get_fp(b), a == b).1,
         Op::X87Load {
             bits,
             denormal,
@@ -1054,13 +1347,22 @@ fn eval_fp_op(
                     } else {
                         (-F32_MAX_F64, F32_MAX_F64)
                     };
+                    let f32_safe_nonzero = !store_proved || fv.f32_safe_nonzero;
+                    let mn = if fv.min_nonzero_abs() >= F32_SAFE_MIN_F64 {
+                        f64_to_f32_down(fv.min_nonzero_abs().min(F32_MAX_F64))
+                    } else if f32_safe_nonzero {
+                        F32_SAFE_MIN_F64
+                    } else {
+                        F32_MIN_NORMAL_F64
+                    };
                     return FpFact {
                         finite: true,
                         binary32_exact: true,
                         f32_normal_or_zero: true,
-                        f32_safe_nonzero: !store_proved || fv.f32_safe_nonzero,
+                        f32_safe_nonzero,
                         lo,
                         hi,
+                        min_nonzero: mn,
                         dyadic_q: None,
                     };
                 }
@@ -1074,10 +1376,1224 @@ fn eval_fp_op(
                 f32_safe_nonzero: false,
                 lo: f64::NEG_INFINITY,
                 hi: f64::INFINITY,
+                min_nonzero: 0.0,
                 dyadic_q: None,
             }
         }
         Op::Select { a, b, .. } => get_fp(a).join(get_fp(b)),
         _ => FpFact::TOP,
     }
+}
+
+#[derive(Clone, Copy)]
+struct CountedLatch {
+    i_0: Value,
+    limit: Option<Value>,
+    dir: i32,
+    cc: ConditionCode,
+}
+
+#[derive(Clone, Copy)]
+struct AffineInd {
+    param: Value,
+    x_0: Value,
+    dx: Value,
+    sum_val: Value,
+    f32_step: bool,
+    latch_idx: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct InputReq {
+    needs_exact_f32: bool,
+    needs_f32_store: bool,
+}
+
+impl InputReq {
+    fn window(self) -> (i16, i16) {
+        if self.needs_exact_f32 {
+            (F32_EXACT_MIN_EXP, F32_EXACT_MAX_EXP)
+        } else if self.needs_f32_store {
+            (F32_STORE_MIN_EXP, F32_STORE_MAX_EXP)
+        } else {
+            (F64_WIN_MIN_EXP, F64_WIN_MAX_EXP)
+        }
+    }
+}
+
+fn invert_cc(cc: ConditionCode) -> Option<ConditionCode> {
+    Some(match cc {
+        ConditionCode::e => ConditionCode::ne,
+        ConditionCode::ne => ConditionCode::e,
+        ConditionCode::l => ConditionCode::ge,
+        ConditionCode::ge => ConditionCode::l,
+        ConditionCode::le => ConditionCode::g,
+        ConditionCode::g => ConditionCode::le,
+        ConditionCode::b => ConditionCode::ae,
+        ConditionCode::ae => ConditionCode::b,
+        ConditionCode::be => ConditionCode::a,
+        ConditionCode::a => ConditionCode::be,
+        _ => return None,
+    })
+}
+
+fn swap_cc(cc: ConditionCode) -> Option<ConditionCode> {
+    Some(match cc {
+        ConditionCode::e => ConditionCode::e,
+        ConditionCode::ne => ConditionCode::ne,
+        ConditionCode::l => ConditionCode::g,
+        ConditionCode::g => ConditionCode::l,
+        ConditionCode::le => ConditionCode::ge,
+        ConditionCode::ge => ConditionCode::le,
+        ConditionCode::b => ConditionCode::a,
+        ConditionCode::a => ConditionCode::b,
+        ConditionCode::be => ConditionCode::ae,
+        ConditionCode::ae => ConditionCode::be,
+        _ => return None,
+    })
+}
+
+fn safe_int_limit(width: u8) -> (f64, f64) {
+    match width {
+        2 => (32_760.0, 32_761.0),
+        4 => (2_147_000_000.0, 2_147_010_000.0),
+        _ => {
+            let lim = (1u64 << 62) as f64;
+            (lim, lim * 1.01)
+        }
+    }
+}
+
+fn fp_window_fact(min_exp: i16, max_exp: i16, exact_f32: bool) -> FpFact {
+    let hi = pow2_f64(i32::from(max_exp) + 1);
+    let min_nz = pow2_f64(i32::from(min_exp));
+    FpFact {
+        finite: true,
+        binary32_exact: exact_f32,
+        f32_normal_or_zero: min_nz >= F32_MIN_NORMAL_F64,
+        f32_safe_nonzero: min_nz >= F32_SAFE_MIN_F64,
+        lo: -hi,
+        hi,
+        min_nonzero: min_nz,
+        dyadic_q: None,
+    }
+}
+
+fn fact_satisfies_window(f: FpFact, min_exp: i16, max_exp: i16, exact_f32: bool) -> bool {
+    if !f.finite {
+        return false;
+    }
+    if exact_f32 && !f.binary32_exact {
+        return false;
+    }
+    let hi = pow2_f64(i32::from(max_exp) + 1);
+    let min_nz = pow2_f64(i32::from(min_exp));
+    f.max_abs() < hi && (f.is_zero() || f.min_nonzero_abs() >= min_nz)
+}
+
+fn peel_f32_roundtrip(defs: &[Option<Op>], v: Value) -> (Value, bool) {
+    if let Some(Op::X87Load {
+        bits, single: true, ..
+    }) = defs[v.0 as usize]
+    {
+        let src = peel_i32_bits(defs, bits);
+        if let Some(Op::X87Store {
+            value,
+            width: 4,
+            integer: false,
+            ..
+        }) = defs[src.0 as usize]
+        {
+            return (value, true);
+        }
+    }
+    (v, false)
+}
+
+fn peel_add_zero(defs: &[Option<Op>], fp_facts: &[Option<FpFact>], mut v: Value) -> Value {
+    let is_zero = |x: Value| fp_facts[x.0 as usize].is_some_and(FpFact::is_zero);
+    for _ in 0..8 {
+        match defs[v.0 as usize] {
+            Some(Op::Fp(FpOp::Add, a, b, _) | Op::X87Single(FpOp::Add, a, b, _)) => {
+                if is_zero(b) {
+                    v = a;
+                } else if is_zero(a) {
+                    v = b;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    v
+}
+
+struct LoopEdge<'a> {
+    head: usize,
+    latch: usize,
+    entry_args: &'a [Value],
+    back_args: &'a [Value],
+}
+
+fn detect_counted_latch(
+    func: &Func,
+    defs: &[Option<Op>],
+    preds: &[Vec<usize>],
+    edge: &LoopEdge<'_>,
+    entry_avail: &[bool],
+) -> Option<CountedLatch> {
+    let (head, latch) = (edge.head, edge.latch);
+    let (entry_args, back_args) = (edge.entry_args, edge.back_args);
+    let (branch_block, branch_target) = match &func.blocks[latch].end {
+        End::Branch { .. } => (latch, head),
+        End::Jump(t) if t.block.0 as usize == head && preds[latch].len() == 1 => {
+            (preds[latch][0], latch)
+        }
+        _ => return None,
+    };
+    let End::Branch { cond, taken, fall } = &func.blocks[branch_block].end else {
+        return None;
+    };
+    let (branch_taken, raw_cc, flags) = {
+        let Some(Op::Test { flags, cond: cc }) = defs[cond.0 as usize] else {
+            return None;
+        };
+        if taken.block.0 as usize == branch_target && fall.block.0 as usize != branch_target {
+            (true, cc, flags)
+        } else if fall.block.0 as usize == branch_target && taken.block.0 as usize != branch_target
+        {
+            (false, cc, flags)
+        } else {
+            return None;
+        }
+    };
+    let cc = if branch_taken {
+        raw_cc
+    } else {
+        invert_cc(raw_cc)?
+    };
+    let head_params = &func.blocks[head].params;
+    let match_step = |v: Value| -> Option<(usize, i32)> {
+        let (base, dir) = match defs[v.0 as usize]? {
+            Op::Int(IntOp::Add, a, b) => match (defs[a.0 as usize], defs[b.0 as usize]) {
+                (_, Some(Op::Constant(Type::I32, c))) => {
+                    let s = c as u32 as i32;
+                    if s == 1 || s == -1 {
+                        (a, s)
+                    } else {
+                        return None;
+                    }
+                }
+                (Some(Op::Constant(Type::I32, c)), _) => {
+                    let s = c as u32 as i32;
+                    if s == 1 || s == -1 {
+                        (b, s)
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            Op::Int(IntOp::Sub, a, b) => {
+                if let Some(Op::Constant(Type::I32, c)) = defs[b.0 as usize] {
+                    let s = c as u32 as i32;
+                    if s == 1 || s == -1 {
+                        (a, -s)
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let idx = head_params.iter().position(|&p| p == base)?;
+        if func.ty(base) == Type::I32
+            && back_args.get(idx) == Some(&v)
+            && entry_args
+                .get(idx)
+                .is_some_and(|&v0| entry_avail[v0.0 as usize])
+        {
+            Some((idx, dir))
+        } else {
+            None
+        }
+    };
+
+    match defs[flags.0 as usize]? {
+        Op::Flags {
+            kind: FlagKind::Sub,
+            width: 4,
+            a,
+            b,
+            ..
+        } => {
+            if let Some((idx, dir)) = match_step(a)
+                && entry_avail[b.0 as usize]
+                && func.ty(b) == Type::I32
+            {
+                let supported = matches!(
+                    (dir, cc),
+                    (
+                        1,
+                        ConditionCode::l | ConditionCode::b | ConditionCode::le | ConditionCode::ne
+                    ) | (-1, ConditionCode::g | ConditionCode::ne)
+                );
+                if supported {
+                    return Some(CountedLatch {
+                        i_0: entry_args[idx],
+                        limit: Some(b),
+                        dir,
+                        cc,
+                    });
+                }
+            }
+            if let Some((idx, dir)) = match_step(b)
+                && entry_avail[a.0 as usize]
+                && func.ty(a) == Type::I32
+            {
+                let swapped = swap_cc(cc)?;
+                let supported = matches!(
+                    (dir, swapped),
+                    (
+                        1,
+                        ConditionCode::l | ConditionCode::b | ConditionCode::le | ConditionCode::ne
+                    ) | (-1, ConditionCode::g | ConditionCode::ne)
+                );
+                if supported {
+                    return Some(CountedLatch {
+                        i_0: entry_args[idx],
+                        limit: Some(a),
+                        dir,
+                        cc: swapped,
+                    });
+                }
+            }
+            None
+        }
+        Op::Flags {
+            kind: FlagKind::Decrement,
+            width: 4,
+            a,
+            ..
+        } if cc == ConditionCode::ne => {
+            let (idx, dir) = match_step(a)?;
+            (dir == -1).then(|| CountedLatch {
+                i_0: entry_args[idx],
+                limit: None,
+                dir,
+                cc,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn detect_affine_inductions(
+    func: &Func,
+    defs: &[Option<Op>],
+    fp_facts: &[Option<FpFact>],
+    edge: &LoopEdge<'_>,
+    entry_avail: &[bool],
+    latch_idx: usize,
+) -> Vec<AffineInd> {
+    let (head, entry_args, back_args) = (edge.head, edge.entry_args, edge.back_args);
+    let mut out = Vec::new();
+    for (idx, &param) in func.blocks[head].params.iter().enumerate() {
+        if func.ty(param) != Type::F64 {
+            continue;
+        }
+        let x_0 = entry_args[idx];
+        let x_back = back_args[idx];
+        if !entry_avail[x_0.0 as usize] {
+            continue;
+        }
+        let (v1, rounded_f32) = peel_f32_roundtrip(defs, x_back);
+        let v2 = peel_add_zero(defs, fp_facts, v1);
+        let (a, b, is_single) = match defs[v2.0 as usize] {
+            Some(Op::Fp(FpOp::Add, a, b, _)) => (a, b, false),
+            Some(Op::X87Single(FpOp::Add, a, b, _)) => (a, b, true),
+            _ => continue,
+        };
+        let dx = if peel_add_zero(defs, fp_facts, a) == param && entry_avail[b.0 as usize] {
+            b
+        } else if peel_add_zero(defs, fp_facts, b) == param && entry_avail[a.0 as usize] {
+            a
+        } else {
+            continue;
+        };
+        out.push(AffineInd {
+            param,
+            x_0,
+            dx,
+            sum_val: v2,
+            f32_step: rounded_f32 || is_single,
+            latch_idx,
+        });
+    }
+    out
+}
+
+fn can_build_bound(
+    v: Value,
+    defs: &[Option<Op>],
+    fp_facts: &[Option<FpFact>],
+    affine_params: &BTreeSet<Value>,
+    guarded_inputs: &BTreeMap<Value, InputReq>,
+    block0_avail: &[bool],
+    depth: u8,
+) -> Option<u8> {
+    if depth == 0 {
+        return None;
+    }
+    if affine_params.contains(&v) {
+        return Some(1);
+    }
+    if guarded_inputs.contains_key(&v) {
+        return Some(1);
+    }
+    if let Some(Op::Constant(Type::F64, bits)) = defs[v.0 as usize] {
+        let x = f64::from_bits(bits as u64);
+        if x == 0.0 || (x.is_finite() && x.abs() >= pow2_f64(-240) && x.abs() <= pow2_f64(240)) {
+            return Some(0);
+        }
+        return None;
+    }
+    if block0_avail[v.0 as usize] {
+        let f = fp_facts[v.0 as usize]?;
+        if f.finite
+            && f.max_abs() <= pow2_f64(240)
+            && (f.is_zero() || f.min_nonzero_abs() >= pow2_f64(-240))
+        {
+            return Some(1);
+        }
+        return None;
+    }
+    match defs[v.0 as usize]? {
+        Op::FpUnary(FpUnary::Neg | FpUnary::Abs, a) => can_build_bound(
+            a,
+            defs,
+            fp_facts,
+            affine_params,
+            guarded_inputs,
+            block0_avail,
+            depth - 1,
+        ),
+        Op::Fp(FpOp::Add | FpOp::Sub, a, b, _) | Op::X87Single(FpOp::Add | FpOp::Sub, a, b, _) => {
+            if fp_facts[b.0 as usize].is_some_and(FpFact::is_zero) {
+                return can_build_bound(
+                    a,
+                    defs,
+                    fp_facts,
+                    affine_params,
+                    guarded_inputs,
+                    block0_avail,
+                    depth - 1,
+                );
+            }
+            if fp_facts[a.0 as usize].is_some_and(FpFact::is_zero) {
+                return can_build_bound(
+                    b,
+                    defs,
+                    fp_facts,
+                    affine_params,
+                    guarded_inputs,
+                    block0_avail,
+                    depth - 1,
+                );
+            }
+            let da = can_build_bound(
+                a,
+                defs,
+                fp_facts,
+                affine_params,
+                guarded_inputs,
+                block0_avail,
+                depth - 1,
+            )?;
+            let db = can_build_bound(
+                b,
+                defs,
+                fp_facts,
+                affine_params,
+                guarded_inputs,
+                block0_avail,
+                depth - 1,
+            )?;
+            Some(da.max(db))
+        }
+        Op::Fp(FpOp::Mul, a, b, _) | Op::X87Single(FpOp::Mul, a, b, _) => {
+            let da = can_build_bound(
+                a,
+                defs,
+                fp_facts,
+                affine_params,
+                guarded_inputs,
+                block0_avail,
+                depth - 1,
+            )?;
+            let db = can_build_bound(
+                b,
+                defs,
+                fp_facts,
+                affine_params,
+                guarded_inputs,
+                block0_avail,
+                depth - 1,
+            )?;
+            let sum = da.saturating_add(db);
+            (sum <= MAX_BOUND_DEGREE).then_some(sum)
+        }
+        _ => None,
+    }
+}
+
+struct EntryBuilder<'a> {
+    func: &'a mut Func,
+    insts: Vec<(Option<Value>, Op)>,
+}
+
+impl<'a> EntryBuilder<'a> {
+    fn emit(&mut self, op: Op) -> Option<Value> {
+        let result = self.func.result(&op).map(|ty| {
+            let v = Value(self.func.types.len() as u32);
+            self.func.types.push(ty);
+            v
+        });
+        self.insts.push((result, op));
+        result
+    }
+
+    fn const_i32(&mut self, n: u32) -> Value {
+        self.emit(Op::Constant(Type::I32, u128::from(n))).unwrap()
+    }
+
+    fn const_f64(&mut self, x: f64) -> Value {
+        self.emit(Op::Constant(Type::F64, u128::from(x.to_bits())))
+            .unwrap()
+    }
+
+    fn cmp_i32(&mut self, a: Value, b: Value, cond: ConditionCode) -> Value {
+        let flags = self
+            .emit(Op::Flags {
+                kind: FlagKind::Sub,
+                width: 4,
+                a,
+                b,
+                prior: None,
+            })
+            .unwrap();
+        self.emit(Op::Test { flags, cond }).unwrap()
+    }
+
+    fn materialize(&mut self, v: Value, defs: &[Option<Op>], block0_avail: &[bool]) -> Value {
+        if block0_avail[v.0 as usize] {
+            return v;
+        }
+        match defs[v.0 as usize] {
+            Some(Op::Constant(ty, bits)) => self.emit(Op::Constant(ty, bits)).unwrap(),
+            _ => unreachable!("entry_avail guarantees Block(0) or Constant"),
+        }
+    }
+
+    fn build_trip_count(
+        &mut self,
+        latch: CountedLatch,
+        defs: &[Option<Op>],
+        block0_avail: &[bool],
+    ) -> Value {
+        let i_0 = self.materialize(latch.i_0, defs, block0_avail);
+        let limit_val = latch.limit.map(|l| self.materialize(l, defs, block0_avail));
+        let one = self.const_i32(1);
+        let fail = self.const_i32(u32::MAX);
+        match (latch.dir, latch.cc) {
+            (1, ConditionCode::l) => {
+                let limit = limit_val.unwrap();
+                let diff = self.emit(Op::Int(IntOp::Sub, limit, i_0)).unwrap();
+                let in_order = self.cmp_i32(i_0, limit, ConditionCode::l);
+                let imax = self.const_i32(i32::MAX as u32);
+                let not_max = self.cmp_i32(i_0, imax, ConditionCode::ne);
+                let fallback = self
+                    .emit(Op::Select {
+                        cond: not_max,
+                        a: one,
+                        b: fail,
+                    })
+                    .unwrap();
+                self.emit(Op::Select {
+                    cond: in_order,
+                    a: diff,
+                    b: fallback,
+                })
+                .unwrap()
+            }
+            (1, ConditionCode::b) => {
+                let limit = limit_val.unwrap();
+                let diff = self.emit(Op::Int(IntOp::Sub, limit, i_0)).unwrap();
+                let in_order = self.cmp_i32(i_0, limit, ConditionCode::b);
+                let not_max = self.cmp_i32(i_0, fail, ConditionCode::ne);
+                let fallback = self
+                    .emit(Op::Select {
+                        cond: not_max,
+                        a: one,
+                        b: fail,
+                    })
+                    .unwrap();
+                self.emit(Op::Select {
+                    cond: in_order,
+                    a: diff,
+                    b: fallback,
+                })
+                .unwrap()
+            }
+            (1, ConditionCode::le) => {
+                let limit = limit_val.unwrap();
+                let diff = self.emit(Op::Int(IntOp::Sub, limit, i_0)).unwrap();
+                let count = self.emit(Op::Int(IntOp::Add, diff, one)).unwrap();
+                let in_order = self.cmp_i32(i_0, limit, ConditionCode::le);
+                let imax = self.const_i32(i32::MAX as u32);
+                let lim_not_max = self.cmp_i32(limit, imax, ConditionCode::ne);
+                let i_not_max = self.cmp_i32(i_0, imax, ConditionCode::ne);
+                let safe_count = self
+                    .emit(Op::Select {
+                        cond: lim_not_max,
+                        a: count,
+                        b: fail,
+                    })
+                    .unwrap();
+                let fallback = self
+                    .emit(Op::Select {
+                        cond: i_not_max,
+                        a: one,
+                        b: fail,
+                    })
+                    .unwrap();
+                self.emit(Op::Select {
+                    cond: in_order,
+                    a: safe_count,
+                    b: fallback,
+                })
+                .unwrap()
+            }
+            (-1, ConditionCode::g) => {
+                let limit = limit_val.unwrap();
+                let diff = self.emit(Op::Int(IntOp::Sub, i_0, limit)).unwrap();
+                let in_order = self.cmp_i32(i_0, limit, ConditionCode::g);
+                let imin = self.const_i32(i32::MIN as u32);
+                let not_min = self.cmp_i32(i_0, imin, ConditionCode::ne);
+                let fallback = self
+                    .emit(Op::Select {
+                        cond: not_min,
+                        a: one,
+                        b: fail,
+                    })
+                    .unwrap();
+                self.emit(Op::Select {
+                    cond: in_order,
+                    a: diff,
+                    b: fallback,
+                })
+                .unwrap()
+            }
+            (1, ConditionCode::ne) => {
+                let limit = limit_val.unwrap();
+                let diff = self.emit(Op::Int(IntOp::Sub, limit, i_0)).unwrap();
+                let not_eq = self.cmp_i32(i_0, limit, ConditionCode::ne);
+                self.emit(Op::Select {
+                    cond: not_eq,
+                    a: diff,
+                    b: fail,
+                })
+                .unwrap()
+            }
+            (-1, ConditionCode::ne) => {
+                let limit = limit_val.unwrap_or_else(|| self.const_i32(0));
+                let diff = self.emit(Op::Int(IntOp::Sub, i_0, limit)).unwrap();
+                let not_eq = self.cmp_i32(i_0, limit, ConditionCode::ne);
+                self.emit(Op::Select {
+                    cond: not_eq,
+                    a: diff,
+                    b: fail,
+                })
+                .unwrap()
+            }
+            _ => unreachable!("filtered by detect_counted_latch"),
+        }
+    }
+
+    fn emit_bound(
+        &mut self,
+        v: Value,
+        defs: &[Option<Op>],
+        fp_facts: &[Option<FpFact>],
+        sym_bounds: &BTreeMap<Value, Value>,
+        block0_avail: &[bool],
+        cache: &mut BTreeMap<Value, Value>,
+    ) -> Value {
+        if let Some(&cached) = cache.get(&v) {
+            return cached;
+        }
+        if let Some(&b) = sym_bounds.get(&v) {
+            return b;
+        }
+        let res = if let Some(Op::Constant(Type::F64, bits)) = defs[v.0 as usize] {
+            self.const_f64(f64::from_bits(bits as u64).abs())
+        } else if block0_avail[v.0 as usize] {
+            self.emit(Op::FpUnary(FpUnary::Abs, v)).unwrap()
+        } else {
+            match defs[v.0 as usize].unwrap() {
+                Op::FpUnary(FpUnary::Neg | FpUnary::Abs, a) => {
+                    self.emit_bound(a, defs, fp_facts, sym_bounds, block0_avail, cache)
+                }
+                Op::Fp(FpOp::Add | FpOp::Sub, a, b, _)
+                | Op::X87Single(FpOp::Add | FpOp::Sub, a, b, _) => {
+                    if fp_facts[b.0 as usize].is_some_and(FpFact::is_zero) {
+                        self.emit_bound(a, defs, fp_facts, sym_bounds, block0_avail, cache)
+                    } else if fp_facts[a.0 as usize].is_some_and(FpFact::is_zero) {
+                        self.emit_bound(b, defs, fp_facts, sym_bounds, block0_avail, cache)
+                    } else {
+                        let ba =
+                            self.emit_bound(a, defs, fp_facts, sym_bounds, block0_avail, cache);
+                        let bb =
+                            self.emit_bound(b, defs, fp_facts, sym_bounds, block0_avail, cache);
+                        self.emit(Op::Fp(FpOp::Add, ba, bb, true)).unwrap()
+                    }
+                }
+                Op::Fp(FpOp::Mul, a, b, _) | Op::X87Single(FpOp::Mul, a, b, _) => {
+                    let ba = self.emit_bound(a, defs, fp_facts, sym_bounds, block0_avail, cache);
+                    let bb = self.emit_bound(b, defs, fp_facts, sym_bounds, block0_avail, cache);
+                    self.emit(Op::Fp(FpOp::Mul, ba, bb, true)).unwrap()
+                }
+                _ => unreachable!("verified by can_build_bound"),
+            }
+        };
+        cache.insert(v, res);
+        res
+    }
+}
+
+/// Infers optional `Block(0)` numerical domain guards for resident x87 loops
+/// when static analysis leaves unproved arithmetic or stores inside the loop.
+pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) -> bool) -> bool {
+    if !func.resident
+        || func.blocks.len() <= 1
+        || func.domain_guards.len() >= MAX_DOMAIN_GUARDS
+        || !func.domain_guards.is_empty()
+    {
+        return false;
+    }
+    // Block(0) must be a one-shot entry prologue (never a loop head).
+    if func
+        .blocks
+        .iter()
+        .flat_map(|b| b.end.targets())
+        .any(|t| t.block == Block(0))
+    {
+        return false;
+    }
+
+    let first_effect = func.blocks[0]
+        .insts
+        .iter()
+        .position(|(_, op)| {
+            matches!(
+                op,
+                Op::Store { .. } | Op::FrameStore { .. } | Op::ScopeWritten(_)
+            )
+        })
+        .unwrap_or(func.blocks[0].insts.len());
+    let last_plain = func.blocks[0]
+        .insts
+        .iter()
+        .rposition(|(_, op)| matches!(op, Op::PlainPage { .. }))
+        .map_or(0, |i| i + 1);
+    if first_effect < last_plain {
+        return false;
+    }
+    let insert_pos = first_effect;
+
+    let n = func.types.len();
+    let mut block0_avail = vec![false; n];
+    for &p in &func.blocks[0].params {
+        block0_avail[p.0 as usize] = true;
+    }
+    for &(r, _) in &func.blocks[0].insts[..insert_pos] {
+        if let Some(r) = r {
+            block0_avail[r.0 as usize] = true;
+        }
+    }
+
+    let defs = super::definitions(func);
+    let mut entry_avail = block0_avail.clone();
+    for (i, def) in defs.iter().enumerate() {
+        if matches!(def, Some(Op::Constant(..))) {
+            entry_avail[i] = true;
+        }
+    }
+
+    let dom = dominators(func);
+    let has_dom = |b: usize, d: usize| dom[b][d / 64] >> (d % 64) & 1 != 0;
+
+    // Locate all single-entry, single-backedge natural loops.
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
+    for (b, block) in func.blocks.iter().enumerate() {
+        for t in block.end.targets() {
+            preds[t.block.0 as usize].push(b);
+        }
+    }
+    let mut loops = Vec::new();
+    for (head, head_preds) in preds.iter().enumerate().skip(1) {
+        let mut non_back = Vec::new();
+        let mut backedges = Vec::new();
+        for &p in head_preds {
+            if has_dom(p, head) {
+                backedges.push(p);
+            } else {
+                non_back.push(p);
+            }
+        }
+        if non_back.len() == 1 && backedges.len() == 1 {
+            loops.push((head, non_back[0], backedges[0]));
+        }
+    }
+    if loops.is_empty() {
+        return false;
+    }
+
+    let primary_head = loops
+        .iter()
+        .find(|&&(_, entry, _)| entry == 0)
+        .map_or(loops[0].0, |&(h, _, _)| h);
+    let guard_id = func.blocks[primary_head]
+        .head
+        .map(|h| func.records[h.record.0 as usize].eip)
+        .unwrap_or_else(|| func.records[0].eip);
+    if refused_domain(guard_id) {
+        return false;
+    }
+
+    // Union of natural loop blocks across all detected loops.
+    let mut in_loop = vec![false; func.blocks.len()];
+    for &(head, _, latch) in &loops {
+        in_loop[head] = true;
+        let mut work = vec![latch];
+        while let Some(b) = work.pop() {
+            if !in_loop[b] && has_dom(b, head) {
+                in_loop[b] = true;
+                for &p in &preds[b] {
+                    if !in_loop[p] {
+                        work.push(p);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check whether any loop still has unproved x87 work.
+    let has_unproved = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(b, _)| in_loop[*b])
+        .flat_map(|(_, blk)| &blk.insts)
+        .any(|(_, op)| match *op {
+            Op::Fp(.., false) | Op::X87Store { proved: false, .. } => true,
+            Op::X87Single(.., cur) => {
+                cur & (SINGLE_A | SINGLE_B | SINGLE_RESULT) != (SINGLE_A | SINGLE_B | SINGLE_RESULT)
+            }
+            _ => false,
+        });
+    if !has_unproved {
+        return false;
+    }
+
+    let (_, static_fp) = analyze_fixpoint(func, &defs, &DomainSeeds::default());
+
+    let mut latches = Vec::<CountedLatch>::new();
+    let mut affine_inds = Vec::<AffineInd>::new();
+    for &(head, entry_pred, latch) in &loops {
+        let Some(entry_args) = func.blocks[entry_pred]
+            .end
+            .targets()
+            .find(|t| t.block.0 as usize == head)
+            .map(|t| t.args.clone())
+        else {
+            continue;
+        };
+        let Some(back_args) = func.blocks[latch]
+            .end
+            .targets()
+            .find(|t| t.block.0 as usize == head)
+            .map(|t| t.args.clone())
+        else {
+            continue;
+        };
+        let edge = LoopEdge {
+            head,
+            latch,
+            entry_args: &entry_args,
+            back_args: &back_args,
+        };
+        let Some(cl) = detect_counted_latch(func, &defs, &preds, &edge, &entry_avail) else {
+            continue;
+        };
+        let latch_idx = latches.len();
+        let inds =
+            detect_affine_inductions(func, &defs, &static_fp, &edge, &entry_avail, latch_idx);
+        if !inds.is_empty() {
+            latches.push(cl);
+            affine_inds.extend(inds);
+        }
+    }
+    let affine_map: BTreeMap<Value, AffineInd> =
+        affine_inds.iter().map(|&ind| (ind.param, ind)).collect();
+    let affine_params: BTreeSet<Value> = affine_map.keys().copied().collect();
+
+    // Propagate exact_f32 and f32_store requirements backwards from loop x87 ops
+    // to Block(0) F64 inputs and affine inductions.
+    let mut val_reqs = vec![InputReq::default(); n];
+    let mut queue: Vec<Value> = Vec::new();
+    let mark_req =
+        |v: Value, exact: bool, store: bool, reqs: &mut [InputReq], q: &mut Vec<Value>| {
+            if func.ty(v) != Type::F64 {
+                return;
+            }
+            let r = &mut reqs[v.0 as usize];
+            let old = (r.needs_exact_f32, r.needs_f32_store);
+            r.needs_exact_f32 |= exact;
+            r.needs_f32_store |= store;
+            if (r.needs_exact_f32, r.needs_f32_store) != old {
+                q.push(v);
+            }
+        };
+
+    let mut work_seeds = Vec::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        if !in_loop[b] {
+            continue;
+        }
+        for &(_, op) in &block.insts {
+            match op {
+                Op::Fp(_, a, b_val, false) => {
+                    work_seeds.push(a);
+                    work_seeds.push(b_val);
+                }
+                Op::X87Single(_, a, b_val, cur)
+                    if cur & (SINGLE_A | SINGLE_B | SINGLE_RESULT)
+                        != (SINGLE_A | SINGLE_B | SINGLE_RESULT) =>
+                {
+                    mark_req(a, true, true, &mut val_reqs, &mut queue);
+                    mark_req(b_val, true, true, &mut val_reqs, &mut queue);
+                    work_seeds.push(a);
+                    work_seeds.push(b_val);
+                }
+                Op::X87Store {
+                    value,
+                    integer: false,
+                    proved: false,
+                    ..
+                } => {
+                    mark_req(value, false, true, &mut val_reqs, &mut queue);
+                    work_seeds.push(value);
+                }
+                Op::X87Store {
+                    value,
+                    integer: true,
+                    proved: false,
+                    ..
+                } => {
+                    work_seeds.push(value);
+                }
+                _ => {}
+            }
+        }
+    }
+    // Propagate requirements backwards across loop F64 ops and affine inductions.
+    while let Some(v) = queue.pop() {
+        let req = val_reqs[v.0 as usize];
+        if let Some(&ind) = affine_map.get(&v) {
+            mark_req(
+                ind.x_0,
+                req.needs_exact_f32,
+                req.needs_f32_store,
+                &mut val_reqs,
+                &mut queue,
+            );
+            mark_req(
+                ind.dx,
+                req.needs_exact_f32,
+                req.needs_f32_store,
+                &mut val_reqs,
+                &mut queue,
+            );
+            continue;
+        }
+        if block0_avail[v.0 as usize] {
+            continue;
+        }
+        if let Some(op) = defs[v.0 as usize] {
+            match op {
+                Op::Fp(_, a, b, _) | Op::X87Single(_, a, b, _) => {
+                    mark_req(a, req.needs_exact_f32, false, &mut val_reqs, &mut queue);
+                    mark_req(b, req.needs_exact_f32, false, &mut val_reqs, &mut queue);
+                }
+                Op::FpUnary(_, a) => {
+                    mark_req(
+                        a,
+                        req.needs_exact_f32,
+                        req.needs_f32_store,
+                        &mut val_reqs,
+                        &mut queue,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    for &ind in &affine_inds {
+        if ind.f32_step {
+            let r = val_reqs[ind.param.0 as usize];
+            val_reqs[ind.param.0 as usize].needs_f32_store = true;
+            val_reqs[ind.x_0.0 as usize].needs_f32_store = true;
+            val_reqs[ind.dx.0 as usize].needs_f32_store = true;
+            val_reqs[ind.x_0.0 as usize].needs_exact_f32 |= r.needs_exact_f32;
+            val_reqs[ind.dx.0 as usize].needs_exact_f32 |= r.needs_exact_f32;
+        }
+    }
+
+    // Collect all Block(0) F64 inputs reachable from unproved loop x87 ops.
+    let mut visited = vec![false; n];
+    let mut guarded_inputs = BTreeMap::<Value, InputReq>::new();
+    while let Some(v) = work_seeds.pop() {
+        if visited[v.0 as usize] || func.ty(v) != Type::F64 {
+            continue;
+        }
+        visited[v.0 as usize] = true;
+        if let Some(&ind) = affine_map.get(&v) {
+            work_seeds.push(ind.x_0);
+            work_seeds.push(ind.dx);
+            continue;
+        }
+        if block0_avail[v.0 as usize] {
+            if matches!(defs[v.0 as usize], Some(Op::Constant(..))) {
+                continue;
+            }
+            let req = val_reqs[v.0 as usize];
+            let (min_e, max_e) = req.window();
+            let already_ok = static_fp[v.0 as usize]
+                .is_some_and(|f| fact_satisfies_window(f, min_e, max_e, req.needs_exact_f32));
+            if !already_ok {
+                guarded_inputs.insert(v, req);
+            }
+            continue;
+        }
+        if let Some(op) = defs[v.0 as usize] {
+            for u in op.uses() {
+                if func.ty(u) == Type::F64 {
+                    work_seeds.push(u);
+                }
+            }
+        }
+    }
+    if guarded_inputs.len() > MAX_GUARDED_INPUTS {
+        return false;
+    }
+
+    // Build abstract seeds for profitability simulation.
+    let mut seeds = DomainSeeds::default();
+    for (&v, &req) in &guarded_inputs {
+        let (min_e, max_e) = req.window();
+        let exact =
+            req.needs_exact_f32 || static_fp[v.0 as usize].is_some_and(|f| f.binary32_exact);
+        seeds.inputs.insert(v, fp_window_fact(min_e, max_e, exact));
+    }
+
+    // Seed affine induction invariants and their step sums.
+    let mut active_inds = Vec::new();
+    for &ind in &affine_inds {
+        let fact_of = |v: Value| {
+            let base = static_fp[v.0 as usize].unwrap_or(FpFact::TOP);
+            if let Some(&seed) = seeds.inputs.get(&v) {
+                base.meet(seed)
+            } else {
+                base
+            }
+        };
+        let fx0 = fact_of(ind.x_0);
+        let fdx = fact_of(ind.dx);
+        if !fx0.finite || !fdx.finite {
+            continue;
+        }
+        let req = val_reqs[ind.param.0 as usize];
+        let x_limit = if req.needs_exact_f32 {
+            pow2_f64(i32::from(F32_EXACT_MAX_EXP))
+        } else if ind.f32_step || req.needs_f32_store {
+            F32_MAX_F64
+        } else {
+            pow2_f64(i32::from(F64_WIN_MAX_EXP))
+        };
+        let min_nz = fx0.min_nonzero_abs().min(fdx.min_nonzero_abs());
+        let binary32_exact = fx0.binary32_exact && ind.f32_step;
+        let inv = FpFact {
+            finite: true,
+            binary32_exact,
+            f32_normal_or_zero: min_nz >= F32_MIN_NORMAL_F64,
+            f32_safe_nonzero: min_nz >= F32_SAFE_MIN_F64,
+            lo: -x_limit,
+            hi: x_limit,
+            min_nonzero: min_nz,
+            dyadic_q: None,
+        };
+        seeds.params.insert(ind.param, inv);
+        seeds.values.insert(ind.sum_val, (x_limit, Some(min_nz)));
+        active_inds.push((ind, x_limit, fx0.is_zero(), fdx.is_zero()));
+    }
+
+    // Collect integer X87Store sinks whose symbolic bounds can be checked in Block(0).
+    let mut int_sinks = BTreeMap::<Value, u8>::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        if !in_loop[b] {
+            continue;
+        }
+        for &(_, op) in &block.insts {
+            if let Op::X87Store {
+                value,
+                width,
+                integer: true,
+                proved: false,
+                ..
+            } = op
+                && can_build_bound(
+                    value,
+                    &defs,
+                    &static_fp,
+                    &affine_params,
+                    &guarded_inputs,
+                    &block0_avail,
+                    6,
+                )
+                .is_some()
+            {
+                int_sinks
+                    .entry(value)
+                    .and_modify(|w| *w = (*w).min(width))
+                    .or_insert(width);
+            }
+        }
+    }
+    for (&sink, &width) in &int_sinks {
+        let (_, widened) = safe_int_limit(width);
+        seeds.values.insert(sink, (widened, None));
+    }
+
+    if seeds.inputs.is_empty() && active_inds.is_empty() && int_sinks.is_empty() {
+        return false;
+    }
+
+    // Simulate fixpoint with the planned domain guards to verify profitability.
+    let (_, guarded_fp) = analyze_fixpoint(func, &defs, &seeds);
+    let (_, saved_per_iter) = apply_proved(func, &defs, &guarded_fp, Some(&in_loop), false);
+    if saved_per_iter < MIN_DOMAIN_SAVED_PER_ITER {
+        return false;
+    }
+
+    // Commit: emit Block(0) helper ops and DomainGuards at `insert_pos`.
+    let ordinal = func.domain_guards.len() as u8;
+    func.domain_guards.push(guard_id);
+    func.domain_saved_per_iter = saved_per_iter;
+
+    let mut eb = EntryBuilder {
+        func,
+        insts: Vec::new(),
+    };
+    for (&v, &req) in &guarded_inputs {
+        let (min_exp, max_exp) = req.window();
+        let exact_f32 =
+            req.needs_exact_f32 && !static_fp[v.0 as usize].is_some_and(|f| f.binary32_exact);
+        eb.emit(Op::DomainGuard {
+            kind: DomainGuardKind::FpWindow {
+                value: v,
+                min_exp,
+                max_exp,
+                exact_f32,
+            },
+            ordinal,
+        });
+    }
+
+    let mut sym_bounds = BTreeMap::<Value, Value>::new();
+    let mut bound_cache = BTreeMap::<Value, Value>::new();
+    if !active_inds.is_empty() {
+        let mut latch_n_f64 = BTreeMap::<usize, Value>::new();
+        let two = eb.const_f64(2.0);
+        for &(ind, x_limit, x0_zero, dx_zero) in &active_inds {
+            let n_f64 = *latch_n_f64.entry(ind.latch_idx).or_insert_with(|| {
+                let n_val = eb.build_trip_count(latches[ind.latch_idx], &defs, &block0_avail);
+                eb.emit(Op::DomainGuard {
+                    kind: DomainGuardKind::U32Le {
+                        value: n_val,
+                        max: MAX_DOMAIN_TRIP_COUNT,
+                    },
+                    ordinal,
+                });
+                eb.emit(Op::FromInt(n_val)).unwrap()
+            });
+            let x_0 = eb.materialize(ind.x_0, &defs, &block0_avail);
+            let dx = eb.materialize(ind.dx, &defs, &block0_avail);
+            if !x0_zero && !dx_zero {
+                eb.emit(Op::DomainGuard {
+                    kind: DomainGuardKind::SameSign { a: x_0, b: dx },
+                    ordinal,
+                });
+            }
+            let abs_dx = eb.emit(Op::FpUnary(FpUnary::Abs, dx)).unwrap();
+            let span = eb.emit(Op::Fp(FpOp::Mul, n_f64, abs_dx, true)).unwrap();
+            let total = if x0_zero {
+                span
+            } else {
+                let abs_x0 = eb.emit(Op::FpUnary(FpUnary::Abs, x_0)).unwrap();
+                eb.emit(Op::Fp(FpOp::Add, abs_x0, span, true)).unwrap()
+            };
+            let x_max = eb.emit(Op::Fp(FpOp::Mul, two, total, true)).unwrap();
+            eb.emit(Op::DomainGuard {
+                kind: DomainGuardKind::FpLe {
+                    value: x_max,
+                    bound_bits: x_limit.to_bits(),
+                },
+                ordinal,
+            });
+            sym_bounds.insert(ind.param, x_max);
+        }
+    }
+
+    for (&sink, &width) in &int_sinks {
+        let bound_val = eb.emit_bound(
+            sink,
+            &defs,
+            &static_fp,
+            &sym_bounds,
+            &block0_avail,
+            &mut bound_cache,
+        );
+        let (lim, _) = safe_int_limit(width);
+        eb.emit(Op::DomainGuard {
+            kind: DomainGuardKind::FpLe {
+                value: bound_val,
+                bound_bits: lim.to_bits(),
+            },
+            ordinal,
+        });
+    }
+
+    let inserted = eb.insts;
+    func.blocks[0]
+        .insts
+        .splice(insert_pos..insert_pos, inserted);
+
+    // Apply proved flags using the simulated `guarded_fp` facts.
+    let new_defs = super::definitions(func);
+    apply_proved(func, &new_defs, &guarded_fp, Some(&in_loop), true);
+    true
 }

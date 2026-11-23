@@ -22,6 +22,8 @@ pub(crate) struct Slot {
     pub rows: Cell<u64>,
     pub row_work: Cell<u64>,
     pub probation: Cell<u32>,
+    pub domain_sensor: [Cell<u32>; crate::policy::resident::MAX_DOMAIN_GUARDS],
+    pub domain_misses: Cell<u64>,
 }
 
 const _: () =
@@ -63,6 +65,11 @@ pub(crate) struct Layout<'a> {
     pub cold: usize,
     pub env_miss: usize,
     pub environment: &'a [(usize, usize)],
+    pub domain_miss: Option<usize>,
+    pub domain_fallback: Option<usize>,
+    pub domain_sensors: &'a [(u8, usize, usize)],
+    pub domain_misses_slot: Option<usize>,
+    pub domain_guard_words: u32,
     pub exit: usize,
     pub spill_cells: usize,
     pub probation_slot: usize,
@@ -93,6 +100,7 @@ pub(crate) struct Targets {
     pub exit: usize,
     pub resident_exit: usize,
     pub split: bool,
+    pub domain: bool,
 }
 
 pub(crate) struct MissCounter {
@@ -112,6 +120,7 @@ pub(crate) struct Entry {
     pub form: usize,
     pub tail: usize,
     pub environment: usize,
+    pub domain: Option<usize>,
     pub probation: usize,
     pub split: Option<usize>,
     pub miss_counter: Option<MissCounter>,
@@ -208,6 +217,17 @@ pub(crate) fn emit(
         orr(X, r(0), r(0), r(3), Lsl, 32),
     ]);
     asm.b(exit);
+
+    let domain = targets.domain.then(|| {
+        let at = at + asm.offset();
+        guest_exit(&mut asm, head, Exit::Plan(PlanEvent::DomainGuardMiss));
+        asm.emit_all(&[
+            movk(X, r(0), (version as u16) << 8, 32),
+            orr(X, r(0), r(0), r(3), Lsl, 32),
+        ]);
+        asm.b(exit);
+        at
+    });
 
     // x16 and x17 hold no form values at a cold exit (A64-OPT-7).
     asm.bind(tail);
@@ -308,6 +328,7 @@ pub(crate) fn emit(
         form: form_at,
         tail,
         environment,
+        domain,
         probation,
         split,
         miss_counter,

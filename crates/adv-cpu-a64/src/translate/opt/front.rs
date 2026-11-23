@@ -144,6 +144,7 @@ struct Resident<'a> {
     proof: Option<&'a Proof>,
     checked: &'a dyn Fn(u32) -> bool,
     refused: &'a dyn Fn(u32) -> bool,
+    refused_domain: &'a dyn Fn(u32) -> bool,
 }
 
 /// Builds a resident form of `unit` (A64-OPT-9).
@@ -153,6 +154,19 @@ pub(crate) fn build_with(
     at: &CpuState,
     checked: &dyn Fn(u32) -> bool,
     refused: &dyn Fn(u32) -> bool,
+) -> Result<Built, Reject> {
+    build_with_domains(unit, proof, at, checked, refused, &|_| false)
+}
+
+/// Builds a resident form of `unit` with separate refusal predicates for page
+/// facts (`refused`) and numerical entry domain guards (`refused_domain`).
+pub(crate) fn build_with_domains(
+    unit: &Unit,
+    proof: Option<&Proof>,
+    at: &CpuState,
+    checked: &dyn Fn(u32) -> bool,
+    refused: &dyn Fn(u32) -> bool,
+    refused_domain: &dyn Fn(u32) -> bool,
 ) -> Result<Built, Reject> {
     if let Some(i) = unit.trace.insts.iter().position(|inst| inst.spin) {
         return Err(Reject::Unsupported(i));
@@ -167,6 +181,7 @@ pub(crate) fn build_with(
             proof,
             checked,
             refused,
+            refused_domain,
         }),
         None,
         false,
@@ -808,6 +823,7 @@ fn build_trace(
     }
     let mut resident = resident.map(|r| passes::Resident {
         refused: r.refused,
+        refused_domain: r.refused_domain,
         regions: &store_regions,
         frame_reads: &frame_reads,
         frame_guards: &frame_guards,

@@ -13,6 +13,7 @@ use adv_cpu_core::memory::PAGE_SIZE;
 
 pub(super) struct Resident<'a> {
     pub refused: &'a dyn Fn(u32) -> bool,
+    pub refused_domain: &'a dyn Fn(u32) -> bool,
     pub regions: &'a BTreeMap<RecordId, RecordId>,
     pub frame_guards: &'a std::collections::BTreeSet<RecordId>,
     pub frame_range: Option<(i32, i32)>,
@@ -85,10 +86,25 @@ pub(super) fn run(
     if hoist_frame_loads(func, written_frame, frame_hoist_safe) {
         while propagate(func) {}
     }
-    if fp_range::run(func) {
+    join(func);
+    while propagate(func) {}
+    if forward_stores(func) {
         while propagate(func) {}
     }
-    join(func);
+    if fp_range::run(func) {
+        while propagate(func) {}
+        if fp_range::run(func) {
+            while propagate(func) {}
+        }
+    }
+    if let Some(r) = resident.as_deref()
+        && fp_range::infer_domain_guards(func, r.refused_domain)
+    {
+        while propagate(func) {}
+        if fp_range::run(func) {
+            while propagate(func) {}
+        }
+    }
     group_stores(func, facts, loads, stores, resident.is_some());
     sse_inputs(func);
     dead(func);
@@ -105,6 +121,15 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
                 f(b);
             }
         }
+        Op::DomainGuard { kind, .. } => match kind {
+            crate::translate::opt::ir::DomainGuardKind::FpWindow { value: a, .. }
+            | crate::translate::opt::ir::DomainGuardKind::FpLe { value: a, .. }
+            | crate::translate::opt::ir::DomainGuardKind::U32Le { value: a, .. } => f(a),
+            crate::translate::opt::ir::DomainGuardKind::SameSign { a, b } => {
+                f(a);
+                f(b);
+            }
+        },
         Op::Snapshot(a)
         | Op::IntUnary(_, a)
         | Op::Bits { value: a, .. }
@@ -1899,6 +1924,71 @@ fn per_iteration(func: &Func, resident: bool) -> Vec<bool> {
         }
     }
     every
+}
+
+/// Forward an immediately preceding unchecked full-width `Op::Store` to a
+/// same-address, same-width unchecked `Op::Load` within the same basic block.
+fn forward_stores(func: &mut Func) -> bool {
+    let mut alias: Vec<Value> = (0..func.types.len()).map(|i| Value(i as u32)).collect();
+    let mut forwarded = false;
+    let types = &func.types;
+    for block in &mut func.blocks {
+        let mut last: Option<(Value, u8, Option<u8>, Value)> = None;
+        block.insts.retain(|&(result, op)| match (result, op) {
+            (
+                _,
+                Op::Store {
+                    width,
+                    addr,
+                    value,
+                    checked: false,
+                    scope,
+                    ..
+                },
+            ) => {
+                let full_width = matches!(
+                    (width, types[value.0 as usize]),
+                    (4, Type::I32) | (8, Type::I64 | Type::F64) | (16, Type::V128)
+                );
+                last = full_width.then_some((addr, width, scope, value));
+                true
+            }
+            (_, Op::Store { .. } | Op::FrameStore { .. }) => {
+                last = None;
+                true
+            }
+            (
+                Some(r),
+                Op::Load {
+                    ty,
+                    width,
+                    addr,
+                    checked: false,
+                    clock: false,
+                    scope,
+                    ..
+                },
+            ) => {
+                if let Some((s_addr, s_width, s_scope, s_val)) = last
+                    && s_addr == addr
+                    && s_width == width
+                    && s_scope == scope
+                    && types[s_val.0 as usize] == ty
+                {
+                    alias[r.0 as usize] = s_val;
+                    forwarded = true;
+                    false
+                } else {
+                    true
+                }
+            }
+            _ => true,
+        });
+    }
+    if forwarded {
+        apply_aliases(func, &alias);
+    }
+    forwarded
 }
 
 fn join(func: &mut Func) {
