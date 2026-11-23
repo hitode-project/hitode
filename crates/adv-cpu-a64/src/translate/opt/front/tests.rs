@@ -2576,3 +2576,75 @@ fn resident_division_uses_unconditional_local_facts() {
         }
     }
 }
+
+// spec: A64-OPT-6, A64F-FP-3
+#[test]
+fn c1_merges_compact_constants_and_accept_value_with_round() {
+    // Differing C1 constants merge as a single I32 value rather than an Add recipe.
+    let constant_merge = assemble(|a| {
+        row(a, |a| {
+            let mut skip = a.create_label();
+            a.mov(eax, dword_ptr(esi)).unwrap();
+            a.test(eax, eax).unwrap();
+            a.jz(skip).unwrap();
+            a.fld1().unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+            a.set_label(&mut skip).unwrap();
+        })
+    });
+    for branch in [0u32, 1] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x220;
+        let built = differential(&constant_merge, &at, |m| {
+            m.write(DATA, &branch.to_le_bytes()).unwrap();
+        });
+        assert!(
+            built.func.records.iter().all(|record| {
+                !matches!(
+                    record.x87.as_ref().and_then(|x| x.c1),
+                    Some(Location::Recipe(Recipe::C1 { .. }))
+                )
+            }),
+            "differing C1 constants should merge as C1::Value, not a Recipe::C1"
+        );
+    }
+
+    // Three-way merge: Constant, C1::Value (from FST m32), and C1::Round(Add).
+    let three_way = assemble(|a| {
+        row(a, |a| {
+            let mut add = a.create_label();
+            let mut keep = a.create_label();
+            let mut merge = a.create_label();
+            a.mov(eax, dword_ptr(esi + 16)).unwrap();
+            a.cmp(eax, 1).unwrap();
+            a.je(add).unwrap();
+            a.ja(keep).unwrap();
+            a.fst(dword_ptr(edi)).unwrap();
+            a.jmp(merge).unwrap();
+            a.set_label(&mut add).unwrap();
+            a.fadd(qword_ptr(esi)).unwrap();
+            a.jmp(merge).unwrap();
+            a.set_label(&mut keep).unwrap();
+            a.nop().unwrap();
+            a.set_label(&mut merge).unwrap();
+        })
+    });
+    for (selector, st0_val, addend, entry_c1) in [
+        (0u32, 1.0f64, 0.0f64, false),
+        (0, 1.0 + 0.75 * f64::from(f32::EPSILON), 0.0, false),
+        (1, 1.0, 1.0, false),
+        (1, 1.0, 0.75 * f64::EPSILON, false),
+        (2, 1.0, 0.0, false),
+        (2, 1.0, 0.0, true),
+    ] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = if entry_c1 { 0x220 } else { 0x020 };
+        at.x87.push(adv_cpu_core::floating::fast::extended(st0_val));
+        differential(&three_way, &at, |m| {
+            m.write(DATA, &addend.to_le_bytes()).unwrap();
+            m.write(DATA + 16, &selector.to_le_bytes()).unwrap();
+        });
+    }
+}

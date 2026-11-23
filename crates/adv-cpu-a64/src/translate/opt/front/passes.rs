@@ -1102,7 +1102,7 @@ fn sse_inputs(func: &mut Func) {
         block
             .insts
             .iter()
-            .any(|(_, op)| matches!(op, Op::SseInput { .. }))
+            .any(|(_, op)| matches!(op, Op::SseInput { single: false, .. }))
     }) {
         return;
     }

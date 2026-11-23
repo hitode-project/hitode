@@ -697,13 +697,7 @@ impl Translator<'_> {
 
     /// TwoSum: `s` = a + b rounded, `e` the exact rest; uses d0.
     fn two_sum(&mut self, a: VReg, b: VReg, s: VReg, e: VReg) {
-        self.emit_all(&[
-            dfloat(Float::Fsub, V0, s, a),
-            dfloat(Float::Fsub, e, s, V0),
-            dfloat(Float::Fsub, e, a, e),
-            dfloat(Float::Fsub, V0, b, V0),
-            dfloat(Float::Fadd, e, e, V0),
-        ]);
+        crate::translate::lower::fp_class::two_sum_error(self.asm, a, b, s, e, V0);
     }
 
     /// Branches to `zero` for a zero in `r`, else to `out` unless its

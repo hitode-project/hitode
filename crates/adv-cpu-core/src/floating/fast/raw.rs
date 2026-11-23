@@ -1,50 +1,14 @@
-//! Guarded operations on the full extended significand. No intermediate host
-//! float rounding: copies/comparisons retain all bits, stores round once to
-//! their destination. Exceptional encodings and exponent boundaries fall back.
-use super::*;
-use std::cmp::Ordering;
+//! Guarded rounding on the full extended significand. No intermediate host
+//! float rounding: stores round once to their destination. Exceptional
+//! encodings and exponent boundaries fall back.
+use super::Ext;
 
 /// A normal finite extended value or signed zero. The transaction owns pseudo
 /// encodings, denormals, infinities and NaNs, including their exception rules.
-pub(super) fn ordinary(value: Ext) -> Option<Ext> {
+fn ordinary(value: Ext) -> Option<Ext> {
     let exp = value.sign_exponent() & 0x7fff;
     let sig = value.significand();
     ((exp == 0 && sig == 0) || (exp != 0 && exp != 0x7fff && sig >> 63 != 0)).then_some(value)
-}
-
-pub(super) fn operand(state: &CpuState, index: u8) -> Option<Ext> {
-    let slot = state.x87.physical_index(usize::from(index));
-    if state.x87.physical_tag(slot) == 3 {
-        return None;
-    }
-    ordinary(state.x87.regs[slot])
-}
-
-pub(super) fn source(
-    source: Source,
-    i: &Instruction,
-    state: &CpuState,
-    memory: &Memory,
-) -> Option<Ext> {
-    if let Source::St(index) = source {
-        operand(state, index)
-    } else {
-        Some(extended(load(source, i, state, memory, i32::MAX)?))
-    }
-}
-
-pub(super) fn compare(a: Ext, b: Ext) -> Ordering {
-    if a.significand() == 0 && b.significand() == 0 {
-        return Ordering::Equal;
-    }
-    let a_sign = a.sign_exponent() >> 15;
-    let b_sign = b.sign_exponent() >> 15;
-    if a_sign != b_sign {
-        return b_sign.cmp(&a_sign);
-    }
-    let order = (a.sign_exponent() & 0x7fff, a.significand())
-        .cmp(&(b.sign_exponent() & 0x7fff, b.significand()));
-    if a_sign != 0 { order.reverse() } else { order }
 }
 
 /// Round an unsigned magnitude right by `shift`, retaining enough information

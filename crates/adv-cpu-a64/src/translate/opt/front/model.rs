@@ -192,11 +192,9 @@ pub(super) fn analyze(
 fn merge_c1(a: C1, b: C1, i: usize) -> Result<C1, Reject> {
     Ok(match (a, b) {
         (a, b) if a == b => a,
-        (C1::Value, C1::Constant(_)) | (C1::Constant(_), C1::Value) => C1::Value,
-        (C1::Value, _) | (_, C1::Value) => return Err(Reject::StaticX87(i)),
         (C1::Round(..), C1::Round(..)) => return Err(Reject::StaticX87(i)),
         (round @ C1::Round(..), _) | (_, round @ C1::Round(..)) => round,
-        _ => C1::Round(FpOp::Add, false),
+        _ => C1::Value,
     })
 }
 

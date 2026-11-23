@@ -1,5 +1,5 @@
 //! Transactional x87, SSE and packed-integer execution on canonical CPU state.
-use crate::{CpuState, Memory, PAGE_SIZE, READ, WRITE, X87Cliff, X87State, interpreter::Step};
+use crate::{CpuState, Memory, PAGE_SIZE, READ, WRITE, X87State, interpreter::Step};
 use iced_x86::{Instruction, Mnemonic as M, Register as R};
 pub mod fast;
 
@@ -51,105 +51,6 @@ pub struct X87Effects {
 
 pub fn x87_effects(i: &Instruction) -> Option<X87Effects> {
     x87::helper_effects(i)
-}
-
-/// The instruction completed; generated code continues at the next instruction.
-pub const X87_DONE: u32 = 0;
-/// Nothing changed; the instruction is retried by the interpreter.
-pub const X87_FALLBACK: u32 = 1;
-pub const X87_READ_FAULT: u32 = 2;
-pub const X87_WRITE_FAULT: u32 = 3;
-/// The instruction completed, but it wrote executable memory or left an
-/// unmasked exception pending. Generated code must return to the executor.
-pub const X87_EXIT: u32 = 4;
-
-pub fn native_x87(i: &Instruction) -> bool {
-    // FXSAVE/FXRSTOR also own XMM and MXCSR state.
-    operation(i) == Some(Operation::X87) && !matches!(i.mnemonic(), M::Fxsave | M::Fxrstor)
-}
-
-/// Called only by native code with the Executor's live bridge and CpuState.
-/// GPRs/flags need only be current where X87Effects declares an input; x87/MMX
-/// and EIP must be canonical. Generated exits materialize all remaining state.
-/// Runs the interpreter's own x87 transaction, so results are bit-identical.
-pub unsafe extern "C" fn x87_call(
-    bridge: *mut std::ffi::c_void,
-    state: *mut CpuState,
-    operation: *const NativeX87,
-) -> u32 {
-    // SAFETY: same ABI/lifetime contract as strings::repeat; the instruction is
-    // owned by the Compiled that is executing.
-    let (bridge, state, operation) = unsafe {
-        (
-            &mut *bridge.cast::<crate::trap::Bridge<'_>>(),
-            &mut *state,
-            &*operation,
-        )
-    };
-    if x87_effects(&operation.instruction).is_none_or(|e| e.read_flags || e.write_flags) {
-        state.settle_flags();
-    }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: the bridge's memory is the executor's exclusively borrowed Memory.
-        let memory = unsafe { &mut *bridge.memory };
-        let cliffs = &mut bridge.cliffs;
-        cliffs.x87_helper_calls += 1;
-        let result = match operation.fast {
-            Some(fast) => fast::execute(operation, fast, state, memory),
-            None => fast::execute_other(operation, state, memory),
-        };
-        if let Some(result) = result {
-            cliffs.x87_fast += 1;
-            return result;
-        }
-        let reason = match operation.fast {
-            None => X87Cliff::NoFastForm,
-            Some(_) if state.x87.status & 0x80 != 0 || state.mmx_mode != 0 => X87Cliff::Pending,
-            Some(fast) if fast::arithmetic_precision(state.x87.control).is_none() => {
-                if state.x87.control & 0x0f3f == 0x033f {
-                    let category =
-                        fast::pc64_opportunity(&operation.instruction, fast, state, memory);
-                    *cliffs
-                        .x87_pc64
-                        .entry((operation.instruction.mnemonic(), category))
-                        .or_default() += 1;
-                }
-                *cliffs
-                    .x87_control
-                    .entry(state.x87.control & 0x0f3f)
-                    .or_default() += 1;
-                X87Cliff::Control
-            }
-            Some(_) => X87Cliff::Operand,
-        };
-        *cliffs
-            .x87_exact
-            .entry((operation.instruction.mnemonic(), reason))
-            .or_default() += 1;
-        cliffs.x87_forms.record(operation, state, memory);
-        let epoch = memory.epoch;
-        match execute(
-            &operation.instruction,
-            Operation::X87,
-            operation.opcode,
-            state,
-            memory,
-            true,
-        ) {
-            Step::Executed if memory.epoch != epoch || state.x87.status & 0x80 != 0 => X87_EXIT,
-            Step::Executed => X87_DONE,
-            Step::ReadFault { address, .. } => {
-                state.fault_addr = address;
-                X87_READ_FAULT
-            }
-            Step::WriteFault { address, .. } => {
-                state.fault_addr = address;
-                X87_WRITE_FAULT
-            }
-            _ => X87_FALLBACK,
-        }
-    }))
-    .unwrap_or(X87_FALLBACK)
 }
 
 pub fn execute(
