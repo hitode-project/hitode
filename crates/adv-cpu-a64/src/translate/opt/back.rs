@@ -2129,6 +2129,8 @@ impl<'a> Emitter<'a> {
                         scvtf(W, B, U),
                         vins(3, q, 1, B, 0),
                     ]),
+                    VecUnary::Dup64 => self.asm.emit(vdup_lane(Arr::D2, q, a, 0)),
+                    VecUnary::Dup32 => self.asm.emit(vdup_lane(Arr::S4, q, a, 0)),
                     VecUnary::Low64 => self.asm.emit(vmov(false, q, a)),
                     VecUnary::High64 => {
                         self.asm.emit_all(&[vins(3, q, 0, a, 1), vmov(false, q, q)])
@@ -2191,11 +2193,60 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            Op::VecFp { op, double, a, b } => {
+                let a = self.vr(a, A);
+                let b = self.vr(b, B);
+                let float = match op {
+                    FpOp::Add => Float::Fadd,
+                    FpOp::Sub => Float::Fsub,
+                    FpOp::Mul => Float::Fmul,
+                    FpOp::Div => Float::Fdiv,
+                };
+                self.asm.emit(if double {
+                    vfloat_2d(float, q, a, b)
+                } else {
+                    vfloat(float, true, q, a, b)
+                });
+            }
+            Op::VecFma {
+                sub,
+                double,
+                a,
+                b,
+                c,
+            } => {
+                let va = self.vr(a, A);
+                let vb = self.vr(b, B);
+                let vc = self.vr(c, C);
+                let acc = if q == va || q == vb { C } else { q };
+                if acc != vc {
+                    self.asm.emit(vmov(true, acc, vc));
+                }
+                self.asm.emit(vfmla(double, sub, acc, va, vb));
+                if acc != q {
+                    self.asm.emit(vmov(true, q, acc));
+                }
+            }
+            Op::VecFpToInt {
+                value,
+                double,
+                rounding,
+            } => {
+                let a = self.vr(value, A);
+                self.asm.emit(vfcvt_int_mode(double, rounding, q, a));
+            }
             Op::VecToInt(op, a) => {
                 let a = self.vr(a, A);
                 match op {
                     VecToInt::ExtractWord(lane) => {
                         self.asm.emit(vumov(1, d, a, u32::from(lane)));
+                    }
+                    VecToInt::Extract32(lane) => {
+                        if lane == 0 {
+                            self.asm.emit(fmov_from_v(W, d, a));
+                        } else {
+                            self.asm.emit(vumov(2, d, a, u32::from(lane)));
+                        }
                     }
                     VecToInt::ByteMask(full) => {
                         self.asm.emit_all(&[
@@ -2373,6 +2424,22 @@ impl<'a> Emitter<'a> {
                             self.asm.emit_all(&[
                                 vmov(true, C, a),
                                 vins(2, C, 0, b, 0),
+                                vmov(true, q, C),
+                            ]);
+                        }
+                    }
+                    VecOp::Insert32(lane) => {
+                        let dl = u32::from(lane);
+                        if q == a {
+                            if q != b || dl != 0 {
+                                self.asm.emit(vins(2, q, dl, b, 0));
+                            }
+                        } else if q != b {
+                            self.asm.emit_all(&[vmov(true, q, a), vins(2, q, dl, b, 0)]);
+                        } else {
+                            self.asm.emit_all(&[
+                                vmov(true, C, a),
+                                vins(2, C, dl, b, 0),
                                 vmov(true, q, C),
                             ]);
                         }

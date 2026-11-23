@@ -441,6 +441,137 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
         Op::Vec(op, a, b) => vector(op, get(a), get(b)),
         Op::VecUnary(op, a) => vector_unary(op, get(a)),
         Op::VecToInt(op, a) => u128::from(vector_to_int(op, get(a))),
+        Op::VecFp { op, double, a, b } => {
+            let (av, bv) = (get(a), get(b));
+            if double {
+                let mut out = 0u128;
+                for shift in [0usize, 64] {
+                    let x = f64::from_bits((av >> shift) as u64);
+                    let y = f64::from_bits((bv >> shift) as u64);
+                    let r = match op {
+                        FpOp::Add => x + y,
+                        FpOp::Sub => x - y,
+                        FpOp::Mul => x * y,
+                        FpOp::Div => x / y,
+                    };
+                    if !r.is_finite() || r.is_subnormal() {
+                        return None;
+                    }
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+                out
+            } else {
+                let mut out = 0u128;
+                for lane in 0..4usize {
+                    let shift = lane * 32;
+                    let x = f32::from_bits((av >> shift) as u32);
+                    let y = f32::from_bits((bv >> shift) as u32);
+                    let r = match op {
+                        FpOp::Add => x + y,
+                        FpOp::Sub => x - y,
+                        FpOp::Mul => x * y,
+                        FpOp::Div => x / y,
+                    };
+                    if !r.is_finite() || r.is_subnormal() {
+                        return None;
+                    }
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+                out
+            }
+        }
+        Op::VecFma {
+            sub,
+            double,
+            a,
+            b,
+            c,
+        } => {
+            let (av, bv, cv) = (get(a), get(b), get(c));
+            if double {
+                let mut out = 0u128;
+                for shift in [0usize, 64] {
+                    let x = f64::from_bits((av >> shift) as u64);
+                    let y = f64::from_bits((bv >> shift) as u64);
+                    let z = f64::from_bits((cv >> shift) as u64);
+                    let r = if sub {
+                        (-x).mul_add(y, z)
+                    } else {
+                        x.mul_add(y, z)
+                    };
+                    if !r.is_finite() || r.is_subnormal() {
+                        return None;
+                    }
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+                out
+            } else {
+                let mut out = 0u128;
+                for lane in 0..4usize {
+                    let shift = lane * 32;
+                    let x = f32::from_bits((av >> shift) as u32);
+                    let y = f32::from_bits((bv >> shift) as u32);
+                    let z = f32::from_bits((cv >> shift) as u32);
+                    let r = if sub {
+                        (-x).mul_add(y, z)
+                    } else {
+                        x.mul_add(y, z)
+                    };
+                    if !r.is_finite() || r.is_subnormal() {
+                        return None;
+                    }
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+                out
+            }
+        }
+        Op::VecFpToInt {
+            value,
+            double,
+            rounding,
+        } => {
+            let v = get(value);
+            if double {
+                let mut out = 0u128;
+                for shift in [0usize, 64] {
+                    let x = f64::from_bits((v >> shift) as u64);
+                    if !x.is_finite() {
+                        return None;
+                    }
+                    let rounded = match rounding {
+                        0 => x.round_ties_even(),
+                        1 => x.floor(),
+                        2 => x.ceil(),
+                        _ => x.trunc(),
+                    };
+                    if rounded < -(2.0f64.powi(63)) || rounded >= 2.0f64.powi(63) {
+                        return None;
+                    }
+                    out |= u128::from((rounded as i64) as u64) << shift;
+                }
+                out
+            } else {
+                let mut out = 0u128;
+                for lane in 0..4usize {
+                    let shift = lane * 32;
+                    let x = f32::from_bits((v >> shift) as u32);
+                    if !x.is_finite() {
+                        return None;
+                    }
+                    let rounded = match rounding {
+                        0 => x.round_ties_even(),
+                        1 => x.floor(),
+                        2 => x.ceil(),
+                        _ => x.trunc(),
+                    };
+                    if rounded < -(2.0f32.powi(31)) || rounded >= 2.0f32.powi(31) {
+                        return None;
+                    }
+                    out |= u128::from((rounded as i32) as u32) << shift;
+                }
+                out
+            }
+        }
         Op::Load { width, addr, .. } => {
             let mut bytes = [0u8; 16];
             memory
@@ -814,6 +945,14 @@ fn vector_unary(op: VecUnary, a: u128) -> u128 {
             let n1 = ((a >> 32) as u32) as i32;
             u128::from((f64::from(n0)).to_bits()) | (u128::from((f64::from(n1)).to_bits()) << 64)
         }
+        VecUnary::Dup64 => {
+            let lo = a & u128::from(u64::MAX);
+            lo | (lo << 64)
+        }
+        VecUnary::Dup32 => {
+            let lo = a & u128::from(u32::MAX);
+            lo | (lo << 32) | (lo << 64) | (lo << 96)
+        }
         VecUnary::Low64 => a & u128::from(u64::MAX),
         VecUnary::High64 => a >> 64,
         VecUnary::Shuffle(log2, imm, full) => {
@@ -856,6 +995,7 @@ fn vector_unary(op: VecUnary, a: u128) -> u128 {
 fn vector_to_int(op: VecToInt, a: u128) -> u32 {
     match op {
         VecToInt::ExtractWord(lane) => ((a >> (usize::from(lane) * 16)) & 0xffff) as u32,
+        VecToInt::Extract32(lane) => ((a >> (usize::from(lane) * 32)) & 0xffff_ffff) as u32,
         VecToInt::ByteMask(full) => {
             let bytes = if full { 16 } else { 8 };
             let mut out = 0u32;
@@ -1064,6 +1204,11 @@ fn vector(op: VecOp, a: u128, b: u128) -> u128 {
             }
         }
         VecOp::MoveLow32 => (a & !u128::from(u32::MAX)) | (b & u128::from(u32::MAX)),
+        VecOp::Insert32(lane) => {
+            let val = b & u128::from(u32::MAX);
+            let shift = usize::from(lane) * 32;
+            (a & !(u128::from(u32::MAX) << shift)) | (val << shift)
+        }
         VecOp::Insert64(dst_lane, src_lane) => {
             let val = u128::from((b >> (if src_lane { 64 } else { 0 })) as u64);
             let shift = if dst_lane { 64 } else { 0 };
@@ -1106,6 +1251,32 @@ pub(crate) fn locate(location: &Location<Value>, values: &[u128]) -> u128 {
                 FmaOp::RevSub => (FpOp::Sub, cv, prod),
             };
             u128::from(rounded_up(fp_op, lhs, rhs, single))
+        }
+        Location::Recipe(Recipe::VecLane { vec, lane, double }) => {
+            let bits = get(vec);
+            if double {
+                u128::from((bits >> (u32::from(lane) * 64)) as u64)
+            } else {
+                let f = f32::from_bits((bits >> (u32::from(lane) * 32)) as u32);
+                u128::from(f64::from(f).to_bits())
+            }
+        }
+        Location::Recipe(Recipe::C1Vec {
+            op,
+            a,
+            b,
+            lane,
+            single,
+        }) => {
+            let lane_f64 = |v: Value| {
+                let bits = get(v);
+                if single {
+                    f64::from(f32::from_bits((bits >> (u32::from(lane) * 32)) as u32))
+                } else {
+                    f64::from_bits((bits >> (u32::from(lane) * 64)) as u64)
+                }
+            };
+            u128::from(rounded_up(op, lane_f64(a), lane_f64(b), single))
         }
     }
 }

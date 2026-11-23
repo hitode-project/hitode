@@ -2,6 +2,7 @@
 //! read by execution or recovery. Floating operations remain until validation.
 mod fp_range;
 mod head_flags;
+mod slp;
 use super::{
     BTreeMap, Block, ESP, End, Facts, FlagKind, Func, Head, IntOp, IntUnary, IrRecord, Location, M,
     MAX_PLAIN_FACTS, Op, Recipe, RecordId, Source, Target, Type, Value, VecOp, VecUnary,
@@ -114,6 +115,9 @@ pub(super) fn run(
     if fp_range::contract_fma(func, domain_seeds.as_ref()) {
         dead(func);
     }
+    if slp::run(func) {
+        dead(func);
+    }
     validations(func);
 }
 
@@ -143,6 +147,7 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::FpUnary(_, a)
         | Op::VecUnary(_, a)
         | Op::VecToInt(_, a)
+        | Op::VecFpToInt { value: a, .. }
         | Op::FromInt(a)
         | Op::ToInt { value: a, .. }
         | Op::SsePackedToInt { value: a, .. }
@@ -160,6 +165,7 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::Fp32(_, a, b)
         | Op::SseFp64(_, a, b)
         | Op::Vec(_, a, b)
+        | Op::VecFp { a, b, .. }
         | Op::X87StoreC1 {
             value: a,
             stored: b,
@@ -191,6 +197,12 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         }
         Op::Select { cond, a, b }
         | Op::Fma {
+            a: cond,
+            b: a,
+            c: b,
+            ..
+        }
+        | Op::VecFma {
             a: cond,
             b: a,
             c: b,
@@ -232,8 +244,10 @@ fn substitute(record: &mut IrRecord, map: impl Fn(Value) -> Value) {
         .chain(record.frame.iter_mut().map(|(_, _, loc)| loc))
     {
         match loc {
-            Location::At(v) | Location::Recipe(Recipe::Eflags(v)) => f(v),
-            Location::Recipe(Recipe::C1 { a, b, .. }) => {
+            Location::At(v)
+            | Location::Recipe(Recipe::Eflags(v))
+            | Location::Recipe(Recipe::VecLane { vec: v, .. }) => f(v),
+            Location::Recipe(Recipe::C1 { a, b, .. } | Recipe::C1Vec { a, b, .. }) => {
                 f(a);
                 f(b);
             }

@@ -72,7 +72,7 @@ pub(crate) enum IntUnary {
     ByteSwap,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FpOp {
     Add,
     Sub,
@@ -106,6 +106,7 @@ pub(crate) enum VecOp {
     MulDwords(bool),
     SadBytes(bool),
     MoveLow32,
+    Insert32(u8),
     Insert64(bool, bool),
     InsertWord(u8, bool),
     /// `cmpltpd`: all ones in each lane where the first is less.
@@ -124,6 +125,10 @@ pub(crate) enum VecUnary {
     FromInt4s,
     /// Converts low 2 signed `i32` lanes to 2 `f64` lanes (`cvtdq2pd`).
     FromInt2d,
+    /// Broadcasts lane 0 (`f64` / low 64 bits) into `.2d`.
+    Dup64,
+    /// Broadcasts lane 0 (`f32` / low 32 bits) into `.4s`.
+    Dup32,
     /// Zeroes bits 64..128 of a V128 value.
     Low64,
     /// Copies bits 64..128 to bits 0..64 and zeroes bits 64..128.
@@ -137,6 +142,8 @@ pub(crate) enum VecUnary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VecToInt {
     ExtractWord(u8),
+    /// Extracts 32-bit lane `0..4` (`FMOV W, S` for lane 0, `UMOV W, V.s[lane]` otherwise).
+    Extract32(u8),
     ByteMask(bool),
     SignMask(bool),
 }
@@ -331,6 +338,27 @@ pub(crate) enum Op {
     Vec(VecOp, Value, Value),
     VecUnary(VecUnary, Value),
     VecToInt(VecToInt, Value),
+    /// Proved-safe lane-wise `.2d` (`double = true`) or `.4s` (`double = false`) FP arithmetic.
+    VecFp {
+        op: FpOp,
+        double: bool,
+        a: Value,
+        b: Value,
+    },
+    /// Proved-safe lane-wise `.2d` or `.4s` fused multiply-add/sub: `c + a * b` or `c - a * b`.
+    VecFma {
+        sub: bool,
+        double: bool,
+        a: Value,
+        b: Value,
+        c: Value,
+    },
+    /// Proved-safe lane-wise `.2d` (`f64 -> i64`) or `.4s` (`f32 -> i32`) rounding conversion.
+    VecFpToInt {
+        value: Value,
+        double: bool,
+        rounding: u8,
+    },
     /// A memory load of `width` bytes, zero-extended to `ty`.
     Load {
         ty: Type,
@@ -446,6 +474,7 @@ impl Op {
             | Op::FpUnary(_, a)
             | Op::VecUnary(_, a)
             | Op::VecToInt(_, a)
+            | Op::VecFpToInt { value: a, .. }
             | Op::FromInt(a)
             | Op::ToInt { value: a, .. }
             | Op::SsePackedToInt { value: a, .. }
@@ -463,6 +492,7 @@ impl Op {
             | Op::Fp32(_, a, b)
             | Op::SseFp64(_, a, b)
             | Op::Vec(_, a, b)
+            | Op::VecFp { a, b, .. }
             | Op::X87StoreC1 {
                 value: a,
                 stored: b,
@@ -485,6 +515,12 @@ impl Op {
             Op::Flags { a, b, prior, .. } => [Some(a), Some(b), prior],
             Op::Select { cond, a, b }
             | Op::Fma {
+                a: cond,
+                b: a,
+                c: b,
+                ..
+            }
+            | Op::VecFma {
                 a: cond,
                 b: a,
                 c: b,
@@ -771,7 +807,13 @@ impl Func {
             | Op::FpUnary(..)
             | Op::FromInt(_)
             | Op::X87Load { .. } => Type::F64,
-            Op::Vec(..) | Op::VecUnary(..) | Op::Fp32(..) | Op::SsePackedToInt { .. } => Type::V128,
+            Op::Vec(..)
+            | Op::VecUnary(..)
+            | Op::VecFp { .. }
+            | Op::VecFma { .. }
+            | Op::VecFpToInt { .. }
+            | Op::Fp32(..)
+            | Op::SsePackedToInt { .. } => Type::V128,
             Op::Store { .. }
             | Op::FrameStore { .. }
             | Op::SseInput { .. }

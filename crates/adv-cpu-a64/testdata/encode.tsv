@@ -283,3 +283,17 @@ dac00230	rbit x16, x17
 9b427c10	smulh x16, x0, x2
 1e651c83	fcsel d3, d4, d5, ne
 1e604083	fmov d3, d4
+4e63d441	fadd v1.2d, v2.2d, v3.2d
+4ee3d441	fsub v1.2d, v2.2d, v3.2d
+6e63dc41	fmul v1.2d, v2.2d, v3.2d
+6e63fc41	fdiv v1.2d, v2.2d, v3.2d
+4e23cc41	fmla v1.4s, v2.4s, v3.4s
+4ea3cc41	fmls v1.4s, v2.4s, v3.4s
+4e63cc41	fmla v1.2d, v2.2d, v3.2d
+4ee3cc41	fmls v1.2d, v2.2d, v3.2d
+4e21a841	fcvtns v1.4s, v2.4s
+4e21b841	fcvtms v1.4s, v2.4s
+4ea1a841	fcvtps v1.4s, v2.4s
+4ea1b841	fcvtzs v1.4s, v2.4s
+4e61b841	fcvtms v1.2d, v2.2d
+4ee1a841	fcvtps v1.2d, v2.2d

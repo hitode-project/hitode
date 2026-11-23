@@ -32,6 +32,16 @@ pub(crate) enum Recipe<L> {
     /// EFLAGS of a `Flags` value: its kind and operands, as the interpreter
     /// computes them.
     Eflags(L),
+    /// F64 value held in a lane of a packed `.4s` (`!double`) or `.2d` (`double`) vector.
+    VecLane { vec: L, lane: u8, double: bool },
+    /// C1 after `a[lane] op b[lane]` on packed `.4s` (`single`) or `.2d` (`!single`) vectors.
+    C1Vec {
+        op: FpOp,
+        a: L,
+        b: L,
+        lane: u8,
+        single: bool,
+    },
 }
 
 /// A flag producer with its inputs, evaluated only during cold recovery.
@@ -246,8 +256,11 @@ impl<L: Copy> Record<L> {
             .flat_map(|location| match *location {
                 Location::Constant(_) => [None, None, None],
                 Location::At(at) | Location::Recipe(Recipe::Eflags(at)) => [Some(at), None, None],
-                Location::Recipe(Recipe::C1 { a, b, .. }) => [Some(a), Some(b), None],
+                Location::Recipe(Recipe::C1 { a, b, .. } | Recipe::C1Vec { a, b, .. }) => {
+                    [Some(a), Some(b), None]
+                }
                 Location::Recipe(Recipe::C1Fma { a, b, c, .. }) => [Some(a), Some(b), Some(c)],
+                Location::Recipe(Recipe::VecLane { vec, .. }) => [Some(vec), None, None],
             })
             .flatten()
             .chain(self.flag_groups.iter().flat_map(FlagGroup::uses))
@@ -370,6 +383,30 @@ impl Locations<'_> {
                     c: Value(2),
                 }),
                 &[self.get(a), self.get(b), self.get(c)],
+            ),
+            Location::Recipe(Recipe::VecLane { vec, lane, double }) => super::eval::locate(
+                &Location::Recipe(Recipe::VecLane {
+                    vec: Value(0),
+                    lane,
+                    double,
+                }),
+                &[self.get(vec)],
+            ),
+            Location::Recipe(Recipe::C1Vec {
+                op,
+                a,
+                b,
+                lane,
+                single,
+            }) => super::eval::locate(
+                &Location::Recipe(Recipe::C1Vec {
+                    op,
+                    a: Value(0),
+                    b: Value(1),
+                    lane,
+                    single,
+                }),
+                &[self.get(a), self.get(b)],
             ),
         }
     }
@@ -542,6 +579,26 @@ pub(crate) fn lower_record(record: &IrRecord, locations: &[Host]) -> Record<Host
             a: locations[a.0 as usize],
             b: locations[b.0 as usize],
             c: locations[c.0 as usize],
+        }),
+        Location::Recipe(Recipe::VecLane { vec, lane, double }) => {
+            Location::Recipe(Recipe::VecLane {
+                vec: locations[vec.0 as usize],
+                lane,
+                double,
+            })
+        }
+        Location::Recipe(Recipe::C1Vec {
+            op,
+            a,
+            b,
+            lane,
+            single,
+        }) => Location::Recipe(Recipe::C1Vec {
+            op,
+            a: locations[a.0 as usize],
+            b: locations[b.0 as usize],
+            lane,
+            single,
         }),
     };
     Record {

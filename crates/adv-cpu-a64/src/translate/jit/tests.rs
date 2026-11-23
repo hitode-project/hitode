@@ -4256,6 +4256,143 @@ pub(in crate::translate) mod opt_back {
         }
     }
 
+    // spec: A64-OPT-2
+    #[test]
+    fn opt_back_phase4_vec_fp_fma_and_to_int_match_reference() {
+        let mut h = harness();
+        let pack_f64 = |a: f64, b: f64| u128::from(a.to_bits()) | (u128::from(b.to_bits()) << 64);
+        let pack_f32 = |a: f32, b: f32, c: f32, d: f32| {
+            u128::from(a.to_bits())
+                | (u128::from(b.to_bits()) << 32)
+                | (u128::from(c.to_bits()) << 64)
+                | (u128::from(d.to_bits()) << 96)
+        };
+
+        // 1) VecFp (.2d and .4s) across all 4 arithmetic operations.
+        for double in [false, true] {
+            for op in [FpOp::Add, FpOp::Sub, FpOp::Mul, FpOp::Div] {
+                let (mut f, b, p, _) = start(&[Type::V128, Type::V128]);
+                let v = f
+                    .push(
+                        b,
+                        Op::VecFp {
+                            op,
+                            double,
+                            a: p[0],
+                            b: p[1],
+                        },
+                    )
+                    .unwrap();
+                finish(&mut f, b, v);
+                let args = if double {
+                    [pack_f64(3.25, -7.5), pack_f64(1.5, 2.0)]
+                } else {
+                    [
+                        pack_f32(3.25, -7.5, 11.0, 0.5),
+                        pack_f32(1.5, 2.0, -4.0, 0.25),
+                    ]
+                };
+                compare(&f, &args, &mut h);
+            }
+        }
+
+        // 2) VecFma (.2d and .4s, add and rev-sub) plus Dup64 / Dup32 / Insert32.
+        for double in [false, true] {
+            for sub in [false, true] {
+                let (mut f, b, p, _) = start(&[Type::V128, Type::V128, Type::V128]);
+                let bcast = f
+                    .push(
+                        b,
+                        Op::VecUnary(
+                            if double {
+                                VecUnary::Dup64
+                            } else {
+                                VecUnary::Dup32
+                            },
+                            p[1],
+                        ),
+                    )
+                    .unwrap();
+                let v = f
+                    .push(
+                        b,
+                        Op::VecFma {
+                            sub,
+                            double,
+                            a: p[0],
+                            b: bcast,
+                            c: p[2],
+                        },
+                    )
+                    .unwrap();
+                finish(&mut f, b, v);
+                let args = if double {
+                    [
+                        pack_f64(2.5, -3.5),
+                        pack_f64(4.0, 99.0),
+                        pack_f64(10.0, -20.0),
+                    ]
+                } else {
+                    [
+                        pack_f32(2.5, -3.5, 1.25, -0.5),
+                        pack_f32(4.0, 99.0, 88.0, 77.0),
+                        pack_f32(10.0, -20.0, 30.5, -40.25),
+                    ]
+                };
+                compare(&f, &args, &mut h);
+            }
+        }
+
+        // 3) VecFpToInt (.2d and .4s) across all 4 rounding modes + Extract32.
+        for double in [false, true] {
+            for rounding in 0u8..4 {
+                let (mut f, b, p, _) = start(&[Type::V128]);
+                let ints = f
+                    .push(
+                        b,
+                        Op::VecFpToInt {
+                            value: p[0],
+                            double,
+                            rounding,
+                        },
+                    )
+                    .unwrap();
+                let lane_idx = if double { 2 } else { 3 };
+                let e0 = f
+                    .push(b, Op::VecToInt(VecToInt::Extract32(0), ints))
+                    .unwrap();
+                let ek = f
+                    .push(b, Op::VecToInt(VecToInt::Extract32(lane_idx), ints))
+                    .unwrap();
+                let sum = f.push(b, Op::Int(IntOp::Add, e0, ek)).unwrap();
+                finish(&mut f, b, sum);
+                let arg = if double {
+                    pack_f64(2.5, -3.5)
+                } else {
+                    pack_f32(2.5, -3.5, 1.25, -1.75)
+                };
+                compare(&f, &[arg], &mut h);
+            }
+        }
+
+        // 4) Insert32 packs 4 scalar f32 lanes cleanly.
+        let (mut f, b, p, _) = start(&[Type::V128, Type::V128, Type::V128, Type::V128]);
+        let v1 = f.push(b, Op::Vec(VecOp::Insert32(1), p[0], p[1])).unwrap();
+        let v2 = f.push(b, Op::Vec(VecOp::Insert32(2), v1, p[2])).unwrap();
+        let v3 = f.push(b, Op::Vec(VecOp::Insert32(3), v2, p[3])).unwrap();
+        finish(&mut f, b, v3);
+        compare(
+            &f,
+            &[
+                u128::from(1.25f32.to_bits()),
+                u128::from((-2.5f32).to_bits()),
+                u128::from(3.75f32.to_bits()),
+                u128::from((-4.125f32).to_bits()),
+            ],
+            &mut h,
+        );
+    }
+
     // spec: A64-OPT-4, A64-OPT-6
     #[test]
     fn opt_back_floating_vector_bits_and_select_match_reference() {
