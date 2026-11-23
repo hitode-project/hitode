@@ -93,6 +93,18 @@ impl FpFact {
         dyadic_q: None,
     };
 
+    fn zero() -> Self {
+        Self {
+            finite: true,
+            binary32_exact: true,
+            f32_normal_or_zero: true,
+            f32_safe_nonzero: true,
+            lo: 0.0,
+            hi: 0.0,
+            dyadic_q: Some(ZERO_Q),
+        }
+    }
+
     fn is_zero(self) -> bool {
         self.finite && self.lo == 0.0 && self.hi == 0.0
     }
@@ -321,9 +333,27 @@ fn peel_i32_bits(defs: &[Option<Op>], mut v: Value) -> Value {
 }
 
 /// Evaluates `Op::Fp` abstractly and returns `(proved, fact)`.
-fn eval_fp(op: FpOp, a: FpFact, b: FpFact) -> (bool, FpFact) {
+fn eval_fp(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (bool, FpFact) {
     if !a.finite || !b.finite {
         return (false, FpFact::TOP);
+    }
+    if same_operands && op == FpOp::Sub {
+        // Any finite x satisfies x - x == +0.0 with no overflow or subnormal.
+        return (true, FpFact::zero());
+    }
+    if op == FpOp::Add && b.is_zero() {
+        let proved = a.binary32_exact
+            || a.f32_normal_or_zero
+            || a.dyadic_q.is_some_and(|q| q >= -1022)
+            || a.min_nonzero_abs() >= f64::MIN_POSITIVE;
+        return (proved, a);
+    }
+    if op == FpOp::Add && a.is_zero() {
+        let proved = b.binary32_exact
+            || b.f32_normal_or_zero
+            || b.dyadic_q.is_some_and(|q| q >= -1022)
+            || b.min_nonzero_abs() >= f64::MIN_POSITIVE;
+        return (proved, b);
     }
     let both_f32 = a.binary32_exact && b.binary32_exact;
     let (mut lo, mut hi, q_cand) = match op {
@@ -423,13 +453,19 @@ fn eval_fp(op: FpOp, a: FpFact, b: FpFact) -> (bool, FpFact) {
 }
 
 /// Evaluates `Op::X87Single` abstractly and returns `(proved_flags, fact)`.
-fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact) -> (u8, FpFact) {
+fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (u8, FpFact) {
     let mut flags = 0u8;
     if a.binary32_exact {
         flags |= SINGLE_A;
     }
     if b.binary32_exact {
         flags |= SINGLE_B;
+    }
+    if same_operands && op == FpOp::Sub && a.finite && a.binary32_exact {
+        return (
+            SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT,
+            FpFact::zero(),
+        );
     }
 
     // Even when unproved, a succeeding Op::X87Single always produces a finite,
@@ -812,7 +848,7 @@ pub(super) fn run(func: &mut Func) -> bool {
                 Op::Fp(fp_op, a, b, false) => {
                     let fa = fp_facts[a.0 as usize].unwrap_or(FpFact::TOP);
                     let fb = fp_facts[b.0 as usize].unwrap_or(FpFact::TOP);
-                    let (proved, _) = eval_fp(fp_op, fa, fb);
+                    let (proved, _) = eval_fp(fp_op, fa, fb, a == b);
                     if proved {
                         *op = Op::Fp(fp_op, a, b, true);
                         changed = true;
@@ -821,7 +857,7 @@ pub(super) fn run(func: &mut Func) -> bool {
                 Op::X87Single(fp_op, a, b, cur) => {
                     let fa = fp_facts[a.0 as usize].unwrap_or(FpFact::TOP);
                     let fb = fp_facts[b.0 as usize].unwrap_or(FpFact::TOP);
-                    let (proved, _) = eval_x87_single(fp_op, fa, fb);
+                    let (proved, _) = eval_x87_single(fp_op, fa, fb, a == b);
                     let merged = cur | proved;
                     if merged != cur {
                         *op = Op::X87Single(fp_op, a, b, merged);
@@ -1022,8 +1058,8 @@ fn eval_fp_op(
                 }
             }
         }
-        Op::Fp(fp_op, a, b, _) => eval_fp(fp_op, get_fp(a), get_fp(b)).1,
-        Op::X87Single(fp_op, a, b, _) => eval_x87_single(fp_op, get_fp(a), get_fp(b)).1,
+        Op::Fp(fp_op, a, b, _) => eval_fp(fp_op, get_fp(a), get_fp(b), a == b).1,
+        Op::X87Single(fp_op, a, b, _) => eval_x87_single(fp_op, get_fp(a), get_fp(b), a == b).1,
         Op::X87Load {
             bits,
             denormal,
