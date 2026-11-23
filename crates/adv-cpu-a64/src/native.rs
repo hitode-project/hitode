@@ -200,6 +200,10 @@ pub(crate) struct Diagnostics {
     pub resident_refusals_by_reason: std::collections::BTreeMap<ResidentCold, u64>,
     pub resident_demotions_by_reason: std::collections::BTreeMap<ResidentCold, u64>,
     pub resident_page_crossings: u64,
+    /// `Block(0)` numerical domain guard misses reported to the owner (never `Validation`).
+    pub resident_domain_guard_misses: u64,
+    /// Numerical domain guards refused after cumulative profitability failed.
+    pub resident_domain_guard_refusals: u64,
     pub plan_events: std::collections::BTreeMap<&'static str, u64>,
     pub sensor_decisions: std::collections::BTreeMap<&'static str, u64>,
     /// Fills of the whole indirect table, which also reset the shadow stack.

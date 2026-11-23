@@ -256,6 +256,143 @@ impl Emitter<'_> {
         self.restore_environment(bytes, fallback);
     }
 
+    /// Lower one `Block(0)` numerical domain guard predicate.
+    pub(super) fn domain_guard(&mut self, kind: super::DomainGuardKind, ordinal: u8) {
+        let miss = if self.resident {
+            *self.domain_guard_misses[usize::from(ordinal)].get_or_insert_with(|| self.asm.label())
+        } else {
+            self.fail()
+        };
+        let start = self.asm.offset();
+        match kind {
+            super::DomainGuardKind::FpWindow {
+                value,
+                min_exp,
+                max_exp,
+                exact_f32,
+            } => {
+                let v = self.vr(value, A);
+                let min_biased = (min_exp + 1023) as u32;
+                let span = (max_exp - min_exp + 1) as u32;
+                let ok = self.asm.label();
+                self.asm
+                    .emit_all(&[fmov_from_v(X, T, v), ubfx(X, U, T, 52, 11)]);
+                if min_biased != 0 {
+                    self.asm.emit(super::sub_imm(W, U, U, min_biased, false));
+                }
+                self.asm.emit(cmp_imm(W, U, span, false));
+                self.asm.b_cond(Cond::Lo, ok);
+                self.asm.emit(lsl_imm(X, T, T, 1));
+                self.asm.cbz(X, true, T, miss);
+                self.asm.bind(ok);
+                if exact_f32 {
+                    self.asm.emit_all(&[
+                        unary(Unary::Narrow, C, v),
+                        unary(Unary::Widen, C, C),
+                        fcmp(v, C),
+                    ]);
+                    self.asm.b_cond(Cond::Ne, miss);
+                }
+            }
+            super::DomainGuardKind::SameSign { a, b } => {
+                let a = self.vr(a, A);
+                let b = self.vr(b, B);
+                let ok = self.asm.label();
+                self.asm.emit(fcmp_zero(a));
+                self.asm.b_cond(Cond::Eq, ok);
+                self.asm.emit(fcmp_zero(b));
+                self.asm.b_cond(Cond::Eq, ok);
+                self.asm.emit_all(&[
+                    fmov_from_v(X, T, a),
+                    fmov_from_v(X, U, b),
+                    eor(X, T, T, U, Lsl, 0),
+                ]);
+                self.asm.tbz(true, T, 63, miss);
+                self.asm.bind(ok);
+            }
+            super::DomainGuardKind::FpLe { value, bound_bits } => {
+                let v = self.vr(value, A);
+                self.imm(T, bound_bits);
+                self.asm.emit_all(&[super::fmov_to_v(X, C, T), fcmp(v, C)]);
+                self.asm.b_cond(Cond::Hi, miss);
+            }
+            super::DomainGuardKind::U32Le { value, max } => {
+                let r = self.gp(value, T);
+                if let Some((imm, shift)) = super::add_immediate(u64::from(max)) {
+                    self.asm.emit(cmp_imm(W, r, imm, shift));
+                } else {
+                    self.imm(U, u64::from(max));
+                    self.asm.emit(cmp(W, r, U, Lsl, 0));
+                }
+                self.asm.b_cond(Cond::Hi, miss);
+            }
+        }
+        self.domain_guard_words += self.words_since(start);
+    }
+
+    /// Leave an entry whose numerical domain guard failed before any guest side
+    /// effect, restoring entry countdown and Tier-1 state.
+    pub(super) fn domain_misses_tail(
+        &mut self,
+        bytes: u64,
+        refund: u32,
+        miss: Label,
+        fallback: Label,
+    ) {
+        let guards = std::mem::take(&mut self.domain_guard_misses);
+        if guards.iter().all(Option::is_none) {
+            return;
+        }
+        let restore = self.asm.label();
+        let triggered = self.asm.label();
+        let misses_ptr = self.asm.label();
+        self.domain_misses_slot = Some(misses_ptr);
+        for (ordinal, label) in guards.into_iter().enumerate() {
+            let Some(label) = label else {
+                continue;
+            };
+            let counter = self.asm.label();
+            let report = self.asm.label();
+            self.asm.bind(label);
+            self.asm.ldr_literal(S2, misses_ptr);
+            self.asm.emit_all(&[
+                ldr(X, S3, S2, 0),
+                add_imm(X, S3, S3, 1, false),
+                str(X, S3, S2, 0),
+            ]);
+            self.domain_sensors
+                .push((ordinal as u8, self.asm.offset(), counter));
+            runtime::emit_sensor(&mut self.asm, counter, S2, S3, report);
+            self.asm.b(restore);
+            self.asm.bind(report);
+            self.imm(S3, ordinal as u64);
+            self.asm.b(triggered);
+            self.asm.bind(counter);
+            self.asm.emit_all(&[0, 0]);
+        }
+        self.asm.bind(misses_ptr);
+        self.asm.emit_all(&[0, 0]);
+        self.asm.bind(triggered);
+        self.refund_entry_count(refund);
+        self.restore_environment(bytes, miss);
+        self.asm.bind(restore);
+        self.refund_entry_count(refund);
+        self.restore_environment(bytes, fallback);
+    }
+
+    fn refund_entry_count(&mut self, refund: u32) {
+        if refund == 0 {
+            return;
+        }
+        if let Some((imm, shift)) = super::add_immediate(u64::from(refund)) {
+            self.asm
+                .emit(add_imm(X, super::COUNT, super::COUNT, imm, shift));
+        } else {
+            self.imm(T, u64::from(refund));
+            self.asm.emit(add(X, super::COUNT, super::COUNT, T, Lsl, 0));
+        }
+    }
+
     fn restore_environment(&mut self, bytes: u64, target: Label) {
         self.asm.emit(add_imm(X, S4, RT, ENTRY, false));
         for i in (0..8).step_by(2) {

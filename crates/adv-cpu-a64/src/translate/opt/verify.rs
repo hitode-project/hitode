@@ -2,7 +2,10 @@
 //! records, and the effect-point invariant of A64-OPT-5. A failure is a bug in
 //! the front end or a pass, so translation asserts success.
 
-use super::ir::{Block, End, Func, MAX_PLAIN_FACTS, Op, RecordId, Source, Type, Value};
+use super::ir::{
+    Block, DomainGuardKind, End, Func, MAX_DOMAIN_GUARDS, MAX_PLAIN_FACTS, Op, RecordId, Source,
+    Type, Value,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
@@ -123,6 +126,14 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
                         return Err(Error::Shape(Block(b as u32)));
                     }
                 }
+                Op::DomainGuard { ordinal, .. } => {
+                    if b != 0
+                        || usize::from(ordinal) >= func.domain_guards.len()
+                        || func.domain_guards.len() > MAX_DOMAIN_GUARDS
+                    {
+                        return Err(Error::Shape(Block(b as u32)));
+                    }
+                }
                 Op::Store { after, .. } => activate(after, (b, i + 2), false)?,
                 Op::PageCross { addr, width, .. } | Op::FrameDisjoint { addr, width, .. } => {
                     let mut next = i + 1;
@@ -214,6 +225,17 @@ fn typed(func: &Func, op: &Op) -> bool {
         Op::SseInput { a, b, .. } => is(a, Type::V128) && b.is_none_or(|b| is(b, Type::V128)),
         Op::Constant(..) | Op::Bits { .. } | Op::Validate | Op::ScopeWritten(_) => true,
         Op::PlainPage { addr, .. } | Op::PageCross { addr, .. } => is(addr, Type::I32),
+        Op::DomainGuard { kind, .. } => match kind {
+            DomainGuardKind::FpWindow {
+                value,
+                min_exp,
+                max_exp,
+                ..
+            } => is(value, Type::F64) && min_exp >= -1022 && max_exp <= 1023 && min_exp <= max_exp,
+            DomainGuardKind::SameSign { a, b } => is(a, Type::F64) && is(b, Type::F64),
+            DomainGuardKind::FpLe { value, .. } => is(value, Type::F64),
+            DomainGuardKind::U32Le { value, .. } => is(value, Type::I32),
+        },
         Op::FrameDisjoint {
             addr, base, lo, hi, ..
         } => is(addr, Type::I32) && is(base, Type::I32) && lo < hi,

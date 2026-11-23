@@ -22,6 +22,8 @@ pub(crate) struct Slot {
     pub rows: Cell<u64>,
     pub row_work: Cell<u64>,
     pub probation: Cell<u32>,
+    pub domain_sensor: [Cell<u32>; crate::policy::resident::MAX_DOMAIN_GUARDS],
+    pub domain_misses: Cell<u64>,
 }
 
 const _: () =
@@ -63,6 +65,11 @@ pub(crate) struct Layout<'a> {
     pub cold: usize,
     pub env_miss: usize,
     pub environment: &'a [(usize, usize)],
+    pub domain_miss: usize,
+    pub domain_fallback: usize,
+    pub domain_sensors: &'a [(u8, usize, usize)],
+    pub domain_misses_slot: Option<usize>,
+    pub domain_guard_words: u32,
     pub exit: usize,
     pub spill_cells: usize,
     pub probation_slot: usize,
@@ -112,6 +119,7 @@ pub(crate) struct Entry {
     pub form: usize,
     pub tail: usize,
     pub environment: usize,
+    pub domain: usize,
     pub probation: usize,
     pub split: Option<usize>,
     pub miss_counter: Option<MissCounter>,
@@ -138,6 +146,7 @@ pub(crate) fn emit(
     let retry_counter = asm.label();
     let miss = asm.label();
     let env = asm.label();
+    let domain = asm.label();
     let tail = asm.label();
     let probe = asm.label();
     let sample_counter = asm.label();
@@ -203,6 +212,14 @@ pub(crate) fn emit(
 
     asm.bind(env);
     guest_exit(&mut asm, head, Exit::Plan(PlanEvent::EnvironmentMiss));
+    asm.emit_all(&[
+        movk(X, r(0), (version as u16) << 8, 32),
+        orr(X, r(0), r(0), r(3), Lsl, 32),
+    ]);
+    asm.b(exit);
+
+    asm.bind(domain);
+    guest_exit(&mut asm, head, Exit::Plan(PlanEvent::DomainGuardMiss));
     asm.emit_all(&[
         movk(X, r(0), (version as u16) << 8, 32),
         orr(X, r(0), r(0), r(3), Lsl, 32),
@@ -289,7 +306,12 @@ pub(crate) fn emit(
     ];
     let (entry, probe, next, retry) =
         (address(entry), address(probe), address(next), address(miss));
-    let (tail, environment, probation) = (address(tail), address(env), address(probation));
+    let (tail, environment, domain, probation) = (
+        address(tail),
+        address(env),
+        address(domain),
+        address(probation),
+    );
     let mut words = asm.finish();
     for (from, to) in patches {
         words[(from - at) / 4] = branch(from, to);
@@ -308,6 +330,7 @@ pub(crate) fn emit(
         form: form_at,
         tail,
         environment,
+        domain,
         probation,
         split,
         miss_counter,

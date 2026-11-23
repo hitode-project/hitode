@@ -13,6 +13,7 @@ use adv_cpu_core::memory::PAGE_SIZE;
 
 pub(super) struct Resident<'a> {
     pub refused: &'a dyn Fn(u32) -> bool,
+    pub refused_domain: &'a dyn Fn(u32) -> bool,
     pub regions: &'a BTreeMap<RecordId, RecordId>,
     pub frame_guards: &'a std::collections::BTreeSet<RecordId>,
     pub frame_range: Option<(i32, i32)>,
@@ -112,6 +113,15 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
                 f(b);
             }
         }
+        Op::DomainGuard { kind, .. } => match kind {
+            crate::translate::opt::ir::DomainGuardKind::FpWindow { value: a, .. }
+            | crate::translate::opt::ir::DomainGuardKind::FpLe { value: a, .. }
+            | crate::translate::opt::ir::DomainGuardKind::U32Le { value: a, .. } => f(a),
+            crate::translate::opt::ir::DomainGuardKind::SameSign { a, b } => {
+                f(a);
+                f(b);
+            }
+        },
         Op::Snapshot(a)
         | Op::IntUnary(_, a)
         | Op::Bits { value: a, .. }

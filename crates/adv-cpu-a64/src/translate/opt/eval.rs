@@ -9,8 +9,8 @@ use adv_cpu_core::Memory;
 use adv_cpu_core::integer::{self, CF, OF, PF, ZF};
 
 use super::ir::{
-    Block, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, RecordId, SINGLE_EXACT,
-    SINGLE_RESULT, Type, Value, VecOp, VecToInt, VecUnary,
+    Block, DomainGuardKind, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, RecordId,
+    SINGLE_EXACT, SINGLE_RESULT, Type, Value, VecOp, VecToInt, VecUnary,
 };
 use super::recovery::{Location, Recipe};
 
@@ -434,6 +434,35 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                     && !memory.shared_range(addr, bytes as usize)
             };
             if !plain {
+                return None;
+            }
+            0
+        }
+        Op::DomainGuard { kind, .. } => {
+            let ok = match kind {
+                DomainGuardKind::FpWindow {
+                    value,
+                    min_exp,
+                    max_exp,
+                    exact_f32,
+                } => {
+                    let x = f(value);
+                    let bits = x.to_bits();
+                    let exp = ((bits >> 52) & 0x7ff) as i16 - 1023;
+                    x.is_finite()
+                        && (x == 0.0 || (exp >= min_exp && exp <= max_exp))
+                        && (!exact_f32 || f64::from(x as f32) == x)
+                }
+                DomainGuardKind::SameSign { a, b } => {
+                    let (a, b) = (f(a), f(b));
+                    a == 0.0 || b == 0.0 || a.is_sign_positive() == b.is_sign_positive()
+                }
+                DomainGuardKind::FpLe { value, bound_bits } => {
+                    f(value) <= f64::from_bits(bound_bits)
+                }
+                DomainGuardKind::U32Le { value, max } => (get(value) as u32) <= max,
+            };
+            if !ok {
                 return None;
             }
             0

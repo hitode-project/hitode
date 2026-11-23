@@ -4722,6 +4722,120 @@ pub(in crate::translate) mod opt_back {
             };
             compare(&f, &[bits], &mut h);
         }
+        // Entry DomainGuard predicates match eval on both passing and failing inputs.
+        for exact_f32 in [false, true] {
+            let (mut f, b, p, entry) = start(&[Type::F64]);
+            f.domain_guards.push(1);
+            f.push(
+                b,
+                Op::DomainGuard {
+                    kind: DomainGuardKind::FpWindow {
+                        value: p[0],
+                        min_exp: -125,
+                        max_exp: 20,
+                        exact_f32,
+                    },
+                    ordinal: 0,
+                },
+            );
+            let exit = finish(&mut f, b, p[0]);
+            for (x, expect_ok) in [
+                (0.0f64, true),
+                (-0.0, true),
+                (1.5, true),
+                (-1024.0, true),
+                (1.0 + 2.0f64.powi(-30), !exact_f32),
+                (f64::from(f32::MIN_POSITIVE), false),
+                (2.0f64.powi(21), false),
+                (f64::INFINITY, false),
+                (f64::NAN, false),
+            ] {
+                let got = compare(&f, &[u128::from(x.to_bits())], &mut h);
+                assert_eq!(
+                    got.record,
+                    if expect_ok { exit } else { entry },
+                    "FpWindow(exact_f32={exact_f32}) on {x:?}"
+                );
+            }
+        }
+        {
+            let (mut f, b, p, entry) = start(&[Type::F64, Type::F64]);
+            f.domain_guards.push(2);
+            f.push(
+                b,
+                Op::DomainGuard {
+                    kind: DomainGuardKind::SameSign { a: p[0], b: p[1] },
+                    ordinal: 0,
+                },
+            );
+            let exit = finish(&mut f, b, p[0]);
+            for (x, y, expect_ok) in [
+                (0.0f64, 1.0f64, true),
+                (-0.0, 1.0, true),
+                (1.0, -0.0, true),
+                (1.5, 2.5, true),
+                (-1.5, -2.5, true),
+                (1.5, -2.5, false),
+                (-1.5, 2.5, false),
+            ] {
+                let got = compare(
+                    &f,
+                    &[u128::from(x.to_bits()), u128::from(y.to_bits())],
+                    &mut h,
+                );
+                assert_eq!(got.record, if expect_ok { exit } else { entry });
+            }
+        }
+        {
+            let (mut f, b, p, entry) = start(&[Type::F64]);
+            f.domain_guards.push(3);
+            f.push(
+                b,
+                Op::DomainGuard {
+                    kind: DomainGuardKind::FpLe {
+                        value: p[0],
+                        bound_bits: 100.0f64.to_bits(),
+                    },
+                    ordinal: 0,
+                },
+            );
+            let exit = finish(&mut f, b, p[0]);
+            for (x, expect_ok) in [
+                (-10.0f64, true),
+                (100.0, true),
+                (100.0f64.next_up(), false),
+                (f64::INFINITY, false),
+                (f64::NAN, false),
+            ] {
+                let got = compare(&f, &[u128::from(x.to_bits())], &mut h);
+                assert_eq!(got.record, if expect_ok { exit } else { entry });
+            }
+        }
+        {
+            let (mut f, b, p, entry) = start(&[Type::I32]);
+            f.domain_guards.push(4);
+            f.push(
+                b,
+                Op::DomainGuard {
+                    kind: DomainGuardKind::U32Le {
+                        value: p[0],
+                        max: 1 << 20,
+                    },
+                    ordinal: 0,
+                },
+            );
+            let exit = finish(&mut f, b, p[0]);
+            for (n, expect_ok) in [
+                (0u32, true),
+                (64, true),
+                (1 << 20, true),
+                ((1 << 20) + 1, false),
+                (u32::MAX, false),
+            ] {
+                let got = compare(&f, &[u128::from(n)], &mut h);
+                assert_eq!(got.record, if expect_ok { exit } else { entry });
+            }
+        }
     }
 
     // spec: A64-OPT-4, A64-OPT-6, A64-OPT-7, A64-MEM-10

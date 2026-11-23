@@ -302,6 +302,13 @@ impl Native {
                 PlanEvent::EnvironmentMiss => {
                     self.environment_miss(cpu.eip, (payload >> 8) as usize, payload as u8 as usize);
                 }
+                PlanEvent::DomainGuardMiss => {
+                    self.domain_guard_miss(
+                        cpu.eip,
+                        (payload >> 8) as usize,
+                        payload as u8 as usize,
+                    );
+                }
                 PlanEvent::OfferReady => exit = Exit::Computation,
                 PlanEvent::RowTargetMiss => self.observe_row_target(memory, cpu, payload),
                 PlanEvent::RowGuardMiss => self.observe_row_failure(cpu.eip),
@@ -1218,6 +1225,7 @@ impl Native {
             checked,
             all_checked: self.checks != Checks::Adaptive,
             refused: head.refused.clone(),
+            refused_domains: head.refused_domains.clone(),
             cuts: head.cuts.clone(),
             count_entries: self.count_resident_entries,
         });
@@ -1269,6 +1277,56 @@ impl Native {
         let site = self.code.environment_failed(eip, index, fact);
         self.count_sensor_decision("environment_rebuild");
         self.refuse_resident_fact(eip, site);
+    }
+
+    pub(super) fn domain_guard_miss(&mut self, eip: u32, index: usize, ordinal: usize) {
+        self.diagnostics.resident_domain_guard_misses += 1;
+        let Some((guard_id, entries, iters, misses, guard_words, saved_per_iter)) =
+            self.code.domain_guard_stats(eip, index, ordinal)
+        else {
+            return;
+        };
+        let (hist_entries, hist_iters) = self
+            .plans
+            .resident(eip)
+            .and_then(|head| head.domain_history.get(index).copied())
+            .unwrap_or((0, 0));
+        let total_entries = hist_entries.max(entries);
+        let total_iters = hist_iters.max(iters);
+        if crate::policy::resident::domain_guard_pays(
+            total_entries,
+            total_iters,
+            misses,
+            guard_words,
+            saved_per_iter,
+        ) {
+            let next_period = misses
+                .saturating_mul(2)
+                .clamp(u64::from(crate::policy::resident::DOMAIN_MISS_SAMPLE), 256)
+                as u32;
+            self.code
+                .reset_domain_sensor(eip, index, ordinal, next_period);
+            self.count_sensor_decision("domain_guard_kept");
+        } else {
+            self.diagnostics.resident_domain_guard_refusals += 1;
+            self.count_sensor_decision("domain_guard_refused");
+            self.refuse_domain_guard(eip, guard_id);
+        }
+    }
+
+    pub(super) fn refuse_domain_guard(&mut self, eip: u32, guard_id: u32) {
+        let versions = &self.code.resident(eip).unwrap().versions;
+        let affected = versions.iter().enumerate().filter_map(|(i, version)| {
+            (version.enabled && version.domain_guards.contains(&guard_id)).then_some(i)
+        });
+        if self
+            .plans
+            .resident_mut(eip)
+            .unwrap()
+            .refuse_domain(guard_id, affected)
+        {
+            self.rebuild_resident(eip);
+        }
     }
 
     pub(super) fn refuse_resident_fact(&mut self, eip: u32, site: u32) {
@@ -1508,6 +1566,8 @@ impl Native {
             at,
             form.lowered.key,
             std::mem::take(&mut form.built.plain_sites),
+            std::mem::take(&mut form.built.func.domain_guards),
+            form.built.func.domain_saved_per_iter,
             recovery,
             form.lowered.iteration_retired,
             gate,
@@ -1563,6 +1623,11 @@ impl Native {
             return;
         };
         if probation.profitable(entries, retired) {
+            self.plans.resident_mut(eip).unwrap().archive_domain(
+                index,
+                entries,
+                retired / probation.iteration_retired,
+            );
             self.code.sync();
             self.count_sensor_decision("probation_kept");
         } else {
@@ -1956,6 +2021,7 @@ impl Native {
             checked: FxHashSet::default(),
             all_checked: false,
             refused: FxHashSet::default(),
+            refused_domains: FxHashSet::default(),
             cuts: FxHashSet::default(),
             count_entries: false,
         });

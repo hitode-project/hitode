@@ -13,7 +13,7 @@ use super::recovery::IrRecord;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Value(pub u32);
 
-pub(crate) use crate::policy::resident::MAX_PLAIN_FACTS;
+pub(crate) use crate::policy::resident::{MAX_DOMAIN_GUARDS, MAX_PLAIN_FACTS};
 
 /// Disjoint byte ranges in wrapping 32-bit guest address arithmetic.
 pub(crate) fn disjoint_ranges(a: u32, aw: u32, b: u32, bw: u32) -> bool {
@@ -181,6 +181,26 @@ impl FlagKind {
     }
 }
 
+/// Predicates for `Block(0)` entry domain guards (`Op::DomainGuard`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DomainGuardKind {
+    /// `value` (F64) is finite and either `±0.0` or `2^min_exp <= |value| < 2^(max_exp + 1)`.
+    /// When `exact_f32` is true, `f64::from(value as f32) == value` must also hold.
+    FpWindow {
+        value: Value,
+        min_exp: i16,
+        max_exp: i16,
+        exact_f32: bool,
+    },
+    /// `a` and `b` (F64) do not have opposite nonzero signs:
+    /// `a == 0.0 || b == 0.0 || signbit(a) == signbit(b)`.
+    SameSign { a: Value, b: Value },
+    /// `value` (F64) is ordered and `<= f64::from_bits(bound_bits)`.
+    FpLe { value: Value, bound_bits: u64 },
+    /// `value` (I32, unsigned) `<= max`.
+    U32Le { value: Value, max: u32 },
+}
+
 /// Proof bits for [`Op::X87Single`].
 pub(crate) const SINGLE_A: u8 = 1;
 pub(crate) const SINGLE_B: u8 = 2;
@@ -303,6 +323,13 @@ pub(crate) enum Op {
         bytes: u32,
         write: bool,
     },
+    /// An entry numerical domain guard in `Block(0)` before any guest side
+    /// effect. Failure routes through the separate `DomainGuardMiss` path
+    /// keyed by `func.domain_guards[ordinal]`, never body `Validation`.
+    DomainGuard {
+        kind: DomainGuardKind,
+        ordinal: u8,
+    },
     /// Protects a crossing store whose region already read those bytes.
     /// Recovers to `record` if either page is not ordinary and writable.
     PageCross {
@@ -366,6 +393,12 @@ impl Op {
         let list: [Option<Value>; 3] = match *self {
             Op::Constant(..) | Op::Validate | Op::ScopeWritten(_) => [None; 3],
             Op::SseInput { a, b, .. } => [Some(a), b, None],
+            Op::DomainGuard { kind, .. } => match kind {
+                DomainGuardKind::FpWindow { value: a, .. }
+                | DomainGuardKind::FpLe { value: a, .. }
+                | DomainGuardKind::U32Le { value: a, .. } => [Some(a), None, None],
+                DomainGuardKind::SameSign { a, b } => [Some(a), Some(b), None],
+            },
             Op::Snapshot(a)
             | Op::IntUnary(_, a)
             | Op::Bits { value: a, .. }
@@ -450,6 +483,7 @@ impl Op {
                     | Op::Store { .. }
                     | Op::X87Load { proved: false, .. }
                     | Op::SseInput { .. }
+                    | Op::DomainGuard { .. }
             )
     }
 
@@ -592,6 +626,10 @@ pub(crate) struct Func {
     pub calls: Vec<u32>,
     /// Guest EIPs of resident checks whose operations produce a value.
     pub cold_pcs: BTreeMap<Value, u32>,
+    /// Distinct `Block(0)` numerical domain guard IDs (separate from `plain_sites`).
+    pub domain_guards: Vec<u32>,
+    /// Estimated host instruction words saved per loop iteration by `domain_guards`.
+    pub domain_saved_per_iter: u32,
 }
 
 impl Func {
@@ -677,6 +715,7 @@ impl Func {
             | Op::Validate
             | Op::ScopeWritten(_)
             | Op::PlainPage { .. }
+            | Op::DomainGuard { .. }
             | Op::PageCross { .. }
             | Op::FrameDisjoint { .. } => {
                 return None;

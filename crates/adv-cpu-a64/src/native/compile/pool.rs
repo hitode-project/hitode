@@ -38,6 +38,7 @@ pub(in crate::native) struct Request {
     pub checked: FxHashSet<u32>,
     pub all_checked: bool,
     pub refused: FxHashSet<u32>,
+    pub refused_domains: FxHashSet<u32>,
     pub cuts: FxHashSet<u32>,
     pub count_entries: bool,
 }
@@ -69,6 +70,11 @@ impl ResidentForm {
             cold: lowered.cold,
             env_miss: lowered.env_miss,
             environment: &lowered.environment,
+            domain_miss: lowered.domain_miss,
+            domain_fallback: lowered.domain_fallback,
+            domain_sensors: &lowered.domain_sensors,
+            domain_misses_slot: lowered.domain_misses_slot,
+            domain_guard_words: lowered.domain_guard_words,
             exit: lowered.exit,
             spill_cells: lowered.spill_cells,
             probation_slot: lowered.probation_slot,
@@ -156,6 +162,7 @@ fn compile(request: Request) -> Compiled {
         checked,
         all_checked,
         refused,
+        refused_domains,
         cuts,
         count_entries,
     } = request;
@@ -202,12 +209,13 @@ fn compile(request: Request) -> Compiled {
             &row_unit
         };
         let build = |unit: &Unit, proof: Option<&Proof>| {
-            front::build_with(
+            front::build_with_domains(
                 unit,
                 proof,
                 &at,
                 &|pc| all_checked || checked.contains(&pc),
                 &|pc| refused.contains(&pc),
+                &|id| refused_domains.contains(&id),
             )
         };
         let scoped = crate::translate::opt::computation::rows::Domain::build(&rows.trace, &at.regs)

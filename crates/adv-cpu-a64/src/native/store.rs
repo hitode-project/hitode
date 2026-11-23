@@ -169,6 +169,10 @@ pub(super) struct ResidentVersion<R> {
     pub cold: usize,
     pub retry: usize,
     pub environment: Vec<usize>,
+    pub domain_fallback: usize,
+    pub domain_guards: Vec<u32>,
+    pub domain_guard_words: u32,
+    pub domain_saved_per_iter: u32,
     pub at: CpuState,
     pub key: Key,
     pub plain_sites: Vec<u32>,
@@ -436,6 +440,8 @@ impl<R> CodeStore<R> {
         at: CpuState,
         key: Key,
         plain_sites: Vec<u32>,
+        domain_guards: Vec<u32>,
+        domain_saved_per_iter: u32,
         recovery: R,
         iteration_retired: u32,
         gate: Option<OfferEntry>,
@@ -459,6 +465,9 @@ impl<R> CodeStore<R> {
         slot.probation.set(probation.unwrap_or_default());
         for counter in &slot.env {
             counter.set(misses);
+        }
+        for counter in &slot.domain_sensor {
+            counter.set(crate::policy::resident::DOMAIN_MISS_SAMPLE);
         }
         let base = self.cache.next();
         let mut entry = ingress::emit(
@@ -503,10 +512,22 @@ impl<R> CodeStore<R> {
         for (ordinal, &(_, offset)) in layout.environment.iter().enumerate() {
             literal(words, offset, slot.env[ordinal].as_ptr() as u64);
         }
+        for &(ordinal, _, offset) in layout.domain_sensors {
+            literal(
+                words,
+                offset,
+                slot.domain_sensor[usize::from(ordinal)].as_ptr() as u64,
+            );
+        }
+        if let Some(offset) = layout.domain_misses_slot {
+            literal(words, offset, slot.domain_misses.as_ptr() as u64);
+        }
         for (offset, target) in [
             (layout.exit, entry.tail),
             (layout.miss, entry.retry),
             (layout.env_miss, entry.environment),
+            (layout.domain_miss, entry.domain),
+            (layout.domain_fallback, fallback),
             (layout.cold, fallback),
         ] {
             words[offset] = branch(entry.form + offset * 4, target);
@@ -603,6 +624,10 @@ impl<R> CodeStore<R> {
                 .iter()
                 .map(|&(sensor, _)| entry.form + sensor)
                 .collect(),
+            domain_fallback: entry.form + layout.domain_fallback * 4,
+            domain_guards,
+            domain_guard_words: layout.domain_guard_words,
+            domain_saved_per_iter,
             at,
             key,
             plain_sites,
@@ -760,6 +785,17 @@ impl<R> CodeStore<R> {
             self.cache.patch(version.next, branch(version.next, next));
             self.cache
                 .patch(version.cold, branch(version.cold, fallback));
+            let general = site.versions.iter().enumerate().find_map(|(j, candidate)| {
+                (j != index
+                    && candidate.enabled
+                    && candidate.domain_guards.is_empty()
+                    && candidate.row_target.is_none())
+                .then_some(candidate.entry)
+            });
+            self.cache.patch(
+                version.domain_fallback,
+                branch(version.domain_fallback, general.unwrap_or(fallback)),
+            );
             let target =
                 if let Some(period) = period.filter(|_| tail && version.row_target.is_none()) {
                     version.slot.retry.set(period);
@@ -800,8 +836,20 @@ impl<R> CodeStore<R> {
         if let Some((_, [_, point])) = site.row_retry {
             self.cache.patch(point, branch(point, target));
         }
-        for version in &site.versions {
+        for (index, version) in site.versions.iter().enumerate() {
             self.cache.patch(version.cold, branch(version.cold, target));
+            let has_general = site.versions.iter().enumerate().any(|(j, candidate)| {
+                j != index
+                    && candidate.enabled
+                    && candidate.domain_guards.is_empty()
+                    && candidate.row_target.is_none()
+            });
+            if !has_general {
+                self.cache.patch(
+                    version.domain_fallback,
+                    branch(version.domain_fallback, target),
+                );
+            }
             if let Some(point) = version.proved_cold {
                 self.cache.patch(point, branch(point, target));
             }
@@ -1120,6 +1168,51 @@ impl<R> CodeStore<R> {
         self.cache
             .patch(version.environment[fact], b(runtime::SENSOR_BYTES as i32));
         version.plain_sites[fact]
+    }
+
+    pub(super) fn domain_guard_stats(
+        &self,
+        eip: u32,
+        version: usize,
+        ordinal: usize,
+    ) -> Option<(u32, u64, u64, u64, u32, u32)> {
+        let version = self
+            .chains
+            .get(&eip)?
+            .resident
+            .as_ref()?
+            .versions
+            .get(version)?;
+        let &guard_id = version.domain_guards.get(ordinal)?;
+        let entries = version.slot.entries.get();
+        let iters = version.iterations(version.slot.countdown[1].get());
+        let misses = version.slot.domain_misses.get();
+        Some((
+            guard_id,
+            entries,
+            iters,
+            misses,
+            version.domain_guard_words,
+            version.domain_saved_per_iter,
+        ))
+    }
+
+    pub(super) fn reset_domain_sensor(
+        &self,
+        eip: u32,
+        version: usize,
+        ordinal: usize,
+        period: u32,
+    ) {
+        if let Some(version) = self
+            .chains
+            .get(&eip)
+            .and_then(|chain| chain.resident.as_ref())
+            .and_then(|site| site.versions.get(version))
+            && let Some(cell) = version.slot.domain_sensor.get(ordinal)
+        {
+            cell.set(period);
+        }
     }
 
     pub(super) fn measure_cold(&mut self, eip: u32, period: Option<u32>) {
