@@ -918,15 +918,8 @@ impl Translator<'_> {
                     b
                 };
                 // TwoSum.
-                self.emit_all(&[
-                    dfloat(Float::Fadd, V2, a, b),
-                    dfloat(Float::Fsub, V3, V2, a),
-                    dfloat(Float::Fsub, V4, V2, V3),
-                    dfloat(Float::Fsub, V4, a, V4),
-                    dfloat(Float::Fsub, V3, b, V3),
-                    dfloat(Float::Fadd, V3, V4, V3),
-                    fmov_from_v(X, X16, V3),
-                ]);
+                crate::translate::lower::fp_class::two_sum(self.asm, a, b, V2, V3, V4);
+                self.emit(fmov_from_v(X, X16, V3));
             }
             Arith::Mul => self.emit_all(&[
                 dfloat(Float::Fmul, V2, a, b),

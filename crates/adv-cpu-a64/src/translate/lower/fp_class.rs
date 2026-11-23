@@ -253,3 +253,33 @@ pub(in crate::translate) fn snan(asm: &mut Asm, input: VReg, bits: Reg, fail: La
     asm.tbz(false, bits, 51, fail);
     asm.bind(clean);
 }
+
+/// TwoSum residual: given `s = fl(a + b)`, writes `(a + b) - s` into `e` using
+/// `tmp` as scratch. `e` and `tmp` must be distinct from `a`, `b`, `s` and each
+/// other.
+pub(in crate::translate) fn two_sum_error(
+    asm: &mut Asm,
+    a: VReg,
+    b: VReg,
+    s: VReg,
+    e: VReg,
+    tmp: VReg,
+) {
+    debug_assert_ne!(e, tmp);
+    debug_assert!(![a, b, s].contains(&e));
+    debug_assert!(![a, b, s].contains(&tmp));
+    asm.emit_all(&[
+        dfloat(Float::Fsub, tmp, s, a),
+        dfloat(Float::Fsub, e, s, tmp),
+        dfloat(Float::Fsub, e, a, e),
+        dfloat(Float::Fsub, tmp, b, tmp),
+        dfloat(Float::Fadd, e, e, tmp),
+    ]);
+}
+
+/// TwoSum: writes `s = fl(a + b)` and its exact residual `(a + b) - s` into
+/// `e` using `tmp` as scratch.
+pub(in crate::translate) fn two_sum(asm: &mut Asm, a: VReg, b: VReg, s: VReg, e: VReg, tmp: VReg) {
+    asm.emit(dfloat(Float::Fadd, s, a, b));
+    two_sum_error(asm, a, b, s, e, tmp);
+}

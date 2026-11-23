@@ -712,14 +712,9 @@ impl Emitter<'_> {
             b = B;
         }
         match op {
-            FpOp::Add | FpOp::Sub => self.asm.emit_all(&[
-                dfloat(Fadd, C, a, b),
-                dfloat(Fsub, D, C, a),
-                dfloat(Fsub, E, C, D),
-                dfloat(Fsub, E, a, E),
-                dfloat(Fsub, D, b, D),
-                dfloat(Fadd, D, E, D),
-            ]),
+            FpOp::Add | FpOp::Sub => {
+                crate::translate::lower::fp_class::two_sum(&mut self.asm, a, b, C, D, E);
+            }
             FpOp::Mul => self
                 .asm
                 .emit_all(&[dfloat(Fmul, C, a, b), fnmsub(D, a, b, C)]),
