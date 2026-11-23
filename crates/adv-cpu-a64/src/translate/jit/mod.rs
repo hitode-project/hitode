@@ -156,6 +156,7 @@ pub struct Code {
     pub(crate) marks: Vec<Mark>,
     pub(crate) retired: u32,
     pub(crate) uses_permissions: bool,
+    pub(crate) far_overflow: bool,
     resident_links: bool,
     pub(crate) table_positions: Vec<(usize, usize)>,
     pub(crate) version: VersionLayout,
@@ -454,6 +455,7 @@ struct Translator<'a> {
     /// What each merge holds on arrival (`residency`).
     entry: Vec<residency::Entry>,
     uses_permissions: &'a mut bool,
+    far_overflow: &'a mut bool,
     /// The x87 run whose stack lives in host registers, if any.
     x87: x87::Cache,
     x87_scratch: &'a mut x87::Scratch,
@@ -573,6 +575,7 @@ impl Jit<'_> {
             marks,
             retired,
             uses_permissions,
+            far_overflow,
             resident_links,
             table_positions,
             version,
@@ -583,6 +586,7 @@ impl Jit<'_> {
         table_positions.clear();
         table_positions.resize(tables.len(), (0, 0));
         *uses_permissions = false;
+        *far_overflow = false;
         labels.clear();
         labels.extend((0..trace.len()).map(|_| asm.label()));
         sites.clear();
@@ -635,6 +639,7 @@ impl Jit<'_> {
             vector: simd::Vector::default(),
             entry: entries,
             uses_permissions,
+            far_overflow,
             x87: x87::Cache::for_trace(trace),
             x87_scratch,
             x87_sites: Vec::new(),
@@ -725,6 +730,7 @@ pub(crate) fn lower_computation<'a>(
     }
     .lower_form(unit, eip, true);
     (!code.uses_permissions
+        && !code.far_overflow
         && code.links.is_empty()
         && code
             .far
@@ -855,9 +861,12 @@ impl Translator<'_> {
             // Arrivals are canonical: the entry, or a return.
             let prepaid = trace.prepaid(index);
             self.state = State::CANONICAL;
-            if self.tier1 && index != 0 && self.facts.mask() != 0 {
-                let miss = self.fact_transfer(inst.pc, 0, None);
-                self.facts.guard(self.asm, miss);
+            if self.tier1 && index != 0 {
+                let guard = self.facts.project(facts::MXCSR);
+                if guard.mask() != 0 {
+                    let miss = self.fact_transfer(inst.pc, 0, None);
+                    guard.guard(self.asm, miss);
+                }
             }
             let leave = self.asm.label();
             let resume = self.computation.then(|| self.asm.label());
@@ -1591,14 +1600,29 @@ impl Translator<'_> {
         });
     }
 
-    fn mov_address(&mut self, reg: Reg, value: usize) {
-        let value = value as u64;
+    fn mov_u64(&mut self, reg: Reg, value: u64) {
         self.emit(movz(X, reg, value as u16, 0));
         for shift in [16, 32, 48] {
             let part = (value >> shift) as u16;
             if part != 0 {
                 self.emit(movk(X, reg, part, shift));
             }
+        }
+    }
+
+    fn mov_address(&mut self, reg: Reg, value: usize) {
+        self.mov_u64(reg, value as u64);
+    }
+
+    pub(super) fn x87_stubs(&self) -> Option<crate::translate::lower::X87Stubs> {
+        (!self.computation).then_some(self.stubs.x87).flatten()
+    }
+
+    pub(super) fn materialize_mmx(&mut self) {
+        if let Some(x87) = self.x87_stubs() {
+            self.far_call(x87.materialize_mmx);
+        } else {
+            crate::facts::materialize_mmx(self.asm);
         }
     }
 
@@ -2176,7 +2200,16 @@ impl Translator<'_> {
         self.asm.resolve();
         let words = self.asm.words_mut();
         for &(index, to) in self.far.iter() {
-            let offset = (to as i64 - (at + 4 * index) as i64) as i32;
+            let offset = to as i64 - (at + 4 * index) as i64;
+            let Some(offset) = i32::try_from(offset)
+                .ok()
+                .filter(|offset| (-(1 << 27)..(1 << 27)).contains(offset))
+            else {
+                // Only happens when a unit spills past a 128 MiB cache boundary;
+                // `CodeCache::append` rejects it and clears the cache.
+                *self.far_overflow = true;
+                return false;
+            };
             words[index] = if words[index] == bl(0) {
                 bl(offset)
             } else {

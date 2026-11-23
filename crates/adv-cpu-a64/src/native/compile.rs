@@ -141,6 +141,7 @@ impl Workspace {
             links: self.links(),
             internal_links: self.internal_links(),
             uses_permissions: self.code.uses_permissions,
+            far_overflow: self.code.far_overflow,
         }
     }
 

@@ -155,6 +155,14 @@ pub(in super::super) fn entry_facts(trace: &Trace) -> u64 {
             written = 0;
             top = 0;
         }
+        if matches!(inst.op, Op::Fild64(..)) {
+            mask |= facts::MMX | facts::ES;
+            top = top.wrapping_sub(1) & 7;
+            let slot = 1 << top;
+            slots |= slot & !written;
+            written |= slot;
+            continue;
+        }
         let Op::X87(x) = inst.op else { continue };
         mask |= facts::MMX | facts::ES;
         if matches!(
@@ -2512,7 +2520,7 @@ impl Translator<'_> {
     /// branching to `fail` unless the run may go on.
     fn x87_checks(&mut self, model: Model, need: Need, fail: Label, pending: Label) {
         if self.tier1 && (self.index != 0 || self.facts.mmx() != Some(0)) {
-            crate::facts::materialize_mmx(self.asm);
+            self.materialize_mmx();
         }
         self.x87_reload(model.delta);
         if need.pe {
@@ -2603,6 +2611,13 @@ impl Translator<'_> {
     /// `fail` unless a run may hold it, narrow if `narrow`; uses x0, x1,
     /// x16, x17, d0 and d1.
     fn x87_fetch(&mut self, r: usize, n: u8, narrow: bool, fail: Label) {
+        if let Some(x87) = self.x87_stubs() {
+            self.emit_all(&[movz(W, X0, r as u16, 0), movz(W, X2, u16::from(narrow), 0)]);
+            self.far_call(x87.fetch);
+            self.asm.cbz(W, true, X0, fail);
+            self.emit(vmov(true, v(n), V0));
+            return;
+        }
         self.x87_slot(r);
         self.emit_all(&[ldr(X, X0, X17, 0), ldrh(X1, X17, 8)]);
         let (zero, done) = self.pair_from_extended(X0, X1, n, narrow, fail);
@@ -2624,6 +2639,12 @@ impl Translator<'_> {
     /// Branches to `fail` unless physical register `r` holds what host
     /// register `n` does; uses x0 to x3, x16, x17, d0 and d1.
     fn x87_match(&mut self, r: usize, n: u8, fail: Label) {
+        if let Some(x87) = self.x87_stubs() {
+            self.emit_all(&[vmov(true, V0, v(n)), movz(W, X2, r as u16, 0)]);
+            self.far_call(x87.match_slot);
+            self.asm.cbz(W, true, X0, fail);
+            return;
+        }
         self.pair_to_extended(n, X0, X1);
         self.x87_slot(r);
         self.emit_all(&[ldr(X, X2, X17, 0), ldrh(X3, X17, 8), cmp(X, X0, X2, Lsl, 0)]);
@@ -2677,7 +2698,34 @@ impl Translator<'_> {
     /// Stores `model` with status word `status` into `CpuState`; uses x0
     /// to x2, x16, x17, d0 and d1, and x3 for shared cold bodies.
     pub(super) fn x87_publish(&mut self, model: Model, status: Reg) {
-        if model.shared {
+        if let Some(x87) = self.x87_stubs() {
+            let mut desc = u64::from(model.delta) << 40;
+            let mut modified = false;
+            for (r, slot) in model.slots.iter().enumerate() {
+                let bits = match *slot {
+                    Slot::Entry | Slot::Clean(_) => 0u64,
+                    Slot::Dirty(n) => {
+                        modified = true;
+                        (1 << 3) | u64::from(n)
+                    }
+                    Slot::Freed(Some(n)) => {
+                        modified = true;
+                        (2 << 3) | u64::from(n)
+                    }
+                    Slot::Freed(None) => {
+                        modified = true;
+                        3 << 3
+                    }
+                };
+                desc |= bits << (5 * r);
+            }
+            if modified {
+                desc |= 1 << 43;
+            }
+            self.mov_u64(X0, desc);
+            self.emit(mov(W, X1, status));
+            self.far_call(x87.publish);
+        } else if model.shared {
             let state = Model {
                 ip: None,
                 opcode: None,
@@ -2934,6 +2982,13 @@ impl Translator<'_> {
                 value,
             } => {
                 self.asm.bind(label);
+                if let Some(x87) = self.x87_stubs() {
+                    self.emit(movz(W, X0, u16::from(value), 0));
+                    self.far_call(x87.tags);
+                    self.asm.cbz(W, true, X0, fail);
+                    self.asm.b(done);
+                    return;
+                }
                 // Merges can make a read entry value dirty. A zero tag then
                 // requires a zero payload, so publication preserves its tag.
                 let mask = (0..8)
@@ -3102,7 +3157,7 @@ impl Translator<'_> {
             return;
         }
         self.emit(ldr(X, X5, RUNTIME, runtime::CPU_STATE));
-        let Some((hot, _, need)) = cold.next else {
+        let Some((hot, next_help, need)) = cold.next else {
             self.flush_simd();
             self.asm.b(cold.done);
             return;
@@ -3165,6 +3220,13 @@ impl Translator<'_> {
         }
         self.asm.b(hot);
         self.asm.bind(state_miss);
+        if !cold.after.cyclic
+            && !self.trace.merge[cold.index + 1]
+            && self.cacheable(cold.index + 1).is_some()
+        {
+            self.asm.b(next_help);
+            return;
+        }
         self.emit(msr_nzcv(X4));
         self.x87_value_dispatch(cold.index, leaf.is_some());
     }

@@ -7,6 +7,7 @@ pub(crate) mod tier1 {
     pub const LOOP_LIMIT: usize = 1024;
     pub const WIDE_WEIGHT: usize = 4;
     pub const MAX_DEPTH: u8 = 8;
+    pub const COLD_MAX_DEPTH: u8 = 1;
     pub const INLINE_ROOM: usize = 24;
     pub const INLINE_BODY_BYTES: u32 = 64;
     pub const NATIVE_REGION_MIN: u32 = 128;
@@ -17,7 +18,11 @@ pub(crate) mod tier1 {
     #[cfg(native)]
     pub const CHAIN_LEN: usize = 3;
     #[cfg(native)]
-    pub const CACHE_LEN: usize = 64 << 20;
+    pub const INITIAL_CACHE_LEN: usize = 8 << 20;
+    #[cfg(native)]
+    pub const FALLBACK_CACHE_LEN: usize = 64 << 20;
+    #[cfg(native)]
+    pub const MAX_CACHE_LEN: usize = 128 << 20;
     #[cfg(native)]
     pub const PROMOTION: u8 = 4;
     #[cfg(native)]

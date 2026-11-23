@@ -934,10 +934,17 @@ impl Translator<'_> {
         }
         self.pair_to_extended(g.dest, X0, X1);
         self.wide_ops(g.op, g.reverse, bail);
-        let (zero, done) = self.pair_from_extended(X0, X1, g.to, g.narrow, bail);
-        self.asm.bind(zero);
-        self.pair_zero(X1, g.to, bail);
-        self.asm.bind(done);
+        if let Some(x87) = self.x87_stubs() {
+            self.emit(movz(W, X2, u16::from(g.narrow), 0));
+            self.far_call(x87.pair_from_extended);
+            self.asm.cbz(W, true, X0, bail);
+            self.emit(vmov(true, v(g.to), V0));
+        } else {
+            let (zero, done) = self.pair_from_extended(X0, X1, g.to, g.narrow, bail);
+            self.asm.bind(zero);
+            self.pair_zero(X1, g.to, bail);
+            self.asm.bind(done);
+        }
         self.emit(ldrh(X8, X5, runtime::X87_CONTROL));
         self.pair_control();
         self.asm.b(g.join);
@@ -946,6 +953,17 @@ impl Translator<'_> {
     /// The extended encoding of host register `n` in `sig` and `sexp`;
     /// uses x16, x17, d0 and d1.
     pub(super) fn pair_to_extended(&mut self, n: u8, sig: Reg, sexp: Reg) {
+        if let Some(x87) = self.x87_stubs() {
+            self.emit(vmov(true, V0, v(n)));
+            self.far_call(x87.pair_to_extended);
+            if sig != X0 {
+                self.emit(mov(X, sig, X0));
+            }
+            if sexp != X1 {
+                self.emit(mov(X, sexp, X1));
+            }
+            return;
+        }
         let (zero, case_a, sign, done) = (
             self.asm.label(),
             self.asm.label(),

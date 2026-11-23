@@ -191,6 +191,8 @@ pub struct Memory {
     /// Pages changed since the controller last looked, each with its version
     /// before the first change, and the changed bytes while they stay few.
     pub dirty_pages: BTreeMap<u32, u64>,
+    /// 64-byte line bitmask of writes per dirty watched page; never overflows.
+    pub dirty_lines: BTreeMap<u32, u64>,
     pub dirty_ranges: Option<Vec<(u32, usize)>>,
     reservation: Option<crate::virtual_memory::Reservation>,
     shared_pages: page_map::PageMap<SharedPage>,
@@ -539,6 +541,7 @@ impl Memory {
             code: BTreeMap::new(),
             mapped: Arc::new(vec![true; len / PAGE_SIZE]),
             dirty_pages: BTreeMap::new(),
+            dirty_lines: BTreeMap::new(),
             dirty_ranges: Some(Vec::new()),
             reservation: None,
             shared_pages: Default::default(),
@@ -592,6 +595,7 @@ impl Memory {
             code: BTreeMap::new(),
             mapped: Arc::new(vec![false; len / PAGE_SIZE]),
             dirty_pages: BTreeMap::new(),
+            dirty_lines: BTreeMap::new(),
             dirty_ranges: Some(Vec::new()),
             reservation: Some(reservation),
             shared_pages: Default::default(),
@@ -1004,14 +1008,30 @@ impl Memory {
         let last = ((addr - self.base) as usize + len - 1) / PAGE_SIZE;
         // Only watched pages hold translated code, so only their changes
         // invalidate units; mapping a large file view stays per-page cheap.
+        let mut any_watched = false;
+        let end = (u64::from(addr) + len as u64 - 1).min(u64::from(u32::MAX)) as u32;
         for page in (start..=last).filter(|&page| self.watched[page]) {
+            any_watched = true;
+            let page_addr = self.base + page as u32 * PAGE_SIZE as u32;
             self.dirty_pages
-                .entry(self.base + page as u32 * PAGE_SIZE as u32)
+                .entry(page_addr)
                 .or_insert(self.versions[page]);
+            let from = addr.max(page_addr) - page_addr;
+            let to = end.min(page_addr + (PAGE_SIZE as u32 - 1)) - page_addr;
+            let first = from >> 6;
+            let count = (to >> 6) - first + 1;
+            let mask = if count == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << count) - 1) << first
+            };
+            *self.dirty_lines.entry(page_addr).or_default() |= mask;
         }
-        match &mut self.dirty_ranges {
-            Some(ranges) if ranges.len() < DIRTY_RANGES => ranges.push((addr, len)),
-            ranges => *ranges = None,
+        if any_watched {
+            match &mut self.dirty_ranges {
+                Some(ranges) if ranges.len() < DIRTY_RANGES => ranges.push((addr, len)),
+                ranges => *ranges = None,
+            }
         }
         self.epoch += 1;
         self.code_generation += 1;
@@ -3155,5 +3175,21 @@ mod window_tests {
                 "remapping unwatched pages invalidates nothing"
             );
         }
+    }
+
+    // spec: A64-CTL-10
+    #[test]
+    fn dirty_lines_never_overflow_past_dirty_ranges_limit() {
+        let mut memory = Memory::new(0x10000, 0x4000).unwrap();
+        memory.protect(0x10000, 0x4000, READ | WRITE).unwrap();
+        memory.watch_code(0x10000, 64);
+        memory.dirty_pages.clear();
+        memory.dirty_lines.clear();
+        memory.dirty_ranges = Some(Vec::new());
+        for i in 0..(DIRTY_RANGES + 32) {
+            memory.write(0x10000 + (i % 64) as u32, &[i as u8]).unwrap();
+        }
+        assert!(memory.dirty_ranges.is_none());
+        assert_eq!(memory.dirty_lines.get(&0x10000), Some(&1u64));
     }
 }

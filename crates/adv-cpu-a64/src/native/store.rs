@@ -147,8 +147,13 @@ impl<R> ResidentSite<R> {
     }
 }
 
-pub(super) fn place_stubs(capacity: usize, words: &[u32]) -> Result<(CodeCache, usize), String> {
-    let mut cache = CodeCache::new(capacity)?;
+pub(super) fn place_stubs(
+    initial: usize,
+    max_len: usize,
+    fallback_len: usize,
+    words: &[u32],
+) -> Result<(CodeCache, usize), String> {
+    let mut cache = CodeCache::with_limit(initial, max_len, fallback_len)?;
     let base = cache.append(words).ok_or("stubs do not fit")?;
     Ok((cache, base))
 }
@@ -257,6 +262,21 @@ impl<R> ResidentVersion<R> {
     }
 }
 
+/// Bitmask of the 64-byte lines within `page` covered by `start..start+len`.
+pub(super) fn page_line_mask(page: u32, start: u32, len: u64) -> u64 {
+    let page_start = u64::from(page);
+    let from = u64::from(start).max(page_start) - page_start;
+    let to = (u64::from(start) + len - 1).min(page_start + 4095) - page_start;
+    let first = (from >> 6) as u32;
+    let last = (to >> 6) as u32;
+    let count = last - first + 1;
+    if count == 64 {
+        u64::MAX
+    } else {
+        ((1u64 << count) - 1) << first
+    }
+}
+
 pub(super) struct CodeStore<R> {
     pub(super) resident_exit: usize,
     /// Switch-table slots by guest target: source entry, host slot and
@@ -279,8 +299,8 @@ pub(super) struct CodeStore<R> {
     pub(super) slow_paths: Option<SlowPaths>,
     #[cfg(test)]
     pub(super) value_counts: FxHashMap<u32, u64>,
-    /// Unit entries by the guest pages their code came from.
-    pub(super) pages: FxHashMap<u32, Vec<u32>>,
+    /// Unit entries and their watched 64-byte line masks by guest page.
+    pub(super) pages: FxHashMap<u32, Vec<(u32, u64)>>,
     pub(super) pages_by_unit: FxHashMap<u32, Vec<u32>>,
     /// Patched link points, with the words they held, by the unit they
     /// branch to: the head of a list in `linked`.
@@ -468,6 +488,12 @@ impl<R> CodeStore<R> {
         }
         for counter in &slot.domain_sensor {
             counter.set(crate::policy::resident::DOMAIN_MISS_SAMPLE);
+        }
+        if !self
+            .cache
+            .ensure((layout.words.len() + layout.row_failures.len() * 32 + 512) * 4)
+        {
+            return false;
         }
         let base = self.cache.next();
         let mut entry = ingress::emit(
@@ -668,6 +694,9 @@ impl<R> CodeStore<R> {
         if let Some(tier1) = self.resident_fallback(eip) {
             return Some(tier1);
         }
+        if !self.cache.ensure(64) {
+            return None;
+        }
         let at = self.cache.next();
         let words = ingress::version_miss(eip, at, self.stubs.dispatch);
         self.cache.append(&words)?;
@@ -717,6 +746,9 @@ impl<R> CodeStore<R> {
                     version.row_price.and_then(|price| price.count_register) == Some(reg)
                 })
             });
+        if !self.cache.ensure((cases.len() * 16 + 128) * 4) {
+            return false;
+        }
         let fallback = first.map_or(tier1, |version| version.cold);
         let at = self.cache.next();
         let (words, points) = ingress::row_entry(
@@ -744,7 +776,7 @@ impl<R> CodeStore<R> {
 
     pub(super) fn install_row_retry(&mut self, eip: u32) -> bool {
         let site = self.resident(eip).unwrap();
-        if site.row_retry.is_some() || site.entry().is_none() {
+        if site.row_retry.is_some() || site.entry().is_none() || !self.cache.ensure(64) {
             return false;
         }
         let at = self.cache.next();
@@ -875,6 +907,9 @@ impl<R> CodeStore<R> {
     }
 
     pub(super) fn install_offer(&mut self, eip: u32, gate: OfferEntry) {
+        if !self.cache.ensure(128) {
+            return;
+        }
         let at = self.cache.next();
         let unit = self.tier1(eip).map(|entry| entry.unit);
         let (words, fallback) = ingress::offer_link(eip, at, self.stubs.exit, unit, gate);
@@ -1361,7 +1396,7 @@ impl<R> CodeStore<R> {
                     self.pages.entry(page)
                 {
                     let units = entry.get_mut();
-                    if let Some(index) = units.iter().position(|&unit| unit == eip) {
+                    if let Some(index) = units.iter().position(|&(unit, _)| unit == eip) {
                         units.swap_remove(index);
                     }
                     if units.is_empty() {
@@ -1417,17 +1452,30 @@ impl<R> CodeStore<R> {
             memory.watch_code(from, (to - u64::from(from)) as usize);
         }
         let pages = self.pages_by_unit.entry(eip).or_default();
-        let mut last = None;
         for &(start, len) in spans.iter().filter(|&&(_, len)| len != 0) {
             let end = (u64::from(start) + u64::from(len) - 1).min(u64::from(u32::MAX));
-            for page in (start & !0xfff..=end as u32 & !0xfff).step_by(4096) {
-                if last.is_none_or(|last| last < page) {
-                    last = Some(page);
-                    if let Err(index) = pages.binary_search(&page) {
+            let mut page = start & !0xfff;
+            let last_page = end as u32 & !0xfff;
+            loop {
+                let mask = page_line_mask(page, start, u64::from(len));
+                let units = self.pages.entry(page).or_default();
+                match pages.binary_search(&page) {
+                    Ok(_) => {
+                        if let Some(entry) = units.iter_mut().find(|(unit, _)| *unit == eip) {
+                            entry.1 |= mask;
+                        } else {
+                            units.push((eip, mask));
+                        }
+                    }
+                    Err(index) => {
                         pages.insert(index, page);
-                        self.pages.entry(page).or_default().push(eip);
+                        units.push((eip, mask));
                     }
                 }
+                if page == last_page {
+                    break;
+                }
+                page = page.wrapping_add(4096);
             }
         }
     }
@@ -1439,6 +1487,9 @@ impl<R> CodeStore<R> {
         exit: usize,
         sites: &[(usize, Site)],
     ) -> Option<WorkerCode> {
+        if !self.cache.ensure(words.len() * 4) {
+            return None;
+        }
         words[exit] = branch(self.cache.next() + exit * 4, self.stubs.opt_exit);
         self.place_worker(words, sites)
     }
@@ -1478,6 +1529,7 @@ impl<R> CodeStore<R> {
             work.marks,
             work.version,
         )?;
+        assert!(!work.far_overflow, "far branch out of range inside cache");
         let at = entry.unit;
         if !unit.tables.is_empty() {
             self.table_sources.insert(eip);

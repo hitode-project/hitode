@@ -261,6 +261,7 @@ fn emission_fixture_words(compare: impl Fn(&str, &[u32])) {
         access: host,
         fault: host,
         opt_exit: host,
+        x87: None,
     };
     for (name, code, cold, checked) in [
         ("scalar", &scalar, true, false),
@@ -283,6 +284,7 @@ fn emission_fixture_words(compare: impl Fn(&str, &[u32])) {
             &[CODE + code.len() as u32],
             &|_, _| None,
             &|_| None,
+            &|_| false,
             (!cold, None),
             &mut decodes,
         );
@@ -364,6 +366,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             access: host,
             fault: host,
             opt_exit: host,
+            x87: None,
         };
         let features = Features {
             flagm: false,
@@ -420,6 +423,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         access: HOST_CODE as usize,
         fault: HOST_CODE as usize,
         opt_exit: HOST_CODE as usize,
+        x87: None,
     };
     translate(
         &mut work,
@@ -648,7 +652,7 @@ fn tier_one_widens_bit_tests_in_large_straight_line_units() {
     state.x87.control = 0x027f;
     state.x87.regs[state.x87.top()] = adv_cpu_core::X87Register::from_parts(1 << 63, 0x3fff + 64);
     state.x87.set_physical_tag(state.x87.top(), 0);
-    for _ in 0..3 {
+    for _ in 0..5 {
         compare_tier_one(&mut native, &mut oracle, &state, stop, 200);
     }
     assert!(native.stats.native_code_bytes > 32 * 1024);
@@ -953,6 +957,7 @@ impl Harness {
             access: addr(self.forbidden),
             fault: addr(self.forbidden),
             opt_exit: addr(self.forbidden),
+            x87: Some(self.stubs.x87.at(HOST_CODE as usize)),
         };
         translate(
             &mut work,
@@ -1510,6 +1515,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
             access: HOST_CODE as usize,
             fault: HOST_CODE as usize,
             opt_exit: HOST_CODE as usize,
+            x87: None,
         };
         for writable_tail in [false, true] {
             if writable_tail {
@@ -1610,6 +1616,7 @@ fn j1_unit(code: &[u8]) -> Workspace {
             access: at,
             fault: at,
             opt_exit: at,
+            x87: None,
         },
         &|_, _| None,
         &|_| None,
@@ -1657,6 +1664,7 @@ fn register_value_call_preserves_cache_within_the_helper_path_count() {
             access: at,
             fault: at,
             opt_exit: at,
+            x87: None,
         },
         false,
         Key::read(&cpu, work.unit.fact_mask()),
@@ -1714,6 +1722,7 @@ fn shared_lock_value_calls_fit_the_helper_path_count_with_live_xmm() {
                 access: at,
                 fault: at,
                 opt_exit: at,
+                x87: None,
             },
             false,
             Key::read(&CpuState::default(), work.unit.fact_mask()),
@@ -1919,6 +1928,7 @@ fn proved_divisions_shrink_emitted_sequences_and_retain_dirty_simd_fault_sites()
             access: at,
             fault: at,
             opt_exit: at,
+            x87: None,
         };
         let mut totals = Vec::new();
         for facts in [None, Some(&proof)] {

@@ -2130,7 +2130,17 @@ mod tests {
             let unit = native.front_unit(memory, CODE, false, false, None);
             assert!(unit.code().iter().any(|&(at, _)| at == destination));
         }
-        assert_eq!(native.code.pages.get(&CODE).unwrap().as_slice(), &[CODE]);
+        assert_eq!(
+            native
+                .code
+                .pages
+                .get(&CODE)
+                .unwrap()
+                .iter()
+                .map(|&(eip, _)| eip)
+                .collect::<Vec<_>>(),
+            vec![CODE]
+        );
     }
 
     // spec: A64-OPT-8 A64-OPT-14

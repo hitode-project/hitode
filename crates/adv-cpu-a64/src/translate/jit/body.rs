@@ -632,6 +632,7 @@ mod tests {
                     call: 0,
                     fault: 0,
                     opt_exit: 0,
+                    x87: None,
                 },
                 &|_, _| None,
                 &|pc| {

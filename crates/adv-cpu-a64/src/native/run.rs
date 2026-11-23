@@ -83,6 +83,9 @@ impl Native {
         bridge: *mut std::ffi::c_void,
     ) -> Result<Option<Run>, String> {
         self.bridge = bridge;
+        if self.want_relocate {
+            self.relocate_cache();
+        }
         self.invalidate(memory);
         self.observe_stop(stop);
         self.install_optimized(false);
@@ -546,12 +549,23 @@ impl Native {
 
     pub(crate) fn clear(&mut self) {
         self.diagnostics.clears += 1;
+        self.clear_state();
+    }
+
+    pub(super) fn clear_state(&mut self) {
         self.code.clear();
         self.worker_jobs.clear();
         self.scoped_jobs.clear();
         self.offload.admission.clear();
         self.plans.clear_overlays();
         self.forget_dynamic();
+    }
+
+    fn clear_full(&mut self) {
+        self.clear();
+        if self.code.cache.can_grow() {
+            self.want_relocate = true;
+        }
     }
 
     pub(super) fn count_plan_event(&mut self, event: &'static str) {
@@ -743,7 +757,7 @@ impl Native {
         let eip = cpu.eip;
         self.plans.mark_checked(eip);
         if !self.replace_unit(memory, eip, Key::read(cpu, facts::ALL)) {
-            self.clear();
+            self.clear_full();
         }
     }
 
@@ -768,12 +782,41 @@ impl Native {
     /// that branch to them.
     pub(super) fn invalidate(&mut self, memory: &mut Memory) {
         if memory.dirty_pages.is_empty() {
+            if !memory.dirty_lines.is_empty() {
+                memory.dirty_lines.clear();
+            }
+            if memory.dirty_ranges.as_ref().is_none_or(|r| !r.is_empty()) {
+                memory.dirty_ranges = Some(Vec::new());
+            }
             return;
         }
+        let dirty_pages = std::mem::take(&mut memory.dirty_pages);
+        let dirty_lines = std::mem::take(&mut memory.dirty_lines);
+        if memory.dirty_ranges.as_ref().is_none_or(|r| !r.is_empty()) {
+            memory.dirty_ranges = Some(Vec::new());
+        }
         let mut dropped = false;
-        for page in std::mem::take(&mut memory.dirty_pages).into_keys() {
+        for page in dirty_pages.into_keys() {
             self.decodes.invalidate(page);
-            for eip in self.code.pages.remove(&page).unwrap_or_default() {
+            let mask = dirty_lines.get(&page).copied().unwrap_or(u64::MAX);
+            let affected: Vec<u32> = if mask == u64::MAX {
+                self.code
+                    .pages
+                    .remove(&page)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(eip, _)| eip)
+                    .collect()
+            } else if let Some(units) = self.code.pages.get(&page) {
+                units
+                    .iter()
+                    .filter(|&&(_, lines)| lines & mask != 0)
+                    .map(|&(eip, _)| eip)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for eip in affected {
                 let unit = self.drop_unit(eip);
                 self.diagnostics.dropped_units += u64::from(unit);
                 dropped |= unit;
@@ -829,7 +872,7 @@ impl Native {
         let end = u64::from(end).max(u64::from(start) + 1);
         let mut dropped = false;
         for page in (u64::from(start & !0xfff)..end).step_by(4096) {
-            for eip in self.code.pages.remove(&(page as u32)).unwrap_or_default() {
+            for (eip, _) in self.code.pages.remove(&(page as u32)).unwrap_or_default() {
                 dropped |= self.drop_unit(eip);
             }
         }
@@ -877,7 +920,7 @@ impl Native {
         let entry = match self.emit(memory, eip, observed) {
             Some(entry) => entry,
             None => {
-                self.clear();
+                self.clear_full();
                 self.code.points.clear();
                 self.emit(memory, eip, observed)
                     .ok_or("a64 unit does not fit an empty cache")?
@@ -1052,7 +1095,7 @@ impl Native {
         let entry = self.place_tier1(memory, eip, &work, unit, key, false);
         self.compiler.tier1 = work;
         let Some(entry) = entry else {
-            self.clear();
+            self.clear_full();
             return self
                 .translate(memory, eip, observed)
                 .map(|entry| entry.unit);
