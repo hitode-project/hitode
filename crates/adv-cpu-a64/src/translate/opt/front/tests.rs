@@ -3115,7 +3115,8 @@ fn resident_domain_guards_prove_affine_x87_loop_and_respect_refusal() {
             .expect("resident domain-guarded build");
         assert_eq!(verify::verify(&built.func), Ok(()));
         assert_eq!(built.func.domain_guards.len(), 1);
-        assert!(built.func.domain_saved_per_iter >= 12);
+        assert_eq!(built.func.domain_saved_per_iter.len(), 1);
+        assert!(built.func.domain_saved_per_iter[0] >= 12);
         assert!(
             built.func.blocks[0]
                 .insts
@@ -3562,6 +3563,9 @@ fn phase2_exact_fma_contraction_and_adversarial_guards() {
     let built = build_with_domains(&unit, None, &at, &|_| false, &|_| false, &|_| false).unwrap();
     assert_eq!(verify::verify(&built.func), Ok(()));
     assert_eq!(built.func.domain_guards.len(), 2);
+    assert_eq!(built.func.domain_saved_per_iter.len(), 2);
+    assert!(built.func.domain_saved_per_iter[0] >= 12);
+    assert_eq!(built.func.domain_saved_per_iter[1], 2);
     assert_eq!(
         count(&built, |op| matches!(
             op,
@@ -3582,8 +3586,39 @@ fn phase2_exact_fma_contraction_and_adversarial_guards() {
     .unwrap();
     assert_eq!(verify::verify(&no_fma.func), Ok(()));
     assert_eq!(no_fma.func.domain_guards, vec![built.func.domain_guards[0]]);
+    assert_eq!(no_fma.func.domain_saved_per_iter.len(), 1);
     assert_eq!(count(&no_fma, |op| matches!(op, Op::Fma { .. })), 0);
     assert_eq!(count(&no_fma, |op| matches!(op, Op::Validate)), 0);
+
+    // 5) Boundary regression (P1): 3 * 3002399751580331 = 2^53 + 1 rounds down
+    // to 2^53 in f64 RN, so FMUL then FSUB 2^53 must produce +0.0, NOT FMA 1.0.
+    let boundary_code = assemble(|a| {
+        row(a, |a| {
+            let push_f64 = |a: &mut CodeAssembler, disp: i32, v: f64| {
+                let bits = v.to_bits();
+                a.mov(dword_ptr(esp + disp), bits as u32).unwrap();
+                a.mov(dword_ptr(esp + disp + 4), (bits >> 32) as u32)
+                    .unwrap();
+            };
+            push_f64(a, 0x10, 3.0);
+            push_f64(a, 0x18, 3_002_399_751_580_331.0);
+            push_f64(a, 0x20, 9_007_199_254_740_992.0); // 2^53
+            a.fld(qword_ptr(esp + 0x10)).unwrap();
+            a.fmul(qword_ptr(esp + 0x18)).unwrap();
+            a.fsub(qword_ptr(esp + 0x20)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    let mut b_at = initial();
+    b_at.regs[1] = 1;
+    b_at.x87.control = 0x027f; // PC=53, round-to-nearest-even
+    b_at.x87.status = 0x20;
+    let b_built = differential(&boundary_code, &b_at, |_| {});
+    assert_eq!(
+        count(&b_built, |op| matches!(op, Op::Fma { .. })),
+        0,
+        "inexact 2^53 + 1 product must not be proved exact or contracted to FMA"
+    );
 }
 
 // spec: A64-OPT-4, A64F-FP-5
@@ -3607,8 +3642,8 @@ fn phase3_dynamic_mxcsr_sticky_and_f32_sse_input_dedup() {
     }
 
     // 2) Single-precision SSE chain specializes only on control + PE (0xffe0),
-    // eliminates intermediate and duplicate f32 SseInput checks, and still catches
-    // adversarial `min_subnormal * 2^24` when DE = 0.
+    // deduplicates repeated SSA entry operands, treats cvtsi2ss as non-subnormal,
+    // and retains SseInput checks on Op::Fp32 results (which can produce subnormals).
     let f32_chain = assemble(|a| {
         row(a, |a| {
             a.mulss(xmm0, xmm1).unwrap();
@@ -3625,8 +3660,8 @@ fn phase3_dynamic_mxcsr_sticky_and_f32_sse_input_dedup() {
     at.xmm[2][..4].copy_from_slice(&0.5f32.to_le_bytes());
     let built = differential(&f32_chain, &at, |_| {});
     assert_eq!(built.assumed.mxcsr_mask, 0xffe0);
-    // 3 unique entry operands (xmm0, xmm1, xmm2) across 3 binary ops (6 operand reads):
-    // intermediate xmm0 results and duplicate xmm1 must not re-emit SseInput.
+    // 6 operand reads across 3 binary ops: duplicate xmm1 is deduplicated (6 -> 5),
+    // while intermediate Op::Fp32 results keep their SseInput checks.
     let f32_checks: usize = built
         .func
         .blocks
@@ -3640,8 +3675,8 @@ fn phase3_dynamic_mxcsr_sticky_and_f32_sse_input_dedup() {
         })
         .sum();
     assert_eq!(
-        f32_checks, 3,
-        "expected only 3 f32 SseInput checks (one per unique entry operand)"
+        f32_checks, 5,
+        "expected duplicate xmm1 to deduplicate while keeping checks on Op::Fp32 intermediates"
     );
 
     // Adversarial DAZ=0 subnormal input that normalizes: min_subnormal * 2^24.
@@ -3649,4 +3684,38 @@ fn phase3_dynamic_mxcsr_sticky_and_f32_sse_input_dedup() {
     sub_at.xmm[0][..4].copy_from_slice(&1u32.to_le_bytes()); // min_subnormal f32
     sub_at.xmm[1][..4].copy_from_slice(&0x4b80_0000u32.to_le_bytes()); // 2^24
     compare(&f32_chain, &sub_at, |_| {}, true);
+
+    // 3) Regression (P1): SUBSS producing an exact subnormal followed by MULSS
+    // back into the normal range MUST still raise MXCSR.DE (0x1fa0 -> 0x1fa2).
+    let subss_mulss = assemble(|a| {
+        row(a, |a| {
+            a.subss(xmm0, xmm1).unwrap();
+            a.mulss(xmm0, xmm2).unwrap();
+            a.stmxcsr(dword_ptr(edi)).unwrap();
+        })
+    });
+    let mut sub_cancel = initial();
+    sub_cancel.regs[1] = 1;
+    sub_cancel.mxcsr = 0x1fa0;
+    sub_cancel.xmm[0][..4].copy_from_slice(&0x0080_0001u32.to_le_bytes());
+    sub_cancel.xmm[1][..4].copy_from_slice(&0x0080_0000u32.to_le_bytes());
+    sub_cancel.xmm[2][..4].copy_from_slice(&0x4b80_0000u32.to_le_bytes()); // 2^24
+    compare(&subss_mulss, &sub_cancel, |_| {}, true);
+
+    // 4) Analogous f64 regression: SUBSD producing an exact subnormal followed by
+    // MULSD back into normal range MUST also raise MXCSR.DE (0x1fa0 -> 0x1fa2).
+    let subsd_mulsd = assemble(|a| {
+        row(a, |a| {
+            a.subsd(xmm0, xmm1).unwrap();
+            a.mulsd(xmm0, xmm2).unwrap();
+            a.stmxcsr(dword_ptr(edi)).unwrap();
+        })
+    });
+    let mut sub_cancel_64 = initial();
+    sub_cancel_64.regs[1] = 1;
+    sub_cancel_64.mxcsr = 0x1fa0;
+    sub_cancel_64.xmm[0][..8].copy_from_slice(&0x0010_0000_0000_0001u64.to_le_bytes());
+    sub_cancel_64.xmm[1][..8].copy_from_slice(&0x0010_0000_0000_0000u64.to_le_bytes());
+    sub_cancel_64.xmm[2][..8].copy_from_slice(&((1u64 << 53) as f64).to_bits().to_le_bytes());
+    compare(&subsd_mulsd, &sub_cancel_64, |_| {}, true);
 }

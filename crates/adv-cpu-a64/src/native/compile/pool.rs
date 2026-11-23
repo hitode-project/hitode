@@ -74,7 +74,7 @@ impl ResidentForm {
             domain_fallback: lowered.domain_fallback,
             domain_sensors: &lowered.domain_sensors,
             domain_misses_slot: lowered.domain_misses_slot,
-            domain_guard_words: lowered.domain_guard_words,
+            domain_guard_words: &lowered.domain_guard_words,
             exit: lowered.exit,
             spill_cells: lowered.spill_cells,
             probation_slot: lowered.probation_slot,

@@ -573,8 +573,13 @@ fn eval_fp(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (bool, FpFact
     } else {
         None
     };
+    // `lo` and `hi` were computed with f64 round-to-nearest, so an inexact
+    // mathematical result such as `3 * 3002399751580331 = 2^53 + 1` can round
+    // down onto the exact `2^(q + 53)` boundary. Check the outward-rounded
+    // magnitude (`next_up()`) so any value that could have rounded down from
+    // `>= 2^(q + 53) + 2^q` is never claimed exact.
     let exact_f64 = q_cand
-        .is_some_and(|q| q >= -1022 && fits_mantissa_bits(lo.abs().max(hi.abs()), q, 53))
+        .is_some_and(|q| q >= -1022 && fits_mantissa_bits(lo.abs().max(hi.abs()).next_up(), q, 53))
         || (op == FpOp::Mul
             && (both_f32
                 || (mul_sig.is_some_and(|w| w <= 53)
@@ -2917,14 +2922,15 @@ pub(super) fn infer_domain_guards(
     // Commit: emit Block(0) helper ops and DomainGuards at `insert_pos`.
     let ordinal = func.domain_guards.len() as u8;
     func.domain_guards.push(guard_id);
+    func.domain_saved_per_iter.push(saved_per_iter);
     let fma_ordinal = if !fma_exact_inputs.is_empty() {
         let ord = func.domain_guards.len() as u8;
         func.domain_guards.push(fma_guard_id);
+        func.domain_saved_per_iter.push(fma_pairs);
         Some(ord)
     } else {
         None
     };
-    func.domain_saved_per_iter = saved_per_iter.saturating_add(fma_pairs);
 
     let mut eb = EntryBuilder {
         func,

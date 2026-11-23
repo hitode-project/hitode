@@ -1607,7 +1607,7 @@ impl Native {
             form.lowered.key,
             std::mem::take(&mut form.built.plain_sites),
             std::mem::take(&mut form.built.func.domain_guards),
-            form.built.func.domain_saved_per_iter,
+            std::mem::take(&mut form.built.func.domain_saved_per_iter),
             recovery,
             form.lowered.iteration_retired,
             gate,

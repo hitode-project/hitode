@@ -1231,7 +1231,6 @@ fn sse_inputs(func: &mut Func) {
                 *known = mask;
 
                 let s_clean = match op {
-                    Op::Fp32(..) => true,
                     Op::VecUnary(VecUnary::NarrowScalar, a) => is_from_int[a.0 as usize],
                     Op::Constant(_, bits) => !f32::from_bits(bits as u32).is_subnormal(),
                     Op::Vec(VecOp::MoveLow32, _, b) => f32_clean(b),
@@ -2030,6 +2029,21 @@ fn addr_base_offset(defs: &[Option<Op>], addr: Value) -> (Value, i32) {
     }
 }
 
+/// Whether `[base + a_off, base + a_off + a_width)` and
+/// `[base + b_off, base + b_off + b_width)` are disjoint modulo `PAGE_SIZE`
+/// for every `base`.
+///
+/// Guest virtual mappings are 4 KiB page-aligned, so two accesses through
+/// distinct virtual pages that alias the same backing physical page still
+/// preserve byte offsets modulo `PAGE_SIZE`. Checking disjointness modulo
+/// `PAGE_SIZE` therefore rules out both direct virtual overlap and shared
+/// file-mapping aliases.
+fn disjoint_mod_page(a_off: i32, a_width: u8, b_off: i32, b_width: u8) -> bool {
+    let page = PAGE_SIZE as u32;
+    let d = (b_off as u32).wrapping_sub(a_off as u32) & (page - 1);
+    d >= u32::from(a_width) && d + u32::from(b_width) <= page
+}
+
 /// Forward same-block ordinary `Op::Store`s to subsequent unchecked same-address,
 /// same-width `Op::Load { clock: false }`s across proved-disjoint intervening
 /// stores, applying exact width zero-extension and retaining every `Op::Store`.
@@ -2059,13 +2073,7 @@ fn forward_stores(func: &mut Func) -> bool {
                 ) => {
                     let (base, off) = addr_base_offset(&defs, addr);
                     recent.retain(|&(_, pb, poff, pw, _, _)| {
-                        pb == base
-                            && disjoint_ranges(
-                                poff as u32,
-                                u32::from(pw),
-                                off as u32,
-                                u32::from(width),
-                            )
+                        pb == base && disjoint_mod_page(poff, pw, off, width)
                     });
                     if !checked {
                         if recent.len() == 16 {

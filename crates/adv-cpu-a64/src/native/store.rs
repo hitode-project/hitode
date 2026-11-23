@@ -176,8 +176,8 @@ pub(super) struct ResidentVersion<R> {
     pub environment: Vec<usize>,
     pub domain_fallback: Option<usize>,
     pub domain_guards: Vec<u32>,
-    pub domain_guard_words: u32,
-    pub domain_saved_per_iter: u32,
+    pub domain_guard_words: Vec<u32>,
+    pub domain_saved_per_iter: Vec<u32>,
     pub at: CpuState,
     pub key: Key,
     pub plain_sites: Vec<u32>,
@@ -461,7 +461,7 @@ impl<R> CodeStore<R> {
         key: Key,
         plain_sites: Vec<u32>,
         domain_guards: Vec<u32>,
-        domain_saved_per_iter: u32,
+        domain_saved_per_iter: Vec<u32>,
         recovery: R,
         iteration_retired: u32,
         gate: Option<OfferEntry>,
@@ -657,7 +657,7 @@ impl<R> CodeStore<R> {
                 .collect(),
             domain_fallback: layout.domain_fallback.map(|offset| entry.form + offset * 4),
             domain_guards,
-            domain_guard_words: layout.domain_guard_words,
+            domain_guard_words: layout.domain_guard_words.to_vec(),
             domain_saved_per_iter,
             at,
             key,
@@ -1223,22 +1223,32 @@ impl<R> CodeStore<R> {
         let mut total_iters = 0u64;
         let mut total_misses = 0u64;
         for (j, v) in site.versions.iter().enumerate() {
-            if !v.domain_guards.contains(&guard_id) {
+            let Some(pos) = v.domain_guards.iter().position(|&id| id == guard_id) else {
                 continue;
-            }
+            };
             let (hist_entries, hist_iters) = history.get(j).copied().unwrap_or((0, 0));
             total_entries = total_entries.saturating_add(hist_entries.max(v.slot.entries.get()));
             total_iters =
                 total_iters.saturating_add(hist_iters.max(v.iterations(v.slot.countdown[1].get())));
-            total_misses = total_misses.saturating_add(v.slot.domain_misses.get());
+            if let Some(misses) = v.slot.domain_misses.get(pos) {
+                total_misses = total_misses.saturating_add(misses.get());
+            }
         }
         Some((
             guard_id,
             total_entries,
             total_iters,
             total_misses,
-            current.domain_guard_words,
-            current.domain_saved_per_iter,
+            current
+                .domain_guard_words
+                .get(ordinal)
+                .copied()
+                .unwrap_or(0),
+            current
+                .domain_saved_per_iter
+                .get(ordinal)
+                .copied()
+                .unwrap_or(0),
         ))
     }
 
