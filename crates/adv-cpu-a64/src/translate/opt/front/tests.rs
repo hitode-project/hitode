@@ -2790,3 +2790,285 @@ fn resident_hoists_invariant_x87_frame_loads_with_vector_budget() {
     assert_eq!(body_xl, 0);
     assert_eq!(body_fl, 0);
 }
+
+// spec: A64-OPT-4, A64F-FP-3
+#[test]
+fn fp_range_binary32_store_reload_and_adversarial_bounds() {
+    // 1) Step 1.2A: unknown st(0) narrowed to frame m32 and reloaded proves X87Load
+    // without folding away the rounding or proving X87Store.
+    let step_a = assemble(|a| {
+        row(a, |a| {
+            a.fstp(dword_ptr(esp + 0x10)).unwrap();
+            a.fld(dword_ptr(esp + 0x10)).unwrap();
+            a.fst(qword_ptr(edi)).unwrap();
+        })
+    });
+    for (val, expect_fail) in [
+        (1.5f64, false),
+        (-0.0, false),
+        (1.0 + 2.0f64.powi(-30), false),
+        (f64::from(f32::from_bits(1)), true),
+    ] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        at.x87.push(adv_cpu_core::floating::fast::extended(val));
+        let built = compare(&step_a, &at, |_| {}, expect_fail);
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::X87Load { proved: true, .. })),
+            1
+        );
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::X87Store { proved: false, .. }
+            )),
+            1
+        );
+    }
+
+    // 2) Step 1.2B: proved finite exact normal-or-zero f32 folds X87Load(X87Store(v)) -> v
+    // (preserving -0.0) and X87StoreC1 -> 0.
+    let step_b = assemble(|a| {
+        row(a, |a| {
+            a.movzx(eax, byte_ptr(esi)).unwrap();
+            a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+            a.fild(dword_ptr(esp + 0x10)).unwrap();
+            a.fchs().unwrap();
+            a.fstp(dword_ptr(esp + 0x14)).unwrap();
+            a.fld(dword_ptr(esp + 0x14)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    for byte in [0u8, 1, 255] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = differential(&step_b, &at, |m| {
+            m.write(DATA, &[byte]).unwrap();
+        });
+        assert_eq!(count(&built, |op| matches!(op, Op::X87Load { .. })), 0);
+        assert_eq!(count(&built, |op| matches!(op, Op::X87StoreC1 { .. })), 0);
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::X87Store { proved: true, .. })),
+            1
+        );
+    }
+
+    // 3) Adversarial 1.3: two X87Load(single=true) inputs admit ±Inf, so 0*Inf and Inf-Inf
+    // must NOT be marked proved.
+    let inf_mul = assemble(|a| {
+        row(a, |a| {
+            a.fld(dword_ptr(esi)).unwrap();
+            a.fmul(dword_ptr(esi + 4)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    let inf_sub = assemble(|a| {
+        row(a, |a| {
+            a.fld(dword_ptr(esi)).unwrap();
+            a.fsub(dword_ptr(esi + 4)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    for (code, a_val, b_val) in [
+        (&inf_mul, 0.0f32, f32::INFINITY),
+        (&inf_sub, f32::INFINITY, f32::INFINITY),
+    ] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = compare(
+            code,
+            &at,
+            |m| {
+                m.write(DATA, &a_val.to_le_bytes()).unwrap();
+                m.write(DATA + 4, &b_val.to_le_bytes()).unwrap();
+            },
+            true,
+        );
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::Fp(_, _, _, true))),
+            0,
+            "X87Load(single=true) admits ±Inf and must not prove Fp"
+        );
+    }
+
+    // Adversarial 1.3b: X87Load(single=true, denormal=false) admits f32 subnormals,
+    // so X87Store must NOT be proved and Step 1.2B must NOT fold.
+    let subnormal_reload = assemble(|a| {
+        row(a, |a| {
+            a.fld(dword_ptr(esi)).unwrap();
+            a.fstp(dword_ptr(esp + 0x10)).unwrap();
+            a.fld(dword_ptr(esp + 0x10)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x22; // DE set => denormal = false
+        let built = compare(
+            &subnormal_reload,
+            &at,
+            |m| {
+                m.write(DATA, &1u32.to_le_bytes()).unwrap();
+            },
+            true,
+        );
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::X87Store { proved: false, .. }
+            )),
+            1
+        );
+    }
+
+    // 4) Adversarial 1.4: FISTP m16(-32768) is proved and succeeds; -32769 stays unproved.
+    let fistp_i16_ok = assemble(|a| {
+        row(a, |a| {
+            a.movsx(eax, word_ptr(esi)).unwrap();
+            a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+            a.fild(dword_ptr(esp + 0x10)).unwrap();
+            a.fistp(word_ptr(edi)).unwrap();
+        })
+    });
+    for val in [i16::MIN, 0, i16::MAX] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = differential(&fistp_i16_ok, &at, |m| {
+            m.write(DATA, &val.to_le_bytes()).unwrap();
+        });
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::X87Store {
+                    width: 2,
+                    integer: true,
+                    proved: true,
+                    ..
+                }
+            )),
+            1
+        );
+    }
+    let fistp_i16_oob = assemble(|a| {
+        row(a, |a| {
+            a.movsx(eax, word_ptr(esi)).unwrap();
+            a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+            a.fild(dword_ptr(esp + 0x10)).unwrap();
+            a.fld1().unwrap();
+            a.fsubp(st1, st0).unwrap();
+            a.fistp(word_ptr(edi)).unwrap();
+        })
+    });
+    {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = compare(
+            &fistp_i16_oob,
+            &at,
+            |m| {
+                m.write(DATA, &i16::MIN.to_le_bytes()).unwrap();
+            },
+            true,
+        );
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::X87Store {
+                    width: 2,
+                    integer: true,
+                    proved: false,
+                    ..
+                }
+            )),
+            1
+        );
+    }
+
+    // 5) Adversarial 2.1: PC=24 with a=1, b=1, c=-1+2^-30 (from m64) must not mark c
+    // as SINGLE_B and must fail cleanly to recovery rather than narrowing c to -1.
+    let pc24_non_f32 = assemble(|a| {
+        row(a, |a| {
+            a.fld1().unwrap();
+            a.fld1().unwrap();
+            a.fmulp(st1, st0).unwrap();
+            a.fadd(qword_ptr(esi)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x003f; // PC=24, nearest
+        at.x87.status = 0x20;
+        let c = -1.0f64 + 2.0f64.powi(-30);
+        let built = compare(
+            &pc24_non_f32,
+            &at,
+            |m| {
+                m.write(DATA, &c.to_le_bytes()).unwrap();
+            },
+            true,
+        );
+        assert!(
+            built.func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
+                matches!(op, Op::X87Single(FpOp::Add, _, _, flags) if flags & SINGLE_A != 0 && flags & SINGLE_B == 0)
+            }),
+            "PC=24 add with unproved m64 operand must keep SINGLE_B clear"
+        );
+    }
+
+    // 6) Positive dyadic-scale chain: (u8 - u8) * 1/64 + (-32.5) / 2.0 -> fistp m16,
+    // proved end-to-end with zero Op::Validate under both PC=53 and PC=24 and all 4 RCs.
+    for (pc_ctrl, rc_bits, a_byte, b_byte) in [
+        (0x023fu16, 0x0000u16, 200u8, 50u8),
+        (0x023f, 0x0400, 10, 240),
+        (0x023f, 0x0800, 255, 0),
+        (0x023f, 0x0c00, 0, 255),
+        (0x003f, 0x0000, 123, 77),
+        (0x003f, 0x0c00, 123, 77),
+    ] {
+        let dyadic_chain = assemble(|a| {
+            row(a, |a| {
+                a.movzx(eax, byte_ptr(esi)).unwrap();
+                a.movzx(edx, byte_ptr(esi + 1)).unwrap();
+                a.sub(eax, edx).unwrap();
+                a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+                a.fild(dword_ptr(esp + 0x10)).unwrap();
+                a.mov(dword_ptr(esp + 0x14), 0x3c80_0000u32).unwrap(); // 1/64
+                a.fmul(dword_ptr(esp + 0x14)).unwrap();
+                a.mov(dword_ptr(esp + 0x18), 0xc202_0000u32).unwrap(); // -32.5
+                a.fadd(dword_ptr(esp + 0x18)).unwrap();
+                a.mov(dword_ptr(esp + 0x1c), 0x4000_0000u32).unwrap(); // 2.0
+                a.fdiv(dword_ptr(esp + 0x1c)).unwrap();
+                a.mov(word_ptr(esp + 0x20), u32::from(pc_ctrl | rc_bits))
+                    .unwrap();
+                a.fldcw(word_ptr(esp + 0x20)).unwrap();
+                a.fistp(word_ptr(edi)).unwrap();
+                a.mov(word_ptr(esp + 0x20), u32::from(pc_ctrl)).unwrap();
+                a.fldcw(word_ptr(esp + 0x20)).unwrap();
+            })
+        });
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = pc_ctrl;
+        at.x87.status = 0x20;
+        let built = differential(&dyadic_chain, &at, |m| {
+            m.write(DATA, &[a_byte, b_byte]).unwrap();
+        });
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::Validate)),
+            0,
+            "dyadic chain should need zero Op::Validate for pc={pc_ctrl:#x} rc={rc_bits:#x}"
+        );
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::X87Store { proved: true, .. })),
+            1
+        );
+    }
+}

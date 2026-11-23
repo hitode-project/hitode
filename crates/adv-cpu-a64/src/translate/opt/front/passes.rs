@@ -1,5 +1,6 @@
 //! Propagation removes frame traffic and mode tests; liveness keeps only values
 //! read by execution or recovery. Floating operations remain until validation.
+mod fp_range;
 mod head_flags;
 use super::{
     BTreeMap, Block, ESP, End, Facts, FlagKind, Func, Head, IntOp, IntUnary, IrRecord, Location, M,
@@ -82,6 +83,9 @@ pub(super) fn run(
         }
     }
     if hoist_frame_loads(func, written_frame, frame_hoist_safe) {
+        while propagate(func) {}
+    }
+    if fp_range::run(func) {
         while propagate(func) {}
     }
     join(func);
