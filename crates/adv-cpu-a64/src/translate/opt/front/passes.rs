@@ -145,6 +145,7 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::VecToInt(_, a)
         | Op::FromInt(a)
         | Op::ToInt { value: a, .. }
+        | Op::SsePackedToInt { value: a, .. }
         | Op::X87Store { value: a, .. }
         | Op::Load { addr: a, .. }
         | Op::PlainPage { addr: a, .. }
@@ -1223,6 +1224,7 @@ fn sse_inputs(func: &mut Func) {
                     }
                     Op::VecUnary(VecUnary::Low64, a) => lanes(a) & 1 | 2,
                     Op::VecUnary(VecUnary::High64, a) => lanes(a) >> 1 | 2,
+                    Op::VecUnary(VecUnary::FromInt2d, _) => 3,
                     Op::Select { a, b, .. } => lanes(a) & lanes(b),
                     _ => 0,
                 };
@@ -1233,6 +1235,7 @@ fn sse_inputs(func: &mut Func) {
                 let s_clean = match op {
                     Op::Fp32(..) => true,
                     Op::VecUnary(VecUnary::NarrowScalar, a) => is_from_int[a.0 as usize],
+                    Op::VecUnary(VecUnary::FromInt4s, _) => true,
                     Op::Constant(_, bits) => !f32::from_bits(bits as u32).is_subnormal(),
                     Op::Vec(VecOp::MoveLow32, _, b) => f32_clean(b),
                     Op::Vec(VecOp::Insert64(true, _), a, _) => f32_clean(a),

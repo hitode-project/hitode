@@ -1073,6 +1073,104 @@ fn phase3_dynamic_mxcsr_sticky_reuses_single_resident_version() {
     assert_eq!(native.diagnostics.resident_cold_exits, 0);
 }
 
+// spec: A64-OPT-2, A64-OPT-9, A64F-FP-5
+#[test]
+fn resident_admits_sse_packed_conversions_and_cvttss2si() {
+    // 1) Compute -> CVTTPS2DQ -> store loop installs resident with 0 cold exits,
+    // preserves MXCSR.DE == 0 on subnormal f32 inputs, and bails cleanly on NaN/Inf.
+    let ps2dq_image = Image::loop_body(|a, head, _| {
+        a.movdqu(xmm0, xmmword_ptr(esi)).unwrap();
+        a.cvttps2dq(xmm1, xmm0).unwrap();
+        a.movdqu(xmmword_ptr(edi), xmm1).unwrap();
+        a.add(esi, 16).unwrap();
+        a.add(edi, 16).unwrap();
+        latch(a, head);
+    });
+    let mut state = initial(4);
+    state.mxcsr = 0x1fa0;
+    let init_normal = |m: &mut adv_cpu_core::Memory| {
+        for i in 0..16u32 {
+            let val = if i == 1 {
+                f32::from_bits(1) // subnormal f32 -> 0 without setting MXCSR.DE
+            } else {
+                (i as f32 - 5.5) * 3.25
+            };
+            m.write(DATA + i * 4, &val.to_le_bytes()).unwrap();
+        }
+    };
+    let mut trial = Trial::new(&ps2dq_image, &state, "resident CVTTPS2DQ", &[], init_normal);
+    assert!(trial.try_install_at(state.clone()));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(native.resident_arrivals(ps2dq_image.head).unwrap() > 0);
+    assert_eq!(native.diagnostics.resident_cold_exits, 0);
+    assert_eq!(trial.live.state.mxcsr & 2, 0, "CVTTPS2DQ must not set DE");
+
+    // Adversarial NaN / -2^31 / +2^31 lanes bail cleanly to Tier 1 and match Tier 0.
+    let init_edge = |m: &mut adv_cpu_core::Memory| {
+        let vals = [
+            1.75f32,
+            -2147483648.0,
+            2147483648.0,
+            f32::NAN,
+            -3.9,
+            f32::INFINITY,
+            0.0,
+            -0.0,
+        ];
+        for (i, v) in vals.into_iter().enumerate() {
+            m.write(DATA + i as u32 * 4, &v.to_le_bytes()).unwrap();
+        }
+    };
+    let mut edge_state = initial(2);
+    edge_state.mxcsr = 0x1fa0;
+    let mut trial = Trial::new(
+        &ps2dq_image,
+        &edge_state,
+        "resident CVTTPS2DQ edge bail",
+        &[],
+        init_edge,
+    );
+    assert!(trial.try_install_at(state.clone()));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    assert_eq!(trial.live.state.mxcsr & 1, 1, "NaN/+2^31 must set IE");
+
+    // 2) CVTDQ2PS -> CVTPS2DQ -> CVTDQ2PD -> CVTTPD2DQ -> CVTTSS2SI pipeline installs resident.
+    let pipe_image = Image::loop_body(|a, head, _| {
+        a.movdqu(xmm0, xmmword_ptr(esi)).unwrap();
+        a.cvtdq2ps(xmm1, xmm0).unwrap();
+        a.cvtps2dq(xmm2, xmm1).unwrap();
+        a.cvtdq2pd(xmm3, xmm2).unwrap();
+        a.cvttpd2dq(xmm4, xmm3).unwrap();
+        a.cvtpd2dq(xmm5, xmm3).unwrap();
+        a.paddd(xmm4, xmm5).unwrap();
+        a.cvttss2si(eax, xmm1).unwrap();
+        a.movdqu(xmmword_ptr(edi), xmm4).unwrap();
+        a.mov(dword_ptr(edi + 16), eax).unwrap();
+        a.add(esi, 16).unwrap();
+        a.add(edi, 32).unwrap();
+        latch(a, head);
+    });
+    let init_ints = |m: &mut adv_cpu_core::Memory| {
+        for i in 0..16i32 {
+            let v = (i - 7) * 13;
+            m.write(DATA + i as u32 * 4, &v.to_le_bytes()).unwrap();
+        }
+    };
+    let mut trial = Trial::new(
+        &pipe_image,
+        &state,
+        "resident SSE packed/scalar conv pipeline",
+        &[],
+        init_ints,
+    );
+    assert!(trial.try_install_at(state));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(native.resident_arrivals(pipe_image.head).unwrap() > 0);
+    assert_eq!(native.diagnostics.resident_cold_exits, 0);
+}
+
 // spec: A64-OPT-9, A64F-FP-5, A64-MEM-7
 #[test]
 fn seeded_scalar_sse_memory_forms_cross_a_page() {

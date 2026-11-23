@@ -236,7 +236,9 @@ fn typed(func: &Func, op: &Op) -> bool {
         }
         Op::X87StoreC1 { value, stored, .. } => is(value, Type::F64) && int(stored),
         Op::Vec(_, a, b) => is(a, Type::V128) && is(b, Type::V128),
-        Op::VecUnary(_, a) | Op::VecToInt(_, a) => is(a, Type::V128),
+        Op::VecUnary(_, a) | Op::VecToInt(_, a) | Op::SsePackedToInt { value: a, .. } => {
+            is(a, Type::V128)
+        }
         Op::Load { addr, .. } | Op::Store { addr, .. } | Op::Host(addr) => is(addr, Type::I32),
         Op::FrameLoad { ty, base, .. } => (int_ty(ty) || ty == Type::F64) && is(base, Type::I64),
         Op::FrameStore { base, value, .. } => {

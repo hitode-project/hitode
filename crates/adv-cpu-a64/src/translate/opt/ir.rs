@@ -118,6 +118,12 @@ pub(crate) enum VecUnary {
     ShiftImm(crate::encode::ShiftImm, u8, u8, bool),
     /// Narrows a binary64 scalar to binary32.
     NarrowScalar,
+    /// Widens a binary32 scalar in lane 0 to binary64 in lane 0.
+    WidenScalar,
+    /// Converts 4 signed `i32` lanes to 4 `f32` lanes (`cvtdq2ps`).
+    FromInt4s,
+    /// Converts low 2 signed `i32` lanes to 2 `f64` lanes (`cvtdq2pd`).
+    FromInt2d,
     /// Zeroes bits 64..128 of a V128 value.
     Low64,
     /// Copies bits 64..128 to bits 0..64 and zeroes bits 64..128.
@@ -298,6 +304,14 @@ pub(crate) enum Op {
         wide: bool,
         sse: bool,
     },
+    /// Packed SSE float-to-int32 conversion (`cvttps2dq`, `cvtps2dq`,
+    /// `cvttpd2dq`, `cvtpd2dq`) under default MXCSR with `PE = 1`. Bails to
+    /// Tier 1 if any lane is NaN, Inf, or outside the fast-path `i32` range.
+    SsePackedToInt {
+        value: Value,
+        double: bool,
+        truncate: bool,
+    },
     /// Round to a signed integer or binary32 under an x87 control word.
     /// When `proved`, an integer store fits in `[-2^(8*width-1), 2^(8*width-1))`
     /// and a binary32 store cannot overflow or underflow.
@@ -434,6 +448,7 @@ impl Op {
             | Op::VecToInt(_, a)
             | Op::FromInt(a)
             | Op::ToInt { value: a, .. }
+            | Op::SsePackedToInt { value: a, .. }
             | Op::X87Store { value: a, .. }
             | Op::Load { addr: a, .. }
             | Op::PlainPage { addr: a, .. }
@@ -525,6 +540,7 @@ impl Op {
                     | Op::Store { .. }
                     | Op::X87Load { proved: false, .. }
                     | Op::SseInput { .. }
+                    | Op::SsePackedToInt { .. }
                     | Op::DomainGuard { .. }
             )
     }
@@ -755,7 +771,7 @@ impl Func {
             | Op::FpUnary(..)
             | Op::FromInt(_)
             | Op::X87Load { .. } => Type::F64,
-            Op::Vec(..) | Op::VecUnary(..) | Op::Fp32(..) => Type::V128,
+            Op::Vec(..) | Op::VecUnary(..) | Op::Fp32(..) | Op::SsePackedToInt { .. } => Type::V128,
             Op::Store { .. }
             | Op::FrameStore { .. }
             | Op::SseInput { .. }

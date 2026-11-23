@@ -1994,6 +1994,48 @@ impl<'a> Emitter<'a> {
                     self.asm.bind(resume);
                 }
             }
+            Op::SsePackedToInt {
+                value,
+                double,
+                truncate,
+            } => {
+                let a = self.vr(value, A);
+                let fail = self.fail();
+                if double {
+                    let hi_imm = if truncate { 0x41e0 } else { 0x41df };
+                    self.asm.emit_all(&[
+                        movz(W, U, hi_imm, 16),
+                        vumov(3, T, a, 0),
+                        ubfx(X, T, T, 32, 31),
+                        cmp(W, T, U, Lsl, 0),
+                    ]);
+                    self.asm.b_cond(Cond::Hs, fail);
+                    self.asm.emit_all(&[
+                        vumov(3, T, a, 1),
+                        ubfx(X, T, T, 32, 31),
+                        cmp(W, T, U, Lsl, 0),
+                    ]);
+                    self.asm.b_cond(Cond::Hs, fail);
+                    self.asm.emit_all(&[
+                        if truncate {
+                            vfcvtzs_2d(q, a)
+                        } else {
+                            vfcvtns_2d(q, a)
+                        },
+                        vxtn_2s(q, q),
+                    ]);
+                } else {
+                    self.asm.emit_all(&[
+                        vshift(ShiftImm::Shl, Arr::S4, B, a, 1),
+                        umaxv(B, B),
+                        fmov_from_v(W, T, B),
+                        movz(W, U, 0x9e00, 16),
+                        cmp(W, T, U, Lsl, 0),
+                    ]);
+                    self.asm.b_cond(Cond::Hs, fail);
+                    self.asm.emit(vtoint(truncate, true, q, a));
+                }
+            }
             Op::X87Store {
                 value,
                 width,
@@ -2078,6 +2120,15 @@ impl<'a> Emitter<'a> {
                 let a = self.vr(a, A);
                 match op {
                     VecUnary::NarrowScalar => self.asm.emit(unary(Unary::Narrow, q, a)),
+                    VecUnary::WidenScalar => self.asm.emit(unary(Unary::Widen, q, a)),
+                    VecUnary::FromInt4s => self.asm.emit(vfromint(q, a)),
+                    VecUnary::FromInt2d => self.asm.emit_all(&[
+                        vumov(2, T, a, 0),
+                        vumov(2, U, a, 1),
+                        scvtf(W, q, T),
+                        scvtf(W, B, U),
+                        vins(3, q, 1, B, 0),
+                    ]),
                     VecUnary::Low64 => self.asm.emit(vmov(false, q, a)),
                     VecUnary::High64 => {
                         self.asm.emit_all(&[vins(3, q, 0, a, 1), vmov(false, q, q)])
