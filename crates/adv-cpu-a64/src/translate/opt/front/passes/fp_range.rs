@@ -2865,28 +2865,46 @@ pub(super) fn infer_domain_guards(
             }
             None
         };
-        let mut mul_to_need = BTreeMap::<Value, (Option<Value>, Option<Value>)>::new();
         for (b, block) in func.blocks.iter().enumerate() {
             if !in_loop[b] {
                 continue;
             }
+            let mut mul_to_need = BTreeMap::<Value, (Option<Value>, Option<Value>)>::new();
             for &(res, op) in &block.insts {
-                if let (Some(r), Op::Fp(FpOp::Mul, a, b_val, _)) = (res, op) {
-                    if let (Some(na), Some(nb)) = (fma_need(a), fma_need(b_val))
-                        && (na.is_some() || nb.is_some())
-                    {
-                        mul_to_need.insert(r, (na, nb));
+                match op {
+                    Op::Store { .. }
+                    | Op::FrameStore { .. }
+                    | Op::ScopeWritten(_)
+                    | Op::PageCross { .. }
+                    | Op::FrameDisjoint { .. } => {
+                        mul_to_need.clear();
                     }
-                } else if let Op::Fp(FpOp::Add | FpOp::Sub, lhs, rhs, _) = op
-                    && let Some(&(na, nb)) = mul_to_need.get(&lhs).or_else(|| mul_to_need.get(&rhs))
-                {
-                    if let Some(v) = na {
-                        fma_exact_inputs.insert(v);
+                    Op::Fp(FpOp::Mul, a, b_val, _) => {
+                        if let Some(r) = res
+                            && let (Some(na), Some(nb)) = (fma_need(a), fma_need(b_val))
+                            && (na.is_some() || nb.is_some())
+                        {
+                            mul_to_need.insert(r, (na, nb));
+                        }
                     }
-                    if let Some(v) = nb {
-                        fma_exact_inputs.insert(v);
+                    Op::Fp(FpOp::Add | FpOp::Sub, lhs, rhs, _) => {
+                        let matched = mul_to_need
+                            .get(&lhs)
+                            .map(|&need| (need, rhs))
+                            .or_else(|| mul_to_need.get(&rhs).map(|&need| (need, lhs)));
+                        if let Some(((na, nb), c)) = matched
+                            && guarded_fp[c.0 as usize].is_some_and(|fc| fc.finite)
+                        {
+                            if let Some(v) = na {
+                                fma_exact_inputs.insert(v);
+                            }
+                            if let Some(v) = nb {
+                                fma_exact_inputs.insert(v);
+                            }
+                            fma_pairs += 1;
+                        }
                     }
-                    fma_pairs += 1;
+                    _ => {}
                 }
             }
         }
@@ -3069,29 +3087,55 @@ pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) 
             .unwrap_or(FpFact::TOP)
     };
 
-    // Count ALL uses across blocks, terminators, and IrRecords (including Recipe::C1).
-    let mut total_uses = vec![0usize; n];
+    // Count all non-C1 uses across blocks, terminators, and IrRecords.
+    // Lazy Recipe::C1 references to an Add/Sub consuming `prod` are tracked
+    // separately so contracting Mul+Add/Sub can rewrite them to Recipe::C1Fma
+    // without keeping `prod` alive in the hot loop.
+    let mut non_c1_uses = vec![0usize; n];
     for block in &func.blocks {
         for &(_, op) in &block.insts {
             for u in op.uses() {
-                total_uses[u.0 as usize] += 1;
+                non_c1_uses[u.0 as usize] += 1;
             }
         }
         if let End::Branch { cond, .. } = block.end {
-            total_uses[cond.0 as usize] += 1;
+            non_c1_uses[cond.0 as usize] += 1;
         }
         for t in block.end.targets() {
             for &arg in &t.args {
-                total_uses[arg.0 as usize] += 1;
+                non_c1_uses[arg.0 as usize] += 1;
             }
         }
     }
-    for record in &func.records {
+    let mut c1_records = Vec::<(usize, FpOp, Value, Value, bool)>::new();
+    for (rec_idx, record) in func.records.iter().enumerate() {
         for u in record.uses() {
-            total_uses[u.0 as usize] += 1;
+            non_c1_uses[u.0 as usize] += 1;
+        }
+        if let Some(x87) = &record.x87
+            && let Some(Location::Recipe(Recipe::C1 {
+                op: op @ (FpOp::Add | FpOp::Sub),
+                a,
+                b,
+                single,
+            })) = x87.c1
+        {
+            non_c1_uses[a.0 as usize] -= 1;
+            non_c1_uses[b.0 as usize] -= 1;
+            c1_records.push((rec_idx, op, a, b, single));
         }
     }
 
+    let c1_compatible = |prod: Value, fp_op: FpOp, lhs: Value, rhs: Value, single: bool| {
+        c1_records
+            .iter()
+            .filter(|&&(_, _, ra, rb, _)| ra == prod || rb == prod)
+            .all(|&(_, r_op, ra, rb, r_single)| {
+                r_op == fp_op && ra == lhs && rb == rhs && r_single == single
+            })
+    };
+
+    let mut c1_rewrites = Vec::<(Value, FmaOp, Value, Value, Value, bool)>::new();
     let mut contracted = false;
     for block in &mut func.blocks {
         // prod -> (inst_idx, region_id, single, a, b)
@@ -3111,7 +3155,7 @@ pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) 
                 }
                 Op::Fp(FpOp::Mul, a, b, _) => {
                     if let Some(prod) = result
-                        && total_uses[prod.0 as usize] == 1
+                        && non_c1_uses[prod.0 as usize] == 1
                         && fp_mul_is_exact_f64(get_fp(a), get_fp(b))
                     {
                         muls.insert(prod, (idx, region_id, false, a, b));
@@ -3120,7 +3164,7 @@ pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) 
                 Op::X87Single(FpOp::Mul, a, b, mul_flags) => {
                     let all = SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT;
                     if let Some(prod) = result
-                        && total_uses[prod.0 as usize] == 1
+                        && non_c1_uses[prod.0 as usize] == 1
                         && mul_flags & all == all
                         && get_fp(a).finite
                         && get_fp(b).finite
@@ -3137,7 +3181,7 @@ pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) 
                         } else {
                             FmaOp::Sub
                         };
-                        Some((mul_idx, fma_op, a, b, rhs))
+                        Some((lhs, mul_idx, fma_op, a, b, rhs))
                     } else if let Some(&(mul_idx, mul_reg, false, a, b)) = muls.get(&rhs)
                         && mul_reg == region_id
                     {
@@ -3146,12 +3190,13 @@ pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) 
                         } else {
                             FmaOp::RevSub
                         };
-                        Some((mul_idx, fma_op, a, b, lhs))
+                        Some((rhs, mul_idx, fma_op, a, b, lhs))
                     } else {
                         None
                     };
-                    if let Some((mul_idx, fma_op, a, b, c)) = matched
+                    if let Some((prod, mul_idx, fma_op, a, b, c)) = matched
                         && get_fp(c).finite
+                        && c1_compatible(prod, fp_op, lhs, rhs, false)
                     {
                         let proved = if add_proved
                             || eval_fp(fp_op, get_fp(lhs), get_fp(rhs), lhs == rhs).0
@@ -3169,6 +3214,7 @@ pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) 
                             proved,
                         };
                         removed.insert(mul_idx);
+                        c1_rewrites.push((prod, fma_op, a, b, c, false));
                         contracted = true;
                     }
                 }
@@ -3182,7 +3228,7 @@ pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) 
                             FmaOp::Sub
                         };
                         let c_proved = add_flags & SINGLE_B != 0 || get_fp(rhs).binary32_exact;
-                        Some((mul_idx, fma_op, a, b, rhs, c_proved))
+                        Some((lhs, mul_idx, fma_op, a, b, rhs, c_proved))
                     } else if let Some(&(mul_idx, mul_reg, true, a, b)) = muls.get(&rhs)
                         && mul_reg == region_id
                     {
@@ -3192,12 +3238,13 @@ pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) 
                             FmaOp::RevSub
                         };
                         let c_proved = add_flags & SINGLE_A != 0 || get_fp(lhs).binary32_exact;
-                        Some((mul_idx, fma_op, a, b, lhs, c_proved))
+                        Some((rhs, mul_idx, fma_op, a, b, lhs, c_proved))
                     } else {
                         None
                     };
-                    if let Some((mul_idx, fma_op, a, b, c, c_proved)) = matched
+                    if let Some((prod, mul_idx, fma_op, a, b, c, c_proved)) = matched
                         && get_fp(c).finite
+                        && c1_compatible(prod, fp_op, lhs, rhs, true)
                     {
                         let mut proved = SINGLE_A | SINGLE_B;
                         if c_proved {
@@ -3218,6 +3265,7 @@ pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) 
                             proved,
                         };
                         removed.insert(mul_idx);
+                        c1_rewrites.push((prod, fma_op, a, b, c, true));
                         contracted = true;
                     }
                 }
@@ -3233,6 +3281,23 @@ pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) 
                 }
             }
             block.insts = kept;
+        }
+    }
+    if !c1_rewrites.is_empty() {
+        for &(rec_idx, _, ra, rb, _) in &c1_records {
+            if let Some(&(_, fma_op, a, b, c, single)) = c1_rewrites
+                .iter()
+                .find(|&&(prod, ..)| prod == ra || prod == rb)
+                && let Some(x87) = &mut func.records[rec_idx].x87
+            {
+                x87.c1 = Some(Location::Recipe(Recipe::C1Fma {
+                    op: fma_op,
+                    a,
+                    b,
+                    c,
+                    single,
+                }));
+            }
         }
     }
     contracted

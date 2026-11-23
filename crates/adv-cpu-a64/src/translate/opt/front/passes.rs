@@ -236,6 +236,11 @@ fn substitute(record: &mut IrRecord, map: impl Fn(Value) -> Value) {
                 f(a);
                 f(b);
             }
+            Location::Recipe(Recipe::C1Fma { a, b, c, .. }) => {
+                f(a);
+                f(b);
+                f(c);
+            }
             Location::Constant(_) => {}
         }
     }

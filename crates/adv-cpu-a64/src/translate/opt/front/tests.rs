@@ -3433,35 +3433,71 @@ fn phase2_exact_fma_contraction_and_adversarial_guards() {
         }
     }
 
-    // 3) Non-contraction when Add's C1 is live at exit (prod is referenced by Recipe::C1)
-    // and when an intervening Store separates Mul and Add into different recovery regions.
+    // 3) Live C1 on Add (e.g. observed by a subsequent Store's recovery record)
+    // rewrites to Recipe::C1Fma so contraction still fires, while multi-use `prod`
+    // and cross-region Stores block contraction.
     {
         let c1_observed = assemble(|a| {
             row(a, |a| {
                 a.movzx(eax, byte_ptr(esi)).unwrap();
-                a.mov(dword_ptr(edi), eax).unwrap();
-                a.fstp(st0).unwrap(); // keep x87 depth invariant across loop iterations
                 a.mov(dword_ptr(esp + 0x10), eax).unwrap();
                 a.fild(dword_ptr(esp + 0x10)).unwrap();
                 a.mov(dword_ptr(esp + 0x14), 0x3c80_0000u32).unwrap();
                 a.fmul(dword_ptr(esp + 0x14)).unwrap();
-                a.mov(dword_ptr(esp + 0x18), 0x4120_0000u32).unwrap();
+                a.mov(dword_ptr(esp + 0x18), (1.0f32 / 3.0f32).to_bits())
+                    .unwrap();
                 a.fadd(dword_ptr(esp + 0x18)).unwrap();
-                // Exit directly with st(0) and Recipe::C1 { op: Add, a: prod, b: 10.0 } live.
+                // Checked store right after fadd: its recovery record observes Add's Recipe::C1.
+                a.mov(dword_ptr(edi), eax).unwrap();
+                a.fistp(dword_ptr(esp + 0x1c)).unwrap();
             })
         });
         let mut at = initial();
         at.regs[1] = 1;
         at.x87.control = 0x023f;
         at.x87.status = 0x20;
-        at.x87.push(adv_cpu_core::floating::fast::extended(0.0));
         let built = differential(&c1_observed, &at, |m| {
             m.write(DATA, &[137u8]).unwrap();
         });
         assert_eq!(
             count(&built, |op| matches!(op, Op::Fma { .. })),
+            1,
+            "live Add C1 on Store recovery record should rewrite to Recipe::C1Fma"
+        );
+        assert!(
+            built.func.records.iter().any(|r| matches!(
+                r.x87.as_ref().and_then(|x| x.c1),
+                Some(Location::Recipe(Recipe::C1Fma { .. }))
+            )),
+            "expected Recipe::C1Fma on Store recovery record"
+        );
+    }
+    {
+        let multi_use = assemble(|a| {
+            row(a, |a| {
+                a.movzx(eax, byte_ptr(esi)).unwrap();
+                a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+                a.fild(dword_ptr(esp + 0x10)).unwrap();
+                a.mov(dword_ptr(esp + 0x14), 0x3c80_0000u32).unwrap();
+                a.fmul(dword_ptr(esp + 0x14)).unwrap();
+                a.fld(st0).unwrap(); // duplicate prod so use_count(prod) > 1
+                a.mov(dword_ptr(esp + 0x18), 0x4120_0000u32).unwrap();
+                a.fadd(dword_ptr(esp + 0x18)).unwrap();
+                a.fstp(qword_ptr(edi)).unwrap();
+                a.fstp(qword_ptr(edi + 8)).unwrap();
+            })
+        });
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x023f;
+        at.x87.status = 0x20;
+        let built = differential(&multi_use, &at, |m| {
+            m.write(DATA, &[137u8]).unwrap();
+        });
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::Fma { .. })),
             0,
-            "must not contract when Add's Recipe::C1 observes prod"
+            "must not contract when prod has another use"
         );
     }
     {

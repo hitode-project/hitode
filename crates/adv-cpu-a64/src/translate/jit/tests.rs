@@ -5177,6 +5177,50 @@ pub(in crate::translate) mod opt_back {
             &mut h,
         );
         assert_eq!(got.cpu.x87.status >> 9 & 1, 1);
+        for op in [FmaOp::Add, FmaOp::Sub, FmaOp::RevSub] {
+            for single in [false, true] {
+                let (mut f, b, p, _) = start(&[Type::F64, Type::F64, Type::F64]);
+                let v = f
+                    .push(
+                        b,
+                        Op::Fma {
+                            op,
+                            a: p[0],
+                            b: p[1],
+                            c: p[2],
+                            single,
+                            proved: SINGLE_A | SINGLE_B | SINGLE_C | SINGLE_RESULT,
+                        },
+                    )
+                    .unwrap();
+                let exit = finish(&mut f, b, v);
+                f.records[exit.0 as usize].x87.as_mut().unwrap().c1 =
+                    Some(Location::Recipe(Recipe::C1Fma {
+                        op,
+                        a: p[0],
+                        b: p[1],
+                        c: p[2],
+                        single,
+                    }));
+                f.records[exit.0 as usize].x87.as_mut().unwrap().top = 3;
+                for (a, b_val, c) in [
+                    (3.0f64, 0.25f64, 1.0f64 / 3.0f64),
+                    (137.0f64, 1.0f64 / 64.0f64, f64::from(1.0f32 / 3.0f32)),
+                    (1.0f64, 2.0f64, 1e-16f64),
+                    (1.0f64, 2.0f64, -1e-16f64),
+                ] {
+                    compare(
+                        &f,
+                        &[
+                            u128::from(a.to_bits()),
+                            u128::from(b_val.to_bits()),
+                            u128::from(c.to_bits()),
+                        ],
+                        &mut h,
+                    );
+                }
+            }
+        }
         assert_eq!(got.registers.x[28], WINDOW_BASE);
         assert_eq!(got.registers.x[29], CONTEXT);
     }

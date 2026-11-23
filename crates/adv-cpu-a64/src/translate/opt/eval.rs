@@ -1032,6 +1032,22 @@ pub(crate) fn locate(location: &Location<Value>, values: &[u128]) -> u128 {
             f64::from_bits(get(b) as u64),
             single,
         )),
+        Location::Recipe(Recipe::C1Fma {
+            op,
+            a,
+            b,
+            c,
+            single,
+        }) => {
+            let prod = f64::from_bits(get(a) as u64) * f64::from_bits(get(b) as u64);
+            let cv = f64::from_bits(get(c) as u64);
+            let (fp_op, lhs, rhs) = match op {
+                FmaOp::Add => (FpOp::Add, prod, cv),
+                FmaOp::Sub => (FpOp::Sub, prod, cv),
+                FmaOp::RevSub => (FpOp::Sub, cv, prod),
+            };
+            u128::from(rounded_up(fp_op, lhs, rhs, single))
+        }
     }
 }
 

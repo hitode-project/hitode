@@ -6,7 +6,7 @@
 //! Tier-1 state. The owner's materializer uses the captured host registers
 //! to rebuild `CpuState` and frame bytes for jobs and cold exits.
 
-use super::ir::{FpOp, Value};
+use super::ir::{FmaOp, FpOp, Value};
 
 /// Where a component's value lives at the region start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +21,14 @@ pub(crate) enum Location<L> {
 pub(crate) enum Recipe<L> {
     /// C1 after `a op b` rounded under the form's control word.
     C1 { op: FpOp, a: L, b: L, single: bool },
+    /// C1 after an exact-product FMA (`a * b ± c` or `c - a * b`).
+    C1Fma {
+        op: FmaOp,
+        a: L,
+        b: L,
+        c: L,
+        single: bool,
+    },
     /// EFLAGS of a `Flags` value: its kind and operands, as the interpreter
     /// computes them.
     Eflags(L),
@@ -236,9 +244,10 @@ impl<L: Copy> Record<L> {
             .flatten()
             .chain(self.frame.iter().map(|(_, _, location)| location))
             .flat_map(|location| match *location {
-                Location::Constant(_) => [None, None],
-                Location::At(at) | Location::Recipe(Recipe::Eflags(at)) => [Some(at), None],
-                Location::Recipe(Recipe::C1 { a, b, .. }) => [Some(a), Some(b)],
+                Location::Constant(_) => [None, None, None],
+                Location::At(at) | Location::Recipe(Recipe::Eflags(at)) => [Some(at), None, None],
+                Location::Recipe(Recipe::C1 { a, b, .. }) => [Some(a), Some(b), None],
+                Location::Recipe(Recipe::C1Fma { a, b, c, .. }) => [Some(a), Some(b), Some(c)],
             })
             .flatten()
             .chain(self.flag_groups.iter().flat_map(FlagGroup::uses))
@@ -345,6 +354,22 @@ impl Locations<'_> {
                     b: Value(1),
                 }),
                 &[self.get(a), self.get(b)],
+            ),
+            Location::Recipe(Recipe::C1Fma {
+                op,
+                a,
+                b,
+                c,
+                single,
+            }) => super::eval::locate(
+                &Location::Recipe(Recipe::C1Fma {
+                    op,
+                    single,
+                    a: Value(0),
+                    b: Value(1),
+                    c: Value(2),
+                }),
+                &[self.get(a), self.get(b), self.get(c)],
             ),
         }
     }
@@ -504,6 +529,19 @@ pub(crate) fn lower_record(record: &IrRecord, locations: &[Host]) -> Record<Host
             single,
             a: locations[a.0 as usize],
             b: locations[b.0 as usize],
+        }),
+        Location::Recipe(Recipe::C1Fma {
+            op,
+            a,
+            b,
+            c,
+            single,
+        }) => Location::Recipe(Recipe::C1Fma {
+            op,
+            single,
+            a: locations[a.0 as usize],
+            b: locations[b.0 as usize],
+            c: locations[c.0 as usize],
         }),
     };
     Record {
