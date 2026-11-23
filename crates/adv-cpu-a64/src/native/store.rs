@@ -147,8 +147,13 @@ impl<R> ResidentSite<R> {
     }
 }
 
-pub(super) fn place_stubs(capacity: usize, words: &[u32]) -> Result<(CodeCache, usize), String> {
-    let mut cache = CodeCache::new(capacity)?;
+pub(super) fn place_stubs(
+    initial: usize,
+    max_len: usize,
+    fallback_len: usize,
+    words: &[u32],
+) -> Result<(CodeCache, usize), String> {
+    let mut cache = CodeCache::with_limit(initial, max_len, fallback_len)?;
     let base = cache.append(words).ok_or("stubs do not fit")?;
     Ok((cache, base))
 }
@@ -484,6 +489,12 @@ impl<R> CodeStore<R> {
         for counter in &slot.domain_sensor {
             counter.set(crate::policy::resident::DOMAIN_MISS_SAMPLE);
         }
+        if !self
+            .cache
+            .ensure((layout.words.len() + layout.row_failures.len() * 32 + 512) * 4)
+        {
+            return false;
+        }
         let base = self.cache.next();
         let mut entry = ingress::emit(
             (eip, index),
@@ -683,6 +694,9 @@ impl<R> CodeStore<R> {
         if let Some(tier1) = self.resident_fallback(eip) {
             return Some(tier1);
         }
+        if !self.cache.ensure(64) {
+            return None;
+        }
         let at = self.cache.next();
         let words = ingress::version_miss(eip, at, self.stubs.dispatch);
         self.cache.append(&words)?;
@@ -732,6 +746,9 @@ impl<R> CodeStore<R> {
                     version.row_price.and_then(|price| price.count_register) == Some(reg)
                 })
             });
+        if !self.cache.ensure((cases.len() * 16 + 128) * 4) {
+            return false;
+        }
         let fallback = first.map_or(tier1, |version| version.cold);
         let at = self.cache.next();
         let (words, points) = ingress::row_entry(
@@ -759,7 +776,7 @@ impl<R> CodeStore<R> {
 
     pub(super) fn install_row_retry(&mut self, eip: u32) -> bool {
         let site = self.resident(eip).unwrap();
-        if site.row_retry.is_some() || site.entry().is_none() {
+        if site.row_retry.is_some() || site.entry().is_none() || !self.cache.ensure(64) {
             return false;
         }
         let at = self.cache.next();
@@ -890,6 +907,9 @@ impl<R> CodeStore<R> {
     }
 
     pub(super) fn install_offer(&mut self, eip: u32, gate: OfferEntry) {
+        if !self.cache.ensure(128) {
+            return;
+        }
         let at = self.cache.next();
         let unit = self.tier1(eip).map(|entry| entry.unit);
         let (words, fallback) = ingress::offer_link(eip, at, self.stubs.exit, unit, gate);
@@ -1467,6 +1487,9 @@ impl<R> CodeStore<R> {
         exit: usize,
         sites: &[(usize, Site)],
     ) -> Option<WorkerCode> {
+        if !self.cache.ensure(words.len() * 4) {
+            return None;
+        }
         words[exit] = branch(self.cache.next() + exit * 4, self.stubs.opt_exit);
         self.place_worker(words, sites)
     }
@@ -1506,6 +1529,7 @@ impl<R> CodeStore<R> {
             work.marks,
             work.version,
         )?;
+        assert!(!work.far_overflow, "far branch out of range inside cache");
         let at = entry.unit;
         if !unit.tables.is_empty() {
             self.table_sources.insert(eip);

@@ -155,6 +155,7 @@ pub struct Code {
     pub(crate) marks: Vec<Mark>,
     pub(crate) retired: u32,
     pub(crate) uses_permissions: bool,
+    pub(crate) far_overflow: bool,
     resident_links: bool,
     pub(crate) table_positions: Vec<(usize, usize)>,
     pub(crate) version: VersionLayout,
@@ -453,6 +454,7 @@ struct Translator<'a> {
     /// What each merge holds on arrival (`residency`).
     entry: Vec<residency::Entry>,
     uses_permissions: &'a mut bool,
+    far_overflow: &'a mut bool,
     /// The x87 run whose stack lives in host registers, if any.
     x87: x87::Cache,
     x87_scratch: &'a mut x87::Scratch,
@@ -572,6 +574,7 @@ impl Jit<'_> {
             marks,
             retired,
             uses_permissions,
+            far_overflow,
             resident_links,
             table_positions,
             version,
@@ -582,6 +585,7 @@ impl Jit<'_> {
         table_positions.clear();
         table_positions.resize(tables.len(), (0, 0));
         *uses_permissions = false;
+        *far_overflow = false;
         labels.clear();
         labels.extend((0..trace.len()).map(|_| asm.label()));
         sites.clear();
@@ -634,6 +638,7 @@ impl Jit<'_> {
             vector: simd::Vector::default(),
             entry: entries,
             uses_permissions,
+            far_overflow,
             x87: x87::Cache::for_trace(trace),
             x87_scratch,
             x87_sites: Vec::new(),
@@ -724,6 +729,7 @@ pub(crate) fn lower_computation<'a>(
     }
     .lower_form(unit, eip, true);
     (!code.uses_permissions
+        && !code.far_overflow
         && code.links.is_empty()
         && code
             .far
@@ -2193,7 +2199,16 @@ impl Translator<'_> {
         self.asm.resolve();
         let words = self.asm.words_mut();
         for &(index, to) in self.far.iter() {
-            let offset = (to as i64 - (at + 4 * index) as i64) as i32;
+            let offset = to as i64 - (at + 4 * index) as i64;
+            let Some(offset) = i32::try_from(offset)
+                .ok()
+                .filter(|offset| (-(1 << 27)..(1 << 27)).contains(offset))
+            else {
+                // Only happens when a unit spills past a 128 MiB cache boundary;
+                // `CodeCache::append` rejects it and clears the cache.
+                *self.far_overflow = true;
+                return false;
+            };
             words[index] = if words[index] == bl(0) {
                 bl(offset)
             } else {

@@ -80,7 +80,7 @@ static STALE_GATE: OfferGate = OfferGate {
     split_deadline: AtomicU64::new(u64::MAX),
 };
 
-use crate::policy::tier1::{CACHE_LEN, CHAIN_LEN};
+use crate::policy::tier1::{CHAIN_LEN, FALLBACK_CACHE_LEN, INITIAL_CACHE_LEN, MAX_CACHE_LEN};
 
 /// Most guest instructions one `run` completes, so the owner still sees
 /// deadlines and interrupts while linked units loop.
@@ -645,6 +645,9 @@ pub(crate) struct Native {
     compiler: compile::Compiler,
     pub(crate) features: Features,
     runtime: Box<Runtime>,
+    /// Set after a full-cache clear when the lease was blocked from growing in
+    /// place; the next top-level `run` entry tries to relocate safely.
+    want_relocate: bool,
     /// Live timestamp bridge, including runs without a trap handler.
     pub(crate) clock: *mut std::ffi::c_void,
 }
@@ -844,63 +847,86 @@ impl Native {
     }
 }
 
+unsafe extern "C" fn resident_access(
+    runtime: *mut Runtime,
+    address: u32,
+    site: usize,
+    value: u32,
+    kind: u32,
+) -> u64 {
+    if kind & runtime::ACCESS_STORE != 0 {
+        // SAFETY: the owner and memory are live as in `access`.
+        let owner = unsafe { &*((*runtime).owner as *const Owner) };
+        let memory = unsafe { &*owner.memory };
+        let last = address.wrapping_add((kind & 31) - 1);
+        if [address, last]
+            .into_iter()
+            .any(|at| memory.file_page_copy_on_write(at).is_some() && memory.shared_range(at, 1))
+        {
+            return 1 << 32;
+        }
+    }
+    // SAFETY: same owner and arguments as the Tier-1 stub.
+    let result = unsafe { access(runtime, address, site, value, kind) };
+    if result.recovery.is_null() {
+        result.value
+    } else {
+        1 << 32
+    }
+}
+
+fn build_stubs() -> (stubs::Stubs, usize) {
+    let mut stubs = stubs::stubs();
+    let access_entry = stubs.code.len() * 4;
+    stubs
+        .code
+        .extend(opt::back::access_stub(resident_access as *const () as u64));
+    (stubs, access_entry)
+}
+
+fn record_stubs(base: usize, stubs: &stubs::Stubs, access_entry: usize) {
+    crate::jit_map::record_stubs(
+        base,
+        base + 4 * stubs.code.len(),
+        &[
+            (stubs.enter, "enter"),
+            (stubs.opt_enter, "opt_enter"),
+            (stubs.exit, "exit"),
+            (stubs.resident_exit, "resident_exit"),
+            (stubs.fault, "fault"),
+            (stubs.dispatch, "dispatch"),
+            (stubs.lookup, "lookup"),
+            (stubs.lookup_slow, "lookup_slow"),
+            (stubs.ret_miss, "ret_miss"),
+            (stubs.shadow_reset, "shadow_reset"),
+            (stubs.access, "access"),
+            (access_entry, "resident_access"),
+            (stubs.call, "call"),
+            (stubs.x87.pair_to_extended, "x87_pair_to_extended"),
+            (stubs.x87.pair_from_extended, "x87_pair_from_extended"),
+            (stubs.x87.fetch, "x87_fetch"),
+            (stubs.x87.match_slot, "x87_match_slot"),
+            (stubs.x87.publish, "x87_publish"),
+            (stubs.x87.tags, "x87_tags"),
+            (stubs.x87.materialize_mmx, "materialize_mmx"),
+            (stubs.x87.value_call, "x87_value_call"),
+        ],
+    );
+}
+
 impl Native {
     /// `window` is the host address of guest address 0 in the guest's
     /// `GuestWindow`, which must outlive this.
     pub fn new(window: usize) -> Result<Self, String> {
         adv_cpu_core::fault_recovery::install_translated(on_fault)?;
-        unsafe extern "C" fn resident_access(
-            runtime: *mut Runtime,
-            address: u32,
-            site: usize,
-            value: u32,
-            kind: u32,
-        ) -> u64 {
-            if kind & runtime::ACCESS_STORE != 0 {
-                // SAFETY: the owner and memory are live as in `access`.
-                let owner = unsafe { &*((*runtime).owner as *const Owner) };
-                let memory = unsafe { &*owner.memory };
-                let last = address.wrapping_add((kind & 31) - 1);
-                if [address, last].into_iter().any(|at| {
-                    memory.file_page_copy_on_write(at).is_some() && memory.shared_range(at, 1)
-                }) {
-                    return 1 << 32;
-                }
-            }
-            // SAFETY: same owner and arguments as the Tier-1 stub.
-            let result = unsafe { access(runtime, address, site, value, kind) };
-            if result.recovery.is_null() {
-                result.value
-            } else {
-                1 << 32
-            }
-        }
-
-        let mut stubs = stubs::stubs();
-        let access_entry = stubs.code.len() * 4;
-        stubs
-            .code
-            .extend(opt::back::access_stub(resident_access as *const () as u64));
-        let (cache, base) = store::place_stubs(CACHE_LEN, &stubs.code)?;
-        crate::jit_map::record_stubs(
-            base,
-            base + 4 * stubs.code.len(),
-            &[
-                (stubs.enter, "enter"),
-                (stubs.opt_enter, "opt_enter"),
-                (stubs.exit, "exit"),
-                (stubs.resident_exit, "resident_exit"),
-                (stubs.fault, "fault"),
-                (stubs.dispatch, "dispatch"),
-                (stubs.lookup, "lookup"),
-                (stubs.lookup_slow, "lookup_slow"),
-                (stubs.ret_miss, "ret_miss"),
-                (stubs.shadow_reset, "shadow_reset"),
-                (stubs.access, "access"),
-                (access_entry, "resident_access"),
-                (stubs.call, "call"),
-            ],
-        );
+        let (stubs, access_entry) = build_stubs();
+        let (cache, base) = store::place_stubs(
+            INITIAL_CACHE_LEN,
+            MAX_CACHE_LEN,
+            FALLBACK_CACHE_LEN,
+            &stubs.code,
+        )?;
+        record_stubs(base, &stubs, access_entry);
         // SAFETY: `enter` and `opt_enter` follow the C calling convention with
         // the signature of `Enter`; see the entry emitters in `translate::lower::stubs`.
         let enter = Enter(base + stubs.enter);
@@ -1004,8 +1030,51 @@ impl Native {
             compiler: compile::Compiler::new(),
             features: features(),
             runtime,
+            want_relocate: false,
             clock: std::ptr::null_mut(),
         })
+    }
+
+    /// Relocates a pool-backed cache to a strictly larger contiguous range at a
+    /// safe top-level `run` boundary (no active translated frames, no installed
+    /// fault handler, and no running offload workers).
+    pub(super) fn relocate_cache(&mut self) {
+        self.want_relocate = false;
+        let target = self.code.cache.len().saturating_mul(2);
+        let Some(base) = self.code.cache.relocate(target) else {
+            return;
+        };
+        let (stubs, access_entry) = build_stubs();
+        let placed = self
+            .code
+            .cache
+            .append(&stubs.code)
+            .expect("stubs fit relocated cache");
+        debug_assert_eq!(placed, base);
+        self.code.stub_len = self.code.cache.used();
+        self.clear_state();
+        self.code.enter = Enter(base + stubs.enter);
+        self.code.opt_enter = Enter(base + stubs.opt_enter);
+        self.code.resident_exit = base + stubs.resident_exit;
+        self.code.faults.start = base;
+        self.code.faults.end.set(self.code.cache.next());
+        self.code.faults.stub = base + stubs.fault;
+        self.code.faults.reset = base + stubs.shadow_reset;
+        self.code.stubs = Stubs {
+            exit: base + stubs.exit,
+            dispatch: base + stubs.dispatch,
+            lookup: base + stubs.lookup,
+            lookup_slow: base + stubs.lookup_slow,
+            ret_miss: base + stubs.ret_miss,
+            access: base + stubs.access,
+            call: base + stubs.call,
+            fault: base + stubs.fault,
+            opt_exit: base + stubs.opt_exit,
+            x87: Some(stubs.x87.at(base)),
+        };
+        self.runtime.resident_access = (base + access_entry) as u64;
+        record_stubs(base, &stubs, access_entry);
+        self.code.cache.sync();
     }
 
     pub(crate) fn count_forms(&mut self, enabled: bool) {
@@ -3501,5 +3570,95 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(state_a.regs[0], 24);
+    }
+
+    // spec: A64-CTL-1
+    #[test]
+    fn far_branch_overflow_beyond_cache_limit_is_reported_without_panicking() {
+        use adv_cpu_core::memory::EXEC;
+
+        let (mut memory, mut native) = native();
+        memory.map(HEAD, 0x1000, READ | WRITE).unwrap();
+        memory.write(HEAD, &[0x40, 0xcc]).unwrap();
+        memory.protect(HEAD, 0x1000, READ | EXEC).unwrap();
+        native.observe_stop(HEAD + 1);
+        let unit = native.front_unit(&mut memory, HEAD, false, false, None);
+        let mut work = compile::Workspace::default();
+        work.lower_tier1(
+            &unit,
+            HEAD,
+            &|_| false,
+            0,
+            native.features,
+            native.code.stubs.exit + (128 << 20),
+            native.code.stubs,
+            true,
+            crate::facts::Key::default(),
+            0,
+        );
+        assert!(work.placement().far_overflow);
+    }
+
+    // spec: A64-CTL-1, A64-CTL-13
+    #[test]
+    fn safe_point_relocate_grows_cache_and_preserves_execution_and_fault_recovery() {
+        use adv_cpu_core::memory::EXEC;
+
+        let (mut memory, mut native) = native();
+        native.first_visits = false;
+        let initial_len = native.code.cache.len();
+        assert_eq!(initial_len, INITIAL_CACHE_LEN);
+        let entry = HEAD;
+        let callee = HEAD + 0x40;
+        let stop = entry + 12;
+        memory.map(HEAD, 0x1000, READ | WRITE).unwrap();
+        memory.map(0x30_0000, 0x4000, READ | WRITE).unwrap();
+        // call callee; mov eax, [ecx]; int3
+        let mut main_code = vec![0xe8];
+        let rel = (callee as i32) - (entry as i32 + 5);
+        main_code.extend_from_slice(&rel.to_le_bytes());
+        main_code.extend_from_slice(&[0x8b, 0x01, 0x90, 0x90, 0x90, 0x90, 0x90, 0xcc]);
+        memory.write(entry, &main_code).unwrap();
+        // callee: add eax, 7; ret
+        memory.write(callee, &[0x83, 0xc0, 0x07, 0xc3]).unwrap();
+        memory.protect(HEAD, 0x1000, READ | EXEC).unwrap();
+        native.observe_stop(stop);
+
+        // Pin a neighbor lease and request safe-point relocation.
+        let _neighbor = Native::new(memory.window_base().unwrap()).unwrap();
+        native.want_relocate = true;
+
+        // First run triggers safe-point relocation before translating and faults on unmapped [ecx].
+        let mut faulting = cpu(entry, 0x30_1000, 0x90_0000);
+        faulting.regs[0] = 10;
+        let run = native
+            .run(
+                &mut faulting,
+                &mut memory,
+                stop,
+                SLICE,
+                std::ptr::null_mut(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(native.code.cache.len() > initial_len);
+        assert!(!native.want_relocate);
+        assert_eq!(run.exit, Exit::Event(runtime::Event::Replay));
+        assert_eq!(faulting.eip, entry + 5);
+        assert_eq!(faulting.regs[0], 17);
+
+        // Second run with valid [ecx] completes cleanly on the relocated stubs and cache.
+        memory
+            .write(0x30_0800, &0x1234_5678u32.to_le_bytes())
+            .unwrap();
+        let mut ok = cpu(entry, 0x30_1000, 0x30_0800);
+        ok.regs[0] = 10;
+        while ok.eip != stop {
+            native
+                .run(&mut ok, &mut memory, stop, SLICE, std::ptr::null_mut())
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(ok.regs[0], 0x1234_5678);
     }
 }

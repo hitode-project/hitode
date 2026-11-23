@@ -103,6 +103,7 @@ pub(crate) struct Tier1Placement<'a> {
     pub internal_links: &'a [InternalLink],
     pub table_positions: &'a [(usize, usize)],
     pub uses_permissions: bool,
+    pub far_overflow: bool,
 }
 
 /// Host addresses of the `runtime` stubs units branch to.

@@ -36,19 +36,39 @@ pub struct CodeCache {
     /// Where the CPU executes; equal to `write` on macOS.
     exec: NonNull<u8>,
     len: usize,
+    max_len: usize,
     used: usize,
-    _storage: Storage,
+    storage: Storage,
     /// Writes not yet synchronized, as offset and length.
     dirty: Vec<(usize, usize)>,
 }
 
 impl CodeCache {
+    #[cfg(test)]
     pub fn new(len: usize) -> Result<Self, String> {
-        if len == 0 || len > MAX_LEN || !len.is_multiple_of(page_size()?) {
-            return Err(format!("bad code cache length {len:#x}"));
+        Self::with_limit(len, len, len)
+    }
+
+    /// Leases an initial `initial` bytes from the prepared pool that may grow
+    /// up to `max_len` bytes in place or on safe-point relocation. Non-strict
+    /// hosts that overflow the pool map `fallback_len` bytes directly.
+    pub fn with_limit(initial: usize, max_len: usize, fallback_len: usize) -> Result<Self, String> {
+        let page = page_size()?;
+        if initial == 0
+            || initial > max_len
+            || max_len > MAX_LEN
+            || fallback_len == 0
+            || fallback_len > MAX_LEN
+            || !initial.is_multiple_of(page)
+            || !max_len.is_multiple_of(page)
+            || !fallback_len.is_multiple_of(page)
+        {
+            return Err(format!(
+                "bad code cache length initial={initial:#x} max={max_len:#x} fallback={fallback_len:#x}"
+            ));
         }
         let pool = prepared_pool()?;
-        let (write, exec, storage) = match lease(&pool.ranges, len, strict_pool()) {
+        let (write, exec, storage, max_len) = match lease(&pool.ranges, initial, strict_pool()) {
             Some(lease) => {
                 let offset = lease.range().start;
                 // SAFETY: this disjoint lease stays inside the process-lifetime pool.
@@ -57,25 +77,32 @@ impl CodeCache {
                         NonNull::new_unchecked(pool.mapping.write.as_ptr().add(offset)),
                         NonNull::new_unchecked(pool.mapping.exec.as_ptr().add(offset)),
                         Storage::Lease(lease),
+                        max_len,
                     )
                 }
             }
             None if !strict_pool() => {
-                let mapping = backend::Mapping::new(len)?;
-                (mapping.write, mapping.exec, Storage::Own(mapping))
+                let mapping = backend::Mapping::new(fallback_len)?;
+                (
+                    mapping.write,
+                    mapping.exec,
+                    Storage::Own(mapping),
+                    fallback_len,
+                )
             }
             None => return Err("prepared A64 code pool exhausted".into()),
         };
         let len = match &storage {
             Storage::Lease(lease) => lease.range().len(),
-            Storage::Own(_) => len,
+            Storage::Own(_) => fallback_len,
         };
         Ok(Self {
             write,
             exec,
             len,
+            max_len,
             used: 0,
-            _storage: storage,
+            storage,
             dirty: Vec::new(),
         })
     }
@@ -89,11 +116,76 @@ impl CodeCache {
         self.used
     }
 
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether this cache can still grow within the prepared pool.
+    pub fn can_grow(&self) -> bool {
+        matches!(self.storage, Storage::Lease(_)) && self.len < self.max_len
+    }
+
+    /// Ensures at least `bytes` remain free, extending the pool lease in place
+    /// when adjacent free space is available.
+    pub fn ensure(&mut self, bytes: usize) -> bool {
+        let free = self.len - self.used;
+        if bytes <= free {
+            return true;
+        }
+        self.grow(bytes - free)
+    }
+
+    fn grow(&mut self, min_extra: usize) -> bool {
+        let Storage::Lease(lease) = &mut self.storage else {
+            return false;
+        };
+        let headroom = self.max_len.saturating_sub(self.len);
+        if headroom < min_extra {
+            return false;
+        }
+        let want_extra = self.len.max(min_extra).min(headroom);
+        let granted = lease.extend(want_extra, min_extra);
+        if granted == 0 {
+            return false;
+        }
+        self.len += granted;
+        true
+    }
+
+    /// Atomically relocates a cleared pool lease to a strictly larger range (up
+    /// to `want_len`, capped at `max_len`) in the same prepared pool, returning
+    /// the new executable base address. Leaves the cache unchanged if no larger
+    /// range is available.
+    pub fn relocate(&mut self, want_len: usize) -> Option<usize> {
+        let Storage::Lease(lease) = &mut self.storage else {
+            return None;
+        };
+        let target = want_len.min(self.max_len);
+        if target <= self.len {
+            return None;
+        }
+        let pool = prepared_pool().ok()?;
+        if !lease.relocate(target) {
+            return None;
+        }
+        let offset = lease.range().start;
+        // SAFETY: the relocated lease stays inside the process-lifetime pool
+        // and is disjoint from every other live lease.
+        unsafe {
+            self.write = NonNull::new_unchecked(pool.mapping.write.as_ptr().add(offset));
+            self.exec = NonNull::new_unchecked(pool.mapping.exec.as_ptr().add(offset));
+        }
+        self.len = lease.range().len();
+        self.used = 0;
+        self.dirty.clear();
+        Some(self.exec.as_ptr() as usize)
+    }
+
     /// Appends `words` and returns their executable address, or `None` when
     /// they do not fit.
     pub fn append(&mut self, words: &[u32]) -> Option<usize> {
         let bytes = words.len() * 4;
-        if bytes > self.len - self.used {
+        if !self.ensure(bytes) {
             return None;
         }
         let address = self.next();
@@ -172,7 +264,7 @@ enum Storage {
 
 /// Strict hosts halve the request down to `MIN_LEASE` before giving up:
 /// a smaller cache only resets more often, while Tier 0 is far slower.
-const MIN_LEASE: usize = 16 << 20;
+const MIN_LEASE: usize = 4 << 20;
 fn lease(pool: &CodePool, len: usize, strict: bool) -> Option<CodeLease> {
     let mut want = len;
     loop {
@@ -316,11 +408,11 @@ mod tests {
     #[test]
     fn strict_pools_shrink_leases_before_giving_up() {
         let pool = CodePool::new(64 << 20, page_size().unwrap()).unwrap();
-        let _held = pool.lease(40 << 20).unwrap();
-        assert!(lease(&pool, 64 << 20, false).is_none());
-        let small = lease(&pool, 64 << 20, true).unwrap();
+        let _held = pool.lease(58 << 20).unwrap();
+        assert!(lease(&pool, 8 << 20, false).is_none());
+        let small = lease(&pool, 8 << 20, true).unwrap();
         assert_eq!(small.range().len(), MIN_LEASE);
-        assert!(lease(&pool, 64 << 20, true).is_none());
+        assert!(lease(&pool, 8 << 20, true).is_none());
     }
 
     // spec: A64-CTL-1, A64-CTL-13, A64-ISA-3
@@ -388,5 +480,28 @@ mod tests {
         cache.truncate(0);
         assert_eq!(cache.append(&[NOP]), Some(start));
         cache.sync();
+    }
+
+    // spec: A64-CTL-1, A64-CTL-13
+    #[test]
+    fn growable_cache_extends_or_relocates_within_prepared_pool() {
+        let page = page_size().unwrap();
+        let mut cache = CodeCache::with_limit(page, 4 * page, page).unwrap();
+        let first = cache.append(&vec![NOP; page / 4]).unwrap();
+        assert_eq!(cache.len(), page);
+        let code = [movz(W, Reg::new(0), 19, 0), ret(Reg::LR)];
+        let entry = match cache.append(&code) {
+            Some(second) => {
+                assert_eq!(second, first + page);
+                second
+            }
+            None => {
+                assert!(cache.relocate(2 * page).is_some());
+                cache.append(&code).unwrap()
+            }
+        };
+        assert!(cache.len() >= 2 * page);
+        cache.sync();
+        assert_eq!(call(entry), 19);
     }
 }

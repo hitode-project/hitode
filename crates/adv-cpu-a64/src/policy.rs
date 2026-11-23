@@ -18,7 +18,11 @@ pub(crate) mod tier1 {
     #[cfg(native)]
     pub const CHAIN_LEN: usize = 3;
     #[cfg(native)]
-    pub const CACHE_LEN: usize = 64 << 20;
+    pub const INITIAL_CACHE_LEN: usize = 8 << 20;
+    #[cfg(native)]
+    pub const FALLBACK_CACHE_LEN: usize = 64 << 20;
+    #[cfg(native)]
+    pub const MAX_CACHE_LEN: usize = 128 << 20;
     #[cfg(native)]
     pub const PROMOTION: u8 = 4;
     #[cfg(native)]
