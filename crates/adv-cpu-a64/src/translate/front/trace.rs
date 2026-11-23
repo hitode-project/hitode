@@ -513,6 +513,48 @@ impl Trace {
         self.analyze();
     }
 
+    fn may_close_spin(&self, memory: &Memory, next_pc: u32) -> bool {
+        let Some(first) = self.insts.first() else {
+            return false;
+        };
+        if next_pc <= first.pc
+            || (next_pc - first.pc) as usize >= adv_cpu_core::spin::MAX_BYTES
+            || !self
+                .insts
+                .last()
+                .is_some_and(|last| last.next_pc == next_pc)
+            || !self
+                .insts
+                .windows(2)
+                .all(|pair| pair[0].next_pc == pair[1].pc)
+            || !self.insts.iter().all(|inst| {
+                inst.frame == 0
+                    && inst.mode == Mode::Plain
+                    && inst.next == Next::Fall
+                    && inst.taken.is_none()
+                    && !matches!(inst.op, Op::Body(..))
+            })
+        {
+            return false;
+        }
+        let mut buf = [0u8; adv_cpu_core::spin::MAX_BYTES];
+        let mut len = 0;
+        let page_rem = (0x1000 - (first.pc & 0xfff)) as usize;
+        let first_len = page_rem.min(buf.len());
+        if let Ok(slice) = memory.read(first.pc, first_len) {
+            buf[..first_len].copy_from_slice(slice);
+            len = first_len;
+            if len < buf.len()
+                && let Some(second_pc) = first.pc.checked_add(len as u32)
+                && let Ok(slice) = memory.read(second_pc, buf.len() - len)
+            {
+                buf[len..].copy_from_slice(slice);
+                len = buf.len();
+            }
+        }
+        adv_cpu_core::spin::starts_at(&buf[..len], first.pc)
+    }
+
     fn mark_spin_backedges(&mut self, memory: &Memory, decodes: &Decodes) {
         for from in 0..self.insts.len() {
             let latch = self.insts[from];
@@ -662,7 +704,11 @@ impl Trace {
                 Some(Edge::Internal(index))
             } else if len == limit
                 || *weight >= limit
-                || (len > 0 && frame == 0 && limit != LOOP_LIMIT && existing(pc))
+                || (len > 0
+                    && frame == 0
+                    && limit != LOOP_LIMIT
+                    && existing(pc)
+                    && !self.may_close_spin(memory, pc))
             {
                 Some(Edge::Exit(pc))
             } else {
