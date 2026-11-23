@@ -8,18 +8,19 @@
 //! to be zero at translation time is narrow.
 //!
 //! Arithmetic runs natively under the control word the guest had when the
-//! unit was translated, if it masks every exception, rounds to nearest and
-//! has precision 24, 53 or 64; a run checks the control word is
-//! still that one. Precision 53 takes narrow operands and rounds once in
-//! binary64. Precision 24 also needs single-exact operands, then rounds
-//! that double's significand to 24 bits in integers, keeping the extended
-//! exponent range; binary64 is wide enough that the second rounding is
-//! innocuous for these operations. Precision 64 approximates the exact result as `H + t` from
-//! fused and error-free operations, rounds `t` to the 64-bit grid of `H`
-//! with a magic constant, and leaves for the integer path unless the error
-//! bound keeps that rounding and the inexact flag certain. The integer path
-//! also takes every other case, in cold code, through the extended
-//! encoding.
+//! unit was translated, if it masks precision (`PM`, bit 5), rounds to nearest
+//! and has precision 24, 53 or 64; a run checks the control word is still that
+//! one. Fast paths hold only finite zeros/normals well inside x87's extended
+//! exponent range and bail to generic/interpreter for IE/DE/ZE/OE/UE. Precision
+//! 53 takes narrow operands and rounds once in binary64. Precision 24 also needs
+//! single-exact operands, then rounds that double's significand to 24 bits in
+//! integers, keeping the extended exponent range; binary64 is wide enough that
+//! the second rounding is innocuous for these operations. Precision 64
+//! approximates the exact result as `H + t` from fused and error-free
+//! operations, rounds `t` to the 64-bit grid of `H` with a magic constant, and
+//! leaves for the integer path unless the error bound keeps that rounding and
+//! the inexact flag certain. The integer path also takes every other case, in
+//! cold code, through the extended encoding.
 
 use adv_cpu_core::floating::fast::{Fast, Op as Arith, PE, SINGLE_TAIL, Source};
 
@@ -56,7 +57,7 @@ enum Precision {
 }
 
 fn precision(control: u16) -> Option<Precision> {
-    if control & 0x3f != 0x3f || control >> 10 & 3 != 0 {
+    if control & 0x20 == 0 || control >> 10 & 3 != 0 {
         return None;
     }
     match control >> 8 & 3 {
@@ -933,7 +934,12 @@ impl Translator<'_> {
             None => self.extended(V1, X2, X3),
         }
         self.pair_to_extended(g.dest, X0, X1);
-        self.wide_ops(g.op, g.reverse, bail);
+        let known = self
+            .x87
+            .control_stable
+            .then(|| self.facts.control())
+            .flatten();
+        self.wide_ops(g.op, g.reverse, bail, known);
         if let Some(x87) = self.x87_stubs() {
             self.emit(movz(W, X2, u16::from(g.narrow), 0));
             self.far_call(x87.pair_from_extended);
@@ -946,7 +952,9 @@ impl Translator<'_> {
             self.asm.bind(done);
         }
         self.emit(ldrh(X8, X5, runtime::X87_CONTROL));
-        self.pair_control();
+        if !self.x87.control_stable {
+            self.pair_control();
+        }
         self.asm.b(g.join);
     }
 

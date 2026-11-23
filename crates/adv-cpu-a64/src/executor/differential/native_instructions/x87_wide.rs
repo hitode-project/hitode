@@ -1744,3 +1744,120 @@ fn return_continuation_with_changed_x87_top_avoids_version_misses() {
         assert_eq!(native.tier1_versions(CODE), 1);
     }
 }
+
+// spec: A64F-FP-3, A64F-FP-7
+#[test]
+fn phase4_delphi_0x1332_chains_and_unmasked_traps_match_interpreter() {
+    let config = (Features::default(), false, Checks::Adaptive);
+
+    // 1) Multi-step 64-bit significand chain under Delphi 0x1332 (PC=64, RC=Nearest,
+    // PM=1, IM=0/ZM=0/OM=0) plus directed-rounding PC=64 control words.
+    for ctrl in [0x1332u16, 0x037f, 0x077f, 0x0b7f, 0x0f7f, 0x035f] {
+        let mut program = fixture(|a| {
+            let mut head = a.create_label();
+            a.set_label(&mut head).unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fadd_2(st0, st1).unwrap();
+            a.fsub_2(st0, st2).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+            a.fstp(tbyte_ptr(ebx)).unwrap();
+        });
+        program.state.x87.control = ctrl;
+        program.state.regs[1] = 8; // ecx
+        // 64-bit significands with low bits set (exercise full PC=64 rounding & carry-out).
+        program
+            .state
+            .x87
+            .push(X87Register::from_parts(0x8000_0000_0000_0003, 0x3fff));
+        program
+            .state
+            .x87
+            .push(X87Register::from_parts(0xc000_0000_0000_0005, 0x3fff));
+        program
+            .state
+            .x87
+            .push(X87Register::from_parts(0xffff_ffff_ffff_ffff, 0x3fff));
+        let mut actual = executor(&program, config, false);
+        let mut reference = executor(&program, config, true);
+        assert_eq!(
+            actual.run(program.stop, 500),
+            reference.run(program.stop, 500),
+            "ctrl={ctrl:#06x}"
+        );
+        same(&actual, &reference);
+        if ctrl == 0x1332 {
+            let native = actual.native.as_ref().unwrap();
+            assert_eq!(native.diagnostics.interprets, 0);
+        }
+    }
+
+    // 2) Unmasked traps under 0x1332 (ZM=0 divide-by-zero, IM=0 0/0, IM=0 FISTP overflow)
+    // must still bail cleanly and match Tier-0 status/exception delivery identically.
+    type TrapCase = (&'static str, (u64, u16), (u64, u16), fn(&mut CodeAssembler));
+    let trap_cases: [TrapCase; 3] = [
+        ("zm_div0", (0, 0), (0x8000_0000_0000_0000, 0x3fff), |a| {
+            a.fdiv_2(st0, st1).unwrap();
+            a.wait().unwrap();
+        }),
+        ("im_0div0", (0, 0), (0, 0), |a| {
+            a.fdiv_2(st0, st1).unwrap();
+            a.wait().unwrap();
+        }),
+        (
+            "im_fistp_overflow",
+            (0x8000_0000_0000_0000, 0x3fff),
+            (0x8000_0000_0000_0000, 0x4030), // 2^49, overflows i32
+            |a| {
+                a.fadd_2(st0, st1).unwrap();
+                a.fistp(dword_ptr(ebx)).unwrap();
+                a.wait().unwrap();
+            },
+        ),
+    ];
+    for (name, st1_val, st0_val, emit) in trap_cases {
+        let mut program = fixture(emit);
+        program.state.x87.control = 0x1332;
+        program
+            .state
+            .x87
+            .push(X87Register::from_parts(st1_val.0, st1_val.1));
+        program
+            .state
+            .x87
+            .push(X87Register::from_parts(st0_val.0, st0_val.1));
+        let mut actual = executor(&program, config, false);
+        let mut reference = executor(&program, config, true);
+        assert_eq!(
+            actual.run(program.stop, 100),
+            reference.run(program.stop, 100),
+            "trap case {name}"
+        );
+        same(&actual, &reference);
+    }
+
+    // 3) FLDCW mid-trace changing 0x037f -> 0x0f7f must invalidate x87_control_known.
+    let mut fldcw_prog = fixture(|a| {
+        a.fadd_2(st0, st1).unwrap();
+        a.fldcw(word_ptr(ebx)).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(tbyte_ptr(ebx + 8)).unwrap();
+    });
+    fldcw_prog.state.x87.control = 0x037f;
+    fldcw_prog.data[0..2].copy_from_slice(&0x0f7fu16.to_le_bytes());
+    fldcw_prog
+        .state
+        .x87
+        .push(X87Register::from_parts(0x8000_0000_0000_0001, 0x3fc0)); // tiny tail
+    fldcw_prog
+        .state
+        .x87
+        .push(X87Register::from_parts(0xffff_ffff_ffff_ffff, 0x3fff));
+    let mut actual = executor(&fldcw_prog, config, false);
+    let mut reference = executor(&fldcw_prog, config, true);
+    assert_eq!(
+        actual.run(fldcw_prog.stop, 200),
+        reference.run(fldcw_prog.stop, 200)
+    );
+    same(&actual, &reference);
+}

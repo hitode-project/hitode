@@ -2325,7 +2325,11 @@ impl Translator<'_> {
         self.x87.suspended = false;
         self.x87.merges = merges;
         self.x87.pe = need.pe;
-        self.x87.control_stable = cyclic && self.stable_control(start, end);
+        let straight_guarded = !cyclic
+            && self.tier1
+            && start == 0
+            && !(start + 1..=end).any(|i| self.trace.head(i) || self.trace.merge[i]);
+        self.x87.control_stable = (cyclic || straight_guarded) && self.stable_control(start, end);
         self.x87.entries.clear();
         if sparse {
             for &(index, _) in &self.x87.merges {
@@ -2507,7 +2511,7 @@ impl Translator<'_> {
                 _ => {}
             }
         }
-        self.pair_precision() && arithmetic
+        self.facts.control().is_some() && arithmetic
     }
 
     pub(in super::super) fn x87_require_bit(&mut self, reg: Reg, bit: u32, to: Label) {
