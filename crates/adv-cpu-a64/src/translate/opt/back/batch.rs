@@ -244,9 +244,26 @@ impl Emitter<'_> {
             self.batch_add(dst, src, (iv.stride as u32).wrapping_mul(lanes), U);
             self.copy(loc, Host::Register(dst), Type::I32);
         }
+        #[cfg(test)]
+        let count_strips = batch.plan.body.is_float();
+        #[cfg(not(test))]
+        let count_strips = false;
+        #[cfg(test)]
+        if count_strips {
+            use super::{Runtime, offset_of, str};
+
+            // Incremented only after a full FP strip completes (past admission
+            // guards and any pre-store validation bailouts).
+            let strips = offset_of!(Runtime, vector_strips) as u32;
+            self.asm.emit_all(&[
+                ldr(X, T, RT, strips),
+                add_imm(X, T, T, 1, false),
+                str(X, T, RT, strips),
+            ]);
+        }
         self.asm.emit(sub_imm(X, X4, X4, 1, false));
         self.asm.cbz(X, true, X4, inner);
-        let words = self.words_since(inner_start);
+        let words = self.words_since(inner_start) - if count_strips { 3 } else { 0 };
         let recovery_start = self.asm.offset();
         // Publish the last logical latch's recovery operands once per strip.
         for &(param, value) in &batch.recovery {

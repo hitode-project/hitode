@@ -116,7 +116,7 @@ enum OpCode {
     Unary(Unary),
     Binary(Binary),
     FpFma { sub: bool, double: bool },
-    CheckNormal(bool),
+    CheckNormal { double: bool, strict_min_exp: bool },
     CheckMulUnderflow { double: bool, div: bool },
     CheckIntRange { double: bool, rounding: u8 },
     Blend,
@@ -161,6 +161,11 @@ struct Program {
 }
 
 impl BatchBody for Program {
+    #[cfg(test)]
+    fn is_float(&self) -> bool {
+        self.shape.is_float()
+    }
+
     fn lower(&self, emitter: &mut BatchEmitter<'_, '_>) {
         for iteration in 0..=u32::from(self.shape.repeat()) {
             for &step in &self.code {
@@ -800,7 +805,36 @@ impl Builder<'_> {
     }
 
     fn memory_shape(&self, stream: Stream, count: usize) -> Option<()> {
-        (count == 1 || u32::from(self.shape.lanes()) * u32::from(stream.width) >= 8).then_some(())
+        if self.shape.is_float() {
+            let elem_ok = match (self.shape, stream.write()) {
+                (Shape::Float32, false) => matches!(stream.width, 1 | 2 | 4),
+                (Shape::Float32, true) => stream.width == 4,
+                (Shape::Float64, false) => matches!(stream.width, 4 | 8),
+                (Shape::Float64, true) => matches!(stream.width, 4 | 8),
+                _ => unreachable!(),
+            };
+            if !elem_ok {
+                return None;
+            }
+            if stream.stride == 0 {
+                let expected = if self.shape == Shape::Float64 { 8 } else { 4 };
+                return (stream.width == expected).then_some(());
+            }
+        }
+        if stream.stride == 0 {
+            return matches!(stream.width, 1 | 2 | 4 | 8 | 16).then_some(());
+        }
+        let bytes = match self.shape {
+            Shape::Packed(_) => 16,
+            Shape::Scalar(_) | Shape::Float32 | Shape::Float64 => {
+                u32::from(self.shape.lanes()) * u32::from(stream.width)
+            }
+        };
+        if count == 1 {
+            matches!(bytes, 4 | 8 | 16).then_some(())
+        } else {
+            matches!(bytes, 8 | 16).then_some(())
+        }
     }
 
     fn emit(&mut self, op: OpCode, inputs: Vec<usize>) -> usize {
@@ -1140,9 +1174,14 @@ impl Builder<'_> {
 
     fn float_store(&mut self, v: Value, width: u8) -> Option<usize> {
         let v = self.resolve(v);
-        if let Some(&id) = self.mapped.get(&(v, u32::MAX)) {
-            return Some(id);
+        let double = self.shape == Shape::Float64;
+        // Direct F64 store (`FSTP m64`) in a 2-wide binary64 strip.
+        if double && width == 8 && self.values.func.ty(v) == Type::F64 {
+            return self.float_val(v, false);
         }
+        // Only admit explicit `Op::X87Store` conversions here; never reuse a
+        // raw `Op::Load` from `self.mapped`, whose packed lane width may differ
+        // from the FP strip's store narrowing layout (e.g. 2×u32 vs 2×i64 XTN).
         let Op::X87Store {
             value,
             width: sw,
@@ -1153,10 +1192,12 @@ impl Builder<'_> {
         else {
             return None;
         };
+        if let Some(&id) = self.mapped.get(&(v, u32::MAX)) {
+            return Some(id);
+        }
         if sw != width {
             return None;
         }
-        let double = self.shape == Shape::Float64;
         let id = if integer {
             if width != 4 {
                 return None;
@@ -1173,7 +1214,13 @@ impl Builder<'_> {
             }
             let src = self.float_val(value, !proved)?;
             if !proved {
-                self.effect(OpCode::CheckNormal(double), vec![src]);
+                self.effect(
+                    OpCode::CheckNormal {
+                        double,
+                        strict_min_exp: false,
+                    },
+                    vec![src],
+                );
             }
             src
         };
@@ -1186,7 +1233,13 @@ impl Builder<'_> {
         let double = self.shape == Shape::Float64;
         if let Some(&id) = self.mapped.get(&(v, u32::MAX)) {
             if need_check && self.checked.insert(id) {
-                self.effect(OpCode::CheckNormal(double), vec![id]);
+                self.effect(
+                    OpCode::CheckNormal {
+                        double,
+                        strict_min_exp: false,
+                    },
+                    vec![id],
+                );
             }
             return Some(id);
         }
@@ -1217,7 +1270,13 @@ impl Builder<'_> {
                 self.emit(OpCode::Broadcast(v), vec![])
             };
             if need_check && self.checked.insert(id) {
-                self.effect(OpCode::CheckNormal(double), vec![id]);
+                self.effect(
+                    OpCode::CheckNormal {
+                        double,
+                        strict_min_exp: false,
+                    },
+                    vec![id],
+                );
             }
             self.mapped.insert((v, u32::MAX), id);
             return Some(id);
@@ -1241,8 +1300,14 @@ impl Builder<'_> {
                     }
                     self.emit(OpCode::Unary(Unary::Widen2sTo2d), vec![raw])
                 } else {
-                    if !proved {
-                        self.effect(OpCode::CheckNormal(double), vec![raw]);
+                    if !proved && self.checked.insert(raw) {
+                        self.effect(
+                            OpCode::CheckNormal {
+                                double,
+                                strict_min_exp: false,
+                            },
+                            vec![raw],
+                        );
                     }
                     raw
                 }
@@ -1279,7 +1344,17 @@ impl Builder<'_> {
                 let bv = self.float_val(b, !b_exact)?;
                 let res = self.binary(Binary::Fp(op, false), av, bv);
                 if !proved_all {
-                    self.effect(OpCode::CheckNormal(false), vec![res]);
+                    // Exclude min-normal exponent 1 (2^-126) just like scalar
+                    // `x87_single`, so tininess-before-rounding cannot round a
+                    // subnormal product/quotient up to 2^-126 and hide from checks.
+                    self.checked.insert(res);
+                    self.effect(
+                        OpCode::CheckNormal {
+                            double: false,
+                            strict_min_exp: true,
+                        },
+                        vec![res],
+                    );
                     if matches!(op, FpOp::Mul | FpOp::Div) {
                         self.effect(
                             OpCode::CheckMulUnderflow {
@@ -1297,7 +1372,16 @@ impl Builder<'_> {
                 let bv = self.float_val(b, !proved)?;
                 let res = self.binary(Binary::Fp(op, true), av, bv);
                 if !proved {
-                    self.effect(OpCode::CheckNormal(true), vec![res]);
+                    // Exclude min-normal exponent 1 (2^-1022) so tininess-before-
+                    // rounding cannot round a subnormal result up to 2^-1022.
+                    self.checked.insert(res);
+                    self.effect(
+                        OpCode::CheckNormal {
+                            double: true,
+                            strict_min_exp: true,
+                        },
+                        vec![res],
+                    );
                     if matches!(op, FpOp::Mul | FpOp::Div) {
                         self.effect(
                             OpCode::CheckMulUnderflow {
@@ -1533,34 +1617,45 @@ impl Builder<'_> {
                         code.push(Step::Word(vfmla(double, sub, t, ra, rb)));
                     }
                 }
-                OpCode::CheckNormal(double) => {
+                OpCode::CheckNormal {
+                    double,
+                    strict_min_exp,
+                } => {
                     let src = read(0);
                     let gp2 = Reg::new(17);
                     if !double {
-                        // Normal (1..=254) or ±0.0 across all 4 f32 lanes.
+                        // Normal (`1..=254`, or `2..=254` when `strict_min_exp`
+                        // excludes min-normal 2^-126) or ±0.0 across all 4 f32 lanes.
+                        let (lo_imm, span_imm) = if strict_min_exp {
+                            (0x0200u16, 0xfd00u16)
+                        } else {
+                            (0x0100u16, 0xfe00u16)
+                        };
                         let (t1, t2, t3) = (VReg::new(28), VReg::new(29), VReg::new(30));
                         code.push(Step::Word(vshift(ShiftImm::Shl, Arr::S4, t1, src, 1)));
                         code.push(Step::Word(vzero(true, t2)));
                         code.push(Step::Word(vsame(Same::Cmeq, Arr::S4, t2, t1, t2)));
-                        code.push(Step::Word(movz(Size::W, SCALAR, 0x0100, 16)));
+                        code.push(Step::Word(movz(Size::W, SCALAR, lo_imm, 16)));
                         code.push(Step::Word(vdup(Arr::S4, t3, SCALAR)));
                         code.push(Step::Word(vsame(Same::Sub, Arr::S4, t1, t1, t3)));
                         code.push(Step::Word(vlogic(Logic::Bic, true, t1, t1, t2)));
                         code.push(Step::Word(umaxv(t1, t1)));
                         code.push(Step::Word(fmov_from_v(Size::W, SCALAR, t1)));
-                        code.push(Step::Word(movz(Size::W, gp2, 0xfe00, 16)));
+                        code.push(Step::Word(movz(Size::W, gp2, span_imm, 16)));
                         code.push(Step::Word(cmp(Size::W, SCALAR, gp2, Shift::Lsl, 0)));
                         code.push(Step::BailCond(Cond::Hs));
                     } else {
-                        // Normal (1..=2046) or ±0.0 across both f64 lanes.
+                        // Normal (`1..=2046`, or `2..=2046` when `strict_min_exp`
+                        // excludes min-normal 2^-1022) or ±0.0 across both f64 lanes.
+                        let (lo_exp, span_exp) = if strict_min_exp { (2, 2045) } else { (1, 2046) };
                         for lane in 0..2u32 {
                             code.push(Step::Word(vumov(3, SCALAR, src, lane)));
                             code.push(Step::Word(lsl_imm(Size::X, SCALAR, SCALAR, 1)));
                             code.push(Step::Word(lsr_imm(Size::X, gp2, SCALAR, 53)));
-                            code.push(Step::Word(sub_imm(Size::W, gp2, gp2, 1, false)));
+                            code.push(Step::Word(sub_imm(Size::W, gp2, gp2, lo_exp, false)));
                             code.push(Step::Word(cmp_imm(Size::X, SCALAR, 0, false)));
                             code.push(Step::Word(csel(Size::W, gp2, Reg::ZR, gp2, Cond::Eq)));
-                            code.push(Step::Word(cmp_imm(Size::W, gp2, 2046, false)));
+                            code.push(Step::Word(cmp_imm(Size::W, gp2, span_exp, false)));
                             code.push(Step::BailCond(Cond::Hs));
                         }
                     }

@@ -501,6 +501,10 @@ pub(super) trait LoopKernel {
 
 pub(super) trait BatchBody {
     fn lower(&self, emitter: &mut BatchEmitter<'_, '_>);
+    #[cfg(test)]
+    fn is_float(&self) -> bool {
+        false
+    }
 }
 
 pub(super) struct Plan {

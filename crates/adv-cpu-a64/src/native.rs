@@ -1146,6 +1146,11 @@ impl Native {
     }
 
     #[cfg(test)]
+    pub(crate) fn vector_strips(&self) -> u64 {
+        self.runtime.vector_strips
+    }
+
+    #[cfg(test)]
     pub(crate) fn unit_address(&self, eip: u32) -> Option<usize> {
         self.code.tier1(eip).map(|entry| entry.unit)
     }
