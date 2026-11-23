@@ -1147,28 +1147,56 @@ fn dead(func: &mut Func) {
     }
 }
 
-/// A lane produced by validated arithmetic cannot be subnormal. Track which
-/// lanes retain that property through copies, insertions and block parameters.
+/// A lane produced by validated arithmetic cannot be subnormal (while `DE == 0`,
+/// `exact_sse` rejects subnormal outputs for both `f64` and `f32`). Track which
+/// double (`clean_f64`: bits 0..1) and low single (`clean_f32`) lanes retain that
+/// property through copies, insertions and block parameters, and deduplicate
+/// repeated `Op::SseInput` checks within each basic block.
 fn sse_inputs(func: &mut Func) {
     if !func.blocks.iter().any(|block| {
         block
             .insts
             .iter()
-            .any(|(_, op)| matches!(op, Op::SseInput { single: false, .. }))
+            .any(|(_, op)| matches!(op, Op::SseInput { .. }))
     }) {
         return;
     }
 
-    let mut clean = vec![3u8; func.types.len()];
+    let n = func.types.len();
+    let mut clean_f64 = vec![3u8; n];
+    let mut clean_f32 = vec![true; n];
     for &p in &func.blocks[0].params {
-        clean[p.0 as usize] = 0;
+        clean_f64[p.0 as usize] = 0;
+        clean_f32[p.0 as usize] = false;
+    }
+    let mut is_from_int = vec![false; n];
+    for block in &func.blocks {
+        for &(result, op) in &block.insts {
+            if let Some(result) = result
+                && matches!(op, Op::FromInt(_))
+            {
+                is_from_int[result.0 as usize] = true;
+            }
+        }
+    }
+    // Track Op::Bits(V128, FromInt) so NarrowScalar of an integer-converted value is clean.
+    for block in &func.blocks {
+        for &(result, op) in &block.insts {
+            if let Some(result) = result
+                && let Op::Bits { value, .. } = op
+                && is_from_int[value.0 as usize]
+            {
+                is_from_int[result.0 as usize] = true;
+            }
+        }
     }
     loop {
         let mut changed = false;
         for block in &func.blocks {
             for &(result, op) in &block.insts {
                 let Some(result) = result else { continue };
-                let lanes = |v: Value| clean[v.0 as usize];
+                let lanes = |v: Value| clean_f64[v.0 as usize];
+                let f32_clean = |v: Value| clean_f32[v.0 as usize];
                 let mask = match op {
                     Op::Fp(..)
                     | Op::SseFp64(..)
@@ -1198,15 +1226,35 @@ fn sse_inputs(func: &mut Func) {
                     Op::Select { a, b, .. } => lanes(a) & lanes(b),
                     _ => 0,
                 };
-                let known = &mut clean[result.0 as usize];
+                let known = &mut clean_f64[result.0 as usize];
                 changed |= *known != mask;
                 *known = mask;
+
+                let s_clean = match op {
+                    Op::Fp32(..) => true,
+                    Op::VecUnary(VecUnary::NarrowScalar, a) => is_from_int[a.0 as usize],
+                    Op::Constant(_, bits) => !f32::from_bits(bits as u32).is_subnormal(),
+                    Op::Vec(VecOp::MoveLow32, _, b) => f32_clean(b),
+                    Op::Vec(VecOp::Insert64(true, _), a, _) => f32_clean(a),
+                    Op::Vec(VecOp::Insert64(false, false), _, b) => f32_clean(b),
+                    Op::VecUnary(VecUnary::Low64, a) => f32_clean(a),
+                    Op::Bits { value, .. } => f32_clean(value),
+                    Op::Select { a, b, .. } => f32_clean(a) && f32_clean(b),
+                    _ => false,
+                };
+                let known32 = &mut clean_f32[result.0 as usize];
+                changed |= *known32 != s_clean;
+                *known32 = s_clean;
             }
             for t in block.end.targets() {
                 for (&p, &a) in func.blocks[t.block.0 as usize].params.iter().zip(&t.args) {
-                    let mask = clean[p.0 as usize] & clean[a.0 as usize];
-                    changed |= clean[p.0 as usize] != mask;
-                    clean[p.0 as usize] = mask;
+                    let mask = clean_f64[p.0 as usize] & clean_f64[a.0 as usize];
+                    changed |= clean_f64[p.0 as usize] != mask;
+                    clean_f64[p.0 as usize] = mask;
+
+                    let s_clean = clean_f32[p.0 as usize] && clean_f32[a.0 as usize];
+                    changed |= clean_f32[p.0 as usize] != s_clean;
+                    clean_f32[p.0 as usize] = s_clean;
                 }
             }
         }
@@ -1216,22 +1264,43 @@ fn sse_inputs(func: &mut Func) {
     }
 
     for block in &mut func.blocks {
-        let mut checked = BTreeMap::<Value, u8>::new();
+        let mut checked_f64 = BTreeMap::<Value, u8>::new();
+        let mut checked_f32 = std::collections::BTreeSet::<Value>::new();
         block.insts.retain_mut(|(_, op)| {
-            // A clean double lane can still contain a single subnormal.
             let Op::SseInput {
                 a,
                 b,
                 packed,
-                single: false,
+                single,
                 pc,
             } = *op
             else {
                 return true;
             };
+            if single {
+                if packed {
+                    return true;
+                }
+                let mut needs_check = |v: &Value| {
+                    if clean_f32[v.0 as usize] {
+                        return false;
+                    }
+                    checked_f32.insert(*v)
+                };
+                let mut inputs = [Some(a), b].into_iter().flatten().filter(&mut needs_check);
+                let Some(a) = inputs.next() else { return false };
+                *op = Op::SseInput {
+                    a,
+                    b: inputs.next(),
+                    packed: false,
+                    single: true,
+                    pc,
+                };
+                return true;
+            }
             let mask = if packed { 3 } else { 1 };
             let mut needs_check = |v: &Value| {
-                let known = checked.entry(*v).or_insert(clean[v.0 as usize]);
+                let known = checked_f64.entry(*v).or_insert(clean_f64[v.0 as usize]);
                 let needed = *known & mask != mask;
                 *known |= mask;
                 needed

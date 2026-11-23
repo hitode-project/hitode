@@ -624,6 +624,8 @@ pub(crate) enum Source {
     X87Ip,
     X87Opcode,
     FsBase,
+    /// Dynamic guest MXCSR (used to pass runtime sticky bits without specialization), I32.
+    Mxcsr,
     /// Frame bytes at entry ESP plus `offset`: I32 for 4 bytes, I64 for 8.
     /// Narrower accesses extract from these.
     Frame {
@@ -635,7 +637,9 @@ pub(crate) enum Source {
 impl Source {
     pub(crate) fn ty(self) -> Type {
         match self {
-            Source::Reg(_) | Source::X87Ip | Source::X87Opcode | Source::FsBase => Type::I32,
+            Source::Reg(_) | Source::X87Ip | Source::X87Opcode | Source::FsBase | Source::Mxcsr => {
+                Type::I32
+            }
             Source::Frame { width, .. } if width <= 4 => Type::I32,
             Source::Frame { .. } => Type::I64,
             Source::Eflags => Type::Flags,

@@ -31,7 +31,8 @@ pub(super) struct Model {
     /// Known-bit lattice `(bits, known)` for MMX alias metadata (bits 0–7
     /// written mask, 8–9 tag state, 10 TOP=0).
     pub mmx_meta: (u32, u32),
-    bytes: Rc<BTreeMap<i32, u8>>,
+    /// Known-bit lattice `(bits, known)` per frame byte.
+    bytes: Rc<BTreeMap<i32, (u8, u8)>>,
     flags: Option<u32>,
 }
 
@@ -161,7 +162,16 @@ pub(super) fn analyze(
                 extend(&mut old.stored, &m.stored);
                 extend(&mut old.dirty, &m.dirty);
                 if !old.bytes.iter().all(|(p, v)| m.bytes.get(p) == Some(v)) {
-                    Rc::make_mut(&mut old.bytes).retain(|p, v| m.bytes.get(p) == Some(v));
+                    let bytes = Rc::make_mut(&mut old.bytes);
+                    bytes.retain(|p, (v1, k1)| {
+                        let Some(&(v2, k2)) = m.bytes.get(p) else {
+                            return false;
+                        };
+                        let k = *k1 & k2 & !(*v1 ^ v2);
+                        *v1 &= k;
+                        *k1 = k;
+                        k != 0
+                    });
                 }
                 if old.flags != m.flags {
                     old.flags = None;
@@ -202,12 +212,14 @@ impl Model {
     pub(super) fn load(&self, mem: Mem, width: u8, offsets: &[Option<i32>; 8]) -> Option<u64> {
         let offset = frame_offset(mem, offsets)?;
         (0..i32::from(width)).try_fold(0, |bits, i| {
-            Some(bits | (u64::from(*self.bytes.get(&(offset + i))?) << (i * 8)))
+            let &(v, k) = self.bytes.get(&(offset + i))?;
+            (k == u8::MAX).then_some(bits | (u64::from(v) << (i * 8)))
         })
     }
-    pub(super) fn read(&self, src: Part, width: u8, offsets: &[Option<i32>; 8]) -> Option<u32> {
-        let x = match src {
-            Part::Imm(n) => n,
+    fn read_bits(&self, src: Part, width: u8, offsets: &[Option<i32>; 8]) -> (u32, u32) {
+        let width_mask = adv_cpu_core::integer::mask(width);
+        let (bits, known) = match src {
+            Part::Imm(n) => (n, u32::MAX),
             Part::Reg(r) => {
                 let (r, shift) = if width == 1 && r >= 4 {
                     (r - 4, 8)
@@ -215,17 +227,38 @@ impl Model {
                     (r, 0)
                 };
                 let (bits, known) = self.regs[r as usize];
-                let mask = adv_cpu_core::integer::mask(width) << shift;
-                if known & mask != mask {
-                    return None;
-                }
-                bits >> shift
+                (bits >> shift, known >> shift)
             }
-            Part::Mem(mem) => self.load(mem, width, offsets)? as u32,
+            Part::Mem(mem) => {
+                let Some(offset) = frame_offset(mem, offsets) else {
+                    return (0, 0);
+                };
+                let mut bits = 0u32;
+                let mut known = 0u32;
+                for i in 0..i32::from(width) {
+                    if let Some(&(v, k)) = self.bytes.get(&(offset + i)) {
+                        bits |= u32::from(v & k) << (i * 8);
+                        known |= u32::from(k) << (i * 8);
+                    }
+                }
+                (bits, known)
+            }
         };
-        Some(x & adv_cpu_core::integer::mask(width))
+        (bits & known & width_mask, known & width_mask)
     }
-    fn write(&mut self, dst: Part, width: u8, value: Option<u32>, offsets: &[Option<i32>; 8]) {
+    pub(super) fn read(&self, src: Part, width: u8, offsets: &[Option<i32>; 8]) -> Option<u32> {
+        let mask = adv_cpu_core::integer::mask(width);
+        let (bits, known) = self.read_bits(src, width, offsets);
+        (known & mask == mask).then_some(bits & mask)
+    }
+    fn write_bits(
+        &mut self,
+        dst: Part,
+        width: u8,
+        bits: u32,
+        known: u32,
+        offsets: &[Option<i32>; 8],
+    ) {
         match dst {
             Part::Reg(r) => {
                 let (r, shift) = if width == 1 && r >= 4 {
@@ -234,14 +267,17 @@ impl Model {
                     (r, 0)
                 };
                 let mask = adv_cpu_core::integer::mask(width) << shift;
-                let (bits, known) = &mut self.regs[r as usize];
-                *bits = *bits & !mask | (value.unwrap_or(0) << shift) & mask;
-                *known = *known & !mask | if value.is_some() { mask } else { 0 };
+                let (rb, rk) = &mut self.regs[r as usize];
+                *rb = *rb & !mask | ((bits & known) << shift) & mask;
+                *rk = *rk & !mask | (known << shift) & mask;
             }
             Part::Mem(mem) => {
                 if let Some(p) = frame_offset(mem, offsets) {
                     overwrite(self, p, width);
-                    let byte = |b: i32| value.map(|x| (x >> (b * 8)) as u8);
+                    let byte = |b: i32| {
+                        let k = (known >> (b * 8)) as u8;
+                        (k != 0).then_some(((bits >> (b * 8)) as u8 & k, k))
+                    };
                     if (0..i32::from(width)).any(|b| self.bytes.get(&(p + b)).copied() != byte(b)) {
                         let bytes = Rc::make_mut(&mut self.bytes);
                         for b in 0..i32::from(width) {
@@ -256,6 +292,13 @@ impl Model {
             _ => {}
         }
     }
+    fn write(&mut self, dst: Part, width: u8, value: Option<u32>, offsets: &[Option<i32>; 8]) {
+        let (bits, known) = match value {
+            Some(v) => (v, u32::MAX),
+            None => (0, 0),
+        };
+        self.write_bits(dst, width, bits, known, offsets);
+    }
     fn step(&mut self, op: decode::Op, offsets: &[Option<i32>; 8], i: usize) -> Result<(), Reject> {
         use crate::translate::front::forms::Integer;
         use decode::Op as D;
@@ -266,12 +309,12 @@ impl Model {
         };
         match op {
             D::Mov(dst, src) => {
-                let v = self.read(part(src), 4, offsets);
-                self.write(part(dst), 4, v, offsets);
+                let (bits, known) = self.read_bits(part(src), 4, offsets);
+                self.write_bits(part(dst), 4, bits, known, offsets);
             }
             D::Narrow(None, width, dst, src) => {
-                let v = self.read(src, width, offsets);
-                self.write(dst, width, v, offsets);
+                let (bits, known) = self.read_bits(src, width, offsets);
+                self.write_bits(dst, width, bits, known, offsets);
             }
             D::Alu(alu, dst, src) => self.alu(alu, part(dst), part(src), 4, offsets),
             D::Narrow(Some(alu), width, dst, src) => self.alu(alu, dst, src, width, offsets),
@@ -383,7 +426,8 @@ impl Model {
                 self.c1 = C1::Constant(false);
             }
             D::Simd(s) if s.kind == crate::translate::front::forms::SimdKind::StoreControl => {
-                self.write(Part::Mem(s.mem), 4, Some(self.mxcsr), offsets);
+                // Control bits (0xffc0) are invariant; sticky bits (0x3f) are dynamic.
+                self.write_bits(Part::Mem(s.mem), 4, self.mxcsr & !0x3f, !0x3f, offsets);
             }
             D::Simd(s) => {
                 if s.kind == crate::translate::front::forms::SimdKind::Emms {
@@ -534,32 +578,62 @@ impl Model {
         width: u8,
         offsets: &[Option<i32>; 8],
     ) {
-        let a = self.read(dst, width, offsets);
-        let b = self.read(src, width, offsets);
-        let value = a.zip(b).map(|(a, b)| {
-            use decode::Alu::*;
-            match alu {
-                Add => a.wrapping_add(b),
-                Sub | Cmp => a.wrapping_sub(b),
-                And | Test => a & b,
-                Or => a | b,
-                Xor => a ^ b,
+        let mask = adv_cpu_core::integer::mask(width);
+        let (ab, ak) = self.read_bits(dst, width, offsets);
+        let (bb, bk) = self.read_bits(src, width, offsets);
+        let a = (ak & mask == mask).then_some(ab & mask);
+        let b = (bk & mask == mask).then_some(bb & mask);
+        let (res_bits, res_known) = match alu {
+            decode::Alu::And | decode::Alu::Test => {
+                let k = ((ak & bk) | (ak & !ab) | (bk & !bb)) & mask;
+                ((ab & bb) & k, k)
             }
-        });
-        self.flags = a.zip(b).map(|(a, b)| {
-            let mut flags = 0;
-            let kind = match alu {
-                decode::Alu::Add => M::Add,
-                decode::Alu::Sub | decode::Alu::Cmp => M::Sub,
-                decode::Alu::And | decode::Alu::Test => M::And,
-                decode::Alu::Or => M::Or,
-                decode::Alu::Xor => M::Xor,
-            };
-            adv_cpu_core::integer::binary(&mut flags, kind, a, b, width);
-            flags
-        });
+            decode::Alu::Or => {
+                let k = ((ak & bk) | (ak & ab) | (bk & bb)) & mask;
+                ((ab | bb) & k, k)
+            }
+            decode::Alu::Xor => {
+                let k = (ak & bk) & mask;
+                ((ab ^ bb) & k, k)
+            }
+            decode::Alu::Add => match a.zip(b) {
+                Some((a, b)) => (a.wrapping_add(b) & mask, mask),
+                None => (0, 0),
+            },
+            decode::Alu::Sub | decode::Alu::Cmp => match a.zip(b) {
+                Some((a, b)) => (a.wrapping_sub(b) & mask, mask),
+                None => (0, 0),
+            },
+        };
+        self.flags = match alu {
+            decode::Alu::And | decode::Alu::Test | decode::Alu::Or | decode::Alu::Xor
+                if res_known == mask =>
+            {
+                let mut flags = 0;
+                let kind = match alu {
+                    decode::Alu::And | decode::Alu::Test => M::And,
+                    decode::Alu::Or => M::Or,
+                    _ => M::Xor,
+                };
+                // Logical flags depend solely on the result value.
+                adv_cpu_core::integer::binary(&mut flags, kind, res_bits, res_bits, width);
+                Some(flags)
+            }
+            _ => a.zip(b).map(|(a, b)| {
+                let mut flags = 0;
+                let kind = match alu {
+                    decode::Alu::Add => M::Add,
+                    decode::Alu::Sub | decode::Alu::Cmp => M::Sub,
+                    decode::Alu::And | decode::Alu::Test => M::And,
+                    decode::Alu::Or => M::Or,
+                    decode::Alu::Xor => M::Xor,
+                };
+                adv_cpu_core::integer::binary(&mut flags, kind, a, b, width);
+                flags
+            }),
+        };
         if !matches!(alu, decode::Alu::Cmp | decode::Alu::Test) {
-            self.write(dst, width, value, offsets);
+            self.write_bits(dst, width, res_bits, res_known, offsets);
         }
     }
 }

@@ -77,6 +77,7 @@ fn params(func: &Func, at: &CpuState, memory: &mut Memory) -> Vec<u128> {
         .map(|s| match *s {
             Source::Reg(i) => u128::from(at.regs[i as usize]),
             Source::FsBase => u128::from(at.fs_base),
+            Source::Mxcsr => u128::from(at.mxcsr),
             Source::Eflags => u128::from(at.eflags),
             Source::X87Ip => u128::from(at.x87.ip),
             Source::X87Opcode => u128::from(at.x87.opcode),
@@ -3583,4 +3584,69 @@ fn phase2_exact_fma_contraction_and_adversarial_guards() {
     assert_eq!(no_fma.func.domain_guards, vec![built.func.domain_guards[0]]);
     assert_eq!(count(&no_fma, |op| matches!(op, Op::Fma { .. })), 0);
     assert_eq!(count(&no_fma, |op| matches!(op, Op::Validate)), 0);
+}
+
+// spec: A64-OPT-4, A64F-FP-5
+#[test]
+fn phase3_dynamic_mxcsr_sticky_and_f32_sse_input_dedup() {
+    // 1) STMXCSR-only loop does not specialize on any MXCSR sticky bits (0x3f)
+    // and dynamically observes different entry sticky bits with one compiled IR.
+    let stmxcsr_code = assemble(|a| {
+        row(a, |a| {
+            a.stmxcsr(dword_ptr(edi)).unwrap();
+        })
+    });
+    let (_, _, stmxcsr_built) = built(&stmxcsr_code, &initial());
+    assert_eq!(stmxcsr_built.assumed.mxcsr_mask, 0xffc0);
+    assert!(stmxcsr_built.func.entry.contains(&Source::Mxcsr));
+    for sticky in [0x00u32, 0x03, 0x15, 0x3f] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.mxcsr = 0x1f80 | sticky;
+        differential(&stmxcsr_code, &at, |_| {});
+    }
+
+    // 2) Single-precision SSE chain specializes only on control + PE (0xffe0),
+    // eliminates intermediate and duplicate f32 SseInput checks, and still catches
+    // adversarial `min_subnormal * 2^24` when DE = 0.
+    let f32_chain = assemble(|a| {
+        row(a, |a| {
+            a.mulss(xmm0, xmm1).unwrap();
+            a.addss(xmm0, xmm1).unwrap();
+            a.mulss(xmm0, xmm2).unwrap();
+            a.movss(dword_ptr(edi), xmm0).unwrap();
+        })
+    });
+    let mut at = initial();
+    at.regs[1] = 1;
+    at.mxcsr = 0x1fa0;
+    at.xmm[0][..4].copy_from_slice(&1.5f32.to_le_bytes());
+    at.xmm[1][..4].copy_from_slice(&2.0f32.to_le_bytes());
+    at.xmm[2][..4].copy_from_slice(&0.5f32.to_le_bytes());
+    let built = differential(&f32_chain, &at, |_| {});
+    assert_eq!(built.assumed.mxcsr_mask, 0xffe0);
+    // 3 unique entry operands (xmm0, xmm1, xmm2) across 3 binary ops (6 operand reads):
+    // intermediate xmm0 results and duplicate xmm1 must not re-emit SseInput.
+    let f32_checks: usize = built
+        .func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|(_, op)| match *op {
+            Op::SseInput {
+                b, single: true, ..
+            } => 1 + usize::from(b.is_some()),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(
+        f32_checks, 3,
+        "expected only 3 f32 SseInput checks (one per unique entry operand)"
+    );
+
+    // Adversarial DAZ=0 subnormal input that normalizes: min_subnormal * 2^24.
+    let mut sub_at = at.clone();
+    sub_at.xmm[0][..4].copy_from_slice(&1u32.to_le_bytes()); // min_subnormal f32
+    sub_at.xmm[1][..4].copy_from_slice(&0x4b80_0000u32.to_le_bytes()); // 2^24
+    compare(&f32_chain, &sub_at, |_| {}, true);
 }

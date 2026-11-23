@@ -457,9 +457,8 @@ fn emit<'a>(
         checkpoints: Vec::new(),
         fp_checks: Vec::new(),
         invalid_ints: Vec::new(),
-        mxcsr: inline
-            .filter(|_| resident)
-            .map(|(assumed, _)| assumed.mxcsr),
+        mxcsr_guards: Vec::new(),
+        live_mxcsr: inline.is_some() && resident,
         edges: Vec::new(),
         links: Vec::new(),
         transitions: Vec::new(),
@@ -656,9 +655,23 @@ fn emit<'a>(
         e.checkpoints();
     }
     e.fp_checks();
-    for (check, dst, resume) in std::mem::take(&mut e.invalid_ints) {
+    for (check, dst, resume, fail) in std::mem::take(&mut e.invalid_ints) {
         e.asm.bind(check);
+        e.asm.emit_all(&[
+            ldr(X, T, RT, runtime::CPU_STATE),
+            ldr(W, T, T, runtime::MXCSR),
+        ]);
+        e.asm.tbz(false, T, 0, fail);
         e.asm.emit(movz(W, dst, 0x8000, 16));
+        e.asm.b(resume);
+    }
+    for (check, bit, resume, fail) in std::mem::take(&mut e.mxcsr_guards) {
+        e.asm.bind(check);
+        e.asm.emit_all(&[
+            ldr(X, T, RT, runtime::CPU_STATE),
+            ldr(W, T, T, runtime::MXCSR),
+        ]);
+        e.asm.tbz(false, T, bit, fail);
         e.asm.b(resume);
     }
     e.checked_accesses();
@@ -860,8 +873,9 @@ struct Emitter<'a> {
     region: RecordId,
     checkpoints: Vec<(Label, RecordId, Label)>,
     fp_checks: Vec<FpCheck>,
-    invalid_ints: Vec<(Label, Reg, Label)>,
-    mxcsr: Option<u32>,
+    invalid_ints: Vec<(Label, Reg, Label, Label)>,
+    mxcsr_guards: Vec<(Label, u32, Label, Label)>,
+    live_mxcsr: bool,
     edges: Vec<(Label, Target, usize, usize)>,
     links: Vec<(usize, u32)>,
     transitions: Vec<(usize, usize)>,
@@ -1558,12 +1572,15 @@ impl<'a> Emitter<'a> {
                 self.imm(X2, op as u64);
                 self.imm(X3, if double { 8 } else { 4 });
                 self.asm.bl(exact);
-                let missing = !self.mxcsr.unwrap() & 0x3f;
-                if missing != 0 {
-                    self.imm(U, u64::from(missing));
-                    self.asm.emit(and(W, T, X1, U, Lsl, 0));
-                    self.asm.cbz(W, true, T, fail);
-                }
+                // Check dynamically whether `exact_sse` raised any sticky flag (0x3f)
+                // not already present in the live guest MXCSR.
+                self.asm.emit_all(&[
+                    ldr(X, U, RT, runtime::CPU_STATE),
+                    ldr(W, U, U, runtime::MXCSR),
+                    bic(W, T, X1, U, Lsl, 0),
+                    and_imm(W, T, T, 0x3f),
+                ]);
+                self.asm.cbz(W, true, T, fail);
                 self.asm.emit(fmov_to_v(size, result, X0));
                 self.asm.b(resume);
                 continue;
@@ -1693,17 +1710,29 @@ impl<'a> Emitter<'a> {
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 self.asm.emit(compare(kind, a, b));
-                if self.mxcsr.is_some_and(|mxcsr| mxcsr & 1 != 0) {
-                    return;
-                }
                 let fail = self.fail();
+                let (target, resume) = if self.live_mxcsr {
+                    let (check, resume) = (self.asm.label(), self.asm.label());
+                    self.mxcsr_guards.push((check, 0, resume, fail));
+                    (check, Some(resume))
+                } else {
+                    (fail, None)
+                };
                 if kind == FlagKind::OrderedCompare {
-                    self.asm.b_cond(Cond::Vs, fail);
+                    self.asm.b_cond(Cond::Vs, target);
+                    if let Some(resume) = resume {
+                        self.asm.bind(resume);
+                    }
                 } else {
                     let ordered = self.asm.label();
                     self.asm.b_cond(Cond::Vc, ordered);
-                    fp_class::snan(&mut self.asm, a, T, fail);
-                    fp_class::snan(&mut self.asm, b, T, fail);
+                    fp_class::snan(&mut self.asm, a, T, target);
+                    fp_class::snan(&mut self.asm, b, T, target);
+                    if let Some(resume) = resume {
+                        self.asm.bind(resume);
+                    }
+                    // `snan` uses `fcmp` internally; restore the unordered NZCV.
+                    self.asm.emit(compare(kind, a, b));
                     self.asm.bind(ordered);
                 }
             }
@@ -1950,12 +1979,13 @@ impl<'a> Emitter<'a> {
                     and_imm(X, T, T, i64::MAX as u64),
                     cmp(X, T, U, Lsl, 0),
                 ]);
-                let bound = if sse && self.mxcsr.is_some_and(|mxcsr| mxcsr & 1 != 0) {
+                let fail = self.fail();
+                let bound = if sse && self.live_mxcsr {
                     let (check, resume) = (self.asm.label(), self.asm.label());
-                    self.invalid_ints.push((check, d, resume));
+                    self.invalid_ints.push((check, d, resume, fail));
                     (check, Some(resume))
                 } else {
-                    (self.fail(), None)
+                    (fail, None)
                 };
                 self.asm.b_cond(Cond::Hs, bound.0);
                 self.asm
@@ -2324,17 +2354,25 @@ impl<'a> Emitter<'a> {
                         }
                     }
                     VecOp::LessF64 => {
-                        if self.mxcsr.is_none_or(|mxcsr| mxcsr & 1 == 0) {
-                            let fail = self.fail();
-                            fp_class::nan_operands(
-                                &mut self.asm,
-                                false,
-                                true,
-                                &[a, b],
-                                T,
-                                [C, D],
-                                fail,
-                            );
+                        let fail = self.fail();
+                        let (target, resume) = if self.live_mxcsr {
+                            let (check, resume) = (self.asm.label(), self.asm.label());
+                            self.mxcsr_guards.push((check, 0, resume, fail));
+                            (check, Some(resume))
+                        } else {
+                            (fail, None)
+                        };
+                        fp_class::nan_operands(
+                            &mut self.asm,
+                            false,
+                            true,
+                            &[a, b],
+                            T,
+                            [C, D],
+                            target,
+                        );
+                        if let Some(resume) = resume {
+                            self.asm.bind(resume);
                         }
                         self.asm.emit(vcompare(Float::Fcmgt, false, true, q, b, a));
                     }
@@ -2508,6 +2546,13 @@ impl<'a> Emitter<'a> {
                 let a = self.vr(a, A);
                 let b = b.map(|b| self.vr(b, B));
                 let fail = self.fail();
+                let (target, resume) = if self.live_mxcsr {
+                    let (check, resume) = (self.asm.label(), self.asm.label());
+                    self.mxcsr_guards.push((check, 1, resume, fail));
+                    (check, Some(resume))
+                } else {
+                    (fail, None)
+                };
                 if packed {
                     fp_class::packed_denormals(
                         &mut self.asm,
@@ -2517,7 +2562,7 @@ impl<'a> Emitter<'a> {
                         T,
                         [D, E, C, F],
                     );
-                    fp_class::any_lane(&mut self.asm, C, T, fail);
+                    fp_class::any_lane(&mut self.asm, C, T, target);
                 } else {
                     for input in [Some(a), b].into_iter().flatten() {
                         fp_class::scalar_denormal(
@@ -2526,10 +2571,13 @@ impl<'a> Emitter<'a> {
                             input,
                             T,
                             U,
-                            Some(fail),
+                            Some(target),
                             Reg::ZR,
                         );
                     }
+                }
+                if let Some(resume) = resume {
+                    self.asm.bind(resume);
                 }
             }
             Op::ScopeWritten(mask) => {
@@ -2562,9 +2610,11 @@ extern "C" fn exact_sse(a: u64, b: u64, op: u8, width: u8) -> SseResult {
     softfloat::configure_sse(0x1f80);
     let bits = softfloat::sse_binary(a, b, op, width);
     let mut flags = u64::from(softfloat::flags());
-    // The double-precision input pass relies on validated arithmetic
-    // producing normal or zero values when DE is clear.
-    if width == 8 && f64::from_bits(bits).is_subnormal() {
+    // The SSE input pass relies on validated arithmetic producing normal or
+    // zero values when DE is clear (both f64 and f32).
+    if width == 8 && f64::from_bits(bits).is_subnormal()
+        || width == 4 && f32::from_bits(bits as u32).is_subnormal()
+    {
         flags |= 2;
     }
     SseResult { bits, flags }

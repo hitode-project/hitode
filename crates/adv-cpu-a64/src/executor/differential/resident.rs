@@ -1012,6 +1012,67 @@ fn sse_invalid_results_resume_when_mxcsr_invalid_is_already_set() {
     assert_eq!(native.diagnostics.resident_cold_exits, 0);
 }
 
+// spec: A64-OPT-4, A64-OPT-9, A64F-FP-5
+#[test]
+fn phase3_dynamic_mxcsr_sticky_reuses_single_resident_version() {
+    // 1) Resident SSE loop compiled at MXCSR=0x1fa0 (DE=0, IE=0, PE=1) runs
+    // with 0 cold exits on `min_subnormal * 2^24` when entered with DE=1 (0x1fa2),
+    // and still catches and commits DE=1 when entered with DE=0 (0x1fa0).
+    let sse_image = Image::loop_body(|a, head, _| {
+        a.mulss(xmm0, xmm1).unwrap();
+        a.addss(xmm0, xmm1).unwrap();
+        a.movss(dword_ptr(edi), xmm0).unwrap();
+        latch(a, head);
+    });
+    let mut compile_state = initial(4);
+    compile_state.mxcsr = 0x1fa0;
+    compile_state.xmm[0][..4].copy_from_slice(&1.5f32.to_le_bytes());
+    compile_state.xmm[1][..4].copy_from_slice(&2.0f32.to_le_bytes());
+
+    // Enter with DE=1 and adversarial `min_subnormal * 2^24`: must hit the
+    // existing resident version with 0 cold exits and match Tier-0 bit-for-bit.
+    let mut de_set = compile_state.clone();
+    de_set.mxcsr = 0x1fa2;
+    de_set.xmm[0][..4].copy_from_slice(&1u32.to_le_bytes());
+    de_set.xmm[1][..4].copy_from_slice(&0x4b80_0000u32.to_le_bytes());
+    let mut trial = Trial::new(&sse_image, &de_set, "SSE dynamic DE=1", &[], |_| {});
+    assert!(trial.try_install_at(compile_state.clone()));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(native.resident_arrivals(sse_image.head).unwrap() > 0);
+    assert_eq!(native.diagnostics.resident_cold_exits, 0);
+
+    // Enter with DE=0 and `min_subnormal * 2^24`: must bail and set DE=1.
+    let mut de_clear = de_set.clone();
+    de_clear.mxcsr = 0x1fa0;
+    let mut trial = Trial::new(&sse_image, &de_clear, "SSE dynamic DE=0", &[], |_| {});
+    assert!(trial.try_install_at(compile_state));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    assert_eq!(trial.live.state.mxcsr & 2, 2);
+
+    // 2) STMXCSR loop compiled at 0x1f80 reuses the same resident version for 0x1f85.
+    let stmxcsr_image = Image::loop_body(|a, head, _| {
+        a.stmxcsr(dword_ptr(edi)).unwrap();
+        latch(a, head);
+    });
+    let mut base_state = initial(4);
+    base_state.mxcsr = 0x1f80;
+    let mut sticky_state = base_state.clone();
+    sticky_state.mxcsr = 0x1f85;
+    let mut trial = Trial::new(
+        &stmxcsr_image,
+        &sticky_state,
+        "STMXCSR dynamic",
+        &[],
+        |_| {},
+    );
+    assert!(trial.try_install_at(base_state));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(native.resident_arrivals(stmxcsr_image.head).unwrap() > 0);
+    assert_eq!(native.diagnostics.resident_cold_exits, 0);
+}
+
 // spec: A64-OPT-9, A64F-FP-5, A64-MEM-7
 #[test]
 fn seeded_scalar_sse_memory_forms_cross_a_page() {

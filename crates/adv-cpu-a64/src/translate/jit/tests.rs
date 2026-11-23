@@ -3667,7 +3667,8 @@ pub(in crate::translate) mod opt_back {
                             _ => None,
                         })
                         .collect();
-                    assert_eq!(checks.len(), usize::from(mxcsr & 2 == 0));
+                    assert_eq!(built.assumed.mxcsr_mask, 0xffe0);
+                    assert_eq!(checks.len(), 1);
                     assert!(checks.iter().all(|b| b.is_none()));
                 }
                 let extra = [
@@ -3695,7 +3696,9 @@ pub(in crate::translate) mod opt_back {
                     let failed =
                         guest_fp_pair(&mut h, &code, &built, &at, &data, &rhs.to_le_bytes());
                     if op == 4 && (lhs.is_subnormal() || rhs.is_subnormal()) {
-                        assert_eq!(failed, mxcsr & 2 == 0);
+                        // Standalone eval has no live MXCSR, so Op::SseInput always fails on
+                        // subnormals; resident dynamic DE=1 handling is verified in resident.rs.
+                        assert!(failed);
                     }
                 }
             }

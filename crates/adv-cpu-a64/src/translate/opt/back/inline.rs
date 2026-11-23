@@ -197,6 +197,11 @@ impl Emitter<'_> {
                     self.asm.emit(ldr(W, out, CPU, runtime::FS_BASE));
                     Host::Register(out)
                 }
+                Source::Mxcsr => {
+                    let out = self.rd(param);
+                    self.asm.emit(ldr(W, out, CPU, runtime::MXCSR));
+                    Host::Register(out)
+                }
                 Source::X87Ip => {
                     let out = self.rd(param);
                     self.asm.emit(ldr(W, out, CPU, runtime::X87_IP));

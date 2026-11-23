@@ -132,6 +132,7 @@ struct Front<'a> {
     base: Value,
     bias: i32,
     fs_base: Option<Value>,
+    mxcsr: Option<Value>,
     state: State,
     loads: BTreeMap<Value, usize>,
     stores: BTreeMap<RecordId, usize>,
@@ -297,11 +298,6 @@ fn build_trace(
         return Err(Reject::Mode(i));
     }
     let mmx = !x87 && mmx_index.is_some();
-    let simd = |pick: fn(&crate::translate::front::forms::Simd) -> bool| {
-        insts
-            .iter()
-            .any(|i| matches!(i.op, decode::Op::Simd(s) if pick(&s)))
-    };
     let floating = insts
         .iter()
         .position(|i| matches!(i.op, decode::Op::Simd(s) if s.floating()));
@@ -313,13 +309,6 @@ fn build_trace(
         return Err(Reject::Mode(i));
     }
     let floating = floating.is_some();
-    let control = simd(|s| {
-        matches!(
-            s.kind,
-            crate::translate::front::forms::SimdKind::StoreControl
-                | crate::translate::front::forms::SimdKind::LoadControl
-        )
-    });
     // Precision exceptions are sticky and the form's arithmetic may raise
     // them, so a form that computes assumes they are already raised.
     let mut forced = at.clone();
@@ -340,11 +329,10 @@ fn build_trace(
         denormal: at.x87.status & 2 != 0,
         x87,
         mmx,
-        mxcsr_mask: if floating || control {
-            u32::MAX
-        } else {
-            0xffc0
-        },
+        // Never specialize on IE/DE/ZE/OE/UE (0x1f); floating SSE forms require
+        // only control bits (0xffc0) plus PE (0x20), while STMXCSR passes entry
+        // sticky bits dynamically via Source::Mxcsr.
+        mxcsr_mask: if floating { 0xffe0 } else { 0xffc0 },
     };
     let accesses = resident.map(|_| facts::accesses(unit, facts));
     let ebp = at.regs[EBP as usize].wrapping_sub(at.regs[ESP as usize]);
@@ -687,6 +675,7 @@ fn build_trace(
         base,
         bias,
         fs_base: None,
+        mxcsr: None,
         state: entry_state,
         loads: BTreeMap::new(),
         stores: BTreeMap::new(),
