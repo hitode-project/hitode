@@ -362,6 +362,12 @@ pub(super) fn link(source: &Path, target: &Path) -> Result<(), String> {
     std::os::unix::fs::symlink(source, target).map_err(|e| format!("{}: {e}", target.display()))
 }
 
+/// Wine modules backed by `wined3d`/OpenGL that Hitode does not serve.
+/// Exposing Wine's `dxgi.dll` in `system32` causes D3D9 titles that probe it
+/// (such as Microsoft's DirectX SDK / Unity VRAM detection) to load a DLL whose
+/// `CreateDXGIFactory` fails without GL instead of taking their non-DXGI fallback.
+const OMITTED_MODULES: &[&str] = &["dxgi.dll"];
+
 /// Create or refresh the prefix; returns it and drive C:.
 fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
     let prefix = config.prefix.to_owned();
@@ -403,6 +409,22 @@ fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
             let name = entry.file_name();
+            if directory == MODULES
+                && OMITTED_MODULES
+                    .iter()
+                    .any(|&omitted| name.eq_ignore_ascii_case(omitted))
+            {
+                let target = windows.join("system32").join(&name);
+                if target
+                    .symlink_metadata()
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    adv_wineserver::names_changed();
+                    std::fs::remove_file(&target)
+                        .map_err(|e| format!("{}: {e}", target.display()))?;
+                }
+                continue;
+            }
             let target = if name == "sortdefault.nls" {
                 windows.join("globalization/sorting").join(name)
             } else {
@@ -1564,6 +1586,64 @@ mod link_tests {
             lookup(&devices, &name("data1.arc")),
             Ok(Lookup::Found(_))
         ));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // spec: WINE-SES-1, WINE-SYS-15
+    #[test]
+    fn prefix_omits_dxgi_and_cleans_stale_symlink_without_touching_regular_file() {
+        let root = std::env::temp_dir().join(format!("adv-prefix-omit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dist = root.join("dist");
+        let template = dist.join(super::TEMPLATE);
+        let modules = dist.join(super::MODULES);
+        let nls = dist.join("share/wine/nls");
+        let prefix_dir = root.join("prefix");
+        let exe = root.join("game.exe");
+        std::fs::create_dir_all(template.join("drive_c/windows")).unwrap();
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::create_dir_all(&nls).unwrap();
+        for reg in ["system.reg", "user.reg", "userdef.reg"] {
+            std::fs::write(template.join(reg), b"").unwrap();
+        }
+        std::fs::write(template.join("links.tsv"), b"").unwrap();
+        std::fs::write(modules.join("ntdll.dll"), b"").unwrap();
+        std::fs::write(modules.join("dxgi.dll"), b"").unwrap();
+        std::fs::write(nls.join("sortdefault.nls"), b"").unwrap();
+        std::fs::write(&exe, b"").unwrap();
+
+        let config = super::Config {
+            dist: &dist,
+            prefix: &prefix_dir,
+            drive: None,
+            locale: 0x409,
+            fonts: "",
+            exe: &exe,
+            width: 640,
+            height: 480,
+            jit: true,
+            debug: "",
+            stdout: None,
+        };
+        let (_, drive) = super::prefix(&config).unwrap();
+        let system32 = drive.join("windows/system32");
+        assert!(system32.join("ntdll.dll").symlink_metadata().is_ok());
+        assert!(system32.join("dxgi.dll").symlink_metadata().is_err());
+
+        // Refreshing an older prefix removes a stale/dangling symlink.
+        std::os::unix::fs::symlink(
+            root.join("removed-bundle/dxgi.dll"),
+            system32.join("dxgi.dll"),
+        )
+        .unwrap();
+        super::prefix(&config).unwrap();
+        assert!(system32.join("dxgi.dll").symlink_metadata().is_err());
+
+        // A user-supplied regular file in system32 stays untouched.
+        std::fs::write(system32.join("dxgi.dll"), b"native").unwrap();
+        super::prefix(&config).unwrap();
+        assert_eq!(std::fs::read(system32.join("dxgi.dll")).unwrap(), b"native");
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

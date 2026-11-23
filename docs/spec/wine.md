@@ -814,6 +814,8 @@ Verify mode MUST compare staged output and state with synchronous decoding.
 Process startup MUST register the prefix's drive letters in the server namespace.
 **Verification**: Test
 
+Wine modules whose graphics backend Hitode does not serve (such as `dxgi.dll`) stay omitted from system32; refreshing an older prefix removes stale symlinks while leaving regular files intact.
+
 ### WINE-SES-2 Host wakes
 
 **Rule**: While every guest context waits, a session MUST serve finished host work before it blocks. A host wake MUST end the block. The run loop MUST take the wake's interrupt before it drains host work.
