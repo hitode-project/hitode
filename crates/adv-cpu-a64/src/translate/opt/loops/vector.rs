@@ -3,10 +3,11 @@
 //! established by the original scalar iteration following the batch region.
 
 use super::{
-    Access, BatchBody, BatchEmitter, Cc, Defs, End, FlagKind, Func, IntOp, IntUnary, Loop,
-    LoopKernel, Op, Plan, Stream, Target, Type, Value, VecOp, VecUnary, invert,
+    Access, BatchBody, BatchEmitter, Cc, Defs, End, FlagKind, FmaOp, FpOp, FpUnary, Func, IntOp,
+    IntUnary, Loop, LoopKernel, Op, Plan, SINGLE_A, SINGLE_B, SINGLE_C, SINGLE_EXACT,
+    SINGLE_RESULT, Stream, Target, Type, Value, VecOp, VecUnary, invert,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::encode::*;
 
@@ -19,20 +20,26 @@ pub(in crate::translate::opt) struct Vector;
 enum Shape {
     Scalar(u8),
     Packed(u8),
+    /// 4-wide binary32 independent floating-point vector strip (`A64-TR-9`).
+    Float32,
+    /// 2-wide binary64 independent floating-point vector strip (`A64-TR-9`).
+    Float64,
 }
 
 impl Shape {
     fn lanes(self) -> u8 {
         match self {
             Self::Scalar(width) => 16 / width,
-            Self::Packed(_) => 2,
+            Self::Packed(_) | Self::Float64 => 2,
+            Self::Float32 => 4,
         }
     }
 
     fn arr(self) -> Arr {
         match self {
             Self::Scalar(width) => Arr::new(width.trailing_zeros(), true),
-            Self::Packed(_) => Arr::D2,
+            Self::Packed(_) | Self::Float64 => Arr::D2,
+            Self::Float32 => Arr::S4,
         }
     }
 
@@ -44,8 +51,31 @@ impl Shape {
         }
     }
 
+    fn is_float(self) -> bool {
+        matches!(self, Self::Float32 | Self::Float64)
+    }
+
     fn repeat(self) -> bool {
         self == Self::Packed(16)
+    }
+}
+
+fn single_proved(proved: u8) -> bool {
+    const REQ: u8 = SINGLE_A | SINGLE_B | SINGLE_RESULT;
+    proved & SINGLE_EXACT != 0 || proved & REQ == REQ
+}
+
+fn single_fma_proved(proved: u8) -> bool {
+    const REQ: u8 = SINGLE_A | SINGLE_B | SINGLE_C | SINGLE_RESULT;
+    proved & SINGLE_EXACT != 0 || proved & REQ == REQ
+}
+
+fn float_op(op: FpOp) -> Float {
+    match op {
+        FpOp::Add => Float::Fadd,
+        FpOp::Sub => Float::Fsub,
+        FpOp::Mul => Float::Fmul,
+        FpOp::Div => Float::Fdiv,
     }
 }
 
@@ -54,6 +84,11 @@ enum Unary {
     Not,
     Shift(ShiftImm, Arr, u32),
     ShuffleWords(u8),
+    FpNeg(bool),
+    FpAbs(bool),
+    FpToInt(bool, u8),
+    IntToFp32,
+    Widen2sTo2d,
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +98,7 @@ enum Binary {
     UnsignedGt(Arr),
     Unpack(Permute, u8),
     Pack(Narrowing, u8),
+    Fp(FpOp, bool),
 }
 
 #[derive(Clone, Copy)]
@@ -75,9 +111,14 @@ enum OpCode {
     Load(Memory),
     Store(Memory),
     Broadcast(Value),
+    BroadcastExactF32(Value),
     Constant(u128),
     Unary(Unary),
     Binary(Binary),
+    FpFma { sub: bool, double: bool },
+    CheckNormal(bool),
+    CheckMulUnderflow { double: bool, div: bool },
+    CheckIntRange { double: bool, rounding: u8 },
     Blend,
     Charge(i32),
     ClassTest(u8),
@@ -99,6 +140,10 @@ enum Step {
     Address(Stream, u32),
     Gp(Value, VReg, Arr),
     Vector(Value, VReg),
+    FpBroadcast(Value, VReg, bool, bool),
+    BailCond(Cond),
+    BailNonZero(Reg),
+    BailNonZeroX(Reg),
     Imm(u64),
     Charge(i32),
     LaneStore(Stream, u32, VReg),
@@ -147,6 +192,42 @@ impl BatchBody for Program {
                             emitter.asm().emit(vmov(true, dst, src));
                         }
                     }
+                    Step::FpBroadcast(value, dst, double, check_exact) => {
+                        let src = emitter.vector_invariant(value, dst);
+                        if double {
+                            emitter.asm().emit(vdup_lane(Arr::D2, dst, src, 0));
+                        } else if check_exact {
+                            let tmp = VReg::new(28);
+                            let gp2 = Reg::new(17);
+                            emitter.asm().emit_all(&[
+                                unary(crate::encode::Unary::Narrow, tmp, src),
+                                unary(crate::encode::Unary::Widen, VReg::new(29), tmp),
+                                fmov_from_v(Size::X, SCALAR, src),
+                                fmov_from_v(Size::X, gp2, VReg::new(29)),
+                                cmp(Size::X, SCALAR, gp2, Shift::Lsl, 0),
+                            ]);
+                            let bail = emitter.bail();
+                            emitter.asm().b_cond(Cond::Ne, bail);
+                            emitter.asm().emit(vdup_lane(Arr::S4, dst, tmp, 0));
+                        } else {
+                            emitter.asm().emit_all(&[
+                                unary(crate::encode::Unary::Narrow, dst, src),
+                                vdup_lane(Arr::S4, dst, dst, 0),
+                            ]);
+                        }
+                    }
+                    Step::BailCond(cond) => {
+                        let bail = emitter.bail();
+                        emitter.asm().b_cond(cond, bail);
+                    }
+                    Step::BailNonZero(reg) => {
+                        let bail = emitter.bail();
+                        emitter.asm().cbz(Size::W, true, reg, bail);
+                    }
+                    Step::BailNonZeroX(reg) => {
+                        let bail = emitter.bail();
+                        emitter.asm().cbz(Size::X, true, reg, bail);
+                    }
                     Step::Imm(bits) => emitter.immediate(SCALAR, bits),
                     Step::Charge(cost) => emitter.adjust_charge(SCALAR, cost),
                     Step::LaneStore(stream, lane, value) => {
@@ -191,9 +272,24 @@ impl LoopKernel for Vector {
 
         let paths = Paths::new(func, loop_)?;
         let values = Values::new(func, loop_, &defs, &paths)?;
+        let has_fp = loop_.blocks.iter().any(|&b| {
+            func.blocks[b.0 as usize].insts.iter().any(|&(r, op)| {
+                r.is_some_and(|v| func.ty(v) == Type::F64)
+                    || matches!(op, Op::X87Store { .. } | Op::X87Load { .. })
+            })
+        });
         let width = loop_.streams.iter().map(|s| s.width).max()?;
-        let mut shapes = vec![Shape::Scalar(1), Shape::Scalar(2), Shape::Scalar(4)];
-        if width >= 8 {
+        let shapes = if has_fp {
+            if !paths.selects.is_empty()
+                || loop_
+                    .streams
+                    .iter()
+                    .any(|s| s.write() && !matches!(s.width, 4 | 8))
+            {
+                return None;
+            }
+            vec![Shape::Float32, Shape::Float64]
+        } else if width >= 8 {
             if !paths.selects.is_empty()
                 || !matches!(width, 8 | 16)
                 || groups.iter().any(|g| {
@@ -202,8 +298,10 @@ impl LoopKernel for Vector {
             {
                 return None;
             }
-            shapes = vec![Shape::Packed(width)];
-        }
+            vec![Shape::Packed(width)]
+        } else {
+            vec![Shape::Scalar(1), Shape::Scalar(2), Shape::Scalar(4)]
+        };
         for shape in shapes {
             if matches!(shape, Shape::Scalar(w) if w < width) {
                 continue;
@@ -212,6 +310,7 @@ impl LoopKernel for Vector {
                 values: &values,
                 shape,
                 mapped: BTreeMap::new(),
+                checked: BTreeSet::new(),
                 insts: Vec::new(),
                 next: 0,
                 bindings: BTreeMap::new(),
@@ -221,7 +320,7 @@ impl LoopKernel for Vector {
                     .insts
                     .iter()
                     .filter_map(|i| match i.op {
-                        OpCode::Broadcast(v) => Some(v),
+                        OpCode::Broadcast(v) | OpCode::BroadcastExactF32(v) => Some(v),
                         _ => None,
                     })
                     .collect();
@@ -260,6 +359,9 @@ impl<'a> Values<'a> {
         for &(p, a) in &loop_.carried {
             let mask = if p == a {
                 u32::MAX
+            } else if func.ty(p) == Type::F64 {
+                // Loop-carried floating-point recurrence: not independent across lanes.
+                return None;
             } else if loop_.ivs.iter().any(|iv| iv.base == p) {
                 continue;
             } else {
@@ -273,7 +375,7 @@ impl<'a> Values<'a> {
             if data.pcs.iter().any(|pc| func.calls.contains(pc)) {
                 return None;
             }
-            for &(result, op) in &data.insts {
+            for &(_, op) in &data.insts {
                 let allowed = match op {
                     Op::Int(IntOp::Shl | IntOp::Shr | IntOp::Sar, _, b) => {
                         defs.constant(b).is_some()
@@ -310,7 +412,18 @@ impl<'a> Values<'a> {
                     | Op::Validate
                     | Op::Constant(..)
                     | Op::Test { .. }
-                    | Op::Select { .. } => true,
+                    | Op::Select { .. }
+                    | Op::X87Load { .. }
+                    | Op::X87Single(..)
+                    | Op::Fp(..)
+                    | Op::Fma {
+                        op: FmaOp::Add | FmaOp::RevSub,
+                        ..
+                    }
+                    | Op::FpUnary(FpUnary::Neg | FpUnary::Abs, _)
+                    | Op::FromInt(_)
+                    | Op::X87Store { .. }
+                    | Op::X87StoreC1 { .. } => true,
                     Op::Bits { to, value } => to != Type::F64 && func.ty(value) != Type::F64,
                     Op::Vec(op, ..) => {
                         packed_binary(op, false).is_some() || packed_binary(op, true).is_some()
@@ -318,7 +431,7 @@ impl<'a> Values<'a> {
                     Op::VecUnary(VecUnary::Low64 | VecUnary::ShiftImm(_, 0..=2, _, _), _) => true,
                     _ => false,
                 };
-                if !allowed || result.is_some_and(|v| func.ty(v) == Type::F64) {
+                if !allowed {
                     return None;
                 }
             }
@@ -533,6 +646,7 @@ struct Builder<'a> {
     values: &'a Values<'a>,
     shape: Shape,
     mapped: BTreeMap<(Value, u32), usize>,
+    checked: BTreeSet<usize>,
     insts: Vec<Inst>,
     next: usize,
     bindings: BTreeMap<Value, Value>,
@@ -578,8 +692,9 @@ impl Builder<'_> {
 
     fn build(&mut self, groups: &[Vec<(usize, Stream)>]) -> Option<Vec<Step>> {
         self.read_inputs(groups)?;
-        // Emit the entire read set before stores. The alias guard permits
-        // identical in-place streams only when their scalar load is first.
+        // Emit the entire read set and all computations + pre-store lane
+        // validations (`A64-OPT-10`) before any store commits.
+        let mut pending_stores = Vec::new();
         for group in groups {
             let stream = group[0].1;
             if !stream.write() {
@@ -591,18 +706,46 @@ impl Builder<'_> {
                 let Access::Store(v) = s.access else {
                     unreachable!()
                 };
-                let value = if matches!(self.shape, Shape::Scalar(_)) {
-                    self.scalar(v, low_mask(s.width))?
-                } else {
-                    self.packed(v)?
+                let value = match self.shape {
+                    Shape::Scalar(_) => self.scalar(v, low_mask(s.width))?,
+                    Shape::Packed(_) => self.packed(v)?,
+                    Shape::Float32 | Shape::Float64 => self.float_store(v, s.width)?,
                 };
                 inputs.push(value);
             }
-            self.insts.push(Inst {
-                op: OpCode::Store(Memory {
+            pending_stores.push((
+                Memory {
                     stream,
                     count: group.len(),
-                }),
+                },
+                inputs,
+            ));
+        }
+        if self.shape.is_float() {
+            // Every potentially-failing FP op in the loop body must be covered
+            // by our validated data path so no exception can be skipped.
+            for &b in &self.values.loop_.blocks {
+                for &(res, op) in &self.values.func.blocks[b.0 as usize].insts {
+                    if op.can_fail()
+                        && !matches!(
+                            op,
+                            Op::Load { .. }
+                                | Op::Store { .. }
+                                | Op::PageCross { .. }
+                                | Op::FrameDisjoint { .. }
+                        )
+                    {
+                        let v = res?;
+                        if !self.mapped.contains_key(&(v, u32::MAX)) {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        for (memory, inputs) in pending_stores {
+            self.insts.push(Inst {
+                op: OpCode::Store(memory),
                 inputs,
                 outputs: vec![],
             });
@@ -995,6 +1138,220 @@ impl Builder<'_> {
         Some(id)
     }
 
+    fn float_store(&mut self, v: Value, width: u8) -> Option<usize> {
+        let v = self.resolve(v);
+        if let Some(&id) = self.mapped.get(&(v, u32::MAX)) {
+            return Some(id);
+        }
+        let Op::X87Store {
+            value,
+            width: sw,
+            rounding,
+            integer,
+            proved,
+        } = self.values.defs.op(v)?
+        else {
+            return None;
+        };
+        if sw != width {
+            return None;
+        }
+        let double = self.shape == Shape::Float64;
+        let id = if integer {
+            if width != 4 {
+                return None;
+            }
+            let src = self.float_val(value, !proved)?;
+            if !proved {
+                self.effect(OpCode::CheckIntRange { double, rounding }, vec![src]);
+            }
+            self.emit(OpCode::Unary(Unary::FpToInt(double, rounding)), vec![src])
+        } else {
+            let expected_width = if double { 8 } else { 4 };
+            if width != expected_width {
+                return None;
+            }
+            let src = self.float_val(value, !proved)?;
+            if !proved {
+                self.effect(OpCode::CheckNormal(double), vec![src]);
+            }
+            src
+        };
+        self.mapped.insert((v, u32::MAX), id);
+        Some(id)
+    }
+
+    fn float_val(&mut self, v: Value, need_check: bool) -> Option<usize> {
+        let v = self.resolve(v);
+        let double = self.shape == Shape::Float64;
+        if let Some(&id) = self.mapped.get(&(v, u32::MAX)) {
+            if need_check && self.checked.insert(id) {
+                self.effect(OpCode::CheckNormal(double), vec![id]);
+            }
+            return Some(id);
+        }
+        let defs = self.values.defs;
+        if let Some(bits) = defs.constant(v) {
+            let f = f64::from_bits(bits as u64);
+            if !double && f64::from(f as f32).to_bits() != f.to_bits() {
+                return None;
+            }
+            if need_check && (!f.is_finite() || (f != 0.0 && f.is_subnormal())) {
+                return None;
+            }
+            let packed = if double {
+                bits & u128::from(u64::MAX)
+            } else {
+                u128::from((f as f32).to_bits())
+            };
+            let id = self.constant(packed);
+            self.mapped.insert((v, u32::MAX), id);
+            return Some(id);
+        }
+        if defs.invariant(&self.values.loop_.blocks, v)
+            || self.values.stable.get(&v) == Some(&u32::MAX)
+        {
+            let id = if !double && need_check {
+                self.emit(OpCode::BroadcastExactF32(v), vec![])
+            } else {
+                self.emit(OpCode::Broadcast(v), vec![])
+            };
+            if need_check && self.checked.insert(id) {
+                self.effect(OpCode::CheckNormal(double), vec![id]);
+            }
+            self.mapped.insert((v, u32::MAX), id);
+            return Some(id);
+        }
+        let id = match defs.op(v)? {
+            Op::X87Load {
+                bits,
+                single,
+                proved,
+                ..
+            } => {
+                if !double && !single {
+                    return None;
+                }
+                let raw = *self.mapped.get(&(bits, u32::MAX))?;
+                if double && single {
+                    // 4-byte f32 stream loaded as 2×f32 into low 64 bits; only
+                    // admit proved f32->f64 loads so subnormal f32 cannot hide.
+                    if !proved {
+                        return None;
+                    }
+                    self.emit(OpCode::Unary(Unary::Widen2sTo2d), vec![raw])
+                } else {
+                    if !proved {
+                        self.effect(OpCode::CheckNormal(double), vec![raw]);
+                    }
+                    raw
+                }
+            }
+            Op::FromInt(a) => {
+                if double {
+                    return None;
+                }
+                // Zero-extended u8/u16 stream loads are exact in binary32.
+                let is_small_unsigned = match defs.op(a) {
+                    Some(Op::Load { width: 1 | 2, .. }) => true,
+                    Some(Op::IntUnary(IntUnary::ZeroExtend8 | IntUnary::ZeroExtend16, inner)) => {
+                        self.mapped.contains_key(&(inner, u32::MAX))
+                    }
+                    _ => false,
+                };
+                if !is_small_unsigned {
+                    return None;
+                }
+                let src_val = match defs.op(a) {
+                    Some(Op::IntUnary(IntUnary::ZeroExtend8 | IntUnary::ZeroExtend16, inner)) => {
+                        inner
+                    }
+                    _ => a,
+                };
+                let int_vec = *self.mapped.get(&(src_val, u32::MAX))?;
+                self.emit(OpCode::Unary(Unary::IntToFp32), vec![int_vec])
+            }
+            Op::X87Single(op, a, b, proved) if !double => {
+                let proved_all = single_proved(proved);
+                let a_exact = proved & (SINGLE_A | SINGLE_EXACT) != 0;
+                let b_exact = proved & (SINGLE_B | SINGLE_EXACT) != 0;
+                let av = self.float_val(a, !a_exact)?;
+                let bv = self.float_val(b, !b_exact)?;
+                let res = self.binary(Binary::Fp(op, false), av, bv);
+                if !proved_all {
+                    self.effect(OpCode::CheckNormal(false), vec![res]);
+                    if matches!(op, FpOp::Mul | FpOp::Div) {
+                        self.effect(
+                            OpCode::CheckMulUnderflow {
+                                double: false,
+                                div: op == FpOp::Div,
+                            },
+                            vec![res, av, bv],
+                        );
+                    }
+                }
+                res
+            }
+            Op::Fp(op, a, b, proved) if double => {
+                let av = self.float_val(a, !proved)?;
+                let bv = self.float_val(b, !proved)?;
+                let res = self.binary(Binary::Fp(op, true), av, bv);
+                if !proved {
+                    self.effect(OpCode::CheckNormal(true), vec![res]);
+                    if matches!(op, FpOp::Mul | FpOp::Div) {
+                        self.effect(
+                            OpCode::CheckMulUnderflow {
+                                double: true,
+                                div: op == FpOp::Div,
+                            },
+                            vec![res, av, bv],
+                        );
+                    }
+                }
+                res
+            }
+            Op::Fma {
+                op: fma_op @ (FmaOp::Add | FmaOp::RevSub),
+                a,
+                b,
+                c,
+                single,
+                proved,
+            } if single == !double
+                && if single {
+                    single_fma_proved(proved)
+                } else {
+                    proved & SINGLE_RESULT != 0
+                } =>
+            {
+                let av = self.float_val(a, false)?;
+                let bv = self.float_val(b, false)?;
+                let cv = self.float_val(c, false)?;
+                self.emit(
+                    OpCode::FpFma {
+                        sub: fma_op == FmaOp::RevSub,
+                        double,
+                    },
+                    vec![av, bv, cv],
+                )
+            }
+            Op::FpUnary(op @ (FpUnary::Neg | FpUnary::Abs), a) => {
+                let av = self.float_val(a, need_check)?;
+                self.emit(
+                    OpCode::Unary(if op == FpUnary::Neg {
+                        Unary::FpNeg(double)
+                    } else {
+                        Unary::FpAbs(double)
+                    }),
+                    vec![av],
+                )
+            }
+            _ => return None,
+        };
+        self.mapped.insert((v, u32::MAX), id);
+        Some(id)
+    }
+
     fn allocate(&self) -> Option<Vec<Step>> {
         let mut last = vec![0; self.next];
         for (i, inst) in self.insts.iter().enumerate() {
@@ -1043,7 +1400,12 @@ impl Builder<'_> {
                         code.push(Step::Gp(v, target(), Arr::S4));
                     }
                     Shape::Packed(_) => code.push(Step::Vector(v, target())),
+                    Shape::Float32 => code.push(Step::FpBroadcast(v, target(), false, false)),
+                    Shape::Float64 => code.push(Step::FpBroadcast(v, target(), true, false)),
                 },
+                OpCode::BroadcastExactF32(v) => {
+                    code.push(Step::FpBroadcast(v, target(), false, true));
+                }
                 OpCode::Constant(bits) => {
                     if bits == 0 {
                         code.push(Step::Word(vzero(true, target())));
@@ -1082,6 +1444,36 @@ impl Builder<'_> {
                                 | target().number(),
                         ));
                     }
+                    Unary::FpNeg(double) | Unary::FpAbs(double) => {
+                        let tmp = VReg::new(28);
+                        let logic = if matches!(op, Unary::FpNeg(_)) {
+                            Logic::Eor
+                        } else {
+                            Logic::Bic
+                        };
+                        if double {
+                            code.push(Step::Word(movz(Size::X, SCALAR, 0x8000, 48)));
+                            code.push(Step::Word(vdup(Arr::D2, tmp, SCALAR)));
+                        } else {
+                            code.push(Step::Word(movz(Size::W, SCALAR, 0x8000, 16)));
+                            code.push(Step::Word(vdup(Arr::S4, tmp, SCALAR)));
+                        }
+                        code.push(Step::Word(vlogic(logic, true, target(), read(0), tmp)));
+                    }
+                    Unary::FpToInt(double, rounding) => {
+                        code.push(Step::Word(vfcvt_int_mode(
+                            double,
+                            rounding,
+                            target(),
+                            read(0),
+                        )));
+                    }
+                    Unary::IntToFp32 => {
+                        code.push(Step::Word(vfromint(target(), read(0))));
+                    }
+                    Unary::Widen2sTo2d => {
+                        code.push(Step::Word(vwiden(target(), read(0))));
+                    }
                 },
                 OpCode::Binary(op) => {
                     let x = VReg::new(28);
@@ -1116,8 +1508,112 @@ impl Builder<'_> {
                             code.push(Step::Word(vnarrow(op, narrow, y, read(1))));
                             vpermute(Permute::Zip1, Arr::S4, target(), x, y)
                         }
+                        Binary::Fp(fp, double) => {
+                            if double {
+                                vfloat_2d(float_op(fp), target(), read(0), read(1))
+                            } else {
+                                vfloat(float_op(fp), true, target(), read(0), read(1))
+                            }
+                        }
                     };
                     code.push(Step::Word(word));
+                }
+                OpCode::FpFma { sub, double } => {
+                    let t = target();
+                    let (ra, rb, rc) = (read(0), read(1), read(2));
+                    if t == ra || t == rb {
+                        let tmp = VReg::new(28);
+                        code.push(Step::Word(vmov(true, tmp, rc)));
+                        code.push(Step::Word(vfmla(double, sub, tmp, ra, rb)));
+                        code.push(Step::Word(vmov(true, t, tmp)));
+                    } else {
+                        if t != rc {
+                            code.push(Step::Word(vmov(true, t, rc)));
+                        }
+                        code.push(Step::Word(vfmla(double, sub, t, ra, rb)));
+                    }
+                }
+                OpCode::CheckNormal(double) => {
+                    let src = read(0);
+                    let gp2 = Reg::new(17);
+                    if !double {
+                        // Normal (1..=254) or ±0.0 across all 4 f32 lanes.
+                        let (t1, t2, t3) = (VReg::new(28), VReg::new(29), VReg::new(30));
+                        code.push(Step::Word(vshift(ShiftImm::Shl, Arr::S4, t1, src, 1)));
+                        code.push(Step::Word(vzero(true, t2)));
+                        code.push(Step::Word(vsame(Same::Cmeq, Arr::S4, t2, t1, t2)));
+                        code.push(Step::Word(movz(Size::W, SCALAR, 0x0100, 16)));
+                        code.push(Step::Word(vdup(Arr::S4, t3, SCALAR)));
+                        code.push(Step::Word(vsame(Same::Sub, Arr::S4, t1, t1, t3)));
+                        code.push(Step::Word(vlogic(Logic::Bic, true, t1, t1, t2)));
+                        code.push(Step::Word(umaxv(t1, t1)));
+                        code.push(Step::Word(fmov_from_v(Size::W, SCALAR, t1)));
+                        code.push(Step::Word(movz(Size::W, gp2, 0xfe00, 16)));
+                        code.push(Step::Word(cmp(Size::W, SCALAR, gp2, Shift::Lsl, 0)));
+                        code.push(Step::BailCond(Cond::Hs));
+                    } else {
+                        // Normal (1..=2046) or ±0.0 across both f64 lanes.
+                        for lane in 0..2u32 {
+                            code.push(Step::Word(vumov(3, SCALAR, src, lane)));
+                            code.push(Step::Word(lsl_imm(Size::X, SCALAR, SCALAR, 1)));
+                            code.push(Step::Word(lsr_imm(Size::X, gp2, SCALAR, 53)));
+                            code.push(Step::Word(sub_imm(Size::W, gp2, gp2, 1, false)));
+                            code.push(Step::Word(cmp_imm(Size::X, SCALAR, 0, false)));
+                            code.push(Step::Word(csel(Size::W, gp2, Reg::ZR, gp2, Cond::Eq)));
+                            code.push(Step::Word(cmp_imm(Size::W, gp2, 2046, false)));
+                            code.push(Step::BailCond(Cond::Hs));
+                        }
+                    }
+                }
+                OpCode::CheckMulUnderflow { double, div } => {
+                    // Bail if any lane underflowed to ±0.0 from nonzero input(s).
+                    let (res, a, b) = (read(0), read(1), read(2));
+                    let (t1, t2, t3) = (VReg::new(28), VReg::new(29), VReg::new(30));
+                    let arr = if double { Arr::D2 } else { Arr::S4 };
+                    code.push(Step::Word(vzero(true, t3)));
+                    code.push(Step::Word(vshift(ShiftImm::Shl, arr, t1, res, 1)));
+                    code.push(Step::Word(vsame(Same::Cmeq, arr, t1, t1, t3)));
+                    code.push(Step::Word(vshift(ShiftImm::Shl, arr, t2, a, 1)));
+                    code.push(Step::Word(vsame(Same::Cmeq, arr, t2, t2, t3)));
+                    code.push(Step::Word(vlogic(Logic::Bic, true, t1, t1, t2)));
+                    if !div {
+                        code.push(Step::Word(vshift(ShiftImm::Shl, arr, t2, b, 1)));
+                        code.push(Step::Word(vsame(Same::Cmeq, arr, t2, t2, t3)));
+                        code.push(Step::Word(vlogic(Logic::Bic, true, t1, t1, t2)));
+                    }
+                    if double {
+                        let gp2 = Reg::new(17);
+                        code.push(Step::Word(vumov(3, SCALAR, t1, 0)));
+                        code.push(Step::Word(vumov(3, gp2, t1, 1)));
+                        code.push(Step::Word(orr(Size::X, SCALAR, SCALAR, gp2, Shift::Lsl, 0)));
+                        code.push(Step::BailNonZeroX(SCALAR));
+                    } else {
+                        code.push(Step::Word(umaxv(t1, t1)));
+                        code.push(Step::Word(fmov_from_v(Size::W, SCALAR, t1)));
+                        code.push(Step::BailNonZero(SCALAR));
+                    }
+                }
+                OpCode::CheckIntRange { double, rounding } => {
+                    let src = read(0);
+                    let gp2 = Reg::new(17);
+                    if !double {
+                        let tmp = VReg::new(28);
+                        code.push(Step::Word(vshift(ShiftImm::Shl, Arr::S4, tmp, src, 1)));
+                        code.push(Step::Word(umaxv(tmp, tmp)));
+                        code.push(Step::Word(fmov_from_v(Size::W, SCALAR, tmp)));
+                        code.push(Step::Word(movz(Size::W, gp2, 0x9e00, 16)));
+                        code.push(Step::Word(cmp(Size::W, SCALAR, gp2, Shift::Lsl, 0)));
+                        code.push(Step::BailCond(Cond::Hs));
+                    } else {
+                        let hi_imm = if rounding == 3 { 0x41e0 } else { 0x41df };
+                        code.push(Step::Word(movz(Size::W, gp2, hi_imm, 16)));
+                        for lane in 0..2u32 {
+                            code.push(Step::Word(vumov(3, SCALAR, src, lane)));
+                            code.push(Step::Word(ubfx(Size::X, SCALAR, SCALAR, 32, 31)));
+                            code.push(Step::Word(cmp(Size::W, SCALAR, gp2, Shift::Lsl, 0)));
+                            code.push(Step::BailCond(Cond::Hs));
+                        }
+                    }
                 }
                 OpCode::ClassTest(test) => {
                     let r = Reg::new(test);
@@ -1201,6 +1697,8 @@ impl Builder<'_> {
         let (work, bytes) = match self.shape {
             Shape::Scalar(w) => (w.trailing_zeros(), s.width * self.shape.lanes()),
             Shape::Packed(_) => (log, 16),
+            Shape::Float32 => (2, s.width * 4),
+            Shape::Float64 => (if write { 3 } else { log }, s.width * 2),
         };
         let consecutive = regs
             .iter()

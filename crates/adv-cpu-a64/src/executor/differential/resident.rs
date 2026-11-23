@@ -1289,6 +1289,227 @@ fn phase4_cross_channel_slp_resident_execution_and_cold_fault() {
     assert!(native.diagnostics.resident_cold_exits > 0);
 }
 
+// spec: A64-TR-9, A64-OPT-10
+#[test]
+fn phase4_independent_fp_vector_strips_and_serial_prefix_recovery() {
+    // 1) 4-wide .4s PC=24 independent FP strip: dst[i] = src[i] * st1 + st0.
+    // Verifies vector batch execution on normal inputs, plus mid-strip pre-store
+    // bailout and exact serial-prefix recovery on subnormal, NaN, and underflow.
+    let f32_strip = Image::loop_body(|a, head, _| {
+        a.fld(dword_ptr(esi)).unwrap();
+        a.fmul_2(st0, st2).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(dword_ptr(edi)).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    let mut state = initial(32);
+    state.x87.control = 0x003f; // PC=24, nearest
+    state.x87.status = 0x20;
+    state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(f64::from(1.25f32))); // st(1) after bias
+    state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(f64::from(0.5f32))); // st(0) = bias
+
+    let init_f32_normal = |m: &mut adv_cpu_core::Memory| {
+        for i in 0..32u32 {
+            let v = (i as f32 - 12.0) * 0.75;
+            m.write(DATA + i * 4, &v.to_le_bytes()).unwrap();
+        }
+    };
+    let mut trial = Trial::new(
+        &f32_strip,
+        &state,
+        "PC=24 .4s FP strip",
+        &[],
+        init_f32_normal,
+    );
+    assert!(trial.try_install_at(state.clone()));
+    assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(
+        native.vector_regions() > 0,
+        "expected .4s FP strip batch to execute"
+    );
+    assert_eq!(native.diagnostics.resident_cold_exits, 0);
+
+    // Mid-strip subnormal (lane 1 of strip 3) + NaN (lane 2 of strip 5) bail
+    // pre-store and recover via exact serial prefix.
+    let init_f32_edge = |m: &mut adv_cpu_core::Memory| {
+        init_f32_normal(m);
+        m.write(DATA + 13 * 4, &1u32.to_le_bytes()).unwrap(); // min subnormal -> DE
+        m.write(DATA + 22 * 4, &0x7fc0_0001u32.to_le_bytes())
+            .unwrap(); // qNaN
+    };
+    let mut trial = Trial::new(
+        &f32_strip,
+        &state,
+        "PC=24 .4s FP strip mid-strip subnormal/NaN bail",
+        &[],
+        init_f32_edge,
+    );
+    assert!(trial.try_install_at(state.clone()));
+    assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(native.vector_regions() > 0);
+    assert_eq!(
+        trial.live.state.x87.status & 2,
+        2,
+        "subnormal lane must raise x87 DE"
+    );
+
+    // Underflow-to-zero on Mul (`1e-25 * 1e-25 == 0.0`) must bail pre-store and
+    // raise x87 UE.
+    let mut uf_state = initial(16);
+    uf_state.x87.control = 0x003f;
+    uf_state.x87.status = 0x20;
+    uf_state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(f64::from(1e-25f32)));
+    uf_state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(0.0));
+    let init_f32_uf = |m: &mut adv_cpu_core::Memory| {
+        for i in 0..16u32 {
+            let v = if i == 9 { 1e-25f32 } else { 1.0f32 };
+            m.write(DATA + i * 4, &v.to_le_bytes()).unwrap();
+        }
+    };
+    let mut trial = Trial::new(
+        &f32_strip,
+        &uf_state,
+        "PC=24 .4s FP strip underflow-to-zero bail",
+        &[],
+        init_f32_uf,
+    );
+    assert!(trial.try_install_at(uf_state));
+    assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+    assert_eq!(
+        trial.live.state.x87.status & 0x10,
+        0x10,
+        "mul underflow to zero must raise x87 UE"
+    );
+
+    // Inexact-f32 loop-invariant st(1) (f64 1.0/3.0) must fail BroadcastExactF32
+    // pre-store and match Tier 0 bit-for-bit via scalar fallback.
+    let mut inexact_state = initial(16);
+    inexact_state.x87.control = 0x003f;
+    inexact_state.x87.status = 0x20;
+    inexact_state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(1.0 / 3.0));
+    inexact_state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(0.5));
+    let mut trial = Trial::new(
+        &f32_strip,
+        &inexact_state,
+        "PC=24 .4s FP strip inexact-f32 invariant bail",
+        &[],
+        init_f32_normal,
+    );
+    assert!(trial.try_install_at(inexact_state));
+    assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+
+    // 2) 2-wide .2d PC=53 FP-to-int32 strip: dst_i32[i] = trunc(src_f64[i] * s + b),
+    // including mid-strip i32 overflow bailout (IE + 0x8000_0000).
+    let f64_to_i32 = Image::loop_body(|a, head, _| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fmul_2(st0, st2).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fistp(dword_ptr(edi)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 4).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    let mut d_state = initial(16);
+    d_state.x87.control = 0x023f; // PC=53, nearest (FISTP rounds to nearest-even)
+    d_state.x87.status = 0x20;
+    d_state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(1.5));
+    d_state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(2.25));
+    let init_f64 = |m: &mut adv_cpu_core::Memory| {
+        for i in 0..16u32 {
+            let v = (i as f64 - 6.5) * 10.0;
+            m.write(DATA + i * 8, &v.to_le_bytes()).unwrap();
+        }
+    };
+    let mut trial = Trial::new(
+        &f64_to_i32,
+        &d_state,
+        "PC=53 .2d FP->i32 strip",
+        &[],
+        init_f64,
+    );
+    assert!(trial.try_install_at(d_state.clone()));
+    assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(
+        native.vector_regions() > 0,
+        "expected .2d FP->i32 strip batch to execute"
+    );
+    assert_eq!(native.diagnostics.resident_cold_exits, 0);
+
+    let init_f64_ovf = |m: &mut adv_cpu_core::Memory| {
+        init_f64(m);
+        m.write(DATA + 7 * 8, &3.0e9f64.to_le_bytes()).unwrap();
+    };
+    let mut trial = Trial::new(
+        &f64_to_i32,
+        &d_state,
+        "PC=53 .2d FP->i32 overflow bail",
+        &[],
+        init_f64_ovf,
+    );
+    assert!(trial.try_install_at(d_state));
+    assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+    assert_eq!(
+        trial.live.state.x87.status & 1,
+        1,
+        "i32 overflow must raise IE"
+    );
+
+    // 3) Loop-carried FP recurrence (`sum += src[i]`) must NOT vectorize.
+    let reduction = Image::loop_body(|a, head, _| {
+        a.fadd(qword_ptr(esi)).unwrap();
+        a.fst(qword_ptr(edi)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+    });
+    let mut r_state = initial(16);
+    r_state.x87.control = 0x023f; // PC=53, nearest
+    r_state.x87.status = 0x20;
+    r_state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(0.0));
+    let mut trial = Trial::new(
+        &reduction,
+        &r_state,
+        "PC=53 FP recurrence stays scalar",
+        &[],
+        init_f64,
+    );
+    assert!(trial.try_install_at(r_state));
+    assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert_eq!(
+        native.vector_regions(),
+        0,
+        "loop-carried FP recurrence must not vectorize"
+    );
+}
+
 // spec: A64-OPT-9, A64F-FP-5, A64-MEM-7
 #[test]
 fn seeded_scalar_sse_memory_forms_cross_a_page() {
