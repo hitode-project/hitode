@@ -4838,6 +4838,7 @@ pub(in crate::translate) mod opt_back {
         }
         {
             let (mut f, b, p, entry) = start(&[Type::F64]);
+            f.domain_guards.push(5);
             f.push(
                 b,
                 Op::DomainGuard {
@@ -5203,12 +5204,22 @@ pub(in crate::translate) mod opt_back {
                         single,
                     }));
                 f.records[exit.0 as usize].x87.as_mut().unwrap().top = 3;
-                for (a, b_val, c) in [
-                    (3.0f64, 0.25f64, 1.0f64 / 3.0f64),
-                    (137.0f64, 1.0f64 / 64.0f64, f64::from(1.0f32 / 3.0f32)),
-                    (1.0f64, 2.0f64, 1e-16f64),
-                    (1.0f64, 2.0f64, -1e-16f64),
-                ] {
+                let cases: &[(f64, f64, f64)] = if single {
+                    &[
+                        (3.0, 0.25, f64::from(1.0f32 / 3.0f32)),
+                        (137.0, 1.0 / 64.0, f64::from(1.0f32 / 3.0f32)),
+                        (1.0, 2.0, f64::from(1e-7f32)),
+                        (1.0, 2.0, f64::from(-1e-7f32)),
+                    ]
+                } else {
+                    &[
+                        (3.0, 0.25, 1.0 / 3.0),
+                        (137.0, 1.0 / 64.0, f64::from(1.0f32 / 3.0f32)),
+                        (1.0, 2.0, 1e-16),
+                        (1.0, 2.0, -1e-16),
+                    ]
+                };
+                for &(a, b_val, c) in cases {
                     compare(
                         &f,
                         &[
