@@ -3159,3 +3159,102 @@ fn resident_domain_guards_prove_affine_x87_loop_and_respect_refusal() {
         );
     }
 }
+
+// spec: A64-OPT-2, A64-OPT-3
+#[test]
+fn phase2_store_forwarding_and_exact_identity_folds() {
+    // 1) Same-block narrow store forwarding across a disjoint store preserves
+    // both stores and applies exact zero-extension.
+    let narrow = assemble(|a| {
+        row(a, |a| {
+            a.mov(byte_ptr(edi), al).unwrap();
+            a.mov(word_ptr(edi + 4), bx).unwrap();
+            a.movzx(eax, byte_ptr(edi)).unwrap();
+            a.movzx(edx, word_ptr(edi + 4)).unwrap();
+            a.add(eax, edx).unwrap();
+            a.mov(dword_ptr(edi + 8), eax).unwrap();
+        })
+    });
+    {
+        let mut at = initial();
+        at.regs[0] = 0x1234_56ab;
+        at.regs[1] = 1;
+        at.regs[3] = 0xdead_be01;
+        let built = differential(&narrow, &at, |_| {});
+        assert_eq!(count(&built, |op| matches!(op, Op::Load { .. })), 0);
+        assert_eq!(count(&built, |op| matches!(op, Op::Store { .. })), 3);
+    }
+
+    // 2) Finite m - m folds to +0.0 and x + (+0.0) folds to x when x cannot be -0.0.
+    let cancel = assemble(|a| {
+        row(a, |a| {
+            a.movzx(eax, byte_ptr(esi)).unwrap();
+            a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+            a.fild(dword_ptr(esp + 0x10)).unwrap();
+            a.fld(st0).unwrap();
+            a.fsub_2(st0, st1).unwrap(); // m - m -> +0.0
+            a.faddp(st1, st0).unwrap(); // m + (+0.0) -> m
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    for pc_ctrl in [0x023fu16, 0x003fu16] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = pc_ctrl;
+        at.x87.status = 0x20;
+        let built = differential(&cancel, &at, |m| {
+            m.write(DATA, &[42u8]).unwrap();
+        });
+        assert_eq!(count(&built, |op| matches!(op, Op::Fp(..))), 0);
+        assert_eq!(count(&built, |op| matches!(op, Op::X87Single(..))), 0);
+        assert_eq!(count(&built, |op| matches!(op, Op::Validate)), 0);
+    }
+
+    // 3) Adversarial: (-0.0) + (+0.0) must produce +0.0 (never fold to -0.0).
+    let neg_zero_add = assemble(|a| {
+        row(a, |a| {
+            a.fldz().unwrap();
+            a.fchs().unwrap(); // -0.0
+            a.fldz().unwrap(); // +0.0
+            a.faddp(st1, st0).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x023f;
+        at.x87.status = 0x20;
+        let _ = differential(&neg_zero_add, &at, |_| {});
+    }
+
+    // 4) Adversarial PC=24: (1 + 2^-30) + 0.0 must NOT skip 24-bit precision check/rounding.
+    let pc24_add_zero = assemble(|a| {
+        row(a, |a| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fldz().unwrap();
+            a.faddp(st1, st0).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x003f; // PC=24
+        at.x87.status = 0x20;
+        let x = 1.0f64 + 2.0f64.powi(-30);
+        let built = compare(
+            &pc24_add_zero,
+            &at,
+            |m| {
+                m.write(DATA, &x.to_le_bytes()).unwrap();
+            },
+            true,
+        );
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::X87Single(FpOp::Add, _, _, _))),
+            1,
+            "PC=24 (1 + 2^-30) + 0 must NOT fold away"
+        );
+    }
+}

@@ -1926,66 +1926,144 @@ fn per_iteration(func: &Func, resident: bool) -> Vec<bool> {
     every
 }
 
-/// Forward an immediately preceding unchecked full-width `Op::Store` to a
-/// same-address, same-width unchecked `Op::Load` within the same basic block.
-fn forward_stores(func: &mut Func) -> bool {
-    let mut alias: Vec<Value> = (0..func.types.len()).map(|i| Value(i as u32)).collect();
-    let mut forwarded = false;
-    let types = &func.types;
-    for block in &mut func.blocks {
-        let mut last: Option<(Value, u8, Option<u8>, Value)> = None;
-        block.insts.retain(|&(result, op)| match (result, op) {
-            (
-                _,
-                Op::Store {
-                    width,
-                    addr,
-                    value,
-                    checked: false,
-                    scope,
-                    ..
-                },
-            ) => {
-                let full_width = matches!(
-                    (width, types[value.0 as usize]),
-                    (4, Type::I32) | (8, Type::I64 | Type::F64) | (16, Type::V128)
-                );
-                last = full_width.then_some((addr, width, scope, value));
-                true
-            }
-            (_, Op::Store { .. } | Op::FrameStore { .. }) => {
-                last = None;
-                true
-            }
-            (
-                Some(r),
-                Op::Load {
-                    ty,
-                    width,
-                    addr,
-                    checked: false,
-                    clock: false,
-                    scope,
-                    ..
-                },
-            ) => {
-                if let Some((s_addr, s_width, s_scope, s_val)) = last
-                    && s_addr == addr
-                    && s_width == width
-                    && s_scope == scope
-                    && types[s_val.0 as usize] == ty
-                {
-                    alias[r.0 as usize] = s_val;
-                    forwarded = true;
-                    false
-                } else {
-                    true
-                }
-            }
-            _ => true,
-        });
+fn addr_base_offset(defs: &[Option<Op>], addr: Value) -> (Value, i32) {
+    match defs[addr.0 as usize] {
+        Some(Op::Int(IntOp::Add, base, off)) => match defs[off.0 as usize] {
+            Some(Op::Constant(Type::I32, c)) => (base, c as u32 as i32),
+            _ => match defs[base.0 as usize] {
+                Some(Op::Constant(Type::I32, c)) => (off, c as u32 as i32),
+                _ => (addr, 0),
+            },
+        },
+        Some(Op::Int(IntOp::Sub, base, off)) => match defs[off.0 as usize] {
+            Some(Op::Constant(Type::I32, c)) => (base, (c as u32 as i32).wrapping_neg()),
+            _ => (addr, 0),
+        },
+        _ => (addr, 0),
     }
-    if forwarded {
+}
+
+/// Forward same-block ordinary `Op::Store`s to subsequent unchecked same-address,
+/// same-width `Op::Load { clock: false }`s across proved-disjoint intervening
+/// stores, applying exact width zero-extension and retaining every `Op::Store`.
+fn forward_stores(func: &mut Func) -> bool {
+    let defs = definitions(func);
+    let types = &func.types;
+    let mut alias: Vec<Value> = (0..types.len()).map(|i| Value(i as u32)).collect();
+    let mut aliased = false;
+    let mut forwarded = false;
+
+    for block in &mut func.blocks {
+        // (addr, base, offset, width, scope, value)
+        let mut recent: Vec<(Value, Value, i32, u8, Option<u8>, Value)> = Vec::new();
+        let mut out = Vec::with_capacity(block.insts.len());
+        for &(result, op) in &block.insts {
+            match (result, op) {
+                (
+                    _,
+                    Op::Store {
+                        width,
+                        addr,
+                        value,
+                        checked,
+                        scope,
+                        ..
+                    },
+                ) => {
+                    let (base, off) = addr_base_offset(&defs, addr);
+                    recent.retain(|&(_, pb, poff, pw, _, _)| {
+                        pb == base
+                            && disjoint_ranges(
+                                poff as u32,
+                                u32::from(pw),
+                                off as u32,
+                                u32::from(width),
+                            )
+                    });
+                    if !checked {
+                        if recent.len() == 16 {
+                            recent.remove(0);
+                        }
+                        recent.push((addr, base, off, width, scope, value));
+                    }
+                    out.push((result, op));
+                }
+                (_, Op::FrameStore { .. }) => {
+                    recent.clear();
+                    out.push((result, op));
+                }
+                (
+                    Some(r),
+                    Op::Load {
+                        ty,
+                        width,
+                        addr,
+                        checked: false,
+                        clock: false,
+                        scope,
+                        ..
+                    },
+                ) => {
+                    let (base, off) = addr_base_offset(&defs, addr);
+                    let hit = recent.iter().rev().find_map(
+                        |&(s_addr, s_base, s_off, s_width, s_scope, s_val)| {
+                            ((s_addr == addr || (s_base == base && s_off == off))
+                                && s_width == width
+                                && s_scope == scope)
+                                .then_some(s_val)
+                        },
+                    );
+                    if let Some(s_val) = hit {
+                        match (width, types[s_val.0 as usize], ty) {
+                            (1, Type::I32, Type::I32) => {
+                                out.push((Some(r), Op::IntUnary(IntUnary::ZeroExtend8, s_val)));
+                                forwarded = true;
+                                continue;
+                            }
+                            (2, Type::I32, Type::I32) => {
+                                out.push((Some(r), Op::IntUnary(IntUnary::ZeroExtend16, s_val)));
+                                forwarded = true;
+                                continue;
+                            }
+                            (4, Type::I32, Type::I32) | (16, Type::V128, Type::V128) => {
+                                alias[r.0 as usize] = s_val;
+                                aliased = true;
+                                forwarded = true;
+                                continue;
+                            }
+                            (4, Type::I64, Type::I32) => {
+                                out.push((Some(r), Op::IntUnary(IntUnary::Low32, s_val)));
+                                forwarded = true;
+                                continue;
+                            }
+                            (8, t1, t2) if t1 == t2 => {
+                                alias[r.0 as usize] = s_val;
+                                aliased = true;
+                                forwarded = true;
+                                continue;
+                            }
+                            (8, Type::I64, Type::F64) | (8, Type::F64, Type::I64) => {
+                                out.push((
+                                    Some(r),
+                                    Op::Bits {
+                                        to: ty,
+                                        value: s_val,
+                                    },
+                                ));
+                                forwarded = true;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    out.push((result, op));
+                }
+                _ => out.push((result, op)),
+            }
+        }
+        block.insts = out;
+    }
+    if aliased {
         apply_aliases(func, &alias);
     }
     forwarded
