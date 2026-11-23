@@ -4836,6 +4836,139 @@ pub(in crate::translate) mod opt_back {
                 assert_eq!(got.record, if expect_ok { exit } else { entry });
             }
         }
+        {
+            let (mut f, b, p, entry) = start(&[Type::F64]);
+            f.domain_guards.push(5);
+            f.push(
+                b,
+                Op::DomainGuard {
+                    kind: DomainGuardKind::ExactF32 { value: p[0] },
+                    ordinal: 0,
+                },
+            );
+            let exit = finish(&mut f, b, p[0]);
+            for (x, expect_ok) in [
+                (0.0f64, true),
+                (-0.0f64, true),
+                (1.5f64, true),
+                (1.0 + f64::from_bits(0x3e10_0000_0000_0000), false),
+                (f64::NAN, false),
+                (f64::INFINITY, true),
+                (f64::NEG_INFINITY, true),
+            ] {
+                let got = compare(&f, &[u128::from(x.to_bits())], &mut h);
+                assert_eq!(got.record, if expect_ok { exit } else { entry });
+            }
+        }
+        // Phase 2.1: Op::Fma (PC=53 and PC=24) matches eval across all three
+        // signs, signed zeros, proof bit combinations, and adversarial c = -1 + 2^-30.
+        for op in [FmaOp::Add, FmaOp::Sub, FmaOp::RevSub] {
+            for proved in [0u8, SINGLE_RESULT] {
+                let (mut f, b, p, _entry) = start(&[Type::F64, Type::F64, Type::F64]);
+                let r = f
+                    .push(
+                        b,
+                        Op::Fma {
+                            op,
+                            a: p[0],
+                            b: p[1],
+                            c: p[2],
+                            single: false,
+                            proved,
+                        },
+                    )
+                    .unwrap();
+                if proved == 0 {
+                    f.push(b, Op::Validate);
+                }
+                let _exit = finish(&mut f, b, r);
+                let cases: &[(f64, f64, f64)] = if proved == 0 {
+                    &[
+                        (1.5, 2.0, 0.25),
+                        (1.0, 1.0, 1.0),
+                        (0.0, 1.0, 0.0),
+                        (-0.0, 1.0, 0.0),
+                        (0.0, 1.0, -0.0),
+                        (-0.0, 1.0, -0.0),
+                        (1e200, 1e200, 1.0),
+                        (f64::MIN_POSITIVE, 0.5, 0.0),
+                    ]
+                } else {
+                    &[
+                        (1.5, 2.0, 0.25),
+                        (1.0, 1.0, 1.0),
+                        (0.0, 1.0, 0.0),
+                        (-0.0, 1.0, 0.0),
+                        (0.0, 1.0, -0.0),
+                        (-0.0, 1.0, -0.0),
+                        (-3.25, 4.5, 7.125),
+                    ]
+                };
+                for &(a_v, b_v, c_v) in cases {
+                    compare(
+                        &f,
+                        &[
+                            u128::from(a_v.to_bits()),
+                            u128::from(b_v.to_bits()),
+                            u128::from(c_v.to_bits()),
+                        ],
+                        &mut h,
+                    );
+                }
+            }
+            for proved in [
+                0u8,
+                SINGLE_A | SINGLE_B | SINGLE_RESULT,
+                SINGLE_A | SINGLE_B | SINGLE_C | SINGLE_RESULT,
+                SINGLE_A | SINGLE_B | SINGLE_C | SINGLE_RESULT | SINGLE_EXACT,
+            ] {
+                let (mut f, b, p, entry) = start(&[Type::F64, Type::F64, Type::F64]);
+                let r = f
+                    .push(
+                        b,
+                        Op::Fma {
+                            op,
+                            a: p[0],
+                            b: p[1],
+                            c: p[2],
+                            single: true,
+                            proved,
+                        },
+                    )
+                    .unwrap();
+                if f.blocks[b.0 as usize].insts.last().unwrap().1.floating() {
+                    f.push(b, Op::Validate);
+                }
+                let exit = finish(&mut f, b, r);
+                let mut cases: Vec<(f64, f64, f64, bool)> = vec![
+                    (1.5, 2.0, 0.25, true),
+                    (1.0, 1.0, 1.0, true),
+                    (0.0, 1.0, 0.0, true),
+                    (-0.0, 1.0, 0.0, true),
+                    (0.0, 1.0, -0.0, true),
+                    (-0.0, 1.0, -0.0, true),
+                ];
+                if proved & SINGLE_C == 0 {
+                    // Adversarial PC=24 case: c = -1 + 2^-30 must fail rather than pre-narrowing to -1.
+                    cases.push((1.0, 1.0, -1.0 + 2.0f64.powi(-30), false));
+                }
+                if proved & (SINGLE_RESULT | SINGLE_EXACT) == 0 {
+                    cases.push((f64::from(f32::MAX), 2.0, 1.0, false));
+                }
+                for (a_v, b_v, c_v, expect_ok) in cases {
+                    let got = compare(
+                        &f,
+                        &[
+                            u128::from(a_v.to_bits()),
+                            u128::from(b_v.to_bits()),
+                            u128::from(c_v.to_bits()),
+                        ],
+                        &mut h,
+                    );
+                    assert_eq!(got.record, if expect_ok { exit } else { entry });
+                }
+            }
+        }
     }
 
     // spec: A64-OPT-4, A64-OPT-6, A64-OPT-7, A64-MEM-10
@@ -5045,6 +5178,60 @@ pub(in crate::translate) mod opt_back {
             &mut h,
         );
         assert_eq!(got.cpu.x87.status >> 9 & 1, 1);
+        for op in [FmaOp::Add, FmaOp::Sub, FmaOp::RevSub] {
+            for single in [false, true] {
+                let (mut f, b, p, _) = start(&[Type::F64, Type::F64, Type::F64]);
+                let v = f
+                    .push(
+                        b,
+                        Op::Fma {
+                            op,
+                            a: p[0],
+                            b: p[1],
+                            c: p[2],
+                            single,
+                            proved: SINGLE_A | SINGLE_B | SINGLE_C | SINGLE_RESULT,
+                        },
+                    )
+                    .unwrap();
+                let exit = finish(&mut f, b, v);
+                f.records[exit.0 as usize].x87.as_mut().unwrap().c1 =
+                    Some(Location::Recipe(Recipe::C1Fma {
+                        op,
+                        a: p[0],
+                        b: p[1],
+                        c: p[2],
+                        single,
+                    }));
+                f.records[exit.0 as usize].x87.as_mut().unwrap().top = 3;
+                let cases: &[(f64, f64, f64)] = if single {
+                    &[
+                        (3.0, 0.25, f64::from(1.0f32 / 3.0f32)),
+                        (137.0, 1.0 / 64.0, f64::from(1.0f32 / 3.0f32)),
+                        (1.0, 2.0, f64::from(1e-7f32)),
+                        (1.0, 2.0, f64::from(-1e-7f32)),
+                    ]
+                } else {
+                    &[
+                        (3.0, 0.25, 1.0 / 3.0),
+                        (137.0, 1.0 / 64.0, f64::from(1.0f32 / 3.0f32)),
+                        (1.0, 2.0, 1e-16),
+                        (1.0, 2.0, -1e-16),
+                    ]
+                };
+                for &(a, b_val, c) in cases {
+                    compare(
+                        &f,
+                        &[
+                            u128::from(a.to_bits()),
+                            u128::from(b_val.to_bits()),
+                            u128::from(c.to_bits()),
+                        ],
+                        &mut h,
+                    );
+                }
+            }
+        }
         assert_eq!(got.registers.x[28], WINDOW_BASE);
         assert_eq!(got.registers.x[29], CONTEXT);
     }

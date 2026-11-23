@@ -9,8 +9,8 @@ use adv_cpu_core::Memory;
 use adv_cpu_core::integer::{self, CF, OF, PF, ZF};
 
 use super::ir::{
-    Block, DomainGuardKind, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, RecordId,
-    SINGLE_EXACT, SINGLE_RESULT, Type, Value, VecOp, VecToInt, VecUnary,
+    Block, DomainGuardKind, End, FlagKind, FmaOp, FpOp, FpUnary, Func, IntOp, IntUnary, Op,
+    RecordId, SINGLE_EXACT, SINGLE_RESULT, Type, Value, VecOp, VecToInt, VecUnary,
 };
 use super::recovery::{Location, Recipe};
 
@@ -210,6 +210,61 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 }
             }
             float(widened)?
+        }
+        Op::Fma {
+            op,
+            a,
+            b,
+            c,
+            single,
+            proved,
+        } => {
+            let (a, b, c) = (f(a), f(b), f(c));
+            if single {
+                let (sa, sb, sc) = (a as f32, b as f32, c as f32);
+                if f64::from(sa) != a || f64::from(sb) != b || f64::from(sc) != c {
+                    return None;
+                }
+                let r = match op {
+                    FmaOp::Add => sa.mul_add(sb, sc),
+                    FmaOp::Sub => sa.mul_add(sb, -sc),
+                    FmaOp::RevSub => (-sa).mul_add(sb, sc),
+                };
+                if r != 0.0 {
+                    if !r.is_normal() {
+                        return None;
+                    }
+                    if proved & (SINGLE_RESULT | SINGLE_EXACT) == 0 {
+                        if r.abs() < f32::from_bits(0x0100_0000) {
+                            return None;
+                        }
+                    } else if r.abs() == f32::MIN_POSITIVE {
+                        return None;
+                    }
+                }
+                let widened = f64::from(r);
+                if proved & SINGLE_EXACT != 0 {
+                    let d = match op {
+                        FmaOp::Add => a.mul_add(b, c),
+                        FmaOp::Sub => a.mul_add(b, -c),
+                        FmaOp::RevSub => (-a).mul_add(b, c),
+                    };
+                    if d.to_bits() != widened.to_bits() {
+                        return None;
+                    }
+                }
+                float(widened)?
+            } else {
+                let r = match op {
+                    FmaOp::Add => a.mul_add(b, c),
+                    FmaOp::Sub => a.mul_add(b, -c),
+                    FmaOp::RevSub => (-a).mul_add(b, c),
+                };
+                if !r.is_finite() || r.is_subnormal() {
+                    return None;
+                }
+                float(r)?
+            }
         }
         Op::Fp32(op, a, b) => {
             let a = f32::from_bits(get(a) as u32);
@@ -461,6 +516,10 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                     f(value) <= f64::from_bits(bound_bits)
                 }
                 DomainGuardKind::U32Le { value, max } => (get(value) as u32) <= max,
+                DomainGuardKind::ExactF32 { value } => {
+                    let x = f(value);
+                    f64::from(x as f32) == x
+                }
             };
             if !ok {
                 return None;
@@ -973,6 +1032,22 @@ pub(crate) fn locate(location: &Location<Value>, values: &[u128]) -> u128 {
             f64::from_bits(get(b) as u64),
             single,
         )),
+        Location::Recipe(Recipe::C1Fma {
+            op,
+            a,
+            b,
+            c,
+            single,
+        }) => {
+            let prod = f64::from_bits(get(a) as u64) * f64::from_bits(get(b) as u64);
+            let cv = f64::from_bits(get(c) as u64);
+            let (fp_op, lhs, rhs) = match op {
+                FmaOp::Add => (FpOp::Add, prod, cv),
+                FmaOp::Sub => (FpOp::Sub, prod, cv),
+                FmaOp::RevSub => (FpOp::Sub, cv, prod),
+            };
+            u128::from(rounded_up(fp_op, lhs, rhs, single))
+        }
     }
 }
 

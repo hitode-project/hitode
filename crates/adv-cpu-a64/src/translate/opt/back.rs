@@ -1448,6 +1448,72 @@ impl<'a> Emitter<'a> {
         self.asm.emit(unary(Unary::Widen, dst, C));
     }
 
+    fn fma(&mut self, op: FmaOp, dst: VReg, [a, b, c]: [VReg; 3], single: bool, proved: u8) {
+        if !single || proved & SINGLE_EXACT != 0 {
+            let word = match op {
+                FmaOp::Add => fmadd(dst, a, b, c),
+                FmaOp::Sub => fnmsub(dst, a, b, c),
+                FmaOp::RevSub => fmsub(dst, a, b, c),
+            };
+            self.asm.emit(word);
+            if !single && proved & SINGLE_RESULT == 0 {
+                let fail = self.fail();
+                let valid = self.asm.label();
+                self.asm.emit_all(&[
+                    fmov_from_v(X, T, dst),
+                    ubfx(X, U, T, 52, 11),
+                    sub_imm(W, U, U, 1, false),
+                    cmp_imm(W, U, 2046, false),
+                ]);
+                self.asm.b_cond(Cond::Lo, valid);
+                self.asm.emit(lsl_imm(X, T, T, 1));
+                self.asm.cbz(X, true, T, fail);
+                self.asm.bind(valid);
+            }
+            return;
+        }
+        let all = SINGLE_A | SINGLE_B | SINGLE_C | SINGLE_RESULT;
+        let fail = (proved & all != all).then(|| self.fail());
+        // Narrow a -> D (scratch E), b -> E (scratch A), c -> A (scratch B)
+        // so all three single-precision operands stay live without clobbering.
+        self.asm.emit(unary(Unary::Narrow, D, a));
+        if proved & SINGLE_A == 0 {
+            self.asm.emit_all(&[unary(Unary::Widen, E, D), fcmp(a, E)]);
+            self.asm.b_cond(Cond::Ne, fail.unwrap());
+        }
+        self.asm.emit(unary(Unary::Narrow, E, b));
+        if proved & SINGLE_B == 0 {
+            self.asm.emit_all(&[unary(Unary::Widen, A, E), fcmp(b, A)]);
+            self.asm.b_cond(Cond::Ne, fail.unwrap());
+        }
+        self.asm.emit(unary(Unary::Narrow, A, c));
+        if proved & SINGLE_C == 0 {
+            self.asm.emit_all(&[unary(Unary::Widen, B, A), fcmp(c, B)]);
+            self.asm.b_cond(Cond::Ne, fail.unwrap());
+        }
+        let word = match op {
+            FmaOp::Add => fmadd_s(C, D, E, A),
+            FmaOp::Sub => fnmsub_s(C, D, E, A),
+            FmaOp::RevSub => fmsub_s(C, D, E, A),
+        };
+        self.asm.emit(word);
+        if proved & SINGLE_RESULT == 0 {
+            let fail = fail.unwrap();
+            let valid = self.asm.label();
+            self.asm.emit_all(&[
+                fmov_from_v(W, T, C),
+                ubfx(W, U, T, 23, 8),
+                sub_imm(W, U, U, 2, false),
+                cmp_imm(W, U, 253, false),
+            ]);
+            self.asm.b_cond(Cond::Lo, valid);
+            self.asm.emit(lsl_imm(W, T, T, 1));
+            self.asm.cbz(W, true, T, fail);
+            self.asm.bind(valid);
+        }
+        self.asm.emit(unary(Unary::Widen, dst, C));
+    }
+
     fn fp_checks(&mut self) {
         let exact = self.asm.label();
         let mut uses_exact = false;
@@ -1827,6 +1893,19 @@ impl<'a> Emitter<'a> {
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 self.x87_single(op, q, [a, b], proved);
+            }
+            Op::Fma {
+                op,
+                a,
+                b,
+                c,
+                single,
+                proved,
+            } => {
+                let a = self.vr(a, A);
+                let b = self.vr(b, B);
+                let c = self.vr(c, C);
+                self.fma(op, q, [a, b, c], single, proved);
             }
             Op::FpUnary(op, a) => {
                 let a = self.vr(a, A);

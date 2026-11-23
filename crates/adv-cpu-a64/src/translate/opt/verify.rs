@@ -230,6 +230,7 @@ fn typed(func: &Func, op: &Op) -> bool {
         Op::Fp(_, a, b, _) | Op::X87Single(_, a, b, _) | Op::SseFp64(_, a, b) => {
             is(a, Type::F64) && is(b, Type::F64)
         }
+        Op::Fma { a, b, c, .. } => is(a, Type::F64) && is(b, Type::F64) && is(c, Type::F64),
         Op::FpUnary(_, a) | Op::ToInt { value: a, .. } | Op::X87Store { value: a, .. } => {
             is(a, Type::F64)
         }
@@ -253,7 +254,9 @@ fn typed(func: &Func, op: &Op) -> bool {
                 ..
             } => is(value, Type::F64) && min_exp >= -1022 && max_exp <= 1023 && min_exp <= max_exp,
             DomainGuardKind::SameSign { a, b } => is(a, Type::F64) && is(b, Type::F64),
-            DomainGuardKind::FpLe { value, .. } => is(value, Type::F64),
+            DomainGuardKind::FpLe { value, .. } | DomainGuardKind::ExactF32 { value } => {
+                is(value, Type::F64)
+            }
             DomainGuardKind::U32Le { value, .. } => is(value, Type::I32),
         },
         Op::FrameDisjoint {

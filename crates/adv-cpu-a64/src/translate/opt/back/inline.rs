@@ -326,6 +326,15 @@ impl Emitter<'_> {
                 }
                 self.asm.b_cond(Cond::Hi, miss);
             }
+            super::DomainGuardKind::ExactF32 { value } => {
+                let v = self.vr(value, A);
+                self.asm.emit_all(&[
+                    unary(Unary::Narrow, C, v),
+                    unary(Unary::Widen, C, C),
+                    fcmp(v, C),
+                ]);
+                self.asm.b_cond(Cond::Ne, miss);
+            }
         }
         self.domain_guard_words += self.words_since(start);
     }
@@ -773,11 +782,22 @@ impl Emitter<'_> {
             u64::from(x87.status & !0x3a00 | u16::from(x87.top) << 11),
         );
         if let Some(value) = x87.c1 {
-            let value = if let Location::Recipe(Recipe::C1 { op, a, b, single }) = value {
-                self.c1(op, a, b, single);
-                T
-            } else {
-                self.gp_at(numeric(value), T)
+            let value = match value {
+                Location::Recipe(Recipe::C1 { op, a, b, single }) => {
+                    self.c1(op, a, b, single);
+                    T
+                }
+                Location::Recipe(Recipe::C1Fma {
+                    op,
+                    a,
+                    b,
+                    c,
+                    single,
+                }) => {
+                    self.c1_fma(op, a, b, c, single);
+                    T
+                }
+                other => self.gp_at(numeric(other), T),
             };
             self.asm.emit(bfi(W, S5, value, 9, 1));
         }
@@ -859,13 +879,40 @@ impl Emitter<'_> {
                 .asm
                 .emit_all(&[dfloat(Fdiv, C, a, b), fmsub(D, C, b, a)]),
         }
+        self.c1_finish(op == FpOp::Div, b, single);
+    }
+
+    /// Recomputes C1 for a contracted exact-product FMA (`a * b ± c` or `c - a * b`).
+    fn c1_fma(&mut self, op: super::super::ir::FmaOp, a: Host, b: Host, c: Host, single: bool) {
+        use super::super::ir::FmaOp;
+        let va = self.v_at(a, A);
+        let vb = self.v_at(b, B);
+        self.asm.emit(dfloat(Float::Fmul, A, va, vb));
+        let vc = self.v_at(c, B);
+        match op {
+            FmaOp::Add => {
+                crate::translate::lower::fp_class::two_sum(&mut self.asm, A, vc, C, D, E);
+            }
+            FmaOp::Sub => {
+                self.asm.emit(vfneg2d(B, vc));
+                crate::translate::lower::fp_class::two_sum(&mut self.asm, A, B, C, D, E);
+            }
+            FmaOp::RevSub => {
+                self.asm.emit(vfneg2d(A, A));
+                crate::translate::lower::fp_class::two_sum(&mut self.asm, vc, A, C, D, E);
+            }
+        }
+        self.c1_finish(false, B, single);
+    }
+
+    fn c1_finish(&mut self, is_div: bool, b: crate::encode::VReg, single: bool) {
         self.asm.emit_all(&[
             fcmp_zero(D),
             fmov_from_v(X, T, D),
             fmov_from_v(X, U, C),
             eor(X, T, T, U, Lsl, 0),
         ]);
-        if op == FpOp::Div {
+        if is_div {
             self.asm
                 .emit_all(&[fmov_from_v(X, U, b), eor(X, T, T, U, Lsl, 0)]);
         }
@@ -895,7 +942,9 @@ fn numeric(location: Location<Host>) -> Host {
     match location {
         Location::At(host) | Location::Recipe(Recipe::Eflags(host)) => host,
         Location::Constant(bits) => Host::Constant(u128::from(bits)),
-        Location::Recipe(Recipe::C1 { .. }) => unreachable!("C1 has its own emission"),
+        Location::Recipe(Recipe::C1 { .. } | Recipe::C1Fma { .. }) => {
+            unreachable!("C1 has its own emission")
+        }
     }
 }
 

@@ -220,6 +220,9 @@ d51b443f	msr fpsr, xzr
 1f628c24	fnmsub d4, d1, d2, d3
 1f441462	fmadd d2, d3, d4, d5
 1f449462	fmsub d2, d3, d4, d5
+1f228c24	fnmsub s4, s1, s2, s3
+1f041462	fmadd s2, s3, s4, s5
+1f049462	fmsub s2, s3, s4, s5
 6ee0f862	fneg v2.2d, v3.2d
 9e630202	ucvtf d2, x16
 9e790050	fcvtzu x16, d2

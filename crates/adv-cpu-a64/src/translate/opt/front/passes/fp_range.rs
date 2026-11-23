@@ -11,12 +11,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    Block, End, FlagKind, Func, IntOp, IntUnary, Op, Type, Value, apply_aliases, dominators,
+    Block, End, FlagKind, Func, IntOp, IntUnary, Location, Op, Recipe, Type, Value, apply_aliases,
+    dominators,
 };
 use crate::translate::front::tags::ConditionCode;
 use crate::translate::opt::ir::{
-    DomainGuardKind, FpOp, FpUnary, MAX_DOMAIN_GUARDS, SINGLE_A, SINGLE_B, SINGLE_EXACT,
-    SINGLE_RESULT,
+    DomainGuardKind, FmaOp, FpOp, FpUnary, MAX_DOMAIN_GUARDS, SINGLE_A, SINGLE_B, SINGLE_C,
+    SINGLE_EXACT, SINGLE_RESULT,
 };
 
 const ZERO_Q: i16 = i16::MAX;
@@ -98,6 +99,10 @@ struct FpFact {
     /// Sound lower bound on `|x|` for all nonzero values when `finite == true`
     /// (`0.0` if unknown, `f64::INFINITY` if identically zero).
     min_nonzero: f64,
+    /// Whether `-0.0` is possible (soundly `true` when unknown).
+    may_be_neg_zero: bool,
+    /// Upper bound on significant mantissa bit-width `w` when finite (`0` for `±0.0`).
+    sig_bits: Option<u8>,
     /// Exact dyadic scale `q`: every value is `k * 2^q` for integer `k`.
     /// `Some(ZERO_Q)` means identically `±0.0`. Valid only when `finite`.
     dyadic_q: Option<i16>,
@@ -112,6 +117,8 @@ impl FpFact {
         lo: f64::NEG_INFINITY,
         hi: f64::INFINITY,
         min_nonzero: 0.0,
+        may_be_neg_zero: true,
+        sig_bits: None,
         dyadic_q: None,
     };
 
@@ -124,12 +131,30 @@ impl FpFact {
             lo: 0.0,
             hi: 0.0,
             min_nonzero: f64::INFINITY,
+            may_be_neg_zero: false,
+            sig_bits: Some(0),
             dyadic_q: Some(ZERO_Q),
         }
     }
 
     fn is_zero(self) -> bool {
         self.finite && self.lo == 0.0 && self.hi == 0.0
+    }
+
+    fn is_pos_zero(self) -> bool {
+        self.is_zero() && !self.may_be_neg_zero
+    }
+
+    fn effective_sig_bits(self) -> Option<u8> {
+        if !self.finite {
+            return None;
+        }
+        match (self.sig_bits, self.binary32_exact) {
+            (Some(w), true) => Some(w.min(24)),
+            (Some(w), false) => Some(w),
+            (None, true) => Some(24),
+            (None, false) => None,
+        }
     }
 
     fn max_abs(self) -> f64 {
@@ -182,16 +207,23 @@ impl FpFact {
 
     fn join(self, other: Self) -> Self {
         let finite = self.finite && other.finite;
-        let (lo, hi, min_nonzero, dyadic_q) = if finite {
+        let (lo, hi, min_nonzero, sig_bits, dyadic_q) = if finite {
+            let sig = match (self.effective_sig_bits(), other.effective_sig_bits()) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            };
             (
                 self.lo.min(other.lo),
                 self.hi.max(other.hi),
                 self.min_nonzero_abs().min(other.min_nonzero_abs()),
+                sig,
                 dyadic_min(self.dyadic_q, other.dyadic_q),
             )
         } else {
-            (f64::NEG_INFINITY, f64::INFINITY, 0.0, None)
+            (f64::NEG_INFINITY, f64::INFINITY, 0.0, None, None)
         };
+        let may_be_neg_zero =
+            (self.may_be_neg_zero || other.may_be_neg_zero) && !(finite && (lo > 0.0 || hi < 0.0));
         Self {
             finite,
             binary32_exact: self.binary32_exact && other.binary32_exact,
@@ -200,6 +232,8 @@ impl FpFact {
             lo,
             hi,
             min_nonzero,
+            may_be_neg_zero,
+            sig_bits,
             dyadic_q,
         }
     }
@@ -207,7 +241,7 @@ impl FpFact {
     /// Intersects `self` with an additional proved invariant `other`.
     fn meet(self, other: Self) -> Self {
         let finite = self.finite || other.finite;
-        let (lo, hi, min_nonzero, dyadic_q) = if self.finite && other.finite {
+        let (lo, hi, min_nonzero, sig_bits, dyadic_q) = if self.finite && other.finite {
             let lo = self.lo.max(other.lo);
             let hi = self.hi.min(other.hi);
             let (lo, hi) = if lo <= hi {
@@ -215,19 +249,38 @@ impl FpFact {
             } else {
                 (other.lo, other.hi)
             };
+            let sig = match (self.effective_sig_bits(), other.effective_sig_bits()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             (
                 lo,
                 hi,
                 self.min_nonzero_abs().max(other.min_nonzero_abs()),
+                sig,
                 self.dyadic_q.or(other.dyadic_q),
             )
         } else if self.finite {
-            (self.lo, self.hi, self.min_nonzero_abs(), self.dyadic_q)
+            (
+                self.lo,
+                self.hi,
+                self.min_nonzero_abs(),
+                self.effective_sig_bits(),
+                self.dyadic_q,
+            )
         } else if other.finite {
-            (other.lo, other.hi, other.min_nonzero_abs(), other.dyadic_q)
+            (
+                other.lo,
+                other.hi,
+                other.min_nonzero_abs(),
+                other.effective_sig_bits(),
+                other.dyadic_q,
+            )
         } else {
-            (f64::NEG_INFINITY, f64::INFINITY, 0.0, None)
+            (f64::NEG_INFINITY, f64::INFINITY, 0.0, None, None)
         };
+        let may_be_neg_zero =
+            self.may_be_neg_zero && other.may_be_neg_zero && !(finite && (lo > 0.0 || hi < 0.0));
         Self {
             finite,
             binary32_exact: self.binary32_exact || other.binary32_exact,
@@ -240,6 +293,8 @@ impl FpFact {
             lo,
             hi,
             min_nonzero,
+            may_be_neg_zero,
+            sig_bits,
             dyadic_q,
         }
     }
@@ -263,6 +318,8 @@ impl FpFact {
                     lo: -F32_MAX_F64,
                     hi: F32_MAX_F64,
                     min_nonzero: joined.min_nonzero,
+                    may_be_neg_zero: joined.may_be_neg_zero,
+                    sig_bits: Some(24),
                     dyadic_q: None,
                 }
             } else {
@@ -274,6 +331,8 @@ impl FpFact {
                     lo: f64::NEG_INFINITY,
                     hi: f64::INFINITY,
                     min_nonzero: 0.0,
+                    may_be_neg_zero: joined.may_be_neg_zero,
+                    sig_bits: None,
                     dyadic_q: None,
                 }
             }
@@ -286,6 +345,54 @@ impl FpFact {
 fn pow2_f64(exp: i32) -> f64 {
     debug_assert!((-1022..=1023).contains(&exp));
     f64::from_bits(((exp + 1023) as u64) << 52)
+}
+
+/// Exact significant mantissa bit-width of a finite `f64` bit pattern (`0` for `±0.0`).
+fn exact_sig_bits(bits: u64) -> u8 {
+    let mag = bits & !(1u64 << 63);
+    if mag == 0 {
+        return 0;
+    }
+    let exp = (mag >> 52) & 0x7ff;
+    let frac = mag & ((1u64 << 52) - 1);
+    if exp == 0 {
+        (64 - frac.leading_zeros() - frac.trailing_zeros()) as u8
+    } else if frac == 0 {
+        1
+    } else {
+        (53 - frac.trailing_zeros()) as u8
+    }
+}
+
+fn int_sig_bits(lo: i64, hi: i64) -> Option<u8> {
+    let max_mag = lo.unsigned_abs().max(hi.unsigned_abs());
+    if max_mag == 0 {
+        Some(0)
+    } else {
+        let bits = 64 - max_mag.leading_zeros();
+        (bits <= 53).then_some(bits as u8)
+    }
+}
+
+fn is_literal_neg_zero(defs: &[Option<Op>], v: Value) -> bool {
+    matches!(
+        defs.get(v.0 as usize),
+        Some(Some(Op::Constant(Type::F64, bits))) if *bits as u64 == (-0.0f64).to_bits()
+    )
+}
+
+fn result_may_be_neg_zero(op: FpOp, a: FpFact, b: FpFact, lo: f64, hi: f64) -> bool {
+    if lo > 0.0 || hi < 0.0 {
+        return false;
+    }
+    match op {
+        FpOp::Add => a.may_be_neg_zero && b.may_be_neg_zero,
+        FpOp::Sub => a.may_be_neg_zero && b.lo <= 0.0 && b.hi >= 0.0,
+        FpOp::Mul | FpOp::Div => {
+            !((a.lo >= 0.0 && !a.may_be_neg_zero && b.lo >= 0.0 && !b.may_be_neg_zero)
+                || (a.hi < 0.0 && b.hi < 0.0))
+        }
+    }
 }
 
 /// Exact dyadic scale `q` of a finite `f64` bit pattern (`x = k * 2^q` with odd `k`).
@@ -459,9 +566,21 @@ fn eval_fp(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (bool, FpFact
         return (false, FpFact::TOP);
     }
 
+    let mul_sig = if op == FpOp::Mul {
+        a.effective_sig_bits()
+            .zip(b.effective_sig_bits())
+            .and_then(|(wa, wb)| wa.checked_add(wb))
+    } else {
+        None
+    };
     let exact_f64 = q_cand
         .is_some_and(|q| q >= -1022 && fits_mantissa_bits(lo.abs().max(hi.abs()), q, 53))
-        || (op == FpOp::Mul && both_f32);
+        || (op == FpOp::Mul
+            && (both_f32
+                || (mul_sig.is_some_and(|w| w <= 53)
+                    && (a.is_zero()
+                        || b.is_zero()
+                        || a.min_nonzero_abs() * b.min_nonzero_abs() > 2.0 * f64::MIN_POSITIVE))));
 
     if !exact_f64 {
         lo = lo.next_down();
@@ -548,6 +667,25 @@ fn eval_fp(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (bool, FpFact
         || hi <= -F32_SAFE_MIN_F64
         || (lo == 0.0 && hi == 0.0);
 
+    let sig_bits = if exact_f64 {
+        if lo == 0.0 && hi == 0.0 {
+            Some(0)
+        } else if let Some(w) = mul_sig.filter(|&w| w <= 53) {
+            Some(w)
+        } else if let Some(q) = dyadic_q {
+            if max_abs == 0.0 {
+                Some(0)
+            } else if fits_mantissa_bits(max_abs, q, 24) {
+                Some(24)
+            } else {
+                Some(53)
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let fact = FpFact {
         finite: true,
         binary32_exact,
@@ -556,6 +694,8 @@ fn eval_fp(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (bool, FpFact
         lo,
         hi,
         min_nonzero,
+        may_be_neg_zero: result_may_be_neg_zero(op, a, b, lo, hi),
+        sig_bits,
         dyadic_q,
     };
     (proved, fact)
@@ -577,10 +717,22 @@ fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (u8, 
         );
     }
     if op == FpOp::Add && b.is_zero() && a.finite && a.binary32_exact && a.f32_safe_nonzero {
-        return (SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT, a);
+        return (
+            SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT,
+            FpFact {
+                may_be_neg_zero: a.may_be_neg_zero && b.may_be_neg_zero,
+                ..a
+            },
+        );
     }
     if op == FpOp::Add && a.is_zero() && b.finite && b.binary32_exact && b.f32_safe_nonzero {
-        return (SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT, b);
+        return (
+            SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT,
+            FpFact {
+                may_be_neg_zero: a.may_be_neg_zero && b.may_be_neg_zero,
+                ..b
+            },
+        );
     }
 
     // Even when unproved, a succeeding Op::X87Single always produces a finite,
@@ -593,6 +745,8 @@ fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (u8, 
         lo: -F32_MAX_F64,
         hi: F32_MAX_F64,
         min_nonzero: F32_MIN_NORMAL_F64,
+        may_be_neg_zero: true,
+        sig_bits: Some(24),
         dyadic_q: None,
     };
 
@@ -637,11 +791,28 @@ fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (u8, 
     }
 
     let raw_max = raw_lo.abs().max(raw_hi.abs());
+    let mul_sig = if op == FpOp::Mul {
+        a.effective_sig_bits()
+            .zip(b.effective_sig_bits())
+            .and_then(|(wa, wb)| wa.checked_add(wb))
+    } else {
+        None
+    };
+    let mul_safe_min =
+        a.is_zero() || b.is_zero() || a.min_nonzero_abs() * b.min_nonzero_abs() >= F32_SAFE_MIN_F64;
     let exact_f32 = raw_max <= F32_MAX_F64
-        && q_cand.is_some_and(|q| q >= -125 && fits_mantissa_bits(raw_max, q, 24));
+        && (q_cand.is_some_and(|q| q >= -125 && fits_mantissa_bits(raw_max, q, 24))
+            || (op == FpOp::Mul && mul_sig.is_some_and(|w| w <= 24) && mul_safe_min));
 
     if exact_f32 {
         flags |= SINGLE_RESULT | SINGLE_EXACT;
+        let mn = if op == FpOp::Mul && !a.is_zero() && !b.is_zero() {
+            (0.5 * a.min_nonzero_abs() * b.min_nonzero_abs()).max(F32_SAFE_MIN_F64)
+        } else if raw_lo == 0.0 && raw_hi == 0.0 {
+            f64::INFINITY
+        } else {
+            F32_SAFE_MIN_F64
+        };
         let fact = FpFact {
             finite: true,
             binary32_exact: true,
@@ -649,7 +820,9 @@ fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (u8, 
             f32_safe_nonzero: true,
             lo: raw_lo,
             hi: raw_hi,
-            min_nonzero: F32_SAFE_MIN_F64,
+            min_nonzero: mn,
+            may_be_neg_zero: result_may_be_neg_zero(op, a, b, raw_lo, raw_hi),
+            sig_bits: mul_sig.filter(|&w| w <= 24).or(Some(24)),
             dyadic_q: q_cand,
         };
         return (flags, fact);
@@ -736,6 +909,8 @@ fn eval_x87_single(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (u8, 
         lo,
         hi,
         min_nonzero,
+        may_be_neg_zero: result_may_be_neg_zero(op, a, b, lo, hi),
+        sig_bits: Some(24),
         dyadic_q: None,
     };
     (flags, fact)
@@ -874,7 +1049,7 @@ fn eval_int_op(
 }
 
 #[derive(Default)]
-struct DomainSeeds {
+pub(super) struct DomainSeeds {
     inputs: BTreeMap<Value, FpFact>,
     params: BTreeMap<Value, FpFact>,
     values: BTreeMap<Value, (f64, Option<f64>)>,
@@ -1036,28 +1211,157 @@ fn apply_proved(
     let mut saved_per_iter = 0u32;
     let mut alias: Vec<Value> = (0..n).map(|i| Value(i as u32)).collect();
     let mut aliased = false;
+    let mut folded_c1: Vec<(FpOp, Value, Value, bool)> = Vec::new();
 
     for (b, block) in func.blocks.iter_mut().enumerate() {
         let in_loop = loop_blocks.is_none_or(|lb| lb.get(b).copied().unwrap_or(false));
         for (result, op) in &mut block.insts {
             match *op {
-                Op::Fp(fp_op, a, b_val, false) => {
+                Op::Fp(fp_op, a, b_val, cur_proved) => {
                     let fa = get_fp(a);
                     let fb = get_fp(b_val);
-                    let (proved, _) = eval_fp(fp_op, fa, fb, a == b_val);
-                    if proved {
+                    // Phase 2.2: under RC == Nearest, finite m - m -> +0.0.
+                    if fp_op == FpOp::Sub && a == b_val && fa.finite {
                         if in_loop {
-                            saved_per_iter = saved_per_iter.saturating_add(5);
+                            saved_per_iter =
+                                saved_per_iter.saturating_add(if cur_proved { 1 } else { 6 });
                         }
                         if commit {
-                            *op = Op::Fp(fp_op, a, b_val, true);
+                            *op = Op::Constant(Type::F64, 0);
+                            folded_c1.push((fp_op, a, b_val, false));
                         }
                         changed = true;
+                        continue;
+                    }
+                    // Phase 2.2: exact identity zero folds (binary64 normal/zero).
+                    let f64_normal_or_zero = |f: FpFact| {
+                        f.finite && (f.is_zero() || f.min_nonzero_abs() >= f64::MIN_POSITIVE)
+                    };
+                    let fold_to = match fp_op {
+                        FpOp::Add => {
+                            if (fb.is_pos_zero() && f64_normal_or_zero(fa) && !fa.may_be_neg_zero)
+                                || (is_literal_neg_zero(defs, b_val) && f64_normal_or_zero(fa))
+                            {
+                                Some(a)
+                            } else if (fa.is_pos_zero()
+                                && f64_normal_or_zero(fb)
+                                && !fb.may_be_neg_zero)
+                                || (is_literal_neg_zero(defs, a) && f64_normal_or_zero(fb))
+                            {
+                                Some(b_val)
+                            } else {
+                                None
+                            }
+                        }
+                        FpOp::Sub => {
+                            if (fb.is_pos_zero() && f64_normal_or_zero(fa))
+                                || (is_literal_neg_zero(defs, b_val)
+                                    && f64_normal_or_zero(fa)
+                                    && !fa.may_be_neg_zero)
+                            {
+                                Some(a)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let (Some(r), Some(target)) = (*result, fold_to) {
+                        if in_loop {
+                            saved_per_iter =
+                                saved_per_iter.saturating_add(if cur_proved { 1 } else { 6 });
+                        }
+                        if commit {
+                            alias[r.0 as usize] = target;
+                            aliased = true;
+                            folded_c1.push((fp_op, a, b_val, false));
+                        }
+                        changed = true;
+                        continue;
+                    }
+                    if !cur_proved {
+                        let (proved, _) = eval_fp(fp_op, fa, fb, a == b_val);
+                        if proved {
+                            if in_loop {
+                                saved_per_iter = saved_per_iter.saturating_add(5);
+                            }
+                            if commit {
+                                *op = Op::Fp(fp_op, a, b_val, true);
+                            }
+                            changed = true;
+                        }
                     }
                 }
                 Op::X87Single(fp_op, a, b_val, cur) => {
                     let fa = get_fp(a);
                     let fb = get_fp(b_val);
+                    // Phase 2.2: under RC == Nearest, finite binary32-exact m - m -> +0.0.
+                    if fp_op == FpOp::Sub && a == b_val && fa.finite && fa.binary32_exact {
+                        if in_loop {
+                            let all = SINGLE_A | SINGLE_B | SINGLE_RESULT;
+                            saved_per_iter = saved_per_iter.saturating_add(if cur & all == all {
+                                1
+                            } else {
+                                14
+                            });
+                        }
+                        if commit {
+                            *op = Op::Constant(Type::F64, 0);
+                            folded_c1.push((fp_op, a, b_val, true));
+                        }
+                        changed = true;
+                        continue;
+                    }
+                    // Phase 2.2: identity zero fold ONLY when operand is already exact in
+                    // binary32 (preventing (1 + 2^-30) + 0 under PC=24 from skipping rounding).
+                    let f32_exact_safe =
+                        |f: FpFact| f.finite && f.binary32_exact && f.f32_safe_nonzero;
+                    let fold_to = match fp_op {
+                        FpOp::Add => {
+                            if (fb.is_pos_zero() && f32_exact_safe(fa) && !fa.may_be_neg_zero)
+                                || (is_literal_neg_zero(defs, b_val) && f32_exact_safe(fa))
+                            {
+                                Some(a)
+                            } else if (fa.is_pos_zero()
+                                && f32_exact_safe(fb)
+                                && !fb.may_be_neg_zero)
+                                || (is_literal_neg_zero(defs, a) && f32_exact_safe(fb))
+                            {
+                                Some(b_val)
+                            } else {
+                                None
+                            }
+                        }
+                        FpOp::Sub => {
+                            if (fb.is_pos_zero() && f32_exact_safe(fa))
+                                || (is_literal_neg_zero(defs, b_val)
+                                    && f32_exact_safe(fa)
+                                    && !fa.may_be_neg_zero)
+                            {
+                                Some(a)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let (Some(r), Some(target)) = (*result, fold_to) {
+                        if in_loop {
+                            let all = SINGLE_A | SINGLE_B | SINGLE_RESULT;
+                            saved_per_iter = saved_per_iter.saturating_add(if cur & all == all {
+                                1
+                            } else {
+                                14
+                            });
+                        }
+                        if commit {
+                            alias[r.0 as usize] = target;
+                            aliased = true;
+                            folded_c1.push((fp_op, a, b_val, true));
+                        }
+                        changed = true;
+                        continue;
+                    }
                     let (proved, _) = eval_x87_single(fp_op, fa, fb, a == b_val);
                     let merged = cur | proved;
                     if merged != cur {
@@ -1191,6 +1495,17 @@ fn apply_proved(
         }
     }
 
+    if commit && !folded_c1.is_empty() {
+        for record in &mut func.records {
+            if let Some(x87) = &mut record.x87
+                && let Some(Location::Recipe(Recipe::C1 { op, a, b, single })) = x87.c1
+                && folded_c1.contains(&(op, a, b, single))
+            {
+                x87.c1 = Some(Location::Constant(0));
+            }
+        }
+    }
+
     if commit && aliased {
         for block in &mut func.blocks {
             block
@@ -1249,6 +1564,8 @@ fn fp_fact_of_const(bits: u64) -> FpFact {
             lo: x,
             hi: x,
             min_nonzero: if x == 0.0 { f64::INFINITY } else { x.abs() },
+            may_be_neg_zero: bits == (-0.0f64).to_bits(),
+            sig_bits: Some(exact_sig_bits(bits)),
             dyadic_q: Some(exact_dyadic_q(bits)),
         }
     } else if x.is_infinite() {
@@ -1260,6 +1577,8 @@ fn fp_fact_of_const(bits: u64) -> FpFact {
             lo: f64::NEG_INFINITY,
             hi: f64::INFINITY,
             min_nonzero: 0.0,
+            may_be_neg_zero: false,
+            sig_bits: None,
             dyadic_q: None,
         }
     } else {
@@ -1292,6 +1611,8 @@ fn eval_fp_op(
                 lo,
                 hi,
                 min_nonzero: if q == ZERO_Q { f64::INFINITY } else { 1.0 },
+                may_be_neg_zero: false,
+                sig_bits: int_sig_bits(r.lo, r.hi),
                 dyadic_q: Some(q),
             }
         }
@@ -1301,6 +1622,7 @@ fn eval_fp_op(
                 FpUnary::Neg => FpFact {
                     lo: if a.finite { -a.hi } else { f64::NEG_INFINITY },
                     hi: if a.finite { -a.lo } else { f64::INFINITY },
+                    may_be_neg_zero: !a.finite || (a.lo <= 0.0 && a.hi >= 0.0),
                     ..a
                 },
                 FpUnary::Abs => {
@@ -1311,7 +1633,12 @@ fn eval_fp_op(
                     } else {
                         (a.lo.abs().min(a.hi.abs()), a.lo.abs().max(a.hi.abs()))
                     };
-                    FpFact { lo, hi, ..a }
+                    FpFact {
+                        lo,
+                        hi,
+                        may_be_neg_zero: false,
+                        ..a
+                    }
                 }
             }
         }
@@ -1363,6 +1690,8 @@ fn eval_fp_op(
                         lo,
                         hi,
                         min_nonzero: mn,
+                        may_be_neg_zero: fv.may_be_neg_zero && !(lo > 0.0 || hi < 0.0),
+                        sig_bits: Some(24),
                         dyadic_q: None,
                     };
                 }
@@ -1377,6 +1706,8 @@ fn eval_fp_op(
                 lo: f64::NEG_INFINITY,
                 hi: f64::INFINITY,
                 min_nonzero: 0.0,
+                may_be_neg_zero: true,
+                sig_bits: None,
                 dyadic_q: None,
             }
         }
@@ -1475,6 +1806,8 @@ fn fp_window_fact(min_exp: i16, max_exp: i16, exact_f32: bool) -> FpFact {
         lo: -hi,
         hi,
         min_nonzero: min_nz,
+        may_be_neg_zero: true,
+        sig_bits: exact_f32.then_some(24),
         dyadic_q: None,
     }
 }
@@ -2076,13 +2409,16 @@ impl<'a> EntryBuilder<'a> {
 
 /// Infers optional `Block(0)` numerical domain guards for resident x87 loops
 /// when static analysis leaves unproved arithmetic or stores inside the loop.
-pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) -> bool) -> bool {
+pub(super) fn infer_domain_guards(
+    func: &mut Func,
+    refused_domain: &dyn Fn(u32) -> bool,
+) -> Option<DomainSeeds> {
     if !func.resident
         || func.blocks.len() <= 1
         || func.domain_guards.len() >= MAX_DOMAIN_GUARDS
         || !func.domain_guards.is_empty()
     {
-        return false;
+        return None;
     }
     // Block(0) must be a one-shot entry prologue (never a loop head).
     if func
@@ -2091,7 +2427,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
         .flat_map(|b| b.end.targets())
         .any(|t| t.block == Block(0))
     {
-        return false;
+        return None;
     }
 
     let first_effect = func.blocks[0]
@@ -2110,7 +2446,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
         .rposition(|(_, op)| matches!(op, Op::PlainPage { .. }))
         .map_or(0, |i| i + 1);
     if first_effect < last_plain {
-        return false;
+        return None;
     }
     let insert_pos = first_effect;
 
@@ -2159,7 +2495,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
         }
     }
     if loops.is_empty() {
-        return false;
+        return None;
     }
 
     let primary_head = loops
@@ -2171,7 +2507,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
         .map(|h| func.records[h.record.0 as usize].eip)
         .unwrap_or_else(|| func.records[0].eip);
     if refused_domain(guard_id) {
-        return false;
+        return None;
     }
 
     // Union of natural loop blocks across all detected loops.
@@ -2206,7 +2542,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
             _ => false,
         });
     if !has_unproved {
-        return false;
+        return None;
     }
 
     let (_, static_fp) = analyze_fixpoint(func, &defs, &DomainSeeds::default());
@@ -2398,7 +2734,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
         }
     }
     if guarded_inputs.len() > MAX_GUARDED_INPUTS {
-        return false;
+        return None;
     }
 
     // Build abstract seeds for profitability simulation.
@@ -2444,6 +2780,8 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
             lo: -x_limit,
             hi: x_limit,
             min_nonzero: min_nz,
+            may_be_neg_zero: fx0.may_be_neg_zero,
+            sig_bits: binary32_exact.then_some(24),
             dyadic_q: None,
         };
         seeds.params.insert(ind.param, inv);
@@ -2489,20 +2827,104 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
     }
 
     if seeds.inputs.is_empty() && active_inds.is_empty() && int_sinks.is_empty() {
-        return false;
+        return None;
     }
 
     // Simulate fixpoint with the planned domain guards to verify profitability.
     let (_, guarded_fp) = analyze_fixpoint(func, &defs, &seeds);
     let (_, saved_per_iter) = apply_proved(func, &defs, &guarded_fp, Some(&in_loop), false);
     if saved_per_iter < MIN_DOMAIN_SAVED_PER_ITER {
-        return false;
+        return None;
+    }
+
+    // Optional independent secondary ordinal: guard Block(0) binary64 inputs
+    // feeding PC=53 Mul -> Add/Sub with a binary32-exact multiplicand so
+    // Phase 2.1 can contract to single-instruction FMADD/FMSUB/FNMSUB D.
+    // Separate guard_id ensures non-f32 f64 workloads withdraw ONLY FMA exactness
+    // without touching ordinal 0 finiteness/range proofs.
+    let fma_guard_id = guard_id ^ 0x464d_4131;
+    let mut fma_exact_inputs = BTreeSet::<Value>::new();
+    let mut fma_pairs = 0u32;
+    if !refused_domain(fma_guard_id) && func.domain_guards.len() + 1 < MAX_DOMAIN_GUARDS {
+        let fma_need = |v: Value| -> Option<Option<Value>> {
+            let fv = guarded_fp[v.0 as usize].unwrap_or(FpFact::TOP);
+            if !fv.finite {
+                return None;
+            }
+            if fv.binary32_exact {
+                return Some(None);
+            }
+            if guarded_inputs.contains_key(&v) {
+                return Some(Some(v));
+            }
+            if let Some(&ind) = affine_map.get(&v)
+                && ind.f32_step
+                && guarded_inputs.contains_key(&ind.x_0)
+            {
+                return Some(Some(ind.x_0));
+            }
+            None
+        };
+        for (b, block) in func.blocks.iter().enumerate() {
+            if !in_loop[b] {
+                continue;
+            }
+            let mut mul_to_need = BTreeMap::<Value, (Option<Value>, Option<Value>)>::new();
+            for &(res, op) in &block.insts {
+                match op {
+                    Op::Store { .. }
+                    | Op::FrameStore { .. }
+                    | Op::ScopeWritten(_)
+                    | Op::PageCross { .. }
+                    | Op::FrameDisjoint { .. } => {
+                        mul_to_need.clear();
+                    }
+                    Op::Fp(FpOp::Mul, a, b_val, _) => {
+                        if let Some(r) = res
+                            && let (Some(na), Some(nb)) = (fma_need(a), fma_need(b_val))
+                            && (na.is_some() || nb.is_some())
+                        {
+                            mul_to_need.insert(r, (na, nb));
+                        }
+                    }
+                    Op::Fp(FpOp::Add | FpOp::Sub, lhs, rhs, _) => {
+                        let matched = mul_to_need
+                            .get(&lhs)
+                            .map(|&need| (need, rhs))
+                            .or_else(|| mul_to_need.get(&rhs).map(|&need| (need, lhs)));
+                        if let Some(((na, nb), c)) = matched
+                            && guarded_fp[c.0 as usize].is_some_and(|fc| fc.finite)
+                        {
+                            if let Some(v) = na {
+                                fma_exact_inputs.insert(v);
+                            }
+                            if let Some(v) = nb {
+                                fma_exact_inputs.insert(v);
+                            }
+                            fma_pairs += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if fma_pairs < 2 {
+            fma_exact_inputs.clear();
+            fma_pairs = 0;
+        }
     }
 
     // Commit: emit Block(0) helper ops and DomainGuards at `insert_pos`.
     let ordinal = func.domain_guards.len() as u8;
     func.domain_guards.push(guard_id);
-    func.domain_saved_per_iter = saved_per_iter;
+    let fma_ordinal = if !fma_exact_inputs.is_empty() {
+        let ord = func.domain_guards.len() as u8;
+        func.domain_guards.push(fma_guard_id);
+        Some(ord)
+    } else {
+        None
+    };
+    func.domain_saved_per_iter = saved_per_iter.saturating_add(fma_pairs);
 
     let mut eb = EntryBuilder {
         func,
@@ -2521,6 +2943,27 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
             },
             ordinal,
         });
+    }
+    if let Some(ord) = fma_ordinal {
+        for &v in &fma_exact_inputs {
+            eb.emit(Op::DomainGuard {
+                kind: DomainGuardKind::ExactF32 { value: v },
+                ordinal: ord,
+            });
+            if let Some(seed) = seeds.inputs.get_mut(&v) {
+                seed.binary32_exact = true;
+                seed.sig_bits = Some(24);
+            }
+        }
+        for &(ind, ..) in &active_inds {
+            if ind.f32_step
+                && fma_exact_inputs.contains(&ind.x_0)
+                && let Some(param_seed) = seeds.params.get_mut(&ind.param)
+            {
+                param_seed.binary32_exact = true;
+                param_seed.sig_bits = Some(24);
+            }
+        }
     }
 
     let mut sym_bounds = BTreeMap::<Value, Value>::new();
@@ -2595,5 +3038,267 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
     // Apply proved flags using the simulated `guarded_fp` facts.
     let new_defs = super::definitions(func);
     apply_proved(func, &new_defs, &guarded_fp, Some(&in_loop), true);
-    true
+    Some(seeds)
+}
+
+fn fp_mul_is_exact_f64(a: FpFact, b: FpFact) -> bool {
+    if !a.finite || !b.finite {
+        return false;
+    }
+    let (proved, fact) = eval_fp(FpOp::Mul, a, b, false);
+    if !proved || !fact.finite {
+        return false;
+    }
+    if a.binary32_exact && b.binary32_exact {
+        return true;
+    }
+    if let (Some(wa), Some(wb)) = (a.effective_sig_bits(), b.effective_sig_bits())
+        && wa.saturating_add(wb) <= 53
+    {
+        return true;
+    }
+    fact.dyadic_q
+        .is_some_and(|q| q >= -1022 && fits_mantissa_bits(fact.max_abs(), q, 53))
+}
+
+/// Phase 2.1: Contracts exact `Mul -> Add/Sub` pairs into `Op::Fma` after
+/// `passes::dead`, preserving recovery regions, `Recipe::C1` observability,
+/// sign semantics, and `PC=24` input exactness checks.
+pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) -> bool {
+    let has_candidate = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|(_, op)| matches!(op, Op::Fp(FpOp::Mul, ..) | Op::X87Single(FpOp::Mul, ..)));
+    if !has_candidate {
+        return false;
+    }
+
+    let n = func.types.len();
+    let defs = super::definitions(func);
+    let default_seeds = DomainSeeds::default();
+    let seeds = domain_seeds.unwrap_or(&default_seeds);
+    let (_, fp_facts) = analyze_fixpoint(func, &defs, seeds);
+    let get_fp = |v: Value| {
+        fp_facts
+            .get(v.0 as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(FpFact::TOP)
+    };
+
+    // Count all non-C1 uses across blocks, terminators, and IrRecords.
+    // Lazy Recipe::C1 references to an Add/Sub consuming `prod` are tracked
+    // separately so contracting Mul+Add/Sub can rewrite them to Recipe::C1Fma
+    // without keeping `prod` alive in the hot loop.
+    let mut non_c1_uses = vec![0usize; n];
+    for block in &func.blocks {
+        for &(_, op) in &block.insts {
+            for u in op.uses() {
+                non_c1_uses[u.0 as usize] += 1;
+            }
+        }
+        if let End::Branch { cond, .. } = block.end {
+            non_c1_uses[cond.0 as usize] += 1;
+        }
+        for t in block.end.targets() {
+            for &arg in &t.args {
+                non_c1_uses[arg.0 as usize] += 1;
+            }
+        }
+    }
+    let mut c1_records = Vec::<(usize, FpOp, Value, Value, bool)>::new();
+    for (rec_idx, record) in func.records.iter().enumerate() {
+        for u in record.uses() {
+            non_c1_uses[u.0 as usize] += 1;
+        }
+        if let Some(x87) = &record.x87
+            && let Some(Location::Recipe(Recipe::C1 {
+                op: op @ (FpOp::Add | FpOp::Sub),
+                a,
+                b,
+                single,
+            })) = x87.c1
+        {
+            non_c1_uses[a.0 as usize] -= 1;
+            non_c1_uses[b.0 as usize] -= 1;
+            c1_records.push((rec_idx, op, a, b, single));
+        }
+    }
+
+    let c1_compatible = |prod: Value, fp_op: FpOp, lhs: Value, rhs: Value, single: bool| {
+        c1_records
+            .iter()
+            .filter(|&&(_, _, ra, rb, _)| ra == prod || rb == prod)
+            .all(|&(_, r_op, ra, rb, r_single)| {
+                r_op == fp_op && ra == lhs && rb == rhs && r_single == single
+            })
+    };
+
+    let mut c1_rewrites = Vec::<(Value, FmaOp, Value, Value, Value, bool)>::new();
+    let mut contracted = false;
+    for block in &mut func.blocks {
+        // prod -> (inst_idx, region_id, single, a, b)
+        let mut muls = BTreeMap::<Value, (usize, u32, bool, Value, Value)>::new();
+        let mut removed = BTreeSet::<usize>::new();
+        let mut region_id = 0u32;
+
+        for idx in 0..block.insts.len() {
+            let (result, op) = block.insts[idx];
+            match op {
+                Op::Store { .. }
+                | Op::FrameStore { .. }
+                | Op::ScopeWritten(_)
+                | Op::PageCross { .. }
+                | Op::FrameDisjoint { .. } => {
+                    region_id += 1;
+                }
+                Op::Fp(FpOp::Mul, a, b, _) => {
+                    if let Some(prod) = result
+                        && non_c1_uses[prod.0 as usize] == 1
+                        && fp_mul_is_exact_f64(get_fp(a), get_fp(b))
+                    {
+                        muls.insert(prod, (idx, region_id, false, a, b));
+                    }
+                }
+                Op::X87Single(FpOp::Mul, a, b, mul_flags) => {
+                    let all = SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT;
+                    if let Some(prod) = result
+                        && non_c1_uses[prod.0 as usize] == 1
+                        && mul_flags & all == all
+                        && get_fp(a).finite
+                        && get_fp(b).finite
+                    {
+                        muls.insert(prod, (idx, region_id, true, a, b));
+                    }
+                }
+                Op::Fp(fp_op @ (FpOp::Add | FpOp::Sub), lhs, rhs, add_proved) => {
+                    let matched = if let Some(&(mul_idx, mul_reg, false, a, b)) = muls.get(&lhs)
+                        && mul_reg == region_id
+                    {
+                        let fma_op = if fp_op == FpOp::Add {
+                            FmaOp::Add
+                        } else {
+                            FmaOp::Sub
+                        };
+                        Some((lhs, mul_idx, fma_op, a, b, rhs))
+                    } else if let Some(&(mul_idx, mul_reg, false, a, b)) = muls.get(&rhs)
+                        && mul_reg == region_id
+                    {
+                        let fma_op = if fp_op == FpOp::Add {
+                            FmaOp::Add
+                        } else {
+                            FmaOp::RevSub
+                        };
+                        Some((rhs, mul_idx, fma_op, a, b, lhs))
+                    } else {
+                        None
+                    };
+                    if let Some((prod, mul_idx, fma_op, a, b, c)) = matched
+                        && get_fp(c).finite
+                        && c1_compatible(prod, fp_op, lhs, rhs, false)
+                    {
+                        let proved = if add_proved
+                            || eval_fp(fp_op, get_fp(lhs), get_fp(rhs), lhs == rhs).0
+                        {
+                            SINGLE_RESULT
+                        } else {
+                            0
+                        };
+                        block.insts[idx].1 = Op::Fma {
+                            op: fma_op,
+                            a,
+                            b,
+                            c,
+                            single: false,
+                            proved,
+                        };
+                        removed.insert(mul_idx);
+                        c1_rewrites.push((prod, fma_op, a, b, c, false));
+                        contracted = true;
+                    }
+                }
+                Op::X87Single(fp_op @ (FpOp::Add | FpOp::Sub), lhs, rhs, add_flags) => {
+                    let matched = if let Some(&(mul_idx, mul_reg, true, a, b)) = muls.get(&lhs)
+                        && mul_reg == region_id
+                    {
+                        let fma_op = if fp_op == FpOp::Add {
+                            FmaOp::Add
+                        } else {
+                            FmaOp::Sub
+                        };
+                        let c_proved = add_flags & SINGLE_B != 0 || get_fp(rhs).binary32_exact;
+                        Some((lhs, mul_idx, fma_op, a, b, rhs, c_proved))
+                    } else if let Some(&(mul_idx, mul_reg, true, a, b)) = muls.get(&rhs)
+                        && mul_reg == region_id
+                    {
+                        let fma_op = if fp_op == FpOp::Add {
+                            FmaOp::Add
+                        } else {
+                            FmaOp::RevSub
+                        };
+                        let c_proved = add_flags & SINGLE_A != 0 || get_fp(lhs).binary32_exact;
+                        Some((rhs, mul_idx, fma_op, a, b, lhs, c_proved))
+                    } else {
+                        None
+                    };
+                    if let Some((prod, mul_idx, fma_op, a, b, c, c_proved)) = matched
+                        && get_fp(c).finite
+                        && c1_compatible(prod, fp_op, lhs, rhs, true)
+                    {
+                        let mut proved = SINGLE_A | SINGLE_B;
+                        if c_proved {
+                            proved |= SINGLE_C;
+                        }
+                        if add_flags & SINGLE_RESULT != 0 {
+                            proved |= SINGLE_RESULT;
+                        }
+                        if add_flags & SINGLE_EXACT != 0 && c_proved {
+                            proved |= SINGLE_RESULT | SINGLE_EXACT;
+                        }
+                        block.insts[idx].1 = Op::Fma {
+                            op: fma_op,
+                            a,
+                            b,
+                            c,
+                            single: true,
+                            proved,
+                        };
+                        removed.insert(mul_idx);
+                        c1_rewrites.push((prod, fma_op, a, b, c, true));
+                        contracted = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !removed.is_empty() {
+            let mut kept = Vec::with_capacity(block.insts.len() - removed.len());
+            for (i, inst) in block.insts.drain(..).enumerate() {
+                if !removed.contains(&i) {
+                    kept.push(inst);
+                }
+            }
+            block.insts = kept;
+        }
+    }
+    if !c1_rewrites.is_empty() {
+        for &(rec_idx, _, ra, rb, _) in &c1_records {
+            if let Some(&(_, fma_op, a, b, c, single)) = c1_rewrites
+                .iter()
+                .find(|&&(prod, ..)| prod == ra || prod == rb)
+                && let Some(x87) = &mut func.records[rec_idx].x87
+            {
+                x87.c1 = Some(Location::Recipe(Recipe::C1Fma {
+                    op: fma_op,
+                    a,
+                    b,
+                    c,
+                    single,
+                }));
+            }
+        }
+    }
+    contracted
 }
