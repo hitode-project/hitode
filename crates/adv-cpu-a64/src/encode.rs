@@ -1014,6 +1014,21 @@ pub const fn vfloat(op: Float, full: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 
         | rd.number()
 }
 
+/// `<op> vd.2d, vn.2d, vm.2d` (`fadd`/`fsub`/`fmul`/`fdiv`).
+pub const fn vfloat_2d(op: Float, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    vfloat(op, true, rd, rn, rm) | 1 << 22
+}
+
+/// `fmla`/`fmls vd.<4s/2d>, vn, vm`: `vd = vd ± vn * vm`, rounded once.
+pub const fn vfmla(double: bool, sub: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    0x4E20_CC00
+        | (sub as u32) << 23
+        | (double as u32) << 22
+        | rm.number() << 16
+        | rn.number() << 5
+        | rd.number()
+}
+
 /// Floating compare masks in .4s/.2d, or the scalar S/D form.
 pub const fn vcompare(op: Float, scalar: bool, double: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 {
     assert!(matches!(op, Float::Fcmeq | Float::Fcmge | Float::Fcmgt));
@@ -1157,14 +1172,25 @@ pub const fn vfrint32(full: bool, double: bool, truncate: bool, rd: VReg, rn: VR
         | rd.number()
 }
 
+/// `fcvtns`/`fcvtms`/`fcvtps`/`fcvtzs vd.<4s/2d>, vn.<4s/2d>` for x87 RC 0..=3.
+pub const fn vfcvt_int_mode(double: bool, rounding: u8, rd: VReg, rn: VReg) -> u32 {
+    let base = match rounding {
+        0 => 0x4E21_A800, // fcvtns (nearest even)
+        1 => 0x4E21_B800, // fcvtms (floor, -Inf)
+        2 => 0x4EA1_A800, // fcvtps (ceil, +Inf)
+        _ => 0x4EA1_B800, // fcvtzs (toward zero)
+    };
+    base | (double as u32) << 22 | rn.number() << 5 | rd.number()
+}
+
 /// `fcvtzs vd.2d, vn.2d`.
 pub const fn vfcvtzs_2d(rd: VReg, rn: VReg) -> u32 {
-    0x4EE1_B800 | rn.number() << 5 | rd.number()
+    vfcvt_int_mode(true, 3, rd, rn)
 }
 
 /// `fcvtns vd.2d, vn.2d`.
 pub const fn vfcvtns_2d(rd: VReg, rn: VReg) -> u32 {
-    0x4E61_A800 | rn.number() << 5 | rd.number()
+    vfcvt_int_mode(true, 0, rd, rn)
 }
 
 /// `xtn vd.2s, vn.2d` (extract low 32 bits of each 64-bit lane, zeroing upper 64 bits).
@@ -2079,6 +2105,44 @@ mod tests {
             (ldrh(r(16), r(5), 362), "ldrh w16, [x5, #362]"),
             (strh(Reg::ZR, r(5), 364), "strh wzr, [x5, #364]"),
             (sturh(r(17), r(5), -3), "sturh w17, [x5, #-3]"),
+            (
+                vfloat_2d(Float::Fadd, v(1), v(2), v(3)),
+                "fadd v1.2d, v2.2d, v3.2d",
+            ),
+            (
+                vfloat_2d(Float::Fsub, v(1), v(2), v(3)),
+                "fsub v1.2d, v2.2d, v3.2d",
+            ),
+            (
+                vfloat_2d(Float::Fmul, v(1), v(2), v(3)),
+                "fmul v1.2d, v2.2d, v3.2d",
+            ),
+            (
+                vfloat_2d(Float::Fdiv, v(1), v(2), v(3)),
+                "fdiv v1.2d, v2.2d, v3.2d",
+            ),
+            (
+                vfmla(false, false, v(1), v(2), v(3)),
+                "fmla v1.4s, v2.4s, v3.4s",
+            ),
+            (
+                vfmla(false, true, v(1), v(2), v(3)),
+                "fmls v1.4s, v2.4s, v3.4s",
+            ),
+            (
+                vfmla(true, false, v(1), v(2), v(3)),
+                "fmla v1.2d, v2.2d, v3.2d",
+            ),
+            (
+                vfmla(true, true, v(1), v(2), v(3)),
+                "fmls v1.2d, v2.2d, v3.2d",
+            ),
+            (vfcvt_int_mode(false, 0, v(1), v(2)), "fcvtns v1.4s, v2.4s"),
+            (vfcvt_int_mode(false, 1, v(1), v(2)), "fcvtms v1.4s, v2.4s"),
+            (vfcvt_int_mode(false, 2, v(1), v(2)), "fcvtps v1.4s, v2.4s"),
+            (vfcvt_int_mode(false, 3, v(1), v(2)), "fcvtzs v1.4s, v2.4s"),
+            (vfcvt_int_mode(true, 1, v(1), v(2)), "fcvtms v1.2d, v2.2d"),
+            (vfcvt_int_mode(true, 2, v(1), v(2)), "fcvtps v1.2d, v2.2d"),
         ]
     }
 

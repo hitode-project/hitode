@@ -3650,3 +3650,217 @@ fn phase3_dynamic_mxcsr_sticky_and_f32_sse_input_dedup() {
     sub_at.xmm[1][..4].copy_from_slice(&0x4b80_0000u32.to_le_bytes()); // 2^24
     compare(&f32_chain, &sub_at, |_| {}, true);
 }
+
+// spec: A64-OPT-2
+#[test]
+fn phase4_cross_channel_slp_pricing_and_order_preservation() {
+    // 1) 4-channel PC=24 affine loop (SINGLE_EXACT == 0 via non-exact f32 sum)
+    // packs into .4s (Op::VecFp / Op::VecFma + Op::VecFpToInt), hoists packs to
+    // Block(0), and matches Tier-0 across rounding modes and mid-channel faults.
+    let emit_ftol = |a: &mut CodeAssembler| {
+        a.fnstcw(word_ptr(esp + 0x14)).unwrap();
+        a.movzx(eax, word_ptr(esp + 0x14)).unwrap();
+        a.or(eax, 0xc00).unwrap();
+        a.mov(word_ptr(esp + 0x16), ax).unwrap();
+        a.fldcw(word_ptr(esp + 0x16)).unwrap();
+        a.fistp(dword_ptr(esp + 0x10)).unwrap();
+        a.fldcw(word_ptr(esp + 0x14)).unwrap();
+        a.mov(eax, dword_ptr(esp + 0x10)).unwrap();
+    };
+    let four_ch_single = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        for k in 0..4 {
+            a.fld(dword_ptr(esp + 0x20 + k * 4)).unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fadd(dword_ptr(esp + 0x40 + k * 4)).unwrap();
+            emit_ftol(a);
+            a.mov(dword_ptr(edi + edx * 4 + k * 0x100), eax).unwrap();
+        }
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(dword_ptr(esp + 0x18)).unwrap();
+        a.fld(dword_ptr(esp + 0x18)).unwrap();
+        a.inc(edx).unwrap();
+        a.cmp(edx, ebx).unwrap();
+        a.jl(head).unwrap();
+    });
+    let unit4 = resident_unit(&four_ch_single);
+    let mut at4 = initial();
+    at4.regs[2] = 0; // edx
+    at4.regs[3] = 8; // ebx
+    at4.x87.control = 0x003f; // PC=24, nearest (FISTP chops via FLDCW)
+    at4.x87.status = 0x20;
+    at4.x87
+        .push(adv_cpu_core::floating::fast::extended(1.0 / 64.0));
+    at4.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+    let built4 =
+        build_with_domains(&unit4, None, &at4, &|_| false, &|_| false, &|_| false).unwrap();
+    assert_eq!(verify::verify(&built4.func), Ok(()));
+    assert!(
+        count(&built4, |op| matches!(
+            op,
+            Op::VecFp { double: false, .. } | Op::VecFma { double: false, .. }
+        )) >= 1,
+        "expected 4-channel PC=24 loop to emit .4s vector FP/FMA"
+    );
+    assert_eq!(
+        count(&built4, |op| matches!(
+            op,
+            Op::VecFpToInt { double: false, .. }
+        )),
+        1,
+        "expected 4-channel PC=24 loop to emit one .4s VecFpToInt"
+    );
+    assert!(
+        built4.func.blocks[0]
+            .insts
+            .iter()
+            .any(|(_, op)| matches!(op, Op::Vec(VecOp::Insert32(_), ..))),
+        "expected loop-invariant f32 channel packs hoisted into Block(0)"
+    );
+
+    // 2) 6-channel PC=53 loop with FMA refused (uncontracted FMUL + FADD + FISTP):
+    // 3× .2d pairs share one Dup64 broadcast (scalar 18 -> vec 16 words) and pack.
+    let six_ch_double = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        for k in 0..6 {
+            a.fld(qword_ptr(esp + 0x20 + k * 8)).unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fadd(dword_ptr(esp + 0x60 + k * 4)).unwrap();
+            emit_ftol(a);
+            a.mov(dword_ptr(edi + edx * 4 + k * 0x100), eax).unwrap();
+        }
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(dword_ptr(esp + 0x18)).unwrap();
+        a.fld(dword_ptr(esp + 0x18)).unwrap();
+        a.inc(edx).unwrap();
+        a.cmp(edx, ebx).unwrap();
+        a.jl(head).unwrap();
+    });
+    let unit6 = resident_unit(&six_ch_double);
+    let mut at6 = initial();
+    at6.regs[2] = 0;
+    at6.regs[3] = 8;
+    at6.x87.control = 0x023f; // PC=53, nearest (FISTP chops via FLDCW)
+    at6.x87.status = 0x20;
+    at6.x87
+        .push(adv_cpu_core::floating::fast::extended(1.0 / 64.0));
+    at6.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+    // With FMA enabled (default), 2-wide .2d FMA+FISTP (5 words) is worse than
+    // scalar FMADD+FCVT (4 words), so the cost model MUST keep it scalar.
+    let built6_fma =
+        build_with_domains(&unit6, None, &at6, &|_| false, &|_| false, &|_| false).unwrap();
+    assert_eq!(verify::verify(&built6_fma.func), Ok(()));
+    assert_eq!(
+        count(&built6_fma, |op| matches!(op, Op::VecFma { .. })),
+        0,
+        "cost model must decline unprofitable .2d DoubleFma"
+    );
+    // Refusing ONLY the ExactF32 FMA guard leaves uncontracted FMUL+FADD+FISTP,
+    // where 3× .2d pairs sharing one Dup64 beat scalar (16 < 18 words).
+    let fma_id = built6_fma.func.domain_guards[1];
+    let built6_slp = build_with_domains(&unit6, None, &at6, &|_| false, &|_| false, &|id| {
+        id == fma_id
+    })
+    .unwrap();
+    assert_eq!(verify::verify(&built6_slp.func), Ok(()));
+    assert_eq!(
+        count(&built6_slp, |op| matches!(
+            op,
+            Op::VecFpToInt { double: true, .. }
+        )),
+        3,
+        "expected 3× .2d SLP packs across 6 uncontracted PC=53 channels"
+    );
+    assert_eq!(
+        count(&built6_slp, |op| matches!(
+            op,
+            Op::VecUnary(VecUnary::Dup64, _)
+        )),
+        1,
+        "expected one shared Dup64 broadcast across all 3 .2d pairs"
+    );
+
+    // 3) Differential check + mid-channel fault recovery order: channels 0 & 1
+    // commit before channel 2 faults between `fadd` and `fistp`, exercising
+    // `Recipe::VecLane` (st0) and `Recipe::C1Vec` (x87.c1) during cold recovery,
+    // and channel 3 never commits.
+    let fault_ch = assemble(|a| {
+        row(a, |a| {
+            // Non-constant bounded f32 inputs via movzx+fild so fp_range proves
+            // X87Single (without SINGLE_EXACT) + X87Store even without domain guards.
+            a.mov(dword_ptr(esp + 0x18), (1.0f32 / 3.0).to_bits())
+                .unwrap();
+            a.fld(dword_ptr(esp + 0x18)).unwrap(); // st(0) = x = 1/3 (f32)
+            for k in 0..4 {
+                a.movzx(eax, byte_ptr(esp + 0x20 + k)).unwrap();
+                a.mov(dword_ptr(esp + 0x60 + k * 4), eax).unwrap();
+                a.fild(dword_ptr(esp + 0x60 + k * 4)).unwrap();
+                a.fstp(qword_ptr(esp + 0xa0 + k * 8)).unwrap();
+                a.mov(
+                    dword_ptr(esp + 0x40 + k * 4),
+                    (10.3f32 + k as f32 * 1.3).to_bits(),
+                )
+                .unwrap();
+            }
+            for k in 0..4 {
+                a.fld(qword_ptr(esp + 0xa0 + k * 8)).unwrap();
+                a.fmul_2(st0, st1).unwrap();
+                a.fadd(dword_ptr(esp + 0x40 + k * 4)).unwrap();
+                if k == 2 {
+                    // Fault right after fadd while st0 = prod_2 and C1 = Add(m_2, c_2).
+                    a.mov(dword_ptr(esi), eax).unwrap();
+                }
+                a.fnstcw(word_ptr(esp + 0x80 + k * 8)).unwrap();
+                a.movzx(eax, word_ptr(esp + 0x80 + k * 8)).unwrap();
+                a.or(eax, 0xc00).unwrap();
+                a.mov(word_ptr(esp + 0x82 + k * 8), ax).unwrap();
+                a.fldcw(word_ptr(esp + 0x82 + k * 8)).unwrap();
+                a.fistp(dword_ptr(esp + 0x84 + k * 8)).unwrap();
+                a.fldcw(word_ptr(esp + 0x80 + k * 8)).unwrap();
+                a.mov(eax, dword_ptr(esp + 0x84 + k * 8)).unwrap();
+                a.mov(dword_ptr(edi + k * 4), eax).unwrap();
+            }
+            a.fstp(st0).unwrap();
+        })
+    });
+    let init_fault_mem = |m: &mut Memory| {
+        m.write(FRAME + 0x20, &[7, 13, 29, 43]).unwrap();
+    };
+    let mut f_at = initial();
+    f_at.regs[1] = 1;
+    f_at.regs[6] = DATA + 0x80; // mapped esi for normal differential run
+    f_at.x87.control = 0x003f; // PC=24, nearest (FISTP chops via FLDCW)
+    f_at.x87.status = 0x20;
+    let built_f = differential(&fault_ch, &f_at, init_fault_mem);
+    assert!(
+        count(&built_f, |op| matches!(op, Op::VecFp { double: false, .. })) >= 2,
+        "expected fault_ch to pack into .4s VecFp"
+    );
+    assert_eq!(
+        count(&built_f, |op| matches!(
+            op,
+            Op::VecFpToInt { double: false, .. }
+        )),
+        1,
+        "expected fault_ch to emit one .4s VecFpToInt"
+    );
+    assert!(
+        built_f.func.records.iter().any(|r| {
+            r.x87.as_ref().is_some_and(|x| {
+                x.stack
+                    .iter()
+                    .flatten()
+                    .any(|loc| matches!(loc, Location::Recipe(Recipe::VecLane { .. })))
+                    && matches!(x.c1, Some(Location::Recipe(Recipe::C1Vec { .. })))
+            })
+        }),
+        "expected cold recovery records to rewrite st0/C1 to Recipe::VecLane + Recipe::C1Vec"
+    );
+
+    // Now point esi to an unmapped address: channel 2 must fault after 0 & 1 wrote.
+    let mut bad_at = f_at.clone();
+    bad_at.regs[6] = 0x9000_0000;
+    compare(&fault_ch, &bad_at, init_fault_mem, true);
+}

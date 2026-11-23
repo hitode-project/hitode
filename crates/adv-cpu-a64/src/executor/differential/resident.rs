@@ -1171,6 +1171,124 @@ fn resident_admits_sse_packed_conversions_and_cvttss2si() {
     assert_eq!(native.diagnostics.resident_cold_exits, 0);
 }
 
+// spec: A64-OPT-2, A64-OPT-6
+#[test]
+fn phase4_cross_channel_slp_resident_execution_and_cold_fault() {
+    let image = Image::loop_body(|a, head, _| {
+        for k in 0..4 {
+            a.fld(dword_ptr(esp + 0x20 + k * 4)).unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fadd(dword_ptr(esp + 0x40 + k * 4)).unwrap();
+            a.fnstcw(word_ptr(esp + 0x14)).unwrap();
+            a.movzx(eax, word_ptr(esp + 0x14)).unwrap();
+            a.or(eax, 0xc00).unwrap();
+            a.mov(word_ptr(esp + 0x16), ax).unwrap();
+            a.fldcw(word_ptr(esp + 0x16)).unwrap();
+            a.fistp(dword_ptr(esp + 0x10)).unwrap();
+            a.fldcw(word_ptr(esp + 0x14)).unwrap();
+            a.mov(eax, dword_ptr(esp + 0x10)).unwrap();
+            a.mov(dword_ptr(edi + k * 4), eax).unwrap();
+        }
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(dword_ptr(esp + 0x18)).unwrap();
+        a.fld(dword_ptr(esp + 0x18)).unwrap();
+        a.add(edi, 16).unwrap();
+        latch(a, head);
+        // Normalize the empty scratch slot popped by `fistp` after loop exit.
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    let mut state = initial(8);
+    state.x87.control = 0x003f; // PC=24, nearest (FISTP chops via FLDCW)
+    state.x87.status = 0x20;
+    state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(f64::from(
+            1.0f32 / 3.0,
+        )));
+    state.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+
+    let init_mem = |m: &mut adv_cpu_core::Memory| {
+        for k in 0..4u32 {
+            let s = (1.1f32 + k as f32 * 0.7).to_le_bytes();
+            let b = (10.3f32 + k as f32 * 1.3).to_le_bytes();
+            m.write(FRAME + 0x20 + k * 4, &s).unwrap();
+            m.write(FRAME + 0x40 + k * 4, &b).unwrap();
+        }
+    };
+
+    let mut trial = Trial::new(&image, &state, "PC=24 4-ch SLP", &[], init_mem);
+    assert!(trial.try_install_at(state.clone()));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(native.resident_arrivals(image.head).unwrap() > 0);
+    assert_eq!(native.diagnostics.resident_cold_exits, 0);
+
+    // Cold exit (`FrameDisjoint`) right between `fadd` and `fistp` in channel 2
+    // on real AArch64 hardware exercises `Recipe::VecLane` (st0) and
+    // `Recipe::C1Vec` (x87.c1) through `RegisterDump` materialization, then
+    // resumes and finishes matching Tier-0 bit-for-bit.
+    let fault_image = Image::loop_body(|a, head, _| {
+        for k in 0..4 {
+            a.fld(dword_ptr(esp + 0x20 + k * 4)).unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fadd(dword_ptr(esp + 0x40 + k * 4)).unwrap();
+            if k == 2 {
+                a.mov(edx, dword_ptr(esi)).unwrap();
+                a.mov(dword_ptr(edx), eax).unwrap();
+            }
+            a.fnstcw(word_ptr(esp + 0x14)).unwrap();
+            a.movzx(eax, word_ptr(esp + 0x14)).unwrap();
+            a.or(eax, 0xc00).unwrap();
+            a.mov(word_ptr(esp + 0x16), ax).unwrap();
+            a.fldcw(word_ptr(esp + 0x16)).unwrap();
+            a.fistp(dword_ptr(esp + 0x10)).unwrap();
+            a.fldcw(word_ptr(esp + 0x14)).unwrap();
+            a.mov(eax, dword_ptr(esp + 0x10)).unwrap();
+            a.mov(dword_ptr(edi + k * 4), eax).unwrap();
+        }
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(dword_ptr(esp + 0x18)).unwrap();
+        a.fld(dword_ptr(esp + 0x18)).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 16).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    let init_fault_mem = |m: &mut adv_cpu_core::Memory| {
+        init_mem(m);
+        // Iter 0 stores to DATA+0x200 (disjoint from frame); iter 1 stores to
+        // FRAME+0x38 (inside frame range [0x10..0x50), without corrupting the
+        // f32 inputs at 0x20..0x2c or 0x40..0x4c) -> triggers in-body
+        // `FrameDisjoint` mid-channel 2, then iters 2..7 re-enter resident!
+        let addrs = [
+            DATA + 0x200,
+            FRAME + 0x38,
+            DATA + 0x204,
+            DATA + 0x208,
+            DATA + 0x20c,
+            DATA + 0x210,
+            DATA + 0x214,
+            DATA + 0x218,
+        ];
+        for (i, addr) in addrs.into_iter().enumerate() {
+            m.write(DATA + i as u32 * 4, &addr.to_le_bytes()).unwrap();
+        }
+    };
+    let mut trial = Trial::new(
+        &fault_image,
+        &state,
+        "PC=24 4-ch SLP cold exit",
+        &[],
+        init_fault_mem,
+    );
+    assert!(trial.try_install_at(state));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(native.diagnostics.resident_cold_exits > 0);
+}
+
 // spec: A64-OPT-9, A64F-FP-5, A64-MEM-7
 #[test]
 fn seeded_scalar_sse_memory_forms_cross_a_page() {

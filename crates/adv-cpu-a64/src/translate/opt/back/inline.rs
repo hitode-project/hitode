@@ -947,8 +947,13 @@ fn numeric(location: Location<Host>) -> Host {
     match location {
         Location::At(host) | Location::Recipe(Recipe::Eflags(host)) => host,
         Location::Constant(bits) => Host::Constant(u128::from(bits)),
-        Location::Recipe(Recipe::C1 { .. } | Recipe::C1Fma { .. }) => {
-            unreachable!("C1 has its own emission")
+        Location::Recipe(
+            Recipe::C1 { .. }
+            | Recipe::C1Fma { .. }
+            | Recipe::VecLane { .. }
+            | Recipe::C1Vec { .. },
+        ) => {
+            unreachable!("recipe has its own or cold-only emission")
         }
     }
 }
