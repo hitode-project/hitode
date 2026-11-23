@@ -275,6 +275,9 @@ impl Model {
                 if let Some(p) = frame_offset(mem, offsets) {
                     overwrite(self, p, width);
                     let byte = |b: i32| {
+                        if b >= 4 {
+                            return None;
+                        }
                         let k = (known >> (b * 8)) as u8;
                         (k != 0).then_some(((bits >> (b * 8)) as u8 & k, k))
                     };
