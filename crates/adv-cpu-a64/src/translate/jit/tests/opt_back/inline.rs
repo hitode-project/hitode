@@ -308,7 +308,7 @@ fn opt_inline_exit_equivalence() {
     assumed.x87 = true;
     for op in [FpOp::Add, FpOp::Sub, FpOp::Mul, FpOp::Div] {
         let mut f = f.clone();
-        let v = f.push(b, Op::Fp(op, p[0], p[1])).unwrap();
+        let v = f.push(b, Op::Fp(op, p[0], p[1], false)).unwrap();
         f.push(b, Op::Validate);
         let exit = finish(&mut f, b, v);
         f.records[exit.0 as usize].x87.as_mut().unwrap().c1 = Some(Location::Recipe(Recipe::C1 {

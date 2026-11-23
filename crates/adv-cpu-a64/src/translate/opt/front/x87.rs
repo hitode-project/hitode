@@ -152,6 +152,7 @@ impl Front<'_> {
                     width,
                     rounding,
                     integer,
+                    proved: false,
                 });
                 let mem = x.mem.ok_or(Reject::Unsupported(self.index))?;
                 self.write(mem, width, stored)?;
@@ -214,9 +215,9 @@ impl Front<'_> {
                 let (a, b) = if reverse { (b, a) } else { (a, b) };
                 let op = model::fp(op);
                 let result = self.value(if single {
-                    Op::X87Single(op, a, b)
+                    Op::X87Single(op, a, b, 0)
                 } else {
-                    Op::Fp(op, a, b)
+                    Op::Fp(op, a, b, false)
                 });
                 let slot = (self.state.top + dest) & 7;
                 self.state.x87[slot as usize] = Some(result);
@@ -293,6 +294,7 @@ impl Front<'_> {
                     bits,
                     denormal: !self.assumed.denormal,
                     single: false,
+                    proved: false,
                 }))
             }
             Operand::F32 => {
@@ -302,6 +304,7 @@ impl Front<'_> {
                     bits,
                     denormal: !self.assumed.denormal,
                     single: true,
+                    proved: false,
                 }))
             }
             Operand::I32 => self.integer_load(mem.ok_or(Reject::Unsupported(self.index))?, 4),

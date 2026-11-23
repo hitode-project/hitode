@@ -1,5 +1,6 @@
 //! Propagation removes frame traffic and mode tests; liveness keeps only values
 //! read by execution or recovery. Floating operations remain until validation.
+mod fp_range;
 mod head_flags;
 use super::{
     BTreeMap, Block, ESP, End, Facts, FlagKind, Func, Head, IntOp, IntUnary, IrRecord, Location, M,
@@ -24,6 +25,8 @@ pub(super) fn run(
     facts: &dyn Facts,
     loads: &BTreeMap<Value, usize>,
     stores: &BTreeMap<RecordId, usize>,
+    written_frame: &std::collections::BTreeSet<i32>,
+    frame_hoist_safe: bool,
     mut resident: Option<&mut Resident<'_>>,
 ) {
     if let Some(i) = func.entry.iter().position(|s| *s == Source::Eflags) {
@@ -79,6 +82,12 @@ pub(super) fn run(
             }
         }
     }
+    if hoist_frame_loads(func, written_frame, frame_hoist_safe) {
+        while propagate(func) {}
+    }
+    if fp_range::run(func) {
+        while propagate(func) {}
+    }
     join(func);
     group_stores(func, facts, loads, stores, resident.is_some());
     sse_inputs(func);
@@ -113,8 +122,8 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::X87Load { bits: a, .. }
         | Op::Test { flags: a, .. } => f(a),
         Op::Int(_, a, b)
-        | Op::Fp(_, a, b)
-        | Op::X87Single(_, a, b)
+        | Op::Fp(_, a, b, _)
+        | Op::X87Single(_, a, b, _)
         | Op::Fp32(_, a, b)
         | Op::SseFp64(_, a, b)
         | Op::Vec(_, a, b)
@@ -1506,9 +1515,26 @@ fn hoist_effect(op: Op) -> bool {
         )
 }
 
-/// Blocks that run on every iteration of a loop that encloses them: the
-/// loop head dominates them and they dominate one of its backedges.
-fn per_iteration(func: &Func, resident: bool) -> Vec<bool> {
+fn apply_aliases(func: &mut Func, alias: &[Value]) {
+    for block in &mut func.blocks {
+        for (_, op) in &mut block.insts {
+            map_op(op, alias);
+        }
+        if let End::Branch { cond, .. } = &mut block.end {
+            *cond = resolve(*cond, alias);
+        }
+        for target in targets_mut(&mut block.end) {
+            for arg in &mut target.args {
+                *arg = resolve(*arg, alias);
+            }
+        }
+    }
+    for record in &mut func.records {
+        map_record(record, alias);
+    }
+}
+
+fn dominators(func: &Func) -> Vec<Vec<u64>> {
     let count = func.blocks.len();
     let words = count.div_ceil(64);
     let mut predecessors = vec![Vec::new(); count];
@@ -1517,29 +1543,333 @@ fn per_iteration(func: &Func, resident: bool) -> Vec<bool> {
             predecessors[t.block.0 as usize].push(b);
         }
     }
-    let has = |set: &[u64], b: usize| set[b / 64] >> (b % 64) & 1 != 0;
-    let mut dominators = vec![vec![u64::MAX; words]; count];
-    dominators[0] = vec![0; words];
-    dominators[0][0] = 1;
+    let mut dom = vec![vec![u64::MAX; words]; count];
+    dom[0] = vec![0; words];
+    dom[0][0] = 1;
     loop {
         let mut changed = false;
         for b in 1..count {
             let mut set = vec![u64::MAX; words];
             for &p in &predecessors[b] {
-                for (s, d) in set.iter_mut().zip(&dominators[p]) {
+                for (s, d) in set.iter_mut().zip(&dom[p]) {
                     *s &= d;
                 }
             }
             set[b / 64] |= 1 << (b % 64);
-            if set != dominators[b] {
-                dominators[b] = set;
+            if set != dom[b] {
+                dom[b] = set;
                 changed = true;
             }
         }
         if !changed {
-            break;
+            return dom;
         }
     }
+}
+
+/// Hoist unit-invariant `X87Load`s (from `Block(0)` values or invariant
+/// `FrameLoad`s) and direct `F64` frame loads out of loops into `Block(0)`,
+/// budgeting hoisted `F64` values against allocatable vector registers rather
+/// than `CARRIED` GPRs.
+fn hoist_frame_loads(
+    func: &mut Func,
+    written_frame: &std::collections::BTreeSet<i32>,
+    frame_hoist_safe: bool,
+) -> bool {
+    if func.blocks.len() <= 1 {
+        return false;
+    }
+    let dom = dominators(func);
+    let has = |set: &[u64], b: usize| set[b / 64] >> (b % 64) & 1 != 0;
+    let count = func.blocks.len();
+    let mut every_iter = vec![false; count];
+    let mut has_backedge = false;
+    for (latch, data) in func.blocks.iter().enumerate() {
+        for head in data.end.targets().map(|t| t.block.0 as usize) {
+            if !has(&dom[latch], head) {
+                continue;
+            }
+            has_backedge = true;
+            for b in 0..count {
+                every_iter[b] |= has(&dom[b], head) && has(&dom[latch], b);
+            }
+        }
+    }
+    if !has_backedge {
+        return false;
+    }
+    let exits: Vec<usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(b, data)| matches!(data.end, End::Exit(_)).then_some(b))
+        .collect();
+    let runs_on_entry = |b: usize| exits.iter().all(|&e| has(&dom[e], b));
+
+    let insert_pos = func.blocks[0]
+        .insts
+        .iter()
+        .position(|(_, op)| matches!(op, Op::FrameStore { .. } | Op::Store { .. }))
+        .unwrap_or(func.blocks[0].insts.len());
+    let last_plain = func.blocks[0]
+        .insts
+        .iter()
+        .rposition(|(_, op)| matches!(op, Op::PlainPage { .. }))
+        .map_or(0, |i| i + 1);
+    if insert_pos < last_plain {
+        return false;
+    }
+    let mut block0_defs = vec![false; func.types.len()];
+    for &p in &func.blocks[0].params {
+        block0_defs[p.0 as usize] = true;
+    }
+    for &(r, _) in &func.blocks[0].insts[..insert_pos] {
+        if let Some(r) = r {
+            block0_defs[r.0 as usize] = true;
+        }
+    }
+
+    let can_hoist_frame =
+        frame_hoist_safe && (!func.resident || func.entry.contains(&Source::Reg(ESP)));
+    let mut written = written_frame.clone();
+    if can_hoist_frame {
+        for block in &func.blocks {
+            for &(_, op) in &block.insts {
+                if let Op::FrameStore { offset, value, .. } = op {
+                    let width = if func.ty(value) == Type::I32 { 4 } else { 8 };
+                    written.extend(offset..offset + width);
+                }
+            }
+        }
+    }
+
+    let mut use_count = vec![0usize; func.types.len()];
+    for block in &func.blocks {
+        for &(_, op) in &block.insts {
+            for v in op.uses() {
+                use_count[v.0 as usize] += 1;
+            }
+        }
+        if let End::Branch { cond, .. } = block.end {
+            use_count[cond.0 as usize] += 1;
+        }
+        for t in block.end.targets() {
+            for &v in &t.args {
+                use_count[v.0 as usize] += 1;
+            }
+        }
+    }
+    for record in &func.records {
+        for v in record.uses() {
+            use_count[v.0 as usize] += 1;
+        }
+    }
+
+    // Map eligible invariant FrameLoads in blocks 1.. to their op.
+    let mut frame_loads = BTreeMap::<Value, (Type, Value, i32)>::new();
+    if can_hoist_frame {
+        for (b, block) in func.blocks.iter().enumerate().skip(1) {
+            if !every_iter[b] {
+                continue;
+            }
+            for &(r, op) in &block.insts {
+                if let (Some(r), Op::FrameLoad { ty, base, offset }) = (r, op)
+                    && block0_defs[base.0 as usize]
+                {
+                    let width = if ty == Type::I32 { 4 } else { 8 };
+                    if (offset..offset + width).all(|o| !written.contains(&o)) {
+                        frame_loads.insert(r, (ty, base, offset));
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect eligible X87Load users of invariant FrameLoads and of Block(0) values.
+    let mut x87_users = BTreeMap::<Value, Vec<(Value, bool, bool, bool)>>::new();
+    let mut block0_x87 = Vec::<(Value, Value, bool, bool, bool)>::new();
+    for (b, block) in func.blocks.iter().enumerate().skip(1) {
+        if !every_iter[b] {
+            continue;
+        }
+        for &(r, op) in &block.insts {
+            if let (
+                Some(r),
+                Op::X87Load {
+                    bits,
+                    denormal,
+                    single,
+                    proved,
+                },
+            ) = (r, op)
+                && (proved || runs_on_entry(b))
+            {
+                if block0_defs[bits.0 as usize] {
+                    block0_x87.push((r, bits, denormal, single, proved));
+                } else if frame_loads.contains_key(&bits) {
+                    x87_users
+                        .entry(bits)
+                        .or_default()
+                        .push((r, denormal, single, proved));
+                }
+            }
+        }
+    }
+
+    if block0_x87.is_empty() && frame_loads.is_empty() {
+        return false;
+    }
+
+    let has_packed_sse = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|(_, op)| matches!(op, Op::SseInput { packed: true, .. }));
+    let vec_budget: usize = if has_packed_sse { 18 } else { 22 };
+    let carried_vec = func
+        .blocks
+        .iter()
+        .skip(1)
+        .filter(|b| b.head.is_some())
+        .map(|b| {
+            b.params
+                .iter()
+                .filter(|v| {
+                    matches!(func.ty(**v), Type::F64 | Type::V128) && use_count[v.0 as usize] > 0
+                })
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    let mut remaining_vecs = vec_budget.saturating_sub(carried_vec);
+    if remaining_vecs == 0 {
+        return false;
+    }
+
+    let mut hoisted_fl = BTreeMap::<(u8, Value, i32), Value>::new();
+    let mut hoisted_xl = BTreeMap::<(Value, bool, bool), Value>::new();
+    let mut alias: Vec<Value> = (0..func.types.len()).map(|i| Value(i as u32)).collect();
+    let mut moved = Vec::<(Option<Value>, Op)>::new();
+    let mut remove = std::collections::BTreeSet::<Value>::new();
+
+    // First hoist X87Loads whose raw bits are already defined in Block(0)
+    // (such as Source::Frame parameters or hoisted Loads).
+    for (xl, bits, denormal, single, proved) in block0_x87 {
+        let xkey = (bits, denormal, single);
+        if let Some(&existing) = hoisted_xl.get(&xkey) {
+            alias[xl.0 as usize] = existing;
+            remove.insert(xl);
+        } else if remaining_vecs > 0 {
+            remaining_vecs -= 1;
+            hoisted_xl.insert(xkey, xl);
+            moved.push((
+                Some(xl),
+                Op::X87Load {
+                    bits,
+                    denormal,
+                    single,
+                    proved,
+                },
+            ));
+            remove.insert(xl);
+        }
+    }
+
+    // Next hoist invariant FrameLoad (+ X87Load) pairs from blocks 1...
+    for (b, block) in func.blocks.iter().enumerate().skip(1) {
+        if !every_iter[b] {
+            continue;
+        }
+        for &(r, op) in &block.insts {
+            let Some(fl) = r else { continue };
+            let Op::FrameLoad { ty, base, offset } = op else {
+                continue;
+            };
+            if !frame_loads.contains_key(&fl) {
+                continue;
+            }
+            let key = (ty as u8, base, offset);
+            if ty == Type::F64 {
+                if let Some(&existing) = hoisted_fl.get(&key) {
+                    alias[fl.0 as usize] = existing;
+                    remove.insert(fl);
+                } else if remaining_vecs > 0 {
+                    remaining_vecs -= 1;
+                    hoisted_fl.insert(key, fl);
+                    moved.push((Some(fl), op));
+                    remove.insert(fl);
+                }
+                continue;
+            }
+            let Some(users) = x87_users.get(&fl) else {
+                continue;
+            };
+            if users.len() != use_count[fl.0 as usize] {
+                continue;
+            }
+            // Count how many new vector registers all users of this FrameLoad need.
+            let existing_fl = hoisted_fl.get(&key).copied();
+            let mut new_keys = std::collections::BTreeSet::new();
+            for &(_, denormal, single, _) in users {
+                if existing_fl.is_none_or(|cfl| !hoisted_xl.contains_key(&(cfl, denormal, single)))
+                {
+                    new_keys.insert((denormal, single));
+                }
+            }
+            if new_keys.len() > remaining_vecs {
+                continue;
+            }
+            let canon_fl = if let Some(existing) = existing_fl {
+                remove.insert(fl);
+                existing
+            } else {
+                hoisted_fl.insert(key, fl);
+                moved.push((Some(fl), op));
+                remove.insert(fl);
+                fl
+            };
+            for &(xl, denormal, single, proved) in users {
+                let xkey = (canon_fl, denormal, single);
+                if let Some(&existing) = hoisted_xl.get(&xkey) {
+                    alias[xl.0 as usize] = existing;
+                    remove.insert(xl);
+                } else {
+                    remaining_vecs -= 1;
+                    hoisted_xl.insert(xkey, xl);
+                    moved.push((
+                        Some(xl),
+                        Op::X87Load {
+                            bits: canon_fl,
+                            denormal,
+                            single,
+                            proved,
+                        },
+                    ));
+                    remove.insert(xl);
+                }
+            }
+        }
+    }
+
+    if moved.is_empty() && remove.is_empty() {
+        return false;
+    }
+    func.blocks[0].insts.splice(insert_pos..insert_pos, moved);
+    for block in &mut func.blocks[1..] {
+        block
+            .insts
+            .retain(|(r, _)| r.is_none_or(|r| !remove.contains(&r)));
+    }
+    apply_aliases(func, &alias);
+    true
+}
+
+/// Blocks that run on every iteration of a loop that encloses them: the
+/// loop head dominates them and they dominate one of its backedges.
+fn per_iteration(func: &Func, resident: bool) -> Vec<bool> {
+    let count = func.blocks.len();
+    let has = |set: &[u64], b: usize| set[b / 64] >> (b % 64) & 1 != 0;
+    let dominators = dominators(func);
     if resident {
         let mut required = Vec::new();
         let mut has_backedge = false;

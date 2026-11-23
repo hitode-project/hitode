@@ -4038,7 +4038,7 @@ pub(in crate::translate) mod opt_back {
         let mut h = harness();
         for op in [FpOp::Add, FpOp::Sub, FpOp::Mul, FpOp::Div] {
             let (mut f, b, p, _) = start(&[Type::F64, Type::F64]);
-            let v = f.push(b, Op::Fp(op, p[0], p[1])).unwrap();
+            let v = f.push(b, Op::Fp(op, p[0], p[1], false)).unwrap();
             f.push(b, Op::Validate);
             finish(&mut f, b, v);
             for (a, b) in [
@@ -4492,7 +4492,7 @@ pub(in crate::translate) mod opt_back {
         f.records[entry.0 as usize].x87.as_mut().unwrap().valid = 3;
         f.records[entry.0 as usize].x87.as_mut().unwrap().stack[0] = Some(Location::At(p[0]));
         f.records[entry.0 as usize].x87.as_mut().unwrap().stack[1] = Some(Location::At(p[1]));
-        let v = f.push(b, Op::Fp(FpOp::Mul, p[0], p[1])).unwrap();
+        let v = f.push(b, Op::Fp(FpOp::Mul, p[0], p[1], false)).unwrap();
         f.push(b, Op::Validate);
         finish(&mut f, b, v);
         for (x, y) in [
@@ -4523,6 +4523,7 @@ pub(in crate::translate) mod opt_back {
                         bits: p[0],
                         denormal,
                         single: false,
+                        proved: false,
                     },
                 )
                 .unwrap();
@@ -4548,6 +4549,7 @@ pub(in crate::translate) mod opt_back {
                         bits: p[0],
                         denormal: false,
                         single: true,
+                        proved: false,
                     },
                 )
                 .unwrap();
@@ -4582,6 +4584,143 @@ pub(in crate::translate) mod opt_back {
             for (n, d) in [(123, 0), (u64::MAX, 1), (i64::MIN as u64, u32::MAX)] {
                 compare(&f, &[u128::from(n), u128::from(d)], &mut h);
             }
+        }
+        // Proved x87 integer stores accept the full signed half-open range [-2^(8w-1), 2^(8w-1)),
+        // including exact lower bounds like FISTP m16(-32768), across all four rounding modes.
+        for (width, samples) in [
+            (2u8, vec![-32768.0, -32767.5, -1.5, -0.0, 0.0, 1.5, 32767.0]),
+            (
+                4,
+                vec![f64::from(i32::MIN), -2.5, -0.0, 2.5, f64::from(i32::MAX)],
+            ),
+            (
+                8,
+                vec![
+                    i64::MIN as f64,
+                    -100.25,
+                    -0.0,
+                    100.75,
+                    (i64::MAX - 1024) as f64,
+                ],
+            ),
+        ] {
+            for rounding in 0..4u8 {
+                let (mut f, b, p, _) = start(&[Type::F64]);
+                let v = f
+                    .push(
+                        b,
+                        Op::X87Store {
+                            value: p[0],
+                            width,
+                            rounding,
+                            integer: true,
+                            proved: true,
+                        },
+                    )
+                    .unwrap();
+                finish(&mut f, b, v);
+                for &x in &samples {
+                    let limit = (1u64 << (width * 8 - 1)) as f64;
+                    let r = match rounding {
+                        0 => x.round_ties_even(),
+                        1 => x.floor(),
+                        2 => x.ceil(),
+                        _ => x.trunc(),
+                    };
+                    if r >= -limit && r < limit {
+                        compare(&f, &[u128::from(x.to_bits())], &mut h);
+                    }
+                }
+            }
+        }
+        // Unproved and proved binary32 narrowing agree with eval on exp==1 (0x0080_0001).
+        for proved in [false, true] {
+            let (mut f, b, p, entry) = start(&[Type::F64]);
+            f.records[entry.0 as usize].x87.as_mut().unwrap().valid = 1;
+            f.records[entry.0 as usize].x87.as_mut().unwrap().stack[0] = Some(Location::At(p[0]));
+            let v = f
+                .push(
+                    b,
+                    Op::X87Store {
+                        value: p[0],
+                        width: 4,
+                        rounding: 0,
+                        integer: false,
+                        proved,
+                    },
+                )
+                .unwrap();
+            if !proved {
+                f.push(b, Op::Validate);
+            }
+            let exit = finish(&mut f, b, v);
+            let min_next = f64::from(f32::from_bits(0x0080_0001));
+            for (x, expect_exit) in [
+                (-0.0f64, true),
+                (1.5, true),
+                (min_next, proved),
+                (f64::from(f32::from_bits(0x0100_0000)), true),
+            ] {
+                let got = compare(&f, &[u128::from(x.to_bits())], &mut h);
+                assert_eq!(got.record, if expect_exit { exit } else { entry });
+            }
+        }
+        // Proved Op::Fp, Op::X87Load, and Op::X87Single match eval without validation checks.
+        for op in [FpOp::Add, FpOp::Sub, FpOp::Mul, FpOp::Div] {
+            let (mut f, b, p, _) = start(&[Type::F64, Type::F64]);
+            let v = f.push(b, Op::Fp(op, p[0], p[1], true)).unwrap();
+            finish(&mut f, b, v);
+            compare(
+                &f,
+                &[u128::from(3.5f64.to_bits()), u128::from(0.5f64.to_bits())],
+                &mut h,
+            );
+        }
+        for proved in [
+            0u8,
+            SINGLE_A,
+            SINGLE_A | SINGLE_B,
+            SINGLE_A | SINGLE_B | SINGLE_RESULT,
+            SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT,
+        ] {
+            let (mut f, b, p, _) = start(&[Type::F64, Type::F64]);
+            let v = f
+                .push(b, Op::X87Single(FpOp::Add, p[0], p[1], proved))
+                .unwrap();
+            if Op::X87Single(FpOp::Add, p[0], p[1], proved).floating() {
+                f.push(b, Op::Validate);
+            }
+            finish(&mut f, b, v);
+            compare(
+                &f,
+                &[
+                    u128::from(1.25f64.to_bits()),
+                    u128::from((-0.5f64).to_bits()),
+                ],
+                &mut h,
+            );
+        }
+        for single in [false, true] {
+            let ty = if single { Type::I32 } else { Type::I64 };
+            let (mut f, b, p, _) = start(&[ty]);
+            let v = f
+                .push(
+                    b,
+                    Op::X87Load {
+                        bits: p[0],
+                        denormal: true,
+                        single,
+                        proved: true,
+                    },
+                )
+                .unwrap();
+            finish(&mut f, b, v);
+            let bits = if single {
+                u128::from((-2.5f32).to_bits())
+            } else {
+                u128::from((-2.5f64).to_bits())
+            };
+            compare(&f, &[bits], &mut h);
         }
     }
 
@@ -4776,7 +4915,7 @@ pub(in crate::translate) mod opt_back {
         finish(&mut f, b, v);
         compare(&f, &params, &mut h);
         let (mut f, b, p, _) = start(&[Type::F64, Type::F64]);
-        let v = f.push(b, Op::Fp(FpOp::Div, p[0], p[1])).unwrap();
+        let v = f.push(b, Op::Fp(FpOp::Div, p[0], p[1], false)).unwrap();
         f.push(b, Op::Validate);
         let exit = finish(&mut f, b, v);
         f.records[exit.0 as usize].x87.as_mut().unwrap().c1 = Some(Location::Recipe(Recipe::C1 {
@@ -4974,7 +5113,7 @@ pub(in crate::translate) mod opt_back {
                 pc: 0,
             },
         );
-        let v = f.push(b, Op::Fp(FpOp::Mul, p[2], p[3])).unwrap();
+        let v = f.push(b, Op::Fp(FpOp::Mul, p[2], p[3], false)).unwrap();
         f.push(b, Op::Validate);
         finish(&mut f, b, v);
         let mut h = harness();
@@ -5318,7 +5457,7 @@ pub(in crate::translate) mod opt_back {
                 }),
             );
             let one = f.push(entry, Op::Constant(Type::I32, 1)).unwrap();
-            let total = f.push(head, Op::Fp(FpOp::Add, sum, p[1])).unwrap();
+            let total = f.push(head, Op::Fp(FpOp::Add, sum, p[1], false)).unwrap();
             f.push(head, Op::Validate);
             let next = f.push(head, Op::Int(IntOp::Sub, count, one)).unwrap();
             let done = f.block(None);

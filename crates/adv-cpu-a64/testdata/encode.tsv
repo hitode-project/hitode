@@ -238,6 +238,10 @@ d51b443f	msr fpsr, xzr
 9e600020	fcvtns x0, d1
 1e780020	fcvtzs w0, d1
 1e600020	fcvtns w0, d1
+9e700020	fcvtms x0, d1
+9e680020	fcvtps x0, d1
+1e700020	fcvtms w0, d1
+1e680020	fcvtps w0, d1
 5ac010c6	clz w6, w6
 5ac000e6	rbit w6, w7
 dac00230	rbit x16, x17

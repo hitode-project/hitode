@@ -135,6 +135,8 @@ struct Front<'a> {
     state: State,
     loads: BTreeMap<Value, usize>,
     stores: BTreeMap<RecordId, usize>,
+    /// Frame byte offsets (relative to `bias`) written by any frame store in the unit.
+    written_frame: std::collections::BTreeSet<i32>,
     pending_store: Option<(u8, Value, Value)>,
 }
 
@@ -673,6 +675,7 @@ fn build_trace(
         state: entry_state,
         loads: BTreeMap::new(),
         stores: BTreeMap::new(),
+        written_frame: std::collections::BTreeSet::new(),
         pending_store: None,
     };
     let entry = f.record(unit.trace.insts[0].pc, unit.trace.owed(0), Start::Entry(0));
@@ -811,11 +814,14 @@ fn build_trace(
         frame_range: frame.last().map(|&last| (bias, last + 1)),
         plain_sites: &mut plain_sites,
     });
+    let frame_hoist_safe = !write_through || (resident.is_some() && frame.last().is_some());
     passes::run(
         &mut f.func,
         pass_facts,
         &f.loads,
         &f.stores,
+        &f.written_frame,
+        frame_hoist_safe,
         resident.as_mut(),
     );
     if let Some(b) = (1..f.func.blocks.len()).find(|&b| {
@@ -983,6 +989,8 @@ impl Front<'_> {
     }
     fn write(&mut self, mem: Mem, width: u8, value: Value) -> Result<(), Reject> {
         if let Some(offset) = self.frame_offset(mem) {
+            self.written_frame
+                .extend((offset - self.bias)..(offset - self.bias + i32::from(width)));
             if self.write_through {
                 let addr = self.address(mem)?;
                 self.pending_store = Some((width, addr, value));

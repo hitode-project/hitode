@@ -181,6 +181,13 @@ impl FlagKind {
     }
 }
 
+/// Proof bits for [`Op::X87Single`].
+pub(crate) const SINGLE_A: u8 = 1;
+pub(crate) const SINGLE_B: u8 = 2;
+pub(crate) const SINGLE_RESULT: u8 = 4;
+/// Binary64 arithmetic matches binary32 bit-for-bit (implies `SINGLE_A | SINGLE_B | SINGLE_RESULT`).
+pub(crate) const SINGLE_EXACT: u8 = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
     Constant(Type, u128),
@@ -230,9 +237,10 @@ pub(crate) enum Op {
         to: Type,
         value: Value,
     },
-    Fp(FpOp, Value, Value),
-    /// x87 precision 24 when both inputs are exact in binary32.
-    X87Single(FpOp, Value, Value),
+    /// Binary64 x87 arithmetic; when `proved`, inputs and result cannot fail.
+    Fp(FpOp, Value, Value, bool),
+    /// x87 precision 24 when both inputs are exact in binary32; `proved` carries `SINGLE_*` bits.
+    X87Single(FpOp, Value, Value, u8),
     Fp32(FpOp, Value, Value),
     SseFp64(FpOp, Value, Value),
     FpUnary(FpUnary, Value),
@@ -245,11 +253,14 @@ pub(crate) enum Op {
         sse: bool,
     },
     /// Round to a signed integer or binary32 under an x87 control word.
+    /// When `proved`, an integer store fits in `[-2^(8*width-1), 2^(8*width-1))`
+    /// and a binary32 store cannot overflow or underflow.
     X87Store {
         value: Value,
         width: u8,
         rounding: u8,
         integer: bool,
+        proved: bool,
     },
     /// Whether a checked store increased the magnitude of its operand.
     X87StoreC1 {
@@ -328,11 +339,13 @@ pub(crate) enum Op {
         value: Value,
     },
     /// The x87 reading of binary64 bits, or of binary32 bits widened
-    /// exactly when `single`. Fails on NaN and, when `denormal`, subnormals.
+    /// exactly when `single`. Fails on NaN and, when `denormal`, subnormals,
+    /// unless `proved`.
     X87Load {
         bits: Value,
         denormal: bool,
         single: bool,
+        proved: bool,
     },
     /// Checks raw SSE lanes for denormals when MXCSR.DE is clear.
     SseInput {
@@ -370,8 +383,8 @@ impl Op {
             | Op::X87Load { bits: a, .. }
             | Op::Test { flags: a, .. } => [Some(a), None, None],
             Op::Int(_, a, b)
-            | Op::Fp(_, a, b)
-            | Op::X87Single(_, a, b)
+            | Op::Fp(_, a, b, _)
+            | Op::X87Single(_, a, b, _)
             | Op::Fp32(_, a, b)
             | Op::SseFp64(_, a, b)
             | Op::Vec(_, a, b)
@@ -408,12 +421,16 @@ impl Op {
     /// Whether the operation requires validation before an effect point.
     pub(crate) fn floating(&self) -> bool {
         match *self {
-            Op::Fp(..)
-            | Op::X87Single(..)
-            | Op::Fp32(..)
+            Op::Fp(_, _, _, proved) => !proved,
+            Op::X87Single(_, _, _, proved) => {
+                proved & SINGLE_EXACT == 0
+                    && proved & (SINGLE_A | SINGLE_B | SINGLE_RESULT)
+                        != (SINGLE_A | SINGLE_B | SINGLE_RESULT)
+            }
+            Op::Fp32(..)
             | Op::SseFp64(..)
             | Op::ToInt { .. }
-            | Op::X87Store { .. }
+            | Op::X87Store { proved: false, .. }
             | Op::Vec(VecOp::LessF64, ..) => true,
             Op::Flags { kind, .. } => kind.floating(),
             _ => false,
@@ -431,7 +448,7 @@ impl Op {
                     | Op::FrameDisjoint { .. }
                     | Op::Load { .. }
                     | Op::Store { .. }
-                    | Op::X87Load { .. }
+                    | Op::X87Load { proved: false, .. }
                     | Op::SseInput { .. }
             )
     }

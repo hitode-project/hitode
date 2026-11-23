@@ -9,8 +9,8 @@ use adv_cpu_core::Memory;
 use adv_cpu_core::integer::{self, CF, OF, PF, ZF};
 
 use super::ir::{
-    Block, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, RecordId, Type, Value, VecOp,
-    VecToInt, VecUnary,
+    Block, End, FlagKind, FpOp, FpUnary, Func, IntOp, IntUnary, Op, RecordId, SINGLE_EXACT,
+    SINGLE_RESULT, Type, Value, VecOp, VecToInt, VecUnary,
 };
 use super::recovery::{Location, Recipe};
 
@@ -169,8 +169,8 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 Type::Flags => unreachable!("no reinterpretation as flags"),
             }
         }
-        Op::Fp(op, a, b) | Op::SseFp64(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
-        Op::X87Single(op, a, b) => {
+        Op::Fp(op, a, b, _) | Op::SseFp64(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
+        Op::X87Single(op, a, b, proved) => {
             let (a, b) = (f(a), f(b));
             let (sa, sb) = (a as f32, b as f32);
             if f64::from(sa) != a || f64::from(sb) != b {
@@ -187,10 +187,29 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 {
                     return None;
                 }
-            } else if !r.is_normal() || r.abs() == f32::MIN_POSITIVE {
+            } else if !r.is_normal() {
+                return None;
+            } else if proved & (SINGLE_RESULT | SINGLE_EXACT) == 0 {
+                // Unproved backend excludes the entire exp == 1 binade (< 2^-125).
+                if r.abs() < f32::from_bits(0x0100_0000) {
+                    return None;
+                }
+            } else if r.abs() == f32::MIN_POSITIVE {
                 return None;
             }
-            float(f64::from(r))?
+            let widened = f64::from(r);
+            if proved & SINGLE_EXACT != 0 {
+                let d = match op {
+                    FpOp::Add => a + b,
+                    FpOp::Sub => a - b,
+                    FpOp::Mul => a * b,
+                    FpOp::Div => a / b,
+                };
+                if d.to_bits() != widened.to_bits() {
+                    return None;
+                }
+            }
+            float(widened)?
         }
         Op::Fp32(op, a, b) => {
             let a = f32::from_bits(get(a) as u32);
@@ -249,6 +268,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             width,
             rounding,
             integer,
+            proved,
         } => {
             let value = f(value);
             if integer {
@@ -259,7 +279,12 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                     _ => value.trunc(),
                 };
                 let limit = (1u64 << (width * 8 - 1)) as f64;
-                if !rounded.is_finite() || rounded.abs() >= limit {
+                let out_of_range = if proved {
+                    !rounded.is_finite() || rounded < -limit || rounded >= limit
+                } else {
+                    !rounded.is_finite() || rounded.abs() >= limit
+                };
+                if out_of_range {
                     return None;
                 }
                 let n = rounded as i64;
@@ -270,7 +295,16 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 }
             } else {
                 let rounded = value as f32;
-                if value != 0.0 && (!rounded.is_normal() || rounded.abs() == f32::MIN_POSITIVE) {
+                let bad = if proved {
+                    value != 0.0
+                        && (!rounded.is_normal()
+                            || rounded.abs() == f32::MIN_POSITIVE && f64::from(rounded) != value)
+                } else {
+                    // Unproved backend checks exp in 2..=254, excluding exp == 1 (< 2^-125).
+                    value != 0.0
+                        && (!rounded.is_normal() || rounded.abs() < f32::from_bits(0x0100_0000))
+                };
+                if bad {
                     return None;
                 }
                 u128::from(rounded.to_bits())
@@ -355,6 +389,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             bits,
             denormal,
             single,
+            ..
         } => {
             let (x, tiny) = if single {
                 let x = f32::from_bits(get(bits) as u32);
@@ -975,7 +1010,7 @@ mod tests {
         let y = f.param(b, Type::F64);
         let addr = f.param(b, Type::I32);
         f.entry = vec![Source::X87(0), Source::X87(1), Source::Reg(7)];
-        let p = f.push(b, Op::Fp(FpOp::Mul, x, y)).unwrap();
+        let p = f.push(b, Op::Fp(FpOp::Mul, x, y, false)).unwrap();
         f.push(b, Op::Validate);
         f.push(
             b,
@@ -1070,6 +1105,7 @@ mod tests {
                 bits: raw,
                 denormal: true,
                 single: false,
+                proved: false,
             },
         );
         f.end(b, End::Exit(exit));

@@ -2648,3 +2648,427 @@ fn c1_merges_compact_constants_and_accept_value_with_round() {
         });
     }
 }
+
+// spec: A64-OPT-3, A64-OPT-9
+#[test]
+fn resident_hoists_invariant_x87_frame_loads_with_vector_budget() {
+    // 10 invariant x87 frame loads (> CARRIED GPRs) after an indexed store
+    // (write_through = true, protected by FrameDisjoint), plus one written frame
+    // slot that must stay inside the loop.
+    let code = resident_loop(|a| {
+        a.mov(dword_ptr(edi + ecx * 4), eax).unwrap();
+        for k in 0..5i32 {
+            a.fld(qword_ptr(esp + 0x20 + 8 * k)).unwrap();
+            a.fadd(dword_ptr(esp + 0x60 + 4 * k)).unwrap();
+            a.faddp(st1, st0).unwrap();
+        }
+        a.fstp(dword_ptr(esp + 0x90)).unwrap();
+        a.fld(dword_ptr(esp + 0x90)).unwrap();
+    });
+    let unit = resident_unit(&code);
+    let mut at = initial();
+    at.regs[1] = 3;
+    at.x87.status = 0x20;
+    at.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+    let built = build_with(&unit, None, &at, &|_| false, &|_| false).unwrap();
+
+    // Every invariant FrameLoad + X87Load (5 f64 + 5 f32) moves into Block(0),
+    // leaving only the written cell's X87Load inside the loop body.
+    let block0_x87 = built.func.blocks[0]
+        .insts
+        .iter()
+        .filter(|(_, op)| matches!(op, Op::X87Load { .. }))
+        .count();
+    let body_frame_loads: usize = built.func.blocks[1..]
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|(_, op)| matches!(op, Op::FrameLoad { .. }))
+        .count();
+    assert_eq!(block0_x87, 10);
+    assert_eq!(body_frame_loads, 0);
+    for &(res, op) in &built.func.blocks[0].insts {
+        if matches!(op, Op::X87Load { .. }) {
+            let val = res.unwrap();
+            assert!(
+                built.func.cold_pcs.contains_key(&val),
+                "hoisted X87Load must preserve its original cold_pc"
+            );
+        }
+    }
+
+    let init_memory = |nan_slot: bool| {
+        let mut memory = resident_memory();
+        for k in 0..5u32 {
+            let d = if nan_slot && k == 2 {
+                f64::NAN
+            } else {
+                f64::from(k + 1)
+            };
+            let s = f32::from((k + 1) as u8) * 0.5;
+            memory
+                .write(FRAME + 0x20 + 8 * k, &d.to_le_bytes())
+                .unwrap();
+            memory
+                .write(FRAME + 0x60 + 4 * k, &s.to_le_bytes())
+                .unwrap();
+        }
+        memory
+    };
+
+    // Normal execution: 3 iterations * sum_{k=1..=5}(k + 0.5*k) = 3 * 22.5 = 67.5.
+    let mut memory = init_memory(false);
+    let run = eval::run(
+        &built.func,
+        &params(&built.func, &at, &mut memory),
+        &mut memory,
+        1000,
+    );
+    let eval::Outcome::Exit(id) = run.outcome else {
+        panic!("expected normal exit, got {:?}", run.outcome);
+    };
+    let x87 = built.func.records[id.0 as usize].x87.as_ref().unwrap();
+    let top_val = eval::locate(x87.stack[x87.top as usize].as_ref().unwrap(), &run.values);
+    assert_eq!(f64::from_bits(top_val as u64), 67.5);
+
+    // NaN in a hoisted frame slot fails cleanly to RecordId(0) before any store.
+    let mut memory = init_memory(true);
+    let run = eval::run(
+        &built.func,
+        &params(&built.func, &at, &mut memory),
+        &mut memory,
+        1000,
+    );
+    assert_eq!(run.outcome, eval::Outcome::Fail(RecordId(0)));
+
+    // Indexed store aliasing the frame triggers FrameDisjoint before modifying it.
+    let mut alias_at = at.clone();
+    alias_at.regs[7] = FRAME + 0x20;
+    let mut memory = init_memory(false);
+    let run = eval::run(
+        &built.func,
+        &params(&built.func, &alias_at, &mut memory),
+        &mut memory,
+        1000,
+    );
+    assert!(matches!(run.outcome, eval::Outcome::Fail(_)));
+    let mut untouched = [0u8; 8];
+    memory.read_into(FRAME + 0x20, &mut untouched).unwrap();
+    assert_eq!(f64::from_le_bytes(untouched), 1.0);
+
+    // Beyond CARRIED (>20 live GPRs + frame cells), cells are not Block(0)
+    // Source::Frame parameters; they emit FrameLoad + X87Load in the loop, and
+    // hoisting moves both into Block(0) under the vector register budget.
+    let overflow_carried = resident_loop(|a| {
+        a.mov(dword_ptr(edi + ecx * 4), eax).unwrap();
+        for k in 0..8i32 {
+            a.fld(qword_ptr(esp + 0x20 + 8 * k)).unwrap();
+            a.fadd(dword_ptr(esp + 0x60 + 4 * k)).unwrap();
+            a.faddp(st1, st0).unwrap();
+        }
+        for k in 0..5i32 {
+            a.add(eax, dword_ptr(esp + 0xa0 + 4 * k)).unwrap();
+        }
+    });
+    let unit2 = resident_unit(&overflow_carried);
+    let built2 = build_with(&unit2, None, &at, &|_| false, &|_| false).unwrap();
+    let block0_xl = built2.func.blocks[0]
+        .insts
+        .iter()
+        .filter(|(_, op)| matches!(op, Op::X87Load { .. }))
+        .count();
+    let body_xl: usize = built2.func.blocks[1..]
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|(_, op)| matches!(op, Op::X87Load { .. }))
+        .count();
+    let body_fl: usize = built2.func.blocks[1..]
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|(_, op)| matches!(op, Op::FrameLoad { .. }))
+        .count();
+    assert_eq!(block0_xl, 16);
+    assert_eq!(body_xl, 0);
+    assert_eq!(body_fl, 0);
+}
+
+// spec: A64-OPT-4, A64F-FP-3
+#[test]
+fn fp_range_binary32_store_reload_and_adversarial_bounds() {
+    // 1) Step 1.2A: unknown st(0) narrowed to frame m32 and reloaded proves X87Load
+    // without folding away the rounding or proving X87Store.
+    let step_a = assemble(|a| {
+        row(a, |a| {
+            a.fstp(dword_ptr(esp + 0x10)).unwrap();
+            a.fld(dword_ptr(esp + 0x10)).unwrap();
+            a.fst(qword_ptr(edi)).unwrap();
+        })
+    });
+    for (val, expect_fail) in [
+        (1.5f64, false),
+        (-0.0, false),
+        (1.0 + 2.0f64.powi(-30), false),
+        (f64::from(f32::from_bits(1)), true),
+    ] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        at.x87.push(adv_cpu_core::floating::fast::extended(val));
+        let built = compare(&step_a, &at, |_| {}, expect_fail);
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::X87Load { proved: true, .. })),
+            1
+        );
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::X87Store { proved: false, .. }
+            )),
+            1
+        );
+    }
+
+    // 2) Step 1.2B: proved finite exact normal-or-zero f32 folds X87Load(X87Store(v)) -> v
+    // (preserving -0.0) and X87StoreC1 -> 0.
+    let step_b = assemble(|a| {
+        row(a, |a| {
+            a.movzx(eax, byte_ptr(esi)).unwrap();
+            a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+            a.fild(dword_ptr(esp + 0x10)).unwrap();
+            a.fchs().unwrap();
+            a.fstp(dword_ptr(esp + 0x14)).unwrap();
+            a.fld(dword_ptr(esp + 0x14)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    for byte in [0u8, 1, 255] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = differential(&step_b, &at, |m| {
+            m.write(DATA, &[byte]).unwrap();
+        });
+        assert_eq!(count(&built, |op| matches!(op, Op::X87Load { .. })), 0);
+        assert_eq!(count(&built, |op| matches!(op, Op::X87StoreC1 { .. })), 0);
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::X87Store { proved: true, .. })),
+            1
+        );
+    }
+
+    // 3) Adversarial 1.3: two X87Load(single=true) inputs admit ±Inf, so 0*Inf and Inf-Inf
+    // must NOT be marked proved.
+    let inf_mul = assemble(|a| {
+        row(a, |a| {
+            a.fld(dword_ptr(esi)).unwrap();
+            a.fmul(dword_ptr(esi + 4)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    let inf_sub = assemble(|a| {
+        row(a, |a| {
+            a.fld(dword_ptr(esi)).unwrap();
+            a.fsub(dword_ptr(esi + 4)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    for (code, a_val, b_val) in [
+        (&inf_mul, 0.0f32, f32::INFINITY),
+        (&inf_sub, f32::INFINITY, f32::INFINITY),
+    ] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = compare(
+            code,
+            &at,
+            |m| {
+                m.write(DATA, &a_val.to_le_bytes()).unwrap();
+                m.write(DATA + 4, &b_val.to_le_bytes()).unwrap();
+            },
+            true,
+        );
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::Fp(_, _, _, true))),
+            0,
+            "X87Load(single=true) admits ±Inf and must not prove Fp"
+        );
+    }
+
+    // Adversarial 1.3b: X87Load(single=true, denormal=false) admits f32 subnormals,
+    // so X87Store must NOT be proved and Step 1.2B must NOT fold.
+    let subnormal_reload = assemble(|a| {
+        row(a, |a| {
+            a.fld(dword_ptr(esi)).unwrap();
+            a.fstp(dword_ptr(esp + 0x10)).unwrap();
+            a.fld(dword_ptr(esp + 0x10)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x22; // DE set => denormal = false
+        let built = compare(
+            &subnormal_reload,
+            &at,
+            |m| {
+                m.write(DATA, &1u32.to_le_bytes()).unwrap();
+            },
+            true,
+        );
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::X87Store { proved: false, .. }
+            )),
+            1
+        );
+    }
+
+    // 4) Adversarial 1.4: FISTP m16(-32768) is proved and succeeds; -32769 stays unproved.
+    let fistp_i16_ok = assemble(|a| {
+        row(a, |a| {
+            a.movsx(eax, word_ptr(esi)).unwrap();
+            a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+            a.fild(dword_ptr(esp + 0x10)).unwrap();
+            a.fistp(word_ptr(edi)).unwrap();
+        })
+    });
+    for val in [i16::MIN, 0, i16::MAX] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = differential(&fistp_i16_ok, &at, |m| {
+            m.write(DATA, &val.to_le_bytes()).unwrap();
+        });
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::X87Store {
+                    width: 2,
+                    integer: true,
+                    proved: true,
+                    ..
+                }
+            )),
+            1
+        );
+    }
+    let fistp_i16_oob = assemble(|a| {
+        row(a, |a| {
+            a.movsx(eax, word_ptr(esi)).unwrap();
+            a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+            a.fild(dword_ptr(esp + 0x10)).unwrap();
+            a.fld1().unwrap();
+            a.fsubp(st1, st0).unwrap();
+            a.fistp(word_ptr(edi)).unwrap();
+        })
+    });
+    {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = compare(
+            &fistp_i16_oob,
+            &at,
+            |m| {
+                m.write(DATA, &i16::MIN.to_le_bytes()).unwrap();
+            },
+            true,
+        );
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::X87Store {
+                    width: 2,
+                    integer: true,
+                    proved: false,
+                    ..
+                }
+            )),
+            1
+        );
+    }
+
+    // 5) Adversarial 2.1: PC=24 with a=1, b=1, c=-1+2^-30 (from m64) must not mark c
+    // as SINGLE_B and must fail cleanly to recovery rather than narrowing c to -1.
+    let pc24_non_f32 = assemble(|a| {
+        row(a, |a| {
+            a.fld1().unwrap();
+            a.fld1().unwrap();
+            a.fmulp(st1, st0).unwrap();
+            a.fadd(qword_ptr(esi)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x003f; // PC=24, nearest
+        at.x87.status = 0x20;
+        let c = -1.0f64 + 2.0f64.powi(-30);
+        let built = compare(
+            &pc24_non_f32,
+            &at,
+            |m| {
+                m.write(DATA, &c.to_le_bytes()).unwrap();
+            },
+            true,
+        );
+        assert!(
+            built.func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
+                matches!(op, Op::X87Single(FpOp::Add, _, _, flags) if flags & SINGLE_A != 0 && flags & SINGLE_B == 0)
+            }),
+            "PC=24 add with unproved m64 operand must keep SINGLE_B clear"
+        );
+    }
+
+    // 6) Positive dyadic-scale chain: (u8 - u8) * 1/64 + (-32.5) / 2.0 -> fistp m16,
+    // proved end-to-end with zero Op::Validate under both PC=53 and PC=24 and all 4 RCs.
+    for (pc_ctrl, rc_bits, a_byte, b_byte) in [
+        (0x023fu16, 0x0000u16, 200u8, 50u8),
+        (0x023f, 0x0400, 10, 240),
+        (0x023f, 0x0800, 255, 0),
+        (0x023f, 0x0c00, 0, 255),
+        (0x003f, 0x0000, 123, 77),
+        (0x003f, 0x0c00, 123, 77),
+    ] {
+        let dyadic_chain = assemble(|a| {
+            row(a, |a| {
+                a.movzx(eax, byte_ptr(esi)).unwrap();
+                a.movzx(edx, byte_ptr(esi + 1)).unwrap();
+                a.sub(eax, edx).unwrap();
+                a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+                a.fild(dword_ptr(esp + 0x10)).unwrap();
+                a.mov(dword_ptr(esp + 0x14), 0x3c80_0000u32).unwrap(); // 1/64
+                a.fmul(dword_ptr(esp + 0x14)).unwrap();
+                a.mov(dword_ptr(esp + 0x18), 0xc202_0000u32).unwrap(); // -32.5
+                a.fadd(dword_ptr(esp + 0x18)).unwrap();
+                a.mov(dword_ptr(esp + 0x1c), 0x4000_0000u32).unwrap(); // 2.0
+                a.fdiv(dword_ptr(esp + 0x1c)).unwrap();
+                a.mov(word_ptr(esp + 0x20), u32::from(pc_ctrl | rc_bits))
+                    .unwrap();
+                a.fldcw(word_ptr(esp + 0x20)).unwrap();
+                a.fistp(word_ptr(edi)).unwrap();
+                a.mov(word_ptr(esp + 0x20), u32::from(pc_ctrl)).unwrap();
+                a.fldcw(word_ptr(esp + 0x20)).unwrap();
+            })
+        });
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = pc_ctrl;
+        at.x87.status = 0x20;
+        let built = differential(&dyadic_chain, &at, |m| {
+            m.write(DATA, &[a_byte, b_byte]).unwrap();
+        });
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::Validate)),
+            0,
+            "dyadic chain should need zero Op::Validate for pc={pc_ctrl:#x} rc={rc_bits:#x}"
+        );
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::X87Store { proved: true, .. })),
+            1
+        );
+    }
+}

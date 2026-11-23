@@ -196,7 +196,7 @@ fn typed(func: &Func, op: &Op) -> bool {
         Op::Test { flags, .. } => is(flags, Type::Flags),
         Op::Select { cond, a, b } => is(cond, Type::I32) && func.ty(a) == func.ty(b),
         Op::Fp32(_, a, b) => is(a, Type::V128) && is(b, Type::V128),
-        Op::Fp(_, a, b) | Op::X87Single(_, a, b) | Op::SseFp64(_, a, b) => {
+        Op::Fp(_, a, b, _) | Op::X87Single(_, a, b, _) | Op::SseFp64(_, a, b) => {
             is(a, Type::F64) && is(b, Type::F64)
         }
         Op::FpUnary(_, a) | Op::ToInt { value: a, .. } | Op::X87Store { value: a, .. } => {
@@ -431,7 +431,7 @@ mod tests {
 
     fn store_product(validate: bool) -> Func {
         let (mut f, body, eax, x) = skeleton();
-        let product = f.push(body, Op::Fp(FpOp::Mul, x, x)).unwrap();
+        let product = f.push(body, Op::Fp(FpOp::Mul, x, x, false)).unwrap();
         let bits = f
             .push(
                 body,
@@ -489,7 +489,7 @@ mod tests {
                 fall: to(right),
             },
         );
-        f.push(left, Op::Fp(FpOp::Add, x, x));
+        f.push(left, Op::Fp(FpOp::Add, x, x, false));
         f.end(left, End::Jump(to(join)));
         f.end(right, End::Jump(to(join)));
         let after = f.record(record([Some(eax); 8]));
@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn a_backedge_is_an_effect_point() {
         let (mut f, body, _, x) = skeleton();
-        let sum = f.push(body, Op::Fp(FpOp::Add, x, x)).unwrap();
+        let sum = f.push(body, Op::Fp(FpOp::Add, x, x, false)).unwrap();
         let eax = f.blocks[0].params[0];
         let back = Target {
             block: Block(0),
@@ -610,10 +610,10 @@ mod tests {
                 fall: to(join),
             },
         );
-        let product = f.push(side, Op::Fp(FpOp::Mul, x, x)).unwrap();
+        let product = f.push(side, Op::Fp(FpOp::Mul, x, x, false)).unwrap();
         f.push(side, Op::Validate);
         f.end(side, End::Jump(to(join)));
-        f.push(join, Op::Fp(FpOp::Add, product, x));
+        f.push(join, Op::Fp(FpOp::Add, product, x, false));
         f.push(join, Op::Validate);
         let exit = f.record(record([Some(eax); 8]));
         f.end(join, End::Exit(exit));

@@ -1356,44 +1356,53 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn x87_single(&mut self, op: FpOp, dst: VReg, [a, b]: [VReg; 2]) {
-        let fail = self.fail();
-        for (value, single) in [(a, D), (b, E)] {
-            self.asm.emit_all(&[
-                unary(Unary::Narrow, single, value),
-                unary(Unary::Widen, C, single),
-                fcmp(value, C),
-            ]);
-            self.asm.b_cond(Cond::Ne, fail);
-        }
+    fn x87_single(&mut self, op: FpOp, dst: VReg, [a, b]: [VReg; 2], proved: u8) {
         let float = match op {
             FpOp::Add => Float::Fadd,
             FpOp::Sub => Float::Fsub,
             FpOp::Mul => Float::Fmul,
             FpOp::Div => Float::Fdiv,
         };
-        let valid = self.asm.label();
-        self.asm.emit_all(&[
-            sfloat(float, C, D, E),
-            fmov_from_v(W, T, C),
-            ubfx(W, U, T, 23, 8),
-            sub_imm(W, U, U, 2, false),
-            cmp_imm(W, U, 253, false),
-        ]);
-        self.asm.b_cond(Cond::Lo, valid);
-        self.asm.emit(lsl_imm(W, T, T, 1));
-        self.asm.cbz(W, true, T, fail);
-        // A zero sum of two binary32 operands cannot be a rounded zero.
-        // For a product or quotient, require a zero factor or dividend.
-        if matches!(op, FpOp::Mul | FpOp::Div) {
-            self.asm.emit(fcmp_zero(a));
-            if op == FpOp::Mul {
-                self.asm.b_cond(Cond::Eq, valid);
-                self.asm.emit(fcmp_zero(b));
-            }
-            self.asm.b_cond(Cond::Ne, fail);
+        if proved & SINGLE_EXACT != 0 {
+            self.asm.emit(dfloat(float, dst, a, b));
+            return;
         }
-        self.asm.bind(valid);
+        let need_fail =
+            proved & (SINGLE_A | SINGLE_B | SINGLE_RESULT) != (SINGLE_A | SINGLE_B | SINGLE_RESULT);
+        let fail = need_fail.then(|| self.fail());
+        for (value, single, bit) in [(a, D, SINGLE_A), (b, E, SINGLE_B)] {
+            self.asm.emit(unary(Unary::Narrow, single, value));
+            if proved & bit == 0 {
+                self.asm
+                    .emit_all(&[unary(Unary::Widen, C, single), fcmp(value, C)]);
+                self.asm.b_cond(Cond::Ne, fail.unwrap());
+            }
+        }
+        self.asm.emit(sfloat(float, C, D, E));
+        if proved & SINGLE_RESULT == 0 {
+            let fail = fail.unwrap();
+            let valid = self.asm.label();
+            self.asm.emit_all(&[
+                fmov_from_v(W, T, C),
+                ubfx(W, U, T, 23, 8),
+                sub_imm(W, U, U, 2, false),
+                cmp_imm(W, U, 253, false),
+            ]);
+            self.asm.b_cond(Cond::Lo, valid);
+            self.asm.emit(lsl_imm(W, T, T, 1));
+            self.asm.cbz(W, true, T, fail);
+            // A zero sum of two binary32 operands cannot be a rounded zero.
+            // For a product or quotient, require a zero factor or dividend.
+            if matches!(op, FpOp::Mul | FpOp::Div) {
+                self.asm.emit(fcmp_zero(a));
+                if op == FpOp::Mul {
+                    self.asm.b_cond(Cond::Eq, valid);
+                    self.asm.emit(fcmp_zero(b));
+                }
+                self.asm.b_cond(Cond::Ne, fail);
+            }
+            self.asm.bind(valid);
+        }
         self.asm.emit(unary(Unary::Widen, dst, C));
     }
 
@@ -1749,7 +1758,18 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            Op::Fp(fp, a, b) | Op::SseFp64(fp, a, b) | Op::Fp32(fp, a, b) => {
+            Op::Fp(fp, a, b, true) => {
+                let a = self.vr(a, A);
+                let b = self.vr(b, B);
+                let float = match fp {
+                    FpOp::Add => Float::Fadd,
+                    FpOp::Sub => Float::Fsub,
+                    FpOp::Mul => Float::Fmul,
+                    FpOp::Div => Float::Fdiv,
+                };
+                self.asm.emit(dfloat(float, q, a, b));
+            }
+            Op::Fp(fp, a, b, false) | Op::SseFp64(fp, a, b) | Op::Fp32(fp, a, b) => {
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 self.fp(
@@ -1760,10 +1780,10 @@ impl<'a> Emitter<'a> {
                     !matches!(op, Op::Fp(..)),
                 );
             }
-            Op::X87Single(op, a, b) => {
+            Op::X87Single(op, a, b, proved) => {
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
-                self.x87_single(op, q, [a, b]);
+                self.x87_single(op, q, [a, b], proved);
             }
             Op::FpUnary(op, a) => {
                 let a = self.vr(a, A);
@@ -1827,44 +1847,59 @@ impl<'a> Emitter<'a> {
                 width,
                 rounding,
                 integer,
+                proved,
             } => {
                 let a = self.vr(value, A);
-                let fail = self.fail();
-                if integer {
-                    let rounded = match rounding {
-                        0 => Unary::Frintn,
-                        1 => Unary::Frintm,
-                        2 => Unary::Frintp,
-                        _ => Unary::Frintz,
-                    };
-                    let operand = if rounding == 3 {
-                        a
+                if proved {
+                    if integer {
+                        self.asm.emit(fcvt_int_mode(
+                            if width == 8 { X } else { W },
+                            rounding,
+                            d,
+                            a,
+                        ));
                     } else {
-                        self.asm.emit(unary(rounded, C, a));
-                        C
-                    };
-                    self.asm.emit_all(&[
-                        fmov_from_v(X, T, operand),
-                        ubfx(X, T, T, 52, 11),
-                        cmp_imm(W, T, 1023 + u32::from(width) * 8 - 1, false),
-                    ]);
-                    self.asm.b_cond(Cond::Hs, fail);
-                    self.asm
-                        .emit(fcvt_int(if width == 8 { X } else { W }, true, d, operand));
+                        self.asm
+                            .emit_all(&[unary(Unary::Narrow, C, a), fmov_from_v(W, d, C)]);
+                    }
                 } else {
-                    let good = self.asm.label();
-                    self.asm.emit_all(&[
-                        unary(Unary::Narrow, C, a),
-                        fmov_from_v(W, d, C),
-                        ubfx(W, U, d, 23, 8),
-                        sub_imm(W, U, U, 2, false),
-                        cmp_imm(W, U, 253, false),
-                    ]);
-                    self.asm.b_cond(Cond::Lo, good);
-                    // Zero is exact only when the source was also zero.
-                    self.asm.emit(fcmp_zero(a));
-                    self.asm.b_cond(Cond::Ne, fail);
-                    self.asm.bind(good);
+                    let fail = self.fail();
+                    if integer {
+                        let rounded = match rounding {
+                            0 => Unary::Frintn,
+                            1 => Unary::Frintm,
+                            2 => Unary::Frintp,
+                            _ => Unary::Frintz,
+                        };
+                        let operand = if rounding == 3 {
+                            a
+                        } else {
+                            self.asm.emit(unary(rounded, C, a));
+                            C
+                        };
+                        self.asm.emit_all(&[
+                            fmov_from_v(X, T, operand),
+                            ubfx(X, T, T, 52, 11),
+                            cmp_imm(W, T, 1023 + u32::from(width) * 8 - 1, false),
+                        ]);
+                        self.asm.b_cond(Cond::Hs, fail);
+                        self.asm
+                            .emit(fcvt_int(if width == 8 { X } else { W }, true, d, operand));
+                    } else {
+                        let good = self.asm.label();
+                        self.asm.emit_all(&[
+                            unary(Unary::Narrow, C, a),
+                            fmov_from_v(W, d, C),
+                            ubfx(W, U, d, 23, 8),
+                            sub_imm(W, U, U, 2, false),
+                            cmp_imm(W, U, 253, false),
+                        ]);
+                        self.asm.b_cond(Cond::Lo, good);
+                        // Zero is exact only when the source was also zero.
+                        self.asm.emit(fcmp_zero(a));
+                        self.asm.b_cond(Cond::Ne, fail);
+                        self.asm.bind(good);
+                    }
                 }
             }
             Op::X87StoreC1 {
@@ -2309,32 +2344,32 @@ impl<'a> Emitter<'a> {
                 bits,
                 denormal,
                 single,
+                proved,
             } => {
-                let fail = self.fail();
                 let r = self.gp(bits, U);
-                let nan = self.asm.label();
-                let done = self.asm.label();
-                // Exponent position and width, and the bits above the fraction.
-                let (size, low, exponent, high) = if single {
-                    (W, 23, 8, 9)
-                } else {
-                    (X, 52, 11, 12)
-                };
-                self.asm.emit_all(&[
-                    ubfx(size, T, r, low, exponent),
-                    cmp_imm(W, T, (1 << exponent) - 1, false),
-                ]);
-                self.asm.b_cond(Cond::Eq, nan);
-                if denormal {
-                    self.asm.cbz(W, true, T, done);
-                    self.asm.emit(lsl_imm(size, T, r, 1));
+                let size = if single { W } else { X };
+                if !proved {
+                    let fail = self.fail();
+                    let nan = self.asm.label();
+                    let done = self.asm.label();
+                    // Exponent position and width, and the bits above the fraction.
+                    let (low, exponent, high) = if single { (23, 8, 9) } else { (52, 11, 12) };
+                    self.asm.emit_all(&[
+                        ubfx(size, T, r, low, exponent),
+                        cmp_imm(W, T, (1 << exponent) - 1, false),
+                    ]);
+                    self.asm.b_cond(Cond::Eq, nan);
+                    if denormal {
+                        self.asm.cbz(W, true, T, done);
+                        self.asm.emit(lsl_imm(size, T, r, 1));
+                        self.asm.cbz(size, true, T, fail);
+                    }
+                    self.asm.b(done);
+                    self.asm.bind(nan);
+                    self.asm.emit(lsl_imm(size, T, r, high));
                     self.asm.cbz(size, true, T, fail);
+                    self.asm.bind(done);
                 }
-                self.asm.b(done);
-                self.asm.bind(nan);
-                self.asm.emit(lsl_imm(size, T, r, high));
-                self.asm.cbz(size, true, T, fail);
-                self.asm.bind(done);
                 self.asm.emit(fmov_to_v(size, q, r));
                 if single {
                     self.asm.emit(unary(Unary::Widen, q, q));
