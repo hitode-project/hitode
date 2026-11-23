@@ -61,8 +61,8 @@ pub(crate) struct Lowered {
     pub environment: Vec<(usize, usize)>,
     /// The branch words a failed `DomainGuard` takes: reporting to owner vs
     /// falling back to a general resident version or Tier-1.
-    pub domain_miss: usize,
-    pub domain_fallback: usize,
+    pub domain_miss: Option<usize>,
+    pub domain_fallback: Option<usize>,
     pub domain_sensors: Vec<(u8, usize, usize)>,
     pub domain_misses_slot: Option<usize>,
     pub domain_guard_words: u32,
@@ -232,12 +232,8 @@ fn lower_form(
         .iter()
         .map(|&(sensor, counter)| (sensor, e.asm.position(counter) / 4))
         .collect();
-    let domain_miss = e
-        .domain_miss
-        .map_or(miss, |label| e.asm.position(label) / 4);
-    let domain_fallback = e
-        .domain_fallback
-        .map_or(cold, |label| e.asm.position(label) / 4);
+    let domain_miss = e.domain_miss.map(|label| e.asm.position(label) / 4);
+    let domain_fallback = e.domain_fallback.map(|label| e.asm.position(label) / 4);
     let domain_sensors = e
         .domain_sensors
         .iter()
@@ -364,8 +360,8 @@ fn emit<'a>(
         branch_only[v.0 as usize] = false;
     }
     let env_miss = resident.then(|| asm.label());
-    let domain_miss = resident.then(|| asm.label());
-    let domain_fallback = resident.then(|| asm.label());
+    let domain_miss = (resident && !func.domain_guards.is_empty()).then(|| asm.label());
+    let domain_fallback = (resident && !func.domain_guards.is_empty()).then(|| asm.label());
     let row_strip = domain.and_then(|(domain, _)| {
         let batch = batches
             .iter()

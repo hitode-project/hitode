@@ -3208,4 +3208,205 @@ mod tests {
         assert_eq!(state.regs[0], 0x5a5a_5a5au32.wrapping_add(trips));
         assert_eq!(state.regs[1], 0);
     }
+
+    // spec: A64-OPT-2, A64-OPT-9
+    #[test]
+    fn domain_guard_miss_keeps_profitable_specialization_and_refuses_unprofitable_without_touching_plain_sites()
+     {
+        // HEAD:
+        //   fld qword ptr [esp+0x20]    ; dd 44 24 20
+        //   fmul st(0), st(1)           ; d8 c9
+        //   fadd dword ptr [esp+0x28]   ; d8 44 24 28
+        //   fistp dword ptr [esp+0x10]  ; db 5c 24 10
+        //   mov eax, dword ptr [esp+0x10] ; 8b 44 24 10
+        //   mov dword ptr [edi+edx*4], eax ; 89 04 97
+        //   fadd st(0), st(1)           ; d8 c1
+        //   inc edx                     ; 42
+        //   cmp edx, ebx                ; 39 da
+        //   jl HEAD                     ; 7c e4
+        //   int3                        ; cc
+        let body: &[u8] = &[
+            0xdd, 0x44, 0x24, 0x20, 0xd8, 0xc9, 0xd8, 0x44, 0x24, 0x28, 0xdb, 0x5c, 0x24, 0x10,
+            0x8b, 0x44, 0x24, 0x10, 0x89, 0x04, 0x97, 0xd8, 0xc1, 0x42, 0x39, 0xda, 0x7c, 0xe4,
+            0xcc,
+        ];
+
+        let make_cpu = |eip: u32, cols: u32| {
+            let mut state = resident_cpu(eip, 1);
+            state.regs[2] = 0; // edx = 0
+            state.regs[3] = cols; // ebx = cols
+            state.regs[4] = OUTPUT + 0x1000; // esp
+            state.regs[7] = OUTPUT; // edi
+            state.x87.control = 0x023f;
+            state.x87.status = 0x20;
+            state.x87.push(adv_cpu_core::floating::fast::extended(0.25));
+            state.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+            state
+        };
+        let write_frame = |memory: &mut Memory, slope: f64, base: f32| {
+            memory.write(OUTPUT + 0x1020, &slope.to_le_bytes()).unwrap();
+            memory.write(OUTPUT + 0x1028, &base.to_le_bytes()).unwrap();
+        };
+        let read_i32s = |memory: &Memory, cols: u32| -> Vec<i32> {
+            memory
+                .read(OUTPUT, cols as usize * 4)
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
+                .collect()
+        };
+
+        let run_to_stop =
+            |native: &mut Native, memory: &mut Memory, stop: u32, state: &mut CpuState| {
+                let mut steps = 0;
+                while state.eip != stop {
+                    let run = enter(native, memory, stop, state);
+                    assert_eq!(run.exit, Exit::Dispatch);
+                    steps += 1;
+                    assert!(steps <= 8, "stuck at eip={:#x}", state.eip);
+                }
+            };
+
+        // Case 1: Profitable specialization settles through real probation,
+        // archives in-domain work, and survives rare out-of-domain misses
+        // without triggering Validation cold exits, cut_pays, or refusal.
+        {
+            let (mut memory, mut native, stop) = resident_loop(body);
+            native.count_resident_entries = true;
+            write_frame(&mut memory, 4.0, 10.0);
+            let at = make_cpu(HEAD, 16);
+            native
+                .translate(
+                    &mut memory,
+                    HEAD,
+                    crate::facts::Key::read(&at, crate::facts::ALL),
+                )
+                .unwrap();
+            native.discover(&mut memory, HEAD, HEAD, at);
+            native.install_optimized(true);
+            let version = &native.code.resident(HEAD).unwrap().versions[0];
+            assert_eq!(version.domain_guards.len(), 1);
+            assert!(!version.plain_sites.is_empty());
+            assert!(
+                native.plans.resident(HEAD).unwrap().probation[0].is_some(),
+                "real discovery should start probation"
+            );
+
+            // Warm up in-domain calls past probation so finish_probation archives
+            // profitable in-domain iteration savings into domain_history.
+            for _ in 0..plan::PROBATION + 4 {
+                let mut state = make_cpu(OUTSIDE, 16);
+                run_to_stop(&mut native, &mut memory, stop, &mut state);
+                let got = read_i32s(&memory, 16);
+                let want: Vec<i32> = (0..16).map(|i| 10 + i).collect();
+                assert_eq!(got, want);
+            }
+            assert!(
+                native.plans.resident(HEAD).unwrap().probation[0].is_none(),
+                "probation should have settled as profitable"
+            );
+            assert!(
+                native.plans.resident(HEAD).unwrap().domain_history[0].1 >= 256 * 16,
+                "expected archived in-domain iterations"
+            );
+            assert_eq!(native.diagnostics.resident_cold_exits, 0);
+            assert_eq!(native.diagnostics.resident_domain_guard_misses, 0);
+
+            // Trigger rare out-of-domain misses (bound(y) = 2e9 * 2 + 10 > 2.147e9)
+            // enough times to hit DOMAIN_MISS_SAMPLE and evaluate profitability.
+            write_frame(&mut memory, 2_000_000_000.0, 10.0);
+            for _ in 0..crate::policy::resident::DOMAIN_MISS_SAMPLE {
+                let mut state = make_cpu(OUTSIDE, 4);
+                run_to_stop(&mut native, &mut memory, stop, &mut state);
+                assert_eq!(
+                    read_i32s(&memory, 4),
+                    vec![10, 500_000_010, 1_000_000_010, 1_500_000_010]
+                );
+            }
+            assert_eq!(
+                native.diagnostics.resident_cold_exits, 0,
+                "domain guard miss must never be attributed as ResidentCold::Validation"
+            );
+            assert!(
+                native.diagnostics.resident_domain_guard_misses >= 1,
+                "expected sampled PlanEvent::DomainGuardMiss"
+            );
+            assert_eq!(
+                native.diagnostics.resident_domain_guard_refusals, 0,
+                "profitable specialization must not be withdrawn by rare misses"
+            );
+            assert!(
+                native
+                    .plans
+                    .resident(HEAD)
+                    .unwrap()
+                    .refused_domains
+                    .is_empty()
+            );
+            assert!(native.code.resident(HEAD).unwrap().versions[0].enabled);
+        }
+
+        // Case 2: Repeated unprofitable out-of-domain misses refuse ONLY the
+        // numerical domain guard while leaving plain_sites intact, and rebuild
+        // without domain guards.
+        {
+            let (mut memory, mut native, stop) = resident_loop(body);
+            native.count_resident_entries = true;
+            write_frame(&mut memory, 4.0, 10.0);
+            assert!(native.force_resident_at(&mut memory, make_cpu(HEAD, 16)));
+            let guard_id = native.code.resident(HEAD).unwrap().versions[0].domain_guards[0];
+            let initial_plain = native.code.resident(HEAD).unwrap().versions[0]
+                .plain_sites
+                .clone();
+            assert!(!initial_plain.is_empty());
+
+            // Run only out-of-domain calls so cumulative profitability is negative.
+            write_frame(&mut memory, 2_000_000_000.0, 10.0);
+            for _ in 0..crate::policy::resident::DOMAIN_MISS_SAMPLE {
+                let mut state = make_cpu(OUTSIDE, 4);
+                run_to_stop(&mut native, &mut memory, stop, &mut state);
+                assert_eq!(
+                    read_i32s(&memory, 4),
+                    vec![10, 500_000_010, 1_000_000_010, 1_500_000_010]
+                );
+            }
+            native.install_optimized(true);
+
+            assert_eq!(native.diagnostics.resident_cold_exits, 0);
+            assert!(native.diagnostics.resident_domain_guard_misses >= 1);
+            assert!(native.diagnostics.resident_domain_guard_refusals >= 1);
+            let plan = native.plans.resident(HEAD).unwrap();
+            assert!(plan.refused_domains.contains(&guard_id));
+            assert!(
+                plan.refused.is_empty(),
+                "domain guard refusal must not touch plain_sites refusal set"
+            );
+            let rebuilt = native
+                .code
+                .resident(HEAD)
+                .unwrap()
+                .versions
+                .iter()
+                .find(|v| v.enabled)
+                .expect("rebuilt enabled general resident version");
+            assert!(rebuilt.domain_guards.is_empty());
+            assert_eq!(rebuilt.plain_sites, initial_plain);
+
+            // Both out-of-domain and in-domain calls run cleanly on the rebuilt form.
+            let mut state = make_cpu(OUTSIDE, 4);
+            run_to_stop(&mut native, &mut memory, stop, &mut state);
+            assert_eq!(
+                read_i32s(&memory, 4),
+                vec![10, 500_000_010, 1_000_000_010, 1_500_000_010]
+            );
+            write_frame(&mut memory, 4.0, 10.0);
+            let mut state = make_cpu(OUTSIDE, 16);
+            run_to_stop(&mut native, &mut memory, stop, &mut state);
+            let want: Vec<i32> = (0..16).map(|i| 10 + i).collect();
+            assert_eq!(read_i32s(&memory, 16), want);
+            assert_eq!(native.diagnostics.resident_cold_exits, 0);
+        }
+    }
 }

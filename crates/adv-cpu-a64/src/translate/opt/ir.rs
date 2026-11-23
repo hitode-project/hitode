@@ -681,7 +681,7 @@ impl Func {
         Value(self.types.len() as u32 - 1)
     }
 
-    fn result(&self, op: &Op) -> Option<Type> {
+    pub(crate) fn result(&self, op: &Op) -> Option<Type> {
         Some(match *op {
             Op::Constant(ty, _)
             | Op::Bits { to: ty, .. }

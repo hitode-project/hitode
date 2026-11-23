@@ -1281,18 +1281,15 @@ impl Native {
 
     pub(super) fn domain_guard_miss(&mut self, eip: u32, index: usize, ordinal: usize) {
         self.diagnostics.resident_domain_guard_misses += 1;
-        let Some((guard_id, entries, iters, misses, guard_words, saved_per_iter)) =
-            self.code.domain_guard_stats(eip, index, ordinal)
+        let history = self
+            .plans
+            .resident(eip)
+            .map_or(&[][..], |head| head.domain_history.as_slice());
+        let Some((guard_id, total_entries, total_iters, misses, guard_words, saved_per_iter)) =
+            self.code.domain_guard_totals(eip, index, ordinal, history)
         else {
             return;
         };
-        let (hist_entries, hist_iters) = self
-            .plans
-            .resident(eip)
-            .and_then(|head| head.domain_history.get(index).copied())
-            .unwrap_or((0, 0));
-        let total_entries = hist_entries.max(entries);
-        let total_iters = hist_iters.max(iters);
         if crate::policy::resident::domain_guard_pays(
             total_entries,
             total_iters,

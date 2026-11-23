@@ -95,8 +95,17 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
     for (&p, source) in blocks[0].params.iter().zip(&func.entry) {
         register_only[p.0 as usize] = matches!(source, Source::Reg(_) | Source::FsBase);
     }
+    if !func.domain_guards.is_empty()
+        && blocks
+            .iter()
+            .flat_map(|b| b.end.targets())
+            .any(|t| t.block == Block(0))
+    {
+        return Err(Error::Shape(Block(0)));
+    }
     let mut fact_prefix = true;
     let mut plain_count = 0;
+    let mut seen_entry_effect = false;
     for (b, block) in blocks.iter().enumerate() {
         if let Some(head) = block.head {
             activate(head.record, (b, 1), charged[b])?;
@@ -128,13 +137,24 @@ pub(crate) fn verify(func: &Func) -> Result<(), Error> {
                 }
                 Op::DomainGuard { ordinal, .. } => {
                     if b != 0
+                        || seen_entry_effect
                         || usize::from(ordinal) >= func.domain_guards.len()
                         || func.domain_guards.len() > MAX_DOMAIN_GUARDS
                     {
                         return Err(Error::Shape(Block(b as u32)));
                     }
                 }
-                Op::Store { after, .. } => activate(after, (b, i + 2), false)?,
+                Op::Store { after, .. } => {
+                    if b == 0 {
+                        seen_entry_effect = true;
+                    }
+                    activate(after, (b, i + 2), false)?;
+                }
+                Op::FrameStore { .. } | Op::ScopeWritten(_) => {
+                    if b == 0 {
+                        seen_entry_effect = true;
+                    }
+                }
                 Op::PageCross { addr, width, .. } | Op::FrameDisjoint { addr, width, .. } => {
                     let mut next = i + 1;
                     if matches!(op, Op::FrameDisjoint { .. })

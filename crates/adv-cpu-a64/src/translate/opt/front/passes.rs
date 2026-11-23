@@ -97,6 +97,14 @@ pub(super) fn run(
             while propagate(func) {}
         }
     }
+    if let Some(r) = resident.as_deref()
+        && fp_range::infer_domain_guards(func, r.refused_domain)
+    {
+        while propagate(func) {}
+        if fp_range::run(func) {
+            while propagate(func) {}
+        }
+    }
     group_stores(func, facts, loads, stores, resident.is_some());
     sse_inputs(func);
     dead(func);

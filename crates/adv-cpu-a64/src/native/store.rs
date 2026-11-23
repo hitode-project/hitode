@@ -169,7 +169,7 @@ pub(super) struct ResidentVersion<R> {
     pub cold: usize,
     pub retry: usize,
     pub environment: Vec<usize>,
-    pub domain_fallback: usize,
+    pub domain_fallback: Option<usize>,
     pub domain_guards: Vec<u32>,
     pub domain_guard_words: u32,
     pub domain_saved_per_iter: u32,
@@ -485,6 +485,7 @@ impl<R> CodeStore<R> {
                 exit: self.stubs.exit,
                 resident_exit: self.resident_exit,
                 split: layout.split.is_some(),
+                domain: layout.domain_miss.is_some(),
             },
         );
         let probe_word = (index == 0).then(|| entry.words[(entry.probe - base) / 4]);
@@ -526,11 +527,15 @@ impl<R> CodeStore<R> {
             (layout.exit, entry.tail),
             (layout.miss, entry.retry),
             (layout.env_miss, entry.environment),
-            (layout.domain_miss, entry.domain),
-            (layout.domain_fallback, fallback),
             (layout.cold, fallback),
         ] {
             words[offset] = branch(entry.form + offset * 4, target);
+        }
+        if let (Some(offset), Some(target)) = (layout.domain_miss, entry.domain) {
+            words[offset] = branch(entry.form + offset * 4, target);
+        }
+        if let Some(offset) = layout.domain_fallback {
+            words[offset] = branch(entry.form + offset * 4, fallback);
         }
         let split = layout.split.zip(entry.split).map(|(split, target)| {
             let leave = entry.form + split.leave * 4;
@@ -624,7 +629,7 @@ impl<R> CodeStore<R> {
                 .iter()
                 .map(|&(sensor, _)| entry.form + sensor)
                 .collect(),
-            domain_fallback: entry.form + layout.domain_fallback * 4,
+            domain_fallback: layout.domain_fallback.map(|offset| entry.form + offset * 4),
             domain_guards,
             domain_guard_words: layout.domain_guard_words,
             domain_saved_per_iter,
@@ -785,17 +790,17 @@ impl<R> CodeStore<R> {
             self.cache.patch(version.next, branch(version.next, next));
             self.cache
                 .patch(version.cold, branch(version.cold, fallback));
-            let general = site.versions.iter().enumerate().find_map(|(j, candidate)| {
-                (j != index
-                    && candidate.enabled
-                    && candidate.domain_guards.is_empty()
-                    && candidate.row_target.is_none())
-                .then_some(candidate.entry)
-            });
-            self.cache.patch(
-                version.domain_fallback,
-                branch(version.domain_fallback, general.unwrap_or(fallback)),
-            );
+            if let Some(point) = version.domain_fallback {
+                let general = site.versions.iter().enumerate().find_map(|(j, candidate)| {
+                    (j != index
+                        && candidate.enabled
+                        && candidate.domain_guards.is_empty()
+                        && candidate.row_target.is_none())
+                    .then_some(candidate.entry)
+                });
+                self.cache
+                    .patch(point, branch(point, general.unwrap_or(fallback)));
+            }
             let target =
                 if let Some(period) = period.filter(|_| tail && version.row_target.is_none()) {
                     version.slot.retry.set(period);
@@ -838,17 +843,16 @@ impl<R> CodeStore<R> {
         }
         for (index, version) in site.versions.iter().enumerate() {
             self.cache.patch(version.cold, branch(version.cold, target));
-            let has_general = site.versions.iter().enumerate().any(|(j, candidate)| {
-                j != index
-                    && candidate.enabled
-                    && candidate.domain_guards.is_empty()
-                    && candidate.row_target.is_none()
-            });
-            if !has_general {
-                self.cache.patch(
-                    version.domain_fallback,
-                    branch(version.domain_fallback, target),
-                );
+            if let Some(point) = version.domain_fallback {
+                let has_general = site.versions.iter().enumerate().any(|(j, candidate)| {
+                    j != index
+                        && candidate.enabled
+                        && candidate.domain_guards.is_empty()
+                        && candidate.row_target.is_none()
+                });
+                if !has_general {
+                    self.cache.patch(point, branch(point, target));
+                }
             }
             if let Some(point) = version.proved_cold {
                 self.cache.patch(point, branch(point, target));
@@ -1170,30 +1174,36 @@ impl<R> CodeStore<R> {
         version.plain_sites[fact]
     }
 
-    pub(super) fn domain_guard_stats(
+    pub(super) fn domain_guard_totals(
         &self,
         eip: u32,
         version: usize,
         ordinal: usize,
+        history: &[(u64, u64)],
     ) -> Option<(u32, u64, u64, u64, u32, u32)> {
-        let version = self
-            .chains
-            .get(&eip)?
-            .resident
-            .as_ref()?
-            .versions
-            .get(version)?;
-        let &guard_id = version.domain_guards.get(ordinal)?;
-        let entries = version.slot.entries.get();
-        let iters = version.iterations(version.slot.countdown[1].get());
-        let misses = version.slot.domain_misses.get();
+        let site = self.chains.get(&eip)?.resident.as_ref()?;
+        let current = site.versions.get(version)?;
+        let &guard_id = current.domain_guards.get(ordinal)?;
+        let mut total_entries = 0u64;
+        let mut total_iters = 0u64;
+        let mut total_misses = 0u64;
+        for (j, v) in site.versions.iter().enumerate() {
+            if !v.domain_guards.contains(&guard_id) {
+                continue;
+            }
+            let (hist_entries, hist_iters) = history.get(j).copied().unwrap_or((0, 0));
+            total_entries = total_entries.saturating_add(hist_entries.max(v.slot.entries.get()));
+            total_iters =
+                total_iters.saturating_add(hist_iters.max(v.iterations(v.slot.countdown[1].get())));
+            total_misses = total_misses.saturating_add(v.slot.domain_misses.get());
+        }
         Some((
             guard_id,
-            entries,
-            iters,
-            misses,
-            version.domain_guard_words,
-            version.domain_saved_per_iter,
+            total_entries,
+            total_iters,
+            total_misses,
+            current.domain_guard_words,
+            current.domain_saved_per_iter,
         ))
     }
 
