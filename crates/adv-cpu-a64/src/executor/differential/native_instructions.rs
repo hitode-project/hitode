@@ -121,7 +121,14 @@ fn bit_scans_biased_cl_shifts_and_comparisons_run_without_helpers_and_resume_at_
             program.data[4..6].copy_from_slice(&0x8000u16.to_le_bytes());
             let instructions =
                 iced_x86::Decoder::new(32, &program.code, 0).iter().count() as u64 - 1;
-            let config = (Features { flagm }, false, Checks::Adaptive);
+            let config = (
+                Features {
+                    flagm,
+                    ..Features::default()
+                },
+                false,
+                Checks::Adaptive,
+            );
             for budget in 1..=instructions + 1 {
                 let mut native = executor(&program, config, false);
                 let mut oracle = executor(&program, config, true);
@@ -341,7 +348,14 @@ fn bit_scan_and_scalar_compare_cross_page_faults_commit_only_the_prefix_and_retr
         program.state.regs[5] = address;
         for flagm in [false, true] {
             for checks in [Checks::Adaptive, Checks::All, Checks::Slow] {
-                let config = (Features { flagm }, false, checks);
+                let config = (
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
+                    false,
+                    checks,
+                );
                 let mut native = executor(&program, config, false);
                 let mut oracle = executor(&program, config, true);
                 let expected = oracle.run(program.stop, 100).unwrap();
@@ -476,7 +490,14 @@ fn sse_conversions_double_arithmetic_and_flag_compares_match_the_owner() {
                     13 => 0x1fa0,
                     _ => 0x1f80,
                 };
-                let config = (Features { flagm }, false, Checks::Adaptive);
+                let config = (
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
+                    false,
+                    Checks::Adaptive,
+                );
                 let budgets: &[u64] = if scenario == 0 {
                     &[1, 2, 3, 100]
                 } else {
@@ -538,7 +559,14 @@ fn sse_directed_arithmetic_and_conversion_stay_native() {
         lane.copy_from_slice(&value.to_le_bytes());
     }
     program.data[16..20].copy_from_slice(&0x1fa0u32.to_le_bytes());
-    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     for rc in 0..4 {
         for sticky in [0, 0x20] {
             program.state.mxcsr = 0x1f80 | (rc << 13) | sticky;
@@ -564,7 +592,14 @@ fn sse_directed_arithmetic_and_conversion_stay_native() {
 // spec: A64F-FP-5
 #[test]
 fn sse_directed_arithmetic_preserves_value_exits_and_versions_control_changes() {
-    let config = (Features { flagm: false }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     for packed in [false, true] {
         let mut program = fixture(|a| {
             a.addps(xmm2, xmm2).unwrap();
@@ -671,7 +706,14 @@ fn comparison_exceptions_alignment_and_scalar_upper_lanes_match_the_owner() {
                         _ => 0x1f80,
                     };
                     for flagm in [false, true] {
-                        let config = (Features { flagm }, false, Checks::Adaptive);
+                        let config = (
+                            Features {
+                                flagm,
+                                ..Features::default()
+                            },
+                            false,
+                            Checks::Adaptive,
+                        );
                         let mut native = executor(&program, config, false);
                         let mut oracle = executor(&program, config, true);
                         let outcome = native.run(program.stop, 100).unwrap();
@@ -723,7 +765,14 @@ fn tf_and_rf_keep_precise_boundaries_for_new_native_forms() {
                 _ => compare_instruction(true, true, a, None, 0),
             });
             program.state.eflags |= flag;
-            let config = (Features { flagm: false }, false, Checks::Adaptive);
+            let config = (
+                Features {
+                    flagm: false,
+                    ..Features::default()
+                },
+                false,
+                Checks::Adaptive,
+            );
             let mut native = executor(&program, config, false);
             let mut oracle = executor(&program, config, true);
             let outcome = native.run(program.stop, 100).unwrap();
@@ -759,7 +808,14 @@ fn rewritten_bit_scan_and_comparison_forms_invalidate_the_old_native_unit() {
     let programs = [make(false), make(true)];
     assert_eq!(programs[0].stop, programs[1].stop);
     for flagm in [false, true] {
-        let config = (Features { flagm }, false, Checks::Adaptive);
+        let config = (
+            Features {
+                flagm,
+                ..Features::default()
+            },
+            false,
+            Checks::Adaptive,
+        );
         let mut native = executor(&programs[0], config, false);
         native.protect(CODE, 0x1_0000, 7).unwrap();
         for program in programs.iter().cycle().take(4) {
@@ -808,7 +864,14 @@ fn scalar_moves_word_extraction_bit_tests_and_leave_match_at_budget_cuts() {
         for first in [false, true] {
             for checks in [Checks::Adaptive, Checks::All, Checks::Slow] {
                 for budget in 1..=instructions + 1 {
-                    let config = (Features { flagm }, first, checks);
+                    let config = (
+                        Features {
+                            flagm,
+                            ..Features::default()
+                        },
+                        first,
+                        checks,
+                    );
                     let mut native = executor(&program, config, false);
                     let mut oracle = executor(&program, config, true);
                     assert_eq!(
@@ -895,7 +958,14 @@ fn checked_strings_cross_ordinary_blocked_and_alias_pages_at_element_boundaries(
                             p.state.regs[7] = if source { DATA + 0x200 } else { at };
                             for flagm in [false, true] {
                                 for checks in [Checks::All, Checks::Slow] {
-                                    let config = (Features { flagm }, false, checks);
+                                    let config = (
+                                        Features {
+                                            flagm,
+                                            ..Features::default()
+                                        },
+                                        false,
+                                        checks,
+                                    );
                                     let mut native = executor(&p, config, false);
                                     let mut oracle = executor(&p, config, true);
                                     for cpu in [&mut native, &mut oracle] {
@@ -965,7 +1035,14 @@ fn checked_ordinary_pages_avoid_helpers_and_follow_permission_changes() {
         a.mov(esi, dword_ptr(ebx + 4)).unwrap();
     });
     for flagm in [false, true] {
-        let config = (Features { flagm }, false, Checks::All);
+        let config = (
+            Features {
+                flagm,
+                ..Features::default()
+            },
+            false,
+            Checks::All,
+        );
         let mut native = executor(&program, config, false);
         let mut oracle = executor(&program, config, true);
         // An inaccessible neighbour blocks the entire 16 KiB window page.
@@ -1067,7 +1144,14 @@ fn scalar_integer_conversions_preserve_flags_upper_lanes_and_fault_boundaries() 
                 _ => 0x1f80,
             };
             for flagm in [false, true] {
-                let config = (Features { flagm }, false, Checks::Adaptive);
+                let config = (
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
+                    false,
+                    Checks::Adaptive,
+                );
                 let budgets: &[u64] = if scenario == 0 { &[1, 2, 100] } else { &[100] };
                 for &budget in budgets {
                     let mut native = executor(&program, config, false);
@@ -1117,7 +1201,14 @@ fn narrow_shifts_and_negation_keep_undefined_flags_and_register_halves() {
                     program.state.regs[1] = 0;
                     program.state.regs[4] = 0xabc00000 | value;
                     for flagm in [false, true] {
-                        let config = (Features { flagm }, false, Checks::Adaptive);
+                        let config = (
+                            Features {
+                                flagm,
+                                ..Features::default()
+                            },
+                            false,
+                            Checks::Adaptive,
+                        );
                         let mut native = executor(&program, config, false);
                         let mut oracle = executor(&program, config, true);
                         assert_eq!(
@@ -1155,7 +1246,14 @@ fn simd_lane_insertion_byte_shifts_and_control_stores_match_the_owner() {
         program.data[..16].fill(0x73);
         program.state.mxcsr = 0x5fa3;
         for checks in [Checks::Adaptive, Checks::All, Checks::Slow] {
-            let config = (Features { flagm: false }, false, checks);
+            let config = (
+                Features {
+                    flagm: false,
+                    ..Features::default()
+                },
+                false,
+                checks,
+            );
             for budget in 1..=10 {
                 let mut native = executor(&program, config, false);
                 let mut oracle = executor(&program, config, true);
@@ -1217,7 +1315,14 @@ fn x87_single_precision_rounding_keeps_extended_exponents_and_exception_state() 
             for control in [0x007f, 0x027f, 0x037f, 0x047f, 0x007e] {
                 program.state.x87.set_control(control);
                 for flagm in [false, true] {
-                    let config = (Features { flagm }, false, Checks::Adaptive);
+                    let config = (
+                        Features {
+                            flagm,
+                            ..Features::default()
+                        },
+                        false,
+                        Checks::Adaptive,
+                    );
                     let mut native = executor(&program, config, false);
                     let mut oracle = executor(&program, config, true);
                     assert_eq!(
@@ -1255,7 +1360,14 @@ fn cmpxchg8b_matches_interpreter_flags_faults_and_native_commits() {
                 program.data[offset as usize..offset as usize + 8]
                     .copy_from_slice(&0x1122334455667788u64.to_le_bytes());
                 for flagm in [false, true] {
-                    let config = (Features { flagm }, false, Checks::Adaptive);
+                    let config = (
+                        Features {
+                            flagm,
+                            ..Features::default()
+                        },
+                        false,
+                        Checks::Adaptive,
+                    );
                     let mut native = executor(&program, config, false);
                     let mut oracle = executor(&program, config, true);
                     if !writable {
@@ -1414,7 +1526,14 @@ fn sse_values_choose_between_the_fast_and_the_slow_path() {
                     }
                 }
                 program.state.mxcsr = mxcsr;
-                let config = (Features { flagm: false }, false, Checks::Adaptive);
+                let config = (
+                    Features {
+                        flagm: false,
+                        ..Features::default()
+                    },
+                    false,
+                    Checks::Adaptive,
+                );
                 let mut native = executor(&program, config, false);
                 let mut oracle = executor(&program, config, true);
                 let outcome = native.run(program.stop, 100).unwrap();
@@ -1474,7 +1593,14 @@ fn values_rounded_up_to_min_normal_raise_underflow_after_rounding() {
             }
         }
         program.state.mxcsr = 0x1fa0;
-        let config = (Features { flagm: false }, false, Checks::Adaptive);
+        let config = (
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
+            false,
+            Checks::Adaptive,
+        );
         let mut native = executor(&program, config, false);
         let mut oracle = executor(&program, config, true);
         let outcome = native.run(program.stop, 100).unwrap();
@@ -1526,7 +1652,14 @@ fn j1_fault_recipes_match_interpreter_before_dead_flag_rewrites() {
                 p.state.regs[0] = value;
                 for flagm in [false, true] {
                     for checks in [Checks::Adaptive, Checks::All] {
-                        let config = (Features { flagm }, false, checks);
+                        let config = (
+                            Features {
+                                flagm,
+                                ..Features::default()
+                            },
+                            false,
+                            checks,
+                        );
                         let mut native = executor(&p, config, false);
                         let mut oracle = executor(&p, config, true);
                         assert_eq!(
@@ -1563,7 +1696,14 @@ fn j1_budget_refusals_and_conditional_exits_are_exact() {
         });
         for flagm in [false, true] {
             for budget in [3, 4, 5, 6, 13, 100, 250] {
-                let config = (Features { flagm }, false, Checks::Adaptive);
+                let config = (
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
+                    false,
+                    Checks::Adaptive,
+                );
                 let mut native = executor(&p, config, false);
                 let mut oracle = executor(&p, config, true);
                 assert_eq!(
@@ -1602,7 +1742,14 @@ fn j1_x87_sahf_and_control_changes_match_interpreter() {
         });
         p.data[..2].copy_from_slice(&0x037fu16.to_le_bytes());
         for flagm in [false, true] {
-            let config = (Features { flagm }, false, Checks::Adaptive);
+            let config = (
+                Features {
+                    flagm,
+                    ..Features::default()
+                },
+                false,
+                Checks::Adaptive,
+            );
             let mut native = executor(&p, config, false);
             let mut oracle = executor(&p, config, true);
             assert_eq!(
@@ -1647,7 +1794,14 @@ fn j1_recipes_survive_partial_flag_writers_and_operand_reuse() {
             });
             p.state.regs[0] = if overflow { 0x8000_0000 } else { 1 };
             for flagm in [false, true] {
-                let config = (Features { flagm }, false, Checks::Adaptive);
+                let config = (
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
+                    false,
+                    Checks::Adaptive,
+                );
                 let mut native = executor(&p, config, false);
                 let mut oracle = executor(&p, config, true);
                 assert_eq!(

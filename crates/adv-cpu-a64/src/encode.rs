@@ -1147,6 +1147,26 @@ pub const fn vtoint(truncate: bool, full: bool, rd: VReg, rn: VReg) -> u32 {
     base | (full as u32) << 30 | rn.number() << 5 | rd.number()
 }
 
+/// `frint32z` (`truncate`) or `frint32x` (`!truncate`) `vd.2s/4s/2d, vn.2s/4s/2d` (FEAT_FRINTTS).
+pub const fn vfrint32(full: bool, double: bool, truncate: bool, rd: VReg, rn: VReg) -> u32 {
+    0x0E21_E800
+        | (full as u32) << 30
+        | (!truncate as u32) << 29
+        | (double as u32) << 22
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// `fcvtzs vd.2d, vn.2d`.
+pub const fn vfcvtzs_2d(rd: VReg, rn: VReg) -> u32 {
+    0x4EE1_B800 | rn.number() << 5 | rd.number()
+}
+
+/// `xtn vd.2s, vn.2d` (extract low 32 bits of each 64-bit lane, zeroing upper 64 bits).
+pub const fn vxtn_2s(rd: VReg, rn: VReg) -> u32 {
+    0x0EA1_2800 | rn.number() << 5 | rd.number()
+}
+
 /// `scvtf vd.4s, vn.4s`.
 pub const fn vfromint(rd: VReg, rn: VReg) -> u32 {
     0x4E21_D800 | rn.number() << 5 | rd.number()
@@ -1695,6 +1715,33 @@ mod tests {
             (vext(v(0), v(1), v(2), 3), "ext v0.16b, v1.16b, v2.16b, #3"),
             (vtoint(false, false, v(0), v(1)), "fcvtns v0.2s, v1.2s"),
             (vtoint(true, false, v(0), v(1)), "fcvtzs v0.2s, v1.2s"),
+            (vtoint(true, true, v(0), v(1)), "fcvtzs v0.4s, v1.4s"),
+            (
+                vfrint32(true, false, true, v(0), v(1)),
+                "frint32z v0.4s, v1.4s",
+            ),
+            (
+                vfrint32(false, false, true, v(0), v(1)),
+                "frint32z v0.2s, v1.2s",
+            ),
+            (
+                vfrint32(true, true, true, v(0), v(1)),
+                "frint32z v0.2d, v1.2d",
+            ),
+            (
+                vfrint32(true, false, false, v(0), v(1)),
+                "frint32x v0.4s, v1.4s",
+            ),
+            (
+                vfrint32(false, false, false, v(0), v(1)),
+                "frint32x v0.2s, v1.2s",
+            ),
+            (
+                vfrint32(true, true, false, v(0), v(1)),
+                "frint32x v0.2d, v1.2d",
+            ),
+            (vfcvtzs_2d(v(0), v(1)), "fcvtzs v0.2d, v1.2d"),
+            (vxtn_2s(v(0), v(1)), "xtn v0.2s, v1.2d"),
             (sfcmgt(v(0), v(1), v(2)), "fcmgt s0, s1, s2"),
             (
                 vfloat(Float::Fcmgt, false, v(0), v(1), v(2)),

@@ -116,34 +116,12 @@ pub(crate) enum Checks {
     Slow,
 }
 
-/// Host features from the OS.
+/// Host features from the OS (with `ADV_HOST_FEATURES` override applied).
 fn features() -> Features {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        const HWCAP_FLAGM: u64 = 1 << 35;
-        // SAFETY: getauxval has no preconditions.
-        let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) } as u64;
-        Features {
-            flagm: hwcap & HWCAP_FLAGM != 0,
-        }
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        let mut value: libc::c_int = 0;
-        let mut len = std::mem::size_of_val(&value);
-        // SAFETY: a valid name, and an output buffer of `len` bytes.
-        let found = unsafe {
-            libc::sysctlbyname(
-                c"hw.optional.arm.FEAT_FlagM".as_ptr(),
-                (&raw mut value).cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        } == 0;
-        Features {
-            flagm: found && value != 0,
-        }
+    let host = adv_cpu_core::HostFeatures::get();
+    Features {
+        flagm: host.contains(adv_cpu_core::HostFeatures::FLAGM),
+        frintts: host.contains(adv_cpu_core::HostFeatures::FRINTTS),
     }
 }
 

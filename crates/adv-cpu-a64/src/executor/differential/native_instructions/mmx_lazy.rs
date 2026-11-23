@@ -5,7 +5,16 @@ fn configs() -> impl Iterator<Item = Config> {
         [false, true].into_iter().flat_map(move |first| {
             [Checks::Adaptive, Checks::All, Checks::Slow]
                 .into_iter()
-                .map(move |checks| (Features { flagm }, first, checks))
+                .map(move |checks| {
+                    (
+                        Features {
+                            flagm,
+                            ..Features::default()
+                        },
+                        first,
+                        checks,
+                    )
+                })
         })
     })
 }
@@ -283,7 +292,14 @@ fn checked_simd_accesses_complete_and_refuse_without_instruction_helpers() {
                 chunk.copy_from_slice(&1.0f64.to_le_bytes());
             }
             for flagm in [false, true] {
-                let config = (Features { flagm }, false, Checks::Slow);
+                let config = (
+                    Features {
+                        flagm,
+                        ..Features::default()
+                    },
+                    false,
+                    Checks::Slow,
+                );
                 let mut native = executor(&program, config, false);
                 let mut oracle = executor(&program, config, true);
                 let outcome = native.run(program.stop, 100).unwrap();

@@ -899,7 +899,47 @@ impl Translator<'_> {
             self.register(simd.src)
         };
         self.cpu();
-        self.emit_all(&[ldr(W, X13, X5, runtime::MXCSR), movz(W, X0, 0, 0)]);
+        self.emit(ldr(W, X13, X5, runtime::MXCSR));
+        let done = self.features.frintts.then(|| {
+            let (slow, done) = (self.asm.label(), self.asm.label());
+            // Fast path requires DAZ = 0, PM = 1, and (for non-truncating forms) RC = Nearest.
+            self.asm.tbz(true, X13, 6, slow);
+            self.asm.tbz(false, X13, 12, slow);
+            if !truncate {
+                self.emit(and_imm(W, X17, X13, 0x6000));
+                self.asm.cbz(W, true, X17, slow);
+            }
+            self.emit(msr_fpsr(Reg::ZR));
+            if double {
+                self.emit_all(&[
+                    vfrint32(true, true, truncate, V0, s),
+                    vfcvtzs_2d(V0, V0),
+                    vxtn_2s(V0, V0),
+                ]);
+            } else {
+                let full = !matches!(simd.dst, Loc::Mmx(_));
+                self.emit_all(&[
+                    vfrint32(full, false, truncate, V0, s),
+                    vtoint(true, full, V0, V0),
+                ]);
+            }
+            self.emit(mrs_fpsr(X17));
+            // Any NaN, infinity, or out-of-range lane sets IOC (bit 0) and falls back
+            // to the per-lane path for integer indefinite and #XM arbitration.
+            self.asm.tbz(true, X17, 0, slow);
+            if !self.vector.guards.fp_pe {
+                // FPSR.IXC (bit 4) maps directly to MXCSR.PE (bit 5).
+                self.emit_all(&[
+                    and_imm(W, X17, X17, 0x10),
+                    orr(W, X13, X13, X17, Shift::Lsl, 1),
+                    str(W, X13, X5, runtime::MXCSR),
+                ]);
+            }
+            self.asm.b(done);
+            self.asm.bind(slow);
+            done
+        });
+        self.emit(movz(W, X0, 0, 0));
         let temp = VReg::new(3);
         self.emit(vzero(true, V0));
         for lane in 0..if double || matches!(simd.dst, Loc::Mmx(_)) {
@@ -981,6 +1021,9 @@ impl Translator<'_> {
             str(W, X13, X5, runtime::MXCSR),
         ]);
         self.asm.cbz(W, true, X2, bail);
+        if let Some(done) = done {
+            self.asm.bind(done);
+        }
         let d = self.destination(simd.dst, false);
         self.emit(vmov(simd.full(), d, V0));
         self.written(simd.dst);
@@ -2068,7 +2111,10 @@ mod tests {
             &[0x10000 + code.len() as u32],
             &|_| false,
             0,
-            Features { flagm: false },
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
             0,
             Stubs {
                 call: 0,

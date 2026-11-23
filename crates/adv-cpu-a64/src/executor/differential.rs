@@ -1984,7 +1984,14 @@ fn random_programs_match_the_interpreter_at_the_stop_and_inside_units() {
         (false, false, Checks::Slow),
     ];
     for (flagm, first_visits, checks) in configs {
-        let config = (Features { flagm }, first_visits, checks);
+        let config = (
+            Features {
+                flagm,
+                ..Features::default()
+            },
+            first_visits,
+            checks,
+        );
         for seed in 1..=1000 {
             native += compare(seed, u64::MAX >> 1, config);
             for budget in [1, 5, 13, 40, 120, 400] {
@@ -2002,7 +2009,14 @@ fn baseline_switch_matches_tier0_and_common_tier1_path_counts() {
     for seed in 1..=16 {
         let program = program(seed);
         for budget in [13, 40, 120, 400, u64::MAX >> 1] {
-            let config = (Features { flagm: true }, true, Checks::Adaptive);
+            let config = (
+                Features {
+                    flagm: true,
+                    ..Features::default()
+                },
+                true,
+                Checks::Adaptive,
+            );
             let enabled = translated(&program, budget, config, false);
             let baseline = translated(&program, budget, config, true);
             for (outcome, state, memory, _, _, debt) in [&baseline, &enabled] {
@@ -2898,7 +2912,14 @@ fn dump_program() {
 fn first_divergence() {
     let seed: u64 = std::env::var("SEED").unwrap().parse().unwrap();
     let program = program(seed);
-    let config = (Features { flagm: true }, false, Checks::Adaptive);
+    let config = (
+        Features {
+            flagm: true,
+            ..Features::default()
+        },
+        false,
+        Checks::Adaptive,
+    );
     for budget in 1..5000 {
         let (a, b, m, _, _, debt) = translated(&program, budget, config, false);
         let (outcome, state, memory) = reference(&program, reference_budget(budget, debt, &a));

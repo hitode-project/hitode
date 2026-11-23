@@ -48,7 +48,16 @@ fn configs() -> impl Iterator<Item = Config> {
         [false, true].into_iter().flat_map(move |first| {
             [Checks::Adaptive, Checks::All, Checks::Slow]
                 .into_iter()
-                .map(move |checks| (Features { flagm }, first, checks))
+                .map(move |checks| {
+                    (
+                        Features {
+                            flagm,
+                            ..Features::default()
+                        },
+                        first,
+                        checks,
+                    )
+                })
         })
     })
 }
@@ -242,7 +251,14 @@ fn modified_index_and_non_image_or_writable_tables_use_the_original_probe() {
         let mut p = program(false, kind == 0);
         // A rewritten index is deliberately made terminating here.
         p.code[0x4000 + 7 * 4..0x4004 + 7 * 4].copy_from_slice(&p.stop.to_le_bytes());
-        let config = (Features { flagm: false }, false, Checks::Adaptive);
+        let config = (
+            Features {
+                flagm: false,
+                ..Features::default()
+            },
+            false,
+            Checks::Adaptive,
+        );
         let mut native = configured(&p, config, false);
         let mut oracle = configured(&p, config, true);
         if kind == 1 {

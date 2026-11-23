@@ -119,7 +119,10 @@ fn fixture(config: (bool, bool, Checks)) -> (Executor, u32) {
     executor.state.eflags = 0x202;
     executor.state.xmm = [[0xa5; 16]; 8];
     let native = executor.native.as_mut().unwrap();
-    native.features = Features { flagm: config.0 };
+    native.features = Features {
+        flagm: config.0,
+        ..Features::default()
+    };
     native.first_visits = config.1;
     native.checks = config.2;
     (executor, stop)

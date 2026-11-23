@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostFeatures(u32);
 
-const NAMES: [(&str, HostFeatures); 16] = [
+const NAMES: [(&str, HostFeatures); 17] = [
     ("flagm", HostFeatures::FLAGM),
     ("flagm2", HostFeatures::FLAGM2),
     ("afp", HostFeatures::AFP),
@@ -24,6 +24,7 @@ const NAMES: [(&str, HostFeatures); 16] = [
     ("pauth", HostFeatures::PAUTH),
     ("pacg", HostFeatures::PACG),
     ("bti", HostFeatures::BTI),
+    ("frintts", HostFeatures::FRINTTS),
 ];
 
 struct Snapshot {
@@ -62,6 +63,8 @@ impl HostFeatures {
     pub const PAUTH: Self = Self(1 << 13);
     pub const PACG: Self = Self(1 << 14);
     pub const BTI: Self = Self(1 << 15);
+    /// FEAT_FRINTTS (ARMv8.5-A `frint32z`/`frint32x`/`frint64z`/`frint64x`).
+    pub const FRINTTS: Self = Self(1 << 16);
 
     /// Effective capabilities, sampled once including the disable-only override.
     pub fn get() -> Self {
@@ -87,7 +90,12 @@ impl HostFeatures {
 
     #[cfg(any(
         test,
-        any(target_os = "linux", target_os = "android", target_os = "macos")
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )
     ))]
     fn insert(&mut self, feature: Self, available: bool) {
         if available {
@@ -157,13 +165,14 @@ fn from_auxv(hwcap: u64, hwcap2: u64) -> HostFeatures {
         features.insert(feature, hwcap & mask == mask);
     }
     for (feature, bit) in [
-        (HostFeatures::SVE2, 1),   // HWCAP2_SVE2
-        (HostFeatures::FLAGM2, 7), // HWCAP2_FLAGM2
-        (HostFeatures::I8MM, 13),  // HWCAP2_I8MM
-        (HostFeatures::BF16, 14),  // HWCAP2_BF16
-        (HostFeatures::BTI, 17),   // HWCAP2_BTI
-        (HostFeatures::AFP, 20),   // HWCAP2_AFP
-        (HostFeatures::SME, 23),   // HWCAP2_SME
+        (HostFeatures::SVE2, 1),    // HWCAP2_SVE2
+        (HostFeatures::FLAGM2, 7),  // HWCAP2_FLAGM2
+        (HostFeatures::FRINTTS, 8), // HWCAP2_FRINT
+        (HostFeatures::I8MM, 13),   // HWCAP2_I8MM
+        (HostFeatures::BF16, 14),   // HWCAP2_BF16
+        (HostFeatures::BTI, 17),    // HWCAP2_BTI
+        (HostFeatures::AFP, 20),    // HWCAP2_AFP
+        (HostFeatures::SME, 23),    // HWCAP2_SME
     ] {
         features.insert(feature, hwcap2 & (1 << bit) != 0);
     }
@@ -181,7 +190,7 @@ fn detect() -> HostFeatures {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn detect() -> HostFeatures {
     // Exact, case-sensitive names exported by Apple XNU arm_features.inc and
     // bsd/kern/kern_mib.c (ARM_FEATURE_FLAG). Missing keys remain unavailable.
@@ -201,6 +210,7 @@ fn detect() -> HostFeatures {
         (HostFeatures::SME, c"hw.optional.arm.FEAT_SME"),
         (HostFeatures::PAUTH, c"hw.optional.arm.FEAT_PAuth"),
         (HostFeatures::BTI, c"hw.optional.arm.FEAT_BTI"),
+        (HostFeatures::FRINTTS, c"hw.optional.arm.FEAT_FRINTTS"),
     ] {
         let mut value: libc::c_int = 0;
         let mut len = std::mem::size_of_val(&value);
@@ -223,7 +233,12 @@ fn detect() -> HostFeatures {
     features
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
 fn detect() -> HostFeatures {
     HostFeatures::EMPTY
 }
@@ -237,11 +252,12 @@ mod tests {
         assert_eq!(from_auxv(0, 0), HostFeatures::EMPTY);
         assert!(!from_auxv(1 << 9, 0).contains(HostFeatures::FP16));
         assert!(!from_auxv(1 << 10, 0).contains(HostFeatures::FP16));
-        assert_eq!(from_auxv(u64::MAX, u64::MAX).bits(), 0xffff);
+        assert_eq!(from_auxv(u64::MAX, u64::MAX).bits(), 0x1_ffff);
         for (feature, word, bit) in [
             (HostFeatures::FLAGM, 0, 27),
             (HostFeatures::LSE2, 0, 25),
             (HostFeatures::FLAGM2, 1, 7),
+            (HostFeatures::FRINTTS, 1, 8),
             (HostFeatures::AFP, 1, 20),
             (HostFeatures::SVE2, 1, 1),
             (HostFeatures::SME, 1, 23),
@@ -257,11 +273,12 @@ mod tests {
     #[test]
     fn override_can_only_remove_features() {
         let all = from_auxv(u64::MAX, u64::MAX);
-        let limited = all.disable("-AFP,-flagm,-sve,-uscat,-paca, +afp, fp16, -unknown");
+        let limited = all.disable("-AFP,-flagm,-frintts,-sve,-uscat,-paca, +afp, fp16, -unknown");
         for feature in [
             HostFeatures::AFP,
             HostFeatures::FLAGM,
             HostFeatures::FLAGM2,
+            HostFeatures::FRINTTS,
             HostFeatures::SVE,
             HostFeatures::SVE2,
             HostFeatures::LSE2,

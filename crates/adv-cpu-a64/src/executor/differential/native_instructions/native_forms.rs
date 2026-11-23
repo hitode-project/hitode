@@ -86,7 +86,10 @@ fn no_operation_calls(p: &Program) {
         &[p.stop],
         &|_| false,
         0,
-        Features { flagm: false },
+        Features {
+            flagm: false,
+            ..Features::default()
+        },
         at,
         stubs,
         &|_, _| None,
@@ -409,6 +412,102 @@ fn native_forms_packed_conversions_match_rounding_indefinite_and_exceptions() {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-ISA-4, A64F-FP-4
+#[test]
+fn frintts_packed_float_to_int_matches_interpreter_and_fallback() {
+    let has_frintts =
+        adv_cpu_core::HostFeatures::detected().contains(adv_cpu_core::HostFeatures::FRINTTS);
+    let modes: &[bool] = if has_frintts {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    // f32 forms: cvttps2dq, cvtps2dq, cvttps2pi, cvtps2pi
+    for form in 0..4 {
+        let mut p = fixture(|a| {
+            a.pxor(xmm4, xmm2).unwrap();
+            match form {
+                0 => a.cvttps2dq(xmm3, xmm3).unwrap(),
+                1 => a.cvtps2dq(xmm3, xmm3).unwrap(),
+                2 => a.cvttps2pi(mm3, xmm3).unwrap(),
+                _ => a.cvtps2pi(mm3, xmm3).unwrap(),
+            }
+        });
+        for values in [
+            [0u32, 0x8000_0000, 0x4228_0000, 0xc228_0000], // exact ints: +0, -0, +42, -42
+            [0x3fc0_0000, 0xc020_0000, 1, 0x8000_0001],    // inexact + subnormals
+            [0x4eff_ffff, 0xcf00_0000, 0x007f_ffff, 0x807f_ffff], // max/min in-range + max subnormal
+            [0x4f00_0000, 0xcf00_0001, 0x7fc0_1234, 0x7f80_0000], // overflow, qNaN, +Inf
+            [0x3fc0_0000, 0x7fc0_1234, 0x7f80_1234, 0xff80_0000], // mixed inexact + NaN/Inf
+        ] {
+            for (n, v) in values.iter().enumerate() {
+                p.state.xmm[3][4 * n..4 * n + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            for &frintts in modes {
+                for control in [0x1f80, 0x1fa0, 0x1fc0, 0x1f00, 0x0f80, 0x3f80] {
+                    p.state.mxcsr = control;
+                    let config = (
+                        Features {
+                            flagm: false,
+                            frintts,
+                        },
+                        false,
+                        Checks::Adaptive,
+                    );
+                    check(&p, config, None, control & 0x1f80 == 0x1f80);
+                }
+            }
+        }
+    }
+    // f64 forms: cvttpd2dq, cvtpd2dq, cvttpd2pi, cvtpd2pi
+    for form in 0..4 {
+        let mut p = fixture(|a| {
+            a.pxor(xmm4, xmm2).unwrap();
+            match form {
+                0 => a.cvttpd2dq(xmm3, xmm3).unwrap(),
+                1 => a.cvtpd2dq(xmm3, xmm3).unwrap(),
+                2 => a.cvttpd2pi(mm3, xmm3).unwrap(),
+                _ => a.cvtpd2pi(mm3, xmm3).unwrap(),
+            }
+        });
+        for values in [
+            [0.0f64.to_bits(), (-2_147_483_648.0f64).to_bits()], // exact 0 and -2^31
+            [
+                2_147_483_647.9f64.to_bits(),
+                (-2_147_483_648.9f64).to_bits(),
+            ], // in-range under trunc
+            [
+                (-2_147_483_648.5f64).to_bits(),
+                (-2_147_483_648.6f64).to_bits(),
+            ], // ties-even boundary
+            [
+                2_147_483_648.0f64.to_bits(),
+                (-2_147_483_649.0f64).to_bits(),
+            ], // out-of-range
+            [1u64, 0x8000_0000_0000_0001u64],                    // ±min subnormal
+            [0x7ff8_0000_0000_0001u64, f64::INFINITY.to_bits()], // qNaN + +Inf
+        ] {
+            for (n, v) in values.iter().enumerate() {
+                p.state.xmm[3][8 * n..8 * n + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            for &frintts in modes {
+                for control in [0x1f80, 0x1fa0, 0x1fc0, 0x1f00, 0x0f80, 0x3f80] {
+                    p.state.mxcsr = control;
+                    let config = (
+                        Features {
+                            flagm: false,
+                            frintts,
+                        },
+                        false,
+                        Checks::Adaptive,
+                    );
+                    check(&p, config, None, control & 0x1f80 == 0x1f80);
                 }
             }
         }

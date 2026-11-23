@@ -141,7 +141,14 @@ fn native_regions_keep_fault_prefixes_and_decline_nonordinary_ranges() {
             _ => {}
         }
         for flagm in [false, true] {
-            let config = (Features { flagm }, false, Checks::Adaptive);
+            let config = (
+                Features {
+                    flagm,
+                    ..Features::default()
+                },
+                false,
+                Checks::Adaptive,
+            );
             let mut a = executor(&p, config, false);
             let mut b = executor(&p, config, true);
             for e in [&mut a, &mut b] {

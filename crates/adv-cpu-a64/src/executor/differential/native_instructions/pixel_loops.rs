@@ -6,7 +6,16 @@ pub(super) fn configs() -> impl Iterator<Item = Config> {
         [false, true].into_iter().flat_map(move |first| {
             [Checks::Adaptive, Checks::All, Checks::Slow]
                 .into_iter()
-                .map(move |checks| (Features { flagm }, first, checks))
+                .map(move |checks| {
+                    (
+                        Features {
+                            flagm,
+                            ..Features::default()
+                        },
+                        first,
+                        checks,
+                    )
+                })
         })
     })
 }
@@ -137,7 +146,14 @@ fn resident_pixel_faults_recover_both_simd_banks_and_retry_the_original_instruct
                 p.state.regs[if store { 7 } else { 6 }] =
                     DATA + DATA_LEN as u32 - width * 2 - if crossing { 1 } else { 0 };
                 for flagm in [false, true] {
-                    let config = (Features { flagm }, false, Checks::Adaptive);
+                    let config = (
+                        Features {
+                            flagm,
+                            ..Features::default()
+                        },
+                        false,
+                        Checks::Adaptive,
+                    );
                     let mut native = executor(&p, config, false);
                     let mut oracle = executor(&p, config, true);
                     if store {
@@ -183,7 +199,14 @@ fn resident_pixel_faults_recover_both_simd_banks_and_retry_the_original_instruct
 fn pixel_code_changes_invalidate_the_loop_and_preserve_pending_x87_exceptions() {
     for xmm in [false, true] {
         let p = program(xmm, false);
-        let config = (Features { flagm: true }, false, Checks::Adaptive);
+        let config = (
+            Features {
+                flagm: true,
+                ..Features::default()
+            },
+            false,
+            Checks::Adaptive,
+        );
         let mut native = executor(&p, config, false);
         let mut oracle = executor(&p, config, true);
         for changed in [false, true] {

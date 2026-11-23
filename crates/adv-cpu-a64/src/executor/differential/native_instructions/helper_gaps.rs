@@ -134,7 +134,14 @@ fn checked_simd_moves_use_ordinary_aliases_and_follow_permission_changes() {
     });
     for flagm in [false, true] {
         for checks in [Checks::All, Checks::Slow] {
-            let config = (Features { flagm }, false, checks);
+            let config = (
+                Features {
+                    flagm,
+                    ..Features::default()
+                },
+                false,
+                checks,
+            );
             let mut native = executor(&p, config, false);
             let mut oracle = executor(&p, config, true);
             for cpu in [&mut native, &mut oracle] {
@@ -169,7 +176,16 @@ fn configs() -> impl Iterator<Item = Config> {
         [false, true].into_iter().flat_map(move |first| {
             [Checks::Adaptive, Checks::All, Checks::Slow]
                 .into_iter()
-                .map(move |checks| (Features { flagm }, first, checks))
+                .map(move |checks| {
+                    (
+                        Features {
+                            flagm,
+                            ..Features::default()
+                        },
+                        first,
+                        checks,
+                    )
+                })
         })
     })
 }
@@ -557,7 +573,14 @@ fn common_forms_microbenchmark() {
             .copy_from_slice(&adv_cpu_core::X87Register::from_parts(0xa000000000000000, 0x4000).0);
         let mut cpu = executor(
             &p,
-            (Features { flagm: false }, false, Checks::Adaptive),
+            (
+                Features {
+                    flagm: false,
+                    ..Features::default()
+                },
+                false,
+                Checks::Adaptive,
+            ),
             false,
         );
         // Compile before measuring.
@@ -1424,7 +1447,14 @@ fn common_form_conversion_counts() {
         p.state.mxcsr = 0x1fa0;
         let mut native = executor(
             &p,
-            (Features { flagm: false }, false, Checks::Adaptive),
+            (
+                Features {
+                    flagm: false,
+                    ..Features::default()
+                },
+                false,
+                Checks::Adaptive,
+            ),
             false,
         );
         native.write(STACK_TOP, &STACK_TOP.to_le_bytes()).unwrap();
@@ -1434,7 +1464,14 @@ fn common_form_conversion_counts() {
         }
         let mut oracle = executor(
             &p,
-            (Features { flagm: false }, false, Checks::Adaptive),
+            (
+                Features {
+                    flagm: false,
+                    ..Features::default()
+                },
+                false,
+                Checks::Adaptive,
+            ),
             true,
         );
         oracle.write(STACK_TOP, &STACK_TOP.to_le_bytes()).unwrap();
@@ -1495,7 +1532,14 @@ fn common_form_conversion_counts() {
                             p.state.regs[6] = 64;
                         }
                         p.state.eflags = (p.state.eflags & !0x400) | u32::from(reverse) << 10;
-                        let config = (Features { flagm: false }, false, Checks::Adaptive);
+                        let config = (
+                            Features {
+                                flagm: false,
+                                ..Features::default()
+                            },
+                            false,
+                            Checks::Adaptive,
+                        );
                         let mut native = executor(&p, config, false);
                         let mut oracle = executor(&p, config, true);
                         native.count_tier0(true);
