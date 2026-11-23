@@ -1025,7 +1025,7 @@ pub fn alert_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         Ok(event) => {
             let signaler = trace_signaler(env);
             env.sys
-                .set_event_from(event, adv_machine::WakePriority::Normal, signaler);
+                .set_event_handoff(event, adv_machine::WakePriority::Normal, signaler);
             Outcome::Return(status::SUCCESS)
         }
         Err(status) => Outcome::Return(status),
