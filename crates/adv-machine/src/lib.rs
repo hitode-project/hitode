@@ -226,6 +226,10 @@ pub struct Sys {
     wait_deadlines: std::collections::BTreeSet<(u64, CtxId)>,
     /// Stopped contexts whose execution storage still needs to be reclaimed.
     finished_contexts: Vec<CtxId>,
+    /// A host call (such as releasing a contended lock via `NtAlertThreadByThreadId`)
+    /// just woke a blocked peer context; hand off at trap completion so the
+    /// woken waiter can acquire the resource before the signaler spins on it.
+    peer_handoff: bool,
     #[cfg(test)]
     scheduler_work: sched::SchedulerWork,
 }
@@ -978,7 +982,32 @@ impl Sys {
         };
         if valid {
             self.objects.mark_changed(h, priority);
-            self.wake_changed(self.clock.now_us(), signaler.map(|id| (h, id)));
+            let _ = self.wake_changed(self.clock.now_us(), signaler.map(|id| (h, id)));
+        }
+        valid
+    }
+
+    /// Delivers an event and requests an immediate scheduler handoff when a
+    /// blocked peer context becomes runnable, preventing lock-convoy starvation
+    /// when a spinning holder releases a contended lock on a single owner thread.
+    pub fn set_event_handoff(
+        &mut self,
+        h: Handle,
+        priority: WakePriority,
+        signaler: Option<CtxId>,
+    ) -> bool {
+        let valid = match self.objects.get_mut(h) {
+            Some(Object::Event { signaled, .. }) => {
+                *signaled = true;
+                true
+            }
+            _ => false,
+        };
+        if valid {
+            self.objects.mark_changed(h, priority);
+            if self.wake_changed(self.clock.now_us(), signaler.map(|id| (h, id))) {
+                self.peer_handoff = true;
+            }
         }
         valid
     }
@@ -1024,7 +1053,8 @@ impl Sys {
         self.wake_changed(self.clock.now_us(), None);
     }
 
-    fn wake_changed(&mut self, now: u64, signal: Option<(Handle, CtxId)>) {
+    fn wake_changed(&mut self, now: u64, signal: Option<(Handle, CtxId)>) -> bool {
+        let mut woke_peer = false;
         for (id, priority) in self.objects.changed_waiters() {
             let i = id as usize;
             if matches!(self.contexts[i].state, State::Blocked { .. })
@@ -1054,8 +1084,12 @@ impl Sys {
                 });
                 self.release_waiter(i, reason, now, signaler);
                 self.wakes.wake_as(id, now, None, priority);
+                if self.current != id {
+                    woke_peer = true;
+                }
             }
         }
+        woke_peer
     }
 
     /// The host slept with no ready context, until its timeout or a signal:
@@ -1498,6 +1532,11 @@ enum Parked {
     },
     /// Return to the host after committing a frame-producing trap, without a guest wait.
     HostYield {
+        resume_eip: u32,
+    },
+    /// Hand off to a woken peer context after committing a trap, staying runnable
+    /// without marking the context as polling.
+    PeerHandoff {
         resume_eip: u32,
     },
     ServiceYield {
@@ -1944,6 +1983,7 @@ impl Dispatch<'_> {
     }
 
     fn host_call(&mut self, cpu: &mut dyn Guest, index: u32) -> Result<(), Parked> {
+        self.sys.peer_handoff = false;
         let binding = self.sys.thunks.get(index);
         let (audio, f) = (binding.audio, binding.f);
         if audio {
@@ -2016,7 +2056,14 @@ impl Dispatch<'_> {
             Ok(()) if self.yield_on_frame && self.sys.completed_frames != frame_before => {
                 // Return/Call has already committed its stack and continuation state.
                 // Parking here does not fabricate a Sleep or re-execute the host call.
+                self.sys.peer_handoff = false;
                 self.parked = Some(Parked::HostYield {
+                    resume_eip: cpu.reg(Reg::Eip),
+                });
+                TrapAction::Park
+            }
+            Ok(()) if std::mem::take(&mut self.sys.peer_handoff) => {
+                self.parked = Some(Parked::PeerHandoff {
                     resume_eip: cpu.reg(Reg::Eip),
                 });
                 TrapAction::Park
@@ -2026,10 +2073,12 @@ impl Dispatch<'_> {
                 TrapAction::Continue
             }
             Err(Parked::Raise(fault)) => {
+                self.sys.peer_handoff = false;
                 let res = self.exception(cpu, exception::Exception::Fault(fault));
                 self.action(cpu, res, frame_before)
             }
             Err(p) => {
+                self.sys.peer_handoff = false;
                 self.parked = Some(p);
                 TrapAction::Park
             }
@@ -2414,6 +2463,7 @@ impl<B: Backend> Machine<B> {
             wakes: sched::ActiveContexts::default(),
             wait_deadlines: Default::default(),
             finished_contexts: Vec::new(),
+            peer_handoff: false,
             rr_last: None,
             #[cfg(test)]
             scheduler_work: sched::SchedulerWork::default(),
@@ -2746,6 +2796,14 @@ impl<B: Backend> Machine<B> {
                 // Other registers already contain the committed trap result.
                 self.cpu.set_reg(Reg::Eip, resume_eip);
                 self.sys.set_yielded(id, false);
+            }
+            Parked::PeerHandoff { resume_eip } => {
+                self.cpu.set_reg(Reg::Eip, resume_eip);
+                ctx.progress.new_work();
+                self.sys.set_yielded(id, false);
+                self.sys
+                    .schedule_trace
+                    .event("lock_handoff", id, u64::from(resume_eip), 0, 0);
             }
             Parked::Deferred { then, origin } => {
                 ctx.state = State::Ready {

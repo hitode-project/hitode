@@ -14,6 +14,7 @@ use crate::status::{self, Error};
 const PROCESS_DEBUG_PORT: u32 = 7;
 const PROCESS_DEFAULT_HARD_ERROR_MODE: u32 = 12;
 const PROCESS_WOW64_INFORMATION: u32 = 26;
+const THREAD_WINE_NATIVE_THREAD_NAME: u32 = 1000;
 const PROCESS_IMAGE_INFORMATION: u32 = 37;
 const PROCESS_THREAD_STACK_ALLOCATION: u32 = 41;
 
@@ -835,6 +836,42 @@ pub fn set_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                     .flat_map(|unit| unit.to_le_bytes())
                     .collect();
                 request.mask = 0x20;
+            }
+            THREAD_WINE_NATIVE_THREAD_NAME => {
+                if size != 8 {
+                    return Err(status::INFO_LENGTH_MISMATCH.into());
+                }
+                let mut query = GetThreadInfoRequest {
+                    handle: thread,
+                    access: 0,
+                    ..Default::default()
+                };
+                let (reply, _) = server::request(env, &mut query, &[], &mut [])?;
+                if reply.header.error == 0 && reply.pid == env.sys.pid {
+                    let length = crate::object::read_u32(env, info)? & 0xffff;
+                    let buffer = crate::object::read_u32(env, info + 4)?;
+                    let byte_len = (length & !1) as usize;
+                    if byte_len != 0 {
+                        let mut bytes = vec![0; byte_len];
+                        env.cpu
+                            .read(buffer, &mut bytes)
+                            .map_err(|_| status::ACCESS_VIOLATION)?;
+                        let units: Vec<u16> = bytes
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|&pair| u16::from_le_bytes(pair))
+                            .collect();
+                        let name = String::from_utf16_lossy(&units);
+                        if !name.is_empty()
+                            && let Some(ctx) =
+                                env.sys.contexts.iter_mut().find(|c| c.tid == reply.tid)
+                        {
+                            ctx.name = name;
+                        }
+                    }
+                }
+                return Ok(());
             }
             class => {
                 return Err(Error::Unsupported(format!(

@@ -390,7 +390,7 @@ The pinned Wine source carries both through `tools/wine/patches`.
 
 ### WINE-THR-3 Suspension
 
-**Rule**: Suspending a thread MUST stop its context before the caller next runs. Resuming it to a zero count MUST let it run.
+**Rule**: Suspending a thread MUST stop its context before the caller next runs. Resuming it to a zero count MUST let it run. A suspend wait MUST NOT consume or lose a concurrent server select wake-up.
 **Verification**: Test
 
 ### WINE-THR-4 Termination
@@ -813,6 +813,8 @@ Verify mode MUST compare staged output and state with synchronous decoding.
 **Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. A host MUST provision system32, the template's module links and its own host modules on the drive C: a session uses. The program directory MUST use D: or the first unmounted letter after it, with writes in place.
 Process startup MUST register the prefix's drive letters in the server namespace.
 **Verification**: Test
+
+Wine modules whose graphics backend Hitode does not serve (such as `dxgi.dll`) stay omitted from system32; refreshing an older prefix removes stale symlinks while leaving regular files intact.
 
 ### WINE-SES-2 Host wakes
 

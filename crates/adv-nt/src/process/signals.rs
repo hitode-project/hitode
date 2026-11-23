@@ -7,6 +7,10 @@ use adv_cpu::backend::ArchitecturalState;
 use adv_machine::{CtxId, Env, Machine};
 use std::collections::BTreeMap;
 
+/// Cookie used by Wine's `wait_suspend` select requests, distinct from every
+/// user stack address (`u32`) used by normal `sync::select` waits.
+pub(crate) const COOKIE: u64 = u64::MAX - 1;
+
 struct Suspended {
     image: [u8; context::SIZE],
     state: ArchitecturalState,
@@ -76,7 +80,7 @@ fn select(env: &mut Env<'_>) -> Result<(), Error> {
         let mut request = protocol::SelectRequest {
             prev_apc: previous,
             flags: 2,
-            cookie: u64::MAX - 1,
+            cookie: COOKIE,
             timeout: 0,
             ..Default::default()
         };
@@ -89,7 +93,7 @@ fn select(env: &mut Env<'_>) -> Result<(), Error> {
             continue;
         }
         if reply.signaled == 0 {
-            server::begin_wait(env)?;
+            server::begin_suspend_wait(env)?;
             if env.sys.contexts[context as usize].suspend_count == 0 {
                 env.sys.suspend_context(context);
             }

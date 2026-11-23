@@ -69,7 +69,7 @@ Recorded guest signalers MUST come from the operation that satisfied the blocked
 ### PROC-MACH-5 Urgent wakeups
 
 **Rule**: Urgent wakeups such as audio and input MAY run before the normal turn. They MUST NOT starve normal workers or change the completion semantics of guest locks and calls.
-CPU spin handoffs MUST return to the owner's ordinary wake and context selection.
+CPU spin handoffs and contended thread-alert wakeups MUST return to the owner's ordinary wake and context selection without marking the caller as polling.
 An external delivery or a due deadline MUST close computation admission, including for a single offer, and recall active jobs before normal dispatch.
 **Verification**: Test
 

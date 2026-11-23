@@ -999,33 +999,68 @@ pub fn test_alert(env: &mut Env<'_>, _: &[u32]) -> Outcome {
 }
 
 #[derive(Default)]
-struct Alerts(std::collections::HashMap<u32, adv_machine::sched::Handle>);
+struct Alerts(std::collections::HashMap<u32, AlertSlot>);
 
-fn alert_event(env: &mut Env<'_>, tid: u32) -> Result<adv_machine::sched::Handle, Status> {
+struct AlertSlot {
+    event: adv_machine::sched::Handle,
+    /// True while the target thread is blocked in `NtWaitForAlertByThreadId`
+    /// with a non-null lock/address hint (e.g. a contended critical section or
+    /// SRW lock). Bare `NULL` thread alerts keep ordinary wake ordering so
+    /// back-to-back alerts coalesce before the waiter resumes (`WINE-THR-1`).
+    contended_wait: bool,
+}
+
+fn alert_index(tid: u32) -> Result<u32, Status> {
     // Wine indexes its alert table by (tid >> 2) - 1, even for a thread
     // that does not exist yet. Alerts persist until the next wait.
     let index = (tid >> 2).wrapping_sub(1);
     if index / 16384 > 4096 {
         return Err(0xc000_000b);
     }
-    if let Some(&event) = env.ext.get_or_default::<Alerts>().0.get(&index) {
-        return Ok(event);
+    Ok(index)
+}
+
+fn alert_slot(env: &mut Env<'_>, tid: u32) -> Result<(u32, adv_machine::sched::Handle), Status> {
+    let index = alert_index(tid)?;
+    if let Some(slot) = env.ext.get_or_default::<Alerts>().0.get(&index) {
+        return Ok((index, slot.event));
     }
     let event = env.sys.objects.insert(adv_machine::sched::Object::Event {
         manual_reset: true,
         signaled: false,
     });
-    env.ext.get_or_default::<Alerts>().0.insert(index, event);
-    Ok(event)
+    env.ext.get_or_default::<Alerts>().0.insert(
+        index,
+        AlertSlot {
+            event,
+            contended_wait: false,
+        },
+    );
+    Ok((index, event))
+}
+
+fn alert_event(env: &mut Env<'_>, tid: u32) -> Result<adv_machine::sched::Handle, Status> {
+    alert_slot(env, tid).map(|(_, event)| event)
 }
 
 /// NtAlertThreadByThreadId(tid)
 pub fn alert_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
-    match alert_event(env, args[0]) {
-        Ok(event) => {
+    match alert_slot(env, args[0]) {
+        Ok((index, event)) => {
             let signaler = trace_signaler(env);
-            env.sys
-                .set_event_from(event, adv_machine::WakePriority::Normal, signaler);
+            let handoff = env
+                .ext
+                .get_or_default::<Alerts>()
+                .0
+                .get_mut(&index)
+                .is_some_and(|slot| std::mem::take(&mut slot.contended_wait));
+            if handoff {
+                env.sys
+                    .set_event_handoff(event, adv_machine::WakePriority::Normal, signaler);
+            } else {
+                env.sys
+                    .set_event_from(event, adv_machine::WakePriority::Normal, signaler);
+            }
             Outcome::Return(status::SUCCESS)
         }
         Err(status) => Outcome::Return(status),
@@ -1034,16 +1069,25 @@ pub fn alert_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 /// NtWaitForAlertByThreadId(address, *timeout)
 pub fn wait_alert(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let address = args[0];
     let result = (|| {
         let tid = server::current_tid(env)?;
-        let event = alert_event(env, tid)?;
+        let (index, event) = alert_slot(env, tid)?;
         let timeout = read_timeout(env, args[1])?;
         let deadline = timeout.map(|timeout| deadline_us(env, timeout));
-        Ok((event, deadline))
+        Ok((index, event, deadline))
     })();
     match result {
-        Ok((handle, deadline)) => {
+        Ok((index, handle, deadline)) => {
+            if address != 0
+                && let Some(slot) = env.ext.get_or_default::<Alerts>().0.get_mut(&index)
+            {
+                slot.contended_wait = true;
+            }
             Outcome::block(Wait::Object { handle, deadline }, move |env, resume| {
+                if let Some(slot) = env.ext.get_or_default::<Alerts>().0.get_mut(&index) {
+                    slot.contended_wait = false;
+                }
                 if matches!(
                     resume,
                     adv_machine::Resume::Woke(adv_machine::WakeReason::Timeout)

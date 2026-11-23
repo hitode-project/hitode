@@ -151,12 +151,45 @@ struct Thread {
     /// Set when the server ends the thread's wait while the thread is
     /// blocked in the machine.
     wake: Handle,
-    /// Whether the thread waits for a wake-up.
+    /// Whether the thread waits for a normal `select` wake-up.
     waiting: bool,
-    /// The wake-up the server sent, read from the pipe on the thread's
-    /// behalf.
+    /// The normal `select` wake-up the server sent, read from the pipe on the
+    /// thread's behalf.
     pending: Option<WakeUp>,
+    /// Whether the thread is parked in a `SIGUSR1` suspend `select`.
+    suspend_waiting: bool,
+    /// The suspend `select` wake-up (`signals::COOKIE`) or kill (`0`), kept
+    /// separate from `pending` because a suspend wait can stack on top of an
+    /// active `select` wait and wineserver can write both wake-ups back to back.
+    suspend_pending: Option<WakeUp>,
     alert: Option<Rc<crate::ntsync::Fd>>,
+}
+
+impl Thread {
+    /// Drain readable wake-ups from the server pipe into the normal and suspend
+    /// slots. Returns `true` when `self.wake` should be signaled for a normal wait.
+    fn drain(&mut self) -> Result<bool, Error> {
+        let mut signal_wake = false;
+        while let Some(wake_up) = self.channel.wake_up()? {
+            if wake_up.cookie == 0 {
+                if self.suspend_waiting {
+                    self.suspend_pending = Some(wake_up);
+                }
+                self.pending = Some(wake_up);
+                if self.waiting {
+                    signal_wake = true;
+                }
+            } else if wake_up.cookie == crate::process::signals::COOKIE {
+                self.suspend_pending = Some(wake_up);
+            } else {
+                self.pending = Some(wake_up);
+                if self.waiting {
+                    signal_wake = true;
+                }
+            }
+        }
+        Ok(signal_wake)
+    }
 }
 
 struct Cached {
@@ -228,6 +261,8 @@ impl Link {
                 wake,
                 waiting: false,
                 pending: None,
+                suspend_waiting: false,
+                suspend_pending: None,
                 alert: None,
             },
         );
@@ -386,12 +421,13 @@ pub fn deliver(env: &mut Env<'_>) -> bool {
         let Some(thread) = link.threads.get_mut(&context) else {
             continue;
         };
-        if !thread.waiting || thread.pending.is_some() {
+        if !thread.waiting && !thread.suspend_waiting {
             continue;
         }
         // A broken pipe shows when the thread itself reads it.
-        if let Ok(Some(wake_up)) = thread.channel.wake_up() {
-            thread.pending = Some(wake_up);
+        if let Ok(signal_wake) = thread.drain()
+            && signal_wake
+        {
             env.sys.set_event(thread.wake);
             delivered = true;
         }
@@ -423,14 +459,26 @@ pub fn begin_wait(env: &mut Env<'_>) -> Result<Handle, crate::status::Error> {
     let thread = link(env)?.thread(context).map_err(broken)?;
     thread.waiting = true;
     // A wake can arrive in the same step as select's reply, before begin_wait.
-    if thread.pending.is_none() {
-        thread.pending = thread.channel.wake_up().map_err(broken)?;
-    }
+    let _ = thread.drain().map_err(broken)?;
     let wake = thread.wake;
     if thread.pending.is_some() {
         env.sys.set_event(wake);
     }
     Ok(wake)
+}
+
+/// Marks the current thread as parked in a `SIGUSR1` suspend wait without
+/// disturbing any active normal `select` wait.
+pub fn begin_suspend_wait(env: &mut Env<'_>) -> Result<(), crate::status::Error> {
+    let context = env.context;
+    let thread = link(env)?.thread(context).map_err(broken)?;
+    thread.suspend_waiting = true;
+    let signal_wake = thread.drain().map_err(broken)?;
+    let wake = thread.wake;
+    if signal_wake {
+        env.sys.set_event(wake);
+    }
+    Ok(())
 }
 
 /// Takes the wake-up the server sent the current thread, letting the
@@ -440,17 +488,15 @@ pub fn wake_up(env: &mut Env<'_>) -> Result<Option<WakeUp>, crate::status::Error
     let context = env.context;
     let link = link(env)?;
     let time = link.time;
-    let thread = link
-        .threads
-        .get_mut(&context)
-        .ok_or(Error::NoThread(context));
-    let thread = thread.map_err(broken)?;
+    let thread = link.thread(context).map_err(broken)?;
+    let _ = thread.drain().map_err(broken)?;
     let wake_up = match thread.pending.take() {
         Some(wake_up) => Some(wake_up),
         None => {
             link.progress.run_server(time);
             let thread = link.thread(context).map_err(broken)?;
-            thread.channel.wake_up().map_err(broken)?
+            let _ = thread.drain().map_err(broken)?;
+            thread.pending.take()
         }
     };
     if wake_up.is_some() {
@@ -464,12 +510,14 @@ pub fn wake_up(env: &mut Env<'_>) -> Result<Option<WakeUp>, crate::status::Error
 pub fn poll_wake(env: &mut Env<'_>) -> Result<Option<WakeUp>, crate::status::Error> {
     let context = env.context;
     let thread = env.ext.get_mut::<Link>().thread(context).map_err(broken)?;
-    let wake = match thread.pending.take() {
-        Some(w) => Some(w),
-        None => thread.channel.wake_up().map_err(broken)?,
-    };
+    let signal_wake = thread.drain().map_err(broken)?;
+    let wake_event = thread.wake;
+    let wake = thread.suspend_pending.take();
     if wake.is_some() {
-        thread.waiting = false;
+        thread.suspend_waiting = false;
+    }
+    if signal_wake {
+        env.sys.set_event(wake_event);
     }
     Ok(wake)
 }
@@ -1329,4 +1377,89 @@ pub(crate) fn inproc_fd(
     };
     deliver(env);
     Ok(cached)
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    fn write_wake(fd: RawFd, cookie: u64, signaled: u32) {
+        let mut reply = [0u8; 16];
+        reply[..8].copy_from_slice(&cookie.to_ne_bytes());
+        reply[8..12].copy_from_slice(&signaled.to_ne_bytes());
+        // SAFETY: `fd` is the open write end of a test pipe and `reply` is 16 bytes.
+        let written = unsafe { pipes::write(fd, reply.as_ptr().cast(), reply.len()) };
+        assert_eq!(written, 16);
+    }
+
+    fn make_thread() -> (Thread, PipeFd) {
+        let (req_r, _req_w) = pipe().unwrap();
+        let (rep_r, _rep_w) = pipe().unwrap();
+        let (wait_r, wait_w) = pipe().unwrap();
+        // SAFETY: descriptor just created by `pipe()`.
+        unsafe { libc::fcntl(wait_r.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        let thread = Thread {
+            tid: 0x1004,
+            channel: Channel {
+                request: req_r,
+                reply: rep_r,
+                wait: wait_r,
+            },
+            wake: 1,
+            waiting: false,
+            pending: None,
+            suspend_waiting: false,
+            suspend_pending: None,
+            alert: None,
+        };
+        (thread, wait_w)
+    }
+
+    // spec: WINE-THR-3
+    #[test]
+    fn suspend_and_select_wakeups_stay_separate_across_drain() {
+        let (mut thread, wait_w) = make_thread();
+        let select_cookie = 0x2357_0ec8u64;
+        let suspend_cookie = crate::process::signals::COOKIE;
+
+        // Case 1: normal select wake arrives while waiting, then thread is suspended and resumed.
+        thread.waiting = true;
+        write_wake(wait_w.as_raw_fd(), select_cookie, 0x102);
+        assert!(thread.drain().unwrap());
+        assert_eq!(thread.pending.unwrap().cookie, select_cookie);
+        assert!(thread.suspend_pending.is_none());
+
+        thread.suspend_waiting = true;
+        assert!(!thread.drain().unwrap());
+        assert!(thread.suspend_pending.is_none());
+
+        write_wake(wait_w.as_raw_fd(), suspend_cookie, 0);
+        assert!(!thread.drain().unwrap());
+        assert_eq!(
+            thread.suspend_pending.take().unwrap().cookie,
+            suspend_cookie
+        );
+        thread.suspend_waiting = false;
+        assert_eq!(thread.pending.take().unwrap().cookie, select_cookie);
+        thread.waiting = false;
+
+        // Case 2: wineserver writes suspend wake and normal select wake back-to-back.
+        thread.waiting = true;
+        thread.suspend_waiting = true;
+        write_wake(wait_w.as_raw_fd(), suspend_cookie, 0);
+        write_wake(wait_w.as_raw_fd(), select_cookie, 0);
+        assert!(thread.drain().unwrap());
+        assert_eq!(
+            thread.suspend_pending.take().unwrap().cookie,
+            suspend_cookie
+        );
+        assert_eq!(thread.pending.take().unwrap().cookie, select_cookie);
+
+        // Case 3: kill wake-up (cookie 0) reaches both active wait slots.
+        write_wake(wait_w.as_raw_fd(), 0, 7);
+        assert!(thread.drain().unwrap());
+        assert_eq!(thread.suspend_pending.take().unwrap().cookie, 0);
+        let kill = thread.pending.take().unwrap();
+        assert_eq!((kill.cookie, kill.signaled), (0, 7));
+    }
 }

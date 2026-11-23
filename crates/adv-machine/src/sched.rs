@@ -665,6 +665,7 @@ mod active_tests {
             wakes: sched::ActiveContexts::default(),
             wait_deadlines: Default::default(),
             finished_contexts: Vec::new(),
+            peer_handoff: false,
             rr_last: None,
             scheduler_work: sched::SchedulerWork::default(),
         }

@@ -214,3 +214,79 @@ fn two_auto_reset_signals_can_release_two_waiters_before_either_is_scheduled() {
     );
     assert!(!machine.sys.try_acquire(event));
 }
+
+// spec: PROC-MACH-5, PROC-CLOCK-5
+#[test]
+fn set_event_handoff_runs_woken_peer_before_signaler_continues() {
+    #[derive(Default)]
+    struct Order(Vec<u32>);
+
+    let mut registry = Registry::default();
+    registry.add("test", "wait", Conv::Stdcall { argc: 1 }, |env| {
+        let handle = env.arg(0);
+        Outcome::block(
+            Wait::Object {
+                handle,
+                deadline: None,
+            },
+            |env, wake| {
+                assert!(matches!(wake, Resume::Woke(WakeReason::Signaled)));
+                env.ext.get_mut::<Order>().0.push(env.context);
+                Outcome::Return(0)
+            },
+        )
+    });
+    registry.add("test", "signal_handoff", Conv::Stdcall { argc: 1 }, |env| {
+        let handle = env.arg(0);
+        env.sys
+            .set_event_handoff(handle, adv_machine::WakePriority::Normal, Some(env.context));
+        Outcome::Return(0)
+    });
+    registry.add("test", "mark", Conv::Stdcall { argc: 0 }, |env| {
+        env.ext.get_mut::<Order>().0.push(env.context);
+        Outcome::Return(0)
+    });
+
+    let mut machine = Machine::new(
+        UnicornCpu::new(PARK_ADDR).unwrap(),
+        registry,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    machine.ext.insert(Order::default());
+    let event = machine.sys.objects.insert(Object::Event {
+        manual_reset: true,
+        signaled: false,
+    });
+    machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
+    let wait = machine.resolve_import("test", "wait").unwrap();
+    let signal = machine.resolve_import("test", "signal_handoff").unwrap();
+    let mark = machine.resolve_import("test", "mark").unwrap();
+
+    let mut waiter = Asm::new(CODE);
+    waiter.push_imm(event).call(wait).ret();
+    let signaler_at = CODE + 0x100;
+    let mut signaler = Asm::new(signaler_at);
+    signaler.push_imm(event).call(signal).call(mark).ret();
+
+    machine.cpu.write(CODE, &waiter.bytes).unwrap();
+    machine.cpu.write(signaler_at, &signaler.bytes).unwrap();
+
+    machine.spawn("waiter", CODE, &[], 65536).unwrap();
+    assert!(matches!(
+        machine.run(),
+        RunResult::Idle {
+            next_deadline: None
+        }
+    ));
+    assert_eq!(machine.sys.context(0).state_name(), "Blocked");
+
+    machine.spawn("signaler", signaler_at, &[], 65536).unwrap();
+    assert!(matches!(machine.run(), RunResult::Exited(0)));
+    assert_eq!(
+        machine.ext.get::<Order>().0,
+        [0, 1],
+        "woken waiter must run before signaler resumes past the alert trap"
+    );
+    assert_eq!(machine.sys.scheduling.polling_rounds, 0);
+}
