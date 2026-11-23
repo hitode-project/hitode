@@ -43,6 +43,19 @@ impl Front<'_> {
         let opcode = self.location(self.state.opcode);
         args.extend([ip, opcode]);
         if let model::C1::Round(op, single) = self.models[to].c1 {
+            let synthetic = |op: FpOp, single: bool| {
+                let eps = if single {
+                    f64::from(f32::EPSILON)
+                } else {
+                    f64::EPSILON
+                };
+                match op {
+                    FpOp::Add => (1.0, 0.75 * eps),
+                    FpOp::Sub => (1.0, -0.75 * eps),
+                    FpOp::Mul => (1.5, 1.0 + eps),
+                    FpOp::Div => (1.0, 10.0),
+                }
+            };
             let pair = match self.state.c1 {
                 Some(Location::Recipe(Recipe::C1 {
                     op: from,
@@ -51,26 +64,27 @@ impl Front<'_> {
                     b,
                 })) if from == op && single == narrow => [a, b],
                 Some(Location::Constant(c)) => {
-                    let (a, b) = if c == 0 {
-                        (1.0, 1.0)
-                    } else {
-                        let eps = if single {
-                            f64::from(f32::EPSILON)
-                        } else {
-                            f64::EPSILON
-                        };
-                        match op {
-                            FpOp::Add => (1.0, 0.75 * eps),
-                            FpOp::Sub => (1.0, -0.75 * eps),
-                            FpOp::Mul => (1.5, 1.0 + eps),
-                            FpOp::Div => (1.0, 10.0),
-                        }
-                    };
+                    let (a, b_up) = synthetic(op, single);
+                    let b = if c != 0 { b_up } else { 1.0 };
                     debug_assert_eq!(super::super::eval::rounded_up(op, a, b, single), c != 0);
                     [
                         self.constant(Type::F64, u128::from(a.to_bits())),
                         self.constant(Type::F64, u128::from(b.to_bits())),
                     ]
+                }
+                Some(Location::At(cond)) => {
+                    let (a, b_up) = synthetic(op, single);
+                    debug_assert!(super::super::eval::rounded_up(op, a, b_up, single));
+                    debug_assert!(!super::super::eval::rounded_up(op, a, 1.0, single));
+                    let a = self.constant(Type::F64, u128::from(a.to_bits()));
+                    let b_true = self.constant(Type::F64, u128::from(b_up.to_bits()));
+                    let b_false = self.constant(Type::F64, u128::from(1.0f64.to_bits()));
+                    let b = self.value(Op::Select {
+                        cond,
+                        a: b_true,
+                        b: b_false,
+                    });
+                    [a, b]
                 }
                 _ => return Err(Reject::StaticX87(to)),
             };
