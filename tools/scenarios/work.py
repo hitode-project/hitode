@@ -8,13 +8,32 @@ import subprocess
 from pathlib import Path
 
 
+def resident_trips(calls: int, trips: int, arrivals: int, tier1_hits: int | None) -> int:
+    """Return loop iterations executed inside a resident form.
+
+    A resident entry reached from a taken backedge executes `trips - 1`
+    iterations after one Tier-1 pass, while a direct entry from outside
+    executes all `trips` iterations with no Tier-1 pass. When Tier-1
+    arrival counts are available, subtracting full-Tier-1 calls separates
+    backedge entries from direct entries.
+    """
+    if arrivals <= 0 or trips <= 0:
+        return 0
+    if tier1_hits is None:
+        return arrivals * (trips - 1)
+    backedge = min(arrivals, max(0, tier1_hits - (calls - arrivals) * trips))
+    direct = arrivals - backedge
+    return direct * trips + backedge * (trips - 1)
+
+
 def estimate(mapping: Path, exe: Path, compiler: str, layout: dict,
              runs: list[tuple[int, dict]]) -> list[dict[str, int]]:
     """Price straight-line kernel phases with deterministic trip counts.
 
-    Resident entries at each loop head are priced from the first taken
-    backedge through completion. Words describe inline emission. The
-    runner's existing counters account for work outside it.
+    Resident entries at each loop head are priced from direct entries
+    when Tier-1 arrival counts show the first pass bypassed Tier-1, or
+    from the first taken backedge otherwise. Words describe inline
+    emission. The runner's existing counters account for work outside it.
     """
     maps = list(mapping.glob("insn-*.tsv"))
     if not maps:
@@ -84,8 +103,16 @@ def estimate(mapping: Path, exe: Path, compiler: str, layout: dict,
         return cost
 
     def count(iterations: int, report: dict) -> dict[str, int]:
+        diagnostics = report.get("a64_diagnostics", "")
         entries = {int(pc, 16): int(count) for pc, count in re.findall(
-            r"span (0x[0-9a-f]+)=\[entries (\d+)", report.get("a64_diagnostics", ""))}
+            r"span (0x[0-9a-f]+)=\[entries (\d+)", diagnostics)}
+        tier1 = {
+            int(pc, 16): sum(int(n) for n in re.findall(r"\d+", counts))
+            for pc, counts in re.findall(
+                r"(0x[0-9a-f]+)=\[builds \d+, misses \d+, joins \d+, versions \d+, arrivals \[([^\]]*)\]",
+                diagnostics,
+            )
+        }
         calls = iterations * layout["calls"]
         rows = calls * layout["rows"]
         totals = Counter()
@@ -93,10 +120,18 @@ def estimate(mapping: Path, exe: Path, compiler: str, layout: dict,
             row, col, col_end, row_end, end = (names[name + suffix] for suffix in
                                               ("_row", "_col", "_col_end", "_row_end", "_end"))
             row_arrivals = min(calls, entries.get(row, 0))
-            resident_rows = row_arrivals * (layout["rows"] - 1)
+            row_tier1 = max(
+                (v for pc, v in tier1.items() if row <= pc < col or col_end <= pc < row_end),
+                default=None,
+            )
+            resident_rows = resident_trips(calls, layout["rows"], row_arrivals, row_tier1)
             tier1_rows = rows - resident_rows
             col_arrivals = min(tier1_rows, entries.get(col, 0))
-            resident_columns = col_arrivals * (columns - 1)
+            col_tier1 = max(
+                (v for pc, v in tier1.items() if col <= pc < col_end),
+                default=None,
+            )
+            resident_columns = resident_trips(tier1_rows, columns, col_arrivals, col_tier1)
             resident_cells = resident_rows * columns + resident_columns
             tier1_cells = rows * columns - resident_cells
             totals["kernel_resident_cells"] += resident_cells

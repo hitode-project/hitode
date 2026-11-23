@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run  # noqa: E402
+import work  # noqa: E402
 
 
 def scenario(spec, digest="d", min_counters=None, steady_min=None):
@@ -185,6 +186,28 @@ class Judge(unittest.TestCase):
         )
         self.assertIn("steady splits fell below 0.500", failures[0])
         self.assertIn("second head run", failures[0])
+
+
+class Work(unittest.TestCase):
+    def test_resident_trips_falls_back_to_backedge_without_tier1_counts(self):
+        self.assertEqual(work.resident_trips(1440, 2, 1375, None), 1375)
+        self.assertEqual(work.resident_trips(1440, 2, 0, None), 0)
+
+    def test_resident_trips_prices_backedge_entries(self):
+        # 65 warmup calls ran both rows in Tier-1 (130), 1375 calls ran Row 0 in Tier-1.
+        self.assertEqual(work.resident_trips(1440, 2, 1375, 1505), 1375)
+
+    def test_resident_trips_prices_direct_entries(self):
+        # 65 warmup calls ran both rows in Tier-1 (128), 1375 calls entered resident directly.
+        self.assertEqual(work.resident_trips(1440, 2, 1375, 128), 2750)
+        # Steady delta across 8 iterations (1440 -> 2880 calls) credits all 2880 rows.
+        low = work.resident_trips(1440, 2, 1375, 128)
+        high = work.resident_trips(2880, 2, 2815, 128)
+        self.assertEqual(high - low, 2880)
+
+    def test_resident_trips_prices_mixed_direct_and_backedge_entries(self):
+        # 65 warmup calls (130) + 375 backedge calls (375) + 1000 direct calls (0).
+        self.assertEqual(work.resident_trips(1440, 2, 1375, 505), 1000 * 2 + 375)
 
 
 if __name__ == "__main__":

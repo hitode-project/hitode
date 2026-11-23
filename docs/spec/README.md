@@ -57,7 +57,7 @@ A `kernel_work` layout supplies `calls` per iteration, `rows` per call, and pair
 The executable marks the row and column heads, their fall-throughs, and the function end with `_row`, `_col`, `_col_end`, `_row_end`, and `_end` suffixes.
 Optional `callees` entries give the kernel symbol, callee symbol, and calls per cell.
 The final run's generated words price both endpoints of the steady interval.
-The estimate prices resident arrivals from the first taken backedge at each loop head.
+The estimate prices resident arrivals from the first taken backedge, or from entry when Tier-1 arrivals show the first pass bypassed Tier-1.
 Separate report counters retain helper, interpreter and native exit work.
 
 The guest judges its own result: exit status 0 means the pinned behavior holds. `tools/scenarios/run.py gate` judges a change by a base build. In CI, the base is the latest cached master build, and CI runs that commit's copy of the judge. Every master commit since that build passed the same gate:
