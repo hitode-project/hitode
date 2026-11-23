@@ -113,8 +113,8 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::X87Load { bits: a, .. }
         | Op::Test { flags: a, .. } => f(a),
         Op::Int(_, a, b)
-        | Op::Fp(_, a, b)
-        | Op::X87Single(_, a, b)
+        | Op::Fp(_, a, b, _)
+        | Op::X87Single(_, a, b, _)
         | Op::Fp32(_, a, b)
         | Op::SseFp64(_, a, b)
         | Op::Vec(_, a, b)

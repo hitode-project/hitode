@@ -1107,7 +1107,17 @@ pub const fn scvtf(size: Size, rd: VReg, rn: Reg) -> u32 {
 
 /// `fcvtns` (nearest) or `fcvtzs` (`truncate`) from `dn` to `wd`/`xd`.
 pub const fn fcvt_int(size: Size, truncate: bool, rd: Reg, rn: VReg) -> u32 {
-    let base = if truncate { 0x1E78_0000 } else { 0x1E60_0000 };
+    fcvt_int_mode(size, if truncate { 3 } else { 0 }, rd, rn)
+}
+
+/// `fcvtns`/`fcvtms`/`fcvtps`/`fcvtzs` from `dn` to `wd`/`xd` for x87 RC 0..=3.
+pub const fn fcvt_int_mode(size: Size, rounding: u8, rd: Reg, rn: VReg) -> u32 {
+    let base = match rounding {
+        0 => 0x1E60_0000, // fcvtns (nearest even)
+        1 => 0x1E70_0000, // fcvtms (floor, -Inf)
+        2 => 0x1E68_0000, // fcvtps (ceil, +Inf)
+        _ => 0x1E78_0000, // fcvtzs (toward zero)
+    };
     base | size.sf() | rn.number() << 5 | rd.number()
 }
 
@@ -1656,6 +1666,10 @@ mod tests {
             (fcvt_int(X, false, r(0), v(1)), "fcvtns x0, d1"),
             (fcvt_int(W, true, r(0), v(1)), "fcvtzs w0, d1"),
             (fcvt_int(W, false, r(0), v(1)), "fcvtns w0, d1"),
+            (fcvt_int_mode(X, 1, r(0), v(1)), "fcvtms x0, d1"),
+            (fcvt_int_mode(X, 2, r(0), v(1)), "fcvtps x0, d1"),
+            (fcvt_int_mode(W, 1, r(0), v(1)), "fcvtms w0, d1"),
+            (fcvt_int_mode(W, 2, r(0), v(1)), "fcvtps w0, d1"),
             (msr_fpsr(Reg::ZR), "msr fpsr, xzr"),
             (umaxv(v(0), v(0)), "umaxv s0, v0.4s"),
             (vfromint(v(0), v(1)), "scvtf v0.4s, v1.4s"),
