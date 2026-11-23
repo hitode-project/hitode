@@ -968,10 +968,8 @@ impl Translator<'_> {
                 self.emit(unary(Unary::Frintz, V2, temp));
                 self.asm.bind(rounded);
             }
-            self.emit_all(&[fcvt_int(X, true, X6, V2), mrs_fpsr(X17)]);
+            self.emit_all(&[fcvt_int(W, true, X6, V2), mrs_fpsr(X17)]);
             self.asm.tbz(true, X17, 0, invalid);
-            self.emit_all(&[sbfx(X, X17, X6, 0, 32), eor(X, X17, X17, X6, Shift::Lsl, 0)]);
-            self.asm.cbz(X, true, X17, invalid);
             self.emit_all(&[fmov_from_v(X, X17, V2), eor(X, X17, X17, X1, Shift::Lsl, 0)]);
             self.asm.cbz(X, false, X17, converted);
             self.emit(orr_imm(W, X0, X0, 0x20));
