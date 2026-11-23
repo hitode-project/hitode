@@ -4836,6 +4836,29 @@ pub(in crate::translate) mod opt_back {
                 assert_eq!(got.record, if expect_ok { exit } else { entry });
             }
         }
+        {
+            let (mut f, b, p, entry) = start(&[Type::F64]);
+            f.push(
+                b,
+                Op::DomainGuard {
+                    kind: DomainGuardKind::ExactF32 { value: p[0] },
+                    ordinal: 0,
+                },
+            );
+            let exit = finish(&mut f, b, p[0]);
+            for (x, expect_ok) in [
+                (0.0f64, true),
+                (-0.0f64, true),
+                (1.5f64, true),
+                (1.0 + f64::from_bits(0x3e10_0000_0000_0000), false),
+                (f64::NAN, false),
+                (f64::INFINITY, true),
+                (f64::NEG_INFINITY, true),
+            ] {
+                let got = compare(&f, &[u128::from(x.to_bits())], &mut h);
+                assert_eq!(got.record, if expect_ok { exit } else { entry });
+            }
+        }
         // Phase 2.1: Op::Fma (PC=53 and PC=24) matches eval across all three
         // signs, signed zeros, proof bit combinations, and adversarial c = -1 + 2^-30.
         for op in [FmaOp::Add, FmaOp::Sub, FmaOp::RevSub] {

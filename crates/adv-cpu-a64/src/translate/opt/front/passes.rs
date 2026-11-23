@@ -97,17 +97,23 @@ pub(super) fn run(
             while propagate(func) {}
         }
     }
-    if let Some(r) = resident.as_deref()
-        && fp_range::infer_domain_guards(func, r.refused_domain)
+    let domain_seeds = if let Some(r) = resident.as_deref()
+        && let Some(seeds) = fp_range::infer_domain_guards(func, r.refused_domain)
     {
         while propagate(func) {}
         if fp_range::run(func) {
             while propagate(func) {}
         }
-    }
+        Some(seeds)
+    } else {
+        None
+    };
     group_stores(func, facts, loads, stores, resident.is_some());
     sse_inputs(func);
     dead(func);
+    if fp_range::contract_fma(func, domain_seeds.as_ref()) {
+        dead(func);
+    }
     validations(func);
 }
 
@@ -124,7 +130,8 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         Op::DomainGuard { kind, .. } => match kind {
             crate::translate::opt::ir::DomainGuardKind::FpWindow { value: a, .. }
             | crate::translate::opt::ir::DomainGuardKind::FpLe { value: a, .. }
-            | crate::translate::opt::ir::DomainGuardKind::U32Le { value: a, .. } => f(a),
+            | crate::translate::opt::ir::DomainGuardKind::U32Le { value: a, .. }
+            | crate::translate::opt::ir::DomainGuardKind::ExactF32 { value: a } => f(a),
             crate::translate::opt::ir::DomainGuardKind::SameSign { a, b } => {
                 f(a);
                 f(b);

@@ -3258,3 +3258,293 @@ fn phase2_store_forwarding_and_exact_identity_folds() {
         );
     }
 }
+
+// spec: A64-OPT-2, A64-OPT-4, A64-OPT-6
+#[test]
+fn phase2_exact_fma_contraction_and_adversarial_guards() {
+    // 1) PC=53 exact product contracted into Add (FMADD), Sub (FNMSUB), and RevSub (FMSUB).
+    // Include a trailing fistp so the FMA's C1 is overwritten and dead.
+    let make_fma = |kind: u8| {
+        assemble(|a| {
+            row(a, |a| {
+                a.movzx(eax, byte_ptr(esi)).unwrap();
+                a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+                a.fild(dword_ptr(esp + 0x10)).unwrap();
+                a.mov(dword_ptr(esp + 0x14), 0x3c80_0000u32).unwrap(); // 1/64
+                a.fmul(dword_ptr(esp + 0x14)).unwrap();
+                a.mov(dword_ptr(esp + 0x18), 0x4120_0000u32).unwrap(); // 10.0
+                match kind {
+                    0 => a.fadd(dword_ptr(esp + 0x18)).unwrap(),  // a*b + c
+                    1 => a.fsub(dword_ptr(esp + 0x18)).unwrap(),  // a*b - c
+                    _ => a.fsubr(dword_ptr(esp + 0x18)).unwrap(), // c - a*b
+                }
+                a.fst(qword_ptr(edi)).unwrap();
+                a.fistp(dword_ptr(esp + 0x1c)).unwrap(); // overwrites C1
+            })
+        })
+    };
+    for (kind, expect_op) in [(0u8, FmaOp::Add), (1, FmaOp::Sub), (2, FmaOp::RevSub)] {
+        let code = make_fma(kind);
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x023f; // PC=53, nearest
+        at.x87.status = 0x20;
+        let built = differential(&code, &at, |m| {
+            m.write(DATA, &[137u8]).unwrap();
+        });
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::Fma {
+                    op,
+                    single: false,
+                    proved,
+                    ..
+                } if *op == expect_op && proved & SINGLE_RESULT != 0
+            )),
+            1,
+            "expected proved PC=53 FMA ({expect_op:?})"
+        );
+        assert_eq!(count(&built, |op| matches!(op, Op::Validate)), 0);
+    }
+
+    // 2) PC=24 exact FMA: both exact-result (FMADD D via SINGLE_EXACT) and
+    // rounded-sum (FMADD S via SINGLE_A|B|C|RESULT without SINGLE_EXACT).
+    {
+        // Exact result: u8 * (1/64) + (-32.5) fits in 24 bits -> SINGLE_EXACT (FMADD D).
+        let code = assemble(|a| {
+            row(a, |a| {
+                a.movzx(eax, byte_ptr(esi)).unwrap();
+                a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+                a.fild(dword_ptr(esp + 0x10)).unwrap();
+                a.mov(dword_ptr(esp + 0x14), 0x3c80_0000u32).unwrap(); // 1/64
+                a.fmul(dword_ptr(esp + 0x14)).unwrap();
+                a.mov(dword_ptr(esp + 0x18), 0xc202_0000u32).unwrap(); // -32.5
+                a.fadd(dword_ptr(esp + 0x18)).unwrap();
+                a.fst(qword_ptr(edi)).unwrap();
+                a.fistp(dword_ptr(esp + 0x1c)).unwrap();
+            })
+        });
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x003f; // PC=24
+        at.x87.status = 0x20;
+        let built = differential(&code, &at, |m| {
+            m.write(DATA, &[200u8]).unwrap();
+        });
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::Fma {
+                    op: FmaOp::Add,
+                    single: true,
+                    proved,
+                    ..
+                } if proved & SINGLE_EXACT != 0
+            )),
+            1,
+            "expected PC=24 exact FMADD D"
+        );
+        assert_eq!(count(&built, |op| matches!(op, Op::Validate)), 0);
+    }
+    {
+        // Rounded sum of exact product: u8 * (1/64) + f32(1/3) -> FMADD S (not SINGLE_EXACT).
+        let code = assemble(|a| {
+            row(a, |a| {
+                a.movzx(eax, byte_ptr(esi)).unwrap();
+                a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+                a.fild(dword_ptr(esp + 0x10)).unwrap();
+                a.mov(dword_ptr(esp + 0x14), 0x3c80_0000u32).unwrap(); // 1/64
+                a.fmul(dword_ptr(esp + 0x14)).unwrap();
+                a.mov(dword_ptr(esp + 0x18), (1.0f32 / 3.0f32).to_bits())
+                    .unwrap();
+                a.fadd(dword_ptr(esp + 0x18)).unwrap();
+                a.fst(qword_ptr(edi)).unwrap();
+                a.fistp(dword_ptr(esp + 0x1c)).unwrap();
+            })
+        });
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x003f; // PC=24
+        at.x87.status = 0x20;
+        let built = differential(&code, &at, |m| {
+            m.write(DATA, &[123u8]).unwrap();
+        });
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::Fma {
+                    op: FmaOp::Add,
+                    single: true,
+                    proved,
+                    ..
+                } if proved & (SINGLE_A | SINGLE_B | SINGLE_C | SINGLE_RESULT)
+                    == (SINGLE_A | SINGLE_B | SINGLE_C | SINGLE_RESULT)
+                    && proved & SINGLE_EXACT == 0
+            )),
+            1,
+            "expected PC=24 proved FMADD S"
+        );
+        assert_eq!(count(&built, |op| matches!(op, Op::Validate)), 0);
+    }
+    {
+        // Adversarial PC=24 case: exact product 1 * 1 plus non-f32 qword c = -1 + 2^-30.
+        // SINGLE_C is not proved, so the FMA must check c and exit cleanly to Tier-1
+        // instead of pre-narrowing c to -1.0 (which would falsely yield 0.0).
+        let code = assemble(|a| {
+            row(a, |a| {
+                a.movzx(eax, byte_ptr(esi)).unwrap();
+                a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+                a.fild(dword_ptr(esp + 0x10)).unwrap();
+                a.mov(dword_ptr(esp + 0x14), 1.0f32.to_bits()).unwrap();
+                a.fmul(dword_ptr(esp + 0x14)).unwrap();
+                a.fadd(qword_ptr(esi + 8)).unwrap();
+                a.fst(qword_ptr(edi)).unwrap();
+                a.fistp(dword_ptr(esp + 0x1c)).unwrap();
+            })
+        });
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x003f; // PC=24
+        at.x87.status = 0x20;
+        let non_f32 = -1.0f64 + f64::from_bits(0x3e10_0000_0000_0000); // -1 + 2^-30
+        let built = compare(
+            &code,
+            &at,
+            |m| {
+                m.write(DATA, &[1u8]).unwrap();
+                m.write(DATA + 8, &non_f32.to_le_bytes()).unwrap();
+            },
+            true,
+        );
+        // Even if contracted, SINGLE_C must be clear so eval/back check c and do not
+        // corrupt the result by pre-narrowing c.
+        for block in &built.func.blocks {
+            for (_, op) in &block.insts {
+                if let Op::Fma {
+                    single: true,
+                    proved,
+                    ..
+                } = *op
+                {
+                    assert_eq!(proved & SINGLE_C, 0, "qword c must not claim SINGLE_C");
+                }
+            }
+        }
+    }
+
+    // 3) Non-contraction when Add's C1 is live at exit (prod is referenced by Recipe::C1)
+    // and when an intervening Store separates Mul and Add into different recovery regions.
+    {
+        let c1_observed = assemble(|a| {
+            row(a, |a| {
+                a.movzx(eax, byte_ptr(esi)).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+                a.fstp(st0).unwrap(); // keep x87 depth invariant across loop iterations
+                a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+                a.fild(dword_ptr(esp + 0x10)).unwrap();
+                a.mov(dword_ptr(esp + 0x14), 0x3c80_0000u32).unwrap();
+                a.fmul(dword_ptr(esp + 0x14)).unwrap();
+                a.mov(dword_ptr(esp + 0x18), 0x4120_0000u32).unwrap();
+                a.fadd(dword_ptr(esp + 0x18)).unwrap();
+                // Exit directly with st(0) and Recipe::C1 { op: Add, a: prod, b: 10.0 } live.
+            })
+        });
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x023f;
+        at.x87.status = 0x20;
+        at.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+        let built = differential(&c1_observed, &at, |m| {
+            m.write(DATA, &[137u8]).unwrap();
+        });
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::Fma { .. })),
+            0,
+            "must not contract when Add's Recipe::C1 observes prod"
+        );
+    }
+    {
+        let cross_region = assemble(|a| {
+            row(a, |a| {
+                a.movzx(eax, byte_ptr(esi)).unwrap();
+                a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+                a.fild(dword_ptr(esp + 0x10)).unwrap();
+                a.mov(dword_ptr(esp + 0x14), 0x3c80_0000u32).unwrap();
+                a.fmul(dword_ptr(esp + 0x14)).unwrap();
+                a.mov(dword_ptr(edi + 8), eax).unwrap(); // Store starts a new recovery region
+                a.mov(dword_ptr(esp + 0x18), 0x4120_0000u32).unwrap();
+                a.fadd(dword_ptr(esp + 0x18)).unwrap();
+                a.fst(qword_ptr(edi)).unwrap();
+                a.fistp(dword_ptr(esp + 0x1c)).unwrap();
+            })
+        });
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x023f;
+        at.x87.status = 0x20;
+        let built = differential(&cross_region, &at, |m| {
+            m.write(DATA, &[137u8]).unwrap();
+        });
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::Fma { .. })),
+            0,
+            "must not contract across a recovery-region Store boundary"
+        );
+    }
+
+    // 4) Resident 2-channel PC=53 affine loop uses independent secondary ordinal
+    // for ExactF32 FMA; refusing ONLY the FMA ordinal keeps ordinal 0 intact.
+    let two_ch = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        for k in 0..2 {
+            a.fld(qword_ptr(esp + 0x20 + k * 8)).unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fadd(dword_ptr(esp + 0x30 + k * 4)).unwrap();
+            a.fistp(dword_ptr(esp + 0x10)).unwrap();
+            a.mov(eax, dword_ptr(esp + 0x10)).unwrap();
+            a.mov(dword_ptr(edi + edx * 4 + k * 0x100), eax).unwrap();
+        }
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(dword_ptr(esp + 0x18)).unwrap();
+        a.fld(dword_ptr(esp + 0x18)).unwrap();
+        a.inc(edx).unwrap();
+        a.cmp(edx, ebx).unwrap();
+        a.jl(head).unwrap();
+    });
+    let unit = resident_unit(&two_ch);
+    let mut at = initial();
+    at.regs[2] = 0;
+    at.regs[3] = 8;
+    at.x87.control = 0x023f;
+    at.x87.status = 0x20;
+    at.x87
+        .push(adv_cpu_core::floating::fast::extended(1.0 / 64.0));
+    at.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+    let built = build_with_domains(&unit, None, &at, &|_| false, &|_| false, &|_| false).unwrap();
+    assert_eq!(verify::verify(&built.func), Ok(()));
+    assert_eq!(built.func.domain_guards.len(), 2);
+    assert_eq!(
+        count(&built, |op| matches!(
+            op,
+            Op::Fma {
+                op: FmaOp::Add,
+                single: false,
+                proved,
+                ..
+            } if proved & SINGLE_RESULT != 0
+        )),
+        2,
+        "expected both channels to contract into proved FMADD D"
+    );
+    let fma_guard_id = built.func.domain_guards[1];
+    let no_fma = build_with_domains(&unit, None, &at, &|_| false, &|_| false, &|id| {
+        id == fma_guard_id
+    })
+    .unwrap();
+    assert_eq!(verify::verify(&no_fma.func), Ok(()));
+    assert_eq!(no_fma.func.domain_guards, vec![built.func.domain_guards[0]]);
+    assert_eq!(count(&no_fma, |op| matches!(op, Op::Fma { .. })), 0);
+    assert_eq!(count(&no_fma, |op| matches!(op, Op::Validate)), 0);
+}

@@ -16,8 +16,8 @@ use super::{
 };
 use crate::translate::front::tags::ConditionCode;
 use crate::translate::opt::ir::{
-    DomainGuardKind, FpOp, FpUnary, MAX_DOMAIN_GUARDS, SINGLE_A, SINGLE_B, SINGLE_EXACT,
-    SINGLE_RESULT,
+    DomainGuardKind, FmaOp, FpOp, FpUnary, MAX_DOMAIN_GUARDS, SINGLE_A, SINGLE_B, SINGLE_C,
+    SINGLE_EXACT, SINGLE_RESULT,
 };
 
 const ZERO_Q: i16 = i16::MAX;
@@ -1049,7 +1049,7 @@ fn eval_int_op(
 }
 
 #[derive(Default)]
-struct DomainSeeds {
+pub(super) struct DomainSeeds {
     inputs: BTreeMap<Value, FpFact>,
     params: BTreeMap<Value, FpFact>,
     values: BTreeMap<Value, (f64, Option<f64>)>,
@@ -2409,13 +2409,16 @@ impl<'a> EntryBuilder<'a> {
 
 /// Infers optional `Block(0)` numerical domain guards for resident x87 loops
 /// when static analysis leaves unproved arithmetic or stores inside the loop.
-pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) -> bool) -> bool {
+pub(super) fn infer_domain_guards(
+    func: &mut Func,
+    refused_domain: &dyn Fn(u32) -> bool,
+) -> Option<DomainSeeds> {
     if !func.resident
         || func.blocks.len() <= 1
         || func.domain_guards.len() >= MAX_DOMAIN_GUARDS
         || !func.domain_guards.is_empty()
     {
-        return false;
+        return None;
     }
     // Block(0) must be a one-shot entry prologue (never a loop head).
     if func
@@ -2424,7 +2427,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
         .flat_map(|b| b.end.targets())
         .any(|t| t.block == Block(0))
     {
-        return false;
+        return None;
     }
 
     let first_effect = func.blocks[0]
@@ -2443,7 +2446,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
         .rposition(|(_, op)| matches!(op, Op::PlainPage { .. }))
         .map_or(0, |i| i + 1);
     if first_effect < last_plain {
-        return false;
+        return None;
     }
     let insert_pos = first_effect;
 
@@ -2492,7 +2495,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
         }
     }
     if loops.is_empty() {
-        return false;
+        return None;
     }
 
     let primary_head = loops
@@ -2504,7 +2507,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
         .map(|h| func.records[h.record.0 as usize].eip)
         .unwrap_or_else(|| func.records[0].eip);
     if refused_domain(guard_id) {
-        return false;
+        return None;
     }
 
     // Union of natural loop blocks across all detected loops.
@@ -2539,7 +2542,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
             _ => false,
         });
     if !has_unproved {
-        return false;
+        return None;
     }
 
     let (_, static_fp) = analyze_fixpoint(func, &defs, &DomainSeeds::default());
@@ -2731,7 +2734,7 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
         }
     }
     if guarded_inputs.len() > MAX_GUARDED_INPUTS {
-        return false;
+        return None;
     }
 
     // Build abstract seeds for profitability simulation.
@@ -2824,20 +2827,86 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
     }
 
     if seeds.inputs.is_empty() && active_inds.is_empty() && int_sinks.is_empty() {
-        return false;
+        return None;
     }
 
     // Simulate fixpoint with the planned domain guards to verify profitability.
     let (_, guarded_fp) = analyze_fixpoint(func, &defs, &seeds);
     let (_, saved_per_iter) = apply_proved(func, &defs, &guarded_fp, Some(&in_loop), false);
     if saved_per_iter < MIN_DOMAIN_SAVED_PER_ITER {
-        return false;
+        return None;
+    }
+
+    // Optional independent secondary ordinal: guard Block(0) binary64 inputs
+    // feeding PC=53 Mul -> Add/Sub with a binary32-exact multiplicand so
+    // Phase 2.1 can contract to single-instruction FMADD/FMSUB/FNMSUB D.
+    // Separate guard_id ensures non-f32 f64 workloads withdraw ONLY FMA exactness
+    // without touching ordinal 0 finiteness/range proofs.
+    let fma_guard_id = guard_id ^ 0x464d_4131;
+    let mut fma_exact_inputs = BTreeSet::<Value>::new();
+    let mut fma_pairs = 0u32;
+    if !refused_domain(fma_guard_id) && func.domain_guards.len() + 1 < MAX_DOMAIN_GUARDS {
+        let fma_need = |v: Value| -> Option<Option<Value>> {
+            let fv = guarded_fp[v.0 as usize].unwrap_or(FpFact::TOP);
+            if !fv.finite {
+                return None;
+            }
+            if fv.binary32_exact {
+                return Some(None);
+            }
+            if guarded_inputs.contains_key(&v) {
+                return Some(Some(v));
+            }
+            if let Some(&ind) = affine_map.get(&v)
+                && ind.f32_step
+                && guarded_inputs.contains_key(&ind.x_0)
+            {
+                return Some(Some(ind.x_0));
+            }
+            None
+        };
+        let mut mul_to_need = BTreeMap::<Value, (Option<Value>, Option<Value>)>::new();
+        for (b, block) in func.blocks.iter().enumerate() {
+            if !in_loop[b] {
+                continue;
+            }
+            for &(res, op) in &block.insts {
+                if let (Some(r), Op::Fp(FpOp::Mul, a, b_val, _)) = (res, op) {
+                    if let (Some(na), Some(nb)) = (fma_need(a), fma_need(b_val))
+                        && (na.is_some() || nb.is_some())
+                    {
+                        mul_to_need.insert(r, (na, nb));
+                    }
+                } else if let Op::Fp(FpOp::Add | FpOp::Sub, lhs, rhs, _) = op
+                    && let Some(&(na, nb)) = mul_to_need.get(&lhs).or_else(|| mul_to_need.get(&rhs))
+                {
+                    if let Some(v) = na {
+                        fma_exact_inputs.insert(v);
+                    }
+                    if let Some(v) = nb {
+                        fma_exact_inputs.insert(v);
+                    }
+                    fma_pairs += 1;
+                }
+            }
+        }
+        if fma_pairs < 2 {
+            fma_exact_inputs.clear();
+            fma_pairs = 0;
+        }
     }
 
     // Commit: emit Block(0) helper ops and DomainGuards at `insert_pos`.
     let ordinal = func.domain_guards.len() as u8;
     func.domain_guards.push(guard_id);
-    func.domain_saved_per_iter = saved_per_iter;
+    let fma_ordinal = if !fma_exact_inputs.is_empty() {
+        let ord = func.domain_guards.len() as u8;
+        func.domain_guards.push(fma_guard_id);
+        Some(ord)
+    } else {
+        None
+    };
+    func.domain_saved_per_iter = saved_per_iter.saturating_add(fma_pairs);
 
     let mut eb = EntryBuilder {
         func,
@@ -2856,6 +2925,27 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
             },
             ordinal,
         });
+    }
+    if let Some(ord) = fma_ordinal {
+        for &v in &fma_exact_inputs {
+            eb.emit(Op::DomainGuard {
+                kind: DomainGuardKind::ExactF32 { value: v },
+                ordinal: ord,
+            });
+            if let Some(seed) = seeds.inputs.get_mut(&v) {
+                seed.binary32_exact = true;
+                seed.sig_bits = Some(24);
+            }
+        }
+        for &(ind, ..) in &active_inds {
+            if ind.f32_step
+                && fma_exact_inputs.contains(&ind.x_0)
+                && let Some(param_seed) = seeds.params.get_mut(&ind.param)
+            {
+                param_seed.binary32_exact = true;
+                param_seed.sig_bits = Some(24);
+            }
+        }
     }
 
     let mut sym_bounds = BTreeMap::<Value, Value>::new();
@@ -2930,5 +3020,220 @@ pub(super) fn infer_domain_guards(func: &mut Func, refused_domain: &dyn Fn(u32) 
     // Apply proved flags using the simulated `guarded_fp` facts.
     let new_defs = super::definitions(func);
     apply_proved(func, &new_defs, &guarded_fp, Some(&in_loop), true);
-    true
+    Some(seeds)
+}
+
+fn fp_mul_is_exact_f64(a: FpFact, b: FpFact) -> bool {
+    if !a.finite || !b.finite {
+        return false;
+    }
+    let (proved, fact) = eval_fp(FpOp::Mul, a, b, false);
+    if !proved || !fact.finite {
+        return false;
+    }
+    if a.binary32_exact && b.binary32_exact {
+        return true;
+    }
+    if let (Some(wa), Some(wb)) = (a.effective_sig_bits(), b.effective_sig_bits())
+        && wa.saturating_add(wb) <= 53
+    {
+        return true;
+    }
+    fact.dyadic_q
+        .is_some_and(|q| q >= -1022 && fits_mantissa_bits(fact.max_abs(), q, 53))
+}
+
+/// Phase 2.1: Contracts exact `Mul -> Add/Sub` pairs into `Op::Fma` after
+/// `passes::dead`, preserving recovery regions, `Recipe::C1` observability,
+/// sign semantics, and `PC=24` input exactness checks.
+pub(super) fn contract_fma(func: &mut Func, domain_seeds: Option<&DomainSeeds>) -> bool {
+    let has_candidate = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|(_, op)| matches!(op, Op::Fp(FpOp::Mul, ..) | Op::X87Single(FpOp::Mul, ..)));
+    if !has_candidate {
+        return false;
+    }
+
+    let n = func.types.len();
+    let defs = super::definitions(func);
+    let default_seeds = DomainSeeds::default();
+    let seeds = domain_seeds.unwrap_or(&default_seeds);
+    let (_, fp_facts) = analyze_fixpoint(func, &defs, seeds);
+    let get_fp = |v: Value| {
+        fp_facts
+            .get(v.0 as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(FpFact::TOP)
+    };
+
+    // Count ALL uses across blocks, terminators, and IrRecords (including Recipe::C1).
+    let mut total_uses = vec![0usize; n];
+    for block in &func.blocks {
+        for &(_, op) in &block.insts {
+            for u in op.uses() {
+                total_uses[u.0 as usize] += 1;
+            }
+        }
+        if let End::Branch { cond, .. } = block.end {
+            total_uses[cond.0 as usize] += 1;
+        }
+        for t in block.end.targets() {
+            for &arg in &t.args {
+                total_uses[arg.0 as usize] += 1;
+            }
+        }
+    }
+    for record in &func.records {
+        for u in record.uses() {
+            total_uses[u.0 as usize] += 1;
+        }
+    }
+
+    let mut contracted = false;
+    for block in &mut func.blocks {
+        // prod -> (inst_idx, region_id, single, a, b)
+        let mut muls = BTreeMap::<Value, (usize, u32, bool, Value, Value)>::new();
+        let mut removed = BTreeSet::<usize>::new();
+        let mut region_id = 0u32;
+
+        for idx in 0..block.insts.len() {
+            let (result, op) = block.insts[idx];
+            match op {
+                Op::Store { .. }
+                | Op::FrameStore { .. }
+                | Op::ScopeWritten(_)
+                | Op::PageCross { .. }
+                | Op::FrameDisjoint { .. } => {
+                    region_id += 1;
+                }
+                Op::Fp(FpOp::Mul, a, b, _) => {
+                    if let Some(prod) = result
+                        && total_uses[prod.0 as usize] == 1
+                        && fp_mul_is_exact_f64(get_fp(a), get_fp(b))
+                    {
+                        muls.insert(prod, (idx, region_id, false, a, b));
+                    }
+                }
+                Op::X87Single(FpOp::Mul, a, b, mul_flags) => {
+                    let all = SINGLE_A | SINGLE_B | SINGLE_RESULT | SINGLE_EXACT;
+                    if let Some(prod) = result
+                        && total_uses[prod.0 as usize] == 1
+                        && mul_flags & all == all
+                        && get_fp(a).finite
+                        && get_fp(b).finite
+                    {
+                        muls.insert(prod, (idx, region_id, true, a, b));
+                    }
+                }
+                Op::Fp(fp_op @ (FpOp::Add | FpOp::Sub), lhs, rhs, add_proved) => {
+                    let matched = if let Some(&(mul_idx, mul_reg, false, a, b)) = muls.get(&lhs)
+                        && mul_reg == region_id
+                    {
+                        let fma_op = if fp_op == FpOp::Add {
+                            FmaOp::Add
+                        } else {
+                            FmaOp::Sub
+                        };
+                        Some((mul_idx, fma_op, a, b, rhs))
+                    } else if let Some(&(mul_idx, mul_reg, false, a, b)) = muls.get(&rhs)
+                        && mul_reg == region_id
+                    {
+                        let fma_op = if fp_op == FpOp::Add {
+                            FmaOp::Add
+                        } else {
+                            FmaOp::RevSub
+                        };
+                        Some((mul_idx, fma_op, a, b, lhs))
+                    } else {
+                        None
+                    };
+                    if let Some((mul_idx, fma_op, a, b, c)) = matched
+                        && get_fp(c).finite
+                    {
+                        let proved = if add_proved
+                            || eval_fp(fp_op, get_fp(lhs), get_fp(rhs), lhs == rhs).0
+                        {
+                            SINGLE_RESULT
+                        } else {
+                            0
+                        };
+                        block.insts[idx].1 = Op::Fma {
+                            op: fma_op,
+                            a,
+                            b,
+                            c,
+                            single: false,
+                            proved,
+                        };
+                        removed.insert(mul_idx);
+                        contracted = true;
+                    }
+                }
+                Op::X87Single(fp_op @ (FpOp::Add | FpOp::Sub), lhs, rhs, add_flags) => {
+                    let matched = if let Some(&(mul_idx, mul_reg, true, a, b)) = muls.get(&lhs)
+                        && mul_reg == region_id
+                    {
+                        let fma_op = if fp_op == FpOp::Add {
+                            FmaOp::Add
+                        } else {
+                            FmaOp::Sub
+                        };
+                        let c_proved = add_flags & SINGLE_B != 0 || get_fp(rhs).binary32_exact;
+                        Some((mul_idx, fma_op, a, b, rhs, c_proved))
+                    } else if let Some(&(mul_idx, mul_reg, true, a, b)) = muls.get(&rhs)
+                        && mul_reg == region_id
+                    {
+                        let fma_op = if fp_op == FpOp::Add {
+                            FmaOp::Add
+                        } else {
+                            FmaOp::RevSub
+                        };
+                        let c_proved = add_flags & SINGLE_A != 0 || get_fp(lhs).binary32_exact;
+                        Some((mul_idx, fma_op, a, b, lhs, c_proved))
+                    } else {
+                        None
+                    };
+                    if let Some((mul_idx, fma_op, a, b, c, c_proved)) = matched
+                        && get_fp(c).finite
+                    {
+                        let mut proved = SINGLE_A | SINGLE_B;
+                        if c_proved {
+                            proved |= SINGLE_C;
+                        }
+                        if add_flags & SINGLE_RESULT != 0 {
+                            proved |= SINGLE_RESULT;
+                        }
+                        if add_flags & SINGLE_EXACT != 0 && c_proved {
+                            proved |= SINGLE_RESULT | SINGLE_EXACT;
+                        }
+                        block.insts[idx].1 = Op::Fma {
+                            op: fma_op,
+                            a,
+                            b,
+                            c,
+                            single: true,
+                            proved,
+                        };
+                        removed.insert(mul_idx);
+                        contracted = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !removed.is_empty() {
+            let mut kept = Vec::with_capacity(block.insts.len() - removed.len());
+            for (i, inst) in block.insts.drain(..).enumerate() {
+                if !removed.contains(&i) {
+                    kept.push(inst);
+                }
+            }
+            block.insts = kept;
+        }
+    }
+    contracted
 }

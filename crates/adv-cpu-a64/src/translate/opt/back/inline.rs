@@ -326,6 +326,15 @@ impl Emitter<'_> {
                 }
                 self.asm.b_cond(Cond::Hi, miss);
             }
+            super::DomainGuardKind::ExactF32 { value } => {
+                let v = self.vr(value, A);
+                self.asm.emit_all(&[
+                    unary(Unary::Narrow, C, v),
+                    unary(Unary::Widen, C, C),
+                    fcmp(v, C),
+                ]);
+                self.asm.b_cond(Cond::Ne, miss);
+            }
         }
         self.domain_guard_words += self.words_since(start);
     }

@@ -199,6 +199,8 @@ pub(crate) enum DomainGuardKind {
     FpLe { value: Value, bound_bits: u64 },
     /// `value` (I32, unsigned) `<= max`.
     U32Le { value: Value, max: u32 },
+    /// `value` (F64) is exact in binary32 (`f64::from(value as f32) == value`).
+    ExactF32 { value: Value },
 }
 
 /// Proof bits for [`Op::X87Single`] and [`Op::Fma`].
@@ -420,7 +422,8 @@ impl Op {
             Op::DomainGuard { kind, .. } => match kind {
                 DomainGuardKind::FpWindow { value: a, .. }
                 | DomainGuardKind::FpLe { value: a, .. }
-                | DomainGuardKind::U32Le { value: a, .. } => [Some(a), None, None],
+                | DomainGuardKind::U32Le { value: a, .. }
+                | DomainGuardKind::ExactF32 { value: a } => [Some(a), None, None],
                 DomainGuardKind::SameSign { a, b } => [Some(a), Some(b), None],
             },
             Op::Snapshot(a)

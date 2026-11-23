@@ -516,6 +516,10 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                     f(value) <= f64::from_bits(bound_bits)
                 }
                 DomainGuardKind::U32Le { value, max } => (get(value) as u32) <= max,
+                DomainGuardKind::ExactF32 { value } => {
+                    let x = f(value);
+                    f64::from(x as f32) == x
+                }
             };
             if !ok {
                 return None;
