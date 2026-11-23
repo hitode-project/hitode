@@ -854,9 +854,12 @@ impl Translator<'_> {
             // Arrivals are canonical: the entry, or a return.
             let prepaid = trace.prepaid(index);
             self.state = State::CANONICAL;
-            if self.tier1 && index != 0 && self.facts.mask() != 0 {
-                let miss = self.fact_transfer(inst.pc, 0, None);
-                self.facts.guard(self.asm, miss);
+            if self.tier1 && index != 0 {
+                let guard = self.facts.project(facts::MXCSR);
+                if guard.mask() != 0 {
+                    let miss = self.fact_transfer(inst.pc, 0, None);
+                    guard.guard(self.asm, miss);
+                }
             }
             let leave = self.asm.label();
             let resume = self.computation.then(|| self.asm.label());
@@ -1590,14 +1593,29 @@ impl Translator<'_> {
         });
     }
 
-    fn mov_address(&mut self, reg: Reg, value: usize) {
-        let value = value as u64;
+    fn mov_u64(&mut self, reg: Reg, value: u64) {
         self.emit(movz(X, reg, value as u16, 0));
         for shift in [16, 32, 48] {
             let part = (value >> shift) as u16;
             if part != 0 {
                 self.emit(movk(X, reg, part, shift));
             }
+        }
+    }
+
+    fn mov_address(&mut self, reg: Reg, value: usize) {
+        self.mov_u64(reg, value as u64);
+    }
+
+    pub(super) fn x87_stubs(&self) -> Option<crate::translate::lower::X87Stubs> {
+        (!self.computation).then_some(self.stubs.x87).flatten()
+    }
+
+    pub(super) fn materialize_mmx(&mut self) {
+        if let Some(x87) = self.x87_stubs() {
+            self.far_call(x87.materialize_mmx);
+        } else {
+            crate::facts::materialize_mmx(self.asm);
         }
     }
 

@@ -16,6 +16,9 @@ pub(crate) mod flags;
 pub(super) mod fp_class;
 pub(crate) mod resident;
 pub(crate) mod stubs;
+pub(crate) mod x87_stubs;
+
+pub use x87_stubs::X87Stubs;
 
 pub(in crate::translate) const X0: Reg = Reg::new(0);
 pub(in crate::translate) const X1: Reg = Reg::new(1);
@@ -121,6 +124,8 @@ pub struct Stubs {
     pub fault: usize,
     /// Where an optimized form leaves through a record.
     pub opt_exit: usize,
+    /// Shared cold helpers for Tier-1 x87 runs.
+    pub x87: Option<X87Stubs>,
 }
 
 /// The backward link's patch word precedes the ordinary dispatch prefix.

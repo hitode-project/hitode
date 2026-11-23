@@ -77,6 +77,8 @@ pub struct Stubs {
     pub access: usize,
     /// Where translated code calls an INT 0x2e handler.
     pub call: usize,
+    /// Shared cold helpers for Tier-1 x87 runs.
+    pub x87: super::X87Stubs,
 }
 
 const fn r(number: u8) -> Reg {
@@ -153,12 +155,14 @@ pub fn stubs() -> Stubs {
     emit_access(&mut asm, fault_label);
     let call = asm.offset();
     emit_call(&mut asm);
+    let x87 = super::x87_stubs::emit(&mut asm);
     let opt_exit = asm.offset();
     emit_opt_exit(&mut asm, Exit::Optimized);
     let resident_exit = asm.offset();
     emit_opt_exit(&mut asm, Exit::Plan(PlanEvent::ResidentRecovery));
     Stubs {
         call,
+        x87,
         code: asm.finish(),
         enter,
         opt_enter,

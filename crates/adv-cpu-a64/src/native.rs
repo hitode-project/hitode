@@ -945,6 +945,7 @@ impl Native {
                     call: base + stubs.call,
                     fault: base + stubs.fault,
                     opt_exit: base + stubs.opt_exit,
+                    x87: Some(stubs.x87.at(base)),
                 },
                 tier1: FxHashMap::default(),
                 tier1_chains: FxHashMap::default(),

@@ -246,7 +246,7 @@ impl Translator<'_> {
         self.publish(0xff);
         self.cpu();
         if self.index != 0 || self.facts.mmx() != Some(0) {
-            crate::facts::materialize_mmx(self.asm);
+            self.materialize_mmx();
         }
         if let Some(mem) = memory {
             if operands.waits {
@@ -316,7 +316,7 @@ impl Translator<'_> {
     /// Load canonical state for an instruction outside the cache.
     fn x87_state(&mut self, waits: bool, slow: Label) {
         if self.tier1 && (self.index != 0 || self.facts.mmx() != Some(0)) {
-            crate::facts::materialize_mmx(self.asm);
+            self.materialize_mmx();
         }
         self.emit_all(&[mrs_nzcv(X4), ldrh(X13, X5, runtime::X87_STATUS)]);
         if self.tier1 {

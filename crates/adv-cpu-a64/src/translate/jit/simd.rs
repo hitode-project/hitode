@@ -45,6 +45,7 @@
 //! forms ignore upper lanes; NaN signaling follows each x86 predicate.
 //! EFLAGS comparisons use the value entry on a NaN.
 
+use super::{X1, X2};
 use crate::translate::lower::fp_class;
 use crate::translate::lower::stubs;
 
@@ -332,7 +333,7 @@ impl Translator<'_> {
             self.as_part(Part::SimdGuard, |t| {
                 t.cpu();
                 if t.tier1 && (t.index != 0 || t.facts.mmx() != Some(0)) {
-                    crate::facts::materialize_mmx(t.asm);
+                    t.materialize_mmx();
                 }
                 let bail = t.leave_for_event(runtime::Event::PendingX87);
                 t.emit(ldrh(X16, X5, runtime::X87_STATUS));
@@ -1908,6 +1909,19 @@ impl Translator<'_> {
         pairs: Option<u8>,
     ) {
         let index = self.helpers + u32::from(helper);
+        if let (Some(x87), Some(_), stubs::ValueTarget::Float(access)) =
+            (self.x87_stubs(), pairs, &target)
+        {
+            let desc = match *access {
+                None => 0u32,
+                Some(adv_cpu_core::floating::ValueAccess::Read(w)) => u32::from(w) | (1 << 16),
+                Some(adv_cpu_core::floating::ValueAccess::Write(w)) => u32::from(w) | (2 << 16),
+            };
+            self.mov_imm(X1, index);
+            self.mov_imm(X2, desc);
+            self.far_call(x87.value_call);
+            return;
+        }
         stubs::emit_value_call(self.asm, index, self.vector.xmm, pairs, target);
     }
 
@@ -2085,6 +2099,7 @@ mod tests {
                 access: 0,
                 fault: 0,
                 opt_exit: 0,
+                x87: None,
             },
             &|_, _| None,
             &|_| None,

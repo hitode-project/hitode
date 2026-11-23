@@ -111,6 +111,7 @@ impl InlineRun {
             access: addr(h.forbidden),
             fault: addr(h.forbidden),
             opt_exit: addr(h.forbidden),
+            x87: Some(h.stubs.x87.at(HOST_CODE as usize)),
         };
         let mut work = Workspace::default();
         translate(

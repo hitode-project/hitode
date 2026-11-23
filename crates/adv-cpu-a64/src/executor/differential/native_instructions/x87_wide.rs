@@ -332,7 +332,8 @@ fn parity_exits_from_long_runs_reach_their_publication() {
     // the run lies beyond tbz reach of the parity jcc.
     for (a, b) in [(1.5f64, 2.5f64), (2.5, 1.5)] {
         let mut program = fixture(|asm| {
-            let mut done = asm.create_label();
+            let (mut top, mut done) = (asm.create_label(), asm.create_label());
+            asm.set_label(&mut top).unwrap();
             asm.fld(qword_ptr(ebx)).unwrap();
             asm.fld(qword_ptr(ebx + 8)).unwrap();
             asm.fcom_2(st0, st1).unwrap();
@@ -346,11 +347,14 @@ fn parity_exits_from_long_runs_reach_their_publication() {
                 asm.fsub(qword_ptr(ebx + 16)).unwrap();
             }
             asm.fstp(qword_ptr(ebx + 56)).unwrap();
+            asm.dec(ecx).unwrap();
+            asm.jnz(top).unwrap();
             asm.set_label(&mut done).unwrap();
         });
         for (at, value) in [(0, a), (8, b), (16, 0.75), (24, 1.25), (32, 3.0), (40, 0.5)] {
             program.data[at..at + 8].copy_from_slice(&value.to_le_bytes());
         }
+        program.state.regs[1] = 1;
         program.state.x87.control = 0x037f;
         let config = (Features { flagm: false }, false, Checks::All);
         let mut native = executor(&program, config, false);
@@ -1556,5 +1560,68 @@ fn tier1_region_mxcsr_uses_another_version() {
         let native = actual.native.as_ref().unwrap();
         assert_eq!(native.tier1_versions(CODE), versions);
         assert_eq!(native.diagnostics.interprets, 0);
+    }
+}
+
+// spec: A64F-FP-7 A64A-FALL-5
+#[test]
+fn straight_line_x87_infinity_chains_without_value_dispatch() {
+    let mut program = fixture(|a| {
+        a.fld(dword_ptr(ebx)).unwrap();
+        a.fld(st0).unwrap();
+        a.fucomp(st0, st1).unwrap();
+        a.fstp(dword_ptr(ebx + 4)).unwrap();
+    });
+    program.data[0..4].copy_from_slice(&f32::INFINITY.to_le_bytes());
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut actual = executor(&program, config, false);
+    let mut reference = executor(&program, config, true);
+    assert_eq!(
+        actual.run(program.stop, 100),
+        reference.run(program.stop, 100)
+    );
+    same(&actual, &reference);
+    let native = actual.native.as_ref().unwrap();
+    assert_eq!(native.diagnostics.interprets, 0);
+    assert_eq!(native.diagnostics.x87_value_dispatches, 0);
+}
+
+// spec: A64A-ROLE-5
+#[test]
+fn return_continuation_with_changed_x87_top_avoids_version_misses() {
+    let mut program = fixture(|a| {
+        let mut callee = a.create_label();
+        let mut done = a.create_label();
+        a.fld(dword_ptr(ebx)).unwrap();
+        a.fstp(dword_ptr(ebx + 4)).unwrap();
+        a.call(callee).unwrap();
+        a.fild(qword_ptr(ebx + 8)).unwrap();
+        a.fmul(dword_ptr(ebx)).unwrap();
+        a.fstp(qword_ptr(ebx + 16)).unwrap();
+        a.jmp(done).unwrap();
+        a.set_label(&mut callee).unwrap();
+        // Force a real call (exceeds inline room when padded) and rotate x87 TOP.
+        for _ in 0..80 {
+            a.nop().unwrap();
+        }
+        a.fld(dword_ptr(ebx)).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut done).unwrap();
+    });
+    program.data[0..4].copy_from_slice(&2.5f32.to_le_bytes());
+    program.data[8..16].copy_from_slice(&123_456i64.to_le_bytes());
+    let config = (Features::default(), false, Checks::Adaptive);
+    let mut actual = executor(&program, config, false);
+    for _ in 0..3 {
+        actual.state = program.state.clone();
+        let mut reference = executor(&program, config, true);
+        assert_eq!(
+            actual.run(program.stop, 500),
+            reference.run(program.stop, 500)
+        );
+        same(&actual, &reference);
+        let native = actual.native.as_ref().unwrap();
+        assert_eq!(native.diagnostics.interprets, 0);
+        assert_eq!(native.tier1_versions(CODE), 1);
     }
 }
