@@ -1570,7 +1570,7 @@ fn a_shared_soft_page_completes_loads_and_stores() {
 // spec: A64-OPT-9, A64-MEM-11
 #[test]
 fn a_loop_polling_linear_shared_memory_observes_a_device_write() {
-    const COUNT: u32 = 1 << 22;
+    const COUNT: u32 = 1 << 26;
     const VALUE: u8 = 7;
     let image = Image::loop_body(|a, head, stop| {
         a.movzx(eax, byte_ptr(esi)).unwrap();
@@ -1610,15 +1610,23 @@ fn a_loop_polling_linear_shared_memory_observes_a_device_write() {
     let deadline = Instant::now() + Duration::from_secs(3);
     trial.live.set_deadline(Some(deadline));
     let fuel = 6 * u64::from(COUNT) + 1;
+    let ready = std::sync::Barrier::new(2);
     std::thread::scope(|scope| {
         let writer = scope.spawn(|| {
+            ready.wait();
             // The first iteration publishes zero. Wait for a later sample.
+            let mut spins = 0u32;
             while storage.load_u8(64) == 0 {
                 assert!(Instant::now() < deadline, "guest never published a poll");
-                std::thread::yield_now();
+                std::hint::spin_loop();
+                spins = spins.wrapping_add(1);
+                if spins.trailing_zeros() >= 16 {
+                    std::thread::yield_now();
+                }
             }
             storage.store_u8(0, VALUE);
         });
+        ready.wait();
         let outcome = trial.live.run(image.stop, fuel).unwrap();
         writer.join().unwrap();
         assert_eq!(outcome, RunOutcome::ReachedStop);
