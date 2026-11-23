@@ -3757,11 +3757,51 @@ fn phase4_cross_channel_slp_pricing_and_order_preservation() {
         0,
         "cost model must decline unprofitable .2d DoubleFma"
     );
-    // Refusing ONLY the ExactF32 FMA guard leaves uncontracted FMUL+FADD+FISTP,
-    // where 3× .2d pairs sharing one Dup64 beat scalar (16 < 18 words).
+    // Refusing ONLY the ExactF32 FMA guard leaves uncontracted FMUL+FADD+FISTP
+    // (scalar 18 -> vec 16 words, +12 header words). With an unknown dynamic
+    // bound (`ebx`), 1-column calls cannot amortize the 12-word header, so SLP
+    // must decline.
     let fma_id = built6_fma.func.domain_guards[1];
-    let built6_slp = build_with_domains(&unit6, None, &at6, &|_| false, &|_| false, &|id| {
+    let built6_dyn = build_with_domains(&unit6, None, &at6, &|_| false, &|_| false, &|id| {
         id == fma_id
+    })
+    .unwrap();
+    assert_eq!(verify::verify(&built6_dyn.func), Ok(()));
+    assert_eq!(
+        count(&built6_dyn, |op| matches!(
+            op,
+            Op::VecFpToInt { double: true, .. }
+        )),
+        0,
+        "unknown trip count must not gamble on unamortized .2d header setup"
+    );
+    // When the loop has a statically known trip count >= 8 (`xor edx, edx` .. `cmp edx, 8`),
+    // the 12-word header strictly amortizes (`12 < 2 * 8`) and 3× .2d pairs pack,
+    // sharing one Dup64 broadcast.
+    let six_ch_known = assemble(|a| {
+        let mut head = a.create_label();
+        a.xor(edx, edx).unwrap();
+        a.set_label(&mut head).unwrap();
+        for k in 0..6 {
+            a.fld(qword_ptr(esp + 0x20 + k * 8)).unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fadd(dword_ptr(esp + 0x60 + k * 4)).unwrap();
+            emit_ftol(a);
+            a.mov(dword_ptr(edi + edx * 4 + k * 0x100), eax).unwrap();
+        }
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(dword_ptr(esp + 0x18)).unwrap();
+        a.fld(dword_ptr(esp + 0x18)).unwrap();
+        a.inc(edx).unwrap();
+        a.cmp(edx, 8).unwrap();
+        a.jl(head).unwrap();
+    });
+    let unit6_known = resident_unit(&six_ch_known);
+    let built6_known_fma =
+        build_with_domains(&unit6_known, None, &at6, &|_| false, &|_| false, &|_| false).unwrap();
+    let known_fma_id = built6_known_fma.func.domain_guards[1];
+    let built6_slp = build_with_domains(&unit6_known, None, &at6, &|_| false, &|_| false, &|id| {
+        id == known_fma_id
     })
     .unwrap();
     assert_eq!(verify::verify(&built6_slp.func), Ok(()));
@@ -3771,7 +3811,7 @@ fn phase4_cross_channel_slp_pricing_and_order_preservation() {
             Op::VecFpToInt { double: true, .. }
         )),
         3,
-        "expected 3× .2d SLP packs across 6 uncontracted PC=53 channels"
+        "expected 3× .2d SLP packs across 6 uncontracted PC=53 channels with known trip count"
     );
     assert_eq!(
         count(&built6_slp, |op| matches!(

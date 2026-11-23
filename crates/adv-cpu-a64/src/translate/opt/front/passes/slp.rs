@@ -14,9 +14,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::{
-    End, FmaOp, FpOp, Func, Location, Op, Recipe, SINGLE_A, SINGLE_B, SINGLE_C, SINGLE_EXACT,
-    SINGLE_RESULT, Type, Value, VecOp, VecToInt, VecUnary,
+    End, FlagKind, FmaOp, FpOp, Func, IntOp, Location, Op, Recipe, SINGLE_A, SINGLE_B, SINGLE_C,
+    SINGLE_EXACT, SINGLE_RESULT, Type, Value, VecOp, VecToInt, VecUnary,
 };
+use crate::translate::front::tags::ConditionCode;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum StoreKind {
@@ -470,48 +471,87 @@ fn available_before(
     }
 }
 
+struct PriceCtx<'a> {
+    block_idx: usize,
+    def_block: &'a [Option<usize>],
+    const_f64: &'a [Option<u64>],
+    loop_uses: &'a [u32],
+}
+
 /// Pricing for one operand slot (2 or 4 lanes) of a packed group.
-/// Returns `(body_words, header_words)`.
+/// Returns `(body_words, header_words, extra_live_vregs)`.
 fn price_slot(
     lanes: &[Value],
     is_single: bool,
-    block_idx: usize,
-    def_block: &[Option<usize>],
-    const_f64: &[Option<u64>],
+    ctx: &PriceCtx<'_>,
     shared_bcasts: &mut BTreeSet<(bool, Value)>,
-) -> (u32, u32) {
-    let invariant = block_idx != 0 && all_in_block0(lanes, def_block, const_f64);
-    if lanes.iter().all(|v| const_f64[v.0 as usize].is_some()) {
+) -> (u32, u32, i32) {
+    let invariant = ctx.block_idx != 0 && all_in_block0(lanes, ctx.def_block, ctx.const_f64);
+    let net_vregs = |hoisted: bool| -> i32 {
+        if !hoisted {
+            return 0;
+        }
+        // Replacing `k` loop-body single-use scalar F64 invariants with 1 V128
+        // pack frees `k - 1` vector registers across the loop; if lanes retain
+        // other loop-body uses, the hoisted pack adds +1 live V128.
+        let mut unique = BTreeSet::new();
+        let mut freed = 0i32;
+        for &v in lanes {
+            if unique.insert(v)
+                && ctx.const_f64[v.0 as usize].is_none()
+                && ctx.loop_uses[v.0 as usize] <= 1
+            {
+                freed += 1;
+            }
+        }
+        1 - freed
+    };
+    if lanes.iter().all(|v| ctx.const_f64[v.0 as usize].is_some()) {
         // Packs directly into a single `Op::Constant(Type::V128, bits)`.
         let w = 2;
-        return if invariant { (0, w) } else { (w, 0) };
+        return if invariant {
+            (0, w, net_vregs(true))
+        } else {
+            (w, 0, 0)
+        };
     }
     let all_same = lanes.iter().all(|&v| v == lanes[0]);
     if all_same {
         let key = (is_single, lanes[0]);
         if !shared_bcasts.insert(key) {
-            return (0, 0);
+            return (0, 0, 0);
         }
         // Single: NarrowScalar (1) + Dup32 (1) = 2; Double: Dup64 (1).
         let w = if is_single { 2 } else { 1 };
-        if invariant { (0, w) } else { (w, 0) }
+        if invariant {
+            (0, w, net_vregs(true))
+        } else {
+            (w, 0, 0)
+        }
     } else if is_single {
         // 4× NarrowScalar (4) + 3× Insert32 (3..6, conservatively 4) = 8 words.
         let w = 8;
-        if invariant { (0, w) } else { (w, 0) }
+        if invariant {
+            (0, w, net_vregs(true))
+        } else {
+            (w, 0, 0)
+        }
     } else {
         // Insert64(true, false) (vmov + vins = 2 words).
         let w = 2;
-        if invariant { (0, w) } else { (w, 0) }
+        if invariant {
+            (0, w, net_vregs(true))
+        } else {
+            (w, 0, 0)
+        }
     }
 }
 
 fn price_group(
     key: ChannelKey,
     channels: &[Channel],
-    block_idx: usize,
-    def_block: &[Option<usize>],
-    const_f64: &[Option<u64>],
+    ctx: &PriceCtx<'_>,
+    live_vregs: &mut i32,
     shared_bcasts: &mut BTreeSet<(bool, Value)>,
 ) -> (u32, u32, u32) {
     let scalar_words: u32 = channels.iter().map(|c| c.scalar_words).sum();
@@ -522,16 +562,15 @@ fn price_group(
 
     for s in 0..n_slots {
         let lanes: Vec<Value> = channels.iter().map(|c| c.inputs[s]).collect();
-        let (bw, hw) = price_slot(
-            &lanes,
-            is_single,
-            block_idx,
-            def_block,
-            const_f64,
-            shared_bcasts,
-        );
+        let (bw, hw, dv) = price_slot(&lanes, is_single, ctx, shared_bcasts);
         vec_body_words += bw;
         header_words += hw;
+        *live_vregs += dv;
+        // Charge a conservative reload penalty if hoisting pushes live vector
+        // registers past the 14-register comfort margin (out of v0..v15).
+        if dv > 0 && *live_vregs > 14 {
+            vec_body_words += 2;
+        }
     }
 
     // Core vector arithmetic + conversion + lane extractions.
@@ -548,6 +587,117 @@ fn price_group(
     vec_body_words += arith_words + conv_extract_words;
 
     (scalar_words, vec_body_words, header_words)
+}
+
+/// Statically provable minimum trip count for a simple single-block loop
+/// entered via an unconditional `End::Jump` predecessor. Returns `1` whenever
+/// the bound is dynamic/unknown, so header setup is never amortized against
+/// unverified trip counts.
+fn known_min_trips(func: &Func, block_idx: usize) -> u32 {
+    if block_idx == 0 {
+        return 1;
+    }
+    let block = &func.blocks[block_idx];
+    let End::Branch { cond, taken, fall } = &block.end else {
+        return 1;
+    };
+    // Support both direct self-backedges (`taken -> block_idx`) and 1-hop
+    // resident checkpoint trampolines (`taken -> tramp -> block_idx`).
+    let (back, tramp_block) =
+        if taken.block.0 as usize == block_idx && fall.block.0 as usize != block_idx {
+            (taken, None)
+        } else if fall.block.0 as usize != block_idx
+            && let tb = taken.block.0 as usize
+            && let End::Jump(t) = &func.blocks[tb].end
+            && t.block.0 as usize == block_idx
+        {
+            (t, Some(tb))
+        } else {
+            return 1;
+        };
+
+    let mut entry = None;
+    for (bi, b) in func.blocks.iter().enumerate() {
+        if bi == block_idx || Some(bi) == tramp_block {
+            continue;
+        }
+        for t in b.end.targets() {
+            if t.block.0 as usize == block_idx {
+                if entry.is_some() || !matches!(b.end, End::Jump(_)) {
+                    return 1;
+                }
+                entry = Some(t);
+            }
+        }
+    }
+    let Some(entry) = entry else {
+        return 1;
+    };
+
+    let mut const_i32 = BTreeMap::<Value, u32>::new();
+    let mut def_op = BTreeMap::<Value, Op>::new();
+    for b in &func.blocks {
+        for &(res, op) in &b.insts {
+            if let Some(v) = res {
+                def_op.insert(v, op);
+                if let Op::Constant(Type::I32, bits) = op {
+                    const_i32.insert(v, bits as u32);
+                }
+            }
+        }
+    }
+
+    let Some(Op::Test { flags, cond: cc }) = def_op.get(cond).copied() else {
+        return 1;
+    };
+    let Some(Op::Flags { kind, a, b, .. }) = def_op.get(&flags).copied() else {
+        return 1;
+    };
+
+    for (idx, &param) in block.params.iter().enumerate() {
+        let Some(&init) = entry.args.get(idx).and_then(|v| const_i32.get(v)) else {
+            continue;
+        };
+        let Some(&next) = back.args.get(idx) else {
+            continue;
+        };
+        if kind == FlagKind::Decrement && cc == ConditionCode::ne && a == param {
+            if let Some(Op::Int(IntOp::Sub, lhs, rhs)) = def_op.get(&next).copied()
+                && lhs == param
+                && const_i32.get(&rhs) == Some(&1)
+                && init > 0
+            {
+                return init;
+            }
+        } else if kind == FlagKind::Sub
+            && cc == ConditionCode::l
+            && a == next
+            && let Some(&bound) = const_i32.get(&b)
+            && let Some(Op::Int(IntOp::Add, lhs, rhs)) = def_op.get(&next).copied()
+            && lhs == param
+            && let Some(&step) = const_i32.get(&rhs)
+            && step > 0
+            && (init as i32) < (bound as i32)
+        {
+            let diff = (i64::from(bound as i32) - i64::from(init as i32)) as u64;
+            let trips = diff.div_ceil(u64::from(step));
+            return u32::try_from(trips).unwrap_or(u32::MAX).max(1);
+        }
+    }
+    1
+}
+
+fn slp_profitable(
+    scalar_words: u32,
+    vec_body_words: u32,
+    header_words: u32,
+    min_trips: u32,
+) -> bool {
+    if vec_body_words >= scalar_words {
+        return false;
+    }
+    let saved = scalar_words - vec_body_words;
+    header_words < saved.saturating_mul(min_trips)
 }
 
 /// Run intra-iteration cross-channel SLP across all blocks of `func`.
@@ -626,33 +776,61 @@ pub(super) fn run(func: &mut Func) -> bool {
             continue;
         }
 
+        // Estimate live vector/FP registers entering `block_idx` plus proven
+        // minimum trip count so header setup is priced against real trips and
+        // register-spill pressure rather than an unverified fixed multiplier.
+        let min_trips = known_min_trips(func, block_idx);
+        // Count non-Block(0) uses so Block(0) entry DomainGuards don't make
+        // single-use loop invariants look multi-use inside the loop body.
+        let mut loop_uses = vec![0u32; n];
+        for (bi, b) in func.blocks.iter().enumerate() {
+            if bi == 0 && block_idx != 0 {
+                continue;
+            }
+            for &(_, op) in &b.insts {
+                for v in op.uses() {
+                    loop_uses[v.0 as usize] = loop_uses[v.0 as usize].saturating_add(1);
+                }
+            }
+            for t in b.end.targets() {
+                for &v in &t.args {
+                    loop_uses[v.0 as usize] = loop_uses[v.0 as usize].saturating_add(1);
+                }
+            }
+        }
+        let mut live_vregs: i32 = func.blocks[0]
+            .params
+            .iter()
+            .copied()
+            .chain(func.blocks[0].insts.iter().filter_map(|&(res, _)| res))
+            .filter(|&v| {
+                matches!(func.ty(v), Type::F64 | Type::V128)
+                    && const_f64[v.0 as usize].is_none()
+                    && loop_uses[v.0 as usize] > 0
+            })
+            .count() as i32;
+
         // Price each group with shared broadcasts across all accepted groups in
         // this block, keeping only strictly profitable groups. Also handle the
         // case where a shared broadcast (e.g. Dup64 on a loop induction value)
         // only breaks even when amortized across >= 2 groups of the same key.
+        let price_ctx = PriceCtx {
+            block_idx,
+            def_block: &def_block,
+            const_f64: &const_f64,
+            loop_uses: &loop_uses,
+        };
         let mut shared_bcasts = BTreeSet::<(bool, Value)>::new();
         let mut accepted: Vec<GroupPlan> = Vec::new();
         let mut deferred = BTreeMap::<ChannelKey, Vec<(Vec<Channel>, usize)>>::new();
         for (key, chs, insert_at) in tentative {
             let mut trial_bcasts = shared_bcasts.clone();
-            let (scalar_words, vec_body_words, header_words) = price_group(
-                key,
-                &chs,
-                block_idx,
-                &def_block,
-                &const_f64,
-                &mut trial_bcasts,
-            );
-            let profitable = if block_idx == 0 {
-                vec_body_words + header_words < scalar_words
-            } else if vec_body_words < scalar_words {
-                let saved = scalar_words - vec_body_words;
-                header_words == 0 || header_words <= saved.saturating_mul(8)
-            } else {
-                false
-            };
-            if profitable {
+            let mut trial_vregs = live_vregs;
+            let (scalar_words, vec_body_words, header_words) =
+                price_group(key, &chs, &price_ctx, &mut trial_vregs, &mut trial_bcasts);
+            if slp_profitable(scalar_words, vec_body_words, header_words, min_trips) {
                 shared_bcasts = trial_bcasts;
+                live_vregs = trial_vregs;
                 accepted.push(GroupPlan {
                     key,
                     channels: chs,
@@ -667,17 +845,12 @@ pub(super) fn run(func: &mut Func) -> bool {
                 continue;
             }
             let mut trial_bcasts = shared_bcasts.clone();
+            let mut trial_vregs = live_vregs;
             let mut plans = Vec::with_capacity(groups.len());
             let (mut tot_scalar, mut tot_body, mut tot_header) = (0u32, 0u32, 0u32);
             for (chs, insert_at) in groups {
-                let (sw, bw, hw) = price_group(
-                    key,
-                    &chs,
-                    block_idx,
-                    &def_block,
-                    &const_f64,
-                    &mut trial_bcasts,
-                );
+                let (sw, bw, hw) =
+                    price_group(key, &chs, &price_ctx, &mut trial_vregs, &mut trial_bcasts);
                 tot_scalar += sw;
                 tot_body += bw;
                 tot_header += hw;
@@ -687,16 +860,9 @@ pub(super) fn run(func: &mut Func) -> bool {
                     insert_at,
                 });
             }
-            let profitable = if block_idx == 0 {
-                tot_body + tot_header < tot_scalar
-            } else if tot_body < tot_scalar {
-                let saved = tot_scalar - tot_body;
-                tot_header == 0 || tot_header <= saved.saturating_mul(8)
-            } else {
-                false
-            };
-            if profitable {
+            if slp_profitable(tot_scalar, tot_body, tot_header, min_trips) {
                 shared_bcasts = trial_bcasts;
+                live_vregs = trial_vregs;
                 accepted.extend(plans);
             }
         }

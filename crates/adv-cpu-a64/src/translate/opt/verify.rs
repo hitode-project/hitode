@@ -240,9 +240,7 @@ fn typed(func: &Func, op: &Op) -> bool {
         Op::VecUnary(_, a)
         | Op::VecToInt(_, a)
         | Op::VecFpToInt { value: a, .. }
-        | Op::SsePackedToInt { value: a, .. } => {
-            is(a, Type::V128)
-        }
+        | Op::SsePackedToInt { value: a, .. } => is(a, Type::V128),
         Op::Load { addr, .. } | Op::Store { addr, .. } | Op::Host(addr) => is(addr, Type::I32),
         Op::FrameLoad { ty, base, .. } => (int_ty(ty) || ty == Type::F64) && is(base, Type::I64),
         Op::FrameStore { base, value, .. } => {
