@@ -182,6 +182,12 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
             }
         }
         Op::Select { cond, a, b }
+        | Op::Fma {
+            a: cond,
+            b: a,
+            c: b,
+            ..
+        }
         | Op::Remainder {
             quotient: cond,
             dividend: a,

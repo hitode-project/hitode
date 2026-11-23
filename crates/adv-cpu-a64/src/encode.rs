@@ -1040,6 +1040,21 @@ pub const fn fmsub(rd: VReg, rn: VReg, rm: VReg, ra: VReg) -> u32 {
     0x1F40_8000 | rm.number() << 16 | ra.number() << 10 | rn.number() << 5 | rd.number()
 }
 
+/// `fnmsub sd, sn, sm, sa`: sn * sm - sa, rounded once.
+pub const fn fnmsub_s(rd: VReg, rn: VReg, rm: VReg, ra: VReg) -> u32 {
+    0x1F20_8000 | rm.number() << 16 | ra.number() << 10 | rn.number() << 5 | rd.number()
+}
+
+/// `fmadd sd, sn, sm, sa`: sa + sn * sm, rounded once.
+pub const fn fmadd_s(rd: VReg, rn: VReg, rm: VReg, ra: VReg) -> u32 {
+    0x1F00_0000 | rm.number() << 16 | ra.number() << 10 | rn.number() << 5 | rd.number()
+}
+
+/// `fmsub sd, sn, sm, sa`: sa - sn * sm, rounded once.
+pub const fn fmsub_s(rd: VReg, rn: VReg, rm: VReg, ra: VReg) -> u32 {
+    0x1F00_8000 | rm.number() << 16 | ra.number() << 10 | rn.number() << 5 | rd.number()
+}
+
 /// `fneg vd.2d, vn.2d`.
 pub const fn vfneg2d(rd: VReg, rn: VReg) -> u32 {
     0x6EE0_F800 | rn.number() << 5 | rd.number()
@@ -1646,6 +1661,9 @@ mod tests {
             (fnmsub(v(4), v(1), v(2), v(3)), "fnmsub d4, d1, d2, d3"),
             (fmadd(v(2), v(3), v(4), v(5)), "fmadd d2, d3, d4, d5"),
             (fmsub(v(2), v(3), v(4), v(5)), "fmsub d2, d3, d4, d5"),
+            (fnmsub_s(v(4), v(1), v(2), v(3)), "fnmsub s4, s1, s2, s3"),
+            (fmadd_s(v(2), v(3), v(4), v(5)), "fmadd s2, s3, s4, s5"),
+            (fmsub_s(v(2), v(3), v(4), v(5)), "fmsub s2, s3, s4, s5"),
             (vfneg2d(v(2), v(3)), "fneg v2.2d, v3.2d"),
             (ucvtf(v(2), r(16)), "ucvtf d2, x16"),
             (fcvtzu(r(16), v(2)), "fcvtzu x16, d2"),

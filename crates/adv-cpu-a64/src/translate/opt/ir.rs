@@ -201,12 +201,25 @@ pub(crate) enum DomainGuardKind {
     U32Le { value: Value, max: u32 },
 }
 
-/// Proof bits for [`Op::X87Single`].
+/// Proof bits for [`Op::X87Single`] and [`Op::Fma`].
 pub(crate) const SINGLE_A: u8 = 1;
 pub(crate) const SINGLE_B: u8 = 2;
 pub(crate) const SINGLE_RESULT: u8 = 4;
-/// Binary64 arithmetic matches binary32 bit-for-bit (implies `SINGLE_A | SINGLE_B | SINGLE_RESULT`).
+/// Binary64 arithmetic matches binary32 bit-for-bit (implies all operand & result proofs).
 pub(crate) const SINGLE_EXACT: u8 = 8;
+/// Third operand (`c`) of [`Op::Fma`] is exact in binary32.
+pub(crate) const SINGLE_C: u8 = 16;
+
+/// Fused multiply-add/sub sign form for a proved-exact product:
+/// - `Add`: `a * b + c` (`FMADD`)
+/// - `Sub`: `a * b - c` (`FNMSUB`)
+/// - `RevSub`: `c - a * b` (`FMSUB`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FmaOp {
+    Add,
+    Sub,
+    RevSub,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -261,6 +274,17 @@ pub(crate) enum Op {
     Fp(FpOp, Value, Value, bool),
     /// x87 precision 24 when both inputs are exact in binary32; `proved` carries `SINGLE_*` bits.
     X87Single(FpOp, Value, Value, u8),
+    /// Fused multiply-add/sub for a proved-exact product (`a * b ± c` or `c - a * b`).
+    /// For `single == false`, `SINGLE_RESULT` in `proved` elides the post-check;
+    /// for `single == true`, `proved` carries `SINGLE_A`/`SINGLE_B`/`SINGLE_C`/`SINGLE_RESULT`/`SINGLE_EXACT`.
+    Fma {
+        op: FmaOp,
+        a: Value,
+        b: Value,
+        c: Value,
+        single: bool,
+        proved: u8,
+    },
     Fp32(FpOp, Value, Value),
     SseFp64(FpOp, Value, Value),
     FpUnary(FpUnary, Value),
@@ -442,6 +466,12 @@ impl Op {
             } => [Some(a), Some(b), None],
             Op::Flags { a, b, prior, .. } => [Some(a), Some(b), prior],
             Op::Select { cond, a, b }
+            | Op::Fma {
+                a: cond,
+                b: a,
+                c: b,
+                ..
+            }
             | Op::Remainder {
                 quotient: cond,
                 dividend: a,
@@ -459,6 +489,15 @@ impl Op {
                 proved & SINGLE_EXACT == 0
                     && proved & (SINGLE_A | SINGLE_B | SINGLE_RESULT)
                         != (SINGLE_A | SINGLE_B | SINGLE_RESULT)
+            }
+            Op::Fma { single, proved, .. } => {
+                if single {
+                    proved & SINGLE_EXACT == 0
+                        && proved & (SINGLE_A | SINGLE_B | SINGLE_C | SINGLE_RESULT)
+                            != (SINGLE_A | SINGLE_B | SINGLE_C | SINGLE_RESULT)
+                } else {
+                    proved & SINGLE_RESULT == 0
+                }
             }
             Op::Fp32(..)
             | Op::SseFp64(..)
@@ -704,6 +743,7 @@ impl Func {
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..)
             | Op::X87Single(..)
+            | Op::Fma { .. }
             | Op::SseFp64(..)
             | Op::FpUnary(..)
             | Op::FromInt(_)
