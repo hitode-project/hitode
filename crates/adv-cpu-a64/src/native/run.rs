@@ -1324,22 +1324,10 @@ impl Native {
 
     pub(super) fn domain_guard_miss(&mut self, eip: u32, index: usize, ordinal: usize) {
         self.diagnostics.resident_domain_guard_misses += 1;
-        let history = self
-            .plans
-            .resident(eip)
-            .map_or(&[][..], |head| head.domain_history.as_slice());
-        let Some((guard_id, total_entries, total_iters, misses, guard_words, saved_per_iter)) =
-            self.code.domain_guard_totals(eip, index, ordinal, history)
-        else {
+        let Some((guard_id, misses, pays)) = self.domain_guard_verdict(eip, index, ordinal) else {
             return;
         };
-        if crate::policy::resident::domain_guard_pays(
-            total_entries,
-            total_iters,
-            misses,
-            guard_words,
-            saved_per_iter,
-        ) {
+        if pays {
             let next_period = misses
                 .saturating_mul(2)
                 .clamp(u64::from(crate::policy::resident::DOMAIN_MISS_SAMPLE), 256)
@@ -1347,26 +1335,70 @@ impl Native {
             self.code
                 .reset_domain_sensor(eip, index, ordinal, next_period);
             self.count_sensor_decision("domain_guard_kept");
-        } else {
-            self.diagnostics.resident_domain_guard_refusals += 1;
-            self.count_sensor_decision("domain_guard_refused");
-            self.refuse_domain_guard(eip, guard_id);
+        } else if self.mark_domain_refused(eip, guard_id) {
+            self.rebuild_resident(eip);
         }
     }
 
-    pub(super) fn refuse_domain_guard(&mut self, eip: u32, guard_id: u32) {
+    /// The policy verdict on one entry domain guard's cumulative ledger:
+    /// its ID, its misses, and whether it pays.
+    fn domain_guard_verdict(
+        &self,
+        eip: u32,
+        index: usize,
+        ordinal: usize,
+    ) -> Option<(u32, u64, bool)> {
+        let history = self
+            .plans
+            .resident(eip)
+            .map_or(&[][..], |head| head.domain_history.as_slice());
+        let (guard_id, total_entries, total_iters, misses, guard_words, saved_per_iter) = self
+            .code
+            .domain_guard_totals(eip, index, ordinal, history)?;
+        let pays = crate::policy::resident::domain_guard_pays(
+            total_entries,
+            total_iters,
+            misses,
+            guard_words,
+            saved_per_iter,
+        );
+        Some((guard_id, misses, pays))
+    }
+
+    /// Hits are counted only inside the probation window, so an entry guard
+    /// that never misses is priced here, each ordinal on its own margin.
+    /// Returns whether any guard was refused (a rebuild is then pending).
+    fn settle_domain_guards(&mut self, eip: u32, index: usize) -> bool {
+        let ordinals = self.code.resident(eip).unwrap().versions[index]
+            .domain_guards
+            .len();
+        let mut refused = false;
+        for ordinal in 0..ordinals {
+            if let Some((guard_id, _, false)) = self.domain_guard_verdict(eip, index, ordinal) {
+                refused |= self.mark_domain_refused(eip, guard_id);
+            }
+        }
+        if refused {
+            self.rebuild_resident(eip);
+        }
+        refused
+    }
+
+    fn mark_domain_refused(&mut self, eip: u32, guard_id: u32) -> bool {
         let versions = &self.code.resident(eip).unwrap().versions;
         let affected = versions.iter().enumerate().filter_map(|(i, version)| {
             (version.enabled && version.domain_guards.contains(&guard_id)).then_some(i)
         });
-        if self
+        let refused = self
             .plans
             .resident_mut(eip)
             .unwrap()
-            .refuse_domain(guard_id, affected)
-        {
-            self.rebuild_resident(eip);
+            .refuse_domain(guard_id, affected);
+        if refused {
+            self.diagnostics.resident_domain_guard_refusals += 1;
+            self.count_sensor_decision("domain_guard_refused");
         }
+        refused
     }
 
     pub(super) fn refuse_resident_fact(&mut self, eip: u32, site: u32) {
@@ -1586,6 +1618,11 @@ impl Native {
             mmx: form.built.assumed.mmx,
         };
         let spill_cells = form.lowered.spill_cells;
+        // Entry domain guards are priced on the probation window's counts even
+        // when Tier-1 gives the version itself no price.
+        let measured = probation.is_some()
+            || form.lowered.has_rows()
+            || !form.built.func.domain_guards.is_empty();
         let row_target = form.lowered.row_target;
         let previous = self
             .code
@@ -1607,11 +1644,11 @@ impl Native {
             form.lowered.key,
             std::mem::take(&mut form.built.plain_sites),
             std::mem::take(&mut form.built.func.domain_guards),
-            form.built.func.domain_saved_per_iter,
+            std::mem::take(&mut form.built.func.domain_saved_per_iter),
             recovery,
             form.lowered.iteration_retired,
             gate,
-            (probation.is_some() || form.lowered.has_rows()).then_some(PROBATION),
+            measured.then_some(PROBATION),
             MISSES,
             form.placement(),
             unit,
@@ -1658,6 +1695,7 @@ impl Native {
         self.stop_cold_window(eip);
         let probation = self.plans.resident_mut(eip).unwrap().probation[index].take();
         let (entries, retired) = self.code.finish_probation(eip, index);
+        let refused = self.settle_domain_guards(eip, index);
         let Some(probation) = probation else {
             self.code.sync();
             return;
@@ -1670,6 +1708,10 @@ impl Native {
             );
             self.code.sync();
             self.count_sensor_decision("probation_kept");
+        } else if refused {
+            // The rebuild without the refused guards is measured afresh.
+            self.code.sync();
+            self.count_sensor_decision("probation_rebuilt");
         } else {
             crate::jit_map::demoted(eip, index, entries, retired / probation.iteration_retired);
             self.count_sensor_decision("probation_declined");

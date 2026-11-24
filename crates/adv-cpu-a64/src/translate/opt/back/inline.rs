@@ -341,7 +341,10 @@ impl Emitter<'_> {
                 self.asm.b_cond(Cond::Ne, miss);
             }
         }
-        self.domain_guard_words += self.words_since(start);
+        let emitted = self.words_since(start);
+        if let Some(words) = self.domain_guard_words.get_mut(usize::from(ordinal)) {
+            *words += emitted;
+        }
     }
 
     /// Leave an entry whose numerical domain guard failed before any guest side
@@ -368,11 +371,12 @@ impl Emitter<'_> {
             let counter = self.asm.label();
             let report = self.asm.label();
             self.asm.bind(label);
+            let miss_offset = ordinal as u32 * 8;
             self.asm.ldr_literal(S2, misses_ptr);
             self.asm.emit_all(&[
-                ldr(X, S3, S2, 0),
+                ldr(X, S3, S2, miss_offset),
                 add_imm(X, S3, S3, 1, false),
-                str(X, S3, S2, 0),
+                str(X, S3, S2, miss_offset),
             ]);
             self.domain_sensors
                 .push((ordinal as u8, self.asm.offset(), counter));

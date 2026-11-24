@@ -28,7 +28,6 @@ const F32_SAFE_MIN_F64: f64 = 2.350_988_701_644_575e-38; // f32::from_bits(0x010
 const WIDEN_LIMIT: u8 = 3;
 const MAX_DOMAIN_TRIP_COUNT: u32 = 1 << 20;
 const MAX_GUARDED_INPUTS: usize = 24;
-const MIN_DOMAIN_SAVED_PER_ITER: u32 = 12;
 const MAX_BOUND_DEGREE: u8 = 3;
 const F64_WIN_MIN_EXP: i16 = -240;
 const F64_WIN_MAX_EXP: i16 = 240;
@@ -573,8 +572,13 @@ fn eval_fp(op: FpOp, a: FpFact, b: FpFact, same_operands: bool) -> (bool, FpFact
     } else {
         None
     };
+    // `lo` and `hi` were computed with f64 round-to-nearest, so an inexact
+    // mathematical result such as `3 * 3002399751580331 = 2^53 + 1` can round
+    // down onto the exact `2^(q + 53)` boundary. Check the outward-rounded
+    // magnitude (`next_up()`) so any value that could have rounded down from
+    // `>= 2^(q + 53) + 2^q` is never claimed exact.
     let exact_f64 = q_cand
-        .is_some_and(|q| q >= -1022 && fits_mantissa_bits(lo.abs().max(hi.abs()), q, 53))
+        .is_some_and(|q| q >= -1022 && fits_mantissa_bits(lo.abs().max(hi.abs()).next_up(), q, 53))
         || (op == FpOp::Mul
             && (both_f32
                 || (mul_sig.is_some_and(|w| w <= 53)
@@ -2832,8 +2836,10 @@ pub(super) fn infer_domain_guards(
 
     // Simulate fixpoint with the planned domain guards to verify profitability.
     let (_, guarded_fp) = analyze_fixpoint(func, &defs, &seeds);
+    // The guard's price is settled at run time on its own ledger (policy::resident),
+    // so the pass exports any positive saving instead of gating on a threshold.
     let (_, saved_per_iter) = apply_proved(func, &defs, &guarded_fp, Some(&in_loop), false);
-    if saved_per_iter < MIN_DOMAIN_SAVED_PER_ITER {
+    if saved_per_iter == 0 {
         return None;
     }
 
@@ -2908,23 +2914,20 @@ pub(super) fn infer_domain_guards(
                 }
             }
         }
-        if fma_pairs < 2 {
-            fma_exact_inputs.clear();
-            fma_pairs = 0;
-        }
     }
 
     // Commit: emit Block(0) helper ops and DomainGuards at `insert_pos`.
     let ordinal = func.domain_guards.len() as u8;
     func.domain_guards.push(guard_id);
+    func.domain_saved_per_iter.push(saved_per_iter);
     let fma_ordinal = if !fma_exact_inputs.is_empty() {
         let ord = func.domain_guards.len() as u8;
         func.domain_guards.push(fma_guard_id);
+        func.domain_saved_per_iter.push(fma_pairs);
         Some(ord)
     } else {
         None
     };
-    func.domain_saved_per_iter = saved_per_iter.saturating_add(fma_pairs);
 
     let mut eb = EntryBuilder {
         func,

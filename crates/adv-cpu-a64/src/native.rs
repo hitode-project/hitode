@@ -3643,4 +3643,252 @@ mod tests {
         }
         assert_eq!(ok.regs[0], 0x1234_5678);
     }
+
+    // spec: A64-OPT-2
+    #[test]
+    fn shared_mapping_alias_prevents_cross_store_forwarding() {
+        // HEAD:
+        //   mov dword ptr [edi], 1          ; c7 07 01 00 00 00
+        //   mov dword ptr [edi+0x4000], 2   ; c7 87 00 40 00 00 02 00 00 00
+        //   mov eax, dword ptr [edi]        ; 8b 07
+        //   dec ecx                         ; 49
+        //   jne HEAD                        ; 75 eb
+        //   int3                            ; cc
+        let body: &[u8] = &[
+            0xc7, 0x07, 0x01, 0x00, 0x00, 0x00, 0xc7, 0x87, 0x00, 0x40, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x8b, 0x07, 0x49, 0x75, 0xeb, 0xcc,
+        ];
+        let (mut memory, mut native, stop) = resident_loop(body);
+        native.count_resident_entries = true;
+        // Map the same shared backing page at two virtual addresses 0x4000 apart.
+        let alias_a = DATA + 0x10_0000;
+        let alias_b = alias_a + 0x4000;
+        let storage = memory.map_shared_audio(alias_a, 0x1000).unwrap();
+        memory
+            .map_shared_file(alias_b, 0x1000, storage, READ | WRITE, false)
+            .unwrap();
+
+        let mut at = resident_cpu(HEAD, 4);
+        at.regs[7] = alias_a;
+        assert!(native.force_resident_at(&mut memory, at));
+
+        let mut state = resident_cpu(OUTSIDE, 4);
+        state.regs[7] = alias_a;
+        let before = native.diagnostics.resident_entries;
+        while state.eip != stop {
+            enter(&mut native, &mut memory, stop, &mut state);
+        }
+        assert_eq!(state.eip, stop);
+        assert!(native.diagnostics.resident_entries > before);
+        assert_eq!(
+            state.regs[0], 2,
+            "store to aliased view [p+0x4000] must invalidate forwarded [p]"
+        );
+    }
+
+    // spec: A64-OPT-8, A64-OPT-9
+    #[test]
+    fn hit_only_domain_guards_are_priced_at_probation_end() {
+        // One FMUL -> FADD pair whose binary64 multiplicand needs an ExactF32
+        // entry guard (ordinal 1) beside the base range guard (ordinal 0).
+        //   HEAD:
+        //     fld qword ptr [esp+0x20]       ; dd 44 24 20
+        //     fmul st(0), st(1)              ; d8 c9
+        //     fadd dword ptr [esp+0x30]      ; d8 44 24 30
+        //     fistp dword ptr [esp+0x10]     ; db 5c 24 10
+        //     mov eax, dword ptr [esp+0x10]  ; 8b 44 24 10
+        //     mov dword ptr [edi+edx*4], eax ; 89 04 97
+        //     fadd st(0), st(1)              ; d8 c1
+        //     fstp dword ptr [esp+0x18]      ; d9 5c 24 18
+        //     fld dword ptr [esp+0x18]       ; d9 44 24 18
+        //     inc edx                        ; 42
+        //     cmp edx, ebx                   ; 39 da
+        //     jl HEAD                        ; 7c dc
+        //     int3                           ; cc
+        let body: &[u8] = &[
+            0xdd, 0x44, 0x24, 0x20, 0xd8, 0xc9, 0xd8, 0x44, 0x24, 0x30, 0xdb, 0x5c, 0x24, 0x10,
+            0x8b, 0x44, 0x24, 0x10, 0x89, 0x04, 0x97, 0xd8, 0xc1, 0xd9, 0x5c, 0x24, 0x18, 0xd9,
+            0x44, 0x24, 0x18, 0x42, 0x39, 0xda, 0x7c, 0xdc, 0xcc,
+        ];
+        let make_cpu = |eip: u32, cols: u32| {
+            let mut state = resident_cpu(eip, 1);
+            state.regs[2] = 0; // edx
+            state.regs[3] = cols; // ebx
+            state.regs[4] = OUTPUT + 0x1000; // esp
+            state.regs[7] = OUTPUT; // edi
+            state.x87.control = 0x023f;
+            state.x87.status = 0x20;
+            state.x87.push(adv_cpu_core::floating::fast::extended(0.25));
+            state.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+            state
+        };
+        let run = |cols: u32| {
+            let (mut memory, mut native, stop) = resident_loop(body);
+            native.count_resident_entries = true;
+            memory
+                .write(OUTPUT + 0x1020, &4.0f64.to_le_bytes())
+                .unwrap();
+            memory
+                .write(OUTPUT + 0x1030, &10.0f32.to_le_bytes())
+                .unwrap();
+            let at = make_cpu(HEAD, cols);
+            native
+                .translate(
+                    &mut memory,
+                    HEAD,
+                    crate::facts::Key::read(&at, crate::facts::ALL),
+                )
+                .unwrap();
+            native.discover(&mut memory, HEAD, HEAD, at);
+            native.install_optimized(true);
+            let version = &native.code.resident(HEAD).unwrap().versions[0];
+            assert_eq!(version.domain_guards.len(), 2);
+            assert_eq!(version.domain_saved_per_iter[1], 1);
+            let fma_guard = version.domain_guards[1];
+            for _ in 0..plan::PROBATION + 4 {
+                let mut state = make_cpu(OUTSIDE, cols);
+                let mut steps = 0;
+                while state.eip != stop {
+                    assert_eq!(
+                        enter(&mut native, &mut memory, stop, &mut state).exit,
+                        Exit::Dispatch
+                    );
+                    steps += 1;
+                    assert!(steps <= 8, "stuck at eip={:#x}", state.eip);
+                }
+                let got: Vec<i32> = memory
+                    .read(OUTPUT, cols as usize * 4)
+                    .unwrap()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from_le_bytes(*c))
+                    .collect();
+                assert_eq!(got, (0..cols as i32).map(|i| 10 + i).collect::<Vec<_>>());
+            }
+            assert_eq!(native.diagnostics.resident_domain_guard_misses, 0);
+            let refused = native
+                .plans
+                .resident(HEAD)
+                .unwrap()
+                .refused_domains
+                .contains(&fma_guard);
+            (
+                refused,
+                native.plans.resident(HEAD).unwrap().probation[0].is_none(),
+            )
+        };
+
+        // A long loop amortizes the entry check over many one-word savings.
+        let (refused, settled) = run(64);
+        assert!(settled, "probation should have settled");
+        assert!(!refused, "a single FMA pair pays on a long loop");
+
+        // One iteration per entry never repays the check. The guard never
+        // misses, so only the probation window's hit counts can refuse it.
+        let (refused, _) = run(1);
+        assert!(refused, "a hit-only unprofitable guard must be refused");
+    }
+
+    #[test]
+    fn domain_guard_misses_and_margin_are_tracked_per_ordinal() {
+        // Two-channel PC=53 affine loop emitting two independent Block(0) domain guards:
+        // ordinal 0 (base range) and ordinal 1 (ExactF32 for FMA contraction).
+        //   HEAD:
+        //     fld qword ptr [esp+0x20]         ; dd 44 24 20
+        //     fmul st(0), st(1)                ; d8 c9
+        //     fadd dword ptr [esp+0x30]        ; d8 44 24 30
+        //     fistp dword ptr [esp+0x10]       ; db 5c 24 10
+        //     mov eax, dword ptr [esp+0x10]    ; 8b 44 24 10
+        //     mov dword ptr [edi+edx*4], eax   ; 89 04 97
+        //     fld qword ptr [esp+0x28]         ; dd 44 24 28
+        //     fmul st(0), st(1)                ; d8 c9
+        //     fadd dword ptr [esp+0x34]        ; d8 44 24 34
+        //     fistp dword ptr [esp+0x10]       ; db 5c 24 10
+        //     mov eax, dword ptr [esp+0x10]    ; 8b 44 24 10
+        //     mov dword ptr [edi+edx*4+0x100], eax ; 89 84 97 00 01 00 00
+        //     fadd st(0), st(1)                ; d8 c1
+        //     fstp dword ptr [esp+0x18]        ; d9 5c 24 18
+        //     fld dword ptr [esp+0x18]         ; d9 44 24 18
+        //     inc edx                          ; 42
+        //     cmp edx, ebx                     ; 39 da
+        //     jl HEAD                          ; 7c c3
+        //     int3                             ; cc
+        let body: &[u8] = &[
+            0xdd, 0x44, 0x24, 0x20, 0xd8, 0xc9, 0xd8, 0x44, 0x24, 0x30, 0xdb, 0x5c, 0x24, 0x10,
+            0x8b, 0x44, 0x24, 0x10, 0x89, 0x04, 0x97, 0xdd, 0x44, 0x24, 0x28, 0xd8, 0xc9, 0xd8,
+            0x44, 0x24, 0x34, 0xdb, 0x5c, 0x24, 0x10, 0x8b, 0x44, 0x24, 0x10, 0x89, 0x84, 0x97,
+            0x00, 0x01, 0x00, 0x00, 0xd8, 0xc1, 0xd9, 0x5c, 0x24, 0x18, 0xd9, 0x44, 0x24, 0x18,
+            0x42, 0x39, 0xda, 0x7c, 0xc3, 0xcc,
+        ];
+        let make_cpu = |eip: u32, cols: u32| {
+            let mut state = resident_cpu(eip, 1);
+            state.regs[2] = 0; // edx
+            state.regs[3] = cols; // ebx
+            state.regs[4] = OUTPUT + 0x1000; // esp
+            state.regs[7] = OUTPUT; // edi
+            state.x87.control = 0x023f;
+            state.x87.status = 0x20;
+            state.x87.push(adv_cpu_core::floating::fast::extended(0.25));
+            state.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+            state
+        };
+        let write_frame = |memory: &mut Memory, s0: f64, s1: f64, b0: f32, b1: f32| {
+            memory.write(OUTPUT + 0x1020, &s0.to_le_bytes()).unwrap();
+            memory.write(OUTPUT + 0x1028, &s1.to_le_bytes()).unwrap();
+            memory.write(OUTPUT + 0x1030, &b0.to_le_bytes()).unwrap();
+            memory.write(OUTPUT + 0x1034, &b1.to_le_bytes()).unwrap();
+        };
+
+        let (mut memory, mut native, stop) = resident_loop(body);
+        native.count_resident_entries = true;
+        write_frame(&mut memory, 4.0, 2.0, 10.0, 20.0);
+        assert!(native.force_resident_at(&mut memory, make_cpu(HEAD, 8)));
+
+        let version = &native.code.resident(HEAD).unwrap().versions[0];
+        assert_eq!(version.domain_guards.len(), 2);
+        let range_guard = version.domain_guards[0];
+        let fma_guard = version.domain_guards[1];
+        assert_eq!(version.domain_guard_words.len(), 2);
+        assert_eq!(version.domain_saved_per_iter.len(), 2);
+        assert!(version.domain_saved_per_iter[0] >= 12);
+        assert_eq!(version.domain_saved_per_iter[1], 2);
+
+        // Pass non-binary32 f64 slopes that stay well inside ordinal 0's range
+        // window, so ONLY ordinal 1 (ExactF32) misses.
+        let non_f32 = f64::from_bits(4.0f64.to_bits() + 1);
+        write_frame(&mut memory, non_f32, non_f32, 10.0, 20.0);
+        // Run enough misses to cross DOMAIN_MISS_SAMPLE without subsidizing
+        // ordinal 1 from ordinal 0's saved_per_iter.
+        for _ in 0..crate::policy::resident::DOMAIN_MISS_SAMPLE {
+            let mut state = make_cpu(OUTSIDE, 4);
+            while state.eip != stop {
+                enter(&mut native, &mut memory, stop, &mut state);
+            }
+        }
+        let version = &native.code.resident(HEAD).unwrap().versions[0];
+        assert_eq!(
+            version.slot.domain_misses[0].get(),
+            0,
+            "ordinal 1 misses must not pollute ordinal 0 miss count"
+        );
+        assert!(
+            native
+                .plans
+                .resident(HEAD)
+                .unwrap()
+                .refused_domains
+                .contains(&fma_guard),
+            "unprofitable ordinal 1 (ExactF32) must be refused on its own marginal merit"
+        );
+        assert!(
+            !native
+                .plans
+                .resident(HEAD)
+                .unwrap()
+                .refused_domains
+                .contains(&range_guard),
+            "ordinal 0 (base range guard) must remain intact when only ordinal 1 misses"
+        );
+    }
 }

@@ -65,7 +65,7 @@ pub(crate) struct Lowered {
     pub domain_fallback: Option<usize>,
     pub domain_sensors: Vec<(u8, usize, usize)>,
     pub domain_misses_slot: Option<usize>,
-    pub domain_guard_words: u32,
+    pub domain_guard_words: Vec<u32>,
     pub cold: usize,
     /// Static costs of the resident entry, longest normal exit, and a loop iteration.
     pub entry_words: u32,
@@ -442,7 +442,7 @@ fn emit<'a>(
         domain_guard_misses: vec![None; func.domain_guards.len()],
         domain_sensors: Vec::new(),
         domain_misses_slot: None,
-        domain_guard_words: 0,
+        domain_guard_words: vec![0; func.domain_guards.len()],
         checked_accesses: Vec::new(),
         page_cross: None,
         page_crossings: Vec::new(),
@@ -859,7 +859,7 @@ struct Emitter<'a> {
     domain_guard_misses: Vec<Option<Label>>,
     domain_sensors: Vec<(u8, usize, Label)>,
     domain_misses_slot: Option<Label>,
-    domain_guard_words: u32,
+    domain_guard_words: Vec<u32>,
     checked_accesses: Vec<resident::CheckedAccess>,
     page_cross: Option<RecordId>,
     page_crossings: Vec<resident::PageCrossing>,
@@ -1581,6 +1581,17 @@ impl<'a> Emitter<'a> {
                     and_imm(W, T, T, 0x3f),
                 ]);
                 self.asm.cbz(W, true, T, fail);
+                // Do not resume with a subnormal result so downstream SseInput
+                // elimination remains sound when MXCSR.DE is clear. A raised DE
+                // is sticky, so the elided checks could not change it.
+                let not_subnormal = self.asm.label();
+                let exp_shift = if double { 53 } else { 24 };
+                self.asm.tbz(true, U, 1, not_subnormal);
+                self.asm.emit(lsl_imm(size, T, X0, 1));
+                self.asm.cbz(size, false, T, not_subnormal);
+                self.asm.emit(lsr_imm(size, U, T, exp_shift));
+                self.asm.cbz(size, false, U, fail);
+                self.asm.bind(not_subnormal);
                 self.asm.emit(fmov_to_v(size, result, X0));
                 self.asm.b(resume);
                 continue;

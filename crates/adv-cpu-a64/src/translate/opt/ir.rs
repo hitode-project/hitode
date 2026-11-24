@@ -726,8 +726,8 @@ pub(crate) struct Func {
     pub cold_pcs: BTreeMap<Value, u32>,
     /// Distinct `Block(0)` numerical domain guard IDs (separate from `plain_sites`).
     pub domain_guards: Vec<u32>,
-    /// Estimated host instruction words saved per loop iteration by `domain_guards`.
-    pub domain_saved_per_iter: u32,
+    /// Marginal host instruction words saved per loop iteration, parallel to `domain_guards`.
+    pub domain_saved_per_iter: Vec<u32>,
 }
 
 impl Func {

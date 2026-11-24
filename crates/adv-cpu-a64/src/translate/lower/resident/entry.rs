@@ -23,7 +23,7 @@ pub(crate) struct Slot {
     pub row_work: Cell<u64>,
     pub probation: Cell<u32>,
     pub domain_sensor: [Cell<u32>; crate::policy::resident::MAX_DOMAIN_GUARDS],
-    pub domain_misses: Cell<u64>,
+    pub domain_misses: [Cell<u64>; crate::policy::resident::MAX_DOMAIN_GUARDS],
 }
 
 const _: () =
@@ -69,7 +69,7 @@ pub(crate) struct Layout<'a> {
     pub domain_fallback: Option<usize>,
     pub domain_sensors: &'a [(u8, usize, usize)],
     pub domain_misses_slot: Option<usize>,
-    pub domain_guard_words: u32,
+    pub domain_guard_words: &'a [u32],
     pub exit: usize,
     pub spill_cells: usize,
     pub probation_slot: usize,
