@@ -435,7 +435,7 @@ fn imported_file_kind(path: &Path) -> &'static str {
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("iso") => "disc",
+        Some("iso" | "bin" | "img" | "mdf" | "nrg" | "cue" | "ccd" | "mds") => "disc",
         Some("ttf" | "ttc" | "otf" | "otc") => "font",
         _ => "other",
     }

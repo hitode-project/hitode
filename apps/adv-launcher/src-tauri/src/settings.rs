@@ -8,7 +8,10 @@ use tauri_plugin_dialog::DialogExt;
 pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Option<String>, String> {
     let picker = app.dialog().file();
     let picker = match kind.as_str() {
-        "disc" => picker.add_filter("Disc image", &["iso"]),
+        "disc" => picker.add_filter(
+            "Disc image",
+            &["iso", "cue", "bin", "img", "ccd", "mds", "mdf", "nrg"],
+        ),
         "font" => picker.add_filter("Font", &["ttf", "ttc", "otf", "otc"]),
         _ => return Err("unknown file type".into()),
     };
@@ -33,8 +36,10 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
 pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Option<String>, String> {
     use tauri::Manager;
     use tauri_plugin_storage::StorageExt;
+    // The picker copies one file, so descriptors that name siblings are left
+    // out; their raw data files mount on their own.
     let extensions: &[&str] = match kind.as_str() {
-        "disc" => &["iso"],
+        "disc" => &["iso", "bin", "img", "mdf", "nrg"],
         "font" => &["ttf", "ttc", "otf", "otc"],
         _ => return Err("unknown file type".into()),
     };
