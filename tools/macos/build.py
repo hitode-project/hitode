@@ -160,7 +160,10 @@ def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
                                f"export FFMPEG_DIR='{prefix}'\n"
                                f"{wine}"
                                "export LIBCLANG_PATH='/Library/Developer/CommandLineTools/usr/lib'\n"
-                               "export CARGO_PROFILE_RELEASE_STRIP=debuginfo\n"
+                               "export CARGO_PROFILE_RELEASE_STRIP=\"${CARGO_PROFILE_RELEASE_STRIP:-symbols}\"\n"
+                               "if [ \"$CARGO_PROFILE_RELEASE_STRIP\" = 'symbols' ]; then\n"
+                               "  export CARGO_PROFILE_RELEASE_DEBUG=\"${CARGO_PROFILE_RELEASE_DEBUG:-0}\"\n"
+                               "fi\n"
                                "case \" $* \" in *' --release '*)\n"
                                "sep=$(printf '\\037')\n"
                                "flags=\"${CARGO_ENCODED_RUSTFLAGS-$(printf '%s' \"${RUSTFLAGS-}\" | tr ' ' '\\037')}\"\n"
@@ -183,7 +186,9 @@ def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
             if flags is None:
                 previous = env.get('RUSTFLAGS', '').split()
             env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join([*previous, *remap_flags()])
-            env['CARGO_PROFILE_RELEASE_STRIP'] = 'debuginfo'
+            env.setdefault('CARGO_PROFILE_RELEASE_STRIP', 'symbols')
+            if env['CARGO_PROFILE_RELEASE_STRIP'] == 'symbols':
+                env.setdefault('CARGO_PROFILE_RELEASE_DEBUG', '0')
             # ffmpeg-sys-next's prebuilt-library path passes -lav* to the linker;
             # this prefix contains only .a files, so no FFmpeg dylib is linked.
             run('cargo', 'build', '--release', '-p', 'adv-run', '--features',

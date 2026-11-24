@@ -64,10 +64,40 @@ debug = false
 
 [profile.release]
 debug = "line-tables-only"
+lto = "thin"
 
 # Solid runtime compression also runs inside the launcher's build script.
 [profile.release.package.lzma-rust2]
 opt-level = 3
+
+# Optimize cold frontend, reporting, shader-translation and HTTP/TLS crates for
+# size while keeping every CPU, NT, graphics, audio and video crate at level 3.
+[profile.release.package.adv-launcher]
+opt-level = "s"
+[profile.release.package.adv-shell]
+opt-level = "s"
+[profile.release.package.adv-report]
+opt-level = "s"
+[profile.release.package.adv-jit-helper]
+opt-level = "s"
+[profile.release.package.naga]
+opt-level = "s"
+[profile.release.package.reqwest]
+opt-level = "s"
+[profile.release.package.rustls]
+opt-level = "s"
+[profile.release.package.aws-lc-rs]
+opt-level = "s"
+[profile.release.package.aws-lc-sys]
+opt-level = "s"
+[profile.release.package.tauri]
+opt-level = "s"
+[profile.release.package.tauri-runtime-wry]
+opt-level = "s"
+[profile.release.package.wry]
+opt-level = "s"
+[profile.release.package.tao]
+opt-level = "s"
 
 [patch.crates-io]
 cpal = { path = "vendor/cpal" }
