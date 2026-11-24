@@ -1024,6 +1024,11 @@ impl Translator<'_> {
             if self.regions.iter().any(|&(at, _)| at == i) {
                 return None;
             }
+            // The peel emits the body twice, and an x87 run binds its
+            // entries once per unit.
+            if self.x87.in_run(i) {
+                return None;
+            }
             let (reads, writes) = residency::footprint(self.trace, i, self.checked)?;
             read_before_write |= reads & !written;
             written |= writes;
