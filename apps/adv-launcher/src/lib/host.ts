@@ -136,6 +136,18 @@ export function revealDrive(): Promise<void> {
 export function importRegistry(id: string, path: string, discs: string[]): Promise<RegistryImportResult | null> {
   return call("import_registry", { id, path, discs }, null);
 }
+/** Downloads and installs missing non-Wine DLLs for a known redistributable component. */
+export function installRuntimeComponent(id: string): Promise<string[]> {
+  return call("install_runtime_component", { id }, []);
+}
+/** Installs a missing runtime component from a local installer or 32-bit DLL. */
+export function importRuntimeComponent(id: string, path: string): Promise<string[]> {
+  return call("import_runtime_component", { id, path }, []);
+}
+/** Picks a local redistributable installer or 32-bit DLL file. */
+export function pickComponentFile(): Promise<string | null> {
+  return call("pick_game_file", { kind: "component" }, null);
+}
 export function revealPath(path: string): Promise<void> {
   return call("reveal_path", { path }, undefined);
 }

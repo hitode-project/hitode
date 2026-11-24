@@ -18,6 +18,7 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
             "Executable, script or registry",
             &["exe", "bat", "cmd", "reg"],
         ),
+        "component" => picker.add_filter("Runtime installer or DLL", &["exe", "dll", "cab"]),
         _ => return Err("unknown file type".into()),
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -48,6 +49,7 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
         "font" => &["ttf", "ttc", "otf", "otc"],
         "registry" => &["reg", "bat", "cmd"],
         "run" => &["exe", "bat", "cmd", "reg"],
+        "component" => &["exe", "dll", "cab"],
         _ => return Err("unknown file type".into()),
     };
     let files = app
@@ -81,7 +83,11 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
 /// Removes a private copy created by the mobile picker when validation rejects it,
 /// without touching files that live outside `<app_data_dir>/files` on Android.
 #[cfg(any(mobile, test))]
-fn cleanup_rejected_pick(files_dir: &std::path::Path, path: &std::path::Path, remove_inbox: bool) {
+pub(crate) fn cleanup_rejected_pick(
+    files_dir: &std::path::Path,
+    path: &std::path::Path,
+    remove_inbox: bool,
+) {
     if let Ok(files_dir) = files_dir.canonicalize()
         && let Ok(canonical) = path.canonicalize()
         && let Ok(relative) = canonical.strip_prefix(&files_dir)

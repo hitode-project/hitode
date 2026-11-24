@@ -30,6 +30,7 @@ mod mobile_view;
 pub mod overlay;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod play;
+mod redist;
 #[cfg(target_os = "ios")]
 mod remote_pairing;
 mod report;
@@ -209,6 +210,8 @@ pub fn run() {
                 drive::reveal_drive,
                 drive::import_registry,
                 drive::library_installed,
+                redist::install_runtime_component,
+                redist::import_runtime_component,
                 library::reveal_path,
                 gamepad::gamepad_get_state,
                 gamepad::gamepad_save_config
@@ -314,6 +317,8 @@ pub fn run() {
         drive::reveal_drive,
         drive::import_registry,
         drive::library_installed,
+        redist::install_runtime_component,
+        redist::import_runtime_component,
         library::reveal_path,
         gamepad::gamepad_get_state,
         gamepad::gamepad_save_config
@@ -382,6 +387,8 @@ pub fn run() {
         drive::reveal_drive,
         drive::import_registry,
         drive::library_installed,
+        redist::install_runtime_component,
+        redist::import_runtime_component,
         library::reveal_path,
         gamepad::gamepad_get_state,
         gamepad::gamepad_save_config

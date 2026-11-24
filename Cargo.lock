@@ -213,6 +213,7 @@ dependencies = [
  "libc",
  "log",
  "lzma-rust2",
+ "miniz_oxide 0.9.1",
  "ndk-sys",
  "objc2",
  "objc2-app-kit",

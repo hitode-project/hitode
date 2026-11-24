@@ -84,7 +84,7 @@ pub(crate) fn client() -> Result<Client, String> {
 /// Android's platform verifier needs JNI setup and a Gradle component. Trust
 /// the system store directly instead, as Android apps do by default.
 #[cfg(target_os = "android")]
-fn system_certificates() -> Result<Vec<reqwest::Certificate>, String> {
+pub(crate) fn system_certificates() -> Result<Vec<reqwest::Certificate>, String> {
     for dir in [
         "/apex/com.android.conscrypt/cacerts",
         "/system/etc/security/cacerts",

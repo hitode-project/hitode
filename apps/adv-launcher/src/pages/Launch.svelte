@@ -26,6 +26,32 @@
           <div class="track" role="progressbar" aria-label={t("正在启动")} style="margin-top: 32px"><span class="fill"></span></div>
           <div style="margin-top: 36px"><button class="btn quiet" onclick={() => flow.cancel()}>{t("取消")}</button></div>
         </div>
+      {:else if flow.recovery === "component" && flow.recovering}
+        <div class="state fade">
+          <div class="msg">{t("正在安装运行库")}</div>
+          <div class="track" role="progressbar" aria-label={t("正在安装运行库")} style="margin-top: 32px"><span class="fill"></span></div>
+        </div>
+      {:else if flow.recovery === "component"}
+        <div class="state fade">
+          <div class="msg">{flow.reason}</div>
+          <div class="hint">{t("从微软官方获取并安装到共享环境，所有游戏只需一次。")}</div>
+          {#if flow.installError}<div class="mono why">{flow.installError}</div>{/if}
+          <div class="acts">
+            <button class="btn primary" onclick={() => flow.installComponent()}>{t("安装并启动")}</button>
+            <button class="btn quiet" onclick={() => flow.importComponent()}>{t("从本地导入…")}</button>
+            <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
+          </div>
+        </div>
+      {:else if flow.recovery === "registry" && flow.registryFile}
+        <div class="state fade">
+          <div class="msg">{flow.reason}</div>
+          <div class="hint">{t("目录中发现 {0}，首次运行前可能需要先执行。", flow.registryFile)}</div>
+          <div class="acts">
+            <button class="btn primary" onclick={() => flow.openRunPage()}>{t("脚本与注册表…")}</button>
+            <button class="btn quiet" onclick={() => flow.retry()}>{t("再试一次")}</button>
+            <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
+          </div>
+        </div>
       {:else if flow.recovery}
         <div class="state">
           <div class="msg">{flow.reason}</div>
@@ -41,8 +67,14 @@
         <div class="state fade">
           <div class="msg">{t("游戏已停止")}</div>
           <div class="mono why">{flow.reason}</div>
+          {#if flow.registryFile}
+            <div class="hint">{t("目录中发现 {0}，首次运行前可能需要先执行。", flow.registryFile)}</div>
+          {/if}
           <div class="acts">
             <button class="btn primary" onclick={() => flow.retry()}>{t("再试一次")}</button>
+            {#if flow.registryFile}
+              <button class="btn quiet" onclick={() => flow.openRunPage()}>{t("脚本与注册表…")}</button>
+            {/if}
             <button class="btn quiet" onclick={() => flow.changeExe()}>{t("此游戏的设置…")}</button>
             <button class="btn quiet" onclick={() => flow.report()}>{t("报告问题…")}</button>
             <button class="btn quiet" onclick={() => nav.back()}>{t("返回")}</button>
@@ -120,6 +152,11 @@
     margin-top: 10px;
     font-size: 14px;
     color: var(--fg2);
+  }
+  .hint {
+    margin-top: 8px;
+    font-size: 13px;
+    color: var(--fg3);
   }
   .why {
     margin-top: 20px;
