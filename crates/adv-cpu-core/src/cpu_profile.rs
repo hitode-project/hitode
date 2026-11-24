@@ -137,6 +137,14 @@ pub fn reverse_scan(mnemonic: iced_x86::Mnemonic) -> bool {
 }
 
 /// CPUID result in architectural EAX, EBX, ECX, EDX order.
+/// Whether the Windows x86 user profile's IDT gate for `vector` admits CPL3:
+/// breakpoint, overflow, fast fail, assertion, debug service and system
+/// call. Any other `INT n` faults #GP at the instruction, which Windows
+/// reports as an access violation; `INT 1` is not a single step.
+pub const fn user_interrupt_gate(vector: u8) -> bool {
+    matches!(vector, 0x03 | 0x04 | 0x29 | 0x2c | 0x2d | 0x2e)
+}
+
 pub fn cpuid(leaf: u32, _subleaf: u32) -> [u32; 4] {
     let vendor = PROCESSOR_IDENTITY.vendor.as_bytes();
     match leaf {

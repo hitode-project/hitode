@@ -332,6 +332,13 @@ Control-flow-guard protection bits MUST follow Windows. Allocation accepts `PAGE
 **Verification**: Review — the frame boundary is checked before any guest stack write.
 **Basis**: Wine 11.0 `virtual_setup_exception` aborts when the exception frame reaches the last stack page.
 
+### NT-SYS-7 CPU exception records
+
+**Rule**: A CPU exception MUST reach the guest with the code, address, saved EIP and parameters that Windows x86 delivers.
+**Verification**: Test — the probe's output is compared with its output on Windows 11 x86, on both engines.
+
+BOUND out of range raises `STATUS_ARRAY_BOUNDS_EXCEEDED` at the instruction. User mode may use the gates for vectors 3, 4, 0x29, 0x2c, 0x2d and 0x2e. `INT n` through any other gate raises an access violation at the instruction, with parameters 0 and 0xffffffff. `INT 1` is therefore not a single step. `INT 4` raises `STATUS_INTEGER_OVERFLOW` one byte before the next instruction, where EIP stays. `INT 0x2c` raises `STATUS_ASSERTION_FAILURE` with the address and EIP at the instruction.
+
 ## Unix libraries
 
 ### WINE-UNIX-1 Guest ELF libraries

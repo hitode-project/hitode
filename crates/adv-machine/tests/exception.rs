@@ -331,7 +331,7 @@ fn first_fetch_fault_keeps_original_branch_and_stack_after_exception_handler_ret
 #[test]
 fn unhandled_interrupt_keeps_original_registers_and_stack_before_parking() {
     for jit in [false, true] {
-        for vector in [0x2e, 0x81] {
+        for vector in [0x2e, 0x2c] {
             let mut machine = Machine::new(
                 JitCpu::new(PARK_ADDR, jit).unwrap(),
                 Registry::default(),

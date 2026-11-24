@@ -113,7 +113,7 @@ fn run<B: TestCpu>(cpu: B, mode: u32) {
     code.push_imm(0x1234);
     code.bytes.extend([0x89, 0x25]);
     code.bytes.extend((DATA + 12).to_le_bytes());
-    code.bytes.extend([0xcd, 0x80]);
+    code.bytes.extend([0xcd, 0x2c]);
     code.mov_mem_eax(DATA);
     code.bytes.extend([0x89, 0x25]);
     code.bytes.extend((DATA + 16).to_le_bytes());

@@ -211,6 +211,7 @@ pub(super) fn independent(
             || !inside(next)
             || !inside(inst.taken)
             || matches!(inst.op, Op::Integer(Integer::Divide(..)) if divisions[at].is_none())
+            || matches!(inst.op, Op::Integer(Integer::Bound(..)))
         {
             return None;
         }
