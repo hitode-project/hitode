@@ -402,6 +402,8 @@ mod tests {
             let mut machine =
                 Machine::new(cpu, adv_abi::Registry::default(), Clock::virtual_time()).unwrap();
             super::super::install(&mut machine.ext, mode);
+            // Fixed pages stay out of the bottom-up thread stack.
+            assert!(machine.sys.vm.reserve_at(CODE, SOURCE + 0x10000 - CODE));
             machine.cpu.map(CODE, 0x4000, Prot::RWX).unwrap();
             machine.cpu.map(SOURCE, 0x10000, Prot::RW).unwrap();
             machine.cpu.write(SOURCE, &[0x55; 0x10000]).unwrap();

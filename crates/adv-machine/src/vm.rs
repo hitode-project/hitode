@@ -3,7 +3,9 @@
 //! Every region the host puts in the guest (images, stacks, heaps, host pages) is recorded
 //! here, so image loading can tell whether a preferred base is free. Dynamic allocations
 //! are first-fit over 64 KiB granules (the Windows allocation granularity) inside
-//! [`DYN_START`, `DYN_END`). Mapping is done through the caller's [`Guest`], so this also
+//! [`DYN_START`, `DYN_END`). The host's own reservations fill it top-down, as Windows
+//! places system memory, so the low addresses stay free for the guest's bottom-up
+//! `NtAllocateVirtualMemory`, which starts at [`Vm::first_free`]. Mapping is done through the caller's [`Guest`], so this also
 //! works from inside trap handlers.
 
 use std::collections::BTreeMap;
@@ -16,6 +18,8 @@ pub struct Vm {
     /// Reserved regions: start -> size.
     used: BTreeMap<u32, u32>,
     first_free: u32,
+    /// Every granule in [`top_free`, `DYN_END`) is reserved.
+    top_free: u32,
 }
 
 impl Default for Vm {
@@ -33,6 +37,7 @@ impl Vm {
         Self {
             used: BTreeMap::new(),
             first_free: DYN_START,
+            top_free: DYN_END,
         }
     }
 
@@ -69,7 +74,29 @@ impl Vm {
         }
     }
 
-    fn find_free(&self, size: u32) -> Option<u32> {
+    /// Lower `top_free` past the reservations that end at it.
+    fn advance_top(&mut self) {
+        while let Some((&start, &len)) = self.used.range(DYN_START..self.top_free).next_back() {
+            let end = u64::from(start) + u64::from(len);
+            if end.next_multiple_of(u64::from(GRANULE)) < u64::from(self.top_free) {
+                break;
+            }
+            self.top_free = start & !(GRANULE - 1);
+        }
+    }
+
+    /// Releasing `[addr, addr + size)` reopens the top run down to its end.
+    fn released(&mut self, addr: u32, size: u32) {
+        self.first_free = self.first_free.min(addr.max(DYN_START));
+        let end = (u64::from(addr) + u64::from(size))
+            .next_multiple_of(u64::from(GRANULE))
+            .min(u64::from(DYN_END)) as u32;
+        self.top_free = self.top_free.max(end);
+    }
+
+    /// The lowest free granule-aligned range of `size` bytes, as
+    /// `NtAllocateVirtualMemory` places memory without a base.
+    fn find_low(&self, size: u32) -> Option<u32> {
         let mut cursor = self.first_free;
         for (&start, &len) in self.used.range(self.first_free..DYN_END) {
             if start >= cursor && start - cursor >= size {
@@ -83,6 +110,23 @@ impl Vm {
         (DYN_END.checked_sub(cursor)? >= size).then_some(cursor)
     }
 
+    /// The highest free granule-aligned range of `size` bytes, as the host's
+    /// reservations are placed top-down.
+    fn find_free(&self, size: u32) -> Option<u32> {
+        let mut cursor = self.top_free;
+        for (&start, &len) in self.used.range(..self.top_free).rev() {
+            let end = (u64::from(start) + u64::from(len)).next_multiple_of(u64::from(GRANULE));
+            if end <= u64::from(cursor) && u64::from(cursor) - end >= u64::from(size) {
+                return Some(cursor - size);
+            }
+            cursor = cursor.min(start & !(GRANULE - 1));
+            if cursor <= DYN_START {
+                return None;
+            }
+        }
+        (cursor.checked_sub(DYN_START)? >= size).then_some(cursor - size)
+    }
+
     /// Reserve `[addr, addr + size)` without mapping. Fails if any part is taken.
     pub fn reserve_at(&mut self, addr: u32, size: u32) -> bool {
         if size == 0 || u64::from(addr) + u64::from(size) > 1 << 32 || self.overlaps(addr, size) {
@@ -90,6 +134,7 @@ impl Vm {
         }
         self.used.insert(addr, size);
         self.advance_free();
+        self.advance_top();
         true
     }
 
@@ -99,13 +144,15 @@ impl Vm {
         let addr = self.find_free(size)?;
         self.used.insert(addr, size);
         self.advance_free();
+        self.advance_top();
         Some(addr)
     }
 
-    /// Roll back a reservation whose mapping failed, without touching CPU pages.
-    pub(crate) fn cancel_reservation(&mut self, addr: u32) {
-        self.used.remove(&addr);
-        self.first_free = self.first_free.min(addr.max(DYN_START));
+    /// Release a reservation that was never mapped, without touching CPU pages.
+    pub fn release_reservation(&mut self, addr: u32) {
+        if let Some(size) = self.used.remove(&addr) {
+            self.released(addr, size);
+        }
     }
 
     /// Reserve exactly `size` bytes at a free granule-aligned address. Like a
@@ -116,6 +163,7 @@ impl Vm {
         let addr = self.find_free(granules)?;
         self.used.insert(addr, size.max(1));
         self.advance_free();
+        self.advance_top();
         Some(addr)
     }
 
@@ -124,14 +172,15 @@ impl Vm {
         let addr = self.reserve(size).ok_or(MemFault { addr: 0, len: size })?;
         let size = self.used[&addr];
         if let Err(error) = cpu.map(addr, size, prot) {
-            self.used.remove(&addr);
-            self.first_free = self.first_free.min(addr.max(DYN_START));
+            self.release_reservation(addr);
             return Err(error);
         }
         Ok(addr)
     }
 
-    /// Reserve a region and map only `[start + guard, end)` (the guard stays unmapped).
+    /// Reserve a thread stack and map only `[start + guard, end)` (the guard
+    /// stays unmapped). Stacks are guest memory that Windows allocates
+    /// bottom-up, so they take the lowest free range.
     pub fn alloc_with_guard(
         &mut self,
         cpu: &mut dyn Guest,
@@ -142,14 +191,18 @@ impl Vm {
         let requested = size
             .checked_add(guard)
             .ok_or(MemFault { addr: 0, len: size })?;
-        let addr = self.reserve(requested).ok_or(MemFault {
+        let fault = MemFault {
             addr: 0,
             len: requested,
-        })?;
+        };
+        let granules = requested.max(1).checked_add(GRANULE - 1).ok_or(fault)? & !(GRANULE - 1);
+        let addr = self.find_low(granules).ok_or(fault)?;
+        self.used.insert(addr, granules);
+        self.advance_free();
+        self.advance_top();
         let total = self.used[&addr];
         if let Err(error) = cpu.map(addr + guard, total - guard, prot) {
-            self.used.remove(&addr);
-            self.first_free = self.first_free.min(addr.max(DYN_START));
+            self.release_reservation(addr);
             return Err(error);
         }
         Ok(addr)
@@ -193,7 +246,7 @@ impl Vm {
             }
         }
         self.used.remove(&addr);
-        self.first_free = self.first_free.min(addr.max(DYN_START));
+        self.released(addr, size);
         Ok(())
     }
 }
@@ -258,10 +311,23 @@ mod tests {
         }
         assert_eq!(vm.first_free(), DYN_START + 4096 * GRANULE);
         let hole = DYN_START + 31 * GRANULE;
-        vm.cancel_reservation(hole);
+        vm.release_reservation(hole);
         assert_eq!(vm.first_free(), hole);
-        assert_eq!(vm.reserve(GRANULE), Some(hole));
+        assert!(vm.reserve_at(hole, GRANULE));
         assert_eq!(vm.first_free(), DYN_START + 4096 * GRANULE);
+    }
+
+    #[test]
+    fn host_reservations_fill_top_down_and_reuse_freed_holes() {
+        let mut vm = Vm::new();
+        for page in 1..=4096 {
+            assert_eq!(vm.reserve(GRANULE), Some(DYN_END - page * GRANULE));
+        }
+        assert_eq!(vm.first_free(), DYN_START);
+        let hole = DYN_END - 32 * GRANULE;
+        vm.release_reservation(hole);
+        assert_eq!(vm.reserve(GRANULE), Some(hole));
+        assert_eq!(vm.reserve(GRANULE), Some(DYN_END - 4097 * GRANULE));
     }
 
     #[test]
@@ -286,7 +352,7 @@ mod tests {
         let view = vm.reserve_exact(0x3000).unwrap();
         assert_eq!(vm.region(view), Some(0x3000));
         assert_eq!(vm.containing(view + 0x3000), None);
-        assert_eq!(vm.reserve(PAGE), Some(view + GRANULE));
+        assert_eq!(vm.reserve(PAGE), Some(view - GRANULE));
     }
 
     #[test]
@@ -302,19 +368,24 @@ mod tests {
     #[test]
     fn reserve_skips_fixed_regions_in_dynamic_range() {
         let mut vm = Vm::new();
-        assert!(vm.reserve_at(DYN_START, 0x2000)); // e.g. RESOURCE.dll at its preferred base
+        // e.g. a DLL at its preferred base
+        assert!(vm.reserve_at(DYN_END - GRANULE, 0x2000));
         let a = vm.reserve(0x1000).unwrap();
-        assert_eq!(a, DYN_START + GRANULE);
+        assert_eq!(a, DYN_END - 2 * GRANULE);
         let b = vm.reserve(0x2_0000).unwrap();
-        assert_eq!(b, a + GRANULE);
+        assert_eq!(b, a - 0x2_0000);
     }
 
     #[test]
     fn failed_mapping_rolls_back_only_its_reservation_and_reuses_address() {
         for guard in [0, PAGE] {
             let mut vm = Vm::new();
-            assert!(vm.reserve_at(DYN_START, GRANULE));
-            let expected = DYN_START + GRANULE;
+            let (held, expected) = if guard == 0 {
+                (DYN_END - GRANULE, DYN_END - 2 * GRANULE)
+            } else {
+                (DYN_START, DYN_START + GRANULE)
+            };
+            assert!(vm.reserve_at(held, GRANULE));
             let mut guest = MappingGuest {
                 fail_next: true,
                 ..MappingGuest::default()
@@ -328,7 +399,7 @@ mod tests {
             };
             assert!(allocate(&mut vm, &mut guest).is_err());
             assert_eq!(vm.region(expected), None);
-            assert_eq!(vm.region(DYN_START), Some(GRANULE));
+            assert_eq!(vm.region(held), Some(GRANULE));
             assert_eq!(allocate(&mut vm, &mut guest).unwrap(), expected);
             assert_eq!(guest.requests, [(expected + guard, GRANULE - guard); 2]);
         }
@@ -351,7 +422,10 @@ mod tests {
                 .is_err()
         );
         assert!(guest.requests.is_empty());
-        assert_eq!(vm.alloc(&mut guest, PAGE, Prot::RW).unwrap(), DYN_START);
+        assert_eq!(
+            vm.alloc(&mut guest, PAGE, Prot::RW).unwrap(),
+            DYN_END - GRANULE
+        );
     }
 
     #[test]

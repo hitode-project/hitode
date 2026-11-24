@@ -112,6 +112,7 @@ impl Translator<'_> {
                 );
                 self.narrow_write(Part::Reg(EAX), 1, Reg::ZR, X6);
             }
+            Integer::Bound(index, mem, width) => self.bound(index, mem, width),
             Integer::Touch(mem) => {
                 let address = self.effective(mem);
                 self.access(
@@ -400,6 +401,28 @@ impl Translator<'_> {
             },
             ..State::CANONICAL
         };
+    }
+
+    /// Signed bounds as 64-bit differences, so NZCV keeps the guest flags.
+    fn bound(&mut self, index: u8, mut mem: Mem, width: u8) {
+        use crate::translate::lower::access::{Addr, Dir};
+        self.flush_simd();
+        self.canonicalize();
+        let bits = 8 * u32::from(width);
+        for (bound, target) in [(0, X14), (1, X15)] {
+            mem.disp = mem.disp.wrapping_add(bound * u32::from(width));
+            let address = self.effective(mem);
+            self.access(Addr::Window(address), width, Dir::Load, X6);
+            self.emit(sbfx(X, target, X6, 0, bits));
+        }
+        let slow = self.architectural_exception(5);
+        self.emit_all(&[
+            sbfx(X, X13, host(index), 0, bits),
+            sub(X, X16, X13, X14, Lsl, 0),
+        ]);
+        self.asm.tbz(true, X16, 63, slow);
+        self.emit(sub(X, X16, X15, X13, Lsl, 0));
+        self.asm.tbz(true, X16, 63, slow);
     }
 
     fn compare_exchange8(&mut self, mem: Mem) {

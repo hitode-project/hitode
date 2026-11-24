@@ -1814,3 +1814,57 @@ fn j1_recipes_survive_partial_flag_writers_and_operand_reuse() {
         }
     }
 }
+
+// spec: A64-TR-4
+#[test]
+fn bound_checks_signed_pairs_natively_and_faults_br_at_the_instruction() {
+    for word in [false, true] {
+        for value in [i32::MIN, -5, -4, 0, 7, 8, i32::MAX] {
+            let mut program = fixture(|a| {
+                a.cmp(ecx, edx).unwrap();
+                if word {
+                    a.bound(ax, dword_ptr(ebx)).unwrap();
+                } else {
+                    a.bound(eax, qword_ptr(ebx)).unwrap();
+                }
+                a.add(ecx, 1).unwrap();
+            });
+            let pair: [i32; 2] = [-4, 7];
+            for (n, bound) in pair.iter().enumerate() {
+                if word {
+                    program.data[2 * n..2 * n + 2].copy_from_slice(&(*bound as i16).to_le_bytes());
+                } else {
+                    program.data[4 * n..4 * n + 4].copy_from_slice(&bound.to_le_bytes());
+                }
+            }
+            program.state.regs[0] = value as u32;
+            let config = (Features::default(), false, Checks::Adaptive);
+            let mut native = executor(&program, config, false);
+            let mut oracle = executor(&program, config, true);
+            let outcome = native.run(program.stop, 100).unwrap();
+            assert_eq!(
+                outcome,
+                oracle.run(program.stop, 100).unwrap(),
+                "word={word}, value={value}"
+            );
+            same(&native, &oracle);
+            let inside = if word {
+                (-4..=7).contains(&(value as i16))
+            } else {
+                (-4..=7).contains(&value)
+            };
+            if inside {
+                assert_eq!(outcome, RunOutcome::ReachedStop);
+            } else {
+                assert!(
+                    matches!(outcome, RunOutcome::Trap { vector: 5, .. }),
+                    "{outcome:?}"
+                );
+            }
+            assert_eq!(
+                native.stats.interpreter_entries, 0,
+                "word={word}, value={value}"
+            );
+        }
+    }
+}
