@@ -696,6 +696,11 @@ impl Upscaling {
         &self.inputs[1 - self.newest.get()]
     }
 
+    /// The complete canvas-resolution input that the last encode read.
+    pub fn newest_input(&self) -> &Image {
+        &self.inputs[self.newest.get()]
+    }
+
     /// The doubled image of the last encode.
     pub fn output(&self) -> &Image {
         &self.output

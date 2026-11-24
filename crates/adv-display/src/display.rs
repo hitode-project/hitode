@@ -249,6 +249,10 @@ struct Upscaled {
     /// Composition into the model's half-precision input.
     pipelines: Pipelines,
 }
+struct RetainedSource {
+    image: Image,
+    canvas: (u32, u32),
+}
 /// Timestamped passes per frame: every stage (including TBDR clusters), plus
 /// the upscaler's compute.
 const TIMED_PASSES: u32 = 16;
@@ -302,6 +306,10 @@ pub struct Display {
     timing_enabled: bool,
     timings: VecDeque<Timing>,
     readbacks: Vec<adv_gpu::Buffer>,
+    /// Unrotated canvas-resolution snapshot captured on the first retained
+    /// redraw after a real guest frame, so repeated resizes or setting changes
+    /// on a static frame never compound resampling or double-upscale.
+    retained: Option<RetainedSource>,
     invalid: bool,
 }
 impl Display {
@@ -349,6 +357,7 @@ impl Display {
             timing_enabled: false,
             timings: VecDeque::new(),
             readbacks: vec![],
+            retained: None,
             invalid: true,
         };
         this.configure();
@@ -547,18 +556,35 @@ impl Display {
         } else {
             (self.recorder.latest()?, None, &self.video)
         };
-        let image = image
-            .or_else(|| shown(&self.screen, LayerId::Base))
-            .unwrap();
+        let canvas = record.frame.canvas;
+        let (source_image, source_rotation) = if let Some(retained) = &self.retained {
+            (retained.image.clone(), Rotation::None)
+        } else if record
+            .plan
+            .stages
+            .iter()
+            .any(|s| matches!(s, Stage::Upscale { .. }))
+            && let Some(u) = self
+                .upscaled
+                .as_ref()
+                .filter(|u| u.upscaling.size() == canvas)
+        {
+            (u.upscaling.newest_input().clone(), Rotation::None)
+        } else {
+            let image = image
+                .or_else(|| shown(&self.screen, LayerId::Base))
+                .unwrap();
+            (image.image().clone(), buffer_rotation(record))
+        };
         let mut info = record.frame.clone();
         info.base = BaseKind::Gpu { presentable: false };
         info.damage = Region::whole(info.canvas);
         Some(Frame {
             info,
             base: Base::Retained {
-                image: image.image().clone(),
-                canvas: record.frame.canvas,
-                rotation: buffer_rotation(record),
+                image: source_image,
+                canvas,
+                rotation: source_rotation,
             },
             video: video.iter().map(Video::retained).collect(),
             windows: self.windows.current.clone(),
@@ -1388,6 +1414,79 @@ impl Display {
             .then(|| queue.encoder("display frame"));
         let mut timed = vec![];
         let mut reads_base = false;
+        let mut new_retained = None;
+        if retained
+            && self.retained.is_none()
+            && let Base::Retained { canvas, .. } = &frame.base
+        {
+            let snapshot = self.device.create_image(&adv_gpu::resource::ImageDesc {
+                dimension: adv_gpu::resource::Dimension::D2,
+                size: adv_gpu::Extent {
+                    width: canvas.0,
+                    height: canvas.1,
+                    depth_or_layers: 1,
+                },
+                format: adv_gpu::present::COLOR_FORMAT,
+                mips: 1,
+                samples: 1,
+                usage: adv_gpu::resource::Usage::COLOR | adv_gpu::resource::Usage::SAMPLED,
+                view_formats: &[],
+                label: "retained base",
+            })?;
+            let tiles = Tiles {
+                size: *canvas,
+                rects: vec![Rect {
+                    x: 0,
+                    y: 0,
+                    w: canvas.0,
+                    h: canvas.1,
+                }],
+            };
+            let enc = encoder.get_or_insert_with(|| queue.encoder("display frame"));
+            let mut pass = enc.render_pass(&adv_gpu::RenderPassDesc {
+                colors: [adv_gpu::encode::ColorAttachment {
+                    view: snapshot.view(),
+                    load: adv_gpu::encode::Load::DontCare,
+                    store: adv_gpu::encode::Store::Store,
+                    resolve: None,
+                }]
+                .into_iter()
+                .collect(),
+                depth_stencil: None,
+                area: adv_gpu::Rect {
+                    x: 0,
+                    y: 0,
+                    w: canvas.0,
+                    h: canvas.1,
+                },
+                timestamps: None,
+                label: "retained base snapshot",
+            });
+            let data = output::encode(
+                &mut pass,
+                frame.base.source(),
+                snapshot.desc().size,
+                Transform {
+                    rotation: Rotation::None,
+                    dst: Rect {
+                        x: 0,
+                        y: 0,
+                        w: canvas.0,
+                        h: canvas.1,
+                    },
+                },
+                Scale::Integer { x: 1, y: 1 },
+                &tiles,
+                (&self.pipelines.output, &mut self.ring),
+            )?;
+            drop(pass);
+            self.spans.extend(data);
+            reads_base = true;
+            new_retained = Some(RetainedSource {
+                image: snapshot,
+                canvas: *canvas,
+            });
+        }
         for (index, stage) in planned.stages.iter().enumerate() {
             let (into, tiles) = stage_target(stage);
             statistics.stages[index] = StageStats {
@@ -1689,6 +1788,11 @@ impl Display {
             }
         }
         images.extend(window_images);
+        if !retained {
+            self.retained = None;
+        } else if let Some(snapshot) = new_retained {
+            self.retained = Some(snapshot);
+        }
         Ok(Pending {
             record: PresentRecord {
                 token: token.0,
@@ -1781,8 +1885,15 @@ impl Display {
             .iter()
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        let base = shown(&self.screen, LayerId::Base).unwrap().image().clone();
-        let rotation = buffer_rotation(record);
+        let (base, rotation) =
+            if let Some(retained) = self.retained.as_ref().filter(|r| r.canvas == canvas) {
+                (retained.image.clone(), Rotation::None)
+            } else {
+                (
+                    shown(&self.screen, LayerId::Base).unwrap().image().clone(),
+                    buffer_rotation(record),
+                )
+            };
         let videos = self
             .video
             .iter()

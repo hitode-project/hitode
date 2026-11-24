@@ -83,6 +83,7 @@ pub struct GameView {
     #[cfg(target_os = "android")]
     reported: RefCell<Option<crate::mobile::Layout>>,
     created: Instant,
+    active: Cell<bool>,
     paused: Cell<bool>,
     toggle_control: Cell<bool>,
     control: Cell<bool>,
@@ -131,6 +132,7 @@ impl GameView {
             #[cfg(target_os = "android")]
             reported: RefCell::new(None),
             created: Instant::now(),
+            active: Cell::new(true),
             paused: Cell::new(false),
             toggle_control: Cell::new(false),
             control: Cell::new(false),
@@ -516,6 +518,7 @@ impl GameView {
         }
     }
     pub(crate) fn activate(&self, active: bool) {
+        self.active.set(active);
         if !active {
             self.push(Event::FocusLost);
         }
@@ -622,7 +625,7 @@ impl GameView {
             .map_or(1., |(_, scale)| *scale)
     }
     pub(crate) fn native_client_size(&self) -> Result<(u32, u32), String> {
-        Ok(if self.has_surface() && !self.paused.get() {
+        Ok(if self.has_surface() && self.active.get() {
             self.client.get()
         } else {
             (0, 0)

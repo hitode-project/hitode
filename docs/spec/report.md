@@ -95,7 +95,7 @@ Apple model identifiers use `hw.model` on macOS and `hw.machine` on iOS; Android
 
 The summary builds its typed settings once from the end-of-run display mailbox, game view and options. It holds upscaler, scaling, fast-forward mode, custom-font file and override counts, font smoothing and disc count. Headless runs omit display and game-view settings. The report uses this snapshot and adds the frontend’s current touch mode. Reports without a run use current launcher settings.
 
-Choices are `off|anime4k|cunny|artcnn|k7` for upscaling, `fit|integer|stretch` for scaling, `hold|toggle` for fast-forward, and `direct|trackpad` for touch mode.
+Choices are `off|anime4k|cunny|artcnn|k7` for upscaling, `fit|integer|stretch|custom` for scaling, `hold|toggle` for fast-forward, and `direct|trackpad` for touch mode.
 
 ### REPORT-ISSUE-1 Player symptoms
 

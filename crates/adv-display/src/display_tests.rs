@@ -2075,3 +2075,116 @@ fn half_precision_compile_failure_falls_back_to_single_precision() {
     display.present(&mut q, frame(2, &source, all())).unwrap();
     assert!(display.totals().upscaled_runs >= 1);
 }
+
+// spec: HOST-VIEW-1, HOST-VIEW-7
+#[test]
+fn repeated_resizes_on_static_frame_preserve_canvas_pixels_and_avoid_double_upscaling() {
+    let (d, mut q, mut display, _history) = setup();
+    // Crisp high-frequency checkerboard pattern that degrades visibly on repeated resampling.
+    let mut pixels = vec![0u8; 64 * 48 * 4];
+    for y in 0..48u32 {
+        for x in 0..64u32 {
+            let at = ((y * 64 + x) * 4) as usize;
+            let on = ((x ^ y) & 1) == 1;
+            let color = if on {
+                [(x * 4) as u8, (y * 5) as u8, 220, 255]
+            } else {
+                [20, 240u8.saturating_sub((y * 4) as u8), (x * 3) as u8, 255]
+            };
+            pixels[at..at + 4].copy_from_slice(&color);
+        }
+    }
+    let buffer = d
+        .create_buffer(&adv_gpu::resource::BufferDesc {
+            size: pixels.len() as u64,
+            usage: adv_gpu::resource::BufferUsage::STORAGE,
+            memory: adv_gpu::resource::Memory::Upload,
+            label: "static checkerboard",
+        })
+        .unwrap();
+    unsafe { buffer.mapped().unwrap().as_mut().copy_from_slice(&pixels) };
+
+    let mut cfg = settings();
+    cfg.view = (128, 96);
+    cfg.upscaler = Upscaler::Anime4k;
+    display.settings(&mut q, cfg.clone()).unwrap();
+    display
+        .present(
+            &mut q,
+            Frame {
+                info: FrameInfo {
+                    serial: 1,
+                    canvas: (64, 48),
+                    base: BaseKind::Software { indexed: false },
+                    damage: all(),
+                    video: Default::default(),
+                    cursor_regions: Default::default(),
+                    windows: Default::default(),
+                },
+                base: Base::Software {
+                    buffer: buffer.clone(),
+                    pitch: 64 * 4,
+                    extent: (64, 48),
+                    format: crate::stages::ingest::PixelFormat::Bgra32,
+                    palette: None,
+                },
+                video: vec![],
+                windows: vec![],
+                published_at: std::time::Instant::now(),
+                on_read: None,
+            },
+        )
+        .unwrap();
+    while !display.upscaler_ready(&mut q) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    display.service(&mut q).unwrap();
+    let reference_image = display.upscaled_copy(&mut q);
+    let reference_upscaled = read(&d, &mut q, &reference_image);
+
+    // Repeatedly resize across downscaled, fractional, custom aspect and back while static.
+    for (view, placement, upscaler) in [
+        ((96, 72), Placement::Fit, Upscaler::Anime4k),
+        (
+            (110, 60),
+            Placement::Custom {
+                aspect: 1778,
+                zoom: 800,
+            },
+            Upscaler::Anime4k,
+        ),
+        (
+            (40, 30),
+            Placement::Custom {
+                aspect: 1000,
+                zoom: 600,
+            },
+            Upscaler::Off,
+        ),
+        ((128, 96), Placement::Stretch, Upscaler::Off),
+        ((128, 96), Placement::Fit, Upscaler::Anime4k),
+    ] {
+        cfg.view = view;
+        cfg.placement = placement;
+        cfg.upscaler = upscaler;
+        display.settings(&mut q, cfg.clone()).unwrap();
+        while upscaler != Upscaler::Off && !display.upscaler_ready(&mut q) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        display.service(&mut q).unwrap();
+    }
+
+    // Upscaled output after repeated static resizes must match the single-pass reference bit-for-bit.
+    let after_image = display.upscaled_copy(&mut q);
+    let after_resizes_upscaled = read(&d, &mut q, &after_image);
+    assert_eq!(after_resizes_upscaled, reference_upscaled);
+
+    // Capturing the canvas must still recover the exact original guest pixels.
+    let (send, done) = std::sync::mpsc::channel();
+    display.capture(&mut q, Box::new(move |r| send.send(r).unwrap()));
+    let captured = done
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .unwrap()
+        .unwrap();
+    assert_eq!(captured.bgra, pixels);
+}

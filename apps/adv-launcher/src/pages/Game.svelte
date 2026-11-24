@@ -18,8 +18,18 @@
   import { drawerEdgeInset, preferredDrawerSide, type DrawerSide } from "../lib/touch-layout";
   import { tap } from "../lib/tap";
   import CustomKeys from "../components/CustomKeys.svelte";
+  import FrameEditor from "../components/FrameEditor.svelte";
   import GamepadPanel from "../components/GamepadPanel.svelte";
   import TouchControls from "../components/TouchControls.svelte";
+  import {
+    clampAspect,
+    clampZoom,
+    contentArea,
+    customRect,
+    formatAspect,
+    formatZoom,
+    rectToCustom,
+  } from "../lib/custom-frame";
   import { gamepad } from "../lib/gamepad.svelte";
   import GuestDialogs, { type GuestDialog } from "../components/GuestDialogs.svelte";
   import GuestMenuSheet, { type GuestMenu } from "../components/GuestMenu.svelte";
@@ -49,6 +59,7 @@
   let view = $state<View>(untrack(() => runs.takePauseAfterReport(gameId)) ? "menu" : "closed");
   let gamepadPicking = $state(false);
   let editingKeys = $state(false);
+  let editingFrame = $state(false);
   const touchHidden = $derived(
     prefs.hideControls || (gamepad.hasConnected && gamepad.config.autoHideTouch),
   );
@@ -77,8 +88,11 @@
   let backspaceHoldTimer: ReturnType<typeof setTimeout> | undefined;
   let backspaceRepeatTimer: ReturnType<typeof setInterval> | undefined;
 
-  type Scale = "int" | "fit" | "stretch";
+  type Scale = "int" | "fit" | "stretch" | "custom";
   let scale = $state<Scale>(untrack(() => playback(gameId).scale));
+  let customAspect = $state<number>(untrack(() => playback(gameId).customAspect));
+  let customZoom = $state<number>(untrack(() => playback(gameId).customZoom));
+  let naturalAspect = $state<number | null>(null);
   let ff = $state<FastForward>(untrack(() => playback(gameId).toggle ? "toggle" : "hold"));
   let filterError = $state("");
   $effect(() => {
@@ -101,7 +115,13 @@
   }
   $effect(() => {
     if (!gameView) return;
-    const value = { ...playback(gameId), scale, toggle: ff === "toggle" };
+    const value = {
+      ...playback(gameId),
+      scale,
+      customAspect,
+      customZoom,
+      toggle: ff === "toggle",
+    };
     void call("set_game_playback", { playback: value }, null).catch((e) => filterError = String(e));
   });
   let touchMode = $derived(prefs.touchMode);
@@ -163,7 +183,12 @@
   const sparkline = $derived(
     frames.map((v, i) => `${((i * 148) / Math.max(1, frames.length - 1)).toFixed(1)},${graphY(v)}`).join(" "),
   );
-  function updateOverrides(patch: { scale?: Scale; ff?: FastForward }) {
+  function updateOverrides(patch: {
+    scale?: Scale;
+    customAspect?: number;
+    customZoom?: number;
+    ff?: FastForward;
+  }) {
     const setup = loadGameSetup(gameId, game?.codepage ?? 932);
     Object.assign(setup.overrides, patch);
     saveGameSetup(gameId, setup);
@@ -186,9 +211,38 @@
     }
   }
 
+  function seedCustomFromCurrent(): { aspect: number; zoom: number } {
+    const setup = loadGameSetup(gameId, game?.codepage ?? 932);
+    if (setup.overrides.customAspect !== undefined || setup.overrides.customZoom !== undefined) {
+      return { aspect: customAspect, zoom: customZoom };
+    }
+    if (effectiveLayout && effectiveLayout.game.width > 0 && effectiveLayout.game.height > 0) {
+      const area = contentArea(effectiveLayout);
+      return rectToCustom(area, effectiveLayout.game.width, effectiveLayout.game.height);
+    }
+    return { aspect: customAspect, zoom: customZoom };
+  }
+
   function pickScale(value: Scale) {
+    if (value === "custom" && scale !== "custom") {
+      const seeded = seedCustomFromCurrent();
+      customAspect = seeded.aspect;
+      customZoom = seeded.zoom;
+      scale = value;
+      updateOverrides({ scale: value, customAspect: seeded.aspect, customZoom: seeded.zoom });
+      return;
+    }
     scale = value;
     updateOverrides({ scale: value });
+  }
+
+  function updateCustomFrame(aspect: number, zoom: number) {
+    const nextAspect = clampAspect(aspect);
+    const nextZoom = clampZoom(zoom);
+    customAspect = nextAspect;
+    customZoom = nextZoom;
+    if (scale !== "custom") scale = "custom";
+    updateOverrides({ scale: "custom", customAspect: nextAspect, customZoom: nextZoom });
   }
 
   function pickFf(value: FastForward) {
@@ -200,28 +254,40 @@
   let vh = $state(typeof window !== "undefined" ? window.innerHeight : 390);
   const previewLayout = $derived.by((): GameLayout | null => {
     if (gameView || !phone) return null;
+    const base = {
+      width: vw,
+      height: vh,
+      cutouts: [],
+      cornerRadius: 20,
+      gestures: { top: 0, right: 0, bottom: 21, left: 0 },
+    };
     if (scale === "stretch") {
+      return { ...base, game: { x: 0, y: 0, width: vw, height: vh } };
+    }
+    if (scale === "custom") {
       return {
-        width: vw,
-        height: vh,
-        game: { x: 0, y: 0, width: vw, height: vh },
-        cutouts: [],
-        cornerRadius: 20,
-        gestures: { top: 0, right: 0, bottom: 21, left: 0 },
+        ...base,
+        game: customRect({ x: 0, y: 0, width: vw, height: vh }, customAspect, customZoom),
       };
     }
     const gw = Math.min(vw, Math.round((vh * 4) / 3));
     const gh = Math.min(vh, Math.round((gw * 3) / 4));
     return {
-      width: vw,
-      height: vh,
+      ...base,
       game: { x: Math.round((vw - gw) / 2), y: Math.round((vh - gh) / 2), width: gw, height: gh },
-      cutouts: [],
-      cornerRadius: 20,
-      gestures: { top: 0, right: 0, bottom: 21, left: 0 },
     };
   });
   const effectiveLayout = $derived(screen.layout ?? previewLayout);
+  $effect(() => {
+    if (
+      (scale === "fit" || scale === "int") &&
+      effectiveLayout &&
+      effectiveLayout.game.width > 0 &&
+      effectiveLayout.game.height > 0
+    ) {
+      naturalAspect = clampAspect((effectiveLayout.game.width / effectiveLayout.game.height) * 1000);
+    }
+  });
 
   const started = Date.now();
   let now = $state(Date.now());
@@ -236,11 +302,20 @@
     { value: "toggle", label: t("切换") },
   ];
 
-  const scales: { value: Scale; label: string }[] = [
-    { value: "int", label: t("整数倍") },
-    { value: "fit", label: t("适应") },
-    { value: "stretch", label: t("拉伸") },
-  ];
+  const scales = $derived<{ value: Scale; label: string }[]>(
+    phone
+      ? [
+          { value: "int", label: t("整数倍") },
+          { value: "fit", label: t("适应") },
+          { value: "stretch", label: t("拉伸") },
+          { value: "custom", label: t("自定义") },
+        ]
+      : [
+          { value: "int", label: t("整数倍") },
+          { value: "fit", label: t("适应") },
+          { value: "stretch", label: t("拉伸") },
+        ],
+  );
 
   // Diagnostic outline of the published regions: open the game screen with ?regions.
   const showRegions = new URLSearchParams(location.search).has("regions");
@@ -259,6 +334,7 @@
     drawerSide = side ?? preferredSide;
     textBar = false;
     editingKeys = false;
+    editingFrame = false;
     view = "menu";
   }
 
@@ -271,13 +347,23 @@
       savePrefs();
     }
     textBar = false;
+    editingFrame = false;
     view = "closed";
     editingKeys = true;
+  }
+
+  function openFrameEditor() {
+    if (scale !== "custom") pickScale("custom");
+    textBar = false;
+    editingKeys = false;
+    view = "closed";
+    editingFrame = true;
   }
 
   function dismissLayer(): boolean {
     if (textBar) textBar = false;
     else if (editingKeys) editingKeys = false;
+    else if (editingFrame) editingFrame = false;
     else if (forceAsk) forceAsk = false;
     else if (view === "confirm") view = "menu";
     else if (view === "gamepad") view = "menu";
@@ -320,6 +406,7 @@
       (!prefs.hideControls && !customWithoutMenu) ||
       view !== "closed" ||
       editingKeys ||
+      editingFrame ||
       loading ||
       dialogs.length ||
       textBar ||
@@ -446,6 +533,7 @@
   function openTextBar() {
     view = "closed";
     editingKeys = false;
+    editingFrame = false;
     textBar = true;
     queueMicrotask(() => textInput?.focus());
   }
@@ -491,15 +579,16 @@
   function leave() {
     view = "closed";
     editingKeys = false;
+    editingFrame = false;
     textBar = false;
     forceAsk = false;
     quit();
   }
 
-  // The game is paused while the pause menu or key editor is open; once a quit
-  // is requested the host resumes it so it can answer.
+  // The game is paused while the pause menu, key editor or frame editor is
+  // open; once a quit is requested the host resumes it so it can answer.
   $effect(() => {
-    if (!gameView || (view === "closed" && !editingKeys)) return;
+    if (!gameView || (view === "closed" && !editingKeys && !editingFrame)) return;
     return pauser.hold();
   });
 
@@ -527,7 +616,12 @@
 <div class="game" class:phone>
   {#if !gameView}
     <!-- Stand-in for the native game view when none is attached (browser, Linux). -->
-    <div class="scene f-{phone && scale === "int" ? "fit" : scale}" aria-hidden="true">
+    {@const cg = scale === "custom" ? previewLayout?.game : null}
+    <div
+      class="scene {cg ? '' : `f-${phone && scale === 'int' ? 'fit' : scale}`}"
+      style={cg ? `width: ${cg.width}px; height: ${cg.height}px` : undefined}
+      aria-hidden="true"
+    >
       <div class="say">
         <div class="who" lang="ja">{t("葵")}</div>
         <div class="line" lang="ja">「夏休み、まだ半分も残ってるんだよ。……だから、もう少しだけ」</div>
@@ -619,7 +713,7 @@
             <div class="rows">
               <div class="prow">
                 <span>{t("画面")}</span>
-                <div class="seg" role="group" aria-label={t("画面")}>
+                <div class="seg" class:compact={scales.length > 3} role="group" aria-label={t("画面")}>
                   {#each scales as o (o.value)}
                     <button class:on={scale === o.value} aria-pressed={scale === o.value} onclick={() => pickScale(o.value)}>{o.label}</button>
                   {/each}
@@ -715,6 +809,13 @@
               </button>
             {/if}
             {#if phone}
+              <button class="qrow" onclick={openFrameEditor}>
+                <span>{t("调整画面比例…")}</span>
+                <span class="end">
+                  {#if scale === "custom"}<span class="sub-val mono">{formatAspect(customAspect)} · {formatZoom(customZoom)}</span>{/if}
+                  <Icon name="sliders" />
+                </span>
+              </button>
               <button class="qrow" onclick={openKeyEditor}>
                 <span>{t("自定义键位…")}</span>
                 <span class="end"><Icon name="sliders" /></span>
@@ -797,6 +898,15 @@
     </div>
   {:else if loading || dialogs.length}
     <!-- The controls wait for the game's first frame and step aside for its dialogs. -->
+  {:else if phone && editingFrame && effectiveLayout}
+    <FrameEditor
+      layout={effectiveLayout}
+      aspect={customAspect}
+      zoom={customZoom}
+      {naturalAspect}
+      onchange={updateCustomFrame}
+      ondone={() => (editingFrame = false)}
+    />
   {:else if phone && editingKeys && activeProfile}
     <CustomKeys
       {gameId}
@@ -1564,6 +1674,10 @@
     min-height: 52px;
     font-size: 14px;
   }
+  .phone .prow > span {
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
   .phone .seg {
     border-radius: 11px;
   }
@@ -1572,6 +1686,10 @@
     padding: 0 12px;
     border-radius: 9px;
     font-size: 13px;
+  }
+  .phone .seg.compact button {
+    padding: 0 8px;
+    font-size: 12.5px;
   }
   .phone .ibtn {
     width: 44px;
@@ -1820,6 +1938,10 @@
       opacity: 1;
       transform: none;
     }
+  }
+  .sub-val {
+    font-size: 12px;
+    color: var(--fg2);
   }
   .outlines {
     position: absolute;

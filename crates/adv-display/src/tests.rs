@@ -1000,3 +1000,47 @@ fn disabled_damage_setting_preserves_legacy_plans_at_buffer_ages_one_to_three() 
         }
     }
 }
+
+// spec: HOST-VIEW-1, HOST-RUN-1
+#[test]
+fn custom_placement_supports_arbitrary_aspect_and_zoom_clamped_to_view() {
+    // 4:3 game on 20:9 phone stretched to 16:9 at 100% leaves symmetric side bars.
+    let p = run(
+        &frame(),
+        &Settings {
+            view: (2000, 900),
+            placement: Placement::Custom {
+                aspect: 1778,
+                zoom: 1000,
+            },
+            ..settings()
+        },
+        &caps(),
+        &PoolState::default(),
+    );
+    assert_eq!(p.layers.base.dst, rect(200, 0, 1600, 900));
+
+    // Same 16:9 target at 80% zoom shrinks symmetrically inside the fitted box.
+    let p = run(
+        &frame(),
+        &Settings {
+            view: (2000, 900),
+            placement: Placement::Custom {
+                aspect: 1778,
+                zoom: 800,
+            },
+            ..settings()
+        },
+        &caps(),
+        &PoolState::default(),
+    );
+    assert_eq!(p.layers.base.dst, rect(360, 90, 1280, 720));
+
+    // Out-of-range parameters clamp safely inside the view without underflow.
+    let clamped = Placement::Custom {
+        aspect: 9999,
+        zoom: 50,
+    }
+    .rectangle((1000., 500.), (320, 240));
+    assert_eq!(clamped, [250., 167., 500., 166.]);
+}

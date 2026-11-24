@@ -222,6 +222,7 @@ pub enum Scaling {
     Fit,
     Integer,
     Stretch,
+    Custom,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -788,6 +789,13 @@ mod tests {
         assert_eq!(value["scaling"], "integer");
         assert_eq!(value["fast_forward"], "toggle");
         assert_eq!(value["touch_mode"], "trackpad");
+        report.platform.settings.scaling = Some(Scaling::Custom);
+        let json = to_json(&report).unwrap();
+        assert_eq!(serde_json::from_str::<Report>(&json).unwrap(), report);
+        assert_eq!(
+            serde_json::to_value(&report.platform.settings).unwrap()["scaling"],
+            "custom"
+        );
         report.platform.settings.upscaler = None;
         report.platform.settings.scaling = None;
         report.platform.settings.fast_forward = None;

@@ -46,13 +46,15 @@ export const SAVES_GB = 0.128;
 export const CACHE_GB = 2.1;
 
 /** Per-game settings that can override a global value. */
-export type GameScale = "fit" | "int" | "stretch";
+export type GameScale = "fit" | "int" | "stretch" | "custom";
 export type GlyphSmoothing = "game" | "on" | "off";
 /** "auto", "sans", "serif", or "font:<name>" for a local or imported font. */
 export type FontChoice = string;
 
 export interface GameValues {
   scale: GameScale;
+  customAspect: number;
+  customZoom: number;
   filter: Filter;
   smooth: GlyphSmoothing;
   ff: FastForward;
@@ -64,7 +66,14 @@ export interface GameValues {
 export type OverrideKey = keyof GameValues;
 
 /** Global defaults with no control on the settings screen. */
-export const GAME_DEFAULTS = { smooth: "game", gothic: "auto", mincho: "auto", chinese: "auto" } as const;
+export const GAME_DEFAULTS = {
+  smooth: "game",
+  gothic: "auto",
+  mincho: "auto",
+  chinese: "auto",
+  customAspect: 1778,
+  customZoom: 1000,
+} as const;
 
 export interface GameSetup {
   /** Code page the game's own strings are stored in. */

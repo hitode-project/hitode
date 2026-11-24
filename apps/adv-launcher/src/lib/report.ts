@@ -29,7 +29,7 @@ export interface ReportGraphics {
   tier: string;
 }
 export type Upscaler = "off" | "anime4k" | "cunny" | "artcnn" | "k7";
-export type Scaling = "fit" | "integer" | "stretch";
+export type Scaling = "fit" | "integer" | "stretch" | "custom";
 export type FastForward = "hold" | "toggle";
 export type TouchMode = "direct" | "trackpad";
 export interface ReportSettings {

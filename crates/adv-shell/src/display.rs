@@ -109,6 +109,7 @@ impl Ui {
             crate::Scaling::Fit => adv_report::Scaling::Fit,
             crate::Scaling::Integer => adv_report::Scaling::Integer,
             crate::Scaling::Stretch => adv_report::Scaling::Stretch,
+            crate::Scaling::Custom { .. } => adv_report::Scaling::Custom,
         };
         (upscaler, scaling)
     }
