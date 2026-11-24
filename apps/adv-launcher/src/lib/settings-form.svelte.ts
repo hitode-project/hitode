@@ -187,6 +187,10 @@ export class GameForm {
       setGameFilter(this.game.id, "inherit");
       return;
     }
+    if (key === "scale") {
+      delete this.setup.overrides.customAspect;
+      delete this.setup.overrides.customZoom;
+    }
     this.pick(key, this.global[key]);
   }
 

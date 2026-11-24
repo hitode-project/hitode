@@ -93,6 +93,21 @@ mod tests {
             position((1920, 1080), (640, 480), Scaling::Stretch, 960., 540.),
             320 | 240 << 16
         );
+        let custom = Scaling::Custom {
+            aspect: 1600,
+            zoom: 800,
+        };
+        // 1920x1080 with 16:10 at 80% -> 1382x864 centered at (269, 108).
+        assert_eq!(position((1920, 1080), (640, 480), custom, 269., 108.), 0);
+        assert_eq!(
+            position((1920, 1080), (640, 480), custom, 269. + 1382., 108. + 864.),
+            639 | 479 << 16
+        );
+        let (cx, cy) = client_point((1920, 1080), (640, 480), custom, 320., 240.);
+        assert_eq!(
+            position((1920, 1080), (640, 480), custom, cx, cy),
+            320 | 240 << 16
+        );
     }
     #[test]
     fn client_points_invert_positions() {

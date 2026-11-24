@@ -13,7 +13,8 @@ export function playback(gameId: string, exe?: string) {
     if (choice.startsWith("font:")) for (const name of aliases) fontFamilies[name] = choice.slice(5);
   }
   return {
-    scale: values.scale, volume: prefs.volume, muted: prefs.muted,
+    scale: values.scale, customAspect: values.customAspect, customZoom: values.customZoom,
+    volume: prefs.volume, muted: prefs.muted,
     toggle: values.ff === "toggle", pauseInBackground: prefs.pauseInBackground,
     discs: setup.discs, fontFiles: setup.fontFiles, fontFamilies,
     smoothing: values.smooth === "game" ? null : values.smooth === "on",

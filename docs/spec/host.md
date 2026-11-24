@@ -65,8 +65,8 @@ This spec covers the host shells. It includes launcher overlay input, the game v
 **Rule**: The native frame size MUST use physical pixels: content points multiplied by `backingScaleFactor` on macOS. Native GPU presentation MUST default to preserving aspect ratio and black bars, using sharp-bilinear sampling unless the host selects an upscaler. Pointer positions MUST map back through the same letterbox.
 **Verification**: Test
 
-The planner MUST choose fit, integer or stretch placement. The compositor MUST own the black letterbox. Pointer mapping MUST use the exact rectangle returned by presentation feedback.
-Resizing a visible view MUST redraw retained content without waiting for a guest frame. The display MUST use the next guest frame to replace the whole resampled output.
+The planner MUST choose fit, integer, stretch or custom placement. The compositor MUST own the black letterbox. Pointer mapping MUST use the exact rectangle returned by presentation feedback.
+Resizing a visible view MUST redraw retained content without waiting for a guest frame. Repeated redraws on a static frame MUST reuse the unresampled source without compounding resampling or repeating super-resolution. The display MUST use the next guest frame to replace the whole resampled output.
 
 ### HOST-VIEW-3 One composition path
 
@@ -303,7 +303,7 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 
 ### HOST-RUN-1 Presentation controls
 
-**Rule**: Host volume MUST scale device output without modifying source samples. Fit, integer and stretch modes MUST use the same physical-pixel rectangle for presentation and pointer mapping. Integer mode and the command-line window MUST show each game pixel as the most whole device pixels that fit, else shrink proportionally.
+**Rule**: Host volume MUST scale device output without modifying source samples. Fit, integer, stretch and custom modes MUST use the same physical-pixel rectangle for presentation and pointer mapping. Integer mode and the command-line window MUST show each game pixel as the most whole device pixels that fit, else shrink proportionally.
 **Applies to**: Launcher, macOS
 **Verification**: Test
 

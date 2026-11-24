@@ -127,6 +127,10 @@ pub(crate) fn upscaler(name: &str) -> Result<adv_shell::Upscaler, String> {
 #[serde(rename_all = "camelCase")]
 pub struct Playback {
     scale: String,
+    #[serde(default)]
+    custom_aspect: Option<u16>,
+    #[serde(default)]
+    custom_zoom: Option<u16>,
     volume: u8,
     muted: bool,
     toggle: bool,
@@ -233,6 +237,10 @@ impl Playback {
             "fit" => adv_shell::Scaling::Fit,
             "int" => adv_shell::Scaling::Integer,
             "stretch" => adv_shell::Scaling::Stretch,
+            "custom" => adv_shell::Scaling::Custom {
+                aspect: self.custom_aspect.unwrap_or(1778).clamp(500, 3000),
+                zoom: self.custom_zoom.unwrap_or(1000).clamp(500, 1000),
+            },
             _ => return Err("unknown scaling mode".into()),
         };
         session.set_scaling(scale);

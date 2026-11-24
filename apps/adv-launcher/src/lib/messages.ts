@@ -697,4 +697,12 @@ export const messages: Record<string, [string, string]> = {
   "停止": ["Stop", "停止"],
   "{0} 已退出（代码 {1}）": ["{0} exited (code {1})", "{0} が終了しました（コード {1}）"],
   "输入后按回车发送": ["Type and press Return to send", "入力して Return で送信"],
+  "调整画面比例…": ["Adjust frame ratio…", "画面比率を調整…"],
+  "调整画面比例": ["Adjust frame ratio", "画面比率を調整"],
+  "调整画面宽度": ["Adjust frame width", "画面幅を調整"],
+  "调整画面高度": ["Adjust frame height", "画面高さを調整"],
+  "原比例": ["Original", "元の比率"],
+  "满屏": ["Fill", "全画面"],
+  "目标比例": ["Aspect ratio", "アスペクト比"],
+  "画面大小": ["Frame size", "画面サイズ"],
 };

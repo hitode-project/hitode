@@ -6,6 +6,15 @@
   import PhoneSettingsHeader from "./PhoneSettingsHeader.svelte";
   import UpscalingSelect from "./UpscalingSelect.svelte";
   import SettingsSeg from "./SettingsSeg.svelte";
+  import {
+    ASPECT_PRESETS,
+    CUSTOM_ASPECT_MAX,
+    CUSTOM_ASPECT_MIN,
+    CUSTOM_ZOOM_MAX,
+    CUSTOM_ZOOM_MIN,
+    formatAspect,
+    formatZoom,
+  } from "../lib/custom-frame";
   import { revealFolder, type OverrideKey } from "../lib/fake-settings";
   import { prefs } from "../lib/prefs.svelte";
   import { library } from "../lib/library.svelte";
@@ -107,20 +116,69 @@
     <section class="sec" aria-labelledby="pg-view">
       <h2 id="pg-view">{t("画面")}</h2>
       {#if device.gameView || device.simulated}
-        <div class="row" class:ov={form.overridden("scale")}>
+        <div class="row" class:ov={form.overridden("scale") || form.overridden("customAspect") || form.overridden("customZoom")}>
           {@render head("scale", t("缩放"))}
           <SettingsSeg
             variant="phone-sheet"
             label={t("缩放")}
             value={form.value("scale")}
             onpick={(v) => form.pick("scale", v)}
-            options={[
-              { value: "fit", label: t("适应") },
-              { value: "int", label: t("整数倍") },
-              { value: "stretch", label: t("拉伸") },
-            ]}
+            options={device.touch
+              ? [
+                  { value: "fit", label: t("适应") },
+                  { value: "int", label: t("整数倍") },
+                  { value: "stretch", label: t("拉伸") },
+                  { value: "custom", label: t("自定义") },
+                ]
+              : [
+                  { value: "fit", label: t("适应") },
+                  { value: "int", label: t("整数倍") },
+                  { value: "stretch", label: t("拉伸") },
+                ]}
           />
         </div>
+        {#if device.touch && form.value("scale") === "custom"}
+          <div class="custom-frame">
+            <div class="cf-row">
+              <span class="cf-label">{t("目标比例")}</span>
+              <span class="val mono">{formatAspect(form.value("customAspect"))}</span>
+            </div>
+            <div class="cf-presets">
+              {#each ASPECT_PRESETS as p (p.label)}
+                <button
+                  type="button"
+                  class="quiet cf-pill"
+                  class:on={Math.abs(form.value("customAspect") - p.aspect) <= 12}
+                  onclick={() => form.pick("customAspect", p.aspect)}
+                >{p.label}</button>
+              {/each}
+            </div>
+            <input
+              class="cf-range"
+              type="range"
+              min={CUSTOM_ASPECT_MIN}
+              max={CUSTOM_ASPECT_MAX}
+              step={10}
+              value={form.value("customAspect")}
+              aria-label={t("目标比例")}
+              oninput={(e) => form.pick("customAspect", Number(e.currentTarget.value))}
+            />
+            <div class="cf-row">
+              <span class="cf-label">{t("画面大小")}</span>
+              <span class="val mono">{formatZoom(form.value("customZoom"))}</span>
+            </div>
+            <input
+              class="cf-range"
+              type="range"
+              min={CUSTOM_ZOOM_MIN}
+              max={CUSTOM_ZOOM_MAX}
+              step={10}
+              value={form.value("customZoom")}
+              aria-label={t("画面大小")}
+              oninput={(e) => form.pick("customZoom", Number(e.currentTarget.value))}
+            />
+          </div>
+        {/if}
       {/if}
       <div class="row" class:ov={form.overridden("filter")}>
         {@render head("filter", t("超分辨率"))}
@@ -468,6 +526,44 @@
     background: transparent;
   }
 
+  .custom-frame {
+    padding: 12px 0 14px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .cf-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 14px;
+  }
+  .cf-label {
+    color: var(--fg2);
+  }
+  .cf-presets {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .cf-pill {
+    height: 34px;
+    padding: 0 12px;
+    border-radius: 17px;
+    background: var(--field);
+  }
+  .cf-pill.on {
+    background: var(--mark);
+    color: #ffffff;
+  }
+  .cf-range {
+    width: 100%;
+    accent-color: var(--mark);
+  }
+  .mono {
+    font-family: var(--font-mono);
+  }
   @media (prefers-reduced-motion: reduce) {
     .dot {
       transition: none;
