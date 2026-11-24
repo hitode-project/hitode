@@ -52,6 +52,8 @@ pub(super) fn run(
             }
         }
     }
+    // Folding a branch can leave a block with no arrivals, whose uses no
+    // definition dominates: every fold settles reachability too.
     let settle = |func: &mut Func| loop {
         let mut changed = propagate(func);
         changed |= reachable(func);
@@ -70,7 +72,7 @@ pub(super) fn run(
         settle(func);
     }
     hoist(func, facts, loads, stores, resident.as_deref_mut());
-    while propagate(func) {}
+    settle(func);
     if let Some(r) = &resident {
         store_guards(func, facts, loads, stores, r);
         for block in &func.blocks {
@@ -85,25 +87,25 @@ pub(super) fn run(
         }
     }
     if hoist_frame_loads(func, written_frame, frame_hoist_safe) {
-        while propagate(func) {}
+        settle(func);
     }
     join(func);
-    while propagate(func) {}
+    settle(func);
     if forward_stores(func) {
-        while propagate(func) {}
+        settle(func);
     }
     if fp_range::run(func) {
-        while propagate(func) {}
+        settle(func);
         if fp_range::run(func) {
-            while propagate(func) {}
+            settle(func);
         }
     }
     let domain_seeds = if let Some(r) = resident.as_deref()
         && let Some(seeds) = fp_range::infer_domain_guards(func, r.refused_domain)
     {
-        while propagate(func) {}
+        settle(func);
         if fp_range::run(func) {
-            while propagate(func) {}
+            settle(func);
         }
         Some(seeds)
     } else {

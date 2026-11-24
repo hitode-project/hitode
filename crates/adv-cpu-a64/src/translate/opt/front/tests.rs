@@ -817,6 +817,32 @@ fn a_division_keeping_both_results_divides_once() {
     );
 }
 
+// spec: A64-OPT-2
+#[test]
+fn a_branch_a_forwarded_store_decides_drops_the_path_it_never_takes() {
+    // A string constructor stores its capacity, then tests it: forwarding
+    // the store decides the branch, and the fall path, which uses a value
+    // of the block before it, loses its only arrival.
+    let code = assemble(|a| {
+        row(a, |a| {
+            let mut small = a.create_label();
+            let mut done = a.create_label();
+            a.lea(edx, dword_ptr(edi + ebx * 8)).unwrap();
+            a.mov(dword_ptr(edx + 20), 15).unwrap();
+            a.mov(dword_ptr(edx + 16), 0).unwrap();
+            a.cmp(dword_ptr(edx + 20), 16).unwrap();
+            a.jb(small).unwrap();
+            a.mov(eax, dword_ptr(edx)).unwrap();
+            a.jmp(done).unwrap();
+            a.set_label(&mut small).unwrap();
+            a.mov(eax, edx).unwrap();
+            a.set_label(&mut done).unwrap();
+            a.mov(dword_ptr(eax), 0).unwrap();
+        })
+    });
+    differential(&code, &initial(), |_| {});
+}
+
 // spec: A64-OPT-3
 #[test]
 fn a_double_copied_by_dwords_reads_back_as_the_stored_value() {
