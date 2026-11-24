@@ -3,12 +3,19 @@
 use adv_machine::{Env, Outcome};
 
 use crate::object::{read_bytes, read_u32, write_bytes, write_u32};
-use crate::protocol::{AllocateLocallyUniqueIdRequest, GetTokenGroupsRequest, GetTokenSidRequest};
+use crate::protocol::{
+    AllocateLocallyUniqueIdRequest, GetTokenGroupsRequest, GetTokenInfoRequest, GetTokenSidRequest,
+};
 use crate::server;
 use crate::status::{self, Error};
 
 const TOKEN_USER: u32 = 1;
 const TOKEN_GROUPS: u32 = 2;
+const TOKEN_TYPE: u32 = 8;
+const TOKEN_IMPERSONATION_LEVEL: u32 = 9;
+const TOKEN_SESSION_ID: u32 = 12;
+const TOKEN_ELEVATION_TYPE: u32 = 18;
+const TOKEN_ELEVATION: u32 = 20;
 const TOKEN_LOGON_SID: u32 = 28;
 const SE_GROUP_LOGON_ID: u32 = 0xc000_0000;
 /// TOKEN_USER: the SID pointer and its attributes; the SID follows.
@@ -41,6 +48,16 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     }
     if class == TOKEN_GROUPS || class == TOKEN_LOGON_SID {
         return status::finish(groups(env, token, class, info, length, result_length));
+    }
+    if matches!(
+        class,
+        TOKEN_TYPE
+            | TOKEN_IMPERSONATION_LEVEL
+            | TOKEN_SESSION_ID
+            | TOKEN_ELEVATION_TYPE
+            | TOKEN_ELEVATION
+    ) {
+        return status::finish(info_word(env, token, class, info, length, result_length));
     }
     status::finish((|| {
         if class != TOKEN_USER && class != 4 {
@@ -128,6 +145,49 @@ fn groups(
     let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     bytes.extend_from_slice(sids);
     Ok(write_bytes(env, info, &bytes)?)
+}
+
+/// Fixed 4-byte token queries answered by `get_token_info`.
+fn info_word(
+    env: &mut Env<'_>,
+    token: u32,
+    class: u32,
+    info: u32,
+    length: u32,
+    result_length: u32,
+) -> Result<(), Error> {
+    if result_length != 0 {
+        write_u32(env, result_length, 4)?;
+    }
+    if length < 4 {
+        return Err(Error::Status(status::BUFFER_TOO_SMALL));
+    }
+    let mut request = GetTokenInfoRequest {
+        handle: token,
+        ..Default::default()
+    };
+    let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+    status::check(reply.header.error)?;
+    let value = match class {
+        TOKEN_TYPE => {
+            if reply.primary != 0 {
+                1
+            } else {
+                2
+            }
+        }
+        TOKEN_IMPERSONATION_LEVEL => {
+            if reply.primary != 0 {
+                return Err(Error::Status(status::INVALID_PARAMETER));
+            }
+            reply.impersonation_level as u32
+        }
+        TOKEN_SESSION_ID => reply.session_id,
+        TOKEN_ELEVATION_TYPE => reply.elevation_type as u32,
+        TOKEN_ELEVATION => reply.is_elevated as u32,
+        _ => unreachable!(),
+    };
+    Ok(write_u32(env, info, value)?)
 }
 
 /// NtAllocateLocallyUniqueId(*luid)

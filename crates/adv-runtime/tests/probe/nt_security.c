@@ -41,6 +41,11 @@ int main(void)
     PRIVILEGE_SET required = {0}, used;
     GENERIC_MAPPING mapping = {1, 2, 4, 7};
     DWORD size, granted;
+    TOKEN_TYPE token_type;
+    SECURITY_IMPERSONATION_LEVEL imp_level;
+    TOKEN_ELEVATION_TYPE elevation_type;
+    TOKEN_ELEVATION elevation;
+    DWORD session_id;
     DWORD drives, written, serial;
     HANDLE file;
     char contents[4];
@@ -63,6 +68,22 @@ int main(void)
           && *GetSidSubAuthority(user->User.Sid, 3) == 0
           && *GetSidSubAuthority(user->User.Sid, 4) == 1000);
     check("duplicate_token", DuplicateTokenEx(token, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenImpersonation, &imp));
+    check("token_type_primary", GetTokenInformation(token, TokenType, &token_type, sizeof(token_type), &size)
+          && size == sizeof(token_type) && token_type == TokenPrimary);
+    check("token_type_imp", GetTokenInformation(imp, TokenType, &token_type, sizeof(token_type), &size)
+          && size == sizeof(token_type) && token_type == TokenImpersonation);
+    check("token_imp_level", GetTokenInformation(imp, TokenImpersonationLevel, &imp_level, sizeof(imp_level), &size)
+          && size == sizeof(imp_level) && imp_level == SecurityImpersonation);
+    check("token_imp_on_primary", !GetTokenInformation(token, TokenImpersonationLevel, &imp_level, sizeof(imp_level), &size)
+          && GetLastError() == ERROR_INVALID_PARAMETER);
+    check("token_elevation", GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size)
+          && size == sizeof(elevation) && (elevation.TokenIsElevated == 0 || elevation.TokenIsElevated == 1));
+    check("token_elevation_type", GetTokenInformation(token, TokenElevationType, &elevation_type, sizeof(elevation_type), &size)
+          && size == sizeof(elevation_type) && elevation_type >= TokenElevationTypeDefault && elevation_type <= TokenElevationTypeLimited);
+    check("token_session_id", GetTokenInformation(token, TokenSessionId, &session_id, sizeof(session_id), &size)
+          && size == sizeof(session_id));
+    check("token_elevation_short", !GetTokenInformation(token, TokenElevation, &elevation, 2, &size)
+          && GetLastError() == ERROR_INSUFFICIENT_BUFFER && size == sizeof(elevation));
     check("open_thread_empty", !OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &thread_token) && GetLastError() == ERROR_NO_TOKEN);
     check("set_thread_token", SetThreadToken(NULL, imp));
     check("open_thread", OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &thread_token));

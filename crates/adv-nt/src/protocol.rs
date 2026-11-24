@@ -1538,6 +1538,49 @@ impl Request for GetTokenGroupsRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct GetTokenInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetTokenInfoRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetTokenInfoRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetTokenInfoReply {
+    pub header: ReplyHeader,
+    pub token_id: [u8; 8],
+    pub modified_id: [u8; 8],
+    pub session_id: u32,
+    pub primary: i32,
+    pub impersonation_level: i32,
+    pub elevation_type: i32,
+    pub is_elevated: i32,
+    pub group_count: i32,
+    pub privilege_count: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetTokenInfoReply>() == 56);
+const _: () = assert!(std::mem::offset_of!(GetTokenInfoReply, token_id) == 8);
+const _: () = assert!(std::mem::offset_of!(GetTokenInfoReply, modified_id) == 16);
+const _: () = assert!(std::mem::offset_of!(GetTokenInfoReply, session_id) == 24);
+const _: () = assert!(std::mem::offset_of!(GetTokenInfoReply, primary) == 28);
+const _: () = assert!(std::mem::offset_of!(GetTokenInfoReply, impersonation_level) == 32);
+const _: () = assert!(std::mem::offset_of!(GetTokenInfoReply, elevation_type) == 36);
+const _: () = assert!(std::mem::offset_of!(GetTokenInfoReply, is_elevated) == 40);
+const _: () = assert!(std::mem::offset_of!(GetTokenInfoReply, group_count) == 44);
+const _: () = assert!(std::mem::offset_of!(GetTokenInfoReply, privilege_count) == 48);
+
+impl Request for GetTokenInfoRequest {
+    const NUMBER: i32 = 261;
+    type Reply = GetTokenInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct OpenDirectoryRequest {
     pub header: RequestHeader,
     pub access: u32,

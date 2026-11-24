@@ -3,7 +3,17 @@ import { untrack } from "svelte";
 import { androidStorage } from "./android-access.svelte";
 import { inTauri, onHostEvent } from "./bridge";
 import { device } from "./device.svelte";
-import { pauseGame, startGame, stopGame, type GameFinished, type RunSummary } from "./host";
+import {
+  importRuntimeComponent,
+  installRuntimeComponent,
+  libraryInspect,
+  pauseGame,
+  pickComponentFile,
+  startGame,
+  stopGame,
+  type GameFinished,
+  type RunSummary,
+} from "./host";
 
 /**
  * A script started from the run page. It runs there, its console shown, until
@@ -21,6 +31,12 @@ import { explainJit, jit } from "./jit.svelte";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
 import { prefs } from "./prefs.svelte";
+import {
+  componentForDll,
+  exitedWithoutFrame,
+  missingRuntimeComponent,
+  type RuntimeComponent,
+} from "./redist";
 
 /**
  * The states of the launch screen; a game that fails to run comes back here as
@@ -107,6 +123,8 @@ class Runs {
 
   /** Launch errors not yet shown, by game id. */
   errors = $state<Record<string, string>>({});
+  /** Registry helper files discovered after a silent zero-frame exit, by game id. */
+  registryHints = $state<Record<string, string[]>>({});
   /** The game the host is running (start_game returned and it has not finished). */
   running = $state<string | null>(null);
   /** Games the user asked to stop: their end is not a failure. */
@@ -198,6 +216,13 @@ class Runs {
     return error;
   }
 
+  /** Registry files waiting for `gameId`'s launch screen after a zero-frame exit. */
+  takeRegistryHint(gameId: string): string[] | null {
+    const files = this.registryHints[gameId] ?? null;
+    delete this.registryHints[gameId];
+    return files;
+  }
+
   #finished(event: GameFinished): void {
     const id = event.gameId;
     const here = nav.route.name === "game" || nav.route.name === "launch";
@@ -216,12 +241,40 @@ class Runs {
       // A script that never showed anything ends on the run page.
       if (!script.shown) return;
     }
+    const game = library.get(id);
     if ("error" in event && !stopped) {
       this.errors[id] = event.error;
       if (showing) nav.replace({ name: "launch", gameId: id });
-    } else if (library.get(id)?.setup) {
+    } else if (game?.setup) {
       // A setup that ran picks what it installed next.
       if (showing) nav.replace({ name: "install", gameId: id });
+    } else if (
+      showing &&
+      inTauri &&
+      game &&
+      exitedWithoutFrame(event, stopped, !!game.setup, !!script)
+    ) {
+      void libraryInspect(game.path)
+        .then((found) => {
+          const stillShowing =
+            (nav.route.name === "game" || nav.route.name === "launch") &&
+            "gameId" in nav.route &&
+            nav.route.gameId === id &&
+            this.running !== id;
+          if (!stillShowing) return;
+          const files = found?.registryFiles ?? [];
+          if (files.length > 0) {
+            this.registryHints[id] = files;
+            nav.replace({ name: "launch", gameId: id });
+          } else {
+            library.focus = id;
+            nav.home();
+          }
+        })
+        .catch(() => {
+          library.focus = id;
+          if (showing) nav.home();
+        });
     } else {
       // Back to the game's detail in the library; a stop the user asked for
       // (even a forced one, which reports an error) is a normal end.
@@ -236,7 +289,11 @@ export const runs = new Runs();
 /** Words a host launch error that names its cause for the player. */
 function launchError(message: string): string {
   const missing = /^missing_dll:(.+)$/.exec(message);
-  if (missing) return t(MISSING_DLL, missing[1]);
+  if (missing?.[1]) {
+    const component = componentForDll(missing[1]);
+    if (component) return t("需要 {0} 运行库（缺少 {1}）", component.name, component.dll);
+    return t(MISSING_DLL, missing[1]);
+  }
   if (message.includes("no 4 GiB-aligned guest window")) {
     return explainJit(jit.status?.increasedMemoryLimit ? "noGuestWindowExtended" : "noGuestWindow");
   }
@@ -255,20 +312,38 @@ export class LaunchFlow {
   view = $state<LaunchState>("prepare");
   /** Why the game stopped or cannot start. */
   reason = $state("");
-  recovery = $state<"missing" | "access" | "permission" | null>(null);
+  recovery = $state<"missing" | "access" | "permission" | "component" | "registry" | null>(null);
+  missingComponent = $state<RuntimeComponent | null>(null);
+  registryFiles = $state<string[]>([]);
+  installError = $state("");
   recovering = $state(false);
   #gameId: () => string;
   #alive = true;
 
+  get registryFile(): string | null {
+    return this.registryFiles[0] ?? null;
+  }
+
   constructor(gameId: () => string) {
     this.#gameId = gameId;
-    // A pending error (the game failed while running) is shown by the effect below.
-    if (!(gameId() in runs.errors)) void this.#start();
+    // A pending error or zero-frame registry hint is shown by the effects below.
+    if (!(gameId() in runs.errors) && !(gameId() in runs.registryHints)) void this.#start();
     $effect(() => {
       const id = this.#gameId();
       if (runs.errors[id] === undefined) return;
       const error = untrack(() => runs.takeError(id));
-      if (error !== null) this.#fail("failed", launchError(error));
+      if (error !== null) this.#failFromMessage(error);
+    });
+    $effect(() => {
+      const id = this.#gameId();
+      if (runs.registryHints[id] === undefined) return;
+      const files = untrack(() => runs.takeRegistryHint(id));
+      if (files && files.length > 0) {
+        this.recovery = "registry";
+        this.registryFiles = files;
+        this.installError = "";
+        this.#fail("failed", t("游戏未显示画面就退出了"));
+      }
     });
     $effect(() => () => {
       this.#alive = false;
@@ -280,6 +355,9 @@ export class LaunchFlow {
     this.view = "prepare";
     this.reason = "";
     this.recovery = null;
+    this.missingComponent = null;
+    this.registryFiles = [];
+    this.installError = "";
     if (jit.active && !jitDeclined) {
       if (!jit.status) await jit.refresh();
       if (jit.busy) {
@@ -329,9 +407,36 @@ export class LaunchFlow {
             this.recovery = missing ? "missing" : "access";
             this.#fail("failed", t(missing ? "找不到游戏文件" : "无法访问游戏文件夹"));
           }
-        } else this.#fail("failed", launchError(message));
+        } else this.#failFromMessage(message);
       },
     );
+  }
+
+  #failFromMessage(message: string): void {
+    const component = missingRuntimeComponent(message);
+    if (component) {
+      this.recovery = "component";
+      this.missingComponent = component;
+      this.installError = "";
+      this.#fail("failed", t("需要 {0} 运行库（缺少 {1}）", component.name, component.dll));
+      return;
+    }
+    this.#fail("failed", launchError(message));
+    if (!/^missing_dll:/.test(message)) void this.#discoverRegistryFiles();
+  }
+
+  async #discoverRegistryFiles(): Promise<void> {
+    if (!inTauri) return;
+    const game = library.get(this.#gameId());
+    if (!game || game.setup) return;
+    try {
+      const found = await libraryInspect(game.path);
+      if (this.#alive && this.view === "failed" && this.recovery === null) {
+        this.registryFiles = found?.registryFiles ?? [];
+      }
+    } catch {
+      // Optional recovery hint; ignore inspection errors.
+    }
   }
 
   #fail(view: LaunchState, reason: string): void {
@@ -364,6 +469,49 @@ export class LaunchFlow {
     } finally {
       this.recovering = false;
     }
+  }
+
+  /** Downloads and installs the missing redistributable component, then launches. */
+  async installComponent(): Promise<void> {
+    if (!this.missingComponent || this.recovering) return;
+    this.recovering = true;
+    this.installError = "";
+    try {
+      await installRuntimeComponent(this.missingComponent.id);
+      if (this.#alive) this.retry();
+    } catch (error) {
+      if (this.#alive) this.installError = String(error);
+    } finally {
+      this.recovering = false;
+    }
+  }
+
+  /** Imports the missing redistributable component from a local installer or 32-bit DLL, then launches. */
+  async importComponent(): Promise<void> {
+    if (!this.missingComponent || this.recovering) return;
+    this.installError = "";
+    let path: string | null;
+    try {
+      path = await pickComponentFile();
+    } catch (error) {
+      if (this.#alive) this.installError = String(error);
+      return;
+    }
+    if (!path || !this.#alive) return;
+    this.recovering = true;
+    try {
+      await importRuntimeComponent(this.missingComponent.id, path);
+      if (this.#alive) this.retry();
+    } catch (error) {
+      if (this.#alive) this.installError = String(error);
+    } finally {
+      this.recovering = false;
+    }
+  }
+
+  /** Opens the game's scripts and registry page in place of the launch screen. */
+  openRunPage(): void {
+    nav.replace({ name: "game-run", gameId: this.#gameId() });
   }
 
   /** Enables JIT from the recommendation, then starts the game once it is ready. */

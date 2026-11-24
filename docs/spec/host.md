@@ -267,7 +267,7 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 
 ### HOST-LIB-9 Missing modules
 
-**Rule**: A program that ends with `STATUS_DLL_NOT_FOUND` MUST fail its launch with the first module in its static import closure that is missing. The closure MUST follow modules beside the program, and the launcher MUST word the error for the player.
+**Rule**: A program that ends with `STATUS_DLL_NOT_FOUND` MUST fail its launch with the first module in its static import closure that is missing. The closure MUST follow modules beside the program, and the launcher MUST word the error for the player. When a known redistributable supplies that module, the launcher MUST offer one-step installation into `system32` without overwriting Wine CRT modules.
 **Applies to**: Launcher, macOS
 **Verification**: Test
 
