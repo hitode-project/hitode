@@ -264,6 +264,11 @@ fn build_trace(
     split: bool,
     pending_wait: bool,
 ) -> Result<(Func, Assumed, Vec<u32>), Reject> {
+    let _translating = crate::translate::context::Translating::new(
+        unit,
+        unit.trace.insts.first().map_or(0, |inst| inst.pc),
+        "optimization",
+    );
     let scope_access = scope
         .and_then(Proof::scope_frame)
         .map(|frame| frame.access.as_slice());

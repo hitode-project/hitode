@@ -17,6 +17,7 @@ pub use adv_cpu::jit_map::{
     enable_memory as jit_map_enable, locate as jit_map_locate, lookup as jit_map_lookup,
     stub as jit_map_stub,
 };
+pub use adv_cpu::translate::context::panic_context;
 pub use adv_cpu::{CompileStrategy, Cpu, Engine, EngineOptions, HostFeatures};
 #[cfg(target_os = "ios")]
 pub use adv_cpu::{code_pool_state, prepare_code_pool_after_attach, prepare_code_pool_if_debugged};

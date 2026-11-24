@@ -8,6 +8,7 @@ mod frame_pacer;
 mod frontend;
 pub mod gamepad;
 mod heap;
+mod panic_report;
 #[cfg(host_view)]
 pub use adv_runtime::system_font_families;
 #[cfg(host_view)]

@@ -240,6 +240,7 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
 
             pacer: None,
         };
+        super::panic_report::watch(options, false);
         let debugger = super::debug::start(options, false, wake.clone(), debug_display);
         let keys = Arc::new(KeyState::default());
         let started = Instant::now();
@@ -312,6 +313,7 @@ pub(super) fn run_execution(
         pacer: Some(pacer),
     };
     let started = Instant::now();
+    super::panic_report::watch(options, true);
     let debugger = super::debug::start(options, true, wake.clone(), debug_display);
     let ((exit_code, summary), registry) =
         watching_registry(environment, options, dist, |environment| {
