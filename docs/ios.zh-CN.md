@@ -45,7 +45,7 @@ JIT 需要调试器临时附加到 Hitode 上。在这条自签安装路径中�
 | 开启 JIT | 打开 Hitode 时自动开启 | 从 LiveContainer 启动 Hitode 时，由 StikDebug 自动开启 | 打开 Hitode 时自动开启 |
 | 配对文件放在 | Hitode | StikDebug | Hitode |
 | 续签 | SideStore 续签 LiveContainer，Hitode 不用单独续签 | SideStore 续签 LiveContainer 和 StikDebug，Hitode 不用单独续签 | SideStore 续签 Hitode |
-| 要求 | 在 iloader 里安装“LiveContainer + SideStore（每夜构建版）”，需要 2026-11-08 的构建（LiveContainer 3.8.13，提交 9d6ea09b）及以后 | | |
+| 要求 | 在 iloader 里安装“LiveContainer + SideStore（每夜构建版）”，需要 2026-11-08 的构建（LiveContainer 3.8.13，提交 9d6ea09b）及以后 | 同样推荐“LiveContainer + SideStore（每夜构建版）”（含 iOS 27 修复与新版内置 SideStore） | 需用内置 SideStore 续签时也推荐每夜构建版 |
 
 ### 安装步骤
 
@@ -56,7 +56,7 @@ JIT 需要调试器临时附加到 Hitode 上。在这条自签安装路径中�
 3. **用数据线连接手机，在 iloader 里登录 Apple ID。**
    手机上会弹出"要信任此电脑吗？"，选择"信任"。信任只能通过数据线完成；之后只要手机和电脑连着同一个 Wi-Fi，下文用到 iloader 的步骤都可以无线进行，iloader 会自动识别设备。
 4. **用 iloader 安装 LiveContainer + SideStore**，完成后桌面上会出现 LiveContainer 的图标。
-   方式一选“LiveContainer + SideStore（每夜构建版）”，它带有 Hitode 自己开启 JIT 所需的“启用应用辅助进程”。iloader 每次装的都是最新的每夜构建；这项功能从 2026-11-08 的构建（LiveContainer 3.8.13，提交 [9d6ea09b](https://github.com/LiveContainer/LiveContainer/commit/9d6ea09b05afa2c8fc537c372795a294db631311)）开始提供，之前装过的旧每夜构建版要重新安装一次。方式二、方式三选“LiveContainer + SideStore（稳定版）”即可。用 iloader 2.4.1 之前的版本装过 LiveContainer 的话，也要重新安装一次，才能开启内存扩展。
+   推荐选择“LiveContainer + SideStore（每夜构建版）”。方式一**必须**使用每夜构建版，它带有 Hitode 自己开启 JIT 所需的“启用应用辅助进程”（从 2026-11-08 的构建，即 LiveContainer 3.8.13 提交 [9d6ea09b](https://github.com/LiveContainer/LiveContainer/commit/9d6ea09b05afa2c8fc537c372795a294db631311) 开始提供，之前装过的旧每夜构建版要重新安装一次）。方式二（以及需要用到内置 SideStore 的方式三）也推荐选每夜构建版：它包含后续对 iOS 27 的兼容性修复，并且内置的 SideStore 0.7.0 带有应对当前登录问题的配置项，而稳定版中没有这些选项。iloader 每次安装的都是最新的每夜构建；用 iloader 2.4.1 之前的版本装过 LiveContainer 的话，也要重新安装一次，才能开启内存扩展。
 5. **打开开发者模式。**
    到 设置 → 隐私与安全性 → 开发者模式，打开开关，然后按提示重启手机。不打开的话，自签的 app 都无法启动。详见 [Apple 的说明](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device)。
 6. **信任开发者。**
@@ -73,7 +73,7 @@ JIT 需要调试器临时附加到 Hitode 上。在这条自签安装路径中�
    - **方式三**：打开 SideStore，登录同一个 Apple ID，在"My Apps"里点"+"，选中 Hitode 的 IPA。完成后，桌面上会出现 Hitode 的图标。如果打开 Hitode 后提示“未开启内存扩展”，就改用 iloader 的“导入 IPA”安装 Hitode。
 
    SideStore 的具体操作见 [SideStore 文档](https://docs.sidestore.io/)。方式二、方式三要通过 SideStore 安装一次，因为 SideStore 只能续签经它安装的 app。
-   由于近期 Apple 改变了认证方式，各类第三方安装服务受到了不同程度的影响，如果 SideStore 暂时登录不上，可以先用 iloader 的"导入 IPA"安装（IPA 要下载到电脑上），之后用 iloader 续签；等 SideStore 能登录了，再在 SideStore 里安装一次，交给它续签。
+   由于近期 Apple 改变了认证方式，SideStore 登录可能出现报错。如果暂时登录不上，见下方 [SideStore 登录失败或续签出错](#sidestore-登录失败或续签出错)：方式三（以及方式二的 StikDebug）可以先用电脑上 iloader 的“导入 IPA”安装并续签；等 SideStore 能登录了，再在 SideStore 里安装一次交给它续签。
 
 <details>
 <summary>免费 Apple ID 有哪些限制？</summary>
@@ -94,7 +94,18 @@ JIT 需要调试器临时附加到 Hitode 上。在这条自签安装路径中�
 
 LocalDevVPN 只在手机内部建一条本地通道，不会把你的流量发到外部服务器，开着它也能正常上网。该 App 未在中国大陆区的 App Store 上架，请自备一个非中国大陆区的 Apple ID 用于下载或自签安装。
 
-### 2. 放好配对文件
+### 2. 配置 LiveContainer 免 JIT 模式（方式一、方式二）
+
+LiveContainer 需要签名证书才能启动里面安装的 app（方式一关闭了“带 JIT 启动”，且 iOS 26 及以上所有方式都强制要求免 JIT 模式）。用 iloader 安装“LiveContainer + SideStore”后，证书在内置的 SideStore 里，需要手动导入到 LiveContainer：
+
+1. 打开 LiveContainer，点“应用”页左上角的 SideStore 图标打开内置 SideStore，到它的“设置”里登录同一个 Apple ID。
+2. 确认 LocalDevVPN 已连接，在 SideStore 的“My Apps”页点一次“Refresh All”。
+3. 退出 SideStore，回到 LiveContainer 底部的“设置”页，在“免JIT模式”一栏点“从SideStore导入证书”并确认。
+4. “导入证书”按钮变成“移除证书”就说明导入成功；也可以点“免JIT模式诊断”确认配置正常。详见 [LiveContainer + SideStore 文档](https://livecontainer.github.io/docs/installation/lc_sidestore)。
+
+如果第 1 步登录内置 SideStore 报错（如 HTTP 503、`unparseable format`、`-45063`），请直接查看下方 [SideStore 登录失败或续签出错](#sidestore-登录失败或续签出错) 里的对应 issue 进展，或先改用方式三由电脑上的 iloader 直接安装 Hitode。
+
+### 3. 放好配对文件
 
 开启 JIT 需要一个配对文件 `pairingFile.plist`，这个文件要用 iloader 在你自己的电脑上生成。
 
@@ -121,7 +132,7 @@ LocalDevVPN 只在手机内部建一条本地通道，不会把你的流量发�
 > - 不要把 Hitode 的整个文件夹分享给别人，配对文件就在里面。
 > - 如果怀疑泄露了：到 设置 → 通用 → 传输或还原 iPhone → 还原 → 还原位置与隐私，这会清除所有受信任的电脑，已有的配对文件全部失效，重新信任后也不会恢复。然后插线重新信任电脑，用 iloader 生成新的配对文件，重新放进 Hitode 和 SideStore。注意这也会重置所有 app 的位置、照片等权限。
 
-### 3. 开启 JIT
+### 4. 开启 JIT
 
 **方式一、方式三**：
 
@@ -216,7 +227,13 @@ LocalDevVPN 是通的，但手机上没有应答的配对服务。确认 设置 
 
 ### 这台设备不接受当前的配对文件，请用 iloader 重新生成 pairingFile.plist 并重新导入
 
-这份配对文件已经失效，或者不是这台设备的，比如还原过位置与隐私，或者放错了别的设备的文件。请按"一次性设置"第 2 步，用 iloader 为这台设备重新生成 `pairingFile.plist`，再导入 Hitode。
+这份配对文件已经失效，或者不是这台设备的，比如还原过位置与隐私，或者放错了别的设备的文件。请按“一次性设置”第 3 步，用 iloader 为这台设备重新生成 `pairingFile.plist`，再导入 Hitode。
+
+### LiveContainer 提示需要配置免 JIT 模式（JITLess mode is required）
+
+方式一在任何系统上、以及方式二在 iOS 26 及以上系统上，都必须先给 LiveContainer 导入签名证书，否则启动 Hitode 时会在进入应用前直接报错退出（此时打开 LiveContainer 的数据文件夹也只会看到一个 `LCContainerInfo.plist`，不会生成 `Documents`、`Library` 等子文件夹）。
+
+请按“一次性设置”第 2 步完成证书导入。如果已经登录内置 SideStore，点“从SideStore导入证书”时仍提示“证书未找到，你是否登录了内置SideStore？”，可在内置 SideStore 的“设置”底部点“Export Signing Certificate...”导出证书并设置一个密码，再回到 LiveContainer 的“设置 → 免JIT模式”点“导入证书”选中导出的文件。
 
 ### LiveContainer 无法启动 Hitode 的 JIT 扩展
 
@@ -224,7 +241,7 @@ LiveContainer 版本太旧，或者没有打开"启用应用辅助进程"。请�
 
 ### 这是 SideStore 等使用的旧格式配对文件，请选择 StikDebug 使用的 pairingFile.plist
 
-你选中的是 SideStore 用的另一种配对文件。请按"一次性设置"第 2 步，用 iloader 导出 `pairingFile.plist`。
+你选中的是 SideStore 用的另一种配对文件。请按“一次性设置”第 3 步，用 iloader 导出 `pairingFile.plist`。
 
 ### 这不是配对文件，请选择 StikDebug 使用的 pairingFile.plist
 
@@ -232,14 +249,20 @@ LiveContainer 版本太旧，或者没有打开"启用应用辅助进程"。请�
 
 ### SideStore 登录失败或续签出错
 
-比如提示 "Failed to Sign In"、-80045、"数据格式错误"。这是 SideStore 和 Apple 认证之间的问题，和 Hitode 无关。
+比如提示 `503 Service Temporarily Unavailable`、`Invalid server response: unparseable format`、`ADI native error -45063`、`-80045`、`"Failed to Sign In"` 或“数据格式错误”。这是 SideStore 和 Apple 认证接口之间的问题，和 Hitode 无关。遇到这类报错时不要盲目反复重试，也不要点 SideStore 的“撤销证书（Revoke）”，以免影响已安装的其他自签 app。
 
-- 先改用电脑上的 iloader 安装或续签 Hitode，见"安装"第 7 步的备用办法。
-- SideStore 本身的问题和修复进展，请看 [SideStore 文档](https://docs.sidestore.io/) 和它的 [GitHub issues](https://github.com/SideStore/SideStore/issues)。
+- **查看对应报错的追踪 issue 与临时办法**（SideStore 官方发新版修复前可先参考评论区讨论）：
+  - 提示 **503** 或 **`unparseable format`**：见 [SideStore/SideStore#1745](https://github.com/SideStore/SideStore/issues/1745)。
+  - 提示 **`ADI native error -45063`**：见 [SideStore/SideStore#1765](https://github.com/SideStore/SideStore/issues/1765)（与 `#1745` 关联）。
+  - **注意**：上述 issue 里用到的临时设置项（如 `User Customizations`、`Anisette Client Configuration`）仅 **SideStore 每夜构建版（0.7.0）** 提供，稳定版里没有这些选项。如果之前装的是“LiveContainer + SideStore（稳定版）”，需先在电脑上用 iloader 改装“LiveContainer + SideStore（每夜构建版）”（使用同一个 Apple ID 覆盖安装即可，会保留原有数据），再按 issue 中的方法调整。
+  - 其他登录或续签问题，见 [SideStore 文档](https://docs.sidestore.io/) 和 [SideStore GitHub issues](https://github.com/SideStore/SideStore/issues)。
+- **不想折腾临时办法时的替代方案**：
+  - **方式一、方式二**：LiveContainer 需要登录内置 SideStore 来导入免 JIT 证书；若暂时登不上，可以先改用**方式三**——把 Hitode 的 IPA 下载到电脑，用 iloader 的“导入 IPA”直接安装到手机（不依赖 SideStore，7 天后也用 iloader 续签），等 SideStore 官方修复后再切回 LiveContainer。
+  - **方式三**（以及方式二的 StikDebug）：直接用电脑上的 iloader“导入 IPA”安装和续签即可；等 SideStore 恢复后，再在 SideStore 里安装一次交给它续签。
 
 ### 游戏能运行但很卡
 
-在设置页确认“JIT 加速”是否显示“已启用”，未启用时按“一次性设置”第 3 步操作。还要注意：JIT 开启之前就启动的游戏，要退出后重新启动才会用上 JIT。
+在设置页确认“JIT 加速”是否显示“已启用”，未启用时按“一次性设置”第 4 步操作。还要注意：JIT 开启之前就启动的游戏，要退出后重新启动才会用上 JIT。
 
 ## 参考链接
 
