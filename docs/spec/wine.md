@@ -755,6 +755,13 @@ Processor counts and affinity MUST describe eight guest cores in one group, inde
 
 > Note: A setup told to install outside the chosen folder leaves its game elsewhere on drive C:, and its uninstall entry says where.
 
+### WINE-SES-15 Root folders in the chosen folder
+
+**Rule**: With a chosen install folder, a new folder at the root of drive C: MUST lie in that folder. It MUST keep its `C:\` path in later sessions, for opens and for the names handles report. Wine's folders and names the prefix already holds at that root MUST stay in the prefix.
+**Verification**: Test
+
+> Note: Some setups install to a fixed folder at the root of the Windows drive instead of Program Files.
+
 ## Conformance
 
 ### WINE-TEST-1 Wine's own tests

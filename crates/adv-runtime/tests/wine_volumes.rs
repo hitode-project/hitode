@@ -51,7 +51,7 @@ fn with_modules(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
     image
 }
 
-// spec: DEV-DISC-1, DEV-DISC-3, DEV-DISC-4, DEV-DISC-6, DEV-DISC-7, WINE-SES-1, WINE-SES-4, WINE-SES-9, WINE-SES-10
+// spec: DEV-DISC-1, DEV-DISC-3, DEV-DISC-4, DEV-DISC-6, DEV-DISC-7, WINE-SES-1, WINE-SES-4, WINE-SES-9, WINE-SES-10, WINE-SES-15
 #[test]
 fn mounted_volumes_and_install_paths_survive_processes_and_prefix_reuse() {
     let Some(wine::Wine { dist, probes }) = wine::wine() else {
@@ -115,6 +115,11 @@ fn mounted_volumes_and_install_paths_survive_processes_and_prefix_reuse() {
                 std::fs::read(root.join("install/Volume Probe/copied.bin")).unwrap(),
                 b"abcde"
             );
+            assert_eq!(
+                std::fs::read(root.join("install/Volume Root/file.bin")).unwrap(),
+                b"rooted"
+            );
+            assert!(!root.join("prefix/drive_c/Volume Root").exists());
             assert!(
                 !std::fs::read_dir(root.join("prefix"))
                     .unwrap()
@@ -190,6 +195,8 @@ fn mounted_volumes_and_install_paths_survive_processes_and_prefix_reuse() {
             "inherited_read",
             "inherited_map",
             "inherited_install",
+            "root_name",
+            "inherited_root",
         ] {
             assert!(text.contains(&format!("{check}=ok")), "{check}: {text}");
         }

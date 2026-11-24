@@ -37,6 +37,9 @@ int main(void)
         file = open_read(L"C:\\Program Files\\Volume Probe\\renamed.bin");
         check("inherited_install", ReadFile(file, bytes, 9, &count, NULL) && count == 9 && !memcmp(bytes, "installed", 9));
         CloseHandle(file);
+        file = open_read(L"C:\\Volume Root\\file.bin");
+        check("inherited_root", ReadFile(file, bytes, 6, &count, NULL) && count == 6 && !memcmp(bytes, "rooted", 6));
+        CloseHandle(file);
         return 0;
     }
     if (GetFileAttributesA("reset.signal") != INVALID_FILE_ATTRIBUTES) {
@@ -115,6 +118,13 @@ int main(void)
     CloseHandle(installed);
     check("install_rename", MoveFileW(L"C:\\Program Files\\Volume Probe\\file.bin", L"C:\\Program Files\\Volume Probe\\renamed.bin"));
     check("install_copy", CopyFileW(DISC(L"Sub\\\x65e5\x672c.txt"), L"C:\\Program Files\\Volume Probe\\copied.bin", FALSE));
+    /* A folder made at the root of drive C: lies in the chosen folder too. */
+    check("root_folder", CreateDirectoryW(L"C:\\Volume Root", NULL));
+    HANDLE rooted = CreateFileW(L"C:\\Volume Root\\file.bin", GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    check("root_write", rooted != INVALID_HANDLE_VALUE && WriteFile(rooted, "rooted", 6, &count, NULL) && count == 6);
+    WCHAR final[MAX_PATH];
+    check("root_name", GetFinalPathNameByHandleW(rooted, final, MAX_PATH, 0) && !lstrcmpiW(final, L"\\\\?\\C:\\Volume Root\\file.bin"));
+    CloseHandle(rooted);
     SetFilePointer(file, 0, NULL, FILE_BEGIN);
     SetHandleInformation(file, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     SetHandleInformation(mapping, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);

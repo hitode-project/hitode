@@ -24,7 +24,10 @@ pub(super) fn installed(
 ) -> Result<Vec<Installed>, String> {
     let (prefix, _) = host.prefix(config)?;
     let drive_c = files::drive_c(config, &prefix);
-    let program_files = files::installation(options);
+    let chosen = options.install_dir.as_ref().map(|folder| {
+        let folder = folder.canonicalize().unwrap_or_else(|_| folder.clone());
+        adv_nt::file::volume::Install::chosen(folder, &drive_c)
+    });
     let entries = host.serve(config, |socket, shared, time| {
         let (mut connection, _) = adv_nt::server::Connection::connect(socket, shared, time)
             .map_err(|e| format!("registry connection: {e}"))?;
@@ -64,7 +67,7 @@ pub(super) fn installed(
     let mut installed: Vec<Installed> = entries
         .into_iter()
         .filter_map(|(name, location)| {
-            let folder = host_folder(&location, &drive_c, program_files.as_deref())?;
+            let folder = host_folder(&location, &drive_c, chosen.as_ref())?;
             Some(Installed { name, folder })
         })
         .collect();
@@ -106,7 +109,11 @@ fn directory(command: &str) -> Option<String> {
 /// The host folder behind a DOS folder on drive C:, matched without case as
 /// Windows names it. Drive C: itself, its Windows folder and `C:\Program
 /// Files` are where everything lies, so they name no program.
-fn host_folder(dos: &str, drive_c: &Path, program_files: Option<&Path>) -> Option<PathBuf> {
+fn host_folder(
+    dos: &str,
+    drive_c: &Path,
+    chosen: Option<&adv_nt::file::volume::Install>,
+) -> Option<PathBuf> {
     let mut dos = dos.trim().trim_end_matches('\\').to_owned();
     const PROGRAM_FILES: &str = "%ProgramFiles%";
     if dos
@@ -129,10 +136,12 @@ fn host_folder(dos: &str, drive_c: &Path, program_files: Option<&Path>) -> Optio
         return None;
     }
     let mut folder = drive_c.to_owned();
-    if parts[0].eq_ignore_ascii_case("Program Files") {
+    if let Some(chosen) = chosen.filter(|chosen| chosen.holds_root(parts[0])) {
+        folder = chosen.folder().to_owned();
+    } else if parts[0].eq_ignore_ascii_case("Program Files") {
         parts.remove(0);
-        if let Some(root) = program_files {
-            folder = root.to_owned();
+        if let Some(chosen) = chosen {
+            folder = chosen.folder().to_owned();
         } else {
             folder.push("Program Files");
         }
@@ -180,17 +189,26 @@ mod tests {
         std::fs::create_dir_all(drive_c.join("Games/Probe Game")).unwrap();
         std::fs::create_dir_all(drive_c.join("windows")).unwrap();
         std::fs::create_dir_all(custom.join("Vendor/Game")).unwrap();
+        // A setup made `C:\Studio` while the folder was chosen.
+        std::fs::create_dir_all(custom.join("Studio/Game")).unwrap();
+        std::fs::write(custom.join(".hitode-drive-c"), "Studio\n").unwrap();
+        let folder = custom.clone();
+        let custom = adv_nt::file::volume::Install::chosen(custom, &drive_c);
+        assert_eq!(
+            host_folder(r"C:\studio\Game", &drive_c, Some(&custom)), // privacy: allow authored guest path
+            Some(folder.join("Studio/Game"))
+        );
         assert_eq!(
             host_folder(r"c:\games\PROBE GAME\", &drive_c, Some(&custom)),
             Some(drive_c.join("Games/Probe Game"))
         );
         assert_eq!(
             host_folder(r"C:\Program Files\vendor\game", &drive_c, Some(&custom)),
-            Some(custom.join("Vendor/Game"))
+            Some(folder.join("Vendor/Game"))
         );
         assert_eq!(
             host_folder(r"%ProgramFiles%\Vendor\Game", &drive_c, Some(&custom)),
-            Some(custom.join("Vendor/Game"))
+            Some(folder.join("Vendor/Game"))
         );
         for nothing in [
             r"C:\",

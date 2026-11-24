@@ -100,13 +100,134 @@ impl Identity {
     }
 }
 
+/// The host folder behind `C:\Program Files`. A folder the player chose
+/// also holds the folders setups make at the root of drive C:, which a
+/// record in it names for later sessions (WINE-SES-15).
+pub struct Install {
+    folder: PathBuf,
+    roots: Option<Roots>,
+}
+struct Roots {
+    /// Names at the root of the prefix's drive C:, which stay there.
+    kept: Vec<String>,
+    /// Root folders of drive C: that lie in the chosen folder.
+    moved: RefCell<Vec<String>>,
+}
+/// Lists, one per line, the root folders of drive C: a chosen folder holds.
+const RECORD: &str = ".hitode-drive-c";
+/// Wine's own folders at the root of drive C:, before wineboot makes them.
+const SYSTEM: [&str; 5] = [
+    "windows",
+    "users",
+    "ProgramData",
+    "Program Files",
+    "Program Files (x86)",
+];
+
+/// `component` names `long` itself or its short name.
+fn names(component: &str, long: &str) -> bool {
+    component.eq_ignore_ascii_case(long)
+        || component.eq_ignore_ascii_case(&String::from_utf16_lossy(&path::short_name(
+            &long.encode_utf16().collect::<Vec<_>>(),
+        )))
+}
+
+impl Install {
+    /// `C:\Program Files` alone, as a bundled program's folder.
+    pub fn program(folder: PathBuf) -> Self {
+        Self {
+            folder,
+            roots: None,
+        }
+    }
+    /// The folder the player chose, over the prefix's drive C: at `drive_c`.
+    pub fn chosen(folder: PathBuf, drive_c: &Path) -> Self {
+        let mut kept: Vec<String> = SYSTEM.iter().map(|name| (*name).to_owned()).collect();
+        kept.extend(
+            std::fs::read_dir(drive_c)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok()),
+        );
+        let moved = std::fs::read_to_string(folder.join(RECORD))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Self {
+            folder,
+            roots: Some(Roots {
+                kept,
+                moved: RefCell::new(moved),
+            }),
+        }
+    }
+    pub fn folder(&self) -> &Path {
+        &self.folder
+    }
+    /// The root folder of drive C: named `first` lies in the chosen folder.
+    pub fn holds_root(&self, first: &str) -> bool {
+        self.roots
+            .as_ref()
+            .is_some_and(|roots| roots.moved.borrow().iter().any(|moved| names(first, moved)))
+    }
+    /// The host path of `C:\{first}\{tail}` when this folder holds it. A
+    /// new root folder is recorded before it is made; a name the folder holds
+    /// without a record came from Program Files and stays in the prefix.
+    fn host(&self, first: &str, tail: &str) -> Option<PathBuf> {
+        if names(first, "Program Files") {
+            return Some(self.folder.join(tail));
+        }
+        let roots = self.roots.as_ref()?;
+        if first.is_empty() || roots.kept.iter().any(|kept| names(first, kept)) {
+            return None;
+        }
+        if !self.holds_root(first) {
+            let taken = std::fs::read_dir(&self.folder)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| names(first, name))
+                });
+            if taken {
+                return None;
+            }
+            let mut moved = roots.moved.borrow_mut();
+            moved.push(first.to_owned());
+            std::fs::create_dir_all(&self.folder)
+                .and_then(|()| std::fs::write(self.folder.join(RECORD), moved.join("\n") + "\n"))
+                .ok()?;
+        }
+        Some(self.folder.join(first).join(tail))
+    }
+    /// The DOS path of `host` in this folder.
+    pub fn dos(&self, host: &Path) -> Option<String> {
+        let relative = host.strip_prefix(&self.folder).ok()?;
+        let relative = relative.to_str()?.replace('/', "\\");
+        let first = relative.split('\\').next().unwrap_or_default();
+        Some(if !first.is_empty() && self.holds_root(first) {
+            format!(r"C:\{relative}")
+        } else if relative.is_empty() {
+            r"C:\Program Files".into()
+        } else {
+            format!(r"C:\Program Files\{relative}")
+        })
+    }
+}
+
 /// A family shares its mount namespace and immutable file identities.
 #[derive(Clone, Default)]
 pub struct Mounts(Rc<Namespace>);
 #[derive(Default)]
 struct Namespace {
     registered: Cell<bool>,
-    install: Option<PathBuf>,
+    install: Option<Install>,
     root: Option<PathBuf>,
     /// A drive's medium changes in place (WINE-SES-13); open files keep theirs.
     volumes: RefCell<BTreeMap<char, Rc<Mounted>>>,
@@ -146,7 +267,7 @@ impl Drop for Namespace {
     }
 }
 impl Mounts {
-    pub fn new(install: Option<PathBuf>, root: Option<PathBuf>) -> Self {
+    pub fn new(install: Option<Install>, root: Option<PathBuf>) -> Self {
         Self(Rc::new(Namespace {
             registered: Cell::new(false),
             install,
@@ -258,14 +379,8 @@ impl Mounts {
             && let Some(install) = &self.0.install
         {
             let (first, tail) = rest.split_once('\\').unwrap_or((rest, ""));
-            let short = path::short_name(&"Program Files".encode_utf16().collect::<Vec<_>>());
-            if first.eq_ignore_ascii_case("Program Files")
-                || first.eq_ignore_ascii_case(&String::from_utf16_lossy(&short))
-            {
-                let name = format!(
-                    r"\??\unix{}\{tail}",
-                    install.to_string_lossy().replace('/', "\\")
-                );
+            if let Some(host) = install.host(first, tail) {
+                let name = format!(r"\??\unix{}", host.to_string_lossy().replace('/', "\\"));
                 return Some(path::lookup(
                     devices,
                     &name.encode_utf16().collect::<Vec<_>>(),
@@ -396,14 +511,7 @@ impl Mounts {
                 .any(|root| host.starts_with(root))
     }
     pub fn nt_name(&self, host: &Path) -> Option<String> {
-        let install = self.0.install.as_ref()?;
-        let relative = host.strip_prefix(install).ok()?;
-        let relative = relative.to_string_lossy().replace('/', "\\");
-        Some(if relative.is_empty() {
-            r"\??\C:\Program Files".into()
-        } else {
-            format!(r"\??\C:\Program Files\{relative}")
-        })
+        Some(format!(r"\??\{}", self.0.install.as_ref()?.dos(host)?))
     }
     fn of_fd(&self, fd: RawFd) -> Option<Rc<Identity>> {
         if self.0.identities.borrow().is_empty() {
@@ -537,6 +645,56 @@ pub fn read_all(mounts: &Mounts, fd: std::os::fd::RawFd) -> std::io::Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: WINE-SES-15
+    #[test]
+    fn a_chosen_folder_takes_new_root_folders_of_drive_c_and_names_them_there() {
+        let root = std::env::temp_dir().join(format!("adv-install-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (drive_c, folder) = (root.join("drive_c"), root.join("chosen"));
+        std::fs::create_dir_all(drive_c.join("Old")).unwrap();
+        std::fs::create_dir_all(folder.join("Vendor")).unwrap();
+        let install = Install::chosen(folder.clone(), &drive_c);
+        // Program Files, by its long or short name.
+        let short = String::from_utf16_lossy(&path::short_name(
+            &"Program Files".encode_utf16().collect::<Vec<_>>(),
+        ));
+        for name in ["program files", short.as_str()] {
+            assert_eq!(install.host(name, "Vendor"), Some(folder.join("Vendor")));
+        }
+        // Wine's folders, the prefix's own root names and Program Files'
+        // folders stay where they are.
+        for kept in ["windows", "old", "vendor", ""] {
+            assert_eq!(install.host(kept, "x"), None, "{kept}");
+        }
+        assert_eq!(
+            install.host("Studio", "a.txt"),
+            Some(folder.join("Studio/a.txt"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(folder.join(RECORD)).unwrap(),
+            "Studio\n"
+        );
+        std::fs::create_dir_all(folder.join("Studio")).unwrap();
+        // A later session names both folders as their setups did.
+        let later = Install::chosen(folder.clone(), &drive_c);
+        assert_eq!(later.host("STUDIO", "b"), Some(folder.join("STUDIO/b")));
+        assert_eq!(
+            later.dos(&folder.join("Studio/a.txt")).as_deref(),
+            Some(r"C:\Studio\a.txt") // privacy: allow authored guest path
+        );
+        assert_eq!(
+            later.dos(&folder.join("Vendor/game.exe")).as_deref(),
+            Some(r"C:\Program Files\Vendor\game.exe")
+        );
+        assert_eq!(later.dos(&folder).as_deref(), Some(r"C:\Program Files"));
+        // A bundled program's folder is Program Files alone.
+        assert_eq!(
+            Install::program(folder.clone()).host("Studio", "a.txt"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     // spec: NT-FILE-5
     #[test]

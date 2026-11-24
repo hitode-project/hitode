@@ -2,7 +2,7 @@
 //! No ISO parsing or file data is duplicated here. The family retains the VFS,
 //! its media owners and its shared lazy section pages through NT mount owners.
 use super::*;
-use adv_nt::file::volume::{Entry, Info, Mounts, ReadFile, Volume};
+use adv_nt::file::volume::{Entry, Info, Install, Mounts, ReadFile, Volume};
 use adv_os::vfs::{DirEntry, FileSection, OpticalFile};
 use std::io;
 
@@ -188,6 +188,7 @@ fn place(
     config: &Config<'_>,
     options: &SessionOptions,
     drive_c: &Path,
+    chosen: Option<&Install>,
 ) -> Result<Placement, String> {
     let Some(exe) = config.exe else {
         return Ok(Placement {
@@ -200,13 +201,9 @@ fn place(
         .map_err(|e| e.to_string())?;
     // Containment is decided on resolved paths; the drive links the path as given.
     let resolved = game.canonicalize().unwrap_or_else(|_| game.clone());
-    let program_files = installation(options);
     let (directory, drive, install) = if let Some(dos) = below(&resolved, drive_c, r"C:\") {
         (with_slash(dos), None, None)
-    } else if let Some(dos) = program_files
-        .as_deref()
-        .and_then(|root| below(&resolved, root, r"C:\Program Files\"))
-    {
+    } else if let Some(dos) = chosen.and_then(|chosen| chosen.dos(&resolved)) {
         // Installed through `install_dir`: where its setup put it.
         (with_slash(dos), None, None)
     } else if options.install_dir.is_none() && needs_subdirectory_launch(exe) {
@@ -224,10 +221,17 @@ fn place(
     })
 }
 
-/// The host folder behind `C:\Program Files`, when the options give one.
-pub(super) fn installation(options: &SessionOptions) -> Option<PathBuf> {
-    let root = options.install_dir.as_ref()?;
-    Some(root.canonicalize().unwrap_or_else(|_| root.clone()))
+/// The folder the options choose for programs on drive C:, made if missing.
+pub(super) fn installation(
+    options: &SessionOptions,
+    drive_c: &Path,
+) -> Result<Option<Install>, String> {
+    let Some(folder) = &options.install_dir else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+    let folder = folder.canonicalize().map_err(|e| e.to_string())?;
+    Ok(Some(Install::chosen(folder, drive_c)))
 }
 
 /// Drive letters from D: that neither a disc nor `taken` uses.
@@ -254,11 +258,12 @@ pub(super) fn prepare(
     prefix: &Path,
 ) -> Result<Prepared, String> {
     let drive_c = drive_c(config, prefix);
+    let chosen = installation(options, &drive_c)?;
     let Placement {
         folder,
         drive,
-        mut install,
-    } = place(config, options, &drive_c)?;
+        install,
+    } = place(config, options, &drive_c, chosen.as_ref())?;
     let mut links: Vec<(char, PathBuf)> = Vec::new();
     if let (Some(letter), Some((game, _))) = (drive, &folder) {
         links.push((letter, game.clone()));
@@ -289,9 +294,7 @@ pub(super) fn prepare(
                     below(&path, &game, directory)
                 })
                 .or_else(|| below(&path, &drive_c, r"C:\"))
-                .or_else(|| {
-                    installation(options).and_then(|root| below(&path, &root, r"C:\Program Files\"))
-                });
+                .or_else(|| chosen.as_ref().and_then(|chosen| chosen.dos(&path)));
             let dos = match dos {
                 Some(dos) => dos,
                 None => {
@@ -364,10 +367,6 @@ pub(super) fn prepare(
         .iter()
         .map(|(letter, image)| Ok((*letter, disc(*letter, image, codepage)?)))
         .collect::<Result<Vec<_>, String>>()?;
-    if let Some(path) = &options.install_dir {
-        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
-        install = Some(path.canonicalize().map_err(|e| e.to_string())?);
-    }
     let mut replacements: Vec<(PathBuf, Vec<u8>)> = folder
         .as_ref()
         .and_then(|(game, _)| crate::reallive::configuration(game))
@@ -395,7 +394,7 @@ pub(super) fn prepare(
         std::fs::create_dir(&root).map_err(|e| e.to_string())?;
         Some(root.canonicalize().map_err(|e| e.to_string())?)
     };
-    let mut mounts = Mounts::new(install, root.clone());
+    let mut mounts = Mounts::new(chosen.or(install.map(Install::program)), root.clone());
     for (letter, volume) in discs {
         let path = root
             .as_ref()
@@ -495,7 +494,7 @@ mod tests {
         }
     }
 
-    // spec: WINE-SES-1, WINE-SES-11, WINE-SES-12
+    // spec: WINE-SES-1, WINE-SES-11, WINE-SES-12, WINE-SES-15
     #[test]
     fn programs_keep_their_drive_c_and_install_paths_and_others_take_a_drive() {
         let root = std::env::temp_dir().join(format!("adv-programs-{}", std::process::id()));
@@ -556,6 +555,15 @@ mod tests {
         assert_eq!(
             start(Some(&custom.join("game.exe")), &into_custom).0,
             r"C:\Program Files\Vendor\Game\game.exe"
+        );
+        // One its setup made at the root of drive C: keeps that path (WINE-SES-15).
+        let studio = root.join("custom/Studio/Game");
+        std::fs::create_dir_all(&studio).unwrap();
+        write_pe(&studio.join("game.exe"), ".text", b"");
+        std::fs::write(root.join("custom/.hitode-drive-c"), "Studio\n").unwrap();
+        assert_eq!(
+            start(Some(&studio.join("game.exe")), &into_custom).0,
+            r"C:\Studio\Game\game.exe" // privacy: allow authored guest path
         );
         // A tool in the game folder starts in its own directory there.
         assert_eq!(
