@@ -101,21 +101,19 @@ impl Playback {
         exe: std::path::PathBuf,
         data_dir: std::path::PathBuf,
         codepage: u32,
+        (setup, program_files): (Option<String>, Option<std::path::PathBuf>),
     ) -> Result<adv_shell::Options, String> {
-        let exe = match &self.exe {
-            Some(target) => {
-                let candidate = std::path::Path::new(target);
-                if candidate.is_relative() {
-                    exe.parent()
-                        .ok_or("the program has no directory")?
-                        .join(candidate)
-                } else {
-                    candidate.to_path_buf()
-                }
+        // Another program of the game runs on the game's drives, its folder
+        // still the program drive (WINE-SES-12).
+        let program = self.exe.as_ref().map(|target| {
+            let candidate = std::path::Path::new(target);
+            match exe.parent() {
+                Some(folder) if candidate.is_relative() => folder.join(candidate),
+                _ => candidate.to_path_buf(),
             }
-            None => exe,
-        };
-        match std::fs::metadata(&exe) {
+        });
+        match std::fs::metadata(program.as_deref().unwrap_or(&exe)) {
+            _ if setup.is_some() => {}
             Ok(meta) if meta.is_file() => {}
             Ok(_) => return Err("launch_missing_file".into()),
             Err(error) => {
@@ -127,6 +125,19 @@ impl Playback {
             }
         }
         let mut options = self.options(exe, data_dir.clone(), codepage)?;
+        options.program = program.map(|path| adv_shell::Program {
+            image: adv_shell::ProgramImage::Host(path),
+            arguments: String::new(),
+        });
+        // A pending install runs its disc's setup with no game yet; both put
+        // `C:\Program Files` in the folder the player chose.
+        if let Some(setup) = setup {
+            options.run_alone(adv_shell::Program {
+                image: adv_shell::ProgramImage::Guest(setup),
+                arguments: String::new(),
+            });
+        }
+        options.install_dir = program_files;
         crate::drive::apply(app, &mut options)?;
         if let Ok(cache_root) = app.path().app_cache_dir() {
             let gpu_root = cache_root.join("gpu");

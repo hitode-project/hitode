@@ -693,10 +693,10 @@ pub(crate) fn run_cli(options: Options) -> Result<u8, String> {
         &format!(
             "ADV — {}",
             options
-                .exe
-                .file_name()
+                .started()
+                .rsplit(['/', '\\'])
+                .next()
                 .unwrap_or_default()
-                .to_string_lossy()
         ),
         options.width,
         options.height,

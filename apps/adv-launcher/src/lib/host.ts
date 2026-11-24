@@ -18,6 +18,13 @@ export interface LibraryGame {
   favorite: boolean; nsfw: boolean; sessions: PlaySession[];
   offline: "disk" | "missing" | null;
   daily: Record<string, number>; lastRun: LastRun | null;
+  /** Until its setup has run: the setup on the game's first disc. */
+  setup?: string;
+  /** The folder its setup installed into, behind `C:\Program Files`. */
+  programFiles?: string;
+}
+export interface DiscInspection {
+  label: string; bytes: number; programs: string[]; codepage: Codepage;
 }
 export interface ExeCandidate {
   path: string; size: number; arch: "x86" | "x64" | "other"; codepage: Codepage;
@@ -79,6 +86,12 @@ export function libraryScan(root: string, depth: number): Promise<ScanFound[]> {
 }
 export function libraryAdd(folder: string, exe: string, codepage: Codepage, title: string): Promise<LibraryGame | null> {
   return call("library_add", { folder, exe, codepage, title }, null);
+}
+export function libraryInspectDisc(path: string): Promise<DiscInspection | null> {
+  return call("library_inspect_disc", { path }, null);
+}
+export function libraryAddInstall(target: string | null, setup: string, codepage: Codepage, title: string): Promise<LibraryGame | null> {
+  return call("library_add_install", { target, setup, codepage, title }, null);
 }
 export function libraryUpdate(id: string, patch: GamePatch): Promise<LibraryGame | null> {
   return call("library_update", { id, patch }, null);

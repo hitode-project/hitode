@@ -80,128 +80,98 @@ pub(super) fn restore(
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     match extension.as_str() {
-        "reg" => import_reg(host, config, options, file),
+        "reg" => import_reg(host, config, file),
         "bat" | "cmd" => run_batch(host, config, options, file),
         _ => Err("unsupported registry file (expected .reg or .bat)".into()),
     }
 }
 
-fn import_reg(
-    host: &mut Host,
-    config: &Config<'_>,
-    options: &SessionOptions,
-    file: &Path,
-) -> Result<RegistryReport, String> {
+fn import_reg(host: &mut Host, config: &Config<'_>, file: &Path) -> Result<RegistryReport, String> {
     let raw = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let codepage = codepage_for_locale(config.locale);
     let actions = parse_reg(&raw, codepage)?;
 
-    host.check(config)?;
-    let (prefix, drive) = host.prefix(config)?;
-    let prepared = files::prepare(config, options, &prefix)?;
-    let wake = WakeEvent::new().map_err(|e| e.to_string())?;
-    let mut clock = adv_machine::Clock::real();
-    let mut shared = host.connect(config, &mut clock, &wake, prepared.mounts.clone())?;
-    let _lease = host::Lease(shared.clone());
-    let socket = shared
-        .driver
-        .borrow()
-        .server
-        .socket_dir()
-        .ok_or("the server has no socket")?;
+    host.serve(config, |socket, shared, time| {
+        let (mut connection, _) = adv_nt::server::Connection::connect(socket, shared, time)
+            .map_err(|e| format!("registry connection: {e}"))?;
+        let mut client = RegistryClient::new(&mut connection, shared, time);
+        let user_key = client
+            .user_key()
+            .map_err(|e| format!("resolve user registry hive: {e:?}"))?;
 
-    ensure_booted(
-        host,
-        config,
-        &prefix,
-        &drive,
-        &socket,
-        &mut clock,
-        &wake,
-        &shared,
-        &prepared.mounts,
-    )?;
-
-    let time = Time::now(&mut clock);
-    let (mut connection, _) = adv_nt::server::Connection::connect(&socket, &mut shared, time)
-        .map_err(|e| format!("registry connection: {e}"))?;
-    let mut client = RegistryClient::new(&mut connection, &mut shared, time);
-    let user_key = client
-        .user_key()
-        .map_err(|e| format!("resolve user registry hive: {e:?}"))?;
-
-    let mut report = RegistryReport::default();
-    let mut keys_with_values = BTreeSet::new();
-    for action in &actions {
-        if let RegAction::SetValue { key, .. } | RegAction::DeleteValue { key, .. } = action {
-            keys_with_values.insert(key.to_ascii_lowercase());
+        let mut report = RegistryReport::default();
+        let mut keys_with_values = BTreeSet::new();
+        for action in &actions {
+            if let RegAction::SetValue { key, .. } | RegAction::DeleteValue { key, .. } = action {
+                keys_with_values.insert(key.to_ascii_lowercase());
+            }
         }
-    }
 
-    for action in actions {
-        match action {
-            RegAction::CreateKey { path, wow64 } => {
-                let Some(nt_path) = resolve_nt_path(&path, &user_key) else {
-                    continue;
-                };
-                client
-                    .create_key(&nt_path)
-                    .map_err(|e| format!("create key {path}: {e:?}"))?;
-                // Count empty keys only; keys with values count their values instead.
-                if !keys_with_values.contains(&path.to_ascii_lowercase()) {
+        for action in actions {
+            match action {
+                RegAction::CreateKey { path, wow64 } => {
+                    let Some(nt_path) = resolve_nt_path(&path, &user_key) else {
+                        continue;
+                    };
+                    client
+                        .create_key(&nt_path)
+                        .map_err(|e| format!("create key {path}: {e:?}"))?;
+                    // Count empty keys only; keys with values count their values instead.
+                    if !keys_with_values.contains(&path.to_ascii_lowercase()) {
+                        report.entries += 1;
+                        if wow64 {
+                            report.normalized_wow64 += 1;
+                        }
+                    }
+                }
+                RegAction::DeleteKey { path } => {
+                    let Some(nt_path) = resolve_nt_path(&path, &user_key) else {
+                        continue;
+                    };
+                    if is_protected_root(&nt_path, &user_key) {
+                        continue;
+                    }
+                    if client
+                        .delete_key_tree(&nt_path)
+                        .map_err(|e| format!("delete key {path}: {e:?}"))?
+                    {
+                        report.entries += 1;
+                    }
+                }
+                RegAction::SetValue {
+                    key,
+                    name,
+                    kind,
+                    data,
+                    wow64,
+                } => {
+                    let Some(nt_path) = resolve_nt_path(&key, &user_key) else {
+                        continue;
+                    };
+                    client
+                        .set_value(&nt_path, &name, kind, &data)
+                        .map_err(|e| format!("set value {key}\\{name}: {e:?}"))?;
                     report.entries += 1;
                     if wow64 {
                         report.normalized_wow64 += 1;
                     }
                 }
-            }
-            RegAction::DeleteKey { path } => {
-                let Some(nt_path) = resolve_nt_path(&path, &user_key) else {
-                    continue;
-                };
-                if is_protected_root(&nt_path, &user_key) {
-                    continue;
-                }
-                if client
-                    .delete_key_tree(&nt_path)
-                    .map_err(|e| format!("delete key {path}: {e:?}"))?
-                {
-                    report.entries += 1;
-                }
-            }
-            RegAction::SetValue {
-                key,
-                name,
-                kind,
-                data,
-                wow64,
-            } => {
-                let Some(nt_path) = resolve_nt_path(&key, &user_key) else {
-                    continue;
-                };
-                client
-                    .set_value(&nt_path, &name, kind, &data)
-                    .map_err(|e| format!("set value {key}\\{name}: {e:?}"))?;
-                report.entries += 1;
-                if wow64 {
-                    report.normalized_wow64 += 1;
-                }
-            }
-            RegAction::DeleteValue { key, name } => {
-                let Some(nt_path) = resolve_nt_path(&key, &user_key) else {
-                    continue;
-                };
-                if client
-                    .delete_value(&nt_path, &name)
-                    .map_err(|e| format!("delete value {key}\\{name}: {e:?}"))?
-                {
-                    report.entries += 1;
+                RegAction::DeleteValue { key, name } => {
+                    let Some(nt_path) = resolve_nt_path(&key, &user_key) else {
+                        continue;
+                    };
+                    if client
+                        .delete_value(&nt_path, &name)
+                        .map_err(|e| format!("delete value {key}\\{name}: {e:?}"))?
+                    {
+                        report.entries += 1;
+                    }
                 }
             }
         }
-    }
-    drop(connection);
-    Ok(report)
+        drop(connection);
+        Ok(report)
+    })
 }
 
 fn run_batch(
@@ -210,38 +180,26 @@ fn run_batch(
     options: &SessionOptions,
     file: &Path,
 ) -> Result<RegistryReport, String> {
-    host.check(config)?;
-    let exe = std::path::absolute(config.exe).map_err(|e| e.to_string())?;
-    let game_dir = exe
-        .parent()
-        .ok_or("the program has no directory")?
-        .canonicalize()
+    let exe = config
+        .exe
+        .ok_or("registry scripts run in a game's folder")?;
+    let game_dir = std::path::absolute(exe.parent().ok_or("the program has no directory")?)
+        .and_then(|dir| dir.canonicalize())
         .map_err(|e| e.to_string())?;
     let canonical_bat = file.canonicalize().map_err(|e| e.to_string())?;
     let inside_game = canonical_bat
         .strip_prefix(&game_dir)
         .ok()
         .map(Path::to_owned);
-
     let raw = std::fs::read(&canonical_bat).map_err(|e| format!("{}: {e}", file.display()))?;
     let codepage = codepage_for_locale(config.locale);
     let (prefix, drive) = host.prefix(config)?;
-    let config = Config {
-        exe: &exe,
-        ..*config
-    };
-
-    // Prepare the game's exact mount layout first so we know its guest drive letter.
-    let mut prepared = if inside_game.is_some() {
-        let sanitized = sanitize_batch(&raw, codepage, None);
-        files::prepare_with_replacement(
-            &config,
-            options,
-            &prefix,
-            Some((&canonical_bat, sanitized)),
-        )?
-    } else {
-        files::prepare(&config, options, &prefix)?
+    let directory = files::program_directory(config, options, &prefix)?;
+    let mut options = SessionOptions {
+        cdroms: options.cdroms.clone(),
+        install_dir: options.install_dir.clone(),
+        replacements: options.replacements.clone(),
+        ..SessionOptions::default()
     };
 
     struct TempGuard(Option<PathBuf>);
@@ -255,13 +213,17 @@ fn run_batch(
 
     let mut _temp_bat = TempGuard(None);
     let guest_bat = if let Some(relative) = inside_game {
+        // The guest reads the sanitized copy in place of the script.
+        options
+            .replacements
+            .push((canonical_bat, sanitize_batch(&raw, codepage, None)));
         let relative = relative
             .to_str()
             .ok_or("batch path is not valid Unicode")?
             .replace('/', "\\");
-        format!("{}{relative}", prepared.directory)
+        format!("{directory}{relative}")
     } else {
-        let sanitized = sanitize_batch(&raw, codepage, Some(&prepared.directory));
+        let sanitized = sanitize_batch(&raw, codepage, Some(&directory));
         let temp_dir = drive.join("windows/temp");
         std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
         let name = format!("hitode-reg-{}.bat", std::process::id());
@@ -271,129 +233,26 @@ fn run_batch(
         format!(r"C:\windows\temp\{name}")
     };
 
-    let wake = WakeEvent::new().map_err(|e| e.to_string())?;
-    let mut clock = adv_machine::Clock::real();
-    let mut shared = host.connect(&config, &mut clock, &wake, prepared.mounts.clone())?;
-    let _lease = host::Lease(shared.clone());
-    let socket = shared
-        .driver
-        .borrow()
-        .server
-        .socket_dir()
-        .ok_or("the server has no socket")?;
-
-    ensure_booted(
-        host,
-        &config,
-        &prefix,
-        &drive,
-        &socket,
-        &mut clock,
-        &wake,
-        &shared,
-        &prepared.mounts,
-    )?;
-
-    let before = snapshot_watched(&socket, &mut shared, Time::now(&mut clock))?;
-
-    let module = |name: &str| {
-        let path = config.dist.join(MODULES).join(name);
-        std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
-    };
-    let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
-
-    let dev_null = File::open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
     let log_path = prefix.join(format!(".hitode-reg-log-{}", std::process::id()));
     let _log_guard = TempGuard(Some(log_path.clone()));
     let output_write =
         File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
+    options.program = Some(Program {
+        image: Image::Guest(CMD_EXE.into()),
+        arguments: format!("/d /c \"{guest_bat}\""),
+        // The program directory, as when the script is opened there.
+        directory: Some(directory.clone()),
+        output: Some(output_write.as_raw_fd()),
+    });
 
-    let process_config = Config {
-        fonts: "",
-        ..config
-    };
-    let audio = adv_device::AudioControl::new(true);
-    let mut machine = new_machine(&process_config, &drive, clock.clone(), &wake, &audio)?;
-    machine.cpu.executor_mut().use_tier1_only();
-    let mounts = std::mem::take(&mut prepared.mounts);
-    machine.ext.insert(mounts);
-    let stub_gaps = Rc::new(RefCell::new(adv_nt::exception::StubGaps::default()));
-    machine.ext.insert(stub_gaps.clone());
-    let links = Rc::new(RefCell::new(adv_nt::unix::Links::default()));
-    machine.ext.insert(links.clone());
-    let milestones = std::sync::Arc::new(adv_device::Milestones::default());
-    machine.ext.insert(milestones.clone());
-    machine.ext.get_mut::<SurfaceStore>().milestones = Some(milestones.clone());
-
-    let command_line = format!("\"{CMD_EXE}\" /d /c \"{guest_bat}\"");
-    let startup = Startup {
-        image: CMD_EXE,
-        command_line: &command_line,
-        directory: &prepared.directory,
-        environment: ENVIRONMENT,
-        locale: config.locale,
-        debug: config.debug,
-        stdin: Some(dev_null.as_raw_fd()),
-        stdout: Some(output_write.as_raw_fd()),
-        stderr: Some(output_write.as_raw_fd()),
-        graphics_driver: super::super::GRAPHICS_DRIVER,
-        fonts: "",
-    };
-    let started = process::start(
-        &mut machine,
-        &ntdll,
-        &apisets,
-        &startup,
-        &prefix,
-        &socket,
-        Box::new(shared.clone()),
-    )
-    .map_err(|e| format!("cmd.exe: {e}"))?;
-    drop(dev_null);
-    drop(output_write);
-    adv_nt::identity::note_ntdll(&mut machine, &config.dist.join(NTDLL), &ntdll);
-    shared.id.set(started.thread.unix_pid);
-    machine.ext.insert(process::Children::default());
-    machine.ext.insert(shared.clone());
-
-    let fonts = host
-        .fonts
-        .prepare(&process_config, &drive, &SessionOptions::default())?;
-    let mut session = Session {
-        machine,
-        failed_process: None,
-        stub_gaps,
-        links,
-        milestones,
-        _lease: host::Lease(shared.clone()),
-        wake,
-        audio,
-        metrics: ControlMetrics::default(),
-        fonts,
-        foreground: shared.id.get(),
-        delivered: 0,
-        retired_debug: [0; 8],
-        retired_boundaries: Default::default(),
-        shared: shared.clone(),
-        finished: None,
-        idle: BTreeMap::new(),
-        settings: Settings {
-            exe: exe.clone(),
-            dist: config.dist.to_owned(),
-            prefix: prefix.clone(),
-            drive: drive.clone(),
-            locale: config.locale,
-            fonts: String::new(),
-            debug: config.debug.to_owned(),
-            width: config.width,
-            height: config.height,
-            jit: config.jit,
-            ntdll,
-            apisets,
-        },
-    };
+    let before = host.serve(config, |socket, shared, time| {
+        snapshot_watched(socket, shared, time)
+    })?;
+    let wake = WakeEvent::new().map_err(|e| e.to_string())?;
+    let mut session = host.start(config, wake, &options, |_| Ok(()))?;
     let stop = session.run(Instant::now() + BATCH_TIMEOUT);
     drop(session);
+    drop(output_write);
 
     let mut raw_output = Vec::new();
     if let Ok(file) = File::open(&log_path) {
@@ -401,7 +260,9 @@ fn run_batch(
     }
     let output_text = decode_text(&raw_output, codepage).trim().to_owned();
 
-    let report = sync_and_count(&socket, &mut shared, Time::now(&mut clock), &before)?;
+    let report = host.serve(config, |socket, shared, time| {
+        sync_and_count(socket, shared, time, &before)
+    })?;
     match stop {
         Stop::Exited(0) => Ok(report),
         Stop::Exited(_) if report.entries > 0 => Ok(report),
@@ -424,76 +285,6 @@ fn run_batch(
         }
         Stop::Failed(error) => Err(error),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn ensure_booted(
-    host: &mut Host,
-    config: &Config<'_>,
-    prefix: &Path,
-    drive: &Path,
-    socket: &Path,
-    clock: &mut adv_machine::Clock,
-    wake: &WakeEvent,
-    shared: &Shared,
-    mounts: &adv_nt::file::volume::Mounts,
-) -> Result<(), String> {
-    if host.booted() {
-        return Ok(());
-    }
-    let module = |name: &str| {
-        let path = config.dist.join(MODULES).join(name);
-        std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
-    };
-    let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
-    let process_config = Config {
-        fonts: "",
-        ..*config
-    };
-    let audio = adv_device::AudioControl::new(true);
-    let mut boot = new_machine(&process_config, drive, clock.clone(), wake, &audio)?;
-    boot.cpu.executor_mut().use_tier1_only();
-    boot.ext.insert(mounts.clone());
-    let command_line = format!("\"{WINEBOOT}\" --restart");
-    let startup = Startup {
-        image: WINEBOOT,
-        command_line: &command_line,
-        directory: r"C:\windows\system32\",
-        environment: ENVIRONMENT,
-        locale: config.locale,
-        debug: config.debug,
-        stdin: None,
-        stdout: None,
-        stderr: None,
-        graphics_driver: super::super::GRAPHICS_DRIVER,
-        fonts: "",
-    };
-    process::start(
-        &mut boot,
-        &ntdll,
-        &apisets,
-        &startup,
-        prefix,
-        socket,
-        Box::new(shared.clone()),
-    )
-    .map_err(|e| format!("wineboot: {e}"))?;
-    boot.ext.insert(shared.clone());
-    adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), &ntdll);
-    match run(
-        &mut boot,
-        wake,
-        Instant::now() + BOOT,
-        |_| Ok(false),
-        None,
-        None,
-    ) {
-        Stop::Exited(0) => {}
-        stop => return Err(format!("wineboot: {stop:?}")),
-    }
-    drop(boot);
-    host.finish_boot();
-    Ok(())
 }
 
 struct WatchedSnapshot {

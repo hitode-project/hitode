@@ -136,8 +136,8 @@ pub(crate) mod mobile;
 /// The guest dialog and menu data a mobile host's overlay draws and answers.
 #[cfg(mobile)]
 pub use adv_runtime::{
-    DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow, MenuBar,
-    MenuCommand, MenuEvent, MenuItem,
+    ControlKind, DialogControl, DialogEvent, DialogFont, DialogImage, DialogSet, DialogTarget,
+    DialogWindow, MenuBar, MenuCommand, MenuEvent, MenuItem, control_kind,
 };
 #[cfg(target_os = "ios")]
 pub use mobile::GameContainer;

@@ -179,6 +179,9 @@ class Runs {
     if ("error" in event && !stopped) {
       this.errors[id] = event.error;
       if (showing) nav.replace({ name: "launch", gameId: id });
+    } else if (library.get(id)?.setup) {
+      // A setup that ran picks what it installed next.
+      if (showing) nav.replace({ name: "install", gameId: id });
     } else {
       // Back to the game's detail in the library; a stop the user asked for
       // (even a forced one, which reports an error) is a normal end.

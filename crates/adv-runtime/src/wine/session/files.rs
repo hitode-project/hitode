@@ -69,10 +69,16 @@ impl Volume for OpticalVolume {
     }
 }
 
-/// Drive and mount layout prepared for a Wine session.
+/// Drive and mount layout prepared for a Wine session, and its main image.
 pub(super) struct Prepared {
     pub mounts: Mounts,
-    pub directory: String,
+    /// The DOS path of the main image, its command line and the directory it
+    /// starts in.
+    pub image: String,
+    pub command_line: String,
+    pub start: String,
+    /// The main image on the host, when it has one.
+    pub host_image: Option<PathBuf>,
 }
 
 /// Whether `exe` carries an appended virtual filesystem bundle whose path
@@ -116,49 +122,218 @@ fn needs_subdirectory_launch(exe: &Path) -> bool {
     file.read_exact(&mut magic).is_ok() && &magic == b"XOJUMANJ"
 }
 
+/// `path` below `root` as a DOS path under `base`, which ends in a backslash.
+fn below(path: &Path, root: &Path, base: &str) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut dos = base.to_owned();
+    for part in relative.components() {
+        if !dos.ends_with('\\') {
+            dos.push('\\');
+        }
+        dos.push_str(part.as_os_str().to_str()?);
+    }
+    Some(dos)
+}
+
+fn with_slash(mut directory: String) -> String {
+    if !directory.ends_with('\\') {
+        directory.push('\\');
+    }
+    directory
+}
+
+/// A DOS path names a drive or a UNC share; anything else is relative.
+fn absolute_dos(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.get(1) == Some(&b':') || path.starts_with(r"\\")
+}
+
+/// Where the program folder appears: on drive C: when it lies there, in
+/// Program Files for a bundled VFS program, otherwise on the first free drive.
+struct Placement {
+    /// The host folder and its DOS directory, ending in a backslash.
+    folder: Option<(PathBuf, String)>,
+    /// The drive the folder takes, if any.
+    drive: Option<char>,
+    /// The host directory `C:\Program Files` shows instead of the prefix's.
+    install: Option<PathBuf>,
+}
+
+fn place(
+    config: &Config<'_>,
+    options: &SessionOptions,
+    drive_c: &Path,
+) -> Result<Placement, String> {
+    let Some(exe) = config.exe else {
+        return Ok(Placement {
+            folder: None,
+            drive: None,
+            install: None,
+        });
+    };
+    let game = std::path::absolute(exe.parent().ok_or("the program has no directory")?)
+        .map_err(|e| e.to_string())?;
+    // Containment is decided on resolved paths; the drive links the path as given.
+    let resolved = game.canonicalize().unwrap_or_else(|_| game.clone());
+    let program_files = installation(options);
+    let (directory, drive, install) = if let Some(dos) = below(&resolved, drive_c, r"C:\") {
+        (with_slash(dos), None, None)
+    } else if let Some(dos) = program_files
+        .as_deref()
+        .and_then(|root| below(&resolved, root, r"C:\Program Files\"))
+    {
+        // Installed through `install_dir`: where its setup put it.
+        (with_slash(dos), None, None)
+    } else if options.install_dir.is_none() && needs_subdirectory_launch(exe) {
+        (r"C:\Program Files\".to_owned(), None, Some(resolved))
+    } else {
+        let letter = free_drives(options, None)
+            .next()
+            .ok_or("no drive letter remains for the program directory")?;
+        (format!(r"{letter}:\"), Some(letter), None)
+    };
+    Ok(Placement {
+        folder: Some((game, directory)),
+        drive,
+        install,
+    })
+}
+
+/// The host folder behind `C:\Program Files`, when the options give one.
+fn installation(options: &SessionOptions) -> Option<PathBuf> {
+    let root = options.install_dir.as_ref()?;
+    Some(root.canonicalize().unwrap_or_else(|_| root.clone()))
+}
+
+/// Drive letters from D: that neither a disc nor `taken` uses.
+fn free_drives(options: &SessionOptions, taken: Option<char>) -> impl Iterator<Item = char> + '_ {
+    ('D'..='Z').filter(move |letter| {
+        Some(*letter) != taken
+            && !options
+                .cdroms
+                .iter()
+                .any(|(mounted, _)| mounted.to_ascii_uppercase() == *letter)
+    })
+}
+
+fn drive_c(config: &Config<'_>, prefix: &Path) -> PathBuf {
+    let drive = config
+        .drive
+        .map_or_else(|| prefix.join("drive_c"), Path::to_owned);
+    drive.canonicalize().unwrap_or(drive)
+}
+
+/// The DOS directory where the session will show the program folder.
+pub(super) fn program_directory(
+    config: &Config<'_>,
+    options: &SessionOptions,
+    prefix: &Path,
+) -> Result<String, String> {
+    let placement = place(config, options, &drive_c(config, prefix))?;
+    Ok(placement
+        .folder
+        .map_or_else(|| r"C:\".to_owned(), |(_, directory)| directory))
+}
+
 pub(super) fn prepare(
     config: &Config<'_>,
     options: &SessionOptions,
     prefix: &Path,
 ) -> Result<Prepared, String> {
-    prepare_with_replacement(config, options, prefix, None)
-}
-
-pub(super) fn prepare_with_replacement(
-    config: &Config<'_>,
-    options: &SessionOptions,
-    prefix: &Path,
-    extra_replacement: Option<(&Path, Vec<u8>)>,
-) -> Result<Prepared, String> {
-    let game_drive = ('D'..='Z')
-        .find(|letter| {
-            !options
-                .cdroms
-                .iter()
-                .any(|(mounted, _)| mounted.to_ascii_uppercase() == *letter)
-        })
-        .ok_or("no drive letter remains for the program directory")?;
-    let game = std::path::absolute(config.exe.parent().ok_or("the program has no directory")?)
-        .map_err(|e| e.to_string())?;
-    let use_install = options.install_dir.is_none() && needs_subdirectory_launch(config.exe);
-    let directory = if use_install {
-        r"C:\Program Files\".to_owned()
-    } else {
-        format!(r"{game_drive}:\")
+    let drive_c = drive_c(config, prefix);
+    let Placement {
+        folder,
+        drive,
+        mut install,
+    } = place(config, options, &drive_c)?;
+    let mut links: Vec<(char, PathBuf)> = Vec::new();
+    if let (Some(letter), Some((game, _))) = (drive, &folder) {
+        links.push((letter, game.clone()));
+    }
+    let directory = folder
+        .as_ref()
+        .map_or_else(|| r"C:\".to_owned(), |(_, directory)| directory.clone());
+    let (image, host_image) = match options.program.as_ref().map(|program| &program.image) {
+        None => {
+            let exe = config.exe.ok_or("a session needs a program")?;
+            let name = exe
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("the program name is not Unicode")?;
+            (format!("{directory}{name}"), Some(exe.to_owned()))
+        }
+        Some(Image::Guest(path)) if absolute_dos(path) => (path.clone(), None),
+        Some(Image::Guest(path)) => (format!("{directory}{path}"), None),
+        Some(Image::Host(path)) => {
+            let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+            let path = path
+                .canonicalize()
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let dos = folder
+                .as_ref()
+                .and_then(|(game, directory)| {
+                    let game = game.canonicalize().unwrap_or_else(|_| game.clone());
+                    below(&path, &game, directory)
+                })
+                .or_else(|| below(&path, &drive_c, r"C:\"))
+                .or_else(|| {
+                    installation(options).and_then(|root| below(&path, &root, r"C:\Program Files\"))
+                });
+            let dos = match dos {
+                Some(dos) => dos,
+                None => {
+                    let letter = free_drives(options, drive)
+                        .next()
+                        .ok_or("no drive letter remains for the program")?;
+                    links.push((
+                        letter,
+                        path.parent().ok_or("the program has no directory")?.into(),
+                    ));
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or("the program name is not Unicode")?;
+                    format!(r"{letter}:\{name}")
+                }
+            };
+            (dos, Some(path))
+        }
     };
+    let (command_line, start) = match &options.program {
+        None => (
+            image.rsplit('\\').next().unwrap_or_default().to_owned(),
+            directory.clone(),
+        ),
+        Some(program) => {
+            let mut command_line = format!("\"{image}\"");
+            if !program.arguments.is_empty() {
+                command_line.push(' ');
+                command_line.push_str(&program.arguments);
+            }
+            let start = match &program.directory {
+                Some(path) if absolute_dos(path) => with_slash(path.clone()),
+                Some(path) => with_slash(format!("{directory}{path}")),
+                None => {
+                    image[..=image.rfind('\\').ok_or("the program has no directory")?].to_owned()
+                }
+            };
+            (command_line, start)
+        }
+    };
+
     let mut cfg = adv_os::OsConfig::new(
-        config.exe.parent().ok_or("the program has no directory")?,
+        folder
+            .as_ref()
+            .map_or(drive_c.as_path(), |(game, _)| game.as_path()),
         config
             .exe
-            .file_name()
+            .and_then(|exe| exe.file_name())
             .and_then(|name| name.to_str())
-            .ok_or("the program name is not Unicode")?,
+            .unwrap_or_default(),
         prefix,
     );
     cfg.guest_root = directory.clone();
-    cfg.system_dir = config
-        .drive
-        .map_or_else(|| prefix.join("drive_c"), Path::to_owned);
+    cfg.system_dir = drive_c.clone();
     cfg.codepage = match config.locale {
         0x411 => 932,
         0x804 => 936,
@@ -171,27 +346,25 @@ pub(super) fn prepare_with_replacement(
             .map_err(|e| format!("CD-ROM {letter}: {e}"))?;
     }
     let vfs = Rc::new(vfs);
-    let install = if let Some(path) = &options.install_dir {
-        std::fs::create_dir_all(path)
-            .and_then(|_| path.canonicalize())
-            .map(Some)
-            .map_err(|e| e.to_string())?
-    } else if use_install {
-        Some(game.canonicalize().map_err(|e| e.to_string())?)
-    } else {
+    if let Some(path) = &options.install_dir {
+        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        install = Some(path.canonicalize().map_err(|e| e.to_string())?);
+    }
+    let mut replacements: Vec<(PathBuf, Vec<u8>)> = folder
+        .as_ref()
+        .and_then(|(game, _)| crate::reallive::configuration(game))
+        .into_iter()
+        .collect();
+    replacements.extend(options.replacements.iter().cloned());
+    let root = if options.cdroms.is_empty() && replacements.is_empty() {
         None
+    } else {
+        let root =
+            std::path::absolute(prefix.join(format!(".hitode-files-{}", std::process::id())))
+                .map_err(|e| e.to_string())?;
+        std::fs::create_dir(&root).map_err(|e| e.to_string())?;
+        Some(root.canonicalize().map_err(|e| e.to_string())?)
     };
-    let configuration = crate::reallive::configuration(&game);
-    let root =
-        if options.cdroms.is_empty() && configuration.is_none() && extra_replacement.is_none() {
-            None
-        } else {
-            let root =
-                std::path::absolute(prefix.join(format!(".hitode-files-{}", std::process::id())))
-                    .map_err(|e| e.to_string())?;
-            std::fs::create_dir(&root).map_err(|e| e.to_string())?;
-            Some(root.canonicalize().map_err(|e| e.to_string())?)
-        };
     let mut mounts = Mounts::new(install, root.clone());
     for (letter, _) in vfs.optical_drives() {
         let path = root
@@ -209,26 +382,15 @@ pub(super) fn prepare_with_replacement(
             )
             .map_err(|e| e.to_string())?;
     }
-    if let Some((original, text)) = configuration {
+    for (index, (original, bytes)) in replacements.into_iter().enumerate() {
         let directory = root
             .as_ref()
             .expect("session files directory")
-            .join("replaced");
-        let file = directory.join(original.file_name().expect("a file name"));
-        std::fs::create_dir_all(&directory)
-            .and_then(|()| std::fs::write(&file, text))
-            .and_then(|()| mounts.replace(&original, file))
-            .map_err(|e| format!("{}: {e}", original.display()))?;
-    }
-    if let Some((original, bytes)) = extra_replacement {
-        let directory = root
-            .as_ref()
-            .expect("session files directory")
-            .join("replaced-extra");
+            .join(format!("replaced/{index}"));
         let file = directory.join(original.file_name().expect("a file name"));
         std::fs::create_dir_all(&directory)
             .and_then(|()| std::fs::write(&file, bytes))
-            .and_then(|()| mounts.replace(original, file))
+            .and_then(|()| mounts.replace(&original, file))
             .map_err(|e| format!("{}: {e}", original.display()))?;
     }
     let devices = prefix.join("dosdevices");
@@ -242,20 +404,25 @@ pub(super) fn prepare_with_replacement(
             }
         }
     }
-    link(
-        &game,
-        &devices.join(format!("{}:", game_drive.to_ascii_lowercase())),
-    )?;
-    let mut letters = game_drive.to_string();
-    for (letter, root) in mounts.roots() {
+    let mut letters = String::new();
+    let roots = mounts
+        .roots()
+        .map(|(letter, root)| (letter, root.to_owned()));
+    for (letter, root) in links.into_iter().chain(roots.collect::<Vec<_>>()) {
         link(
-            root,
+            &root,
             &devices.join(format!("{}:", letter.to_ascii_lowercase())),
         )?;
         letters.push(letter);
     }
     std::fs::write(managed, letters).map_err(|e| e.to_string())?;
-    Ok(Prepared { mounts, directory })
+    Ok(Prepared {
+        mounts,
+        image,
+        command_line,
+        start,
+        host_image,
+    })
 }
 
 #[cfg(test)]
@@ -299,13 +466,115 @@ mod tests {
             drive: None,
             locale: 0x409,
             fonts: "",
-            exe,
+            exe: Some(exe),
             width: 640,
             height: 480,
             jit: true,
             debug: "",
             stdout: None,
         }
+    }
+
+    // spec: WINE-SES-1, WINE-SES-12
+    #[test]
+    fn programs_keep_their_drive_c_and_install_paths_and_others_take_a_drive() {
+        let root = std::env::temp_dir().join(format!("adv-programs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let prefix = root.join("prefix");
+        let installed = prefix.join("drive_c/Program Files/Vendor/Game");
+        let custom = root.join("custom/Vendor/Game");
+        let (game, elsewhere) = (root.join("game"), root.join("elsewhere"));
+        let devices = prefix.join("dosdevices");
+        for dir in [
+            &installed,
+            &custom,
+            &game.join("tools"),
+            &elsewhere,
+            &devices,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for exe in [
+            installed.join("game.exe"),
+            custom.join("game.exe"),
+            game.join("game.exe"),
+            game.join("tools/config.exe"),
+            elsewhere.join("patch.exe"),
+        ] {
+            write_pe(&exe, ".text", b"");
+        }
+        let start = |exe: Option<&Path>, options: &SessionOptions| {
+            let config = Config {
+                exe,
+                ..test_config(&root, &prefix, &root)
+            };
+            let prepared = prepare(&config, options, &prefix).unwrap();
+            (prepared.image, prepared.command_line, prepared.start)
+        };
+        let program = |image: Image| SessionOptions {
+            program: Some(Program {
+                arguments: "/x".into(),
+                ..Program::new(image)
+            }),
+            ..SessionOptions::default()
+        };
+        assert_eq!(
+            start(
+                Some(&installed.join("game.exe")),
+                &SessionOptions::default()
+            ),
+            (
+                r"C:\Program Files\Vendor\Game\game.exe".into(),
+                "game.exe".into(),
+                r"C:\Program Files\Vendor\Game\".into()
+            )
+        );
+        let into_custom = SessionOptions {
+            install_dir: Some(root.join("custom")),
+            ..SessionOptions::default()
+        };
+        assert_eq!(
+            start(Some(&custom.join("game.exe")), &into_custom).0,
+            r"C:\Program Files\Vendor\Game\game.exe"
+        );
+        // A tool in the game folder starts in its own directory there.
+        assert_eq!(
+            start(
+                Some(&game.join("game.exe")),
+                &program(Image::Host(game.join("tools/config.exe")))
+            ),
+            (
+                r"D:\tools\config.exe".into(), // privacy: allow authored guest path
+                r#""D:\tools\config.exe" /x"#.into(), // privacy: allow authored guest path
+                r"D:\tools\".into()            // privacy: allow authored guest path
+            )
+        );
+        // A file outside it takes the next letter, after the discs.
+        let mut outside = program(Image::Host(elsewhere.join("patch.exe")));
+        outside.cdroms = vec![('E', root.join("missing.iso"))];
+        let config = Config {
+            exe: Some(&game.join("game.exe")),
+            ..test_config(&root, &prefix, &root)
+        };
+        assert!(
+            prepare(&config, &outside, &prefix).is_err(),
+            "the disc is missing"
+        );
+        outside.cdroms.clear();
+        assert_eq!(
+            start(Some(&game.join("game.exe")), &outside).0,
+            r"E:\patch.exe" // privacy: allow authored guest path
+        );
+        // A disc's setup without a game starts on its disc.
+        assert_eq!(
+            start(None, &program(Image::Guest(r"G:\SETUP.EXE".into()))), // privacy: allow authored guest path
+            (
+                r"G:\SETUP.EXE".into(),        // privacy: allow authored guest path
+                r#""G:\SETUP.EXE" /x"#.into(), // privacy: allow authored guest path
+                r"G:\".into()                  // privacy: allow authored guest path
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -324,7 +593,7 @@ mod tests {
             &prefix,
         )
         .unwrap();
-        assert_eq!(prepared.directory, r"D:\"); // privacy: allow authored guest drive path
+        assert_eq!(prepared.start, r"D:\"); // privacy: allow authored guest drive path
         assert_eq!(prepared.mounts.nt_name(&plain), None);
 
         let ultra = root.join("ultra.exe");
@@ -336,7 +605,7 @@ mod tests {
             &prefix,
         )
         .unwrap();
-        assert_eq!(prepared.directory, r"C:\Program Files\");
+        assert_eq!(prepared.start, r"C:\Program Files\");
         assert_eq!(
             prepared
                 .mounts
@@ -355,7 +624,7 @@ mod tests {
             ..SessionOptions::default()
         };
         let prepared = prepare(&test_config(&root, &prefix, &ultra), &options, &prefix).unwrap();
-        assert_eq!(prepared.directory, r"D:\"); // privacy: allow authored guest drive path
+        assert_eq!(prepared.start, r"D:\"); // privacy: allow authored guest drive path
         assert_eq!(
             prepared.mounts.nt_name(&ultra.canonicalize().unwrap()),
             None

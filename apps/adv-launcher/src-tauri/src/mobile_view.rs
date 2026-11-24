@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use adv_shell::mobile::{Insets, Layout, Rect};
 use adv_shell::window::{
-    DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, MenuBar, MenuCommand,
-    MenuEvent, MenuItem, ViewEvent,
+    ControlKind, DialogControl, DialogEvent, DialogFont, DialogImage, DialogSet, DialogTarget,
+    MenuBar, MenuCommand, MenuEvent, MenuItem, ViewEvent,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, WebviewWindow};
@@ -163,6 +163,8 @@ struct Control {
     align: u8,
     /// The control's own em size in guest pixels, when it sets a font.
     font_size: Option<f64>,
+    /// A picture's pixels as a `data:` URL.
+    image: Option<String>,
 }
 
 /// A visible guest dialog for the overlay.
@@ -179,29 +181,54 @@ struct Dialog {
     controls: Vec<Control>,
 }
 
-/// The control kinds the overlay draws, as the macOS projection sorts them.
+/// The control kinds the overlay draws.
 fn kind(control: &DialogControl) -> &'static str {
-    if !control.supported {
-        return "unavailable";
+    match control.kind {
+        ControlKind::Push => "push",
+        ControlKind::Check => "check",
+        ControlKind::Radio => "radio",
+        ControlKind::Group => "group",
+        ControlKind::Label => "label",
+        ControlKind::Frame => "frame",
+        ControlKind::Edit => "edit",
+        ControlKind::Text => "text",
+        ControlKind::Combo => "combo",
+        ControlKind::List => "list",
+        ControlKind::Track => "track",
+        ControlKind::Progress => "progress",
+        ControlKind::Image => "image",
+        ControlKind::Container => "container",
+        ControlKind::Unavailable => "unavailable",
     }
-    match control.class.to_ascii_lowercase().as_str() {
-        "button" => match control.style & 15 {
-            2 | 3 | 5 | 6 => "check",
-            4 | 9 => "radio",
-            7 => "group",
-            _ => "push",
-        },
-        "static" => match control.style & 0x1f {
-            7..=9 | 16..=18 => "frame",
-            _ => "label",
-        },
-        "edit" => "edit",
-        "combobox" => "combo",
-        "listbox" => "list",
-        "msctls_trackbar32" => "track",
-        "msctls_statusbar32" => "label",
-        _ => "unavailable",
+}
+
+/// A picture as a `data:` URL of a top-down 32-bit BMP, which web views
+/// show without a decoder of ours.
+fn picture(image: &DialogImage) -> String {
+    use base64::Engine;
+    let size = 54 + image.bgra.len() as u32;
+    let mut bmp = Vec::with_capacity(size as usize);
+    bmp.extend_from_slice(b"BM");
+    for word in [
+        size,
+        0,
+        54,
+        40,
+        image.width,
+        (image.height as i32).wrapping_neg() as u32,
+    ] {
+        bmp.extend_from_slice(&word.to_le_bytes());
     }
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    for word in [0, image.bgra.len() as u32, 2835, 2835, 0, 0] {
+        bmp.extend_from_slice(&word.to_le_bytes());
+    }
+    bmp.extend_from_slice(&image.bgra);
+    format!(
+        "data:image/bmp;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bmp)
+    )
 }
 
 fn dialogs(set: &DialogSet) -> Vec<Dialog> {
@@ -235,6 +262,7 @@ fn dialogs(set: &DialogSet) -> Vec<Dialog> {
                         value: c.value,
                         align: c.alignment(),
                         font_size: c.font.as_ref().and_then(DialogFont::em),
+                        image: c.image.as_deref().map(picture),
                     })
                 })
                 .collect();
@@ -461,7 +489,7 @@ pub fn touch_mode(mode: &str) -> Result<adv_shell::mobile::TouchMode, String> {
 mod tests {
     use super::*;
 
-    fn control(class: &str, style: u32, supported: bool) -> DialogControl {
+    fn control(class: &str, style: u32, list: bool) -> DialogControl {
         DialogControl {
             target: DialogTarget {
                 dialog: 1,
@@ -483,7 +511,8 @@ mod tests {
             range: None,
             value: 0,
             font: None,
-            supported,
+            kind: adv_shell::window::control_kind(class, style, list, false),
+            image: None,
         }
     }
 
@@ -493,5 +522,23 @@ mod tests {
             assert_eq!(kind(&control("Static", style, true)), "frame");
         }
         assert_eq!(kind(&control("Static", 0x5000_000e, false)), "unavailable");
+        assert_eq!(kind(&control("RichEdit20W", 0x5020_0804, false)), "text");
+    }
+
+    #[test]
+    fn pictures_become_top_down_bitmaps() {
+        use base64::Engine;
+        let url = picture(&DialogImage {
+            width: 2,
+            height: 1,
+            bgra: vec![1, 2, 3, 255, 4, 5, 6, 255],
+        });
+        let bmp = base64::engine::general_purpose::STANDARD
+            .decode(url.strip_prefix("data:image/bmp;base64,").unwrap())
+            .unwrap();
+        assert_eq!(bmp.len(), 62);
+        assert_eq!(&bmp[..2], b"BM");
+        assert_eq!(i32::from_le_bytes(bmp[22..26].try_into().unwrap()), -1);
+        assert_eq!(&bmp[54..], [1, 2, 3, 255, 4, 5, 6, 255]);
     }
 }

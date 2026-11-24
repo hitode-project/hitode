@@ -36,7 +36,7 @@ fn restores_reg_and_batch_files_into_the_shared_prefix() {
         drive: None,
         locale: 0x804, // zh-CN (CP936)
         fonts: "",
-        exe: &exe,
+        exe: Some(&exe),
         width: 640,
         height: 480,
         jit: true,

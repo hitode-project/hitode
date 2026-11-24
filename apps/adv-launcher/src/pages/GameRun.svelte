@@ -143,7 +143,11 @@
 />
 
 {#snippet content()}
-  {#if game}
+  {#if game?.setup}
+    <!-- The game's folder holds nothing to run until its setup has installed it. -->
+    <p class="lead">{t("安装完成并选择主程序后才能在此运行程序。")}</p>
+    <button class="quiet" onclick={() => nav.replace({ name: "install", gameId: game.id })}>{t("选择已安装的程序…")}</button>
+  {:else if game}
     {#if error}<p class="err" role="alert">{error}</p>{/if}
     {#if notice}
       <p class="ok" role="status">

@@ -50,6 +50,7 @@ export function toGame(g: LibraryGame, now: number): Game {
     history: g.daily,
     lastSummary: g.lastRun?.summary ?? null,
     sessions30: g.sessions.length,
+    setup: g.setup ?? null,
   };
 }
 

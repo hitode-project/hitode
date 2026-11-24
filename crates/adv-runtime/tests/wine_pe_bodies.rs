@@ -28,7 +28,7 @@ fn probe(jit: bool) -> Option<String> {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &game.join("pe_bodies.exe"),
+        exe: Some(&game.join("pe_bodies.exe")),
         width: 64,
         height: 32,
         jit,

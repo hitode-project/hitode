@@ -343,13 +343,19 @@ pub async fn start_game(
         .unwrap()
         .launch(&id)
         .map_err(|e| e.to_string())?;
+    let installation = window
+        .state::<Mutex<Library>>()
+        .lock()
+        .unwrap()
+        .installation(&id)
+        .map_err(|e| e.to_string())?;
     let folder = window
         .storage()
         .prepare_folder(exe.parent().unwrap())
         .await?;
     let exe = folder.join(exe.file_name().unwrap());
     let options = playback
-        .prepare(window.app_handle(), exe, data_dir, codepage)
+        .prepare(window.app_handle(), exe, data_dir, codepage, installation)
         .await?;
     let host_window = window.clone();
     on_ui(window.app_handle(), move || {

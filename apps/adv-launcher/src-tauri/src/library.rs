@@ -44,6 +44,14 @@ pub struct LibraryGame {
     pub last_run: Option<LastRun>,
     #[serde(skip_deserializing)]
     pub offline: Option<Offline>,
+    /// Until its setup has run: the setup program on the game's first disc,
+    /// as a DOS path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
+    /// The host folder `C:\Program Files` shows for this game: where its
+    /// setup installed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_files: Option<PathBuf>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlaySession {
@@ -230,6 +238,13 @@ impl Library {
         let data = self.path.parent().unwrap().join("games").join(id);
         Ok((game.folder.join(&game.exe), data, game.codepage))
     }
+    /// The setup a pending install runs, and the folder behind its
+    /// `C:\Program Files`.
+    #[cfg(any(test, target_os = "macos", target_os = "android", target_os = "ios"))]
+    pub fn installation(&self, id: &str) -> io::Result<(Option<String>, Option<PathBuf>)> {
+        let game = &self.games[self.game(id)?];
+        Ok((game.setup.clone(), game.program_files.clone()))
+    }
     #[cfg(any(test, target_os = "macos", target_os = "android", target_os = "ios"))]
     pub fn finished(&mut self, id: &str, seconds: u32, run: LastRun) -> io::Result<()> {
         let ended = run.ended;
@@ -274,6 +289,39 @@ impl Library {
             exe,
             codepage: cp,
             added_at: now(),
+            ..LibraryGame::default()
+        };
+        self.games.push(game.clone());
+        self.save()?;
+        Ok(game)
+    }
+    /// A game a disc's `setup` installs into `target`; its program is chosen
+    /// once the setup has run.
+    /// Without a `target` it installs beside the library.
+    fn add_install(
+        &mut self,
+        target: Option<&Path>,
+        setup: &str,
+        cp: u32,
+        title: &str,
+    ) -> io::Result<LibraryGame> {
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
+        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let target = match target {
+            Some(target) => target.to_owned(),
+            None => self.path.parent().unwrap().join("installed").join(&id),
+        };
+        fs::create_dir_all(&target)?;
+        let dir = fs::canonicalize(&target)?;
+        let game = LibraryGame {
+            id,
+            title: title.into(),
+            folder: dir.clone(),
+            codepage: cp,
+            added_at: now(),
+            setup: Some(setup.into()),
+            program_files: Some(dir),
             ..LibraryGame::default()
         };
         self.games.push(game.clone());
@@ -718,10 +766,59 @@ pub fn library_update(state: Store<'_>, id: String, patch: GamePatch) -> Reply<L
     game.folder = folder.unwrap_or_else(|| game.folder.clone());
     if let Some(exe) = patch.exe {
         game.exe = exe.replace('\\', "/");
+        // Choosing the installed program completes the install.
+        if !game.exe.is_empty() {
+            game.setup = None;
+        }
     }
     let game = present_game(game.clone());
     library.save().map_err(|e| e.to_string())?;
     Ok(game)
+}
+/// A disc image before anything runs from it: its label and size, the
+/// programs its player would start, and the code page of the first.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscInspection {
+    label: String,
+    bytes: u64,
+    programs: Vec<String>,
+    codepage: u32,
+}
+#[tauri::command]
+pub async fn library_inspect_disc(path: PathBuf) -> Reply<DiscInspection> {
+    let inspect = move || -> io::Result<DiscInspection> {
+        let disc = adv_shell::Disc::open(&path, 'D')?;
+        let programs = disc.programs();
+        let codepage = match programs.first() {
+            Some(program) => disc.codepage(program)?,
+            None => 932,
+        };
+        Ok(DiscInspection {
+            label: disc.label().to_owned(),
+            bytes: fs::metadata(&path)?.len(),
+            programs,
+            codepage,
+        })
+    };
+    let found = tauri::async_runtime::spawn_blocking(move || reply(inspect()));
+    found.await.map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub fn library_add_install(
+    state: Store<'_>,
+    target: Option<PathBuf>,
+    setup: String,
+    codepage: u32,
+    title: String,
+) -> Reply<LibraryGame> {
+    reply(
+        state
+            .lock()
+            .unwrap()
+            .add_install(target.as_deref(), &setup, codepage, &title),
+    )
+    .map(present_game)
 }
 #[tauri::command]
 pub fn library_remove(state: Store<'_>, id: String) -> Reply<LibraryGame> {
@@ -947,6 +1044,30 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     // spec: HOST-LIB-10
+    // spec: WINE-SES-12
+    #[test]
+    fn a_pending_install_keeps_its_setup_and_program_files_until_reloaded() {
+        let (dir, mut lib) = fixture("install");
+        let target = dir.join("Installed Game");
+        let game = lib
+            .add_install(Some(&target), r"D:\SETUP.EXE", 932, "Disc title") // privacy: allow authored guest path
+            .unwrap();
+        assert!(target.is_dir());
+        assert_eq!(game.exe, "");
+        let loaded = Library::load(dir.join("app")).unwrap();
+        let (setup, program_files) = loaded.installation(&game.id).unwrap();
+        assert_eq!(setup.as_deref(), Some(r"D:\SETUP.EXE")); // privacy: allow authored guest path
+        assert_eq!(program_files, Some(fs::canonicalize(&target).unwrap()));
+        let beside = lib
+            .add_install(None, r"D:\SETUP.EXE", 932, "Other") // privacy: allow authored guest path
+            .unwrap();
+        assert!(
+            beside
+                .folder
+                .starts_with(fs::canonicalize(dir.join("app")).unwrap())
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn reorder_persists_a_full_permutation_only() {
         let (dir, mut lib) = fixture("reorder");

@@ -50,7 +50,7 @@ fn play(version: u32) {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &exe,
+        exe: Some(&exe),
         width: 64,
         height: 32,
         jit: true,

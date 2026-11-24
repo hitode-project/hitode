@@ -1,6 +1,7 @@
-//! Wine file and section semantics over the shared ISO reader and install root.
+//! Wine file and section semantics over the shared ISO reader and install root,
+//! and installers run from a disc.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
-use adv_runtime::wine::session::{Config, Host, SessionOptions, Stop};
+use adv_runtime::wine::session::{Config, Host, Image, Program, SessionOptions, Stop};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
@@ -136,7 +137,7 @@ fn mounted_volumes_and_install_paths_survive_processes_and_prefix_reuse() {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &root.join("game/volumes.exe"),
+        exe: Some(&root.join("game/volumes.exe")),
         width: 640,
         height: 480,
         jit: true,
@@ -225,4 +226,286 @@ fn mounted_volumes_and_install_paths_survive_processes_and_prefix_reuse() {
         assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
         assert!(text.contains("reset_namespace=ok"), "{text}");
     }
+}
+
+/// One wineserver runs per process: true in the test's own child process,
+/// after the parent has started it and checked that it passed.
+fn in_own_process(test: &str) -> bool {
+    if std::env::var_os("ADV_NT_PROBE_CHILD").is_some() {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env("ADV_NT_PROBE_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+/// An uncompressed cabinet holding `files`, as setup programs unpack.
+fn cabinet(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let names: usize = files.iter().map(|(name, _)| 16 + name.len() + 1).sum();
+    let data: Vec<u8> = files
+        .iter()
+        .flat_map(|(_, bytes)| bytes.iter().copied())
+        .collect();
+    let first_file = 36 + 8;
+    let first_data = first_file + names;
+    let total = first_data + 8 + data.len();
+    let mut cab = Vec::with_capacity(total);
+    cab.extend_from_slice(b"MSCF");
+    for value in [0, total as u32, 0, first_file as u32, 0] {
+        cab.extend_from_slice(&value.to_le_bytes());
+    }
+    cab.extend_from_slice(&[3, 1]);
+    for value in [1u16, files.len() as u16, 0, 0x1234, 0] {
+        cab.extend_from_slice(&value.to_le_bytes());
+    }
+    cab.extend_from_slice(&(first_data as u32).to_le_bytes());
+    cab.extend_from_slice(&1u16.to_le_bytes());
+    cab.extend_from_slice(&0u16.to_le_bytes());
+    let mut offset = 0u32;
+    for (name, bytes) in files {
+        cab.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        cab.extend_from_slice(&offset.to_le_bytes());
+        // Folder 0, 2026-01-01 12:00, archive.
+        for value in [0u16, (46 << 9) | (1 << 5) | 1, 12 << 11, 0x20] {
+            cab.extend_from_slice(&value.to_le_bytes());
+        }
+        cab.extend_from_slice(name.as_bytes());
+        cab.push(0);
+        offset += bytes.len() as u32;
+    }
+    cab.extend_from_slice(&0u32.to_le_bytes());
+    cab.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    cab.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    cab.extend_from_slice(&data);
+    cab
+}
+
+// spec: WINE-SES-10, WINE-SES-12
+#[test]
+fn a_disc_setup_installs_a_game_that_then_runs_from_drive_c() {
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
+        return;
+    };
+    if !in_own_process("a_disc_setup_installs_a_game_that_then_runs_from_drive_c") {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("adv-wine-install-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let installer = std::fs::read(probes.join("installer.exe")).unwrap();
+    let disc = with_modules(&[
+        ("SETUP.EXE", installer.clone()),
+        ("GAME.EXE", installer),
+        (
+            "DATA.CAB",
+            cabinet(&[("readme.txt", b"from a cabinet"), ("data.bin", &[7; 3000])]),
+        ),
+    ]);
+    std::fs::write(root.join("disc.iso"), disc).unwrap();
+    let prefix = root.join("prefix");
+    let run =
+        |host: &mut Host, exe: Option<&std::path::Path>, options: &SessionOptions, log: &str| {
+            let stdout = std::fs::File::create(root.join(log)).unwrap();
+            let config = Config {
+                dist: &dist,
+                prefix: &prefix,
+                drive: None,
+                locale: 0x409,
+                fonts: "",
+                exe,
+                width: 640,
+                height: 480,
+                jit: true,
+                debug: "",
+                stdout: Some(stdout.as_raw_fd()),
+            };
+            let mut session = host
+                .start(
+                    &config,
+                    adv_sync::WakeEvent::new().unwrap(),
+                    options,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            let stop = session.run(Instant::now() + Duration::from_secs(60));
+            drop(session);
+            let text = std::fs::read_to_string(root.join(log)).unwrap();
+            assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+            assert!(!text.contains("FAIL"), "{text}");
+            text
+        };
+
+    // No game folder: the setup's own directory on the disc is where it starts.
+    let output = std::fs::File::create(root.join("setup")).unwrap();
+    let mut host = Host::default();
+    let setup = SessionOptions {
+        cdroms: vec![('D', root.join("disc.iso"))],
+        program: Some(Program {
+            output: Some(output.as_raw_fd()),
+            ..Program::new(Image::Guest(r"D:\SETUP.EXE".into())) // privacy: allow authored guest optical path
+        }),
+        ..SessionOptions::default()
+    };
+    run(&mut host, None, &setup, "setup-stdout");
+    let text = std::fs::read_to_string(root.join("setup")).unwrap();
+    assert!(
+        text.contains("stage_exit=0") && text.contains("msiexec=ok"),
+        "{text}"
+    );
+    let installed = prefix.join("drive_c/Program Files/Probe Vendor/Probe Game");
+    assert_eq!(
+        std::fs::read(installed.join("readme.txt")).unwrap(),
+        b"from a cabinet"
+    );
+    assert_eq!(
+        std::fs::read(installed.join("data.bin")).unwrap(),
+        [7; 3000]
+    );
+    let system = std::fs::read_to_string(prefix.join("system.reg")).unwrap();
+    assert!(
+        system.contains(r"[Software\\Probe Vendor\\Probe Game]"),
+        "{system}"
+    );
+    assert!(
+        system.contains(r"[Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ProbeGame]")
+    );
+
+    // The installed game keeps its drive C: path, so what the setup wrote
+    // about it holds.
+    let text = run(
+        &mut host,
+        Some(&installed.join("game.exe")),
+        &SessionOptions::default(),
+        "game-stdout",
+    );
+    assert!(text.contains("played=ok"), "{text}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// spec: WINE-SES-12, WINE-UI-7, WINE-UI-10
+#[test]
+fn a_setup_wizard_shows_natively_and_a_tree_falls_back_to_its_painting() {
+    use adv_runtime::{ControlKind, DialogEvent};
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
+        return;
+    };
+    if !in_own_process("a_setup_wizard_shows_natively_and_a_tree_falls_back_to_its_painting") {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("adv-wine-wizard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let stdout = std::fs::File::create(root.join("stdout")).unwrap();
+    let config = Config {
+        dist: &dist,
+        prefix: &root.join("prefix"),
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: Some(&probes.join("wizard.exe")),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: Some(stdout.as_raw_fd()),
+    };
+    let mut host = Host::default();
+    let mut session = host
+        .start(
+            &config,
+            adv_sync::WakeEvent::new().unwrap(),
+            &SessionOptions::default(),
+            |_| Ok(()),
+        )
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(60);
+    let mut pressed = Vec::new();
+    // Each page is answered once: a click the guest has not handled yet
+    // leaves the same page showing.
+    let mut answered = None;
+    let mut unavailable = std::collections::BTreeSet::new();
+    let (mut license, mut banner, mut progress, mut browser) = (false, false, false, false);
+    let stop = loop {
+        assert!(Instant::now() < until, "the wizard was not answered");
+        session.refresh_ui();
+        let dialogs = session.dialogs().dialogs;
+        let painted = session
+            .input_view()
+            .windows
+            .iter()
+            .any(|window| window.parent == 0 && window.visible && window.text == "Browse");
+        if painted {
+            assert!(
+                dialogs.is_empty(),
+                "a tree dialog stays the guest's: {dialogs:?}"
+            );
+            browser = true;
+        }
+        if let Some(dialog) = dialogs.first() {
+            for control in dialog.controls.iter().filter(|control| control.visible) {
+                match control.kind {
+                    ControlKind::Unavailable => {
+                        unavailable.insert(control.class.clone());
+                    }
+                    ControlKind::Text => {
+                        license |= control.text.len() > 1000 && control.text.ends_with("The end.");
+                    }
+                    ControlKind::Image => {
+                        let image = control.image.as_ref().unwrap();
+                        assert_eq!((image.width, image.height), (4, 2));
+                        assert_eq!(image.bgra[..8], [255, 0, 0, 255, 0, 255, 0, 255]);
+                        assert_eq!(image.bgra[16..20], [0, 0, 0, 255]);
+                        banner = true;
+                    }
+                    ControlKind::Progress => {
+                        progress |= control.value == 100 && control.range == Some((0, 100));
+                    }
+                    _ => {}
+                }
+            }
+            let default = dialog.controls.iter().find(|control| {
+                control.kind == ControlKind::Push
+                    && control.style & 0xf == 1
+                    && control.visible
+                    && control.enabled
+            });
+            let page = dialog
+                .controls
+                .iter()
+                .find(|control| control.kind == ControlKind::Container && control.visible)
+                .map(|control| control.target);
+            if let Some(button) = default
+                && page.is_some()
+                && page != answered
+            {
+                pressed.push(button.text.clone());
+                session.dialog_event(DialogEvent::Click(button.target));
+                answered = page;
+            }
+        }
+        match session.run(Instant::now() + Duration::from_millis(20)) {
+            Stop::Paused => {}
+            stop => break stop,
+        }
+    };
+    drop(session);
+    let text = std::fs::read_to_string(root.join("stdout")).unwrap();
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert!(
+        text.contains("page=2") && text.contains("finished=1"),
+        "{text}"
+    );
+    assert!(unavailable.is_empty(), "{unavailable:?}");
+    assert!(license && banner && progress && browser, "{text}");
+    assert_eq!(pressed, ["&Next >", "&Next >", "Finish"]);
+    std::fs::remove_dir_all(root).unwrap();
 }

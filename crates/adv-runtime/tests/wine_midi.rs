@@ -36,7 +36,7 @@ fn midi_messages_streams_and_mci_produce_pcm() {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &game.join("midi.exe"),
+        exe: Some(&game.join("midi.exe")),
         width: 64,
         height: 32,
         jit: true,

@@ -14,16 +14,17 @@ fn main() {
 #[cfg(target_os = "macos")]
 mod mac {
     use adv_runtime::{
-        DialogControl, DialogEvent, DialogSet, DialogTarget, DialogWindow, MenuBar, MenuCommand,
-        MenuEvent, MenuItem, MenuKey,
+        ControlKind, DialogControl, DialogEvent, DialogImage, DialogSet, DialogTarget,
+        DialogWindow, MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey,
     };
     use adv_shell::window::{Event, Window};
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::{MainThreadMarker, msg_send};
     use objc2_app_kit::{
-        NSApplication, NSBox, NSButton, NSEvent, NSEventModifierFlags, NSEventType, NSPopUpButton,
-        NSTextField, NSView, NSWindow,
+        NSApplication, NSBox, NSButton, NSEvent, NSEventModifierFlags, NSEventType, NSImageView,
+        NSPopUpButton, NSProgressIndicator, NSScrollView, NSTextField, NSTextView, NSView,
+        NSWindow,
     };
     use objc2_core_foundation::{
         CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext,
@@ -499,7 +500,8 @@ mod mac {
                 range: None,
                 value: 0,
                 font: None,
-                supported: true,
+                kind: adv_runtime::control_kind(class, style, true, false),
+                image: None,
             };
             control.rect.left = 10;
             control.rect.top = top;
@@ -742,6 +744,51 @@ mod mac {
         );
         window.set_dialogs(&DialogSet::default()).unwrap();
         println!("ok etched frame ordering");
+
+        // A setup page: a license, a progress bar and a banner inside a child
+        // dialog, which shows nothing itself.
+        let mut page = control(0x231, "#32770", 0x5000_0000, "", 0);
+        (page.rect.right, page.rect.bottom) = (240, 140);
+        let mut license = control(0x232, "RichEdit20W", 0x5020_0804, "Terms\rof use", 0);
+        license.target.parent = 0x231;
+        let mut bar = control(0x233, "msctls_progress32", 0x5000_0000, "", 60);
+        bar.target.parent = 0x231;
+        (bar.range, bar.value) = (Some((0, 200)), 50);
+        let mut banner = control(0x234, "Static", 0x5000_000e, "", 90);
+        banner.target.parent = 0x231;
+        banner.kind = ControlKind::Image;
+        banner.image = Some(std::sync::Arc::new(DialogImage {
+            width: 2,
+            height: 1,
+            bgra: vec![0, 0, 255, 255, 255, 0, 0, 255],
+        }));
+        let mut setup = set.dialogs[0].clone();
+        setup.text = "Setup".into();
+        setup.client_size = (242, 142);
+        setup.controls = vec![page, license, bar, banner];
+        window
+            .set_dialogs(&DialogSet {
+                dialogs: vec![setup],
+            })
+            .unwrap();
+        let panel = find_window(mtm, "Setup");
+        let views = subviews(&panel);
+        assert_eq!(views.len(), 4);
+        assert!(views[0].downcast_ref::<NSScrollView>().is_none());
+        let text = views[1]
+            .downcast_ref::<NSScrollView>()
+            .and_then(|scroll| scroll.documentView())
+            .and_then(|view| view.downcast::<NSTextView>().ok())
+            .expect("a text view for the license");
+        assert_eq!(text.string().to_string(), "Terms\nof use");
+        assert!(!text.isEditable());
+        let progress = views[2].downcast_ref::<NSProgressIndicator>().unwrap();
+        assert_eq!((progress.maxValue(), progress.doubleValue()), (200.0, 50.0));
+        let picture = views[3].downcast_ref::<NSImageView>().unwrap();
+        let size = picture.image().unwrap().size();
+        assert_eq!((size.width, size.height), (2.0, 1.0));
+        window.set_dialogs(&DialogSet::default()).unwrap();
+        println!("ok setup page controls");
 
         // Exercise delegate notifications without showing a window, sleeping
         // the machine, or terminating the test process.

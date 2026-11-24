@@ -53,7 +53,7 @@ fn probe_inspect(
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &game.join(exe),
+        exe: Some(&game.join(exe)),
         width: 640,
         height: 480,
         jit: true,

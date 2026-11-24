@@ -128,7 +128,7 @@ fn run_case() {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &game.join(&name),
+        exe: Some(&game.join(&name)),
         width: 1024,
         height: 768,
         jit: true,

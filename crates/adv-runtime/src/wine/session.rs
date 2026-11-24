@@ -53,7 +53,9 @@ pub struct Config<'a> {
     /// selects the portable backend's full system discovery; empty isolates
     /// the session to fonts installed in its prefix and Wine distribution.
     pub fonts: &'a str,
-    pub exe: &'a Path,
+    /// The program on the host whose directory becomes the program drive.
+    /// None when a [`Program`] runs without one, as an installer from a disc.
+    pub exe: Option<&'a Path>,
     pub width: u32,
     pub height: u32,
     pub jit: bool,
@@ -70,6 +72,47 @@ pub struct SessionOptions {
     pub font_files: Vec<PathBuf>,
     pub cdroms: Vec<(char, PathBuf)>,
     pub install_dir: Option<PathBuf>,
+    /// Started instead of [`Config::exe`], on the same drives and prefix.
+    pub program: Option<Program>,
+    /// Host files the guest reads with these contents instead; the files
+    /// themselves stay unchanged.
+    pub replacements: Vec<(PathBuf, Vec<u8>)>,
+}
+
+/// A program a session starts in place of its game: a tool in the program
+/// folder, a disc's setup or a Wine program. Like Explorer, it starts in its
+/// image's directory unless `directory` names another.
+#[derive(Clone, Debug)]
+pub struct Program {
+    pub image: Image,
+    /// The command line after the quoted image path.
+    pub arguments: String,
+    /// A DOS directory, relative to the program directory unless absolute.
+    pub directory: Option<String>,
+    /// Receives standard output and error while standard input reads
+    /// nothing; none leaves the standard handles empty, as for a game.
+    pub output: Option<RawFd>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Image {
+    /// A DOS path on the session's drives; relative paths start at the
+    /// program directory.
+    Guest(String),
+    /// A host file. Inside the program folder or drive C: it keeps that path;
+    /// elsewhere its directory takes the next free drive letter.
+    Host(PathBuf),
+}
+
+impl Program {
+    pub fn new(image: Image) -> Self {
+        Self {
+            image,
+            arguments: String::new(),
+            directory: None,
+            output: None,
+        }
+    }
 }
 
 /// Where a run of the session stopped.
@@ -120,7 +163,8 @@ impl Drop for Session {
 }
 
 struct Settings {
-    exe: PathBuf,
+    /// The started image on the host, when it has one.
+    exe: Option<PathBuf>,
     dist: PathBuf,
     prefix: PathBuf,
     drive: PathBuf,
@@ -687,15 +731,15 @@ impl Session {
         prepare: impl FnOnce(&mut Machine<Cpu>) -> Result<(), String>,
     ) -> Result<Session, String> {
         host.check(config)?;
-        let exe = std::path::absolute(config.exe).map_err(|e| e.to_string())?;
+        let exe = config
+            .exe
+            .map(std::path::absolute)
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let config = Config {
-            exe: &exe,
+            exe: exe.as_deref(),
             ..*config
         };
-        let name = exe
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("the program name is not Unicode")?;
         let module = |name: &str| {
             let path = config.dist.join(MODULES).join(name);
             std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
@@ -718,11 +762,8 @@ impl Session {
             .socket_dir()
             .ok_or("the server has no socket")?;
 
-        // As Wine's `run_wineboot`, but restarting: the template stands for
-        // what `--init` installs, and no services run.
         let audio = adv_device::AudioControl::new(true);
-        registry::ensure_booted(
-            host,
+        host.boot(
             &config,
             &prefix,
             &drive,
@@ -746,16 +787,22 @@ impl Session {
         machine.ext.insert(milestones.clone());
         machine.ext.get_mut::<SurfaceStore>().milestones = Some(milestones.clone());
         prepare(&mut machine)?;
+        // A program's output replaces the game's; its input reads nothing.
+        let output = options.program.as_ref().and_then(|program| program.output);
+        let nothing = output
+            .map(|_| std::fs::File::open("/dev/null"))
+            .transpose()
+            .map_err(|e| format!("/dev/null: {e}"))?;
         let startup = Startup {
-            image: &format!("{}{name}", prepared.directory),
-            command_line: name,
-            directory: &prepared.directory,
+            image: &prepared.image,
+            command_line: &prepared.command_line,
+            directory: &prepared.start,
             environment: ENVIRONMENT,
             locale: config.locale,
             debug: config.debug,
-            stdin: None,
-            stdout: config.stdout,
-            stderr: None,
+            stdin: nothing.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
+            stdout: output.or(config.stdout),
+            stderr: output,
             graphics_driver: super::GRAPHICS_DRIVER,
             fonts: config.fonts,
         };
@@ -805,7 +852,7 @@ impl Session {
             finished: None,
             idle: BTreeMap::new(),
             settings: Settings {
-                exe: exe.clone(),
+                exe: prepared.host_image,
                 dist: config.dist.to_owned(),
                 prefix: prefix.clone(),
                 drive: drive.clone(),
@@ -1199,7 +1246,7 @@ impl Session {
                 drive: None,
                 locale: c.locale,
                 fonts: &c.fonts,
-                exe: Path::new(&child.image),
+                exe: Some(Path::new(&child.image)),
                 width: c.width,
                 height: c.height,
                 jit: c.jit,
@@ -1433,7 +1480,7 @@ impl Session {
     /// `STATUS_DLL_NOT_FOUND`.
     pub fn missing_import(&self) -> Option<String> {
         missing_import(
-            &self.settings.exe,
+            self.settings.exe.as_deref()?,
             &self.settings.drive.join("windows/system32"),
         )
     }
@@ -1597,7 +1644,7 @@ mod link_tests {
             drive: None,
             locale: 0x409,
             fonts: "",
-            exe: &exe,
+            exe: Some(&exe),
             width: 640,
             height: 480,
             jit: true,

@@ -150,6 +150,8 @@ device loss; builds without it omit the executor hooks.
 | `--data-dir` | Feature | `target/adv-data/<exe>` |
 | `--cdrom` | Feature | None; repeat to mount read-only disc images |
 | `--install-dir` | Feature | None: `C:\Program Files` lives in the data folder |
+| `--program` | Feature | None: the EXE runs |
+| `--arguments` | Feature | Empty; needs `--program` |
 | `--report` | Diagnostic | No output |
 | `--screenshot` | Diagnostic | No output |
 | `--trace` | Diagnostic | No output |
@@ -171,8 +173,11 @@ It writes the final stop reason and full guest exit code even on a guest failure
 control snapshots retain `running` until execution stops. Ctrl acceleration uses the shared live key policy for
 eligible delays and stays disabled once a child process has been created.
 `--cdrom` accepts `.iso`, raw `.bin`/`.img`/`.mdf`, `.cue`, `.ccd`, `.mds` and `.nrg` images and reads
-their first data track with the shared ISO9660/Joliet reader. The program directory takes the first
-unmounted letter from D: onward. `--install-dir` redirects `C:\Program Files` to the
+their first data track with the shared ISO9660/Joliet reader. The program directory keeps its path
+when it lies on drive C: and otherwise takes the first unmounted letter from D: onward.
+`--program` starts another program on the same drives instead of the EXE (WINE-SES-12): a DOS path
+on a mounted disc, such as its setup, or a host file. Without an EXE it runs on its own, as a
+disc's setup does; `--codepage auto` then reads the program, from its disc when it lies on one. `--install-dir` redirects `C:\Program Files` to the
 selected host directory without replacing the prefix's own directory. Children inherit
 both mappings; removing settings on the next run restores the prefix namespace.
 

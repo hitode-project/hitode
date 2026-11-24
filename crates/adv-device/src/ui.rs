@@ -70,7 +70,102 @@ pub struct DialogControl {
     pub range: Option<(i32, i32)>,
     pub value: i32,
     pub font: Option<DialogFont>,
-    pub supported: bool,
+    /// What the host shows it as.
+    pub kind: ControlKind,
+    /// A picture static's bitmap.
+    pub image: Option<std::sync::Arc<DialogImage>>,
+}
+
+/// How the host shows a standard control natively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlKind {
+    Push,
+    Check,
+    Radio,
+    Group,
+    Label,
+    /// Etched or drawn rectangles and lines.
+    Frame,
+    Edit,
+    /// Read-only text of many lines, as a license in a rich edit.
+    Text,
+    Combo,
+    /// A list box, or a list view's items.
+    List,
+    Track,
+    Progress,
+    /// A picture static with its bitmap.
+    Image,
+    /// A child dialog, as a property sheet page: its controls show, it does not.
+    Container,
+    Unavailable,
+}
+
+/// A bitmap's pixels, top row first, as BGRA with opaque alpha.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialogImage {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+}
+
+/// The rich edit classes Windows and Wine register.
+fn rich_edit(class: &str) -> bool {
+    ["RichEdit", "RichEdit20A", "RichEdit20W", "RICHEDIT50W"]
+        .iter()
+        .any(|name| class.eq_ignore_ascii_case(name))
+}
+
+/// Whether `class` holds text the guest reads back through `WM_GETTEXT`.
+pub fn text_control(class: &str) -> bool {
+    class.eq_ignore_ascii_case("Edit") || rich_edit(class)
+}
+
+/// How a standard control shows natively: `list_box` says a list box or list
+/// view keeps its own item strings, and `image` that a picture has its bitmap.
+pub fn kind(class: &str, style: u32, list_box: bool, image: bool) -> ControlKind {
+    let is = |name: &str| class.eq_ignore_ascii_case(name);
+    if is("Button") {
+        // Owner-drawn buttons retain guest input/state; the platform adapter
+        // can project their captions without running the guest painter.
+        match style & 0xf {
+            2 | 3 | 5 | 6 => ControlKind::Check,
+            4 | 9 => ControlKind::Radio,
+            7 => ControlKind::Group,
+            0 | 1 | 8 | 11 => ControlKind::Push,
+            _ => ControlKind::Unavailable,
+        }
+    } else if is("Static") {
+        match style & 0x1f {
+            0..=3 | 11 | 12 => ControlKind::Label,
+            7..=9 | 16..=18 => ControlKind::Frame,
+            14 if image => ControlKind::Image,
+            _ => ControlKind::Unavailable,
+        }
+    } else if text_control(class) {
+        // ES_MULTILINE with ES_READONLY.
+        if style & 0x804 == 0x804 {
+            ControlKind::Text
+        } else if is("Edit") {
+            ControlKind::Edit
+        } else {
+            ControlKind::Unavailable
+        }
+    } else if is("ComboBox") && style & 3 == 3 {
+        ControlKind::Combo
+    } else if (is("ListBox") || is("SysListView32")) && list_box {
+        ControlKind::List
+    } else if is("msctls_trackbar32") {
+        ControlKind::Track
+    } else if is("msctls_statusbar32") {
+        ControlKind::Label
+    } else if is("msctls_progress32") {
+        ControlKind::Progress
+    } else if is("#32770") {
+        ControlKind::Container
+    } else {
+        ControlKind::Unavailable
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +218,10 @@ impl DialogFont {
 }
 
 impl DialogControl {
+    pub fn supported(&self) -> bool {
+        self.kind != ControlKind::Unavailable
+    }
+
     /// A static's horizontal text alignment: 0 left, 1 center, 2 right.
     pub fn alignment(&self) -> u8 {
         if self.class.eq_ignore_ascii_case("Static") && matches!(self.style & 0x1f, 1 | 2) {
@@ -155,20 +254,6 @@ pub fn without_mnemonics(text: &str) -> String {
         }
     }
     caption
-}
-
-/// Whether a standard control can be shown natively.
-pub fn supported(class: &str, style: u32, list_box: bool) -> bool {
-    // Owner-drawn buttons retain guest input/state; the platform adapter can
-    // project their captions without inventing or running the guest painter.
-    (class.eq_ignore_ascii_case("Button") && matches!(style & 0xf, 0..=9 | 11))
-        || (class.eq_ignore_ascii_case("Static")
-            && matches!(style & 0x1f, 0..=3 | 7..=9 | 11..=12 | 16..=18))
-        || class.eq_ignore_ascii_case("Edit")
-        || (class.eq_ignore_ascii_case("ComboBox") && style & 3 == 3)
-        || (class.eq_ignore_ascii_case("ListBox") && list_box)
-        || class.eq_ignore_ascii_case("msctls_trackbar32")
-        || class.eq_ignore_ascii_case("msctls_statusbar32")
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -291,7 +376,8 @@ mod tests {
             range: None,
             value: 0,
             font: None,
-            supported: true,
+            kind: kind(class, style, true, false),
+            image: None,
         }
     }
 
@@ -327,11 +413,32 @@ mod tests {
     }
 
     #[test]
-    fn static_etched_frames_and_lines_are_supported() {
+    fn standard_controls_show_as_their_kind() {
+        let kind = |class, style| kind(class, style, true, false);
         for style in [0x5000_0010, 0x5000_0011, 0x5000_0012] {
-            assert!(supported("Static", style, false), "{style:#x}");
+            assert_eq!(kind("Static", style), ControlKind::Frame, "{style:#x}");
         }
-        assert!(!supported("Static", 0x5000_000d, false));
-        assert!(!supported("Static", 0x5000_000e, false));
+        assert_eq!(kind("Static", 0x5000_000d), ControlKind::Unavailable);
+        assert_eq!(kind("Static", 0x5000_000e), ControlKind::Unavailable);
+        assert_eq!(
+            super::kind("Static", 0x5000_000e, false, true),
+            ControlKind::Image
+        );
+        // A license: multiline and read-only, in either text class.
+        assert_eq!(kind("RichEdit20W", 0x5020_0804), ControlKind::Text);
+        assert_eq!(kind("Edit", 0x5020_0804), ControlKind::Text);
+        assert_eq!(kind("Edit", 0x5001_0080), ControlKind::Edit);
+        assert_eq!(kind("RichEdit20W", 0x5001_0080), ControlKind::Unavailable);
+        assert_eq!(
+            kind("msctls_progress32", 0x5000_0000),
+            ControlKind::Progress
+        );
+        assert_eq!(kind("SysListView32", 0x5000_0003), ControlKind::List);
+        assert_eq!(
+            super::kind("SysListView32", 0x5000_1003, false, false),
+            ControlKind::Unavailable
+        );
+        assert_eq!(kind("#32770", 0x5000_0000), ControlKind::Container);
+        assert_eq!(kind("SysTreeView32", 0x5000_0000), ControlKind::Unavailable);
     }
 }

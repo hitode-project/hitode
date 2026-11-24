@@ -44,7 +44,7 @@ fn run(probe: &str, gpu: bool) {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &probes.join(probe),
+        exe: Some(&probes.join(probe)),
         width: 640,
         height: 480,
         jit: true,

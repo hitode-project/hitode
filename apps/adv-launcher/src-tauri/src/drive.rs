@@ -84,12 +84,15 @@ pub async fn import_registry(
         return Err("at most four disc images can be mounted".into());
     }
     let _activity = app.state::<crate::game_storage::Activity>().acquire()?;
-    let (exe, data_dir, codepage) = app
-        .state::<Mutex<crate::library::Library>>()
-        .lock()
-        .unwrap()
-        .launch(&id)
-        .map_err(|e| e.to_string())?;
+    let ((exe, data_dir, codepage), (_, program_files)) = {
+        let library = app.state::<Mutex<crate::library::Library>>();
+        let library = library.lock().unwrap();
+        let launch = library.launch(&id).map_err(|e| e.to_string())?;
+        (
+            launch,
+            library.installation(&id).map_err(|e| e.to_string())?,
+        )
+    };
     #[cfg(target_os = "ios")]
     let exe = {
         use tauri_plugin_storage::StorageExt;
@@ -106,6 +109,8 @@ pub async fn import_registry(
     };
     let mut options = adv_shell::Options::new(exe, data_dir);
     options.codepage = Some(codepage);
+    // An installed game keeps the `C:\Program Files` its setup wrote into scripts.
+    options.install_dir = program_files;
     options.cdroms = discs
         .into_iter()
         .enumerate()

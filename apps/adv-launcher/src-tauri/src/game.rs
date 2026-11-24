@@ -279,8 +279,14 @@ pub async fn start_game(
         .unwrap()
         .launch(&id)
         .map_err(|e| e.to_string())?;
+    let installation = window
+        .state::<Mutex<Library>>()
+        .lock()
+        .unwrap()
+        .installation(&id)
+        .map_err(|e| e.to_string())?;
     let options = playback
-        .prepare(window.app_handle(), exe, data_dir, codepage)
+        .prepare(window.app_handle(), exe, data_dir, codepage, installation)
         .await?;
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let host_window = window.clone();

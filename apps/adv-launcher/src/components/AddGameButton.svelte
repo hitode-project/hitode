@@ -2,6 +2,8 @@
   import Icon from "./Icon.svelte";
   import { t } from "../lib/i18n.svelte";
   import { nav } from "../lib/nav.svelte";
+  import { call } from "../lib/bridge";
+  import { chooseInstallDisc } from "../lib/import-flow.svelte";
 
   let { compact = false }: { compact?: boolean } = $props();
   let open = $state(false);
@@ -23,6 +25,15 @@
     open = false;
     nav.go({ name });
   }
+
+  /** A disc image's setup installs the game (WINE-SES-12). */
+  async function install() {
+    open = false;
+    const path = await call<string | null>("pick_game_file", { kind: "disc" }, null);
+    if (!path) return;
+    chooseInstallDisc(path);
+    nav.go({ name: "install" });
+  }
 </script>
 
 <svelte:window onpointerdown={(e) => { if (open && e.target instanceof Node && !wrapper.contains(e.target)) open = false; }} onkeydown={(e) => { if (open && e.key === "Escape") { e.preventDefault(); close(); } }} />
@@ -36,6 +47,7 @@
     <div class="options" role="group" aria-label={t("添加游戏")}>
       <button class="quiet" bind:this={first} onclick={() => pick("import")}>{t("导入单个游戏")}</button>
       <button class="quiet" onclick={() => pick("scan")}>{t("批量导入")}</button>
+      <button class="quiet" onclick={() => void install()}>{t("从光盘安装…")}</button>
     </div>
   {/if}
 </div>

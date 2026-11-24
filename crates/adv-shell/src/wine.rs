@@ -43,6 +43,13 @@ pub(crate) fn restore_registry(
     dist: &Path,
     file: &Path,
 ) -> Result<adv_runtime::wine::session::RegistryReport, String> {
+    let (prefix, debug, codepage) = facts(options)?;
+    let config = config(options, dist, &prefix, &debug, codepage, "", None);
+    environment.restore_registry(&config, &session_options(options), file)
+}
+
+/// The prefix, `WINEDEBUG` and code page a session of `options` runs with.
+fn facts(options: &Options) -> Result<(std::path::PathBuf, String, u32), String> {
     let prefix = match &options.wine_prefix {
         Some(prefix) => prefix.clone(),
         None => options
@@ -55,28 +62,54 @@ pub(crate) fn restore_registry(
     let debug = std::env::var("WINEDEBUG").unwrap_or_default();
     let codepage = match options.codepage {
         Some(codepage) => codepage,
-        None => crate::detect_codepage(&options.exe).map_err(|e| e.to_string())?,
+        None => options.detect_codepage().map_err(|e| e.to_string())?,
     };
-    let config = Config {
+    Ok((prefix, debug, codepage))
+}
+
+fn config<'a>(
+    options: &'a Options,
+    dist: &'a Path,
+    prefix: &'a Path,
+    debug: &'a str,
+    codepage: u32,
+    fonts: &'a str,
+    stdout: Option<std::os::fd::RawFd>,
+) -> Config<'a> {
+    Config {
         dist,
-        prefix: &prefix,
+        prefix,
         drive: options.wine_drive.as_deref(),
         locale: adv_runtime::wine::session::locale(codepage),
-        fonts: "",
-        exe: &options.exe,
+        fonts,
+        exe: options.exe.as_deref(),
         width: options.width,
         height: options.height,
         jit: options.jit,
-        debug: &debug,
-        stdout: None,
-    };
-    let session_options = SessionOptions {
-        fonts: adv_runtime::FontOverrides::default(),
-        font_files: Vec::new(),
+        debug,
+        stdout,
+    }
+}
+
+fn session_options(options: &Options) -> SessionOptions {
+    use adv_runtime::wine::session::{Image, Program};
+    SessionOptions {
+        fonts: adv_runtime::FontOverrides {
+            families: options.font_families.clone(),
+            antialiased: options.font_smoothing,
+        },
+        font_files: options.font_files.clone(),
         cdroms: options.cdroms.clone(),
         install_dir: options.install_dir.clone(),
-    };
-    environment.restore_registry(&config, &session_options, file)
+        program: options.program.as_ref().map(|program| Program {
+            arguments: program.arguments.clone(),
+            ..Program::new(match &program.image {
+                crate::ProgramImage::Guest(path) => Image::Guest(path.clone()),
+                crate::ProgramImage::Host(path) => Image::Host(path.clone()),
+            })
+        }),
+        replacements: Vec::new(),
+    }
 }
 
 fn start(
@@ -87,44 +120,19 @@ fn start(
     keys: &Arc<KeyState>,
     host: Host,
 ) -> Result<Session, String> {
-    let prefix = match &options.wine_prefix {
-        Some(prefix) => prefix.clone(),
-        None => options
-            .data_dir
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("wine"),
-    };
-    let prefix = std::path::absolute(prefix).map_err(|e| e.to_string())?;
-    let debug = std::env::var("WINEDEBUG").unwrap_or_default();
-    let codepage = match options.codepage {
-        Some(codepage) => codepage,
-        None => crate::detect_codepage(&options.exe).map_err(|e| e.to_string())?,
-    };
-    let config = Config {
+    let (prefix, debug, codepage) = facts(options)?;
+    let config = config(
+        options,
         dist,
-        prefix: &prefix,
-        drive: options.wine_drive.as_deref(),
-        locale: adv_runtime::wine::session::locale(codepage),
-        fonts: adv_runtime::wine::session::HOST_FONTS,
-        exe: &options.exe,
-        width: options.width,
-        height: options.height,
-        jit: options.jit,
-        debug: &debug,
-        stdout: Some(libc::STDOUT_FILENO),
-    };
+        &prefix,
+        &debug,
+        codepage,
+        adv_runtime::wine::session::HOST_FONTS,
+        Some(libc::STDOUT_FILENO),
+    );
     let gpu_wake = wake.clone();
     let codec_kernels = options.codec_kernels;
-    let fonts = SessionOptions {
-        fonts: adv_runtime::FontOverrides {
-            families: options.font_families.clone(),
-            antialiased: options.font_smoothing,
-        },
-        font_files: options.font_files.clone(),
-        cdroms: options.cdroms.clone(),
-        install_dir: options.install_dir.clone(),
-    };
+    let fonts = session_options(options);
     environment.start(&config, wake.clone(), &fonts, move |machine| {
         if let Some(waker) = host.capture {
             machine.ext.insert(waker);
@@ -417,7 +425,7 @@ fn report(
     let frame = session.frame();
     let sys = &session.machine.sys;
     let mut fields = vec![
-        format!("\"exe\": {}", json(&options.exe.to_string_lossy())),
+        format!("\"exe\": {}", json(&options.started())),
         format!(
             "\"backend\": {}",
             json(if options.jit { "jit" } else { "interpreter" })
