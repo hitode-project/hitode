@@ -61,6 +61,7 @@ REQUESTS = [
     "set_key_value",
     "get_token_sid",
     "get_token_groups",
+    "get_token_info",
     "open_directory",
     "get_directory_entries",
     "open_mapping",
