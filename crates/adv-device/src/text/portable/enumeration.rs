@@ -32,11 +32,14 @@ pub(super) fn declares(codepages: u32, encoding: Encoding) -> bool {
 }
 
 /// The charsets a face enumerates for `query`; DEFAULT_CHARSET lists the
-/// ANSI code page's charset first, as Windows does.
+/// ANSI code page's charset first, as Windows does. When `fallback` is true
+/// (a substitute for a missing family), an explicit query whose OS/2 code page
+/// bit is absent still reports that repertoire so enumeration agrees with drawing.
 pub(super) fn repertoires(
     font: EnumeratedFont,
     query: Encoding,
     ansi: Encoding,
+    fallback: bool,
 ) -> Vec<EnumeratedFont> {
     let signature = font.signature.unwrap_or_default();
     let repertoires = REPERTOIRES
@@ -66,6 +69,16 @@ pub(super) fn repertoires(
     // repertoire which has not been declared by its author.
     if output.is_empty() && query == Encoding::Automatic && signature.codepages[0] == 0 {
         output.push(font);
+    } else if output.is_empty() && fallback {
+        let mut entry = font;
+        if query != Encoding::Automatic {
+            entry.font.encoding = query;
+            entry.metrics.encoding = query;
+            if let Some(&(_, _, script)) = REPERTOIRES.iter().find(|&&(_, enc, _)| enc == query) {
+                entry.script = script.into();
+            }
+        }
+        output.push(entry);
     }
     output
 }

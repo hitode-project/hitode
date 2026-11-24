@@ -7,7 +7,12 @@ use adv_device::{
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{borrow::Cow, collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 const SINGLE: &[u8] = include_bytes!("fixtures/font-resource.ttf");
 const COLLECTION: &[u8] = include_bytes!("fixtures/font-resource.ttc");
@@ -2066,4 +2071,327 @@ fn vertical_faces_place_rotated_glyphs_inside_the_cell_and_keep_ascii_upright() 
             );
         }
     }
+}
+
+/// Patch `OS/2.xAvgCharWidth` and `hmtx` advance for `glyph_index` in a TTF fixture.
+fn with_metrics(font: &[u8], x_avg: i16, glyph_advances: &[(usize, u16)]) -> Vec<u8> {
+    let mut font = font.to_vec();
+    let table_offset = |bytes: &[u8], tag: &[u8]| {
+        let count = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+        (0..count)
+            .map(|i| 12 + i * 16)
+            .find(|&at| &bytes[at..at + 4] == tag)
+            .map(|at| u32::from_be_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize)
+            .unwrap()
+    };
+    let os2 = table_offset(&font, b"OS/2");
+    font[os2 + 2..os2 + 4].copy_from_slice(&x_avg.to_be_bytes());
+    let hmtx = table_offset(&font, b"hmtx");
+    for &(glyph_index, advance) in glyph_advances {
+        let at = hmtx + glyph_index * 4;
+        font[at..at + 2].copy_from_slice(&advance.to_be_bytes());
+    }
+    font
+}
+
+// spec: DEV-FONT-11 DEV-FONT-7 DEV-FONT-10
+#[test]
+fn duospace_cjk_substitutes_fit_halfwidth_and_fullwidth_cells() {
+    let japanese = include_bytes!("fixtures/font-resource-japanese.ttf");
+    // Give the fixture an em-wide xAvgCharWidth (like Noto CJK / Heiti SC),
+    // keep 'A' (glyph 2) wide at 0.8 em, and narrow 'B' (glyph 3) to 0.3 em.
+    let fixture = with_metrics(
+        &declaring(japanese, 1 | (1 << 17) | (1 << 18)),
+        1000,
+        &[(3, 300)],
+    );
+    let mut text = Text::with_font_directories(&[]);
+    text.add_file_resource(&fixture, true).unwrap();
+    // Simulate a Wine session catalog mapping missing Windows families to the host CJK face.
+    text.set_font_replacements(&FontReplacements {
+        files: Vec::new(),
+        families: vec![
+            (
+                vec!["SimSun".into(), "宋体".into()],
+                vec!["ADV Japanese Fixture".into()],
+            ),
+            (
+                vec!["MS Gothic".into(), "ＭＳ ゴシック".into()],
+                vec!["ADV Japanese Fixture".into()],
+            ),
+        ],
+    });
+
+    let mut exact = font("ADV Japanese Fixture");
+    exact.height = -24;
+    exact.encoding = Encoding::SimplifiedChinese;
+    let exact_a = text
+        .glyph(
+            &exact,
+            glyph(Character::Unicode(0x0041), GlyphFormat::Gray8),
+        )
+        .unwrap()
+        .metrics;
+    let exact_b = text
+        .glyph(
+            &exact,
+            glyph(Character::Unicode(0x0042), GlyphFormat::Gray8),
+        )
+        .unwrap()
+        .metrics;
+    assert_eq!(exact_a.advance_x, 19);
+    assert_eq!(exact_b.advance_x, 7);
+
+    // Exact match with FIXED_PITCH and missing proportional CJK keep their natural advances.
+    let mut exact_fixed = exact.clone();
+    exact_fixed.pitch = Pitch::Fixed;
+    assert_eq!(
+        text.glyph(
+            &exact_fixed,
+            glyph(Character::Unicode(0x0041), GlyphFormat::Gray8)
+        )
+        .unwrap()
+        .metrics
+        .advance_x,
+        19
+    );
+    let mut missing_prop = exact.clone();
+    missing_prop.face = "MS PGothic".into();
+    missing_prop.pitch = Pitch::Fixed;
+    assert_eq!(
+        text.glyph(
+            &missing_prop,
+            glyph(Character::Unicode(0x0041), GlyphFormat::Gray8)
+        )
+        .unwrap()
+        .metrics
+        .advance_x,
+        19
+    );
+
+    // Automatic substitutes for 1:2 Windows CJK families use 0.5 em / 1.0 em advances
+    // and fit wide outlines inside the halfwidth cell while centering narrow ones.
+    for (face, encoding) in [
+        ("SimSun", Encoding::SimplifiedChinese),
+        ("宋体", Encoding::SimplifiedChinese),
+        ("SimHei", Encoding::SimplifiedChinese),
+        ("黑体", Encoding::SimplifiedChinese),
+        ("MS Gothic", Encoding::Japanese),
+        ("ＭＳ ゴシック", Encoding::Japanese),
+    ] {
+        let mut req = font(face);
+        req.height = -24;
+        req.encoding = encoding;
+        let metrics = text.metrics(&req).unwrap();
+        assert_eq!(metrics.average_width, 12, "{face}");
+        assert_eq!(metrics.maximum_width, 24, "{face}");
+        assert!(!metrics.variable_pitch, "{face}");
+
+        let a = text
+            .glyph(&req, glyph(Character::Unicode(0x0041), GlyphFormat::Gray8))
+            .unwrap()
+            .metrics;
+        assert_eq!(a.advance_x, 12, "{face}: 'A' halfwidth advance");
+        assert!(a.origin_x >= 0, "{face}: 'A' origin_x={}", a.origin_x);
+        assert!(
+            a.origin_x + a.width as i32 <= 12,
+            "{face}: 'A' right edge {} exceeds 12",
+            a.origin_x + a.width as i32
+        );
+        assert!(
+            a.width < exact_a.width,
+            "{face}: wide 'A' outline must condense"
+        );
+        let abc = text
+            .character_abc_widths(&req, &[Character::Unicode(0x0041)])
+            .unwrap();
+        assert!(abc[0].left >= 0 && abc[0].right >= 0, "{face}: {abc:?}");
+        assert_eq!(abc[0].left + abc[0].ink as i32 + abc[0].right, 12);
+
+        let b = text
+            .glyph(&req, glyph(Character::Unicode(0x0042), GlyphFormat::Gray8))
+            .unwrap()
+            .metrics;
+        assert_eq!(b.advance_x, 12, "{face}: 'B' halfwidth advance");
+        assert_eq!(
+            b.width, exact_b.width,
+            "{face}: narrow 'B' must not stretch"
+        );
+        assert!(
+            b.origin_x > exact_b.origin_x && b.origin_x + b.width as i32 <= 12,
+            "{face}: narrow 'B' must center inside [0, 12], got origin={} width={}",
+            b.origin_x,
+            b.width
+        );
+
+        let kana = text
+            .glyph(&req, glyph(Character::Unicode(0x3042), GlyphFormat::Gray8))
+            .unwrap()
+            .metrics;
+        assert_eq!(kana.advance_x, 24, "{face}: fullwidth advance");
+        assert!(kana.origin_x >= 0 && kana.origin_x + kana.width as i32 <= 24);
+    }
+
+    // Explicit lfWidth = em/2 keeps xscale = 1.0 even when substitute xAvgCharWidth == 1.0 em.
+    let mut half_width = font("宋体");
+    half_width.height = -24;
+    half_width.width = 12;
+    half_width.encoding = Encoding::SimplifiedChinese;
+    assert_eq!(text.metrics(&half_width).unwrap().average_width, 12);
+    assert_eq!(
+        text.extent(&half_width, TextInput::Unicode(&[0x0041, 0x3042]))
+            .unwrap()
+            .width,
+        36
+    );
+
+    // Synthetic bold widens the fitted halfwidth cell by 1 px to the right (DEV-FONT-7).
+    let mut bold = font("宋体");
+    bold.height = -24;
+    bold.weight = 700;
+    bold.encoding = Encoding::SimplifiedChinese;
+    let bold_metrics = text.metrics(&bold).unwrap();
+    assert_eq!(
+        (bold_metrics.average_width, bold_metrics.maximum_width),
+        (13, 25)
+    );
+    let bold_a = text
+        .glyph(&bold, glyph(Character::Unicode(0x0041), GlyphFormat::Gray8))
+        .unwrap()
+        .metrics;
+    assert_eq!(bold_a.advance_x, 13);
+    assert!(bold_a.origin_x >= 0 && bold_a.origin_x + bold_a.width as i32 <= 13);
+
+    // Vertical `@宋体` keeps ASCII upright and fitted into the halfwidth cell (DEV-FONT-10).
+    let mut vertical = font("@宋体");
+    vertical.height = -24;
+    vertical.encoding = Encoding::SimplifiedChinese;
+    let v_a = text
+        .glyph(
+            &vertical,
+            glyph(Character::Unicode(0x0041), GlyphFormat::Gray8),
+        )
+        .unwrap()
+        .metrics;
+    assert_eq!(v_a.advance_x, 12);
+    assert!(v_a.origin_x >= 0 && v_a.origin_x + v_a.width as i32 <= 12);
+
+    // Explicit host override keeps the chosen face's natural advances and outlines.
+    text.set_overrides(Overrides {
+        families: BTreeMap::from([("宋体".into(), "ADV Japanese Fixture".into())]),
+        antialiased: None,
+    });
+    let mut overridden = font("宋体");
+    overridden.height = -24;
+    overridden.encoding = Encoding::SimplifiedChinese;
+    assert_eq!(
+        text.glyph(
+            &overridden,
+            glyph(Character::Unicode(0x0041), GlyphFormat::Gray8)
+        )
+        .unwrap()
+        .metrics,
+        exact_a
+    );
+}
+
+// spec: DEV-FONT-11
+#[cfg(target_os = "macos")]
+#[test]
+fn duospace_cjk_substitutes_preserve_fullwidth_punctuation_and_fit_wide_latin() {
+    let mut text = Text::default();
+    let mut req = font("宋体");
+    req.height = -24;
+    req.encoding = Encoding::SimplifiedChinese;
+    if text.resolved_character(&req, 0x6C49).map_or(true, |r| {
+        r.family.eq_ignore_ascii_case("SimSun") || r.family == "宋体"
+    }) {
+        return;
+    }
+    let metrics = text.metrics(&req).unwrap();
+    assert_eq!(metrics.average_width, 12);
+    assert!(!metrics.variable_pitch);
+
+    for ch in [' ', 'i', 'l', 'a', 'e', '0', 'A', 'M', 'W', '(', ')'] {
+        let g = text
+            .glyph(
+                &req,
+                glyph(Character::Unicode(u32::from(ch)), GlyphFormat::Gray8),
+            )
+            .unwrap()
+            .metrics;
+        assert_eq!(g.advance_x, 12, "ASCII {ch:?} advance");
+        assert!(
+            g.origin_x >= 0 && g.origin_x + g.width as i32 <= 12,
+            "ASCII {ch:?} box [{}, {}] exceeds [0, 12]",
+            g.origin_x,
+            g.origin_x + g.width as i32
+        );
+    }
+    for ch in ['汉', '。', '—', '…', '“', '※', '○', '♪'] {
+        let g = text
+            .glyph(
+                &req,
+                glyph(Character::Unicode(u32::from(ch)), GlyphFormat::Gray8),
+            )
+            .unwrap()
+            .metrics;
+        assert_eq!(g.advance_x, 24, "CJK {ch:?} advance");
+        assert!(
+            g.origin_x >= 0 && g.origin_x + g.width as i32 <= 24,
+            "CJK {ch:?} box [{}, {}] exceeds [0, 24]",
+            g.origin_x,
+            g.origin_x + g.width as i32
+        );
+    }
+}
+
+// spec: DEV-FONT-4 DEV-FONT-11
+#[test]
+fn extended_enumeration_keeps_named_substitutes_without_os2_codepage_bits() {
+    // A font whose OS/2 ulCodePageRange1 is zero still backs named missing
+    // families under explicit charsets, and backs full-enumeration Windows
+    // families whose charset its cmap covers.
+    let latin_no_cp = declaring(SINGLE, 0);
+    let mut text = Text::with_font_directories(&[]);
+    text.add_file_resource(&latin_no_cp, true).unwrap();
+
+    let named = text
+        .enumerate(
+            Some("宋体"),
+            FontEnumeration::FamiliesEx(Encoding::SimplifiedChinese),
+        )
+        .unwrap();
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].font.face, "宋体");
+    assert_eq!(named[0].font.encoding, Encoding::SimplifiedChinese);
+    assert_eq!(named[0].script, "Chinese GB2312");
+    assert_eq!(named[0].font.pitch, Pitch::Fixed);
+    assert_eq!(named[0].metrics.average_width, 8);
+    assert!(!named[0].metrics.variable_pitch);
+    assert!(named[0].substitute);
+
+    // Full enumeration does not fabricate CJK families when no face maps CJK.
+    assert!(
+        text.enumerate(
+            None,
+            FontEnumeration::FamiliesEx(Encoding::SimplifiedChinese),
+        )
+        .unwrap()
+        .is_empty()
+    );
+
+    // When a face maps Japanese ('あ') even without OS/2 bits, full enumeration
+    // lists missing standard Japanese Windows families through it.
+    let jp_no_cp = declaring(include_bytes!("fixtures/font-resource-japanese.ttf"), 0);
+    let mut jp_text = Text::with_font_directories(&[]);
+    jp_text.add_file_resource(&jp_no_cp, true).unwrap();
+    let full_jp = jp_text
+        .enumerate(None, FontEnumeration::FamiliesEx(Encoding::Japanese))
+        .unwrap();
+    assert!(
+        full_jp
+            .iter()
+            .any(|row| row.substitute && row.font.face == "MS Gothic")
+    );
 }
