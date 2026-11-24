@@ -12,6 +12,9 @@ pub struct ContainerState {
     monitor: RefCell<Option<Retained<AnyObject>>>,
     window_frame: Cell<Option<NSRect>>,
     canvas: Cell<Option<(u32, u32, bool)>>,
+    /// Whether the window follows the game's canvas; a game not shown yet
+    /// leaves it as it is.
+    fitting: Cell<bool>,
 }
 
 define_class!(
@@ -51,6 +54,7 @@ impl GameContainer {
             monitor: RefCell::new(None),
             window_frame: Cell::new(None),
             canvas: Cell::new(None),
+            fitting: Cell::new(false),
         });
         let view: Retained<Self> =
             unsafe { msg_send![super(this), initWithFrame: parent.bounds()] };
@@ -111,8 +115,9 @@ impl GameContainer {
         self.ivars().webview.setHidden(game && !visible);
     }
 
-    /// Mount below the webview, or remove the completed game's view.
-    pub fn set_game(&self, game: Option<&GameView>) {
+    /// Mount below the webview, or remove the completed game's view. A game
+    /// not `shown` yet leaves the window's size until [`Self::show_game`].
+    pub fn set_game(&self, game: Option<&GameView>, shown: bool) {
         if let Some(old) = self.ivars().game.borrow_mut().take() {
             old.removeFromSuperview();
         }
@@ -137,12 +142,27 @@ impl GameContainer {
                 Some(&self.ivars().webview),
             );
             *self.ivars().game.borrow_mut() = Some(game.retain());
+            self.ivars().fitting.set(shown);
             self.fit_canvas(game.canvas_size());
         }
     }
 
+    /// The window follows the mounted game's canvas from now on.
+    pub fn show_game(&self) {
+        self.ivars().fitting.set(true);
+        let canvas = self
+            .ivars()
+            .game
+            .borrow()
+            .as_ref()
+            .map(|game| game.canvas_size());
+        if let Some(canvas) = canvas {
+            self.fit_canvas(canvas);
+        }
+    }
+
     pub(super) fn fit_canvas(&self, canvas: (u32, u32)) {
-        if canvas.0 == 0 || canvas.1 == 0 {
+        if !self.ivars().fitting.get() || canvas.0 == 0 || canvas.1 == 0 {
             return;
         }
         let window = self.window().unwrap();

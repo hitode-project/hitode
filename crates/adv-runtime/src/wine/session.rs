@@ -19,7 +19,7 @@ pub use adv_nt::exception::{Record, StubGaps, WINE_STUB};
 pub use adv_nt::identity::Images;
 pub use host::Host;
 pub use installed::Installed;
-pub use registry::RegistryReport;
+pub use registry::{RegistryReport, RegistryWatch};
 
 use adv_drv::user::project;
 use std::cell::{Cell, RefCell};
@@ -91,9 +91,11 @@ pub struct Program {
     pub arguments: String,
     /// A DOS directory, relative to the program directory unless absolute.
     pub directory: Option<String>,
-    /// Receives standard output and error while standard input reads
-    /// nothing; none leaves the standard handles empty, as for a game.
+    /// Receives standard output and error; none leaves the standard
+    /// handles empty, as for a game.
     pub output: Option<RawFd>,
+    /// Standard input, with output only; none reads nothing.
+    pub input: Option<RawFd>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +115,7 @@ impl Program {
             arguments: String::new(),
             directory: None,
             output: None,
+            input: None,
         }
     }
 }
@@ -789,9 +792,12 @@ impl Session {
         machine.ext.insert(milestones.clone());
         machine.ext.get_mut::<SurfaceStore>().milestones = Some(milestones.clone());
         prepare(&mut machine)?;
-        // A program's output replaces the game's; its input reads nothing.
+        // A program's output replaces the game's; its input reads what it is
+        // given, or nothing.
         let output = options.program.as_ref().and_then(|program| program.output);
+        let input = options.program.as_ref().and_then(|program| program.input);
         let nothing = output
+            .filter(|_| input.is_none())
             .map(|_| std::fs::File::open("/dev/null"))
             .transpose()
             .map_err(|e| format!("/dev/null: {e}"))?;
@@ -802,7 +808,7 @@ impl Session {
             environment: ENVIRONMENT,
             locale: config.locale,
             debug: config.debug,
-            stdin: nothing.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
+            stdin: input.or(nothing.as_ref().map(std::os::fd::AsRawFd::as_raw_fd)),
             stdout: output.or(config.stdout),
             stderr: output,
             graphics_driver: super::GRAPHICS_DRIVER,

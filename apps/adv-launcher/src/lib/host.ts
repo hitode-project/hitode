@@ -65,7 +65,7 @@ export interface RunSummary {
   api_gaps?: { called: string[]; imported: string[] } | null;
 }
 export type GameFinished =
-  | { gameId: string; exitCode: number; summary: RunSummary }
+  | { gameId: string; exitCode: number; summary: RunSummary; registry?: RegistryImportResult }
   | { gameId: string; error: string; summary: RunSummary };
 
 export async function libraryPickFolder(options?: FolderPickOptions): Promise<string | null> {
@@ -112,6 +112,10 @@ export function hapticTick(): void {
 }
 export function libraryRestore(game: LibraryGame, index: number): Promise<void> {
   return call("library_restore", { game, index }, undefined);
+}
+/** Sends a line to the running script, as Enter does. */
+export function scriptInput(line: string): Promise<void> {
+  return call("script_input", { line }, undefined);
 }
 export function startGame(id: string, exe?: string): Promise<void> {
   return call("start_game", { id, filter: gameFilter(id), playback: playback(id, exe) }, undefined);

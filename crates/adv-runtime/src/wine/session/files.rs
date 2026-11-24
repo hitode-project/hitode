@@ -170,6 +170,9 @@ fn absolute_dos(path: &str) -> bool {
     bytes.get(1) == Some(&b':') || path.starts_with(r"\\")
 }
 
+/// Wine's command interpreter, which runs scripts.
+const CMD: &str = r"C:\windows\system32\cmd.exe"; // privacy: allow authored guest path
+
 /// Where the program folder appears: on drive C: when it lies there, in
 /// Program Files for a bundled VFS program, otherwise on the first free drive.
 struct Placement {
@@ -245,18 +248,6 @@ pub(super) fn drive_c(config: &Config<'_>, prefix: &Path) -> PathBuf {
     drive.canonicalize().unwrap_or(drive)
 }
 
-/// The DOS directory where the session will show the program folder.
-pub(super) fn program_directory(
-    config: &Config<'_>,
-    options: &SessionOptions,
-    prefix: &Path,
-) -> Result<String, String> {
-    let placement = place(config, options, &drive_c(config, prefix))?;
-    Ok(placement
-        .folder
-        .map_or_else(|| r"C:\".to_owned(), |(_, directory)| directory))
-}
-
 pub(super) fn prepare(
     config: &Config<'_>,
     options: &SessionOptions,
@@ -321,6 +312,10 @@ pub(super) fn prepare(
             (dos, Some(path))
         }
     };
+    // A script runs in cmd.exe, as Windows starts one; it reads a host
+    // script without the pauses and elevation it carries for a console
+    // window (WINE-SES-11).
+    let script = options.program.is_some() && super::registry::is_script(Path::new(&image));
     let (command_line, start) = match &options.program {
         None => (
             image.rsplit('\\').next().unwrap_or_default().to_owned(),
@@ -331,6 +326,9 @@ pub(super) fn prepare(
             if !program.arguments.is_empty() {
                 command_line.push(' ');
                 command_line.push_str(&program.arguments);
+            }
+            if script {
+                command_line = format!("\"{CMD}\" /d /c \"{command_line}\"");
             }
             let start = match &program.directory {
                 Some(path) if absolute_dos(path) => with_slash(path.clone()),
@@ -376,6 +374,18 @@ pub(super) fn prepare(
         .into_iter()
         .collect();
     replacements.extend(options.replacements.iter().cloned());
+    if let Some(path) = host_image.as_ref().filter(|_| script) {
+        let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        replacements.push((
+            path.clone(),
+            super::registry::sanitize_batch(&raw, codepage),
+        ));
+    }
+    let (image, host_image) = if script {
+        (CMD.to_owned(), None)
+    } else {
+        (image, host_image)
+    };
     let root = if options.cdroms.is_empty() && replacements.is_empty() {
         None
     } else {
@@ -485,7 +495,7 @@ mod tests {
         }
     }
 
-    // spec: WINE-SES-1, WINE-SES-12
+    // spec: WINE-SES-1, WINE-SES-11, WINE-SES-12
     #[test]
     fn programs_keep_their_drive_c_and_install_paths_and_others_take_a_drive() {
         let root = std::env::temp_dir().join(format!("adv-programs-{}", std::process::id()));
@@ -583,6 +593,39 @@ mod tests {
                 r#""G:\SETUP.EXE" /x"#.into(), // privacy: allow authored guest path
                 r"G:\".into()                  // privacy: allow authored guest path
             )
+        );
+        // A script runs in cmd.exe from its own directory, as Windows starts
+        // one; a host script's copy drops its pause.
+        std::fs::write(game.join("tools/restore.bat"), "reg add x\r\npause\r\n").unwrap();
+        assert_eq!(
+            start(
+                Some(&game.join("game.exe")),
+                &program(Image::Host(game.join("tools/restore.bat")))
+            ),
+            (
+                CMD.into(),
+                r#""C:\windows\system32\cmd.exe" /d /c ""D:\tools\restore.bat" /x""#.into(), // privacy: allow authored guest path
+                r"D:\tools\".into() // privacy: allow authored guest path
+            )
+        );
+        let prepared = prepare(
+            &config,
+            &program(Image::Host(game.join("tools/restore.bat"))),
+            &prefix,
+        )
+        .unwrap();
+        let replaced = prefix.join(format!(
+            ".hitode-files-{}/replaced/0/restore.bat",
+            std::process::id()
+        ));
+        assert_eq!(
+            std::fs::read_to_string(replaced).unwrap(),
+            "reg add x\r\nrem [hitode] skipped pause\r\n"
+        );
+        drop(prepared);
+        assert_eq!(
+            start(None, &program(Image::Guest(r"G:\INSTALL.CMD".into()))).1, // privacy: allow authored guest path
+            r#""C:\windows\system32\cmd.exe" /d /c ""G:\INSTALL.CMD" /x""# // privacy: allow authored guest path
         );
         let _ = std::fs::remove_dir_all(&root);
     }

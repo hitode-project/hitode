@@ -5,6 +5,7 @@
 //! guest's windows reach the host natively: dialogs, the menu bar, IME text,
 //! focus, activation, minimizing and closing, and the control channel.
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,7 +38,7 @@ struct Host {
 
 /// Imports a `.reg` file or runs a `.bat` / `.cmd` registry restore script in
 /// the game's Wine environment (same prefix, drive letter, discs and code page).
-pub(crate) fn restore_registry(
+pub(crate) fn import_registry(
     environment: &mut WineHost,
     options: &Options,
     dist: &Path,
@@ -45,7 +46,25 @@ pub(crate) fn restore_registry(
 ) -> Result<adv_runtime::wine::session::RegistryReport, String> {
     let (prefix, debug, codepage) = facts(options)?;
     let config = config(options, dist, &prefix, &debug, codepage, "", None);
-    environment.restore_registry(&config, &session_options(options), file)
+    environment.import_registry(&config, file)
+}
+
+/// Runs `run`, which ends its session, between the registry watch and settle
+/// of the script `options` start (WINE-SES-11), and returns what it wrote.
+fn watching_registry<R>(
+    environment: &mut WineHost,
+    options: &Options,
+    dist: &Path,
+    run: impl FnOnce(&mut WineHost) -> Result<R, String>,
+) -> Result<(R, Option<adv_runtime::wine::session::RegistryReport>), String> {
+    let (prefix, debug, codepage) = facts(options)?;
+    let config = config(options, dist, &prefix, &debug, codepage, "", None);
+    let watch = environment.watch_registry(&config, &session_options(options))?;
+    let result = run(environment)?;
+    let report = watch
+        .map(|watch| environment.settle_registry(&config, &watch))
+        .transpose()?;
+    Ok((result, report))
 }
 
 /// The programs setups installed on the prefix of `options` (WINE-SES-14).
@@ -114,6 +133,14 @@ fn session_options(options: &Options) -> SessionOptions {
         install_dir: options.install_dir.clone(),
         program: options.program.as_ref().map(|program| Program {
             arguments: program.arguments.clone(),
+            output: options
+                .console
+                .as_ref()
+                .map(|console| console.output.as_raw_fd()),
+            input: options
+                .console
+                .as_ref()
+                .map(|console| console.input.as_raw_fd()),
             ..Program::new(match &program.image {
                 crate::ProgramImage::Guest(path) => Image::Guest(path.clone()),
                 crate::ProgramImage::Host(path) => Image::Host(path.clone()),
@@ -216,21 +243,23 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
         let debugger = super::debug::start(options, false, wake.clone(), debug_display);
         let keys = Arc::new(KeyState::default());
         let started = Instant::now();
-        let session = start(
-            &mut WineHost::default(),
-            options,
-            dist,
-            wake.clone(),
-            &keys,
-            host,
-        )?;
-        let (code, session, _) = drive(options, session, None, &keys, &wake, debugger, started)?;
-        let frame = session.frame();
+        let ((code, frames), registry) =
+            watching_registry(&mut WineHost::default(), options, dist, |environment| {
+                let session = start(environment, options, dist, wake.clone(), &keys, host)?;
+                let (code, session, _) =
+                    drive(options, session, None, &keys, &wake, debugger, started)?;
+                Ok((code, session.frame().frames))
+            })?;
         eprintln!(
-            "wine: exit {code} after {:.2}s, {} frames presented",
+            "wine: exit {code} after {:.2}s, {frames} frames presented",
             started.elapsed().as_secs_f64(),
-            frame.frames
         );
+        if let Some(registry) = registry {
+            eprintln!(
+                "wine: the script wrote {} registry entries, {} mirrored from WOW6432Node",
+                registry.entries, registry.normalized_wow64
+            );
+        }
         Ok(code)
     })();
     service.shutdown();
@@ -284,17 +313,26 @@ pub(super) fn run_execution(
     };
     let started = Instant::now();
     let debugger = super::debug::start(options, true, wake.clone(), debug_display);
-    let session = start(environment, options, dist, wake.clone(), &keys, host)?;
-    let (exit_code, _, summary) = drive(
-        options,
-        session,
-        Some(worker),
-        &keys,
-        &wake,
-        debugger,
-        started,
-    )?;
-    Ok(Finished { exit_code, summary })
+    let ((exit_code, summary), registry) =
+        watching_registry(environment, options, dist, |environment| {
+            let session = start(environment, options, dist, wake.clone(), &keys, host)?;
+            // The session ends before the registry settles.
+            let (exit_code, _, summary) = drive(
+                options,
+                session,
+                Some(worker),
+                &keys,
+                &wake,
+                debugger,
+                started,
+            )?;
+            Ok((exit_code, summary))
+        })?;
+    Ok(Finished {
+        exit_code,
+        summary,
+        registry,
+    })
 }
 
 /// Headless answers to dialogs: each one's default button, pressed once its

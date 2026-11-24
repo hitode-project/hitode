@@ -54,6 +54,75 @@ pub use session::Session;
 pub struct Finished {
     pub exit_code: u8,
     pub summary: adv_report::RunSummary,
+    /// What a script wrote to the registry (WINE-SES-11).
+    pub registry: Option<adv_runtime::wine::session::RegistryReport>,
+}
+
+/// A program's console, piped to the host: what it reads, and where its
+/// output and errors go.
+#[derive(Debug)]
+pub struct Console {
+    pub input: std::os::fd::OwnedFd,
+    pub output: std::os::fd::OwnedFd,
+}
+
+/// The host's side of a piped [`Console`]: lines it sends, in the program's
+/// code page.
+pub struct ConsoleInput {
+    writer: std::io::PipeWriter,
+    codepage: u32,
+}
+
+impl Console {
+    /// A console in `codepage`. `on_output` receives everything the program
+    /// wrote so far, decoded, its oldest lines dropped past 64 KiB.
+    pub fn piped(
+        codepage: u32,
+        on_output: impl Fn(String) + Send + 'static,
+    ) -> std::io::Result<(Self, ConsoleInput)> {
+        use std::io::Read;
+        const KEPT: usize = 64 * 1024;
+        let (mut reader, output) = std::io::pipe()?;
+        let (input, writer) = std::io::pipe()?;
+        std::thread::Builder::new()
+            .name("console".into())
+            .spawn(move || {
+                let codec = adv_os::nls::Codec::new(codepage);
+                let mut text = Vec::new();
+                let mut chunk = [0; 4096];
+                while let Ok(count @ 1..) = reader.read(&mut chunk) {
+                    text.extend_from_slice(&chunk[..count]);
+                    if text.len() > KEPT {
+                        let cut = text.len() - KEPT;
+                        let line = text[cut..]
+                            .iter()
+                            .position(|&b| b == b'\n')
+                            .map_or(cut, |at| cut + at + 1);
+                        text.drain(..line);
+                    }
+                    on_output(String::from_utf16_lossy(&codec.to_utf16(codepage, &text)));
+                }
+            })?;
+        Ok((
+            Self {
+                input: input.into(),
+                output: output.into(),
+            },
+            ConsoleInput { writer, codepage },
+        ))
+    }
+}
+
+impl ConsoleInput {
+    /// Sends `line` and the end of a line, as Enter does.
+    pub fn line(&mut self, line: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let units: Vec<u16> = line.encode_utf16().chain([13, 10]).collect();
+        let bytes = adv_os::nls::Codec::new(self.codepage)
+            .from_utf16(self.codepage, &units)
+            .0;
+        self.writer.write_all(&bytes)
+    }
 }
 
 use adv_runtime::{CompileStrategy, Engine, EngineOptions, Snapshot};
@@ -115,6 +184,8 @@ pub struct Options {
     exe: Option<PathBuf>,
     /// Started instead of the game.
     pub program: Option<Program>,
+    /// The program's console; none leaves its standard handles empty.
+    pub console: Option<Console>,
     data_dir: PathBuf,
     no_code_cache: bool,
     pub cdroms: Vec<(char, PathBuf)>,
@@ -395,6 +466,7 @@ impl Options {
             row_batching: true,
             exe,
             program: None,
+            console: None,
             data_dir,
             no_code_cache: false,
             cdroms: Vec::new(),
@@ -1232,4 +1304,37 @@ fn configure_execution_thread() -> String {
         "{{\"requested_qos\": \"user_interactive\", \"applied\": {}, \"set_errno\": {error}}}",
         error == 0
     )
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::Console;
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // spec: WINE-SES-11
+    #[test]
+    fn a_piped_console_speaks_the_programs_code_page() {
+        let (shown, seen) = mpsc::channel();
+        let (console, mut input) = Console::piped(936, move |text| {
+            let _ = shown.send(text);
+        })
+        .unwrap();
+        let mut output = std::fs::File::from(console.output);
+        // "名字" in code page 936, split inside a character.
+        output.write_all(b"\xc3\xfb").unwrap();
+        output.write_all(b"\xd7\xd6: ").unwrap();
+        let mut text = String::new();
+        while text != "名字: " {
+            text = seen.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        input.line("测试").unwrap();
+        drop(input);
+        let mut read = Vec::new();
+        std::fs::File::from(console.input)
+            .read_to_end(&mut read)
+            .unwrap();
+        assert_eq!(read, b"\xb2\xe2\xca\xd4\r\n");
+    }
 }

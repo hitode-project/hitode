@@ -64,15 +64,15 @@ pub fn reveal_drive(app: AppHandle) -> Result<(), String> {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryImport {
     pub entries: usize,
     pub normalized_wow64: usize,
 }
 
-/// Imports a `.reg` file or runs a `.bat` / `.cmd` registry restore script in
-/// the game's Wine environment (same prefix, drive letter, discs and code page).
+/// Imports a `.reg` file into the game's Wine environment (same prefix,
+/// drive letter, discs and code page). Scripts run as programs instead.
 #[tauri::command]
 pub async fn import_registry(
     app: AppHandle,
@@ -125,7 +125,7 @@ pub async fn import_registry(
     let report = tauri::async_runtime::spawn_blocking(move || {
         app_for_run
             .state::<adv_shell::Execution>()
-            .restore_registry(options, file)
+            .import_registry(options, file)
     })
     .await
     .map_err(|e| e.to_string())??;

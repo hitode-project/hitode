@@ -384,6 +384,13 @@ impl Session {
     ) {
         self.driver.damage_hud.observe(observer);
     }
+    /// Calls `observer` once the guest first shows a frame or a dialog: a
+    /// script that never does needs no game view.
+    pub fn observe_shown(&self, observer: impl FnOnce() + 'static) {
+        if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
+            ui.observe_shown(Box::new(observer));
+        }
+    }
     /// Whether the game has shown its first frame.
     pub fn presented(&self) -> bool {
         self.driver

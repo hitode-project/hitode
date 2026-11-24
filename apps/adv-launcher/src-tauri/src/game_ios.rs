@@ -354,8 +354,16 @@ pub async fn start_game(
         .prepare_folder(exe.parent().unwrap())
         .await?;
     let exe = folder.join(exe.file_name().unwrap());
-    let options = playback
-        .prepare(window.app_handle(), exe, data_dir, codepage, installation)
+    let script = playback.script();
+    let (options, console) = playback
+        .prepare(
+            window.app_handle(),
+            &id,
+            exe,
+            data_dir,
+            codepage,
+            installation,
+        )
         .await?;
     let host_window = window.clone();
     on_ui(window.app_handle(), move || {
@@ -394,7 +402,7 @@ pub async fn start_game(
                     drop(ended);
                     crate::gamepad::on_pause_or_stop();
                     set_game_mode(false);
-                    crate::play::finished(&finished_window, id, result, started_at.elapsed());
+                    crate::play::finished(&finished_window, id, result, started_at);
                 }),
                 &host_window.state::<adv_shell::Execution>(),
             );
@@ -409,6 +417,16 @@ pub async fn start_game(
             session.set_active(host.lifecycle.foreground());
             session.set_upscaler(filter);
             playback.apply(&session)?;
+            // A script runs behind the run page until it shows something.
+            if script {
+                let shown_window = host_window.clone();
+                let shown_id = game_id_for_host.clone();
+                session.observe_shown(move || {
+                    crate::play::shown(&shown_window, &shown_id);
+                    let _ = shown_window.run_on_main_thread(|| set_game_mode(true));
+                });
+            }
+            crate::play::started(console);
             host.session = Some(session);
             host.game_id = Some(game_id_for_host);
             host.playback = Some(playback);
@@ -416,7 +434,9 @@ pub async fn start_game(
             host.apply_pause();
             Ok(())
         })?;
-        set_game_mode(true);
+        if !script {
+            set_game_mode(true);
+        }
         Ok(())
     })
     .await

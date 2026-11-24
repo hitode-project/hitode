@@ -2,7 +2,7 @@
 use crate::library::{self, LastRun, Library};
 use adv_shell::Session;
 use serde::Serialize;
-use std::{sync::Mutex, time::Duration};
+use std::{sync::Mutex, time::Instant};
 use tauri::{Emitter, Manager, WebviewWindow};
 
 #[derive(Clone, Serialize)]
@@ -15,6 +15,9 @@ enum Finished {
         exit_code: u8,
         /// Failure and frame timing for the anonymous report.
         summary: adv_report::RunSummary,
+        /// What a script wrote to the registry.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        registry: Option<crate::drive::RegistryImport>,
     },
     Error {
         #[serde(rename = "gameId")]
@@ -25,26 +28,66 @@ enum Finished {
     },
 }
 
-/// Records the play session in the library and emits `game_finished`.
+/// A running script: its console's input, and when it first showed a frame
+/// or a dialog. Until then it runs behind the run page (WINE-SES-11).
+pub(crate) struct Script {
+    input: adv_shell::ConsoleInput,
+    shown: Option<Instant>,
+}
+static SCRIPT: Mutex<Option<Script>> = Mutex::new(None);
+
+/// The session of `script`, when prepared for one, has started.
+pub(crate) fn started(script: Option<Script>) {
+    if script.is_some() {
+        *SCRIPT.lock().unwrap() = script;
+    }
+}
+
+/// Sends a line to the running script, as Enter does.
+#[tauri::command]
+pub fn script_input(line: String) -> Result<(), String> {
+    let mut script = SCRIPT.lock().unwrap();
+    let script = script.as_mut().ok_or("no script is running")?;
+    script.input.line(&line).map_err(|e| e.to_string())
+}
+
+/// The running script first showed something: the game view takes over.
+pub(crate) fn shown(window: &WebviewWindow, id: &str) {
+    if let Some(script) = SCRIPT.lock().unwrap().as_mut() {
+        script.shown.get_or_insert_with(Instant::now);
+    }
+    let _ = window.emit("game_shown", id);
+}
+
+/// Records the play session in the library and emits `game_finished`. A
+/// script counts only from when it showed something, and not at all if it
+/// never did.
 pub(crate) fn finished(
     window: &WebviewWindow,
     id: String,
     result: Result<adv_shell::Finished, String>,
-    elapsed: Duration,
+    started: Instant,
 ) {
+    let elapsed = started.elapsed();
+    let played = match SCRIPT.lock().unwrap().take() {
+        Some(script) => script.shown.map(|at| at.elapsed()),
+        None => Some(elapsed),
+    };
     let summary = match &result {
         Ok(finished) => finished.summary.clone(),
         Err(error) => adv_shell::error_summary(error, elapsed),
     };
-    if let Err(error) = window.state::<Mutex<Library>>().lock().unwrap().finished(
-        &id,
-        elapsed.as_secs() as u32,
-        LastRun {
-            ended: library::now(),
-            summary: Some(summary.clone()),
-            error: result.as_ref().err().cloned(),
-        },
-    ) {
+    if let Some(played) = played
+        && let Err(error) = window.state::<Mutex<Library>>().lock().unwrap().finished(
+            &id,
+            played.as_secs() as u32,
+            LastRun {
+                ended: library::now(),
+                summary: Some(summary.clone()),
+                error: result.as_ref().err().cloned(),
+            },
+        )
+    {
         eprintln!("could not save play session: {error}");
     }
     let payload = match result {
@@ -52,6 +95,12 @@ pub(crate) fn finished(
             game_id: id,
             exit_code: finished.exit_code,
             summary,
+            registry: finished
+                .registry
+                .map(|report| crate::drive::RegistryImport {
+                    entries: report.entries,
+                    normalized_wow64: report.normalized_wow64,
+                }),
         },
         Err(error) => Finished::Error {
             game_id: id,
@@ -94,15 +143,29 @@ pub struct Playback {
     exe: Option<String>,
 }
 impl Playback {
+    /// Whether this run starts a script rather than the game or a program:
+    /// it stays behind the run page until it shows something.
+    pub(crate) fn script(&self) -> bool {
+        self.exe.as_deref().is_some_and(|exe| {
+            std::path::Path::new(exe)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd")
+                })
+        })
+    }
+
     /// Prepare files off the UI thread before creating the native view.
     pub(crate) async fn prepare(
         &self,
         app: &tauri::AppHandle,
+        id: &str,
         exe: std::path::PathBuf,
         data_dir: std::path::PathBuf,
         codepage: u32,
         (setup, program_files): (Option<String>, Option<std::path::PathBuf>),
-    ) -> Result<adv_shell::Options, String> {
+    ) -> Result<(adv_shell::Options, Option<Script>), String> {
         // Another program of the game runs on the game's drives, its folder
         // still the program drive (WINE-SES-12).
         let program = self.exe.as_ref().map(|target| {
@@ -129,6 +192,18 @@ impl Playback {
             image: adv_shell::ProgramImage::Host(path),
             arguments: String::new(),
         });
+        // A script's console is the run page's (WINE-SES-11).
+        let mut script = None;
+        if self.script() {
+            let window = app.clone();
+            let game = id.to_owned();
+            let (console, input) = adv_shell::Console::piped(codepage, move |text| {
+                let _ = window.emit("script_output", (&game, text));
+            })
+            .map_err(|e| e.to_string())?;
+            options.console = Some(console);
+            script = Some(Script { input, shown: None });
+        }
         // A pending install runs its disc's setup with no game yet; both put
         // `C:\Program Files` in the folder the player chose.
         if let Some(setup) = setup {
@@ -150,7 +225,7 @@ impl Playback {
         tauri::async_runtime::spawn_blocking(move || crate::distribution::prepare_in(&app_data))
             .await
             .map_err(|e| e.to_string())??;
-        Ok(options)
+        Ok((options, script))
     }
 
     pub(crate) fn apply(&self, session: &Session) -> Result<(), String> {

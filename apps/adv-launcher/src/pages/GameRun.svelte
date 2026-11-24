@@ -5,7 +5,7 @@
   import { call, inTauri } from "../lib/bridge";
   import { device } from "../lib/device.svelte";
   import { fakeRegistryFiles, loadGameSetup } from "../lib/fake-settings";
-  import { importRegistry, libraryInspect, type ExeCandidate } from "../lib/host";
+  import { importRegistry, libraryInspect, scriptInput, type ExeCandidate } from "../lib/host";
   import { runs } from "../lib/launch.svelte";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
@@ -22,6 +22,29 @@
   let busy = $state<string | null>(null);
   let error = $state("");
   let notice = $state<{ file: string; entries: number } | null>(null);
+
+  /** The script this page started for this game, while it runs or once it ended. */
+  const script = $derived(game && runs.script?.gameId === game.id ? runs.script : null);
+  const scriptRunning = $derived(!!script && !script.result);
+  let line = $state("");
+  let consoleView = $state<HTMLPreElement>();
+
+  $effect(() => {
+    // The newest output stays in view.
+    void script?.output;
+    if (consoleView) consoleView.scrollTop = consoleView.scrollHeight;
+  });
+
+  async function send(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    const text = line;
+    line = "";
+    try {
+      await scriptInput(text);
+    } catch (e) {
+      error = String(e);
+    }
+  }
 
   const mainExe = $derived(
     game ? (inTauri ? game.exe : loadGameSetup(game.id, game.codepage).exe) : "",
@@ -95,8 +118,14 @@
   }
 
   async function runScriptOrReg(path: string, label?: string): Promise<void> {
-    if (!game || busy !== null) return;
+    if (!game || busy !== null || scriptRunning) return;
     error = "";
+    notice = null;
+    if (isBatch(path)) {
+      // It runs here; a window it opens takes the game screen.
+      if (inTauri) runs.runScript(game.id, path);
+      return;
+    }
     busy = path;
     try {
       const discs = loadGameSetup(game.id, game.codepage).discs;
@@ -149,6 +178,18 @@
     <button class="quiet" onclick={() => nav.replace({ name: "install", gameId: game.id })}>{t("选择已安装的程序…")}</button>
   {:else if game}
     {#if error}<p class="err" role="alert">{error}</p>{/if}
+    {#if script?.result}
+      {@const name = script.file.split(/[\\/]/).pop() ?? script.file}
+      {#if "error" in script.result}
+        <p class="err" role="alert">{script.result.error}</p>
+      {:else if script.result.entries > 0}
+        <p class="ok" role="status">{t("已完成 {0}（写入 {1} 项）", name, script.result.entries)}</p>
+      {:else if script.result.exitCode === 0}
+        <p class="ok" role="status">{t("已运行 {0}", name)}</p>
+      {:else}
+        <p class="err" role="alert">{t("{0} 已退出（代码 {1}）", name, script.result.exitCode)}</p>
+      {/if}
+    {/if}
     {#if notice}
       <p class="ok" role="status">
         {notice.entries > 0
@@ -185,19 +226,35 @@
         <h2 id="gr-scripts">{t("脚本与注册表")}</h2>
         {#each scripts as file (file)}
           {@const batch = isBatch(file)}
-          {@const running = busy === file}
+          {@const running = busy === file || (scriptRunning && script?.file === file)}
           <div class="row sm">
             <span class="name ellipsis">{file}</span>
-            <button
-              class="quiet act"
-              disabled={busy !== null}
-              onclick={() => void runScriptOrReg(file, file)}
-            >
-              {running ? (batch ? t("正在运行…") : t("正在导入…")) : (batch ? t("运行") : t("导入"))}
-            </button>
+            {#if running && batch}
+              <button class="quiet act" onclick={() => void runs.stop(game.id, true)}>{t("停止")}</button>
+            {:else}
+              <button
+                class="quiet act"
+                disabled={busy !== null || scriptRunning}
+                onclick={() => void runScriptOrReg(file, file)}
+              >
+                {running ? t("正在导入…") : (batch ? t("运行") : t("导入"))}
+              </button>
+            {/if}
           </div>
         {/each}
       </section>
+    {/if}
+
+    {#if script && (scriptRunning || script.output)}
+      <!-- What the script writes, and a line it reads when it asks. -->
+      <div class="console">
+        <pre bind:this={consoleView} class="out" aria-live="polite">{script.output}</pre>
+        {#if scriptRunning}
+          <form class="in" onsubmit={send}>
+            <input bind:value={line} placeholder={t("输入后按回车发送")} autocomplete="off" spellcheck="false" />
+          </form>
+        {/if}
+      </div>
     {/if}
 
     <section class="sec" aria-labelledby="gr-other">
@@ -205,10 +262,12 @@
       <div class="row">
         <button
           class="quiet pick"
-          disabled={busy !== null}
+          disabled={busy !== null || scriptRunning}
           onclick={() => void pickOtherFile()}
         >
-          {busy !== null && !scripts.includes(busy) ? t("正在运行…") : t("选择其他文件运行…")}
+          {(busy !== null && !scripts.includes(busy)) || (scriptRunning && !scripts.includes(script?.file ?? ""))
+            ? t("正在运行…")
+            : t("选择其他文件运行…")}
         </button>
         <span class="hint">.exe / .bat / .reg</span>
       </div>
@@ -414,6 +473,38 @@
   .sec {
     display: flex;
     flex-direction: column;
+  }
+  .console {
+    display: flex;
+    flex-direction: column;
+    border-radius: 10px;
+    background: var(--field);
+    overflow: hidden;
+  }
+  .out {
+    margin: 0;
+    max-height: 220px;
+    min-height: 3em;
+    overflow: auto;
+    padding: 10px 12px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--fg);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .in input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 9px 12px;
+    border: 0;
+    border-top: 1px solid var(--line);
+    background: transparent;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--fg);
+    outline: none;
   }
   h2 {
     margin: 0 0 6px;

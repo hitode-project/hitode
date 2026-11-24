@@ -313,6 +313,12 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 **Applies to**: Launcher, macOS
 **Verification**: Test
 
+### HOST-RUN-3 Scripts on the run page
+
+**Rule**: A script started from the run page MUST run there, its console output shown and a line of input sent on Return. The game screen MUST take over only once the guest shows a frame or a dialog. Play time MUST count from then, and a script that never shows anything MUST NOT count.
+**Applies to**: Launcher
+**Verification**: Review — the run page and the game screen need the launcher's views, which no test drives.
+
 ### HOST-VNDB-1 Metadata association
 
 **Rule**: VNDB links MUST preserve game files, identifiers and display names unless the user explicitly edits the display name. Import MUST list candidates, default to no link and link only the work the user chooses. Links MUST resolve only visual novel identifiers on VNDB.

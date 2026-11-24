@@ -4,6 +4,19 @@ import { androidStorage } from "./android-access.svelte";
 import { inTauri, onHostEvent } from "./bridge";
 import { device } from "./device.svelte";
 import { pauseGame, startGame, stopGame, type GameFinished, type RunSummary } from "./host";
+
+/**
+ * A script started from the run page. It runs there, its console shown, until
+ * it shows a frame or a dialog; then the game screen takes over.
+ */
+export type ScriptRun = {
+  gameId: string;
+  file: string;
+  /** What it wrote to its console so far. */
+  output: string;
+  shown: boolean;
+  result?: { exitCode: number; entries: number } | { error: string };
+};
 import { explainJit, jit } from "./jit.svelte";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
@@ -102,9 +115,28 @@ class Runs {
   #starting: Record<string, Promise<void>> = {};
   /** Optional one-shot executable override for the next launch of `gameId`. */
   #pendingExe: Record<string, string> = {};
+  /** The last script started from the run page. */
+  script = $state<ScriptRun | null>(null);
 
   constructor() {
     onHostEvent<GameFinished>("game_finished", (event) => this.#finished(event));
+    onHostEvent<[string, string]>("script_output", ([id, text]) => {
+      if (this.script?.gameId === id) this.script.output = text;
+    });
+    onHostEvent<string>("game_shown", (id) => {
+      if (this.script?.gameId !== id || this.script.result) return;
+      this.script.shown = true;
+      nav.go({ name: "game", gameId: id });
+    });
+  }
+
+  /** Runs a script of `gameId` behind the run page. */
+  runScript(gameId: string, file: string): void {
+    this.script = { gameId, file, output: "", shown: false };
+    this.#pendingExe[gameId] = file;
+    this.start(gameId).catch((error: unknown) => {
+      if (this.script?.gameId === gameId) this.script.result = { error: launchError(String(error)) };
+    });
   }
 
   /** Launches a specific executable in `gameId`'s environment without changing its main exe. */
@@ -176,6 +208,14 @@ class Runs {
     if (this.running === id) this.running = null;
     pauser.reset();
     this.summaries[id] = event.summary;
+    const script = this.script?.gameId === id && !this.script.result ? this.script : null;
+    if (script) {
+      script.result = "error" in event
+        ? { error: stopped ? t("已停止") : event.error }
+        : { exitCode: event.exitCode, entries: event.registry?.entries ?? 0 };
+      // A script that never showed anything ends on the run page.
+      if (!script.shown) return;
+    }
     if ("error" in event && !stopped) {
       this.errors[id] = event.error;
       if (showing) nav.replace({ name: "launch", gameId: id });

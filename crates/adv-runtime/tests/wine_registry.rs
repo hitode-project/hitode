@@ -1,10 +1,17 @@
-//! Registry restoration via native `.reg` import and Wine `cmd.exe` batch runs.
+//! Registry restoration via native `.reg` import, and scripts run as programs
+//! in Wine's `cmd.exe` with their console piped.
 //!
 //! It needs `ADV_WINE_DIST`, as the other Wine tests do.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use adv_os::nls::Codec;
-use adv_runtime::wine::session::{Config, Host, SessionOptions};
+use adv_runtime::wine::session::{
+    Config, Host, Image, Program, RegistryReport, SessionOptions, Stop,
+};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 #[allow(dead_code)]
 mod wine {
@@ -12,6 +19,43 @@ mod wine {
         env!("CARGO_MANIFEST_DIR"),
         "/../adv-nt/tests/common/wine.rs"
     ));
+}
+
+/// Runs `script` as a program, `input` its console input, and returns what
+/// it wrote to the registry, its exit and its console output.
+fn run_script(
+    host: &mut Host,
+    config: &Config<'_>,
+    script: &Path,
+    input: &[u8],
+) -> (RegistryReport, Stop, String) {
+    let (mut output, output_write) = std::io::pipe().unwrap();
+    let (input_read, mut input_write) = std::io::pipe().unwrap();
+    input_write.write_all(input).unwrap();
+    let options = SessionOptions {
+        program: Some(Program {
+            output: Some(output_write.as_raw_fd()),
+            input: Some(input_read.as_raw_fd()),
+            ..Program::new(Image::Host(script.to_owned()))
+        }),
+        ..SessionOptions::default()
+    };
+    let watch = host.watch_registry(config, &options).unwrap().unwrap();
+    let mut session = host
+        .start(
+            config,
+            adv_sync::WakeEvent::new().unwrap(),
+            &options,
+            |_| Ok(()),
+        )
+        .unwrap();
+    let stop = session.run(Instant::now() + Duration::from_secs(60));
+    drop(session);
+    drop(output_write);
+    let mut bytes = Vec::new();
+    output.read_to_end(&mut bytes).unwrap();
+    let text = String::from_utf16_lossy(&Codec::new(936).to_utf16(936, &bytes));
+    (host.settle_registry(config, &watch).unwrap(), stop, text)
 }
 
 // spec: WINE-SES-11
@@ -29,7 +73,6 @@ fn restores_reg_and_batch_files_into_the_shared_prefix() {
     std::fs::write(&exe, b"").unwrap();
 
     let mut host = Host::default();
-    let options = SessionOptions::default();
     let config = Config {
         dist: &dist,
         prefix: &prefix,
@@ -61,7 +104,7 @@ fn restores_reg_and_batch_files_into_the_shared_prefix() {
     }
     std::fs::write(&reg_v5, v5_bytes).unwrap();
 
-    let report = host.restore_registry(&config, &options, &reg_v5).unwrap();
+    let report = host.import_registry(&config, &reg_v5).unwrap();
     assert_eq!(report.entries, 3, "unexpected report: {report:?}");
     assert_eq!(report.normalized_wow64, 2, "unexpected report: {report:?}");
 
@@ -96,9 +139,8 @@ fn restores_reg_and_batch_files_into_the_shared_prefix() {
     let bat_units: Vec<u16> = bat_text.encode_utf16().collect();
     std::fs::write(&bat_reg_add, codec.from_utf16(936, &bat_units).0).unwrap();
 
-    let report = host
-        .restore_registry(&config, &options, &bat_reg_add)
-        .unwrap();
+    let (report, stop, text) = run_script(&mut host, &config, &bat_reg_add, b"");
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
     assert!(report.entries >= 2, "expected >=2 entries, got {report:?}");
     assert!(
         report.normalized_wow64 >= 1,
@@ -134,9 +176,8 @@ fn restores_reg_and_batch_files_into_the_shared_prefix() {
     let units: Vec<u16> = regedit_bat.encode_utf16().collect();
     std::fs::write(&bat_regedit, codec.from_utf16(936, &units).0).unwrap();
 
-    let report = host
-        .restore_registry(&config, &options, &bat_regedit)
-        .unwrap();
+    let (report, stop, text) = run_script(&mut host, &config, &bat_regedit, b"");
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
     assert!(report.entries >= 1, "expected >=1 entry, got {report:?}");
     assert!(
         report.normalized_wow64 >= 1,
@@ -156,6 +197,42 @@ fn restores_reg_and_batch_files_into_the_shared_prefix() {
         system_reg.contains(r#""Dir"="D:\\""#), // privacy: allow authored guest drive path
         "expected guest drive root from %cd% in system.reg"
     );
+
+    // 4. An interactive script answered through its console input, from a
+    // folder of its own.
+    let tools = root.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let menu = tools.join("menu.bat");
+    std::fs::write(
+        &menu,
+        concat!(
+            "@echo off\r\n",
+            "set /p name=Name: \r\n",
+            "echo got=%name% in %~dp0\r\n",
+            "choice /c yn /m Continue\r\n",
+            "echo choice=%errorlevel%\r\n",
+            ":menu\r\n",
+            "set /p pick=Pick: \r\n",
+            "if \"%pick%\"==\"2\" goto done\r\n",
+            "echo again=%pick%\r\n",
+            "goto menu\r\n",
+            ":done\r\n",
+            "reg add \"HKCU\\Software\\HitodeRegTest\\Menu\" /v \"Name\" /d \"%name%\" /f >nul\r\n",
+            "pause\r\n",
+            "echo done\r\n",
+        ),
+    )
+    .unwrap();
+    let (report, stop, text) = run_script(&mut host, &config, &menu, b"probe\r\ny1\r\n2\r\n");
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    let folder = r"got=probe in E:\"; // privacy: allow authored guest drive path
+    for line in [folder, "choice=1", "again=1", "done"] {
+        assert!(text.contains(line), "{line} missing from:\n{text}");
+    }
+    assert!(!text.contains("Press any key"), "{text}");
+    assert_eq!(report.entries, 1, "{report:?}");
+    let user_reg = std::fs::read_to_string(prefix.join("user.reg")).unwrap();
+    assert!(user_reg.contains(r#""Name"="probe""#), "{user_reg}");
 
     let _ = std::fs::remove_dir_all(&root);
 }

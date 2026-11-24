@@ -307,7 +307,7 @@ mod mac {
                 ..Default::default()
             })));
             let container = GameContainer::new(&overlay, router.clone()).unwrap();
-            container.set_game(Some(&game));
+            container.set_game(Some(&game), true);
             assert_eq!(
                 container.hitTest(NSPoint::new(20.0, 220.0)).as_deref(),
                 Some(&*overlay)
@@ -366,21 +366,24 @@ mod mac {
             container.set_overlay_visible(true);
             assert!(!overlay.isHidden());
             container.set_overlay_visible(false);
-            container.set_game(None);
+            container.set_game(None, false);
             assert!(!overlay.isHidden(), "leaving the game shows the overlay");
             container.set_overlay_visible(false);
             assert!(!overlay.isHidden(), "without a game the overlay stays");
             let library_frame = native.frame();
             for (width, height) in [(1600, 900), (800, 600)] {
                 let embedded = GameView::new(width, height).unwrap();
-                container.set_game(Some(&embedded));
+                // A game not shown yet, such as a script, leaves the window.
+                container.set_game(Some(&embedded), false);
+                assert_eq!(native.frame(), library_frame);
+                container.show_game();
                 let size = embedded.bounds().size;
                 assert!(
                     (size.width / size.height - f64::from(width) / f64::from(height)).abs() < 0.001
                 );
                 assert_eq!(embedded.bounds().size, container.bounds().size);
                 assert_eq!(overlay.bounds().size, container.bounds().size);
-                container.set_game(None);
+                container.set_game(None, false);
                 assert_eq!(native.frame(), library_frame);
             }
             native.setContentView(Some(&game));

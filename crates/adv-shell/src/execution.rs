@@ -63,15 +63,15 @@ impl Execution {
         Ok(Task::Shared(result))
     }
 
-    /// Imports a `.reg` file or executes a registry restore `.bat` / `.cmd`
-    /// script against the player's shared Wine prefix on the execution owner.
-    pub fn restore_registry(
+    /// Imports a `.reg` file into the player's shared Wine prefix on the
+    /// execution owner; scripts run as programs instead.
+    pub fn import_registry(
         &self,
         options: crate::Options,
         file: PathBuf,
     ) -> Result<adv_runtime::wine::session::RegistryReport, String> {
-        self.on_owner("registry restore", move |host, distribution| {
-            crate::wine::restore_registry(host, &options, distribution, &file)
+        self.on_owner("registry import", move |host, distribution| {
+            crate::wine::import_registry(host, &options, distribution, &file)
         })
     }
     /// The programs setups installed on the prefix of `options`, where they lie.

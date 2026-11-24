@@ -193,8 +193,16 @@ pub async fn start_game(
         .unwrap()
         .installation(&id)
         .map_err(|e| e.to_string())?;
-    let options = playback
-        .prepare(window.app_handle(), exe, data_dir, codepage, installation)
+    let script = playback.script();
+    let (options, console) = playback
+        .prepare(
+            window.app_handle(),
+            &id,
+            exe,
+            data_dir,
+            codepage,
+            installation,
+        )
         .await?;
     let host_window = window.clone();
     on_ui(&window, move || {
@@ -238,7 +246,7 @@ pub async fn start_game(
                     {
                         log::error!("leaving game mode: {error}");
                     }
-                    crate::play::finished(&finished_window, id, result, started_at.elapsed());
+                    crate::play::finished(&finished_window, id, result, started_at);
                 }),
                 &host_window.state::<adv_shell::Execution>(),
             );
@@ -252,6 +260,22 @@ pub async fn start_game(
             session.set_active(host.lifecycle.foreground());
             session.set_upscaler(filter);
             playback.apply(&session)?;
+            // A script runs behind the run page until it shows something.
+            if script {
+                let shown_window = host_window.clone();
+                let shown_id = game_id_for_host.clone();
+                session.observe_shown(move || {
+                    crate::play::shown(&shown_window, &shown_id);
+                    // Requesting audio focus calls back into HOST.
+                    let app = shown_window.app_handle().clone();
+                    let _ = shown_window.run_on_main_thread(move || {
+                        if let Err(error) = android::set_game_mode(&app, true) {
+                            log::error!("entering game mode: {error}");
+                        }
+                    });
+                });
+            }
+            crate::play::started(console);
             host.session = Some(session);
             host.game_id = Some(game_id_for_host);
             host.playback = Some(playback);
@@ -260,6 +284,9 @@ pub async fn start_game(
             Ok(())
         })?;
         // Requesting audio focus calls back into HOST, so it follows the borrow.
+        if script {
+            return Ok(());
+        }
         android::set_game_mode(host_window.app_handle(), true).map_err(|e| e.to_string())
     })
     .await

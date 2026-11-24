@@ -2,25 +2,18 @@
 //!
 //! `.reg` files are parsed directly and written to the live Wine server through
 //! `adv_nt::registry::Client`, normalizing 64-bit `WOW6432Node` paths onto
-//! Hitode's 32-bit (`win32`) prefix. `.bat` / `.cmd` scripts run under Wine's
-//! own `cmd.exe` in a short-lived session sharing the game's drive layout,
-//! optical mounts and code page; common UAC elevation and `pause` steps are
-//! neutralized in a temporary replacement copy so the original file stays
-//! untouched, and any newly written `WOW6432Node` keys are mirrored to the
-//! 32-bit `SOFTWARE` tree afterwards.
+//! Hitode's 32-bit (`win32`) prefix. `.bat` / `.cmd` scripts run as programs
+//! (WINE-SES-11): Wine's `cmd.exe` reads a copy with common UAC elevation and
+//! `pause` steps neutralized, so the original file stays untouched. A
+//! [`RegistryWatch`] taken before the run mirrors the `WOW6432Node` keys it
+//! wrote to the 32-bit `SOFTWARE` tree afterwards.
 use super::*;
 use adv_nt::registry::{Client as RegistryClient, TreeSnapshot};
 use adv_os::nls::Codec;
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::Read;
-use std::os::fd::AsRawFd;
 
-const CMD_EXE: &str = r"C:\windows\system32\cmd.exe";
 const WOW64_ROOT: &str = r"\Registry\Machine\Software\WOW6432Node";
 const SOFTWARE_ROOT: &str = r"\Registry\Machine\Software";
-/// How long a registry batch script may run before timing out.
-const BATCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Summary of a completed registry restore operation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -62,31 +55,42 @@ fn codepage_for_locale(locale: u32) -> u32 {
     }
 }
 
-/// Restores registry entries from a `.reg`, `.bat`, or `.cmd` file into the
-/// host's shared Wine prefix, using the same drive layout and code page as
-/// `config` and `options`.
-pub(super) fn restore(
+/// Whether `path` names a script `cmd.exe` runs.
+pub(super) fn is_script(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
+}
+
+/// The registry before a script ran, to settle what it wrote afterwards.
+pub struct RegistryWatch(WatchedSnapshot);
+
+pub(super) fn watch(host: &mut Host, config: &Config<'_>) -> Result<RegistryWatch, String> {
+    host.serve(config, |socket, shared, time| {
+        snapshot_watched(socket, shared, time)
+    })
+    .map(RegistryWatch)
+}
+
+pub(super) fn settle(
     host: &mut Host,
     config: &Config<'_>,
-    options: &SessionOptions,
+    watch: &RegistryWatch,
+) -> Result<RegistryReport, String> {
+    host.serve(config, |socket, shared, time| {
+        sync_and_count(socket, shared, time, &watch.0)
+    })
+}
+
+/// Imports a `.reg` file into the host's shared Wine prefix.
+pub(super) fn import_reg(
+    host: &mut Host,
+    config: &Config<'_>,
     file: &Path,
 ) -> Result<RegistryReport, String> {
     if !file.is_file() {
         return Err(format!("registry file not found: {}", file.display()));
     }
-    let extension = file
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    match extension.as_str() {
-        "reg" => import_reg(host, config, file),
-        "bat" | "cmd" => run_batch(host, config, options, file),
-        _ => Err("unsupported registry file (expected .reg or .bat)".into()),
-    }
-}
-
-fn import_reg(host: &mut Host, config: &Config<'_>, file: &Path) -> Result<RegistryReport, String> {
     let raw = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let codepage = codepage_for_locale(config.locale);
     let actions = parse_reg(&raw, codepage)?;
@@ -172,119 +176,6 @@ fn import_reg(host: &mut Host, config: &Config<'_>, file: &Path) -> Result<Regis
         drop(connection);
         Ok(report)
     })
-}
-
-fn run_batch(
-    host: &mut Host,
-    config: &Config<'_>,
-    options: &SessionOptions,
-    file: &Path,
-) -> Result<RegistryReport, String> {
-    let exe = config
-        .exe
-        .ok_or("registry scripts run in a game's folder")?;
-    let game_dir = std::path::absolute(exe.parent().ok_or("the program has no directory")?)
-        .and_then(|dir| dir.canonicalize())
-        .map_err(|e| e.to_string())?;
-    let canonical_bat = file.canonicalize().map_err(|e| e.to_string())?;
-    let inside_game = canonical_bat
-        .strip_prefix(&game_dir)
-        .ok()
-        .map(Path::to_owned);
-    let raw = std::fs::read(&canonical_bat).map_err(|e| format!("{}: {e}", file.display()))?;
-    let codepage = codepage_for_locale(config.locale);
-    let (prefix, drive) = host.prefix(config)?;
-    let directory = files::program_directory(config, options, &prefix)?;
-    let mut options = SessionOptions {
-        cdroms: options.cdroms.clone(),
-        install_dir: options.install_dir.clone(),
-        replacements: options.replacements.clone(),
-        ..SessionOptions::default()
-    };
-
-    struct TempGuard(Option<PathBuf>);
-    impl Drop for TempGuard {
-        fn drop(&mut self) {
-            if let Some(path) = self.0.take() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-
-    let mut _temp_bat = TempGuard(None);
-    let guest_bat = if let Some(relative) = inside_game {
-        // The guest reads the sanitized copy in place of the script.
-        options
-            .replacements
-            .push((canonical_bat, sanitize_batch(&raw, codepage, None)));
-        let relative = relative
-            .to_str()
-            .ok_or("batch path is not valid Unicode")?
-            .replace('/', "\\");
-        format!("{directory}{relative}")
-    } else {
-        let sanitized = sanitize_batch(&raw, codepage, Some(&directory));
-        let temp_dir = drive.join("windows/temp");
-        std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
-        let name = format!("hitode-reg-{}.bat", std::process::id());
-        let host_temp = temp_dir.join(&name);
-        std::fs::write(&host_temp, sanitized).map_err(|e| e.to_string())?;
-        _temp_bat = TempGuard(Some(host_temp));
-        format!(r"C:\windows\temp\{name}")
-    };
-
-    let log_path = prefix.join(format!(".hitode-reg-log-{}", std::process::id()));
-    let _log_guard = TempGuard(Some(log_path.clone()));
-    let output_write =
-        File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
-    options.program = Some(Program {
-        image: Image::Guest(CMD_EXE.into()),
-        arguments: format!("/d /c \"{guest_bat}\""),
-        // The program directory, as when the script is opened there.
-        directory: Some(directory.clone()),
-        output: Some(output_write.as_raw_fd()),
-    });
-
-    let before = host.serve(config, |socket, shared, time| {
-        snapshot_watched(socket, shared, time)
-    })?;
-    let wake = WakeEvent::new().map_err(|e| e.to_string())?;
-    let mut session = host.start(config, wake, &options, |_| Ok(()))?;
-    let stop = session.run(Instant::now() + BATCH_TIMEOUT);
-    drop(session);
-    drop(output_write);
-
-    let mut raw_output = Vec::new();
-    if let Ok(file) = File::open(&log_path) {
-        let _ = file.take(16 * 1024).read_to_end(&mut raw_output);
-    }
-    let output_text = decode_text(&raw_output, codepage).trim().to_owned();
-
-    let report = host.serve(config, |socket, shared, time| {
-        sync_and_count(socket, shared, time, &before)
-    })?;
-    match stop {
-        Stop::Exited(0) => Ok(report),
-        Stop::Exited(_) if report.entries > 0 => Ok(report),
-        Stop::Exited(code) => {
-            if output_text.is_empty() {
-                Err(format!("batch script exited with code {code}"))
-            } else {
-                let first_line = output_text.lines().next().unwrap_or(&output_text);
-                Err(format!(
-                    "batch script exited with code {code}: {first_line}"
-                ))
-            }
-        }
-        Stop::Paused => {
-            if output_text.is_empty() {
-                Err("batch script timed out".into())
-            } else {
-                Err(format!("batch script timed out: {output_text}"))
-            }
-        }
-        Stop::Failed(error) => Err(error),
-    }
 }
 
 struct WatchedSnapshot {
@@ -743,17 +634,14 @@ fn is_protected_root(nt_path: &str, user_key: &str) -> bool {
         || lower == format!(r"{user_lower}\software")
 }
 
-/// Neutralizes interactive waits and Windows UAC elevation boilerplate so a
-/// game's registry restore batch script can run non-interactively under Wine.
-fn sanitize_batch(raw: &[u8], codepage: u32, external_dir: Option<&str>) -> Vec<u8> {
+/// Neutralizes the pauses and the Windows UAC elevation boilerplate a script
+/// carries for a console window and an administrator it does not need here.
+pub(super) fn sanitize_batch(raw: &[u8], codepage: u32) -> Vec<u8> {
     let text = decode_text(raw, codepage);
     let mut out = String::with_capacity(text.len() + 64);
     for raw_line in text.lines() {
-        let mut line = raw_line.trim_end_matches('\r').to_owned();
-        if let Some(dir) = external_dir {
-            line = replace_batch_self_vars(&line, dir);
-        }
-        let cleaned = sanitize_batch_line(&line);
+        let line = raw_line.trim_end_matches('\r');
+        let cleaned = sanitize_batch_line(line);
         out.push_str(&cleaned);
         out.push_str("\r\n");
     }
@@ -827,29 +715,6 @@ fn find_trailing_pause(line: &str) -> Option<usize> {
         idx
     };
     Some(start)
-}
-
-fn replace_batch_self_vars(line: &str, dir: &str) -> String {
-    let drive = dir.get(..2).unwrap_or("D:");
-    let path = dir.get(2..).unwrap_or("\\");
-    let mut result = replace_ascii_case_insensitive(line, "%~dp0", dir);
-    result = replace_ascii_case_insensitive(&result, "%~d0", drive);
-    result = replace_ascii_case_insensitive(&result, "%~p0", path);
-    result
-}
-
-fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
-    let lower = haystack.to_ascii_lowercase();
-    let needle_lower = needle.to_ascii_lowercase();
-    let mut out = String::with_capacity(haystack.len());
-    let mut cursor = 0;
-    while let Some(offset) = lower[cursor..].find(&needle_lower) {
-        out.push_str(&haystack[cursor..cursor + offset]);
-        out.push_str(replacement);
-        cursor += offset + needle.len();
-    }
-    out.push_str(&haystack[cursor..]);
-    out
 }
 
 #[cfg(test)]
@@ -981,7 +846,7 @@ mod tests {
             "reg add \"HKLM\\SOFTWARE\\Test\" /v Dir /d \"%~dp0\" /f && pause\r\n",
             "pause >nul\r\n",
         );
-        let cleaned = String::from_utf8(sanitize_batch(script.as_bytes(), 1252, None)).unwrap();
+        let cleaned = String::from_utf8(sanitize_batch(script.as_bytes(), 1252)).unwrap();
         let lines: Vec<&str> = cleaned.lines().collect();
         assert_eq!(lines[0], "@echo off");
         assert!(lines[1].starts_with("rem "));

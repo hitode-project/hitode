@@ -693,4 +693,8 @@ export const messages: Record<string, [string, string]> = {
   "换下一张光盘": ["Insert the next disc", "次のディスクに入れ替え"],
   "添加光盘…": ["Add disc…", "ディスクを追加…"],
   "添加…": ["Add…", "追加…"],
+  "已停止": ["Stopped", "停止しました"],
+  "停止": ["Stop", "停止"],
+  "{0} 已退出（代码 {1}）": ["{0} exited (code {1})", "{0} が終了しました（コード {1}）"],
+  "输入后按回车发送": ["Type and press Return to send", "入力して Return で送信"],
 };

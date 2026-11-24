@@ -55,15 +55,41 @@ impl Host {
         Session::start_on(self, config, wake, options, prepare)
     }
 
-    /// Imports a `.reg` file or executes a registry restore `.bat` / `.cmd`
-    /// script against this host's Wine prefix using the game's mount layout.
-    pub fn restore_registry(
+    /// Imports a `.reg` file into this host's Wine prefix (WINE-SES-11).
+    pub fn import_registry(
+        &mut self,
+        config: &Config<'_>,
+        file: &Path,
+    ) -> Result<registry::RegistryReport, String> {
+        registry::import_reg(self, config, file)
+    }
+
+    /// The registry a script is about to change, when `options` start one.
+    pub fn watch_registry(
         &mut self,
         config: &Config<'_>,
         options: &SessionOptions,
-        file: &Path,
+    ) -> Result<Option<registry::RegistryWatch>, String> {
+        let script = match options.program.as_ref().map(|program| &program.image) {
+            Some(Image::Host(path)) => registry::is_script(path),
+            Some(Image::Guest(path)) => registry::is_script(Path::new(path)),
+            None => false,
+        };
+        if script {
+            registry::watch(self, config).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// What a script wrote since `watch`, its `WOW6432Node` keys mirrored to
+    /// the 32-bit `SOFTWARE` tree (WINE-SES-11).
+    pub fn settle_registry(
+        &mut self,
+        config: &Config<'_>,
+        watch: &registry::RegistryWatch,
     ) -> Result<registry::RegistryReport, String> {
-        registry::restore(self, config, options, file)
+        registry::settle(self, config, watch)
     }
 
     /// The programs setups registered on this host's prefix, where they lie

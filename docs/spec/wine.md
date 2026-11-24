@@ -720,8 +720,12 @@ Processor counts and affinity MUST describe eight guest cores in one group, inde
 
 ### WINE-SES-11 Registry restoration
 
-**Rule**: Registry restoration MUST persist `.reg` imports and `.bat` scripts on the shared prefix with the game's drive layout and code page. Imports and scripts MUST map `WOW6432Node` keys to 32-bit `SOFTWARE`. Batch runs MUST run `cmd.exe` as a guest program (WINE-SES-12), leave source scripts unmodified and neutralize elevation and pauses.
+**Rule**: Registry restoration MUST persist `.reg` imports and `.bat` scripts on the shared prefix with the game's drive layout and code page. Imports and scripts MUST map `WOW6432Node` keys to 32-bit `SOFTWARE`. A script MUST run as a guest program (WINE-SES-12), as the list below requires.
 **Verification**: Test
+
+- `cmd.exe` runs it from its own path, reading a copy without its elevation and pauses.
+- Its console MAY be piped: it then reads the host's lines and writes its output, both in the game's code page.
+- What it wrote is settled once the session ends.
 
 ### WINE-SES-12 Guest programs
 
