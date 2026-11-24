@@ -583,6 +583,13 @@ Every presenter's frames carry only that content, while the host shows caption, 
 
 > Note: Setup wizards are property sheets. Their pages are child dialogs, a license is a read-only rich edit, and banners are picture statics. A tree, a tab strip or an owner-drawn control has no native kind, so its dialog keeps Wine's painting.
 
+### WINE-UI-11 Panic reports
+
+**Rule**: A panic on any thread of a session MUST leave a report in the session's debug folder, whether or not the debugger runs. The report MUST name the thread, the panic and the guest unit being translated, if any. Reporting MUST cost nothing until a panic.
+**Verification**: Test
+
+> Note: A worker that recovers from a panic, such as a failed compile, leaves the game running. Without the report, only stderr shows it.
+
 ### WINE-UI-9 Detached menu bars
 
 **Rule**: A menu bar moved from the presented window MUST follow its root or submenu handles to its new window. The new window MUST remain the command target when hidden. A detached bar with at most one row of content MUST NOT present a window plane.

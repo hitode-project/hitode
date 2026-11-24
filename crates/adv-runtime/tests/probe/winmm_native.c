@@ -258,7 +258,7 @@ static void formats(void)
     HWAVEOUT output;
     WAVEHDR header;
     BYTE pcm[4096];
-    unsigned i;
+    unsigned i, wait;
     const WORD bits[] = {8,16,24,32,32,16,24,32,32};
     const GUID pcm_guid={1,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}};
     ZeroMemory(pcm,sizeof(pcm));
@@ -284,7 +284,8 @@ static void formats(void)
         header.dwBufferLength=441*format.Format.nBlockAlign;
         check("format-prepare", !waveOutPrepareHeader(output,&header,sizeof(header)));
         check("format-write", !waveOutWrite(output,&header,sizeof(header)));
-        Sleep(40);
+        /* 10 ms of sound: a loaded host may return it later than that. */
+        for(wait=0;!(header.dwFlags&WHDR_DONE)&&wait<2000;wait+=10) Sleep(10);
         check("format-done", header.dwFlags&WHDR_DONE);
         check("format-unprepare", !waveOutUnprepareHeader(output,&header,sizeof(header)));
         check("format-close", !waveOutClose(output));

@@ -1,5 +1,6 @@
 //! Translation front end and AArch64 lowerings.
 
+pub mod context;
 pub(crate) mod front;
 pub(crate) mod jit;
 pub(crate) mod lower;
