@@ -3979,3 +3979,68 @@ fn phase4_cross_channel_slp_pricing_and_order_preservation() {
     bad_at.regs[6] = 0x9000_0000;
     compare(&fault_ch, &bad_at, init_fault_mem, true);
 }
+
+// spec: A64-OPT-2, A64-OPT-3
+#[test]
+fn phase1_domain_guard_recognizes_dec_jne_countdown_loop() {
+    let code = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        a.fld(qword_ptr(esp + 0x20)).unwrap();
+        a.fmul_2(st0, st1).unwrap();
+        a.fadd(dword_ptr(esp + 0x28)).unwrap();
+        a.fistp(dword_ptr(esp + 0x10)).unwrap();
+        a.mov(eax, dword_ptr(esp + 0x10)).unwrap();
+        a.mov(dword_ptr(edi + edx * 4), eax).unwrap();
+        a.fst(dword_ptr(esp + 0x40 + edx * 4)).unwrap();
+        a.fld(dword_ptr(esp + 0x40 + edx * 4)).unwrap();
+        a.fsub(dword_ptr(esp + 0x40 + edx * 4)).unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fadd_2(st0, st1).unwrap();
+        a.fstp(dword_ptr(esp + 0x18)).unwrap();
+        a.fld(dword_ptr(esp + 0x18)).unwrap();
+        a.inc(edx).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(head).unwrap();
+    });
+    let unit = resident_unit(&code);
+
+    for pc_ctrl in [0x023fu16, 0x003fu16] {
+        let mut at = initial();
+        at.regs[1] = 8; // ecx = 8 countdown trips
+        at.regs[2] = 0; // edx = 0
+        at.x87.control = pc_ctrl;
+        at.x87.status = 0x20;
+        at.x87
+            .push(adv_cpu_core::floating::fast::extended(1.0 / 64.0));
+        at.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+
+        let built = build_with_domains(&unit, None, &at, &|_| false, &|_| false, &|_| false)
+            .expect("DEC/JNE domain-guarded build");
+        assert_eq!(verify::verify(&built.func), Ok(()));
+        assert!(
+            !built.func.domain_guards.is_empty(),
+            "DEC/JNE countdown latch must emit Block(0) DomainGuard for pc={pc_ctrl:#x}"
+        );
+        assert!(
+            built.func.blocks[0]
+                .insts
+                .iter()
+                .any(|(_, op)| matches!(op, Op::DomainGuard { .. })),
+            "expected Block(0) DomainGuard for DEC/JNE pc={pc_ctrl:#x}"
+        );
+        assert_eq!(
+            count(&built, |op| matches!(op, Op::Fp(.., false))),
+            0,
+            "no unproved Op::Fp should remain for DEC/JNE pc={pc_ctrl:#x}"
+        );
+        assert_eq!(
+            count(&built, |op| matches!(
+                op,
+                Op::X87Store { proved: false, .. }
+            )),
+            0,
+            "no unproved Op::X87Store should remain for DEC/JNE pc={pc_ctrl:#x}"
+        );
+    }
+}

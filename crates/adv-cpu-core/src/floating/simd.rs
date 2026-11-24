@@ -609,6 +609,66 @@ fn sse_minmax_qnan_raises_ie_and_float_to_int_skips_de() {
         assert_eq!(step, Step::Executed);
         assert_eq!(st.mxcsr & 0x3f, 0x00);
     }
+
+    // Intel SDM Vol. 1 §11.5.3.2: unmasked pre-computation IE takes priority
+    // over post-computation PE across packed lanes. On [1.5, qNaN, ...], an
+    // unmasked IE commits only IE (0x01) before #XM and preserves dst; when
+    // IE is masked (IM=1), both IE and PE (0x21) commit.
+    let mut mixed32 = [0u8; 16];
+    mixed32[0..4].copy_from_slice(&1.5f32.to_le_bytes());
+    mixed32[4..8].copy_from_slice(&0x7fc0_0000u32.to_le_bytes());
+    let mut mixed64 = [0u8; 16];
+    mixed64[0..8].copy_from_slice(&1.5f64.to_le_bytes());
+    mixed64[8..16].copy_from_slice(&0x7ff8_0000_0000_0000u64.to_le_bytes());
+    let sentinel = [0xa5u8; 16];
+    for (bytes, src) in [
+        (&[0xf3, 0x0f, 0x5b, 0xc1][..], mixed32), // cvttps2dq
+        (&[0x66, 0x0f, 0x5b, 0xc1][..], mixed32), // cvtps2dq
+        (&[0x66, 0x0f, 0xe6, 0xc1][..], mixed64), // cvttpd2dq
+        (&[0xf2, 0x0f, 0xe6, 0xc1][..], mixed64), // cvtpd2dq
+    ] {
+        // MXCSR=0x0000 (IM=0, PM=0): #XM with only IE committed, dst intact.
+        let (step, st) = run(bytes, 0x0000, sentinel, src);
+        assert_eq!(
+            step,
+            Step::Trap {
+                pc: 0x1000,
+                vector: 19
+            }
+        );
+        assert_eq!(st.mxcsr, 0x0001);
+        assert_eq!(st.xmm[0], sentinel);
+        // MXCSR=0x1000 (IM=0, PM=1): #XM with only IE committed, dst intact.
+        let (step, st) = run(bytes, 0x1000, sentinel, src);
+        assert_eq!(
+            step,
+            Step::Trap {
+                pc: 0x1000,
+                vector: 19
+            }
+        );
+        assert_eq!(st.mxcsr, 0x1001);
+        assert_eq!(st.xmm[0], sentinel);
+        // MXCSR=0x0080 (IM=1, PM=0): IE masked, #XM on PE commits both IE|PE.
+        let (step, st) = run(bytes, 0x0080, sentinel, src);
+        assert_eq!(
+            step,
+            Step::Trap {
+                pc: 0x1000,
+                vector: 19
+            }
+        );
+        assert_eq!(st.mxcsr, 0x00a1);
+        assert_eq!(st.xmm[0], sentinel);
+        // MXCSR=0x1080 (IM=1, PM=1): completes and commits both IE|PE.
+        let (step, st) = run(bytes, 0x1080, sentinel, src);
+        assert_eq!(step, Step::Executed);
+        assert_eq!(st.mxcsr, 0x10a1);
+        assert_eq!(
+            i32::from_le_bytes(st.xmm[0][4..8].try_into().unwrap()),
+            i32::MIN
+        );
+    }
 }
 fn nan(a: u64, width: usize) -> bool {
     if width == 4 {
@@ -898,25 +958,42 @@ fn packed_conversion(
     } else {
         sf::rounding((*tx.state.mxcsr >> 13) as u16)
     };
+    let mut pre_flags = 0u16;
+    let mut post_flags = 0u16;
     for lane in 0..count {
         sf::configure_sse(*tx.state.mxcsr);
         let offset = lane * source_width;
         let mut a = bits(&source[offset..offset + source_width]);
         if from != 2 {
-            a = if to == 2 {
-                input_to_int(tx, a, source_width)
-            } else {
-                input(tx, a, source_width)
-            };
+            if to == 2 {
+                a = input_to_int(tx, a, source_width);
+            } else if denormal(a, source_width) {
+                if *tx.state.mxcsr & 0x40 != 0 {
+                    a &= if source_width == 4 { 1 << 31 } else { 1 << 63 };
+                } else {
+                    pre_flags |= 2;
+                }
+            }
         }
         let mut result = sf::sse_convert(a, from, to, rc);
-        finish(tx, sf::flags());
+        let flags = sf::flags();
+        pre_flags |= flags & 0x07;
+        post_flags |= flags & 0x38;
         if to != 2 && *tx.state.mxcsr & 0x8000 != 0 && denormal(result, target_width) {
-            finish(tx, 0x30);
+            post_flags |= 0x30;
             result &= if target_width == 4 { 1 << 31 } else { 1 << 63 };
         }
         let offset = lane * target_width;
         out[offset..offset + target_width].copy_from_slice(&result.to_le_bytes()[..target_width]);
+    }
+    // Intel SDM Vol. 1 §11.5.3.2: unmasked pre-computation exceptions (IE/DE/ZE)
+    // take priority over post-computation exceptions (OE/UE/PE) across packed
+    // lanes and commit without post-computation flags before raising #XM.
+    let masks = (*tx.state.mxcsr >> 7) as u16;
+    if pre_flags & !masks != 0 {
+        finish(tx, pre_flags);
+    } else {
+        finish(tx, pre_flags | post_flags);
     }
     // CVTPI2PS alone preserves the high 64 bits of the destination XMM register.
     let width = if m == M::Cvtpi2ps || mmx(i.op0_register()).is_some() {

@@ -613,13 +613,8 @@ impl Model {
                 if res_known == mask =>
             {
                 let mut flags = 0;
-                let kind = match alu {
-                    decode::Alu::And | decode::Alu::Test => M::And,
-                    decode::Alu::Or => M::Or,
-                    _ => M::Xor,
-                };
-                // Logical flags depend solely on the result value.
-                adv_cpu_core::integer::binary(&mut flags, kind, res_bits, res_bits, width);
+                // Logical flags (CF=OF=AF=0, SF/ZF/PF from result) depend solely on res_bits.
+                adv_cpu_core::integer::binary(&mut flags, M::Or, res_bits, 0, width);
                 Some(flags)
             }
             _ => a.zip(b).map(|(a, b)| {

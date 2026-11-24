@@ -44,6 +44,8 @@ fn integers(values: [i32; 4]) -> [u8; 16] {
 #[test]
 fn packed_sse_exception_commits_sticky_flags_and_suppresses_all_lanes() {
     let bytes = code(|a| a.cvtps2dq(xmm0, xmm1).unwrap());
+    // Intel SDM Vol. 1 §11.5.3.2: unmasked pre-computation IE raises #XM
+    // before post-computation PE is committed.
     let mut s = CpuState {
         mxcsr: 0x1f00,
         ..CpuState::default()
@@ -58,12 +60,30 @@ fn packed_sse_exception_commits_sticky_flags_and_suppresses_all_lanes() {
         }
     );
     assert_eq!(s.xmm[0], [0xaa; 16]);
-    assert_eq!(s.mxcsr & 0x21, 0x21);
+    assert_eq!(s.mxcsr & 0x3f, 0x01);
     assert_eq!(s.eip, CODE);
     // A preexisting unmasked sticky bit does not retrigger on an exact operation.
     s.xmm[1] = singles([1.0, 2.0, 3.0, 4.0]);
     assert_eq!(step(&bytes, &mut s, &mut memory()), Step::Executed);
     assert_eq!(s.xmm[0], integers([1, 2, 3, 4]));
+    // When IE is masked (IM=1) and PE is unmasked (PM=0), both sticky bits
+    // commit and all destination lanes are suppressed on #XM.
+    let mut s = CpuState {
+        mxcsr: 0x0f80,
+        ..CpuState::default()
+    };
+    s.xmm[0] = [0xaa; 16];
+    s.xmm[1] = singles([1.5, 2.0, f32::NAN, 4.0]);
+    assert_eq!(
+        step(&bytes, &mut s, &mut memory()),
+        Step::Trap {
+            pc: CODE,
+            vector: 19
+        }
+    );
+    assert_eq!(s.xmm[0], [0xaa; 16]);
+    assert_eq!(s.mxcsr & 0x3f, 0x21);
+    assert_eq!(s.eip, CODE);
 }
 
 #[test]

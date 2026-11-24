@@ -3262,3 +3262,89 @@ fn vector_read_falls_back_on_unreadable_host_page_neighbor() {
     assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
     trial.compare_epilogue();
 }
+
+// spec: A64-OPT-2, A64-OPT-10
+#[test]
+fn post_review_xor_flags_and_f32_strip_fistp_precision_match_reference() {
+    // 1) P1 repro: constant-known non-zero XOR must set ZF=0, not ZF=1.
+    let xor_loop = Image::loop_body(|a, head, _| {
+        let mut skip = a.create_label();
+        a.mov(eax, 1).unwrap();
+        a.xor(eax, 2).unwrap(); // 3 != 0 -> ZF must be 0
+        a.je(skip).unwrap();
+        a.inc(ebx).unwrap();
+        a.set_label(&mut skip).unwrap();
+        let mut skip2 = a.create_label();
+        a.mov(eax, 2).unwrap();
+        a.xor(eax, 2).unwrap(); // 0 == 0 -> ZF must be 1
+        a.je(skip2).unwrap();
+        a.add(ebx, 100).unwrap();
+        a.set_label(&mut skip2).unwrap();
+        latch(a, head);
+    });
+    let mut state = initial(12);
+    state.regs[3] = 0; // ebx = 0
+    let mut trial = Trial::new(&xor_loop, &state, "known non-zero XOR flags", &[], |_| {});
+    assert!(trial.try_install_at(state));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    assert_eq!(trial.live.state.regs[3], 12);
+
+    // 2) P1 repro: PC=24/53 loop loading an invariant stack-slot f64 (16777217.0,
+    // 16777219.0, 1.5 - f32::EPSILON/4) and storing via FISTP m32 must not
+    // narrow to .4s without proving binary32 exactness.
+    let fistp_loop = Image::loop_body(|a, head, _| {
+        a.fld(qword_ptr(esp + 0x10)).unwrap();
+        a.fistp(dword_ptr(edi)).unwrap();
+        a.add(edi, 4).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    for pc_ctrl in [0x003fu16, 0x023fu16] {
+        let mut fp_state = initial(33);
+        fp_state.x87.control = pc_ctrl;
+        fp_state.x87.status = 0x20;
+        for (value, expected) in [
+            (16_777_217.0f64, 16_777_217i32),
+            (16_777_219.0f64, 16_777_219i32),
+            (1.5 - f64::from(f32::EPSILON) / 4.0, 1i32),
+        ] {
+            let mut trial = Trial::new(
+                &fistp_loop,
+                &fp_state,
+                "invariant stack f64 -> FISTP m32 (inexact f32)",
+                &[],
+                |m| {
+                    m.write(FRAME + 0x10, &value.to_le_bytes()).unwrap();
+                },
+            );
+            assert!(trial.try_install_at(fp_state.clone()));
+            assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+            assert_eq!(
+                trial.live.native.as_ref().unwrap().vector_strips(),
+                0,
+                "inexact-f32 invariant f64 ({value}) must bail before committing any .4s strip"
+            );
+            let mut out = [0u8; 4];
+            trial.live.memory.read_into(OUTPUT, &mut out).unwrap();
+            assert_eq!(i32::from_le_bytes(out), expected);
+        }
+
+        // Same loop with binary32-exact invariant f64 (42.0) completes .4s strips.
+        let mut trial = Trial::new(
+            &fistp_loop,
+            &fp_state,
+            "invariant stack f64 42.0 -> FISTP m32",
+            &[],
+            |m| {
+                m.write(FRAME + 0x10, &42.0f64.to_le_bytes()).unwrap();
+            },
+        );
+        assert!(trial.try_install_at(fp_state));
+        assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+        assert_eq!(trial.live.native.as_ref().unwrap().vector_strips(), 8);
+        let mut out = [0u8; 4];
+        trial.live.memory.read_into(OUTPUT, &mut out).unwrap();
+        assert_eq!(i32::from_le_bytes(out), 42);
+    }
+}
