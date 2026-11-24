@@ -158,7 +158,7 @@ pub(super) fn prepare(
     };
     let mut vfs = adv_os::Vfs::new(&cfg);
     for (letter, image) in &options.cdroms {
-        vfs.mount_iso(*letter, image)
+        vfs.mount_disc(*letter, image)
             .map_err(|e| format!("CD-ROM {letter}: {e}"))?;
     }
     let vfs = Rc::new(vfs);

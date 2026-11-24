@@ -1,5 +1,6 @@
-//! Userland ISO9660/Joliet optical media. The image is one read-only host file;
-//! guest streams retain only bounded extent metadata and independent cursors.
+//! Userland ISO9660/Joliet optical media. The image is one read-only host file,
+//! reached through the disc-image container in `image`; guest streams retain
+//! only bounded extent metadata and independent cursors.
 //! hadris-iso is the only ISO parser, built with just the read features.
 //! CDFS volume serials follow Wine's mountmgr
 //! (https://github.com/wine-mirror/wine/blob/master/dlls/mountmgr.sys/device.c),
@@ -9,11 +10,13 @@ use super::{DirEntry, FileIdentity, FileStream, Vfs};
 use hadris_iso::file::EntryType;
 use hadris_iso::sync::directory::{DirectoryRecord, DirectoryRef};
 use hadris_iso::sync::read::IsoImage;
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+mod image;
+use image::Disc;
 
 const SECTOR: u64 = 2048;
 const MAX_DESCRIPTORS: u64 = 64;
@@ -34,7 +37,7 @@ pub struct OpticalDriveInfo {
 }
 
 pub(super) struct OpticalMedia {
-    image: IsoImage<File>,
+    image: IsoImage<Disc>,
     root: DirectoryRef,
     joliet: bool,
     pub(super) info: OpticalDriveInfo,
@@ -98,8 +101,8 @@ fn range(offset: u64, length: u64, image_len: u64) -> io::Result<()> {
 
 /// Bound metadata before the library caches the path table. This prevents an
 /// untrusted size from allocating image-sized metadata, and caps descriptor scans.
-fn inspect(file: &mut File) -> io::Result<OpticalDriveInfo> {
-    let image_len = file.metadata()?.len();
+fn inspect(file: &mut Disc) -> io::Result<OpticalDriveInfo> {
+    let image_len = file.len();
     let mut primary: Option<[u8; SECTOR as usize]> = None;
     let mut label = None;
     let mut label_level = 0;
@@ -195,7 +198,7 @@ fn inspect(file: &mut File) -> io::Result<OpticalDriveInfo> {
 
 impl OpticalMedia {
     fn open(path: &Path) -> io::Result<Arc<Self>> {
-        let mut file = File::open(path)?;
+        let mut file = Disc::open(path)?;
         let info = inspect(&mut file)?;
         let image = IsoImage::open(file).map_err(iso_error)?;
         // Windows sees Joliet Unicode names ahead of the primary short names.
@@ -527,9 +530,9 @@ impl Seek for OpticalFile {
 }
 
 impl Vfs {
-    /// Publish an optical drive only after opening and validating the ISO.
+    /// Publish an optical drive only after opening the image and validating its ISO volume.
     /// C: and the configured game-root drive cannot be replaced by optical media.
-    pub fn mount_iso(&mut self, letter: char, path: impl AsRef<Path>) -> io::Result<()> {
+    pub fn mount_disc(&mut self, letter: char, path: impl AsRef<Path>) -> io::Result<()> {
         let letter = letter.to_ascii_uppercase();
         if !letter.is_ascii_alphabetic()
             || letter == 'C'

@@ -12,7 +12,7 @@ fn fixture(name: &str) -> (Vfs, std::path::PathBuf) {
     std::fs::write(&image, FIXTURE).unwrap();
     let cfg = crate::OsConfig::new(directory.join("game"), "game.exe", directory.join("data"));
     let mut vfs = Vfs::new(&cfg);
-    vfs.mount_iso('d', &image).unwrap();
+    vfs.mount_disc('d', &image).unwrap();
     (vfs, directory)
 }
 
@@ -93,7 +93,7 @@ fn optical_fixture_lists_iso_and_joliet_names_and_rejects_writes() {
     primary[17 * 2048..17 * 2048 + 7].copy_from_slice(&[255, b'C', b'D', b'0', b'0', b'1', 1]);
     let primary_path = directory.join("primary.iso");
     std::fs::write(&primary_path, primary).unwrap();
-    vfs.mount_iso('e', primary_path).unwrap();
+    vfs.mount_disc('e', primary_path).unwrap();
     assert_eq!(vfs.optical_drive('E').unwrap().max_component_length, 221);
     assert!(vfs.open_optical_file("E:/readme.txt").is_ok()); // privacy: allow authored guest optical path
     drop(vfs);
@@ -162,16 +162,16 @@ fn optical_fixture_invalid_media_and_extents_fail_without_replacing_drive() {
     let serial = vfs.optical_drive('D').unwrap().serial;
     let invalid_path = directory.join("invalid.iso");
     std::fs::write(&invalid_path, b"not an image").unwrap();
-    assert!(vfs.mount_iso('D', &invalid_path).is_err());
+    assert!(vfs.mount_disc('D', &invalid_path).is_err());
     assert_eq!(vfs.optical_drive('D').unwrap().serial, serial);
-    assert!(vfs.mount_iso('C', directory.join("fixture.iso")).is_err());
-    assert!(vfs.mount_iso('!', directory.join("fixture.iso")).is_err());
+    assert!(vfs.mount_disc('C', directory.join("fixture.iso")).is_err());
+    assert!(vfs.mount_disc('!', directory.join("fixture.iso")).is_err());
     let mut corrupt = FIXTURE.to_vec();
     // Joliet ReadMe's data extent is the third directory record.
     let record = 21 * 2048 + 68;
     corrupt[record + 2..record + 10].copy_from_slice(&[250, 0, 0, 0, 0, 0, 0, 250]);
     std::fs::write(&invalid_path, corrupt).unwrap();
-    vfs.mount_iso('E', &invalid_path).unwrap();
+    vfs.mount_disc('E', &invalid_path).unwrap();
     assert_eq!(
         vfs.open_optical_file("E:/ReadMe.txt").err().unwrap().kind(), // privacy: allow authored guest optical path
         io::ErrorKind::InvalidData
@@ -180,7 +180,7 @@ fn optical_fixture_invalid_media_and_extents_fail_without_replacing_drive() {
     huge[16 * 2048 + 132..16 * 2048 + 140].copy_from_slice(&[0xff; 8]);
     std::fs::write(&invalid_path, huge).unwrap();
     assert_eq!(
-        vfs.mount_iso('F', &invalid_path).unwrap_err().kind(),
+        vfs.mount_disc('F', &invalid_path).unwrap_err().kind(),
         io::ErrorKind::InvalidData
     );
     assert!(vfs.optical_drive('F').is_none());
@@ -188,7 +188,7 @@ fn optical_fixture_invalid_media_and_extents_fail_without_replacing_drive() {
     truncated_directory[17 * 2048 + 166..17 * 2048 + 174]
         .copy_from_slice(&[40, 0, 0, 0, 0, 0, 0, 40]);
     std::fs::write(&invalid_path, truncated_directory).unwrap();
-    vfs.mount_iso('G', &invalid_path).unwrap();
+    vfs.mount_disc('G', &invalid_path).unwrap();
     assert_eq!(
         vfs.open_optical_file("G:/ReadMe.txt").err().unwrap().kind(), // privacy: allow authored guest optical path
         io::ErrorKind::InvalidData
@@ -198,12 +198,12 @@ fn optical_fixture_invalid_media_and_extents_fail_without_replacing_drive() {
 }
 
 #[test]
-#[ignore = "read-only local media probe; set ADV_TEST_ISO explicitly"]
+#[ignore = "read-only local media probe; set ADV_TEST_DISC explicitly"]
 fn optical_local_image_read_only_probe() {
-    let path = std::env::var_os("ADV_TEST_ISO").expect("ADV_TEST_ISO");
+    let path = std::env::var_os("ADV_TEST_DISC").expect("ADV_TEST_DISC");
     let cfg = crate::OsConfig::new("unused", "unused.exe", "unused");
     let mut vfs = Vfs::new(&cfg);
-    vfs.mount_iso('D', path).unwrap();
+    vfs.mount_disc('D', path).unwrap();
     let info = vfs.optical_drive('D').unwrap();
     println!(
         "ISO label={} serial={:08x} capacity={}",
@@ -228,4 +228,183 @@ fn optical_local_image_read_only_probe() {
     );
     file.seek(SeekFrom::End(0)).unwrap();
     assert_eq!(file.read(&mut bytes).unwrap(), 0);
+}
+
+/// The fixture's 2048-byte sectors as raw sectors of `stride` bytes.
+fn raw(mode: u8, stride: usize) -> Vec<u8> {
+    let mut image = Vec::new();
+    for (lba, data) in FIXTURE.chunks(2048).enumerate() {
+        let mut sector = vec![0; stride];
+        sector[..12].copy_from_slice(&[0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0]);
+        let frame = lba + 150;
+        let bcd = |value: usize| (value / 10 * 16 + value % 10) as u8;
+        sector[12..15].copy_from_slice(&[bcd(frame / 4500), bcd(frame / 75 % 60), bcd(frame % 75)]);
+        sector[15] = mode;
+        let at = if mode == 2 { 24 } else { 16 };
+        sector[at..at + 2048].copy_from_slice(data);
+        image.extend(sector);
+    }
+    image
+}
+
+/// Reads the whole logical image through buffers that cross sector and batch bounds.
+fn logical(path: &Path) -> Vec<u8> {
+    let mut disc = image::Disc::open(path).unwrap();
+    let mut bytes = Vec::new();
+    for size in [3000, 100_000].into_iter().cycle() {
+        let mut buffer = vec![0; size];
+        let count = disc.read(&mut buffer).unwrap();
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    disc.seek(SeekFrom::Start(2047)).unwrap();
+    let mut pair = [0; 2];
+    disc.read_exact(&mut pair).unwrap();
+    assert_eq!(pair, FIXTURE[2047..2049]);
+    bytes
+}
+
+fn be32(value: u64) -> [u8; 4] {
+    (value as u32).to_be_bytes()
+}
+
+/// A Nero image: track data, then its block list and trailer.
+fn nero(wide: bool, dao: bool) -> Vec<u8> {
+    let pregap = vec![0; 150 * 2352];
+    let track = raw(1, 2352);
+    let start = pregap.len() as u64;
+    let end = start + track.len() as u64;
+    let mut image = [pregap, track].concat();
+    let trailer = image.len() as u64;
+    let field = |value: u64| {
+        if wide {
+            value.to_be_bytes().to_vec()
+        } else {
+            be32(value).to_vec()
+        }
+    };
+    let (id, body): (&[u8], Vec<u8>) = if dao {
+        let mut body = vec![0; 22];
+        body.extend([0; 12]);
+        body.extend(2352u16.to_be_bytes());
+        body.extend([0x05, 0, 0, 0]);
+        body.extend([field(0), field(start), field(end)].concat());
+        (if wide { b"DAOX" } else { b"DAOI" }, body)
+    } else {
+        let mut body = [field(start), field(end - start)].concat();
+        body.extend([0, 0, 0, 0x05]);
+        body.extend([0; 4]);
+        body.extend(vec![0; if wide { 8 } else { 4 }]);
+        (if wide { b"ETN2" } else { b"ETNF" }, body)
+    };
+    image.extend(b"SINF");
+    image.extend(be32(4));
+    image.extend(be32(1));
+    image.extend(id);
+    image.extend(be32(body.len() as u64));
+    image.extend(body);
+    image.extend(b"END!");
+    image.extend(be32(0));
+    if wide {
+        image.extend(b"NER5");
+        image.extend(trailer.to_be_bytes());
+    } else {
+        image.extend(b"NERO");
+        image.extend(be32(trailer));
+    }
+    image
+}
+
+#[test]
+// spec: DEV-DISC-4, DEV-DISC-5
+fn optical_containers_present_the_first_data_track_as_logical_sectors() {
+    let (_, directory) = fixture("containers");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = directory.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    // Lone raw sectors in Mode 1, Mode 2 Form 1 and with interleaved subchannel.
+    assert_eq!(logical(&write("mode1.bin", &raw(1, 2352))), FIXTURE);
+    assert_eq!(logical(&write("mode2.img", &raw(2, 2352))), FIXTURE);
+    assert_eq!(logical(&write("sub.mdf", &raw(1, 2448))), FIXTURE);
+    // Descriptors that name a same-stem sibling.
+    write("sub.mds", b"MEDIA DESCRIPTOR");
+    assert_eq!(logical(&directory.join("sub.mds")), FIXTURE);
+    write("mode2.ccd", b"[CloneCD]\r\nVersion=3\r\n");
+    assert_eq!(logical(&directory.join("mode2.ccd")), FIXTURE);
+    // A mixed-mode CUE: stored pregap, then an audio track in the same file.
+    let mut mixed = vec![0; 150 * 2352];
+    mixed.extend(raw(1, 2352));
+    mixed.extend(vec![0x55; 75 * 2352]);
+    write("ディスク.bin", &mixed);
+    let (shift_jis, _, _) = encoding_rs::SHIFT_JIS.encode("ディスク.bin");
+    let mut sheet = b"\xef\xbb\xbfREM test\r\nFILE \"".to_vec();
+    sheet.extend_from_slice(&shift_jis);
+    let tracks = format!(
+        "\" BINARY\r\n  TRACK 01 MODE1/2352\r\n    INDEX 01 00:02:00\r\n  TRACK 02 AUDIO\r\n    INDEX 00 00:{:02}:{:02}\r\n    INDEX 01 00:{:02}:{:02}\r\n",
+        (150 + FIXTURE.len() / 2048) / 75,
+        (150 + FIXTURE.len() / 2048) % 75,
+        (152 + FIXTURE.len() / 2048) / 75,
+        (152 + FIXTURE.len() / 2048) % 75,
+    );
+    sheet.extend_from_slice(tracks.as_bytes());
+    let cue = write("mixed.cue", &sheet);
+    assert_eq!(logical(&cue), FIXTURE);
+    // A renamed data file resolves through the sheet's own stem.
+    write("cooked.iso", FIXTURE);
+    let cooked = write(
+        "cooked.cue",
+        b"FILE \"old name.iso\" BINARY\nTRACK 1 MODE1/2048\nINDEX 1 0:0:0\n",
+    );
+    assert_eq!(logical(&cooked), FIXTURE);
+    for (name, wide, dao) in [
+        ("daox.nrg", true, true),
+        ("daoi.nrg", false, true),
+        ("etn2.nrg", true, false),
+        ("etnf.nrg", false, false),
+    ] {
+        assert_eq!(logical(&write(name, &nero(wide, dao))), FIXTURE, "{name}");
+    }
+    let cfg = crate::OsConfig::new(directory.join("game"), "game.exe", directory.join("data"));
+    let mut vfs = Vfs::new(&cfg);
+    vfs.mount_disc('E', &cue).unwrap();
+    vfs.mount_disc('F', directory.join("daox.nrg")).unwrap();
+    for letter in ['E', 'F'] {
+        let info = vfs.optical_drive(letter).unwrap();
+        assert_eq!(info.label, "OPTICAL_TEST");
+        assert_eq!(info.total_bytes, FIXTURE.len() as u64);
+        let mut split = vfs
+            .open_optical_file(&format!("{letter}:/Sub/split.bin")) // privacy: allow authored guest optical path
+            .unwrap();
+        let mut bytes = [0; 16];
+        assert_eq!(split.read(&mut bytes).unwrap(), 11);
+        assert_eq!(&bytes[..11], b"abcde world");
+    }
+    // A disc whose first track is audio is not a data volume.
+    let audio = write(
+        "audio.cue",
+        b"FILE \"mode1.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+    );
+    assert_eq!(
+        vfs.mount_disc('G', audio).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    let mut silent = raw(1, 2352);
+    silent[..16].fill(0x55);
+    let silent = write("silent.bin", &silent);
+    let silent_cue = write(
+        "silent.cue",
+        b"FILE \"silent.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+    );
+    assert!(vfs.mount_disc('G', silent).is_err());
+    assert_eq!(
+        vfs.mount_disc('G', silent_cue).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert!(vfs.optical_drive('G').is_none());
+    drop(vfs);
+    std::fs::remove_dir_all(directory).unwrap();
 }
