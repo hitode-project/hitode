@@ -261,6 +261,11 @@ Unmatched libraries MUST execute their guest implementations.
 **Rule**: An `@`-prefixed face MUST rotate vertical-eligible glyphs ninety degrees counterclockwise into the horizontal cell using their vertical origin and typographic descender. This rotation and cell translation MUST precede glyph orientation and any caller glyph matrix. ASCII and halfwidth glyphs MUST remain unrotated and keep horizontal advances.
 **Verification**: Test
 
+### DEV-FONT-11 Halfwidth and fullwidth CJK substitutes
+
+**Rule**: Automatic substitutes for fixed-ratio CJK Windows families MUST use half-em average and halfwidth advances, full-em fullwidth advances, and fixed-pitch metrics. Mapped glyph outlines MUST fit horizontally within their target advance before synthetic bold, italic, orientation, and caller transforms, centering narrower glyphs without stretching. Exact matches and explicit host overrides MUST keep their own advances and outlines unchanged.
+**Verification**: Test
+
 ## Optical media
 
 ### DEV-DISC-1 Mount configuration

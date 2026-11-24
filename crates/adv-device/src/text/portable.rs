@@ -429,6 +429,7 @@ impl Backend {
                 face,
                 Some(profile.clone()),
                 None,
+                false,
             );
         }
         let name = normalized_name(&request.face);
@@ -475,6 +476,19 @@ impl Backend {
         } else {
             None
         };
+        let duospace = substitute
+            && (is_fixed_cjk_family(&name)
+                || (fixed_pitch
+                    && !is_proportional_cjk_family(&name)
+                    && (is_cjk_encoding(request.encoding)
+                        || face.font().ok().is_some_and(|font| {
+                            let cp = font
+                                .os2()
+                                .ok()
+                                .and_then(|os2| os2.ul_code_page_range_1())
+                                .unwrap_or(0);
+                            replacements::covers_cjk(&font, cp)
+                        }))));
         let mapped = replacement
             .filter(|_| substitute)
             .map(|target| FontRequest {
@@ -493,6 +507,7 @@ impl Backend {
             face,
             None,
             cell,
+            duospace,
         )
     }
     pub(super) fn resource_font(
@@ -531,6 +546,7 @@ impl Backend {
             face,
             discovery.profile.clone(),
             None,
+            false,
         )
     }
     pub(super) fn enumerate(
@@ -646,7 +662,7 @@ impl Backend {
                         })
                         .or_else(|| info.families.first().map(|family| family.0.clone()))
                         .unwrap_or_default();
-                    let request = enumeration_request(info, name);
+                    let mut request = enumeration_request(info, name);
                     let signature = matches!(mode, FontEnumeration::FamiliesEx(_)).then(|| {
                         font.os2()
                             .ok()
@@ -668,7 +684,21 @@ impl Backend {
                         .as_ref()
                         .filter(|_| discovery.profile.is_none())
                         .and_then(|_| ideographic_ascent(&font));
-                    let (_, _, metrics) = font_metrics(&font, &request, cell)?;
+                    let duospace = forced
+                        .as_ref()
+                        .filter(|_| discovery.profile.is_none())
+                        .is_some_and(|name| is_fixed_cjk_family(&normalized_name(name)));
+                    if duospace {
+                        request.pitch = Pitch::Fixed;
+                        request.family = Family::Monospace;
+                    }
+                    let (_, _, metrics) = font_metrics(&font, &request, cell, duospace)?;
+                    let substitute_fallback = forced.is_some()
+                        && matches!(
+                            mode,
+                            FontEnumeration::FamiliesEx(encoding)
+                                if named.is_some() || replacements::covers_encoding(&font, encoding)
+                        );
                     let unscaled = font.metrics(Size::unscaled(), LocationRef::default());
                     let (asc, desc) = cell_units(&font, f32::from(unscaled.units_per_em), cell);
                     let (first, last) = self.enumeration_span(info.id, &font)?;
@@ -678,47 +708,56 @@ impl Backend {
                             .map(|s| s.to_string())
                             .unwrap_or_default()
                     };
-                    Ok(EnumeratedFont {
-                        font: request,
-                        metrics,
-                        characters: [first, last, b'?' as u16, b' ' as u16],
-                        kind: FontKind::TrueType,
-                        device: false,
-                        full_name: string(skrifa::string::StringId::FULL_NAME),
-                        style: string(skrifa::string::StringId::SUBFAMILY_NAME),
-                        script: String::new(),
-                        signature,
-                        design: (mode != FontEnumeration::Faces).then_some(FontDesign {
-                            italic: info.style != Style::Normal,
-                            bold: info.weight.0 >= 700,
-                            regular: info.style == Style::Normal && info.weight.0 < 700,
-                            nonnegative_spacing: true,
-                            postscript_outline: font.cff().is_ok() || font.cff2().is_ok(),
-                            truetype_outline: font.glyf().is_ok(),
-                            multiple_master: !font.axes().is_empty(),
-                            type1: false,
-                            digital_signature: font.dsig().is_ok(),
-                            em_units: u32::from(unscaled.units_per_em),
-                            cell_height: (asc + desc).round() as u32,
-                            average_width: unscaled.average_width.unwrap_or(0.0).max(0.0).round()
-                                as u32,
-                        }),
-                        substitute: forced.is_some(),
-                    })
+                    Ok((
+                        EnumeratedFont {
+                            font: request,
+                            metrics,
+                            characters: [first, last, b'?' as u16, b' ' as u16],
+                            kind: FontKind::TrueType,
+                            device: false,
+                            full_name: string(skrifa::string::StringId::FULL_NAME),
+                            style: string(skrifa::string::StringId::SUBFAMILY_NAME),
+                            script: String::new(),
+                            signature,
+                            design: (mode != FontEnumeration::Faces).then_some(FontDesign {
+                                italic: info.style != Style::Normal,
+                                bold: info.weight.0 >= 700,
+                                regular: info.style == Style::Normal && info.weight.0 < 700,
+                                nonnegative_spacing: true,
+                                postscript_outline: font.cff().is_ok() || font.cff2().is_ok(),
+                                truetype_outline: font.glyf().is_ok(),
+                                multiple_master: !font.axes().is_empty(),
+                                type1: false,
+                                digital_signature: font.dsig().is_ok(),
+                                em_units: u32::from(unscaled.units_per_em),
+                                cell_height: (asc + desc).round() as u32,
+                                average_width: unscaled
+                                    .average_width
+                                    .unwrap_or(0.0)
+                                    .max(0.0)
+                                    .round() as u32,
+                            }),
+                            substitute: forced.is_some(),
+                        },
+                        substitute_fallback,
+                    ))
                 })
                 .ok_or_else(|| TextError::Font("font discovery file became unreadable".into()));
             // Windows leaves out fonts it cannot use; one bad file must not
             // end enumeration of the rest.
-            let Ok(Ok(result)) = result else {
+            let Ok(Ok((result, substitute_fallback))) = result else {
                 continue;
             };
             if named.is_none() && !listed(&result.font.face) {
                 continue;
             }
             let fonts = match mode {
-                FontEnumeration::FamiliesEx(encoding) => {
-                    enumeration::repertoires(result, encoding, self.ansi.unwrap_or(Encoding::Latin))
-                }
+                FontEnumeration::FamiliesEx(encoding) => enumeration::repertoires(
+                    result,
+                    encoding,
+                    self.ansi.unwrap_or(Encoding::Latin),
+                    substitute_fallback,
+                ),
                 _ => vec![result],
             };
             for font in fonts {
@@ -1017,6 +1056,118 @@ fn legacy_families<'a>(font: &FontRef<'a>) -> impl Iterator<Item = String> + 'a 
     font.localized_strings(skrifa::string::StringId::FAMILY_NAME)
         .map(|name| name.to_string())
 }
+fn is_cjk_encoding(encoding: Encoding) -> bool {
+    matches!(
+        encoding,
+        Encoding::Japanese
+            | Encoding::SimplifiedChinese
+            | Encoding::TraditionalChinese
+            | Encoding::Korean
+            | Encoding::Johab
+    )
+}
+/// Standard Windows CJK families with a strict 1:2 halfwidth-to-fullwidth grid.
+fn is_fixed_cjk_family(name: &str) -> bool {
+    matches!(
+        name,
+        "ms gothic"
+            | "ｍｓ ゴシック"
+            | "ms ゴシック"
+            | "ms mincho"
+            | "ｍｓ 明朝"
+            | "ms 明朝"
+            | "simsun"
+            | "宋体"
+            | "nsimsun"
+            | "新宋体"
+            | "simsun-extb"
+            | "simhei"
+            | "黑体"
+            | "fangsong"
+            | "仿宋"
+            | "fangsong_gb2312"
+            | "kaiti"
+            | "楷体"
+            | "kaiti_gb2312"
+            | "mingliu"
+            | "細明體"
+            | "细明体"
+            | "mingliu_hkscs"
+            | "mingliu-extb"
+            | "gulim"
+            | "굴림"
+            | "gulimche"
+            | "굴림체"
+            | "batang"
+            | "바탕"
+            | "batangche"
+            | "바탕체"
+            | "dotum"
+            | "돋움"
+            | "dotumche"
+            | "돋움체"
+            | "gungsuh"
+            | "궁서"
+            | "gungsuhche"
+            | "궁서체"
+    )
+}
+/// Standard Windows CJK families with proportional Latin advances.
+fn is_proportional_cjk_family(name: &str) -> bool {
+    matches!(
+        name,
+        "ms pgothic"
+            | "ｍｓ ｐゴシック"
+            | "ms pゴシック"
+            | "ms ui gothic"
+            | "ms pmincho"
+            | "ｍｓ ｐ明朝"
+            | "ms p明朝"
+            | "meiryo"
+            | "メイリオ"
+            | "meiryo ui"
+            | "yu gothic"
+            | "游ゴシック"
+            | "yu gothic ui"
+            | "yu mincho"
+            | "游明朝"
+            | "microsoft yahei"
+            | "微软雅黑"
+            | "microsoft yahei ui"
+            | "dengxian"
+            | "等线"
+            | "pmingliu"
+            | "新細明體"
+            | "pmingliu-extb"
+            | "microsoft jhenghei"
+            | "microsoft jhenghei ui"
+            | "微軟正黑體"
+            | "malgun gothic"
+    )
+}
+fn duospace_fullwidth(code: u32, raw_advance: f32, em: f32) -> bool {
+    match code {
+        0x0000..=0x007f | 0xff61..=0xffdc | 0xffe8..=0xffee => false,
+        0x00a7..=0x00a8
+        | 0x00b0..=0x00b1
+        | 0x00b7
+        | 0x00d7
+        | 0x00f7
+        | 0x0391..=0x0451
+        | 0x1100..=0x115f
+        | 0x2010..=0x2027
+        | 0x2030..=0x203e
+        | 0x2100..=0x27bf
+        | 0x2e80..=0xa4cf
+        | 0xac00..=0xd7af
+        | 0xf900..=0xfaff
+        | 0xfe10..=0xfe6f
+        | 0xff01..=0xff60
+        | 0xffe0..=0xffe6
+        | 0x20000..=0x3ffff => true,
+        _ => raw_advance >= em * 0.75,
+    }
+}
 fn fixed(request: &FontRequest) -> bool {
     matches!(request.pitch, Pitch::Fixed)
         || matches!(request.family, Family::Monospace)
@@ -1024,10 +1175,7 @@ fn fixed(request: &FontRequest) -> bool {
             request.default,
             Some(DefaultFont::Console | DefaultFont::Fixed | DefaultFont::SystemFixed)
         )
-        || matches!(
-            request.face.to_lowercase().as_str(),
-            "ms gothic" | "ｍｓ ゴシック" | "ms mincho" | "ｍｓ 明朝"
-        )
+        || is_fixed_cjk_family(&normalized_name(&request.face))
 }
 /// Windows widens a face without a bold design by exactly one pixel, at
 /// every size: the glyph extends to the right only (DEV-FONT-7).
@@ -1330,6 +1478,7 @@ fn font_metrics(
     font: &FontRef<'_>,
     request: &FontRequest,
     ideographic_ascent: Option<f32>,
+    duospace: bool,
 ) -> Result<(f32, f32, TextMetrics), TextError> {
     let loc = location(font, request);
     let units = font.metrics(Size::unscaled(), &loc);
@@ -1347,7 +1496,7 @@ fn font_metrics(
     };
     let scale = em / upem;
     let m = font.metrics(Size::new(em), &loc);
-    let average = if fixed(request) {
+    let average = if duospace {
         em * 0.5
     } else {
         m.average_width.unwrap_or(em * 0.5).abs().max(1.0)
@@ -1393,7 +1542,11 @@ fn font_metrics(
         },
         external_leading: m.leading.max(0.0).round() as i32,
         average_width: (average * xscale).round().max(1.0) as i32,
-        maximum_width: (m.max_width.unwrap_or(em).max(em) * xscale).ceil() as i32,
+        maximum_width: if duospace {
+            (em * xscale).ceil() as i32
+        } else {
+            (m.max_width.unwrap_or(em).max(em) * xscale).ceil() as i32
+        },
         weight: if request.weight == 0 {
             400
         } else {
@@ -1409,7 +1562,7 @@ fn font_metrics(
         italic: request.italic,
         underline: request.underline,
         strikeout: request.strikeout,
-        variable_pitch: !fixed(request) && !m.is_monospace,
+        variable_pitch: !duospace && !m.is_monospace,
         vector: true,
         outline: true,
         device: false,
@@ -1466,9 +1619,14 @@ pub(super) struct Font {
     core_fonts: Mutex<BTreeMap<ID, apple::CoreFont>>,
     em: f32,
     xscale: f32,
+    duospace: bool,
     metrics: TextMetrics,
 }
 impl Font {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal constructor carries selected face state"
+    )]
     fn new(
         backend: &Backend,
         request: &FontRequest,
@@ -1477,9 +1635,10 @@ impl Font {
         primary: Arc<Face>,
         profile: Option<Arc<profile::Loaded>>,
         cell: Option<f32>,
+        duospace: bool,
     ) -> Result<Self, TextError> {
         let font = primary.font()?;
-        let (em, xscale, mut metrics) = font_metrics(&font, request, cell)?;
+        let (em, xscale, mut metrics) = font_metrics(&font, request, cell, duospace)?;
         metrics.encoding = realized(
             request.encoding,
             backend.ansi.unwrap_or(Encoding::Latin),
@@ -1510,6 +1669,7 @@ impl Font {
             core_fonts: Mutex::default(),
             em,
             xscale,
+            duospace,
             metrics,
         })
     }
@@ -1856,6 +2016,28 @@ impl Font {
             });
         Ok((tx.round(), ty.round()))
     }
+    fn duospace_target(
+        &self,
+        font: &FontRef<'_>,
+        glyph: GlyphId,
+        code: Option<u32>,
+        vertical: bool,
+    ) -> Option<(f32, f32)> {
+        if !self.duospace || vertical {
+            return None;
+        }
+        let code = code.filter(|&code| code != 0)?;
+        if font.charmap().map(code) != Some(glyph) {
+            return None;
+        }
+        let loc = location(font, &self.request);
+        let raw = font
+            .glyph_metrics(Size::new(self.em), &loc)
+            .advance_width(glyph)?;
+        let full = duospace_fullwidth(code, raw, self.em);
+        let cell_width = (self.em * if full { 1.0 } else { 0.5 } * self.xscale).round();
+        Some((raw * self.xscale, cell_width))
+    }
     fn advance(&self, face: &Face, glyph: GlyphId, code: Option<u32>) -> Result<f32, TextError> {
         let font = face.font()?;
         let vertical = self.vertical_glyph(&font, glyph, code, false);
@@ -1882,13 +2064,8 @@ impl Font {
             return Ok((f32::from(advance) * scale * self.xscale).round() + bold);
         }
 
-        if fixed(&self.request)
-            && let Some(code) = code
-            && code != 0
-            && font.charmap().map(code) == Some(glyph)
-        {
-            let full = matches!(code, 0x1100..=0x11ff | 0x2e80..=0xa4cf | 0xac00..=0xd7af | 0xf900..=0xfaff | 0xfe10..=0xfe6f | 0xff01..=0xff60 | 0xffe0..=0xffe6 | 0x20000..=0x3ffff);
-            return Ok((self.em * if full { 1.0 } else { 0.5 } * self.xscale).round() + bold);
+        if let Some((_, cell_width)) = self.duospace_target(font, glyph, code, vertical) {
+            return Ok(cell_width + bold);
         }
         let loc = location(font, &self.request);
         font.glyph_metrics(Size::new(self.em), &loc)
@@ -2137,11 +2314,12 @@ impl Font {
             && face.info.style == Style::Normal
             && font.axes().get_by_tag(skrifa::Tag::new(b"ital")).is_none()
             && font.axes().get_by_tag(skrifa::Tag::new(b"slnt")).is_none();
+        let fit = self.duospace_target(&font, glyph, code, vertical);
         let mut pen = Pen {
             commands: Vec::new(),
             transform: Transform::IDENTITY,
             xscale: self.xscale,
-            italic,
+            italic: italic && fit.is_none(),
         };
         if let Some(outline) = outlines.get(glyph) {
             if request.hinted {
@@ -2197,6 +2375,12 @@ impl Font {
                 "glyph has no supported scalable outline (embedded bitmap/color fonts unsupported)"
                     .into(),
             ));
+        }
+        if let Some((raw_advance, cell_width)) = fit {
+            synthesis::fit_horizontal(&mut pen.commands, raw_advance, cell_width);
+            if italic {
+                synthesis::shear_italic(&mut pen.commands, self.xscale);
+            }
         }
         if synthetic_bold(&self.request, &font, face.info.weight.0) {
             synthesis::embolden(&mut pen.commands, 1.0);

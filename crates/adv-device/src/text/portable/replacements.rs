@@ -55,6 +55,21 @@ pub(super) fn covers_cjk(font: &FontRef<'_>, codepages: u32) -> bool {
     claims_cjk(mapped_codepages(codepages, Some(font)))
 }
 
+/// Whether `font`'s character map contains a representative glyph for `encoding`.
+pub(super) fn covers_encoding(font: &FontRef<'_>, encoding: Encoding) -> bool {
+    let sample = match encoding {
+        Encoding::Japanese => 'あ',
+        Encoding::SimplifiedChinese => '们',
+        Encoding::TraditionalChinese => '們',
+        Encoding::Korean | Encoding::Johab => '한',
+        Encoding::Latin | Encoding::Automatic => 'A',
+        _ => return false,
+    };
+    font.charmap()
+        .map(sample)
+        .is_some_and(|glyph| glyph.to_u32() != 0)
+}
+
 /// The claimed code pages whose sample character the face maps.
 fn mapped_codepages(mut codepages: u32, font: Option<&FontRef<'_>>) -> u32 {
     for (encoding, sample) in SAMPLES {
