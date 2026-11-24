@@ -556,8 +556,43 @@ pub struct Jit<'a> {
     computation_facts: Option<ComputationFacts<'a>>,
 }
 
+/// Names the unit being lowered when lowering panics, so a report of a
+/// translator failure says which guest code reached it.
+struct Lowering<'a> {
+    unit: &'a Unit,
+    eip: u32,
+    computation: bool,
+}
+
+impl Drop for Lowering<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let insts = &self.unit.trace.insts;
+            eprintln!(
+                "a64: lowering the unit at {:#010x} panicked: {} instructions from {:#010x} to {:#010x}, computation {}",
+                self.eip,
+                insts.len(),
+                insts.first().map_or(0, |inst| inst.pc),
+                insts.last().map_or(0, |inst| inst.pc),
+                self.computation,
+            );
+            for inst in insts {
+                eprintln!(
+                    "a64:   {:#010x}..{:#010x} {:?} next {:?} taken {:?}",
+                    inst.pc, inst.next_pc, inst.op, inst.next, inst.taken
+                );
+            }
+        }
+    }
+}
+
 impl Jit<'_> {
     fn lower_form(&mut self, unit: &Unit, eip: u32, computation: bool) {
+        let _lowering = Lowering {
+            unit,
+            eip,
+            computation,
+        };
         self.code.asm.reset();
         self.code.x87.reset(unit.trace.len());
         while self.emit_unit(unit, eip, computation) {
@@ -987,6 +1022,11 @@ impl Translator<'_> {
                 return None;
             }
             if self.regions.iter().any(|&(at, _)| at == i) {
+                return None;
+            }
+            // The peel emits the body twice, and an x87 run binds its
+            // entries once per unit.
+            if self.x87.in_run(i) {
                 return None;
             }
             let (reads, writes) = residency::footprint(self.trace, i, self.checked)?;

@@ -2,54 +2,18 @@
 //! adapter, controls never compute guest state: a click restores the guest's
 //! check, and only a later snapshot changes what is shown.
 use super::*;
-use adv_runtime::{DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow};
+use adv_runtime::{
+    ControlKind as Kind, DialogControl, DialogEvent, DialogFont, DialogImage, DialogSet,
+    DialogTarget, DialogWindow,
+};
 use objc2::sel;
 use objc2_app_kit::{
-    NSBezelStyle, NSBorderType, NSBox, NSBoxType, NSButton, NSFont, NSPopUpButton, NSResponder,
-    NSScrollView, NSSecureTextField, NSSlider, NSTableColumn, NSTableView, NSTextAlignment,
-    NSTextField, NSView, NSWindowOrderingMode,
+    NSBezelStyle, NSBitmapImageRep, NSBorderType, NSBox, NSBoxType, NSButton, NSFont, NSImage,
+    NSImageScaling, NSImageView, NSPopUpButton, NSProgressIndicator, NSProgressIndicatorStyle,
+    NSResponder, NSScrollView, NSSecureTextField, NSSlider, NSTableColumn, NSTableView,
+    NSTextAlignment, NSTextField, NSTextView, NSView, NSWindowOrderingMode,
 };
 use objc2_foundation::NSIndexSet;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    Push,
-    Check,
-    Radio,
-    Group,
-    Label,
-    Frame,
-    Edit,
-    Combo,
-    List,
-    Track,
-    Unavailable,
-}
-
-fn kind(control: &DialogControl) -> Kind {
-    if !control.supported {
-        return Kind::Unavailable;
-    }
-    let class = control.class.to_ascii_lowercase();
-    match class.as_str() {
-        "button" => match control.style & 15 {
-            2 | 3 | 5 | 6 => Kind::Check,
-            4 | 9 => Kind::Radio,
-            7 => Kind::Group,
-            _ => Kind::Push,
-        },
-        "static" => match control.style & 0x1f {
-            7..=9 | 16..=18 => Kind::Frame,
-            _ => Kind::Label,
-        },
-        "edit" => Kind::Edit,
-        "combobox" => Kind::Combo,
-        "listbox" => Kind::List,
-        "msctls_trackbar32" => Kind::Track,
-        "msctls_statusbar32" => Kind::Label,
-        _ => Kind::Unavailable,
-    }
-}
 
 #[derive(Clone)]
 struct Binding {
@@ -260,6 +224,56 @@ fn list_table(view: &NSView) -> Option<Retained<NSTableView>> {
         .ok()
 }
 
+/// The text a read-only text control's scroll view shows.
+fn text_view(view: &NSView) -> Option<Retained<NSTextView>> {
+    view.downcast_ref::<NSScrollView>()?
+        .documentView()?
+        .downcast::<NSTextView>()
+        .ok()
+}
+
+/// A guest bitmap as an image of its own pixel size.
+fn image(mtm: MainThreadMarker, source: &DialogImage) -> Option<Retained<NSImage>> {
+    let (width, height) = (source.width as isize, source.height as isize);
+    // SAFETY: AppKit allocates the planes; the copy below stays inside them.
+    let bitmap = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
+            mtm.alloc::<NSBitmapImageRep>(),
+            std::ptr::null_mut(),
+            width,
+            height,
+            8,
+            4,
+            true,
+            false,
+            objc2_app_kit::NSDeviceRGBColorSpace,
+            objc2_app_kit::NSBitmapFormat::empty(),
+            4 * width,
+            32,
+        )
+    }?;
+    let data = bitmap.bitmapData();
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: the rep owns `4 * width * height` bytes at `data`.
+    let pixels = unsafe { std::slice::from_raw_parts_mut(data, source.bgra.len()) };
+    for (to, from) in pixels
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(source.bgra.as_chunks::<4>().0)
+    {
+        *to = [from[2], from[1], from[0], 255];
+    }
+    let image = NSImage::initWithSize(
+        mtm.alloc::<NSImage>(),
+        NSSize::new(width as f64, height as f64),
+    );
+    image.addRepresentation(&bitmap);
+    Some(image)
+}
+
 /// Native objects whose callbacks name this control.
 fn binding_keys(view: &NSView) -> Vec<usize> {
     let mut keys = vec![view as *const NSView as usize];
@@ -273,7 +287,7 @@ fn create(mtm: MainThreadMarker, target: &Target, control: &DialogControl) -> Re
     let object: Option<&AnyObject> = Some(target.as_ref());
     // SAFETY: the target implements the action and outlives the controls.
     let view: Retained<NSView> = unsafe {
-        match kind(control) {
+        match control.kind {
             Kind::Push => {
                 let button = NSButton::buttonWithTitle_target_action(&text, object, action, mtm);
                 button.setBezelStyle(NSBezelStyle::FlexiblePush);
@@ -357,6 +371,27 @@ fn create(mtm: MainThreadMarker, target: &Target, control: &DialogControl) -> Re
                 slider.setContinuous(true);
                 Retained::into_super(Retained::into_super(slider))
             }
+            Kind::Text => {
+                let scroll = NSTextView::scrollableTextView(mtm);
+                if let Some(view) = text_view(&scroll) {
+                    view.setEditable(false);
+                    view.setRichText(false);
+                }
+                scroll.setBorderType(NSBorderType::BezelBorder);
+                Retained::into_super(scroll)
+            }
+            Kind::Progress => {
+                let bar = NSProgressIndicator::new(mtm);
+                bar.setStyle(NSProgressIndicatorStyle::Bar);
+                bar.setIndeterminate(false);
+                Retained::into_super(bar)
+            }
+            Kind::Image => {
+                let image = NSImageView::new(mtm);
+                image.setImageScaling(NSImageScaling::ScaleAxesIndependently);
+                Retained::into_super(Retained::into_super(image))
+            }
+            Kind::Container => NSView::new(mtm),
         }
     };
     view
@@ -474,7 +509,7 @@ impl HostDialog {
             .filter(|(_, native)| {
                 !source.controls.iter().any(|c| {
                     c.target == native.source.target
-                        && kind(c) == native.kind
+                        && c.kind == native.kind
                         && c.style == native.source.style
                 })
             })
@@ -509,9 +544,12 @@ impl HostDialog {
                 offset.1 + control.rect.bottom,
             );
             let native = self.controls.entry(control.target.hwnd).or_insert_with(|| {
-                let kind = kind(control);
+                let kind = control.kind;
                 let view = create(mtm, target, control);
-                if matches!(kind, Kind::Group | Kind::Frame | Kind::Unavailable) {
+                if matches!(
+                    kind,
+                    Kind::Group | Kind::Frame | Kind::Container | Kind::Unavailable
+                ) {
                     let first = self.content.subviews().firstObject();
                     self.content.addSubview_positioned_relativeTo(
                         &view,
@@ -521,7 +559,7 @@ impl HostDialog {
                 } else {
                     self.content.addSubview(&view);
                 }
-                if !control.supported {
+                if !control.supported() {
                     log::warn!(
                         "native dialog control unavailable: class={} guest={:#x}",
                         control.class,
@@ -535,6 +573,7 @@ impl HostDialog {
                         // Forces the first projection of every property.
                         text: "\u{0}".into(),
                         items: vec!["\u{0}".into()],
+                        image: None,
                         ..control.clone()
                     },
                 }
@@ -573,13 +612,33 @@ fn project(
     let view = &native.view;
     view.setFrame(frame(rect));
     view.setHidden(!control.visible);
-    let text = if control.supported {
+    let text = if control.supported() {
         control.caption()
     } else {
         format!("Unavailable: {} · {}", control.class, control.text)
     };
     let font = font(control.font.as_ref().or(inherited));
-    if let Some(table) = list_table(view) {
+    if let Some(text_view) = text_view(view) {
+        if native.source.text != text {
+            // Rich edits end lines with a lone CR.
+            let lines = text.replace("\r\n", "\n").replace('\r', "\n");
+            text_view.setString(&NSString::from_str(&lines));
+        }
+        text_view.setFont(Some(&font));
+    } else if let Some(bar) = view.downcast_ref::<NSProgressIndicator>() {
+        let (min, max) = control.range.unwrap_or((0, 100));
+        bar.setMinValue(f64::from(min));
+        bar.setMaxValue(f64::from(max));
+        bar.setDoubleValue(f64::from(control.value));
+    } else if let Some(picture) = view.downcast_ref::<NSImageView>() {
+        if native.source.image != control.image {
+            let shown = control
+                .image
+                .as_deref()
+                .and_then(|source| image(picture.mtm(), source));
+            picture.setImage(shown.as_deref());
+        }
+    } else if let Some(table) = list_table(view) {
         if native.source.items != control.items {
             output
                 .lists
@@ -644,7 +703,7 @@ fn project(
         if native.source.text != text && field.stringValue().to_string() != text {
             field.setStringValue(&NSString::from_str(&text));
         }
-        field.setEnabled(control.enabled && control.supported);
+        field.setEnabled(control.enabled && control.supported());
         field.setFont(Some(&font));
         if native.kind == Kind::Label {
             view.setFrame(label_frame(

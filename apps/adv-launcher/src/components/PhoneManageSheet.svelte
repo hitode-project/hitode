@@ -140,6 +140,10 @@
             <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M10.6 2.6l2.8 2.8-7.7 7.7-3.4.6.6-3.4z"></path></svg>
             <span>{t("编辑标题…")}</span>
           </button>
+          <button class="si" role="menuitem" onclick={() => go({ name: "game-run", gameId: game.id })}>
+            <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 3.2L12.5 8l-8 4.8z"></path></svg>
+            <span>{t("运行其他文件…")}</span>
+          </button>
           <button class="si" role="menuitem" onclick={() => go({ name: "game-settings", gameId: game.id })}>
             <span class="ic"><Icon name="sliders" size={20} stroke={1.3} /></span>
             <span>{t("此游戏的设置…")}</span>

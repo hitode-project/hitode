@@ -1,6 +1,6 @@
 import { loadGameSetup, GAME_DEFAULTS } from "./fake-settings";
 import { prefs } from "./prefs.svelte";
-export function playback(gameId: string) {
+export function playback(gameId: string, exe?: string) {
   const setup = loadGameSetup(gameId, 932);
   const values = { scale: prefs.scale, ff: prefs.fastForward, ...GAME_DEFAULTS, ...setup.overrides };
   const fontFamilies: Record<string, string> = {};
@@ -17,5 +17,6 @@ export function playback(gameId: string) {
     toggle: values.ff === "toggle", pauseInBackground: prefs.pauseInBackground,
     discs: setup.discs, fontFiles: setup.fontFiles, fontFamilies,
     smoothing: values.smooth === "game" ? null : values.smooth === "on",
+    ...(exe ? { exe } : {}),
   };
 }

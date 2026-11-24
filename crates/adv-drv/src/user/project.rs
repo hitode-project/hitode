@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 use adv_abi::{Env, Outcome};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_device::ui::{
-    DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow, InputView,
-    MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation, Rect, WindowView,
-    supported,
+    ControlKind, DialogControl, DialogEvent, DialogFont, DialogImage, DialogSet, DialogTarget,
+    DialogWindow, InputView, MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation,
+    Rect, WindowView, text_control,
 };
 use adv_machine::{CtxId, Ext};
 use adv_nt::process::{module_base, module_export};
@@ -29,6 +29,8 @@ const WS_VISIBLE: u32 = 0x1000_0000;
 const WS_DISABLED: u32 = 0x0800_0000;
 const WS_TABSTOP: u32 = 0x0001_0000;
 const WM_SETTEXT: u32 = 0x0c;
+const WM_GETTEXT: u32 = 0x0d;
+const WM_GETTEXTLENGTH: u32 = 0x0e;
 const WM_CLOSE: u32 = 0x10;
 const WM_ACTIVATEAPP: u32 = 0x1c;
 const WM_GETFONT: u32 = 0x31;
@@ -60,6 +62,20 @@ const TBM_GETPOS: u32 = 0x400;
 const TBM_GETRANGEMIN: u32 = 0x401;
 const TBM_GETRANGEMAX: u32 = 0x402;
 const TBM_SETPOS: u32 = 0x405;
+const PBM_GETRANGE: u32 = 0x407;
+const PBM_GETPOS: u32 = 0x408;
+const STM_GETIMAGE: u32 = 0x173;
+const LVM_GETITEMCOUNT: u32 = 0x1004;
+const LVM_GETNEXTITEM: u32 = 0x100c;
+const LVM_ENSUREVISIBLE: u32 = 0x1013;
+const LVM_SETITEMSTATE: u32 = 0x102b;
+const LVM_GETITEMTEXTW: u32 = 0x1073;
+/// `sizeof(LVITEMW)` (i386).
+const LVITEM: u32 = 60;
+/// Text controls are read whole up to this many UTF-16 units, as a license.
+const LONG_TEXT: u32 = 65536;
+/// The largest picture read back, in pixels a side.
+const IMAGE_SIDE: u32 = 2048;
 /// GA_PARENT and GW_OWNER.
 const GA_PARENT: u32 = 1;
 const GW_OWNER: u32 = 4;
@@ -111,6 +127,11 @@ struct Info {
     range: Option<(i32, i32)>,
     value: i32,
     menu: Vec<MenuItem>,
+    /// A text control's length, when it may exceed what the first read holds.
+    length: u32,
+    /// A picture static's bitmap, and its pixels once read.
+    bitmap: u32,
+    image: Option<Arc<DialogImage>>,
 }
 
 impl Info {
@@ -137,6 +158,26 @@ impl Info {
             && self.visible()
             && self.count != 0
             && self.items.len() == self.count as usize
+    }
+    fn list_view(&self) -> bool {
+        self.is("SysListView32")
+    }
+    /// A multiline text control, whose text can be long.
+    fn long_text(&self) -> bool {
+        text_control(&self.class) && self.style & 4 != 0
+    }
+    fn picture(&self) -> bool {
+        self.is("Static") && self.style & 0x1f == 14
+    }
+    fn kind(&self) -> ControlKind {
+        // Multiple selection and owner-drawn lists without strings, and list
+        // views keeping no strings, stay guest-only.
+        let list = if self.list_view() {
+            self.style & 0x1000 == 0
+        } else {
+            self.style & (0x8 | 0x800) == 0 && (self.style & 0x30 == 0 || self.style & 0x40 != 0)
+        };
+        adv_device::ui::kind(&self.class, self.style, list, self.image.is_some())
     }
     fn list(&self) -> Option<(u32, u32, u32)> {
         if self.is("ListBox") || (self.combo_list() && self.visible()) {
@@ -169,6 +210,8 @@ struct Projection {
     /// Threads with a read under way, and when each last finished one.
     reading: BTreeSet<CtxId>,
     read: HashMap<CtxId, Instant>,
+    /// Pictures already read, by bitmap.
+    images: HashMap<u32, Arc<DialogImage>>,
 }
 
 struct MenuOrigin {
@@ -299,10 +342,19 @@ pub fn dialogs(ext: &Ext) -> DialogSet {
         .copied()
         .filter(|info| is_dialog(info, &by_parent))
     {
-        let mut pending: VecDeque<&Info> = by_parent(dialog.hwnd).into();
+        // A control shows only while its parents do, as pages of a sheet.
+        let mut pending: VecDeque<(&Info, bool)> = by_parent(dialog.hwnd)
+            .into_iter()
+            .map(|child| (child, true))
+            .collect();
         let mut controls = Vec::new();
-        while let Some(control) = pending.pop_front() {
-            pending.extend(by_parent(control.hwnd));
+        while let Some((control, shown)) = pending.pop_front() {
+            let shown = shown && control.visible();
+            pending.extend(
+                by_parent(control.hwnd)
+                    .into_iter()
+                    .map(|child| (child, shown)),
+            );
             let parent = all.iter().find(|info| info.hwnd == control.parent);
             let (x, y) = parent.map_or((0, 0), |parent| parent.origin);
             controls.push(DialogControl {
@@ -317,7 +369,7 @@ pub fn dialogs(ext: &Ext) -> DialogSet {
                     right: control.rect.right - x,
                     bottom: control.rect.bottom - y,
                 },
-                visible: control.visible(),
+                visible: shown,
                 enabled: control.enabled(),
                 check: control.check & 3,
                 items: control.items.clone(),
@@ -325,7 +377,8 @@ pub fn dialogs(ext: &Ext) -> DialogSet {
                 range: control.range,
                 value: control.value,
                 font: font(control),
-                supported: projectable(control),
+                kind: control.kind(),
+                image: control.image.clone(),
             });
         }
         let owner = all.iter().find(|info| info.hwnd == dialog.owner);
@@ -385,18 +438,22 @@ fn target(dialog: u32, info: &Info) -> DialogTarget {
     }
 }
 
-fn projectable(info: &Info) -> bool {
-    // Multiple selection and owner-drawn lists without strings stay guest-only.
-    let list =
-        info.style & (0x8 | 0x800) == 0 && (info.style & 0x30 == 0 || info.style & 0x40 != 0);
-    supported(&info.class, info.style, list)
-}
-
 fn is_dialog<'a>(info: &Info, children: &impl Fn(u32) -> Vec<&'a Info>) -> bool {
     if !info.top_level() || !info.visible() {
         return false;
     }
     if info.is("#32770") {
+        // A dialog shows natively only whole: one control the host cannot
+        // show leaves the dialog to its own painting, as a plane.
+        let mut pending = children(info.hwnd);
+        while let Some(child) = pending.pop() {
+            if child.visible() {
+                if child.kind() == ControlKind::Unavailable {
+                    return false;
+                }
+                pending.extend(children(child.hwnd));
+            }
+        }
         return true;
     }
     // A custom top-level window built only from standard controls, with a
@@ -404,7 +461,9 @@ fn is_dialog<'a>(info: &Info, children: &impl Fn(u32) -> Vec<&'a Info>) -> bool 
     // startup prompts this way. A game canvas has no such children.
     let children = children(info.hwnd);
     !children.is_empty()
-        && children.iter().all(|child| projectable(child))
+        && children
+            .iter()
+            .all(|child| child.kind() != ControlKind::Unavailable)
         && children
             .iter()
             .any(|child| child.is("Button") && child.style & 0xf <= 1)
@@ -576,6 +635,8 @@ enum Message {
     Post(u32, u32, u32, u32),
     Send(u32, u32, u32, u32),
     SetText(u32, String),
+    /// Selects and focuses a list view's item, which notifies its parent.
+    SelectItem(u32, u32),
     Focus(u32),
 }
 
@@ -616,6 +677,23 @@ fn send(env: &mut Env<'_>, mut messages: VecDeque<Message>, done: Done) -> Outco
             (
                 "SendMessageW",
                 vec![hwnd, WM_SETTEXT, 0, buffer],
+                Some(buffer),
+            )
+        }
+        Message::SelectItem(hwnd, item) => {
+            let buffer = match env.sys.vm.alloc(env.cpu, LVITEM, Prot::RW) {
+                Ok(buffer) => buffer,
+                Err(error) => return Outcome::Fail(format!("{MODULE}: {error}")),
+            };
+            // LVIF_STATE: LVIS_FOCUSED | LVIS_SELECTED in both state and mask.
+            if let Err(error) = crate::write_words(env, buffer, &[8, item, 0, 3, 3, 0, 0, 0, 0, 0])
+            {
+                return Outcome::Fail(error);
+            }
+            messages.push_front(Message::Send(hwnd, LVM_ENSUREVISIBLE, item, 0));
+            (
+                "SendMessageW",
+                vec![hwnd, LVM_SETITEMSTATE, item, buffer],
                 Some(buffer),
             )
         }
@@ -676,6 +754,8 @@ pub fn dialog_event(ext: &mut Ext, event: DialogEvent) -> bool {
                     ));
                 }
                 messages
+            } else if control.class.eq_ignore_ascii_case("SysListView32") {
+                vec![Message::SelectItem(target.hwnd, *index as u32)]
             } else if control.class.eq_ignore_ascii_case("ComboBox") {
                 vec![
                     Message::Send(target.hwnd, CB_SETCURSEL, *index as u32, 0),
@@ -947,7 +1027,7 @@ pub fn restore(ext: &mut Ext) -> bool {
 }
 
 fn user32(env: &Env<'_>, name: &str) -> Result<u32, String> {
-    let dll = if name == "GetObjectW" {
+    let dll = if matches!(name, "GetObjectW" | "GetDIBits") {
         "gdi32.dll"
     } else {
         "user32.dll"
@@ -1131,6 +1211,8 @@ fn state(env: &mut Env<'_>, context: CtxId, part: Part, buffer: u32, done: Done)
         Max,
         Font,
         Menu,
+        Bitmap,
+        Length,
     }
     let mut asks = Vec::new();
     let mut list = Vec::new();
@@ -1155,6 +1237,28 @@ fn state(env: &mut Env<'_>, context: CtxId, part: Part, buffer: u32, done: Done)
             for message in [TBM_GETPOS, TBM_GETRANGEMIN, TBM_GETRANGEMAX] {
                 list.push(("SendMessageW", vec![hwnd, message, 0, 0]));
             }
+        }
+        if info.is("msctls_progress32") {
+            asks.extend([(index, Ask::Position), (index, Ask::Min), (index, Ask::Max)]);
+            list.extend([
+                ("SendMessageW", vec![hwnd, PBM_GETPOS, 0, 0]),
+                ("SendMessageW", vec![hwnd, PBM_GETRANGE, 1, 0]),
+                ("SendMessageW", vec![hwnd, PBM_GETRANGE, 0, 0]),
+            ]);
+        }
+        if info.list_view() {
+            asks.extend([(index, Ask::Count), (index, Ask::Selection)]);
+            list.push(("SendMessageW", vec![hwnd, LVM_GETITEMCOUNT, 0, 0]));
+            // The first selected item: LVNI_SELECTED from the start.
+            list.push(("SendMessageW", vec![hwnd, LVM_GETNEXTITEM, u32::MAX, 2]));
+        }
+        if info.picture() {
+            asks.push((index, Ask::Bitmap));
+            list.push(("SendMessageW", vec![hwnd, STM_GETIMAGE, 0, 0]));
+        }
+        if info.long_text() {
+            asks.push((index, Ask::Length));
+            list.push(("SendMessageW", vec![hwnd, WM_GETTEXTLENGTH, 0, 0]));
         }
         if info.font != 0 {
             let at = buffer + STRIDE * index as u32 + FONT_AT;
@@ -1203,6 +1307,8 @@ fn state(env: &mut Env<'_>, context: CtxId, part: Part, buffer: u32, done: Done)
                     count: result.min(ITEMS),
                 }),
                 Ask::Menu => {}
+                Ask::Bitmap => info.bitmap = result,
+                Ask::Length => info.length = result.min(LONG_TEXT - 1),
             }
         }
         let _ = env.sys.vm.free(env.cpu, buffer);
@@ -1219,7 +1325,8 @@ struct Level {
     count: u32,
 }
 
-/// List items: their lengths, then the ones that fit.
+/// List items: their lengths, then the ones that fit; a list view's items
+/// are read at most [`TEXT`] long.
 fn items(env: &mut Env<'_>, context: CtxId, part: Part, menus: Vec<Level>, done: Done) -> Outcome {
     let lists: Vec<(usize, u32, u32)> = part
         .windows
@@ -1242,35 +1349,226 @@ fn items(env: &mut Env<'_>, context: CtxId, part: Part, menus: Vec<Level>, done:
         })
         .collect();
     calls(env, list, move |env, lengths| {
-        let fits: Vec<(usize, u32)> = lists
+        let mut fits: Vec<(usize, u32)> = lists
             .iter()
             .zip(lengths)
             .filter(|&(_, length)| (length as i32) >= 0 && length < TEXT)
             .map(|(&(index, item, _), _)| (index, item))
             .collect();
+        let boxes = fits.len();
+        for (index, info) in part.windows.iter().enumerate() {
+            if info.list_view() {
+                fits.extend((0..info.count).map(|item| (index, item)));
+            }
+        }
+        const SLOT: u32 = 2 * TEXT + LVITEM;
         let buffer = match env
             .sys
             .vm
-            .alloc(env.cpu, 2 * TEXT * fits.len().max(1) as u32, Prot::RW)
+            .alloc(env.cpu, SLOT * fits.len().max(1) as u32, Prot::RW)
         {
             Ok(buffer) => buffer,
             Err(error) => return Outcome::Fail(format!("{MODULE}: {error}")),
         };
-        let list = fits
-            .iter()
-            .enumerate()
-            .map(|(slot, &(index, item))| {
-                let info = &part.windows[index];
+        let mut list = Vec::with_capacity(fits.len());
+        for (slot, &(index, item)) in fits.iter().enumerate() {
+            let info = &part.windows[index];
+            let at = buffer + SLOT * slot as u32;
+            if slot < boxes {
                 let (_, _, text) = info.list().unwrap();
-                let at = buffer + 2 * TEXT * slot as u32;
-                ("SendMessageW", vec![info.hwnd, text, item, at])
-            })
-            .collect();
+                list.push(("SendMessageW", vec![info.hwnd, text, item, at]));
+            } else {
+                // LVIF_TEXT of the item's first column, into the slot.
+                let item_at = at + 2 * TEXT;
+                if let Err(error) = crate::write_words(env, item_at, &[1, item, 0, 0, 0, at, TEXT])
+                {
+                    return Outcome::Fail(error);
+                }
+                list.push((
+                    "SendMessageW",
+                    vec![info.hwnd, LVM_GETITEMTEXTW, item, item_at],
+                ));
+            }
+        }
         calls(env, list, move |env, _| {
             let mut part = part;
             for (slot, &(index, _)) in fits.iter().enumerate() {
-                let text = wide(env, buffer + 2 * TEXT * slot as u32, TEXT);
+                let text = wide(env, buffer + SLOT * slot as u32, TEXT);
                 part.windows[index].items.push(text);
+            }
+            let _ = env.sys.vm.free(env.cpu, buffer);
+            extras(env, context, part, menus, done)
+        })
+    })
+}
+
+/// Long texts read whole, and pictures not seen before: their sizes, then
+/// their pixels.
+fn extras(env: &mut Env<'_>, context: CtxId, part: Part, menus: Vec<Level>, done: Done) -> Outcome {
+    let known = &projection(env.ext).images;
+    let mut part = part;
+    let mut pictures = Vec::new();
+    for (index, info) in part.windows.iter_mut().enumerate() {
+        if info.bitmap == 0 {
+            continue;
+        }
+        match known.get(&info.bitmap) {
+            Some(image) => info.image = Some(image.clone()),
+            None => pictures.push(index),
+        }
+    }
+    let texts: Vec<usize> = part
+        .windows
+        .iter()
+        .enumerate()
+        .filter(|(_, info)| info.length >= TEXT - 1)
+        .map(|(index, _)| index)
+        .collect();
+    if texts.is_empty() && pictures.is_empty() {
+        return menu(env, context, part, menus, 0, done);
+    }
+    // Texts, then a BITMAP (24 bytes) per picture.
+    let sizes: Vec<u32> = texts
+        .iter()
+        .map(|&index| 2 * (part.windows[index].length + 1))
+        .chain(pictures.iter().map(|_| 24))
+        .collect();
+    let buffer = match env
+        .sys
+        .vm
+        .alloc(env.cpu, sizes.iter().sum::<u32>(), Prot::RW)
+    {
+        Ok(buffer) => buffer,
+        Err(error) => return Outcome::Fail(format!("{MODULE}: {error}")),
+    };
+    let offsets: Vec<u32> = sizes
+        .iter()
+        .scan(buffer, |at, size| {
+            let here = *at;
+            *at += size;
+            Some(here)
+        })
+        .collect();
+    let mut list = Vec::new();
+    for (slot, &index) in texts.iter().enumerate() {
+        let info = &part.windows[index];
+        list.push((
+            "SendMessageW",
+            vec![info.hwnd, WM_GETTEXT, info.length + 1, offsets[slot]],
+        ));
+    }
+    for (slot, &index) in pictures.iter().enumerate() {
+        let at = offsets[texts.len() + slot];
+        list.push(("GetObjectW", vec![part.windows[index].bitmap, 24, at]));
+    }
+    calls(env, list, move |env, copied| {
+        for (slot, &index) in texts.iter().enumerate() {
+            let info = &mut part.windows[index];
+            if copied[slot] != 0 {
+                info.text = wide(env, offsets[slot], info.length + 1);
+            }
+        }
+        let sizes: Vec<(usize, u32, u32)> = pictures
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, &index)| {
+                let [_, width, height] = words::<3>(env, offsets[texts.len() + slot]);
+                let side = 1..=IMAGE_SIDE as i32;
+                (side.contains(&width) && side.contains(&height.abs()))
+                    .then(|| (index, width as u32, height.unsigned_abs()))
+            })
+            .collect();
+        let _ = env.sys.vm.free(env.cpu, buffer);
+        pixels(env, context, part, menus, sizes, done)
+    })
+}
+
+/// Each picture's pixels as top-down 32-bit BGRA through `GetDIBits`.
+fn pixels(
+    env: &mut Env<'_>,
+    context: CtxId,
+    part: Part,
+    menus: Vec<Level>,
+    sizes: Vec<(usize, u32, u32)>,
+    done: Done,
+) -> Outcome {
+    if sizes.is_empty() {
+        return menu(env, context, part, menus, 0, done);
+    }
+    // A BITMAPINFOHEADER with room for masks, then the pixels.
+    const HEADER: u32 = 64;
+    let lengths: Vec<u32> = sizes.iter().map(|&(_, w, h)| HEADER + 4 * w * h).collect();
+    let buffer = match env
+        .sys
+        .vm
+        .alloc(env.cpu, lengths.iter().sum::<u32>(), Prot::RW)
+    {
+        Ok(buffer) => buffer,
+        Err(error) => return Outcome::Fail(format!("{MODULE}: {error}")),
+    };
+    let list = vec![("GetDC", vec![0])];
+    let mut at = buffer;
+    let mut slots = Vec::with_capacity(sizes.len());
+    for (&(index, width, height), length) in sizes.iter().zip(&lengths) {
+        let mut header = [0; HEADER as usize / 4];
+        header[..4].copy_from_slice(&[
+            40,
+            width,
+            (height as i32).wrapping_neg() as u32,
+            1 | 32 << 16,
+        ]);
+        if let Err(error) = crate::write_words(env, at, &header) {
+            return Outcome::Fail(error);
+        }
+        slots.push((index, width, height, at));
+        at += length;
+    }
+    calls(env, list, move |env, results| {
+        let dc = results[0];
+        let list = slots
+            .iter()
+            .map(|&(index, _, height, at)| {
+                (
+                    "GetDIBits",
+                    vec![
+                        dc,
+                        part.windows[index].bitmap,
+                        0,
+                        height,
+                        at + HEADER,
+                        at,
+                        0,
+                    ],
+                )
+            })
+            .chain([("ReleaseDC", vec![0, dc])])
+            .collect();
+        calls(env, list, move |env, lines| {
+            let mut part = part;
+            for (&(index, width, height, at), lines) in slots.iter().zip(lines) {
+                if lines != height {
+                    continue;
+                }
+                let mut bgra = vec![0; (4 * width * height) as usize];
+                if env.cpu.read(at + HEADER, &mut bgra).is_err() {
+                    continue;
+                }
+                for pixel in bgra.as_chunks_mut::<4>().0 {
+                    pixel[3] = 255;
+                }
+                let info = &mut part.windows[index];
+                let image = Arc::new(DialogImage {
+                    width,
+                    height,
+                    bgra,
+                });
+                let images = &mut projection(env.ext).images;
+                // Bitmaps are few and outlive their statics rarely.
+                if images.len() >= 64 {
+                    images.clear();
+                }
+                images.insert(info.bitmap, image.clone());
+                info.image = Some(image);
             }
             let _ = env.sys.vm.free(env.cpu, buffer);
             menu(env, context, part, menus, 0, done)

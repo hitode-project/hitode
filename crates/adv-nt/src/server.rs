@@ -999,6 +999,34 @@ impl Connection {
             first,
         ))
     }
+
+    /// Sends one server request on a standalone connection outside a guest machine.
+    pub fn request<R: Request>(
+        &mut self,
+        progress: &mut dyn Progress,
+        time: Time,
+        request: &mut R,
+        data: &[&[u8]],
+        reply_data: &mut [u8],
+    ) -> Result<(R::Reply, usize), Error> {
+        crate::registry::invalidate_request(R::NUMBER);
+        self.channel.call(progress, time, request, data, reply_data)
+    }
+
+    /// Closes a handle on a standalone connection.
+    pub fn close(
+        &mut self,
+        progress: &mut dyn Progress,
+        time: Time,
+        handle: u32,
+    ) -> Result<(), Error> {
+        let mut request = crate::protocol::CloseHandleRequest {
+            handle,
+            ..Default::default()
+        };
+        let _ = self.request(progress, time, &mut request, &[], &mut [])?;
+        Ok(())
+    }
 }
 
 impl Channel {

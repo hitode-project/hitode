@@ -44,7 +44,7 @@ fn native_winmm_callbacks_sounds_and_forwarding() {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &game.join("winmm_native.exe"),
+        exe: Some(&game.join("winmm_native.exe")),
         width: 64,
         height: 32,
         jit: true,

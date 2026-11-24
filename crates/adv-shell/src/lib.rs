@@ -11,6 +11,8 @@ mod heap;
 #[cfg(host_view)]
 pub use adv_runtime::system_font_families;
 #[cfg(host_view)]
+pub use adv_runtime::wine::session::RegistryReport;
+#[cfg(host_view)]
 pub use execution::Execution;
 pub use heap::CountingAllocator;
 #[cfg(host_view)]
@@ -52,15 +54,124 @@ pub use session::Session;
 pub struct Finished {
     pub exit_code: u8,
     pub summary: adv_report::RunSummary,
+    /// What a script wrote to the registry (WINE-SES-11).
+    pub registry: Option<adv_runtime::wine::session::RegistryReport>,
+}
+
+/// A program's console, piped to the host: what it reads, and where its
+/// output and errors go.
+#[derive(Debug)]
+pub struct Console {
+    pub input: std::os::fd::OwnedFd,
+    pub output: std::os::fd::OwnedFd,
+}
+
+/// The host's side of a piped [`Console`]: lines it sends, in the program's
+/// code page.
+pub struct ConsoleInput {
+    writer: std::io::PipeWriter,
+    codepage: u32,
+}
+
+impl Console {
+    /// A console in `codepage`. `on_output` receives everything the program
+    /// wrote so far, decoded, its oldest lines dropped past 64 KiB.
+    pub fn piped(
+        codepage: u32,
+        on_output: impl Fn(String) + Send + 'static,
+    ) -> std::io::Result<(Self, ConsoleInput)> {
+        use std::io::Read;
+        const KEPT: usize = 64 * 1024;
+        let (mut reader, output) = std::io::pipe()?;
+        let (input, writer) = std::io::pipe()?;
+        std::thread::Builder::new()
+            .name("console".into())
+            .spawn(move || {
+                let codec = adv_os::nls::Codec::new(codepage);
+                let mut text = Vec::new();
+                let mut chunk = [0; 4096];
+                while let Ok(count @ 1..) = reader.read(&mut chunk) {
+                    text.extend_from_slice(&chunk[..count]);
+                    if text.len() > KEPT {
+                        let cut = text.len() - KEPT;
+                        let line = text[cut..]
+                            .iter()
+                            .position(|&b| b == b'\n')
+                            .map_or(cut, |at| cut + at + 1);
+                        text.drain(..line);
+                    }
+                    on_output(String::from_utf16_lossy(&codec.to_utf16(codepage, &text)));
+                }
+            })?;
+        Ok((
+            Self {
+                input: input.into(),
+                output: output.into(),
+            },
+            ConsoleInput { writer, codepage },
+        ))
+    }
+}
+
+impl ConsoleInput {
+    /// Sends `line` and the end of a line, as Enter does.
+    pub fn line(&mut self, line: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let units: Vec<u16> = line.encode_utf16().chain([13, 10]).collect();
+        let bytes = adv_os::nls::Codec::new(self.codepage)
+            .from_utf16(self.codepage, &units)
+            .0;
+        self.writer.write_all(&bytes)
+    }
 }
 
 use adv_runtime::{CompileStrategy, Engine, EngineOptions, Snapshot};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub use adv_runtime::disc::Disc;
+
 /// The ANSI code page `--codepage auto` would pick for this executable.
 pub fn detect_codepage(exe: &Path) -> std::io::Result<u32> {
     adv_runtime::codepage::detect_file(exe)
+}
+
+/// A program started instead of the game, on the game's drives and prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Program {
+    /// A DOS path such as `D:\SETUP.EXE`, or a host file. // privacy: allow authored guest path
+    pub image: ProgramImage,
+    /// The command line after the program's path.
+    pub arguments: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProgramImage {
+    Guest(String),
+    Host(PathBuf),
+}
+
+impl ProgramImage {
+    /// A path with a drive letter and a backslash is the guest's; anything
+    /// else names a host file.
+    pub fn parse(path: &str) -> Self {
+        let bytes = path.as_bytes();
+        if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":\\" {
+            Self::Guest(path.to_owned())
+        } else {
+            Self::Host(PathBuf::from(path))
+        }
+    }
+
+    fn stem(&self) -> std::ffi::OsString {
+        match self {
+            Self::Guest(path) => {
+                let name = path.rsplit('\\').next().unwrap_or(path);
+                name.rsplit_once('.').map_or(name, |(stem, _)| stem).into()
+            }
+            Self::Host(path) => path.file_stem().unwrap_or_default().to_owned(),
+        }
+    }
 }
 
 pub struct Options {
@@ -69,7 +180,12 @@ pub struct Options {
     pub font_smoothing: Option<bool>,
     row_workers: Option<usize>,
     row_batching: bool,
-    exe: PathBuf,
+    /// The game; none when only a program such as a disc's setup runs.
+    exe: Option<PathBuf>,
+    /// Started instead of the game.
+    pub program: Option<Program>,
+    /// The program's console; none leaves its standard handles empty.
+    pub console: Option<Console>,
     data_dir: PathBuf,
     no_code_cache: bool,
     pub cdroms: Vec<(char, PathBuf)>,
@@ -277,6 +393,9 @@ impl Options {
 
 const HELP: &str = "adv-run <EXE> [options]\n\
   --exe PATH              guest executable (also accepted positionally)\n\
+  --program PATH          start PATH instead, on the EXE's drives: a DOS path on a\n\
+                          --cdrom disc, or a host file; the EXE may then be left out\n\
+  --arguments TEXT        the program's command line after its path\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
   --row-workers N         additional row helpers, 0 runs batches inline (default: up to 3)\n\
   --no-row-batching       disable proven row batches for comparison\n\
@@ -321,6 +440,24 @@ All guest code, including DLLs and callbacks, executes inside the guest CPU.";
 impl Options {
     /// CLI defaults with a data directory supplied by the host.
     pub fn new(exe: PathBuf, data_dir: PathBuf) -> Self {
+        Self::with(Some(exe), data_dir)
+    }
+
+    /// Defaults for `program` started on its own, as a disc's setup.
+    pub fn program(program: Program, data_dir: PathBuf) -> Self {
+        Self {
+            program: Some(program),
+            ..Self::with(None, data_dir)
+        }
+    }
+
+    /// Starts `program` alone instead of the game, keeping its settings.
+    pub fn run_alone(&mut self, program: Program) {
+        self.exe = None;
+        self.program = Some(program);
+    }
+
+    fn with(exe: Option<PathBuf>, data_dir: PathBuf) -> Self {
         Self {
             font_families: std::collections::BTreeMap::new(),
             font_files: Vec::new(),
@@ -328,6 +465,8 @@ impl Options {
             row_workers: None,
             row_batching: true,
             exe,
+            program: None,
+            console: None,
             data_dir,
             no_code_cache: false,
             cdroms: Vec::new(),
@@ -369,6 +508,38 @@ impl Options {
         }
     }
 
+    /// What runs, for titles and reports: the game, else the program.
+    pub(crate) fn started(&self) -> String {
+        match (
+            &self.exe,
+            self.program.as_ref().map(|program| &program.image),
+        ) {
+            (Some(exe), _) => exe.display().to_string(),
+            (None, Some(ProgramImage::Host(path))) => path.display().to_string(),
+            (None, Some(ProgramImage::Guest(path))) => path.clone(),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// The code page `--codepage auto` picks: the game's, else the program's,
+    /// read from its disc when it lies on one.
+    fn detect_codepage(&self) -> std::io::Result<u32> {
+        if let Some(exe) = &self.exe {
+            return detect_codepage(exe);
+        }
+        match self.program.as_ref().map(|program| &program.image) {
+            Some(ProgramImage::Host(path)) => detect_codepage(path),
+            Some(ProgramImage::Guest(path)) => {
+                let letter = path.as_bytes()[0].to_ascii_uppercase() as char;
+                match self.cdroms.iter().find(|(drive, _)| *drive == letter) {
+                    Some((_, image)) => Disc::open(image, letter)?.codepage(path),
+                    None => Ok(adv_runtime::codepage::detect(path, &[])),
+                }
+            }
+            None => Err(std::io::ErrorKind::InvalidInput.into()),
+        }
+    }
+
     fn parse() -> Result<Option<Self>, String> {
         Self::parse_args(std::env::args().skip(1))
     }
@@ -376,7 +547,8 @@ impl Options {
     fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
         let mut exe = None;
         let mut data_dir = None;
-        let mut options = Self::new(PathBuf::new(), PathBuf::new());
+        let mut arguments = None;
+        let mut options = Self::with(None, PathBuf::new());
         while let Some(arg) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{arg} requires a value"));
             match arg.as_str() {
@@ -385,6 +557,13 @@ impl Options {
                     return Ok(None);
                 }
                 "--exe" => exe = Some(PathBuf::from(value()?)),
+                "--program" => {
+                    options.program = Some(Program {
+                        image: ProgramImage::parse(&value()?),
+                        arguments: String::new(),
+                    })
+                }
+                "--arguments" => arguments = Some(value()?),
                 "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
                 "--no-code-cache" => options.no_code_cache = true,
                 "--cdrom" => {
@@ -486,7 +665,17 @@ impl Options {
                 _ => return Err(format!("unexpected argument: {arg}")),
             }
         }
-        options.exe = exe.ok_or_else(|| format!("an EXE path is required\n{HELP}"))?;
+        if exe.is_none() && options.program.is_none() {
+            return Err(format!("an EXE path or --program is required\n{HELP}"));
+        }
+        options.exe = exe;
+        if let Some(arguments) = arguments {
+            options
+                .program
+                .as_mut()
+                .ok_or("--arguments requires --program")?
+                .arguments = arguments;
+        }
         #[cfg(not(any(host_view, feature = "gpu")))]
         if options.headless_gpu || options.d3d9_sm3 || options.d3d9_shader_cache.is_some() {
             return Err("D3D9 shader capability switches require the gpu feature".into());
@@ -495,7 +684,12 @@ impl Options {
             return Err("--headless-gpu requires --headless".into());
         }
         options.data_dir = data_dir.unwrap_or_else(|| {
-            PathBuf::from("target/adv-data").join(options.exe.file_stem().unwrap_or_default())
+            let stem = match (&options.exe, &options.program) {
+                (Some(exe), _) => exe.file_stem().unwrap_or_default().to_owned(),
+                (None, Some(program)) => program.image.stem(),
+                (None, None) => unreachable!("checked above"),
+            };
+            PathBuf::from("target/adv-data").join(stem)
         });
         if options.width == 0
             || options.height == 0
@@ -547,7 +741,7 @@ fn debug_info(options: &Options, windowed: bool) -> String {
         cfg!(feature = "media"),
         cfg!(any(host_view, feature = "gpu")),
         windowed,
-        options.exe.display(),
+        options.started(),
         options.data_dir.display(),
         debug::unix_us()
     )
@@ -1110,4 +1304,37 @@ fn configure_execution_thread() -> String {
         "{{\"requested_qos\": \"user_interactive\", \"applied\": {}, \"set_errno\": {error}}}",
         error == 0
     )
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::Console;
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // spec: WINE-SES-11
+    #[test]
+    fn a_piped_console_speaks_the_programs_code_page() {
+        let (shown, seen) = mpsc::channel();
+        let (console, mut input) = Console::piped(936, move |text| {
+            let _ = shown.send(text);
+        })
+        .unwrap();
+        let mut output = std::fs::File::from(console.output);
+        // "名字" in code page 936, split inside a character.
+        output.write_all(b"\xc3\xfb").unwrap();
+        output.write_all(b"\xd7\xd6: ").unwrap();
+        let mut text = String::new();
+        while text != "名字: " {
+            text = seen.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        input.line("测试").unwrap();
+        drop(input);
+        let mut read = Vec::new();
+        std::fs::File::from(console.input)
+            .read_to_end(&mut read)
+            .unwrap();
+        assert_eq!(read, b"\xb2\xe2\xca\xd4\r\n");
+    }
 }

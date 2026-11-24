@@ -279,8 +279,22 @@ pub async fn start_game(
         .unwrap()
         .launch(&id)
         .map_err(|e| e.to_string())?;
-    let options = playback
-        .prepare(window.app_handle(), exe, data_dir, codepage)
+    let installation = window
+        .state::<Mutex<Library>>()
+        .lock()
+        .unwrap()
+        .installation(&id)
+        .map_err(|e| e.to_string())?;
+    let script = playback.script();
+    let (options, console) = playback
+        .prepare(
+            window.app_handle(),
+            &id,
+            exe,
+            data_dir,
+            codepage,
+            installation,
+        )
         .await?;
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let host_window = window.clone();
@@ -292,7 +306,8 @@ pub async fn start_game(
                     return Err("a game is already running".into());
                 }
                 let view = GameView::new(640, 480)?;
-                host.container.set_game(Some(&view));
+                // A script runs behind the run page until it shows something.
+                host.container.set_game(Some(&view), !script);
                 let damage_id = id.clone();
                 let finished_window = host_window.clone();
                 let started_at = Instant::now();
@@ -305,14 +320,13 @@ pub async fn start_game(
                             let host = host.as_mut().unwrap();
                             host.session.take();
                             host.game_id = None;
-                            host.container.set_game(None);
+                            host.container.set_game(None, false);
                             host.focus(Target::Overlay);
                             host.asked = None;
                             host.exit.take()
                         });
                         crate::gamepad::on_pause_or_stop();
-                        let elapsed = started_at.elapsed();
-                        crate::play::finished(&finished_window, id, result, elapsed);
+                        crate::play::finished(&finished_window, id, result, started_at);
                         if let Some(code) = exit {
                             finished_window.app_handle().exit(code);
                         }
@@ -339,6 +353,22 @@ pub async fn start_game(
                         session.observe_damage(move |ratios| {
                             let _ = damage_window.emit("game_damage_ratios", (&damage_id, ratios));
                         });
+                        if script {
+                            let shown_window = host_window.clone();
+                            let shown_id = damage_id_for_host.clone();
+                            session.observe_shown(move || {
+                                crate::play::shown(&shown_window, &shown_id);
+                                // Not inside the frontend tick that called this.
+                                let _ = shown_window.run_on_main_thread(|| {
+                                    HOST.with_borrow(|host| {
+                                        if let Some(host) = host {
+                                            host.container.show_game();
+                                        }
+                                    });
+                                });
+                            });
+                        }
+                        crate::play::started(console);
                         host.session = Some(session);
                         host.game_id = Some(damage_id_for_host);
                         host.playback = Some(playback);
@@ -359,7 +389,7 @@ pub async fn start_game(
                         Ok(())
                     }
                     Err(error) => {
-                        host.container.set_game(None);
+                        host.container.set_game(None, false);
                         host.focus(Target::Overlay);
                         Err(error)
                     }
@@ -477,6 +507,33 @@ pub async fn set_game_filter(window: WebviewWindow, filter: String) -> Result<()
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// Puts another of the game's disc images in drive `letter` while it runs.
+#[tauri::command]
+pub async fn change_disc(
+    window: WebviewWindow,
+    letter: char,
+    path: std::path::PathBuf,
+) -> Result<(), String> {
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    window
+        .run_on_main_thread(move || {
+            let done = HOST.with_borrow(|host| {
+                host.as_ref()
+                    .and_then(|host| host.session.as_ref())
+                    .map(|session| session.change_disc(letter, path))
+                    .ok_or_else(|| "no game is running".to_string())
+            });
+            let _ = reply.send(done);
+        })
+        .map_err(|error| error.to_string())?;
+    let changed = tauri::async_runtime::spawn_blocking(move || {
+        result.recv().map_err(|error| error.to_string())?
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    crate::play::disc_changed(changed).await
 }
 
 pub fn window_event(window: &tauri::Window, event: &tauri::WindowEvent) {

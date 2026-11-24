@@ -32,6 +32,8 @@ export interface Game {
   /** Run summary of the last run, kept across restarts; null if none was recorded. */
   lastSummary: RunSummary | null;
   sessions30: number;
+  /** Until its setup has run: the setup program on its disc. */
+  setup?: string | null;
 }
 
 export type LibraryFilter = "all" | "recent" | "favorite" | "unstarted";

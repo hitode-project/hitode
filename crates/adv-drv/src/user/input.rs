@@ -237,7 +237,12 @@ pub(super) fn schedule(ext: &mut Ext, hwnd: u32, job: Job) -> bool {
 }
 
 fn push(ext: &mut Ext, context: CtxId, event: Event) -> Result<(), String> {
-    let Some(queue) = ext.get_mut::<Queues>().0.get_mut(&context) else {
+    // A thread that has not looked at its queue yet has none, even when no
+    // thread of the process has.
+    let Some(queue) = ext
+        .try_get_mut::<Queues>()
+        .and_then(|queues| queues.0.get_mut(&context))
+    else {
         return Err(format!("{MODULE}: context {context} has no queue"));
     };
     // One byte marks a nonempty queue. Neither end can block: writes only
@@ -510,5 +515,24 @@ mod tests {
         let events = &ext.get::<Queues>().0[&1].events;
         assert!(matches!(events.front(), Some(Event::Job(_))));
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn a_window_whose_thread_has_no_queue_yet_takes_no_job() {
+        use crate::user::{Window, Windows, project};
+
+        // A new process's first window, before any of its threads asked for
+        // a message: the host's refresh waits for the queue.
+        let mut ext = Ext::default();
+        ext.get_or_default::<Windows>().0.insert(
+            2,
+            Window {
+                context: 1,
+                visible: true,
+                ..Default::default()
+            },
+        );
+        assert!(!schedule(&mut ext, 2, Box::new(|_, _| unreachable!())));
+        assert!(!project::refresh(&mut ext));
     }
 }

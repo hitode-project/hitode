@@ -48,7 +48,7 @@ fn wine_peek_and_time_loop_idles_and_notifications_wake_it() {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &probes.join("quiet_poll.exe"),
+        exe: Some(&probes.join("quiet_poll.exe")),
         width: 640,
         height: 480,
         jit: true,

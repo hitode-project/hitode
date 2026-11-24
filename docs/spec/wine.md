@@ -3,10 +3,8 @@
 ID prefix: WINE
 ID prefix: SRV
 ID prefix: NT
-ID prefix: NAT
-ID prefix: CODEC
 
-This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server inside the host process. `adv-nt` takes the place of Wine's `ntdll.so` under Wine's own Windows DLLs. `adv-unix` runs Wine's other Unix libraries, such as `win32u.so`, as guest code. [README.md](README.md) explains the format.
+This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server inside the host process. `adv-nt` takes the place of Wine's `ntdll.so` under Wine's own Windows DLLs. `adv-unix` runs Wine's other Unix libraries, such as `win32u.so`, as guest code. [README.md](README.md) explains the format. Native bodies and static codec kernels are in [wine-native.md](wine-native.md).
 
 ## Sources
 
@@ -208,6 +206,13 @@ Listed names include every name the host may fold to an ASCII one. Directories
 over 65536 names, or unreadable ones, keep host lookups. File writes and
 metadata changes leave listings intact. Lookups remember a drive by its link, so
 relinking the game drive for the next session ends them.
+
+### WINE-SYS-16 Heap blocks shrink in place
+
+**Rule**: A heap reallocation that does not grow a block MUST return the same block, as Windows 7 did. This includes blocks the low-fragmentation heap serves.
+**Verification**: Test
+
+> Note: Windows 10's low-fragmentation heap moves a block shrunk into another size class. Engines of the Windows 7 era keep using the pointer they shrank, and crash there.
 
 ### NT-SOCK-1 Wine socket I/O
 
@@ -418,131 +423,6 @@ The pinned Wine source carries both through `tools/wine/patches`.
 **Rule**: The clocks in KUSER_SHARED_DATA MUST be refreshed as each system call enters and before each context runs. A guest that polls the page without a system call MUST see time pass.
 **Verification**: Test
 
-## Native bodies
-
-`adv-nt::identity` matches mapped distribution images and functions against code identity tables.
-`adv-nt::native` binds bodies to the confirmed functions.
-
-### NAT-ID-1 Code identity
-
-**Rule**: A code identity table MUST describe a mapped image only when the hash of the image's headers equals the table's. A function MUST be bound to a native body only when its bytes, with base relocations masked, hash to the table's value. Native bodies MUST find Wine data by the symbol names the table lists, never by pinned addresses.
-**Verification**: Test
-
-A family of bodies whose data symbols the table lacks keeps Wine's code.
-
-### NAT-ID-2 Unix code identity
-
-**Rule**: Unix i386 ELF identity tables MUST include local function symbols and mask dwords patched by dynamic relocations. Unix modules MUST bind bodies only after relocation, with matching ELF headers, program headers, and function bytes. A declined PIC entry call MUST preserve its original return address.
-**Verification**: Test
-
-### NAT-BODY-1 Body semantics
-
-**Rule**: A body bound to a Windows API MUST leave the state the function leaves on Windows, including results, output bytes, errors and the last-error value. Other bodies MUST leave the state their bound guest code leaves. Registers and flags the calling convention does not keep are exempt.
-**Verification**: Test
-
-Windows behavior is measured on Windows 11 with the ACP and locale under test.
-
-Required host text services follow WINE-UNIX-6 in interpreted and translated execution.
-
-### NAT-BODY-2 Performance counter body
-
-**Rule**: Bodies of `kernelbase.dll!QueryPerformanceCounter`, `ntdll.dll!RtlQueryPerformanceCounter` and `ntdll.dll!NtQueryPerformanceCounter` MUST use the system call's counter computation and machine clock. They MUST write the counter and return what Windows returns. Inaccessible outputs MUST produce the status or exception Windows produces.
-**Verification**: Test
-
-### NAT-BODY-3 DirectSound mixer
-
-**Rule**: The DirectSound mixer body MUST preserve Wine's float samples, scratch data, buffer positions, frequency accumulators, states, shared lock words and stopped result. It MUST cover every format, channel count, resampling ratio, 3D setting and floating-point control the function accepts. It MAY return to guest code under A64-CALL-6 only when a lock would wait or an effect object runs.
-**Verification**: Test
-
-Field offsets match the pinned module's DWARF. The mixer runs as a host-call body, so notifications use machine services.
-
-### NAT-BODY-4 DIB primitives
-
-**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic and interpolation rounding. They MUST cover every format, palette depth, brush and floating-point control their primitive accepts. Field offsets MUST match the pinned Unix module's DWARF.
-**Verification**: Test
-
-### NAT-BODY-6 CRT bodies
-
-**Rule**: Locale-independent CRT string and memory bodies MUST return the results and write the bytes the Windows CRT does, for every length and overlap. Inaccessible memory MUST follow A64-CALL-4.
-**Verification**: Test
-
-### NAT-BODY-16 Complete bodies
-
-**Rule**: A body MUST complete every call its function accepts, for all argument values, code pages, locales, formats, overlaps and floating-point controls. It MAY return to guest code only under A64-CALL-6. Faults, including division by zero, MUST raise the exception the function raises.
-**Verification**: Test
-
-### NAT-BODY-17 Body memory access
-
-**Rule**: Bodies MUST reach guest memory through one access type, which on AArch64 reads the window and class table under A64-CALL-4. Other hosts MUST give that type the same results through `Memory`. Bodies MUST read and write guest bytes in place, copying only where their function's semantics need a snapshot.
-**Verification**: Test
-
-### NAT-BODY-18 Direct and service bodies
-
-**Rule**: Hot functions that complete without waits, thread switches or guest calls MUST bind as direct bodies under A64-CALL-2. Service bodies MAY change host state, such as server objects, queues and file positions, but MUST NOT read guest registers or schedule threads. Each binding MUST declare its calling convention, argument bytes and result registers.
-**Verification**: Test
-
-| Group | Service functions |
-|---|---|
-| Time | `QueryPerformanceCounter`, `timeGetTime` |
-| Input | `GetKeyState`, `GetAsyncKeyState`, `GetKeyboardState`, `GetCursorPos` |
-| Queues | `PeekMessageA` and `PeekMessageW` finding no message, `GetQueueStatus`, `GetInputState` |
-| Objects | Waits with a zero timeout, `SetEvent`, `ResetEvent`, `ReleaseSemaphore`, `ReleaseMutex` |
-| Files | File position queries and changes, `GetFileSize`, `GetFileSizeEx` |
-
-Windows empty A/W peeks preserve last error and MSG, dispatch pending sent messages despite filters, and skip GETMESSAGE/FOREGROUNDIDLE hooks. Measured WoW64 empty peeks hand off about once per 100 calls, including PM_NOYIELD; the body requests that completed-call handoff from its owner. Driver jobs, dirty surfaces, internal messages and matching messages or timers requiring server processing retain the full path. The ANSI wrapper keeps its pending character conversion state and reaches the shared empty-peek body through NtUserPeekMessage. The full USER path advances pending server activity before Wine reads its shared queue bits. File cursors belong to server fd ownership, including inherited and duplicate handles whose clients have not admitted a descriptor.
-
-### NAT-BODY-8 D3DX pixel conversion
-
-**Rule**: D3DX pixel bodies MUST preserve channel values, filter coordinates, color keys and padding with layouts matching the pinned module's DWARF. They MUST cover every format, filter and overlap the function accepts. Changed helper code or copy imports MUST leave the function unbound.
-**Verification**: Test
-
-D3DX checks an admitted CRT entry against the exact relocated bytes saved at binding. It watches those bytes and the import slots together.
-
-### NAT-BODY-9 PNG row bodies
-
-**Rule**: PNG row bodies MUST preserve Wine's Sub, Up, Average and Paeth bytes and row metadata for every pixel depth and row overlap. Every host MUST provide each filter, scalar where no device kernel exists. Row metadata offsets MUST match the pinned module's DWARF.
-**Verification**: Test
-
-### NAT-BODY-10 Embedded zlib checksums
-
-**Rule**: Adler-32 bodies MUST preserve the pinned zlib's seeded checksum, short-input arithmetic and null-buffer initialization.
-**Verification**: Test
-
-### NAT-BODY-11 DEFLATE fast batches
-
-**Rule**: Native DEFLATE batches MUST preserve Wine's output, consumed input, bit reservoir, stream pointers and block-end state. They MUST cover every stream the function accepts, including output overlapping its inputs. Stream and window layouts MUST match the pinned module's DWARF.
-**Verification**: Test
-
-### NAT-BODY-12 Queue key state
-
-**Rule**: The `win32u.dll!NtUserGetKeyState` body MUST return Wine's synchronized queue key state, masked and sign-extended, to the guest. A thread without a queue MAY return to guest code under A64-CALL-6, without creating a queue or leaving server errors or references.
-**Verification**: Test
-
-### NAT-BODY-13 Statically linked helpers
-
-**Rule**: Runtime helpers that game images link statically MUST bind only where an executable section holds their exact bytes, each copy under its own thunk. Borland's division bodies MUST return EDX:EAX, pop the divisor, zero ECX, and raise `EXCEPTION_INT_DIVIDE_BY_ZERO` under A64-CALL-4 for a zero divisor. Its copies MUST set EAX, ECX, EDX and overlapping bytes as its code does.
-**Verification**: Test
-
-### NAT-BODY-14 Engine pixel routines
-
-**Rule**: Engine pixel bodies MUST write the pixels the routine writes, bit for bit, even where its pair paths round unlike its single-pixel path. They MUST keep every register the routine keeps. Overlapping sources and destinations MUST be read and written in the routine's order.
-**Verification**: Test
-
-### NAT-BODY-15 Native host work
-
-**Rule**: A body's host work MUST scale with bytes passed and returned, plus a constant. Tables derived from immutable data MUST be built at most once per process and reached without hashing per call. Bodies MUST NOT read clocks, allocate heap memory or take host locks per call, except where their function does.
-**Verification**: Test
-
-### NAT-BODY-19 Host features
-
-**Rule**: Bodies MAY use host instruction set features detected at startup, such as NEON table lookups, CRC32, PMULL and dot products. The variant MUST be chosen when the function binds, without per-call feature checks. Every variant MUST produce identical results.
-**Verification**: Test
-
-### NAT-BODY-20 Wine string comparison data
-
-**Rule**: Comparison bodies MUST read Wine's loaded sort, locale and code page data in place and return Wine's results and last error. They MUST NOT load, copy or correct NLS data.
-**Verification**: Test
-
 ## Host DLL images
 
 ### WINE-DLL-1 Loader-owned entries
@@ -690,6 +570,19 @@ Every presenter's frames carry only that content, while the host shows caption, 
 **Rule**: A shown top-level window MUST be read before its first flush. A dialog the host projects, such as a message box, MUST NOT present frames. Its icon MUST NOT show as an unavailable control.
 **Verification**: Test
 
+### WINE-UI-10 Native dialog controls
+
+**Rule**: A top-level dialog MUST show natively only while every shown control in it has a native kind from the list below. Otherwise the whole dialog MUST stay its own painting as a plane (WINE-GFX-10). A control MUST show only while its parents show.
+**Verification**: Test
+
+- Buttons, labels, frames, edits, combo boxes, list boxes, trackbars, status bars and progress bars.
+- Read-only text of many lines, read whole up to 65536 UTF-16 units.
+- List views that keep their strings.
+- Picture statics, shown by their bitmap's pixels in the snapshot that first shows them.
+- Child dialogs, which show their controls and nothing themselves.
+
+> Note: Setup wizards are property sheets. Their pages are child dialogs, a license is a read-only rich edit, and banners are picture statics. A tree, a tab strip or an owner-drawn control has no native kind, so its dialog keeps Wine's painting.
+
 ### WINE-UI-9 Detached menu bars
 
 **Rule**: A menu bar moved from the presented window MUST follow its root or submenu handles to its new window. The new window MUST remain the command target when hidden. A detached bar with at most one row of content MUST NOT present a window plane.
@@ -769,46 +662,6 @@ Every presenter's frames carry only that content, while the host shows caption, 
 **Rule**: The Wine recipe MUST build winegstreamer's PE module with the distribution's flags, install it, strip debug information, and register its classes. Adding the module MUST NOT change other distribution binaries.
 **Verification**: Review — distribution checksums and prefix regeneration are packaging checks.
 
-## Static codec kernels
-
-Static Vorbis, Theora, and Ogg bindings run on the Wine stack.
-Device decoding follows [device.md](device.md).
-
-### CODEC-MAP-1 Image binding
-
-**Rule**: Image scans MUST run exactly once per non-distribution mapping in native or verify mode and MUST be skipped for all other mappings.
-Admission MUST use reviewed codec signatures over executable ranges and resolve each layout reference to a displacement in the matched code.
-Unmapping MUST retire bindings and their decoder state.
-**Verification**: Test
-
-### CODEC-CALL-1 Vorbis transforms
-
-**Rule**: Native Vorbis transforms MUST retain the built-in stack's admission, ABI, table, buffer, and floating-environment checks. Declined calls MUST preserve guest memory and resume the original function through its trampoline. Verify mode MUST publish guest results and preserve guest floating state.
-**Verification**: Test
-
-### CODEC-CALL-2 Theora packets
-
-**Rule**: Theora bindings MUST retain complete library-family admission and preserve pixels, state, guest allocation lifetime, return values, and callbacks. Calls without admitted decoder state MUST resume guest code before changing guest memory. Verify mode MUST compare native results while publishing guest results.
-**Verification**: Test
-
-### CODEC-CALL-3 Packet run-ahead
-
-**Rule**: A predictor MUST read only complete packets from a stream paired by an observed packet output and decoder input.
-File prediction MUST follow accepted pages linked to contiguous ranges of observed file reads.
-Workers MUST use positioned reads and validate Ogg page CRCs before staging file packets of the paired stream.
-Each decoder MUST stage at most three packets. Each file predictor MUST bound its page buffer and release it with the decoder.
-Workers MUST stage results in host storage without changing committed decoder state.
-The owner MUST match packet bytes, metadata, and decoding controls before committing a staged result.
-Seeks, resets, callable controls, and clear MUST invalidate staged results.
-Verify mode MUST compare staged output and state with synchronous decoding.
-**Verification**: Test
-
-### CODEC-MODULE-1 Shipped Vorbisfile modules
-
-**Rule**: Wine MUST bind admitted shipped `vorbisfile.dll` exports to host thunks while preserving names, ordinals, original code, and loader lifetime. Admission MUST retain the provider's ordinal-layout, static-import, delay-import, and dynamic-symbol checks through Wine's file namespace. Guest mode and rejected modules MUST retain guest execution.
-**Verification**: Test
-**Basis**: DEV-AUDIO-3
-
 ## Sessions
 
 ### WINE-SES-10 Sequential sessions
@@ -818,7 +671,7 @@ Verify mode MUST compare staged output and state with synchronous decoding.
 
 ### WINE-SES-1 Shared prefix
 
-**Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. A host MUST provision system32, the template's module links and its own host modules on the drive C: a session uses. The program directory MUST use D: or the first unmounted letter after it, with writes in place.
+**Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. A host MUST provision system32, the template's module links and its own host modules on the drive C: a session uses. The program directory MUST keep its path on drive C: and otherwise use D: or the first unmounted letter after it, with writes in place.
 Process startup MUST register the prefix's drive letters in the server namespace.
 **Verification**: Test
 
@@ -869,8 +722,52 @@ Processor counts and affinity MUST describe eight guest cores in one group, inde
 
 ### WINE-SES-9 Mounted file ownership
 
-**Rule**: Wine sessions MUST apply ISO mounts and installation-directory mappings before process startup. Files, directories, sections, children, and volume queries MUST retain the same mounted backing. Reused prefixes MUST NOT retain removed host mappings.
+**Rule**: Wine sessions MUST apply disc image mounts and installation-directory mappings before process startup. Files, directories, sections, children, and volume queries MUST retain the same mounted backing. Reused prefixes MUST NOT retain removed host mappings.
 **Verification**: Test
+
+### WINE-SES-11 Registry restoration
+
+**Rule**: Registry restoration MUST persist `.reg` imports and `.bat` scripts on the shared prefix with the game's drive layout and code page. Imports and scripts MUST map `WOW6432Node` keys to 32-bit `SOFTWARE`. A script MUST run as a guest program (WINE-SES-12), as the list below requires.
+**Verification**: Test
+
+- `cmd.exe` runs it from its own path, reading a copy without its elevation and pauses.
+- Its console MAY be piped: it then reads the host's lines and writes its output, both in the game's code page.
+- What it wrote is settled once the session ends.
+
+### WINE-SES-12 Guest programs
+
+**Rule**: A session MUST be able to start a guest program in place of its game, as the list below requires. What the program installs on drive C:, and the registry and shell links it writes, MUST hold in the next session. Children it stages and waits for MUST run to their end.
+**Verification**: Test
+
+- It runs on the game's prefix, discs and program folder, or with no program folder, as a disc's setup does.
+- It starts in its image's directory unless another is given.
+- A host image in the program folder or on drive C: keeps that path; any other takes the next free drive letter.
+- Asked for output, it receives standard output and error, with empty input.
+
+> Note: Explorer starts a program in its own directory, where setups expect their files. A game installed on drive C: keeps the path its setup wrote into the registry and its shortcuts.
+
+> Note: The launcher installs from a disc image this way. A library entry stands for the install, and its first run starts the disc's setup with `C:\Program Files` in the chosen folder. The program the player then picks there becomes the game and keeps that `C:\Program Files`.
+
+### WINE-SES-13 Disc changes
+
+**Rule**: A running session MUST be able to put another disc image in a mounted drive. Paths opened afterwards, and volume queries on the drive, MUST reach the new disc. Files opened before MUST keep reading the disc they were opened on.
+**Verification**: Test
+
+> Note: Setups on several discs ask for the next one in the same drive and check its label.
+
+### WINE-SES-14 Installed programs
+
+**Rule**: A host MUST list the programs whose uninstall entries on the prefix name a folder on drive C:, with that folder on the host. The folder MUST come from `InstallLocation`, else `DisplayIcon`, else `UninstallString`. Drive C: itself, its Windows folder and `C:\Program Files` MUST NOT be listed as a program's folder.
+**Verification**: Test
+
+> Note: A setup told to install outside the chosen folder leaves its game elsewhere on drive C:, and its uninstall entry says where.
+
+### WINE-SES-15 Root folders in the chosen folder
+
+**Rule**: With a chosen install folder, a new folder at the root of drive C: MUST lie in that folder. It MUST keep its `C:\` path in later sessions, for opens and for the names handles report. Wine's folders and names the prefix already holds at that root MUST stay in the prefix.
+**Verification**: Test
+
+> Note: Some setups install to a fixed folder at the root of the Windows drive instead of Program Files.
 
 ## Conformance
 
@@ -985,4 +882,4 @@ Windowless VMR-7 (`CLSID_VideoMixingRenderer`) converts pushed uncompressed RGB 
 **Rule**: Native sources MUST accept PCM, IEEE float, Microsoft ADPCM and xWMA buffers. Compressed decoding MUST use host code.
 **Verification**: Test
 
-Withdrawn: WINE-TEST-2, NAT-BODY-5, NAT-BODY-7
+Withdrawn: WINE-TEST-2

@@ -3,6 +3,7 @@ pub use adv_device::text::Overrides as FontOverrides;
 pub use adv_device::text::system_font_families;
 pub mod codepage;
 mod debug_views;
+pub mod disc;
 mod font;
 mod graphics;
 pub mod reallive;
@@ -39,8 +40,9 @@ pub fn guest_address_space() -> Option<adv_cpu::virtual_memory::AddressSpace> {
     adv_cpu::virtual_memory::GuestWindow::launch_address_space()
 }
 pub use adv_device::ui::{
-    DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow, InputView,
-    MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation, WindowView,
+    ControlKind, DialogControl, DialogEvent, DialogFont, DialogImage, DialogSet, DialogTarget,
+    DialogWindow, InputView, MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation,
+    WindowView, kind as control_kind,
 };
 #[cfg(feature = "gpu")]
 pub use adv_dx::d3d9::{

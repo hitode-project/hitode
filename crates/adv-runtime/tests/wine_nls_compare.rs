@@ -26,7 +26,7 @@ fn probe(reference: bool) -> Option<String> {
         drive: None,
         locale: 0x411,
         fonts: "",
-        exe: &game.join("nls_compare.exe"),
+        exe: Some(&game.join("nls_compare.exe")),
         width: 64,
         height: 32,
         jit: true,

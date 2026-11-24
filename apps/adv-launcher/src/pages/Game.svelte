@@ -169,6 +169,23 @@
     saveGameSetup(gameId, setup);
   }
 
+  // The game's disc images: drive D: holds the first until the player puts in
+  // the next, as setups on several discs ask (WINE-SES-13).
+  // svelte-ignore state_referenced_locally
+  const discs = loadGameSetup(gameId, game?.codepage ?? 932).discs;
+  let inDrive = $state(discs[0] ?? "");
+  let discError = $state("");
+  async function nextDisc() {
+    const next = discs[(discs.indexOf(inDrive) + 1) % discs.length] ?? "";
+    discError = "";
+    try {
+      await call("change_disc", { letter: "D", path: next }, null);
+      inDrive = next;
+    } catch (error) {
+      discError = String(error);
+    }
+  }
+
   function pickScale(value: Scale) {
     scale = value;
     updateOverrides({ scale: value });
@@ -683,6 +700,13 @@
           <div class="group">
             {#if guestMenu && !guestMenu.popup}
               <button class="qrow" onclick={() => { view = "closed"; menuOpen = true; }}>{t("游戏菜单…")}</button>
+            {/if}
+            {#if discs.length > 1}
+              <button class="qrow" onclick={() => void nextDisc()}>
+                <span>{t("换下一张光盘")}</span>
+                <span class="end mono">D: {inDrive.split(/[\\/]/).pop()}</span>
+              </button>
+              {#if discError}<p class="disc-error" role="alert">{discError}</p>{/if}
             {/if}
             {#if gamepad.showInPauseMenu}
               <button class="qrow" onclick={() => (view = "gamepad")}>
@@ -1256,6 +1280,12 @@
     margin-left: auto;
     color: var(--fg3);
     display: flex;
+  }
+  .disc-error {
+    margin: 0;
+    padding: 4px 14px 8px;
+    font-size: 12px;
+    color: var(--danger);
   }
   .qrow.danger {
     color: var(--danger);

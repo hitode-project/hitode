@@ -245,6 +245,12 @@ Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFr
 **Applies to**: Launcher, desktop and Android
 **Verification**: Test
 
+### HOST-LIB-11 Registry file discovery
+
+**Rule**: Folder inspection MUST list top-level `.bat`, `.cmd` and `.reg` files case-insensitively. Ordering MUST place registry-named scripts before registry `.reg` files and other entries.
+**Applies to**: Launcher
+**Verification**: Test
+
 ### HOST-LIB-2 Executable candidates
 
 **Rule**: Top-level `.exe` candidates, all listed in scan results, MUST use case-insensitive extensions, decreasing size, automatic code pages and Machine mappings `0x14c=x86`, `0x8664=x64`, otherwise `other`. Suggestion MUST select the largest x86 excluding stems starting with `setup`, `install`, `unins` or `config`, NSIS or mostly-appended-payload packages and console programs, or null. Candidate and scan `inLibrary` MUST match canonical folder and case-insensitive exe, while inspection-level `inLibrary` MUST match any entry in the folder.
@@ -306,6 +312,12 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 **Rule**: Toggle mode MUST alternate guest Ctrl presses and releases on physical Ctrl presses, ignoring physical releases. Both Ctrl keys MUST toggle the same guest key. Losing focus or changing modes MUST release latched input.
 **Applies to**: Launcher, macOS
 **Verification**: Test
+
+### HOST-RUN-3 Scripts on the run page
+
+**Rule**: A script started from the run page MUST run there, its console output shown and a line of input sent on Return. The game screen MUST take over only once the guest shows a frame or a dialog. Play time MUST count from then, and a script that never shows anything MUST NOT count.
+**Applies to**: Launcher
+**Verification**: Review — the run page and the game screen need the launcher's views, which no test drives.
 
 ### HOST-VNDB-1 Metadata association
 

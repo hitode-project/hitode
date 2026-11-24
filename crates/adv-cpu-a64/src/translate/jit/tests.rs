@@ -6246,3 +6246,79 @@ pub(in crate::translate) mod opt_back {
         assert_eq!(2 - cut.countdown, 0);
     }
 }
+
+// spec: A64-TR-1
+#[cfg(native)]
+#[test]
+fn a_peelable_mmx_loop_inside_an_x87_run_lowers_its_entries_once() {
+    // The outer loop's x87 run reaches the head of the inner MMX loop by a
+    // branch, past MMX code it does not own. Peeling that loop would emit
+    // the head twice, binding the run's entry there twice.
+    let code = bytes(|a| {
+        let mut outer = a.create_label();
+        let mut skip = a.create_label();
+        let mut tail = a.create_label();
+        let mut vector = a.create_label();
+        let mut inner = a.create_label();
+        a.mov(ecx, 8).unwrap();
+        a.set_label(&mut outer).unwrap();
+        a.fld(dword_ptr(esi)).unwrap();
+        a.fistp(dword_ptr(edi)).unwrap();
+        a.test(ebx, ebx).unwrap();
+        a.je(skip).unwrap();
+        a.paddw(mm1, mm2).unwrap();
+        a.set_label(&mut skip).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(outer).unwrap();
+        a.jmp(vector).unwrap();
+        a.set_label(&mut tail).unwrap();
+        a.add(edx, 1).unwrap();
+        a.jmp(outer).unwrap();
+        a.set_label(&mut vector).unwrap();
+        a.test(edx, edx).unwrap();
+        a.je(inner).unwrap();
+        a.paddw(mm3, mm4).unwrap();
+        a.set_label(&mut inner).unwrap();
+        a.movups(xmm0, xmmword_ptr(esi + eax * 4)).unwrap();
+        a.mulps(xmm0, xmm7).unwrap();
+        a.add(eax, 4).unwrap();
+        a.cvtps2pi(mm0, xmm0).unwrap();
+        a.movq(qword_ptr(edi + eax * 2), mm0).unwrap();
+        a.cmp(eax, 16).unwrap();
+        a.jl(inner).unwrap();
+        a.emms().unwrap();
+        a.jmp(tail).unwrap();
+    });
+    let mut mem = memory(&code, &[0; 64]);
+    let mut work = Workspace::default();
+    work.unit
+        .build(&mut mem, CODE, &[], &|_, _| None, &|_| None, true);
+    let mut cpu = x87_setup();
+    cpu.mxcsr = 0x1f80;
+    let key = crate::facts::Key::read(&cpu, work.unit.fact_mask());
+    let at = HOST_CODE as usize;
+    lower_tier1(
+        &mut work.code,
+        &work.unit,
+        CODE,
+        &|_| false,
+        0,
+        Features::default(),
+        at,
+        Stubs {
+            call: at,
+            exit: at,
+            dispatch: at,
+            lookup: at,
+            lookup_slow: at,
+            ret_miss: at,
+            access: at,
+            fault: at,
+            opt_exit: at,
+            x87: None,
+        },
+        true,
+        key,
+        0,
+    );
+}

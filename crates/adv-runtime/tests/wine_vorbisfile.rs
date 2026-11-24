@@ -115,7 +115,7 @@ fn shipped_module_admission_and_callback_decoding() {
             drive: None,
             locale: 0x409,
             fonts: "",
-            exe: &exe,
+            exe: Some(&exe),
             width: 64,
             height: 32,
             jit,

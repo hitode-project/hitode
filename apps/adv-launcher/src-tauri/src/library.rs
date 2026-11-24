@@ -44,6 +44,14 @@ pub struct LibraryGame {
     pub last_run: Option<LastRun>,
     #[serde(skip_deserializing)]
     pub offline: Option<Offline>,
+    /// Until its setup has run: the setup program on the game's first disc,
+    /// as a DOS path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
+    /// The host folder `C:\Program Files` shows for this game: where its
+    /// setup installed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_files: Option<PathBuf>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlaySession {
@@ -230,6 +238,13 @@ impl Library {
         let data = self.path.parent().unwrap().join("games").join(id);
         Ok((game.folder.join(&game.exe), data, game.codepage))
     }
+    /// The setup a pending install runs, and the folder behind its
+    /// `C:\Program Files`.
+    #[cfg(any(test, target_os = "macos", target_os = "android", target_os = "ios"))]
+    pub fn installation(&self, id: &str) -> io::Result<(Option<String>, Option<PathBuf>)> {
+        let game = &self.games[self.game(id)?];
+        Ok((game.setup.clone(), game.program_files.clone()))
+    }
     #[cfg(any(test, target_os = "macos", target_os = "android", target_os = "ios"))]
     pub fn finished(&mut self, id: &str, seconds: u32, run: LastRun) -> io::Result<()> {
         let ended = run.ended;
@@ -280,6 +295,39 @@ impl Library {
         self.save()?;
         Ok(game)
     }
+    /// A game a disc's `setup` installs into `target`; its program is chosen
+    /// once the setup has run.
+    /// Without a `target` it installs beside the library.
+    fn add_install(
+        &mut self,
+        target: Option<&Path>,
+        setup: &str,
+        cp: u32,
+        title: &str,
+    ) -> io::Result<LibraryGame> {
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
+        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let target = match target {
+            Some(target) => target.to_owned(),
+            None => self.path.parent().unwrap().join("installed").join(&id),
+        };
+        fs::create_dir_all(&target)?;
+        let dir = fs::canonicalize(&target)?;
+        let game = LibraryGame {
+            id,
+            title: title.into(),
+            folder: dir.clone(),
+            codepage: cp,
+            added_at: now(),
+            setup: Some(setup.into()),
+            program_files: Some(dir),
+            ..LibraryGame::default()
+        };
+        self.games.push(game.clone());
+        self.save()?;
+        Ok(game)
+    }
     fn remove(&mut self, id: &str) -> io::Result<LibraryGame> {
         let i = self.game(id)?;
         let game = self.games.remove(i);
@@ -322,11 +370,20 @@ type Known = Vec<(PathBuf, String, String)>;
 fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
     let folder = fs::canonicalize(folder)?;
     let mut exes = Vec::new();
+    let mut registry_files = Vec::new();
     for entry in fs::read_dir(&folder)? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !path.is_file() || !name.to_ascii_lowercase().ends_with(".exe") {
+        if !path.is_file() {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".reg") || lower.ends_with(".bat") || lower.ends_with(".cmd") {
+            registry_files.push(name);
+            continue;
+        }
+        if !lower.ends_with(".exe") {
             continue;
         }
         // An unreadable executable is not a candidate; it must not hide the others.
@@ -346,6 +403,7 @@ fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
         });
     }
     exes.sort_by_key(|e| std::cmp::Reverse(e.size));
+    registry_files.sort_by_key(|name| registry_file_rank(name));
     let suggested = exes.iter().position(|e| {
         e.arch == "x86"
             && !prefixed(&e.path, &["setup", "install", "unins", "config"])
@@ -361,6 +419,7 @@ fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
         exes,
         suggested,
         in_library,
+        registry_files,
     })
 }
 fn scan(known: &Known, root: PathBuf, depth: u8) -> io::Result<Vec<ScanFound>> {
@@ -572,6 +631,21 @@ pub struct ExeCandidate {
     codepage: u32,
     in_library: Option<String>,
 }
+fn registry_file_rank(name: &str) -> (u8, u8, String) {
+    let lower = name.to_ascii_lowercase();
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+    let stem_lower = stem.to_ascii_lowercase();
+    let named_registry =
+        stem_lower.contains("reg") || stem.contains("注册表") || stem.contains("レジストリ");
+    let is_script = lower.ends_with(".bat") || lower.ends_with(".cmd");
+    // Prefer registry-named scripts (e.g. `注册表恢复.bat`), then registry `.reg`,
+    // then other `.bat`/`.cmd` scripts, then other `.reg` files.
+    (u8::from(!named_registry), u8::from(!is_script), lower)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderInspection {
@@ -580,6 +654,7 @@ pub struct FolderInspection {
     exes: Vec<ExeCandidate>,
     suggested: Option<usize>,
     in_library: Option<String>,
+    registry_files: Vec<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -691,10 +766,59 @@ pub fn library_update(state: Store<'_>, id: String, patch: GamePatch) -> Reply<L
     game.folder = folder.unwrap_or_else(|| game.folder.clone());
     if let Some(exe) = patch.exe {
         game.exe = exe.replace('\\', "/");
+        // Choosing the installed program completes the install.
+        if !game.exe.is_empty() {
+            game.setup = None;
+        }
     }
     let game = present_game(game.clone());
     library.save().map_err(|e| e.to_string())?;
     Ok(game)
+}
+/// A disc image before anything runs from it: its label and size, the
+/// programs its player would start, and the code page of the first.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscInspection {
+    label: String,
+    bytes: u64,
+    programs: Vec<String>,
+    codepage: u32,
+}
+#[tauri::command]
+pub async fn library_inspect_disc(path: PathBuf) -> Reply<DiscInspection> {
+    let inspect = move || -> io::Result<DiscInspection> {
+        let disc = adv_shell::Disc::open(&path, 'D')?;
+        let programs = disc.programs();
+        let codepage = match programs.first() {
+            Some(program) => disc.codepage(program)?,
+            None => 932,
+        };
+        Ok(DiscInspection {
+            label: disc.label().to_owned(),
+            bytes: fs::metadata(&path)?.len(),
+            programs,
+            codepage,
+        })
+    };
+    let found = tauri::async_runtime::spawn_blocking(move || reply(inspect()));
+    found.await.map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub fn library_add_install(
+    state: Store<'_>,
+    target: Option<PathBuf>,
+    setup: String,
+    codepage: u32,
+    title: String,
+) -> Reply<LibraryGame> {
+    reply(
+        state
+            .lock()
+            .unwrap()
+            .add_install(target.as_deref(), &setup, codepage, &title),
+    )
+    .map(present_game)
 }
 #[tauri::command]
 pub fn library_remove(state: Store<'_>, id: String) -> Reply<LibraryGame> {
@@ -920,6 +1044,30 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     // spec: HOST-LIB-10
+    // spec: WINE-SES-12
+    #[test]
+    fn a_pending_install_keeps_its_setup_and_program_files_until_reloaded() {
+        let (dir, mut lib) = fixture("install");
+        let target = dir.join("Installed Game");
+        let game = lib
+            .add_install(Some(&target), r"D:\SETUP.EXE", 932, "Disc title") // privacy: allow authored guest path
+            .unwrap();
+        assert!(target.is_dir());
+        assert_eq!(game.exe, "");
+        let loaded = Library::load(dir.join("app")).unwrap();
+        let (setup, program_files) = loaded.installation(&game.id).unwrap();
+        assert_eq!(setup.as_deref(), Some(r"D:\SETUP.EXE")); // privacy: allow authored guest path
+        assert_eq!(program_files, Some(fs::canonicalize(&target).unwrap()));
+        let beside = lib
+            .add_install(None, r"D:\SETUP.EXE", 932, "Other") // privacy: allow authored guest path
+            .unwrap();
+        assert!(
+            beside
+                .folder
+                .starts_with(fs::canonicalize(dir.join("app")).unwrap())
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn reorder_persists_a_full_permutation_only() {
         let (dir, mut lib) = fixture("reorder");
@@ -1120,6 +1268,26 @@ mod tests {
             Some("missing")
         );
         assert_eq!(offline(p("/storage/9C33-6BBD/Games/Novel")), Some("disk"));
+    }
+
+    // spec: HOST-LIB-11
+    #[test]
+    fn inspection_lists_and_ranks_top_level_registry_files() {
+        let (dir, lib) = fixture("registry-files");
+        pe(&dir, "game.exe", 0x14c, 100);
+        fs::write(dir.join("notes.txt"), b"ignore").unwrap();
+        fs::write(dir.join("other.REG"), b"").unwrap();
+        fs::write(dir.join("launch.bat"), b"").unwrap();
+        fs::write(dir.join("注册表.reg"), b"").unwrap();
+        fs::write(dir.join("注册表恢复.BAT"), b"").unwrap();
+        fs::create_dir(dir.join("nested")).unwrap();
+        fs::write(dir.join("nested/deep.reg"), b"").unwrap();
+        let found = inspect(&lib.known(), &dir).unwrap();
+        assert_eq!(
+            found.registry_files,
+            vec!["注册表恢复.BAT", "注册表.reg", "launch.bat", "other.REG"]
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }
 

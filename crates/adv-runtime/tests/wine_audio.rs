@@ -34,7 +34,7 @@ fn wine_audio_reaches_the_host_stream() {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &probes.join("audio.exe"),
+        exe: Some(&probes.join("audio.exe")),
         width: 640,
         height: 480,
         jit: true,

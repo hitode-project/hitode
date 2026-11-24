@@ -384,6 +384,13 @@ impl Session {
     ) {
         self.driver.damage_hud.observe(observer);
     }
+    /// Calls `observer` once the guest first shows a frame or a dialog: a
+    /// script that never does needs no game view.
+    pub fn observe_shown(&self, observer: impl FnOnce() + 'static) {
+        if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
+            ui.observe_shown(Box::new(observer));
+        }
+    }
     /// Whether the game has shown its first frame.
     pub fn presented(&self) -> bool {
         self.driver
@@ -399,6 +406,20 @@ impl Session {
             .borrow()
             .as_ref()
             .map_or_else(Vec::new, |ui| ui.frame_intervals())
+    }
+    /// Puts the disc in `image` in drive `letter`; the result arrives once the
+    /// game's thread has changed it.
+    pub fn change_disc(
+        &self,
+        letter: char,
+        image: std::path::PathBuf,
+    ) -> std::sync::mpsc::Receiver<Result<(), String>> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.driver
+            .view
+            .hub()
+            .push(Event::Disc(letter, image, reply));
+        result
     }
     pub fn set_volume(&self, percent: u8) {
         self.driver.view.hub().push(Event::Volume(percent.min(100)));
@@ -693,10 +714,10 @@ pub(crate) fn run_cli(options: Options) -> Result<u8, String> {
         &format!(
             "ADV — {}",
             options
-                .exe
-                .file_name()
+                .started()
+                .rsplit(['/', '\\'])
+                .next()
                 .unwrap_or_default()
-                .to_string_lossy()
         ),
         options.width,
         options.height,

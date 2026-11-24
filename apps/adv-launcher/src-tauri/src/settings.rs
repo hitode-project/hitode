@@ -13,6 +13,11 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
             &["iso", "cue", "bin", "img", "ccd", "mds", "mdf", "nrg"],
         ),
         "font" => picker.add_filter("Font", &["ttf", "ttc", "otf", "otc"]),
+        "registry" => picker.add_filter("Registry file", &["reg", "bat", "cmd"]),
+        "run" => picker.add_filter(
+            "Executable, script or registry",
+            &["exe", "bat", "cmd", "reg"],
+        ),
         _ => return Err("unknown file type".into()),
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -41,6 +46,8 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
     let extensions: &[&str] = match kind.as_str() {
         "disc" => &["iso", "bin", "img", "mdf", "nrg"],
         "font" => &["ttf", "ttc", "otf", "otc"],
+        "registry" => &["reg", "bat", "cmd"],
+        "run" => &["exe", "bat", "cmd", "reg"],
         _ => return Err("unknown file type".into()),
     };
     let files = app

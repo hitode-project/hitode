@@ -18,8 +18,10 @@
   import Game from "./pages/Game.svelte";
   import Gamepad from "./pages/Gamepad.svelte";
   import GameStorage from "./pages/GameStorage.svelte";
+  import GameRun from "./pages/GameRun.svelte";
   import GameSettings from "./pages/GameSettings.svelte";
   import Import from "./pages/Import.svelte";
+  import Install from "./pages/Install.svelte";
   import Launch from "./pages/Launch.svelte";
   import Library from "./pages/Library.svelte";
   import Report from "./pages/Report.svelte";
@@ -28,6 +30,7 @@
   import Stats from "./pages/Stats.svelte";
   import PhoneGameSettings from "./phone/GameSettings.svelte";
   import PhoneImport from "./phone/Import.svelte";
+  import PhoneInstall from "./phone/Install.svelte";
   import PhoneLaunch from "./phone/Launch.svelte";
   import PhoneLibrary from "./phone/Library.svelte";
   import PhoneReport from "./phone/Report.svelte";
@@ -128,9 +131,12 @@
     >
       {#if !phonePage}<JitBanner />{/if}
       {#if !phonePage && route.name === "library"}<UpdateNotice /><AndroidStorageBanner />{/if}
-      {#if route.name === "library" || route.name === "install"}
-        {@const filter = route.name === "library" ? route.filter : "all"}
-        {#if phonePage}<PhoneLibrary {filter} />{:else}<Library {filter} />{/if}
+      {#if route.name === "library"}
+        {#if phonePage}<PhoneLibrary filter={route.filter} />{:else}<Library filter={route.filter} />{/if}
+      {:else if route.name === "install"}
+        {#key route.gameId}
+          {#if phonePage}<PhoneInstall gameId={route.gameId} />{:else}<Install gameId={route.gameId} />{/if}
+        {/key}
       {:else if route.name === "stats"}
         {#if phonePage}<PhoneStats />{:else}<Stats />{/if}
       {:else if route.name === "import"}
@@ -143,6 +149,8 @@
         <Gamepad />
       {:else if route.name === "game-storage" || route.name === "game-files"}
         <GameStorage gameId={route.name === "game-files" ? route.gameId : undefined} />
+      {:else if route.name === "game-run"}
+        <GameRun gameId={route.gameId} />
       {:else if route.name === "game-settings"}
         {#if phonePage}<PhoneGameSettings gameId={route.gameId} />{:else}<GameSettings gameId={route.gameId} />{/if}
       {:else if route.name === "launch"}

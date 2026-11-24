@@ -62,7 +62,7 @@ fn sequential_sessions_child() {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &first.join("session_lifecycle.exe"),
+        exe: Some(&first.join("session_lifecycle.exe")),
         width: 640,
         height: 480,
         jit: true,
@@ -76,7 +76,7 @@ fn sequential_sessions_child() {
     for turn in 0..4 {
         let directory = if turn < 2 { &first } else { &second };
         let config = Config {
-            exe: &directory.join("session_lifecycle.exe"),
+            exe: Some(&directory.join("session_lifecycle.exe")),
             ..config
         };
         if turn == 1 {
@@ -276,7 +276,7 @@ fn program_session(child: bool) {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &game.join("d3d9.exe"),
+        exe: Some(&game.join("d3d9.exe")),
         width: 640,
         height: 480,
         jit: true,
@@ -374,7 +374,7 @@ fn popup_choice_and_cancel_child() {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &probes.join("popup_menu.exe"),
+        exe: Some(&probes.join("popup_menu.exe")),
         width: 640,
         height: 480,
         jit: true,
@@ -482,7 +482,7 @@ fn message_box_child() {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &probes.join("message_box.exe"),
+        exe: Some(&probes.join("message_box.exe")),
         width: 640,
         height: 480,
         jit: true,
@@ -506,7 +506,7 @@ fn message_box_child() {
             let unsupported: Vec<_> = dialog
                 .controls
                 .iter()
-                .filter(|control| !control.supported)
+                .filter(|control| !control.supported())
                 .map(|control| (&control.class, control.style))
                 .collect();
             assert!(unsupported.is_empty(), "{unsupported:?}");

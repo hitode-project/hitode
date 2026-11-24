@@ -53,7 +53,7 @@ fn probe_inspect(
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &game.join(exe),
+        exe: Some(&game.join(exe)),
         width: 640,
         height: 480,
         jit: true,
@@ -480,6 +480,27 @@ fn registry() {
             "retire_setup",
             "retire_warm",
             "retired_handle",
+        ],
+    );
+}
+
+// spec: WINE-SYS-16
+#[test]
+fn heap_blocks_shrink_in_place() {
+    let Some((stop, text)) = probe("heap_blocks_shrink_in_place", "heap_shrink.exe", |_, _| {})
+    else {
+        return;
+    };
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert_checks(
+        &text,
+        "=ok",
+        &[
+            "lfh_shrink",
+            "lfh_enabled",
+            "lfh_shrink_small",
+            "grow",
+            "crt_shrink",
         ],
     );
 }

@@ -3,7 +3,9 @@
   export type DialogTarget = { dialog: number; hwnd: number; parent: number; id: number; createdUs: number };
   export type DialogControl = {
     target: DialogTarget;
-    kind: "push" | "check" | "radio" | "group" | "frame" | "label" | "edit" | "combo" | "list" | "track" | "unavailable";
+    kind:
+      | "push" | "check" | "radio" | "group" | "frame" | "label" | "edit" | "text" | "combo" | "list" | "track"
+      | "progress" | "image" | "container" | "unavailable";
     text: string;
     x: number;
     y: number;
@@ -19,6 +21,8 @@
     align: 0 | 1 | 2;
     /** The control's own em size in guest pixels, when it sets a font. */
     fontSize: number | null;
+    /** A picture's pixels as a `data:` URL. */
+    image: string | null;
   };
   /** A visible guest dialog, in its client pixels (mobile_view.rs `game_dialogs`). */
   export type GuestDialog = {
@@ -127,6 +131,16 @@
                   onclick={() => send({ kind: "select", target: c.target, index: i })}>{item}</button>
               {/each}
             </div>
+          {:else if c.kind === "text"}
+            <!-- Rich edits end lines with a lone CR. -->
+            <textarea class="edit text" style={box(c, s)} readonly value={c.text.replace(/\r\n?/g, "\n")}></textarea>
+          {:else if c.kind === "progress"}
+            <progress class="progress" style={box(c, s)} max={(c.range?.[1] ?? 100) - (c.range?.[0] ?? 0)}
+              value={c.value - (c.range?.[0] ?? 0)}></progress>
+          {:else if c.kind === "image"}
+            {#if c.image}<img class="picture" style={box(c, s)} src={c.image} alt="" />{/if}
+          {:else if c.kind === "container"}
+            <!-- A page's controls show; the page draws nothing. -->
           {:else if c.kind === "track"}
             <input class="track" type="range" style={box(c, s)} disabled={!c.enabled}
               min={c.range?.[0] ?? 0} max={c.range?.[1] ?? 100} value={c.value}
@@ -270,6 +284,17 @@
   .list button.on {
     background: var(--accent);
     color: var(--on-accent);
+  }
+  .text {
+    resize: none;
+    overflow-y: auto;
+    white-space: pre-wrap;
+  }
+  .progress {
+    margin: 0;
+  }
+  .picture {
+    object-fit: fill;
   }
   .track {
     accent-color: var(--accent);

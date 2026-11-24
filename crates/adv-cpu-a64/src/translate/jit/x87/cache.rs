@@ -984,6 +984,12 @@ pub(in super::super) struct Cache {
 }
 
 impl Cache {
+    /// Instruction `index` lies in a sparse x87 run, whose entries are
+    /// bound once per unit.
+    pub(in super::super) fn in_run(&self, index: usize) -> bool {
+        self.owners[index].is_some()
+    }
+
     pub(in super::super) fn for_trace(trace: &Trace) -> Self {
         let mut loops = Vec::new();
         let mut loop_head = vec![false; trace.len()];

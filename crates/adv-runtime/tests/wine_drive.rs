@@ -33,7 +33,7 @@ fn host_modules_go_to_a_drive_c_outside_the_prefix() {
         drive: Some(&drive),
         locale: 0x409,
         fonts: "",
-        exe: &game.join("identity.exe"),
+        exe: Some(&game.join("identity.exe")),
         width: 640,
         height: 480,
         jit: true,

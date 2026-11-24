@@ -5,6 +5,7 @@
 //! guest's windows reach the host natively: dialogs, the menu bar, IME text,
 //! focus, activation, minimizing and closing, and the control channel.
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,14 +36,50 @@ struct Host {
     pacer: Option<super::frame_pacer::HostPacer>,
 }
 
-fn start(
+/// Imports a `.reg` file or runs a `.bat` / `.cmd` registry restore script in
+/// the game's Wine environment (same prefix, drive letter, discs and code page).
+pub(crate) fn import_registry(
     environment: &mut WineHost,
     options: &Options,
     dist: &Path,
-    wake: WakeEvent,
-    keys: &Arc<KeyState>,
-    host: Host,
-) -> Result<Session, String> {
+    file: &Path,
+) -> Result<adv_runtime::wine::session::RegistryReport, String> {
+    let (prefix, debug, codepage) = facts(options)?;
+    let config = config(options, dist, &prefix, &debug, codepage, "", None);
+    environment.import_registry(&config, file)
+}
+
+/// Runs `run`, which ends its session, between the registry watch and settle
+/// of the script `options` start (WINE-SES-11), and returns what it wrote.
+fn watching_registry<R>(
+    environment: &mut WineHost,
+    options: &Options,
+    dist: &Path,
+    run: impl FnOnce(&mut WineHost) -> Result<R, String>,
+) -> Result<(R, Option<adv_runtime::wine::session::RegistryReport>), String> {
+    let (prefix, debug, codepage) = facts(options)?;
+    let config = config(options, dist, &prefix, &debug, codepage, "", None);
+    let watch = environment.watch_registry(&config, &session_options(options))?;
+    let result = run(environment)?;
+    let report = watch
+        .map(|watch| environment.settle_registry(&config, &watch))
+        .transpose()?;
+    Ok((result, report))
+}
+
+/// The programs setups installed on the prefix of `options` (WINE-SES-14).
+pub(crate) fn installed(
+    environment: &mut WineHost,
+    options: &Options,
+    dist: &Path,
+) -> Result<Vec<adv_runtime::wine::session::Installed>, String> {
+    let (prefix, debug, codepage) = facts(options)?;
+    let config = config(options, dist, &prefix, &debug, codepage, "", None);
+    environment.installed(&config, &session_options(options))
+}
+
+/// The prefix, `WINEDEBUG` and code page a session of `options` runs with.
+fn facts(options: &Options) -> Result<(std::path::PathBuf, String, u32), String> {
     let prefix = match &options.wine_prefix {
         Some(prefix) => prefix.clone(),
         None => options
@@ -55,24 +92,38 @@ fn start(
     let debug = std::env::var("WINEDEBUG").unwrap_or_default();
     let codepage = match options.codepage {
         Some(codepage) => codepage,
-        None => crate::detect_codepage(&options.exe).map_err(|e| e.to_string())?,
+        None => options.detect_codepage().map_err(|e| e.to_string())?,
     };
-    let config = Config {
+    Ok((prefix, debug, codepage))
+}
+
+fn config<'a>(
+    options: &'a Options,
+    dist: &'a Path,
+    prefix: &'a Path,
+    debug: &'a str,
+    codepage: u32,
+    fonts: &'a str,
+    stdout: Option<std::os::fd::RawFd>,
+) -> Config<'a> {
+    Config {
         dist,
-        prefix: &prefix,
+        prefix,
         drive: options.wine_drive.as_deref(),
         locale: adv_runtime::wine::session::locale(codepage),
-        fonts: adv_runtime::wine::session::HOST_FONTS,
-        exe: &options.exe,
+        fonts,
+        exe: options.exe.as_deref(),
         width: options.width,
         height: options.height,
         jit: options.jit,
-        debug: &debug,
-        stdout: Some(libc::STDOUT_FILENO),
-    };
-    let gpu_wake = wake.clone();
-    let codec_kernels = options.codec_kernels;
-    let fonts = SessionOptions {
+        debug,
+        stdout,
+    }
+}
+
+fn session_options(options: &Options) -> SessionOptions {
+    use adv_runtime::wine::session::{Image, Program};
+    SessionOptions {
         fonts: adv_runtime::FontOverrides {
             families: options.font_families.clone(),
             antialiased: options.font_smoothing,
@@ -80,7 +131,46 @@ fn start(
         font_files: options.font_files.clone(),
         cdroms: options.cdroms.clone(),
         install_dir: options.install_dir.clone(),
-    };
+        program: options.program.as_ref().map(|program| Program {
+            arguments: program.arguments.clone(),
+            output: options
+                .console
+                .as_ref()
+                .map(|console| console.output.as_raw_fd()),
+            input: options
+                .console
+                .as_ref()
+                .map(|console| console.input.as_raw_fd()),
+            ..Program::new(match &program.image {
+                crate::ProgramImage::Guest(path) => Image::Guest(path.clone()),
+                crate::ProgramImage::Host(path) => Image::Host(path.clone()),
+            })
+        }),
+        replacements: Vec::new(),
+    }
+}
+
+fn start(
+    environment: &mut WineHost,
+    options: &Options,
+    dist: &Path,
+    wake: WakeEvent,
+    keys: &Arc<KeyState>,
+    host: Host,
+) -> Result<Session, String> {
+    let (prefix, debug, codepage) = facts(options)?;
+    let config = config(
+        options,
+        dist,
+        &prefix,
+        &debug,
+        codepage,
+        adv_runtime::wine::session::HOST_FONTS,
+        Some(libc::STDOUT_FILENO),
+    );
+    let gpu_wake = wake.clone();
+    let codec_kernels = options.codec_kernels;
+    let fonts = session_options(options);
     environment.start(&config, wake.clone(), &fonts, move |machine| {
         if let Some(waker) = host.capture {
             machine.ext.insert(waker);
@@ -153,21 +243,23 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
         let debugger = super::debug::start(options, false, wake.clone(), debug_display);
         let keys = Arc::new(KeyState::default());
         let started = Instant::now();
-        let session = start(
-            &mut WineHost::default(),
-            options,
-            dist,
-            wake.clone(),
-            &keys,
-            host,
-        )?;
-        let (code, session, _) = drive(options, session, None, &keys, &wake, debugger, started)?;
-        let frame = session.frame();
+        let ((code, frames), registry) =
+            watching_registry(&mut WineHost::default(), options, dist, |environment| {
+                let session = start(environment, options, dist, wake.clone(), &keys, host)?;
+                let (code, session, _) =
+                    drive(options, session, None, &keys, &wake, debugger, started)?;
+                Ok((code, session.frame().frames))
+            })?;
         eprintln!(
-            "wine: exit {code} after {:.2}s, {} frames presented",
+            "wine: exit {code} after {:.2}s, {frames} frames presented",
             started.elapsed().as_secs_f64(),
-            frame.frames
         );
+        if let Some(registry) = registry {
+            eprintln!(
+                "wine: the script wrote {} registry entries, {} mirrored from WOW6432Node",
+                registry.entries, registry.normalized_wow64
+            );
+        }
         Ok(code)
     })();
     service.shutdown();
@@ -221,17 +313,26 @@ pub(super) fn run_execution(
     };
     let started = Instant::now();
     let debugger = super::debug::start(options, true, wake.clone(), debug_display);
-    let session = start(environment, options, dist, wake.clone(), &keys, host)?;
-    let (exit_code, _, summary) = drive(
-        options,
-        session,
-        Some(worker),
-        &keys,
-        &wake,
-        debugger,
-        started,
-    )?;
-    Ok(Finished { exit_code, summary })
+    let ((exit_code, summary), registry) =
+        watching_registry(environment, options, dist, |environment| {
+            let session = start(environment, options, dist, wake.clone(), &keys, host)?;
+            // The session ends before the registry settles.
+            let (exit_code, _, summary) = drive(
+                options,
+                session,
+                Some(worker),
+                &keys,
+                &wake,
+                debugger,
+                started,
+            )?;
+            Ok((exit_code, summary))
+        })?;
+    Ok(Finished {
+        exit_code,
+        summary,
+        registry,
+    })
 }
 
 /// Headless answers to dialogs: each one's default button, pressed once its
@@ -373,7 +474,7 @@ fn report(
     let frame = session.frame();
     let sys = &session.machine.sys;
     let mut fields = vec![
-        format!("\"exe\": {}", json(&options.exe.to_string_lossy())),
+        format!("\"exe\": {}", json(&options.started())),
         format!(
             "\"backend\": {}",
             json(if options.jit { "jit" } else { "interpreter" })
@@ -755,6 +856,9 @@ fn drive(
 
                     window::Event::Volume(percent) => {
                         metrics.audio.set_volume(percent);
+                    }
+                    window::Event::Disc(letter, image, reply) => {
+                        let _ = reply.send(session.change_disc(letter, &image));
                     }
                     window::Event::Repaint => {}
                     window::Event::FocusLost => {

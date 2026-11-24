@@ -1,0 +1,31 @@
+ntdll: shrink a low-fragmentation heap block in place
+
+Windows 7 shrank every heap block in place, so HeapReAlloc and the CRT's
+realloc returned the same pointer for a smaller size. Programs of that era
+shrink a buffer and keep using the old pointer. Windows 10's
+low-fragmentation heap moves a block whose new size falls in another size
+class, which frees the old one under them; Wine copied that. A visual-novel
+engine's UI library crashes this way on Windows 10 and later.
+
+A low-fragmentation block now shrinks in place whatever its new size, and
+stays in its bin. Growth still moves it. The HeapReAlloc contract allows
+both outcomes, and other blocks already shrink in place.
+
+--- a/dlls/ntdll/heap.c
++++ b/dlls/ntdll/heap.c
+@@ -2177,11 +2177,11 @@
+ 
+ static NTSTATUS heap_resize_block_lfh( struct block *block, ULONG flags, SIZE_T block_size, SIZE_T size, SIZE_T *old_size, void **ret )
+ {
+-    /* as native LFH does it with different block size: refuse to resize even though we could */
+-    if (ROUND_SIZE( *old_size, BLOCK_ALIGN - 1) != ROUND_SIZE( size, BLOCK_ALIGN - 1)) return STATUS_NO_MEMORY;
+-    if (size >= *old_size) return STATUS_NO_MEMORY;
++    /* As Windows 7 does, a block shrinks in place whatever its new size class,
++     * and stays in its bin; only growth moves it. */
++    if (size > *old_size) return STATUS_NO_MEMORY;
+ 
+-    block_size = BLOCK_BIN_SIZE( BLOCK_SIZE_BIN( block_size ) );
++    block_size = block_get_size( block );
+     block_set_flags( block, BLOCK_FLAG_USER_MASK & ~BLOCK_FLAG_USER_INFO, BLOCK_USER_FLAGS( flags ) );
+     block->tail_size = block_size - sizeof(*block) - size;
+     initialize_block( block, *old_size, size, flags );

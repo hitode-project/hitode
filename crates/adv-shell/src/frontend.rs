@@ -69,6 +69,9 @@ pub struct Ui {
     /// Whether the game has shown a frame yet; until then it is loading.
     #[cfg(host_view)]
     presented: bool,
+    /// Called once the guest first shows a frame or a dialog.
+    #[cfg(host_view)]
+    on_shown: Option<Box<dyn FnOnce()>>,
 
     #[cfg(host_view)]
     #[cfg(host_view)]
@@ -138,6 +141,8 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             frame_times: std::collections::VecDeque::new(),
             #[cfg(host_view)]
             presented: false,
+            #[cfg(host_view)]
+            on_shown: None,
 
             #[cfg(host_view)]
             #[cfg(host_view)]
@@ -246,6 +251,21 @@ impl Ui {
     #[cfg(host_view)]
     pub(crate) fn presented(&self) -> bool {
         self.presented
+    }
+
+    #[cfg(host_view)]
+    pub(crate) fn observe_shown(&mut self, observer: Box<dyn FnOnce()>) {
+        self.on_shown = Some(observer);
+        if self.presented || !self.dialogs.current().dialogs.is_empty() {
+            self.shown();
+        }
+    }
+
+    #[cfg(host_view)]
+    fn shown(&mut self) {
+        if let Some(observer) = self.on_shown.take() {
+            observer();
+        }
     }
 
     /// Milliseconds between the presents of the last second, oldest first.
@@ -392,6 +412,7 @@ impl Ui {
                 window::Event::AudioSuspended(_)
                 | window::Event::Volume(_)
                 | window::Event::Paused(_)
+                | window::Event::Disc(..)
                 | window::Event::Text(..) => {}
                 #[cfg(host_view)]
                 window::Event::ForceClose => {
@@ -450,6 +471,9 @@ impl Ui {
             }
         }
         window.presentation(self.menus.current(), self.dialogs.current())?;
+        if !self.dialogs.current().dialogs.is_empty() {
+            self.shown();
+        }
         let started = Instant::now();
         let events = window.take_events();
         self.repaint |= self.pump_events(events, started)?;
@@ -485,6 +509,7 @@ impl Ui {
                 }
                 self.frame_times.push_back(now);
                 self.presented = true;
+                self.shown();
                 self.metric(Delivery::Present(
                     completed.serial,
                     completed.elapsed,

@@ -31,6 +31,13 @@ pub enum Event {
     Paused(bool),
     #[cfg(host_view)]
     Volume(u8),
+    /// The player put the disc in `.1` in drive `.0` (WINE-SES-13).
+    #[cfg(host_view)]
+    Disc(
+        char,
+        std::path::PathBuf,
+        std::sync::mpsc::SyncSender<Result<(), String>>,
+    ),
     Repaint,
 }
 impl Event {
@@ -136,8 +143,8 @@ pub(crate) mod mobile;
 /// The guest dialog and menu data a mobile host's overlay draws and answers.
 #[cfg(mobile)]
 pub use adv_runtime::{
-    DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow, MenuBar,
-    MenuCommand, MenuEvent, MenuItem,
+    ControlKind, DialogControl, DialogEvent, DialogFont, DialogImage, DialogSet, DialogTarget,
+    DialogWindow, MenuBar, MenuCommand, MenuEvent, MenuItem, control_kind,
 };
 #[cfg(target_os = "ios")]
 pub use mobile::GameContainer;

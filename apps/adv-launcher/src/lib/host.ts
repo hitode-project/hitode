@@ -18,6 +18,13 @@ export interface LibraryGame {
   favorite: boolean; nsfw: boolean; sessions: PlaySession[];
   offline: "disk" | "missing" | null;
   daily: Record<string, number>; lastRun: LastRun | null;
+  /** Until its setup has run: the setup on the game's first disc. */
+  setup?: string;
+  /** The folder its setup installed into, behind `C:\Program Files`. */
+  programFiles?: string;
+}
+export interface DiscInspection {
+  label: string; bytes: number; programs: string[]; codepage: Codepage;
 }
 export interface ExeCandidate {
   path: string; size: number; arch: "x86" | "x64" | "other"; codepage: Codepage;
@@ -26,6 +33,10 @@ export interface ExeCandidate {
 export interface FolderInspection {
   folder: string; title: string; exes: ExeCandidate[];
   suggested: number | null; inLibrary: string | null;
+  registryFiles?: string[];
+}
+export interface RegistryImportResult {
+  entries: number; normalizedWow64: number;
 }
 export interface ScanFound {
   folder: string; relative: string; depth: number; title: string;
@@ -54,7 +65,7 @@ export interface RunSummary {
   api_gaps?: { called: string[]; imported: string[] } | null;
 }
 export type GameFinished =
-  | { gameId: string; exitCode: number; summary: RunSummary }
+  | { gameId: string; exitCode: number; summary: RunSummary; registry?: RegistryImportResult }
   | { gameId: string; error: string; summary: RunSummary };
 
 export async function libraryPickFolder(options?: FolderPickOptions): Promise<string | null> {
@@ -76,6 +87,16 @@ export function libraryScan(root: string, depth: number): Promise<ScanFound[]> {
 export function libraryAdd(folder: string, exe: string, codepage: Codepage, title: string): Promise<LibraryGame | null> {
   return call("library_add", { folder, exe, codepage, title }, null);
 }
+export function libraryInspectDisc(path: string): Promise<DiscInspection | null> {
+  return call("library_inspect_disc", { path }, null);
+}
+export function libraryAddInstall(target: string | null, setup: string, codepage: Codepage, title: string): Promise<LibraryGame | null> {
+  return call("library_add_install", { target, setup, codepage, title }, null);
+}
+/** Folders setups installed programs into, outside every game's folder. */
+export function libraryInstalled(id: string): Promise<{ name: string; folder: string }[]> {
+  return call("library_installed", { id }, []);
+}
 export function libraryUpdate(id: string, patch: GamePatch): Promise<LibraryGame | null> {
   return call("library_update", { id, patch }, null);
 }
@@ -92,8 +113,12 @@ export function hapticTick(): void {
 export function libraryRestore(game: LibraryGame, index: number): Promise<void> {
   return call("library_restore", { game, index }, undefined);
 }
-export function startGame(id: string): Promise<void> {
-  return call("start_game", { id, filter: gameFilter(id), playback: playback(id) }, undefined);
+/** Sends a line to the running script, as Enter does. */
+export function scriptInput(line: string): Promise<void> {
+  return call("script_input", { line }, undefined);
+}
+export function startGame(id: string, exe?: string): Promise<void> {
+  return call("start_game", { id, filter: gameFilter(id), playback: playback(id, exe) }, undefined);
 }
 /** Pause or resume the running game, e.g. while the pause menu or report page is open. */
 export function pauseGame(paused: boolean): Promise<void> {
@@ -106,6 +131,10 @@ export function stopGame(force = false): Promise<void> {
 /** Opens drive C: of the Wine prefix, where games' other saved data is. */
 export function revealDrive(): Promise<void> {
   return call("reveal_drive", {}, undefined);
+}
+/** Imports a `.reg` file or executes a registry restore `.bat`/`.cmd` script for a game. */
+export function importRegistry(id: string, path: string, discs: string[]): Promise<RegistryImportResult | null> {
+  return call("import_registry", { id, path, discs }, null);
 }
 export function revealPath(path: string): Promise<void> {
   return call("reveal_path", { path }, undefined);

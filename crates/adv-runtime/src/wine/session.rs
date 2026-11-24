@@ -11,11 +11,15 @@ mod debug;
 mod files;
 mod fonts;
 mod host;
+mod installed;
+mod registry;
 pub use adv_cpu::backend::GuestExt;
 pub use adv_machine::exception::Checkpoint;
 pub use adv_nt::exception::{Record, StubGaps, WINE_STUB};
 pub use adv_nt::identity::Images;
 pub use host::Host;
+pub use installed::Installed;
+pub use registry::{RegistryReport, RegistryWatch};
 
 use adv_drv::user::project;
 use std::cell::{Cell, RefCell};
@@ -51,7 +55,9 @@ pub struct Config<'a> {
     /// selects the portable backend's full system discovery; empty isolates
     /// the session to fonts installed in its prefix and Wine distribution.
     pub fonts: &'a str,
-    pub exe: &'a Path,
+    /// The program on the host whose directory becomes the program drive.
+    /// None when a [`Program`] runs without one, as an installer from a disc.
+    pub exe: Option<&'a Path>,
     pub width: u32,
     pub height: u32,
     pub jit: bool,
@@ -68,6 +74,50 @@ pub struct SessionOptions {
     pub font_files: Vec<PathBuf>,
     pub cdroms: Vec<(char, PathBuf)>,
     pub install_dir: Option<PathBuf>,
+    /// Started instead of [`Config::exe`], on the same drives and prefix.
+    pub program: Option<Program>,
+    /// Host files the guest reads with these contents instead; the files
+    /// themselves stay unchanged.
+    pub replacements: Vec<(PathBuf, Vec<u8>)>,
+}
+
+/// A program a session starts in place of its game: a tool in the program
+/// folder, a disc's setup or a Wine program. Like Explorer, it starts in its
+/// image's directory unless `directory` names another.
+#[derive(Clone, Debug)]
+pub struct Program {
+    pub image: Image,
+    /// The command line after the quoted image path.
+    pub arguments: String,
+    /// A DOS directory, relative to the program directory unless absolute.
+    pub directory: Option<String>,
+    /// Receives standard output and error; none leaves the standard
+    /// handles empty, as for a game.
+    pub output: Option<RawFd>,
+    /// Standard input, with output only; none reads nothing.
+    pub input: Option<RawFd>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Image {
+    /// A DOS path on the session's drives; relative paths start at the
+    /// program directory.
+    Guest(String),
+    /// A host file. Inside the program folder or drive C: it keeps that path;
+    /// elsewhere its directory takes the next free drive letter.
+    Host(PathBuf),
+}
+
+impl Program {
+    pub fn new(image: Image) -> Self {
+        Self {
+            image,
+            arguments: String::new(),
+            directory: None,
+            output: None,
+            input: None,
+        }
+    }
 }
 
 /// Where a run of the session stopped.
@@ -118,7 +168,8 @@ impl Drop for Session {
 }
 
 struct Settings {
-    exe: PathBuf,
+    /// The started image on the host, when it has one.
+    exe: Option<PathBuf>,
     dist: PathBuf,
     prefix: PathBuf,
     drive: PathBuf,
@@ -685,15 +736,15 @@ impl Session {
         prepare: impl FnOnce(&mut Machine<Cpu>) -> Result<(), String>,
     ) -> Result<Session, String> {
         host.check(config)?;
-        let exe = std::path::absolute(config.exe).map_err(|e| e.to_string())?;
+        let exe = config
+            .exe
+            .map(std::path::absolute)
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let config = Config {
-            exe: &exe,
+            exe: exe.as_deref(),
             ..*config
         };
-        let name = exe
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("the program name is not Unicode")?;
         let module = |name: &str| {
             let path = config.dist.join(MODULES).join(name);
             std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
@@ -716,53 +767,19 @@ impl Session {
             .socket_dir()
             .ok_or("the server has no socket")?;
 
-        // As Wine's `run_wineboot`, but restarting: the template stands for
-        // what `--init` installs, and no services run.
         let audio = adv_device::AudioControl::new(true);
-        if !host.booted() {
-            let mut boot = new_machine(&process_config, &drive, clock.clone(), &wake, &audio)?;
-            boot.cpu.executor_mut().use_tier1_only();
-            boot.ext.insert(prepared.mounts.clone());
-            let command_line = format!("\"{WINEBOOT}\" --restart");
-            let startup = Startup {
-                image: WINEBOOT,
-                command_line: &command_line,
-                directory: r"C:\windows\system32\",
-                environment: ENVIRONMENT,
-                locale: config.locale,
-                debug: config.debug,
-                stdin: None,
-                stdout: None,
-                stderr: None,
-                graphics_driver: super::GRAPHICS_DRIVER,
-                fonts: process_config.fonts,
-            };
-            process::start(
-                &mut boot,
-                &ntdll,
-                &apisets,
-                &startup,
-                &prefix,
-                &socket,
-                Box::new(shared.clone()),
-            )
-            .map_err(|e| format!("wineboot: {e}"))?;
-            boot.ext.insert(shared.clone());
-            adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), &ntdll);
-            match run(
-                &mut boot,
-                &wake,
-                Instant::now() + BOOT,
-                |_| Ok(false),
-                None,
-                None,
-            ) {
-                Stop::Exited(0) => {}
-                stop => return Err(format!("wineboot: {stop:?}")),
-            }
-            drop(boot);
-            host.finish_boot();
-        }
+        host.boot(
+            &config,
+            &prefix,
+            &drive,
+            &socket,
+            &mut clock,
+            &wake,
+            &shared,
+            &prepared.mounts,
+            (&ntdll, &apisets),
+            &audio,
+        )?;
 
         let mut fonts = host.fonts.prepare(&config, &drive, options)?;
         let config = process_config;
@@ -777,16 +794,25 @@ impl Session {
         machine.ext.insert(milestones.clone());
         machine.ext.get_mut::<SurfaceStore>().milestones = Some(milestones.clone());
         prepare(&mut machine)?;
+        // A program's output replaces the game's; its input reads what it is
+        // given, or nothing.
+        let output = options.program.as_ref().and_then(|program| program.output);
+        let input = options.program.as_ref().and_then(|program| program.input);
+        let nothing = output
+            .filter(|_| input.is_none())
+            .map(|_| std::fs::File::open("/dev/null"))
+            .transpose()
+            .map_err(|e| format!("/dev/null: {e}"))?;
         let startup = Startup {
-            image: &format!("{}{name}", prepared.directory),
-            command_line: name,
-            directory: &prepared.directory,
+            image: &prepared.image,
+            command_line: &prepared.command_line,
+            directory: &prepared.start,
             environment: ENVIRONMENT,
             locale: config.locale,
             debug: config.debug,
-            stdin: None,
-            stdout: config.stdout,
-            stderr: None,
+            stdin: input.or(nothing.as_ref().map(std::os::fd::AsRawFd::as_raw_fd)),
+            stdout: output.or(config.stdout),
+            stderr: output,
             graphics_driver: super::GRAPHICS_DRIVER,
             fonts: config.fonts,
         };
@@ -836,7 +862,7 @@ impl Session {
             finished: None,
             idle: BTreeMap::new(),
             settings: Settings {
-                exe: exe.clone(),
+                exe: prepared.host_image,
                 dist: config.dist.to_owned(),
                 prefix: prefix.clone(),
                 drive: drive.clone(),
@@ -993,7 +1019,17 @@ impl Session {
                         self.retired_boundaries
                             .merge(&adv_nt::counters::Boundaries::of(&retired.ext));
                         debug::merge_api_diagnostics(&retired, &mut self.stub_gaps.borrow_mut());
+                        drop(retired);
                         self.idle.remove(&id);
+                        // Closing the exited process's channels signals waiters in the server.
+                        let _ = self.machine.visit_context(None, adv_nt::server::run);
+                        if self
+                            .machine
+                            .visit_context(None, adv_nt::server::deliver)
+                            .unwrap_or(false)
+                        {
+                            self.idle.remove(&next);
+                        }
                         check_children = true;
                     } else {
                         self.finished = Some(code);
@@ -1220,7 +1256,7 @@ impl Session {
                 drive: None,
                 locale: c.locale,
                 fonts: &c.fonts,
-                exe: Path::new(&child.image),
+                exe: Some(Path::new(&child.image)),
                 width: c.width,
                 height: c.height,
                 jit: c.jit,
@@ -1412,6 +1448,27 @@ impl Session {
         self.queued(queued)
     }
 
+    /// Puts the disc in `image` in drive `letter`, as a player swaps discs
+    /// (WINE-SES-13). Paths opened from then on read the new disc; files
+    /// already open keep the one they were opened on.
+    pub fn change_disc(&mut self, letter: char, image: &Path) -> Result<(), String> {
+        let letter = letter.to_ascii_uppercase();
+        let volume = files::disc(letter, image, files::codepage(self.settings.locale))?;
+        let root = self
+            .shared
+            .driver
+            .borrow()
+            .mounts
+            .change(letter, volume)
+            .map_err(|e| e.to_string())?;
+        let device = self
+            .settings
+            .prefix
+            .join("dosdevices")
+            .join(format!("{}:", letter.to_ascii_lowercase()));
+        link(&root, &device)
+    }
+
     /// Read the guest's windows again for the native views below.
     pub fn refresh_ui(&mut self) {
         let queued = project::refresh(&mut self.machine.ext);
@@ -1454,7 +1511,7 @@ impl Session {
     /// `STATUS_DLL_NOT_FOUND`.
     pub fn missing_import(&self) -> Option<String> {
         missing_import(
-            &self.settings.exe,
+            self.settings.exe.as_deref()?,
             &self.settings.drive.join("windows/system32"),
         )
     }
@@ -1618,7 +1675,7 @@ mod link_tests {
             drive: None,
             locale: 0x409,
             fonts: "",
-            exe: &exe,
+            exe: Some(&exe),
             width: 640,
             height: 480,
             jit: true,

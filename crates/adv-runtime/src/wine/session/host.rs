@@ -55,6 +55,165 @@ impl Host {
         Session::start_on(self, config, wake, options, prepare)
     }
 
+    /// Imports a `.reg` file into this host's Wine prefix (WINE-SES-11).
+    pub fn import_registry(
+        &mut self,
+        config: &Config<'_>,
+        file: &Path,
+    ) -> Result<registry::RegistryReport, String> {
+        registry::import_reg(self, config, file)
+    }
+
+    /// The registry a script is about to change, when `options` start one.
+    pub fn watch_registry(
+        &mut self,
+        config: &Config<'_>,
+        options: &SessionOptions,
+    ) -> Result<Option<registry::RegistryWatch>, String> {
+        let script = match options.program.as_ref().map(|program| &program.image) {
+            Some(Image::Host(path)) => registry::is_script(path),
+            Some(Image::Guest(path)) => registry::is_script(Path::new(path)),
+            None => false,
+        };
+        if script {
+            registry::watch(self, config).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// What a script wrote since `watch`, its `WOW6432Node` keys mirrored to
+    /// the 32-bit `SOFTWARE` tree (WINE-SES-11).
+    pub fn settle_registry(
+        &mut self,
+        config: &Config<'_>,
+        watch: &registry::RegistryWatch,
+    ) -> Result<registry::RegistryReport, String> {
+        registry::settle(self, config, watch)
+    }
+
+    /// The programs setups registered on this host's prefix, where they lie
+    /// on the host (WINE-SES-14).
+    pub fn installed(
+        &mut self,
+        config: &Config<'_>,
+        options: &SessionOptions,
+    ) -> Result<Vec<super::Installed>, String> {
+        super::installed::installed(self, config, options)
+    }
+
+    /// As Wine's `run_wineboot`, but restarting: the template stands for
+    /// what `--init` installs, and no services run. Once per host. The boot
+    /// shares the caller's modules and audio, so it holds no second copy.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn boot(
+        &mut self,
+        config: &Config<'_>,
+        prefix: &Path,
+        drive: &Path,
+        socket: &Path,
+        clock: &mut adv_machine::Clock,
+        wake: &WakeEvent,
+        shared: &Shared,
+        mounts: &adv_nt::file::volume::Mounts,
+        (ntdll, apisets): (&[u8], &[u8]),
+        audio: &adv_device::AudioControl,
+    ) -> Result<(), String> {
+        if self.booted() {
+            return Ok(());
+        }
+        let process_config = Config {
+            fonts: "",
+            ..*config
+        };
+        let mut boot = new_machine(&process_config, drive, clock.clone(), wake, audio)?;
+        boot.cpu.executor_mut().use_tier1_only();
+        boot.ext.insert(mounts.clone());
+        let command_line = format!("\"{WINEBOOT}\" --restart");
+        let startup = Startup {
+            image: WINEBOOT,
+            command_line: &command_line,
+            directory: r"C:\windows\system32\",
+            environment: ENVIRONMENT,
+            locale: config.locale,
+            debug: config.debug,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            graphics_driver: super::super::GRAPHICS_DRIVER,
+            fonts: "",
+        };
+        process::start(
+            &mut boot,
+            ntdll,
+            apisets,
+            &startup,
+            prefix,
+            socket,
+            Box::new(shared.clone()),
+        )
+        .map_err(|e| format!("wineboot: {e}"))?;
+        boot.ext.insert(shared.clone());
+        adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), ntdll);
+        match run(
+            &mut boot,
+            wake,
+            Instant::now() + BOOT,
+            |_| Ok(false),
+            None,
+            None,
+        ) {
+            Stop::Exited(0) => {}
+            stop => return Err(format!("wineboot: {stop:?}")),
+        }
+        drop(boot);
+        self.finish_boot();
+        Ok(())
+    }
+
+    /// Runs `work` against the booted prefix server while no session runs:
+    /// its socket, the connection owner and the time of the call.
+    pub(super) fn serve<R>(
+        &mut self,
+        config: &Config<'_>,
+        work: impl FnOnce(&Path, &mut Shared, Time) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.check(config)?;
+        let (prefix, drive) = self.prefix(config)?;
+        let wake = WakeEvent::new().map_err(|e| e.to_string())?;
+        let mut clock = adv_machine::Clock::real();
+        let mounts = adv_nt::file::volume::Mounts::default();
+        let mut shared = self.connect(config, &mut clock, &wake, mounts.clone())?;
+        let _lease = Lease(shared.clone());
+        let socket = shared
+            .driver
+            .borrow()
+            .server
+            .socket_dir()
+            .ok_or("the server has no socket")?;
+        if !self.booted() {
+            let module = |name: &str| {
+                let path = config.dist.join(MODULES).join(name);
+                std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+            };
+            let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
+            let audio = adv_device::AudioControl::new(true);
+            self.boot(
+                config,
+                &prefix,
+                &drive,
+                &socket,
+                &mut clock,
+                &wake,
+                &shared,
+                &mounts,
+                (&ntdll, &apisets),
+                &audio,
+            )?;
+        }
+        work(&socket, &mut shared, Time::now(&mut clock))
+    }
+
     pub(super) fn check(&self, config: &Config<'_>) -> Result<(), String> {
         if let Some(binding) = &self.binding {
             if binding.prefix != config.prefix || binding.dist != config.dist {

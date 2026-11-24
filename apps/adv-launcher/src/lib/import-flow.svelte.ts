@@ -3,16 +3,14 @@ import { call, inTauri } from "./bridge";
 import {
   addToLibrary,
   CODEPAGES,
-  defaultInstallTarget,
   encChoices,
   fakeInspection,
   fakeScan,
   FAKE_SCAN_ROOT,
-  pickInstallFolder,
-  takeInstallSource,
   type Enc,
 } from "./fake-import";
-import { libraryAdd, libraryInspect, libraryPickFolder, libraryScan, type ExeCandidate, type FolderInspection, type LibraryGame, type Novel, type ScanFound } from "./host";
+import { loadGameSetup, saveGameSetup } from "./fake-settings";
+import { libraryAdd, libraryAddInstall, libraryInspect, libraryInspectDisc, libraryInstalled, libraryPickFolder, libraryScan, libraryUpdate, type Codepage, type ExeCandidate, type FolderInspection, type LibraryGame, type Novel, type ScanFound } from "./host";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
 import { copyExternalFolder, storageSize, takeCopyableUri, type FolderPickOptions } from "./storage";
@@ -457,86 +455,166 @@ export class ImportPick {
 
 /* ---------- Installer / disc image ---------- */
 
-export type InstallStep = "识别" | "安装中" | "完成";
+/** The disc image the next install screen installs from. */
+let pendingDisc: string | null = null;
 
+export function chooseInstallDisc(path: string): void {
+  pendingDisc = path;
+}
+
+/** Where an install is: reading the disc, ready to run its setup, or choosing the installed program. */
+export type InstallStep = "读取" | "识别" | "错误" | "完成";
+
+/**
+ * Installing a game from a disc image: the disc's setup runs as the game
+ * (WINE-SES-12) with `C:\Program Files` in the chosen folder, then the player
+ * picks what it installed. A library entry stands for the install from the
+ * start, so the setup runs and ends like any game; `gameId` reopens the
+ * screen at its last step.
+ */
 export class InstallFlow {
-  readonly source = takeInstallSource();
-  readonly title = this.source.meta.title;
-  readonly disc = this.source.kind === "disc";
-  readonly encs = encChoices(this.title, this.source.mojibake);
-
-  step = $state<InstallStep>("识别");
+  step = $state<InstallStep>("读取");
+  error = $state("");
+  disc = $state("");
+  label = $state("");
+  detail = $state("");
+  programs = $state<string[]>([]);
+  setup = $state("");
+  title = $state("");
+  codepage = $state<Codepage>(932);
+  /** The chosen install folder; the library's own folder when null. */
+  target = $state<string | null>(null);
   keep = $state(true);
-  target = $state(defaultInstallTarget(this.title));
-  pct = $state(0);
-  exe = $state(this.source.exes[0] ?? "");
+  /** Further discs of a setup on several, mounted after the first and put in drive D: from the pause menu. */
+  more = $state<string[]>([]);
+  /**
+   * What the setup installed: in the install folder, or in a folder its
+   * uninstall entry names when it was told to install elsewhere.
+   */
+  exes = $state<{ value: string; label: string; codepage: Codepage; folder: string; exe: string }[]>([]);
+  exe = $state("");
   enc = $state<Enc>("ja");
-  /** Library id once added; the button then starts the game. */
-  addedId = $state<string | null>(null);
+  readonly encs = $derived(encChoices(this.title));
+  readonly #gameId: string | null;
 
-  readonly finished = $derived(this.pct >= 100);
-  readonly file = $derived(
-    this.source.files[Math.min(this.source.files.length - 1, Math.floor(this.pct / 26))] ?? "",
-  );
-  readonly discLine = $derived(this.keep ? `${this.source.drive} ${this.source.label}` : "不保留");
-
-  #timer: ReturnType<typeof setInterval> | undefined;
-
-  constructor() {
-    $effect(() => () => this.#stop());
+  constructor(gameId: string | null = null) {
+    this.#gameId = gameId;
+    if (gameId) void this.#installed(gameId);
+    else void this.#read();
   }
 
-  #stop(): void {
-    clearInterval(this.#timer);
-    this.#timer = undefined;
+  async #read(): Promise<void> {
+    const disc = pendingDisc;
+    pendingDisc = null;
+    if (!disc) return this.#fail(t("没有选择光盘镜像"));
+    this.disc = disc;
+    try {
+      const found = await libraryInspectDisc(disc);
+      if (!found) return this.#fail(t("无法读取光盘镜像"));
+      this.label = found.label;
+      this.title = found.label;
+      this.detail = t("光盘镜像 · {0}", sizeLabel(found.bytes));
+      this.programs = found.programs;
+      this.setup = found.programs[0] ?? "";
+      this.codepage = found.codepage;
+      this.enc = encOfCodepage(found.codepage);
+      this.step = this.setup ? "识别" : "错误";
+      if (!this.setup) this.error = t("光盘上没有可运行的程序");
+    } catch (error) {
+      this.#fail(String(error));
+    }
   }
 
-  /** Simulated installer run: the guest SETUP.EXE copying files. */
-  start(): void {
-    this.#stop();
-    this.pct = 0;
-    this.addedId = null;
-    this.step = "安装中";
-    this.#timer = setInterval(() => {
-      this.pct = Math.min(100, this.pct + 3);
-      if (this.pct >= 100) this.#stop();
-    }, 110);
-  }
-
-  cancelRun(): void {
-    this.#stop();
-    this.step = "识别";
-  }
-
-  /** Clicking the installer window presses its default button. */
-  tapFrame(): void {
-    if (!this.finished) {
-      this.#stop();
-      this.pct = 100;
-    } else {
+  async #installed(gameId: string): Promise<void> {
+    const game = library.get(gameId);
+    if (!game) return this.#fail(t("找不到这个游戏"));
+    this.title = game.title;
+    this.target = game.path;
+    this.enc = encOfCodepage(game.codepage);
+    try {
+      const found = await libraryScan(game.path, 3);
+      const exes = found.flatMap((f) =>
+        f.exes.map((x) => {
+          const path = [f.relative, x.path].filter(Boolean).join("/");
+          return { value: path, label: path, codepage: x.codepage, folder: game.path, exe: path };
+        }),
+      );
+      for (const program of await libraryInstalled(gameId)) {
+        for (const f of await libraryScan(program.folder, 1)) {
+          for (const x of f.exes) {
+            const exe = [f.relative, x.path].filter(Boolean).join("/");
+            const value = `${program.folder}/${exe}`;
+            exes.push({ value, label: `${program.name} · ${exe}`, codepage: x.codepage, folder: program.folder, exe });
+          }
+        }
+      }
+      this.exes = exes;
+      const suggested = found.find((f) => f.exe);
+      this.exe = suggested?.exe ? [suggested.relative, suggested.exe.path].filter(Boolean).join("/") : (exes[0]?.value ?? "");
       this.step = "完成";
+      if (!exes.length) this.error = t("安装位置里没有找到程序");
+    } catch (error) {
+      this.#fail(String(error));
     }
   }
 
-  changeTarget(): void {
-    this.target = pickInstallFolder(this.target, this.title);
+  #fail(message: string): void {
+    this.error = message;
+    this.step = "错误";
   }
 
-  pickExe(v: string): void {
-    this.exe = v;
-    this.addedId = null;
+  /** Up to four discs mount at once (D: to G:). */
+  get canAddDisc(): boolean {
+    return this.more.length < 3;
   }
 
-  pickEnc(v: Enc): void {
-    this.enc = v;
-    this.addedId = null;
+  async addDisc(): Promise<void> {
+    const path = await call<string | null>("pick_game_file", { kind: "disc" }, null);
+    if (path && path !== this.disc && !this.more.includes(path)) this.more = [...this.more, path];
   }
 
-  add(): void {
-    if (this.addedId) {
-      nav.replace({ name: "launch", gameId: this.addedId });
-      return;
+  async changeTarget(): Promise<void> {
+    const folder = await libraryPickFolder();
+    if (folder) this.target = folder;
+  }
+
+  /** Adds the install to the library and runs the setup as its game. */
+  async start(): Promise<void> {
+    const game = await libraryAddInstall(this.target, this.setup, CODEPAGES[this.enc], this.title.trim() || this.label);
+    if (!game) return this.#fail(t("无法添加到游戏库"));
+    const entry = library.put(game);
+    const setup = loadGameSetup(entry.id, game.codepage);
+    saveGameSetup(entry.id, { ...setup, discs: [this.disc, ...this.more] });
+    nav.replace({ name: "launch", gameId: entry.id });
+  }
+
+  pickExe(value: string): void {
+    this.exe = value;
+    const found = this.exes.find((x) => x.value === value);
+    if (found) this.enc = encOfCodepage(found.codepage);
+  }
+
+  pickEnc(value: Enc): void {
+    this.enc = value;
+  }
+
+  /** The installed program becomes the game; the disc stays only if asked. */
+  async add(): Promise<void> {
+    const id = this.#gameId;
+    const chosen = this.exes.find((x) => x.value === this.exe);
+    if (!id || !chosen) return;
+    const game = library.get(id);
+    if (game && chosen.folder !== game.path) {
+      // Installed elsewhere: the game's folder moves to where it went.
+      const moved = await libraryUpdate(id, { folder: chosen.folder, exe: chosen.exe, codepage: CODEPAGES[this.enc] });
+      if (moved) library.put(moved);
+    } else {
+      await library.setRun(id, { exe: chosen.exe, codepage: CODEPAGES[this.enc] });
     }
-    this.addedId = addToLibrary(this.source.meta.title, this.enc, this.target, this.source.meta);
+    if (!this.keep) {
+      const setup = loadGameSetup(id, CODEPAGES[this.enc]);
+      saveGameSetup(id, { ...setup, discs: [] });
+    }
+    nav.replace({ name: "launch", gameId: id });
   }
 }
