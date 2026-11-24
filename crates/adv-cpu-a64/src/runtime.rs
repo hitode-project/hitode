@@ -116,6 +116,10 @@ pub struct Runtime {
     pub row_work: u32,
     pub row_count: u32,
     pub row_suppressed: u64,
+    /// Completed FP vector strips (test-only; placed at the end to keep all
+    /// architectural `Runtime` field offsets unchanged).
+    #[cfg(test)]
+    pub vector_strips: u64,
 }
 
 const _: () = assert!(offset_of!(Runtime, host_sp) + size_of::<u64>() <= 64);
@@ -132,6 +136,8 @@ impl Runtime {
             native_batches: 0,
             #[cfg(test)]
             vector_regions: 0,
+            #[cfg(test)]
+            vector_strips: 0,
             cpu,
             window,
             shadow: 0,

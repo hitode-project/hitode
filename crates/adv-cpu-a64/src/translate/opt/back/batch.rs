@@ -31,11 +31,26 @@ pub(super) struct Price {
 pub(in crate::translate::opt) struct BatchEmitter<'b, 'f> {
     emitter: &'b mut Emitter<'f>,
     head: u32,
+    bail: Option<Label>,
 }
 
 impl BatchEmitter<'_, '_> {
     pub fn asm(&mut self) -> &mut Asm {
         &mut self.emitter.asm
+    }
+
+    /// Lazily allocates a mid-strip bail target (`A64-TR-9` / `A64-OPT-10`):
+    /// charges only completed strips `X3 - X4`, publishes recovery operands
+    /// when at least one strip ran, and falls into `scalar` so the failing
+    /// strip executes in exact guest order.
+    pub fn bail(&mut self) -> Label {
+        if let Some(label) = self.bail {
+            label
+        } else {
+            let label = self.emitter.asm.label();
+            self.bail = Some(label);
+            label
+        }
     }
 
     pub fn invariant(&mut self, value: Value, scratch: Reg) -> Reg {
@@ -209,10 +224,15 @@ impl Emitter<'_> {
         self.asm.bind(inner);
         self.count(batch.loop_.eip, Counter::Batch);
         let inner_start = self.asm.offset();
-        batch.plan.body.lower(&mut BatchEmitter {
-            emitter: self,
-            head: batch.loop_.eip,
-        });
+        let bail = {
+            let mut emitter = BatchEmitter {
+                emitter: self,
+                head: batch.loop_.eip,
+                bail: None,
+            };
+            batch.plan.body.lower(&mut emitter);
+            emitter.bail
+        };
         let body_end = self.asm.offset();
         for iv in &batch.loop_.ivs {
             let loc = self.locations[iv.base.0 as usize];
@@ -224,9 +244,26 @@ impl Emitter<'_> {
             self.batch_add(dst, src, (iv.stride as u32).wrapping_mul(lanes), U);
             self.copy(loc, Host::Register(dst), Type::I32);
         }
+        #[cfg(test)]
+        let count_strips = batch.plan.body.is_float();
+        #[cfg(not(test))]
+        let count_strips = false;
+        #[cfg(test)]
+        if count_strips {
+            use super::{Runtime, offset_of, str};
+
+            // Incremented only after a full FP strip completes (past admission
+            // guards and any pre-store validation bailouts).
+            let strips = offset_of!(Runtime, vector_strips) as u32;
+            self.asm.emit_all(&[
+                ldr(X, T, RT, strips),
+                add_imm(X, T, T, 1, false),
+                str(X, T, RT, strips),
+            ]);
+        }
         self.asm.emit(sub_imm(X, X4, X4, 1, false));
         self.asm.cbz(X, true, X4, inner);
-        let words = self.words_since(inner_start);
+        let words = self.words_since(inner_start) - if count_strips { 3 } else { 0 };
         let recovery_start = self.asm.offset();
         // Publish the last logical latch's recovery operands once per strip.
         for &(param, value) in &batch.recovery {
@@ -241,6 +278,26 @@ impl Emitter<'_> {
         let words = words + self.words_since(recovery_start);
         self.asm.emit(sub(X, COUNT, COUNT, X5, Lsl, 0));
         self.asm.b(entry);
+
+        if let Some(bail) = bail {
+            self.asm.bind(bail);
+            // Completed strips = planned (`X3`) - remaining (`X4`).
+            self.asm.emit(sub(X, X3, X3, X4, Lsl, 0));
+            self.asm.cbz(X, false, X3, scalar);
+            self.imm(T, charge);
+            self.asm.emit(mul(X, X5, X3, T));
+            for &(param, value) in &batch.recovery {
+                let dst = self.rd(param);
+                self.batch_address(value, dst, U);
+                self.copy(
+                    self.locations[param.0 as usize],
+                    Host::Register(dst),
+                    Type::I32,
+                );
+            }
+            self.asm.emit(sub(X, COUNT, COUNT, X5, Lsl, 0));
+            self.asm.b(scalar);
+        }
 
         // The scalar latch still charges and checkpoints before reaching
         // this edge. Retry the guards after one strip, unless the loop has

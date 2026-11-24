@@ -312,6 +312,7 @@ pub(super) fn recognize(
             values: &values,
             shape,
             mapped: BTreeMap::new(),
+            checked: std::collections::BTreeSet::new(),
             insts: Vec::new(),
             next: 0,
             bindings: BTreeMap::new(),
