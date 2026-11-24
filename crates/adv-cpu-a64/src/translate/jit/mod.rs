@@ -556,8 +556,37 @@ pub struct Jit<'a> {
     computation_facts: Option<ComputationFacts<'a>>,
 }
 
+/// Names the unit being lowered when lowering panics, so a report of a
+/// translator failure says which guest code reached it.
+struct Lowering<'a> {
+    unit: &'a Unit,
+    eip: u32,
+    computation: bool,
+}
+
+impl Drop for Lowering<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let insts = &self.unit.trace.insts;
+            eprintln!(
+                "a64: lowering the unit at {:#010x} panicked: {} instructions from {:#010x} to {:#010x}, computation {}",
+                self.eip,
+                insts.len(),
+                insts.first().map_or(0, |inst| inst.pc),
+                insts.last().map_or(0, |inst| inst.pc),
+                self.computation,
+            );
+        }
+    }
+}
+
 impl Jit<'_> {
     fn lower_form(&mut self, unit: &Unit, eip: u32, computation: bool) {
+        let _lowering = Lowering {
+            unit,
+            eip,
+            computation,
+        };
         self.code.asm.reset();
         self.code.x87.reset(unit.trace.len());
         while self.emit_unit(unit, eip, computation) {
