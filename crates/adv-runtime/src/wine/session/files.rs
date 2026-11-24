@@ -22,6 +22,28 @@ impl ReadFile for OpticalReader {
         self.pages.page(index)
     }
 }
+/// The ANSI code page of a session's `locale`.
+pub(super) fn codepage(locale: u32) -> u32 {
+    match locale {
+        0x411 => 932,
+        0x804 => 936,
+        0x404 => 950,
+        _ => 1252,
+    }
+}
+/// The medium of drive `letter` read from `image`, with names in `codepage`.
+pub(super) fn disc(letter: char, image: &Path, codepage: u32) -> Result<Rc<dyn Volume>, String> {
+    let mut cfg = adv_os::OsConfig::new("", "", "");
+    cfg.guest_root = r"C:\".into();
+    cfg.codepage = codepage;
+    let mut vfs = adv_os::Vfs::new(&cfg);
+    vfs.mount_disc(letter, image)
+        .map_err(|e| format!("CD-ROM {letter}: {e}"))?;
+    Ok(Rc::new(OpticalVolume {
+        vfs: Rc::new(vfs),
+        letter,
+    }))
+}
 fn entry(entry: DirEntry) -> Entry {
     Entry {
         name: entry.name,
@@ -200,7 +222,7 @@ fn place(
 }
 
 /// The host folder behind `C:\Program Files`, when the options give one.
-fn installation(options: &SessionOptions) -> Option<PathBuf> {
+pub(super) fn installation(options: &SessionOptions) -> Option<PathBuf> {
     let root = options.install_dir.as_ref()?;
     Some(root.canonicalize().unwrap_or_else(|_| root.clone()))
 }
@@ -216,7 +238,7 @@ fn free_drives(options: &SessionOptions, taken: Option<char>) -> impl Iterator<I
     })
 }
 
-fn drive_c(config: &Config<'_>, prefix: &Path) -> PathBuf {
+pub(super) fn drive_c(config: &Config<'_>, prefix: &Path) -> PathBuf {
     let drive = config
         .drive
         .map_or_else(|| prefix.join("drive_c"), Path::to_owned);
@@ -321,6 +343,7 @@ pub(super) fn prepare(
         }
     };
 
+    let codepage = codepage(config.locale);
     let mut cfg = adv_os::OsConfig::new(
         folder
             .as_ref()
@@ -334,18 +357,15 @@ pub(super) fn prepare(
     );
     cfg.guest_root = directory.clone();
     cfg.system_dir = drive_c.clone();
-    cfg.codepage = match config.locale {
-        0x411 => 932,
-        0x804 => 936,
-        0x404 => 950,
-        _ => 1252,
-    };
-    let mut vfs = adv_os::Vfs::new(&cfg);
-    for (letter, image) in &options.cdroms {
-        vfs.mount_disc(*letter, image)
-            .map_err(|e| format!("CD-ROM {letter}: {e}"))?;
-    }
-    let vfs = Rc::new(vfs);
+    cfg.codepage = codepage;
+    // Opening the game folder completes the state its installer leaves for
+    // a copied folder.
+    adv_os::Vfs::new(&cfg);
+    let discs = options
+        .cdroms
+        .iter()
+        .map(|(letter, image)| Ok((*letter, disc(*letter, image, codepage)?)))
+        .collect::<Result<Vec<_>, String>>()?;
     if let Some(path) = &options.install_dir {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         install = Some(path.canonicalize().map_err(|e| e.to_string())?);
@@ -366,20 +386,13 @@ pub(super) fn prepare(
         Some(root.canonicalize().map_err(|e| e.to_string())?)
     };
     let mut mounts = Mounts::new(install, root.clone());
-    for (letter, _) in vfs.optical_drives() {
+    for (letter, volume) in discs {
         let path = root
             .as_ref()
             .expect("session files directory")
             .join(letter.to_string());
         mounts
-            .attach(
-                letter,
-                path,
-                Rc::new(OpticalVolume {
-                    vfs: vfs.clone(),
-                    letter,
-                }),
-            )
+            .attach(letter, path, volume)
             .map_err(|e| e.to_string())?;
     }
     for (index, (original, bytes)) in replacements.into_iter().enumerate() {
@@ -405,10 +418,7 @@ pub(super) fn prepare(
         }
     }
     let mut letters = String::new();
-    let roots = mounts
-        .roots()
-        .map(|(letter, root)| (letter, root.to_owned()));
-    for (letter, root) in links.into_iter().chain(roots.collect::<Vec<_>>()) {
+    for (letter, root) in links.into_iter().chain(mounts.roots()) {
         link(
             &root,
             &devices.join(format!("{}:", letter.to_ascii_lowercase())),

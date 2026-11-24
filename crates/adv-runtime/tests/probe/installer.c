@@ -100,6 +100,8 @@ static int stage(const WCHAR *root)
 
     HKEY key;
     DWORD version = 3;
+    WCHAR icon[MAX_PATH + 4];
+    swprintf(icon, MAX_PATH + 4, L"%ls,0", game);
     check("register", RegCreateKeyExW(HKEY_LOCAL_MACHINE, VENDOR, 0, NULL, 0, KEY_WRITE, NULL, &key,
                                       NULL) == ERROR_SUCCESS &&
           RegSetValueExW(key, L"InstallDir", 0, REG_SZ, (BYTE *)target,
@@ -111,7 +113,9 @@ static int stage(const WCHAR *root)
           RegCreateKeyExW(HKEY_LOCAL_MACHINE, UNINSTALL, 0, NULL, 0, KEY_WRITE, NULL, &key, NULL) ==
                   ERROR_SUCCESS &&
               RegSetValueExW(key, L"DisplayName", 0, REG_SZ, (BYTE *)L"Probe Game",
-                             sizeof(L"Probe Game")) == ERROR_SUCCESS);
+                             sizeof(L"Probe Game")) == ERROR_SUCCESS &&
+              RegSetValueExW(key, L"DisplayIcon", 0, REG_SZ, (BYTE *)icon,
+                             (wcslen(icon) + 1) * sizeof(WCHAR)) == ERROR_SUCCESS);
     RegCloseKey(key);
 
     IShellLinkW *link;

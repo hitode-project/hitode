@@ -485,6 +485,33 @@ pub async fn set_game_filter(window: WebviewWindow, filter: String) -> Result<()
     .map_err(|error| error.to_string())?
 }
 
+/// Puts another of the game's disc images in drive `letter` while it runs.
+#[tauri::command]
+pub async fn change_disc(
+    window: WebviewWindow,
+    letter: char,
+    path: std::path::PathBuf,
+) -> Result<(), String> {
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    window
+        .run_on_main_thread(move || {
+            let done = HOST.with_borrow(|host| {
+                host.as_ref()
+                    .and_then(|host| host.session.as_ref())
+                    .map(|session| session.change_disc(letter, path))
+                    .ok_or_else(|| "no game is running".to_string())
+            });
+            let _ = reply.send(done);
+        })
+        .map_err(|error| error.to_string())?;
+    let changed = tauri::async_runtime::spawn_blocking(move || {
+        result.recv().map_err(|error| error.to_string())?
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    crate::play::disc_changed(changed).await
+}
+
 pub fn window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     if window.label() != "main" {
         return;

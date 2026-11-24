@@ -31,6 +31,13 @@ pub enum Event {
     Paused(bool),
     #[cfg(host_view)]
     Volume(u8),
+    /// The player put the disc in `.1` in drive `.0` (WINE-SES-13).
+    #[cfg(host_view)]
+    Disc(
+        char,
+        std::path::PathBuf,
+        std::sync::mpsc::SyncSender<Result<(), String>>,
+    ),
     Repaint,
 }
 impl Event {

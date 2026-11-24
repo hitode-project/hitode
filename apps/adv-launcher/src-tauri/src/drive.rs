@@ -134,3 +134,58 @@ pub async fn import_registry(
         normalized_wow64: report.normalized_wow64,
     })
 }
+
+/// A folder a setup installed a program into, outside every game's folder.
+#[derive(Serialize)]
+pub struct Installed {
+    name: String,
+    folder: PathBuf,
+}
+
+/// Where setups put programs the library does not hold yet, as their
+/// uninstall entries say (WINE-SES-14). A setup told to install elsewhere
+/// than the chosen folder leaves its game there.
+#[tauri::command]
+pub async fn library_installed(app: AppHandle, id: String) -> Result<Vec<Installed>, String> {
+    let _activity = app.state::<crate::game_storage::Activity>().acquire()?;
+    let (exe, data_dir, codepage, program_files, folders) = {
+        let library = app.state::<Mutex<crate::library::Library>>();
+        let library = library.lock().unwrap();
+        let (exe, data_dir, codepage) = library.launch(&id).map_err(|e| e.to_string())?;
+        let (_, program_files) = library.installation(&id).map_err(|e| e.to_string())?;
+        let folders: Vec<PathBuf> = library
+            .games
+            .iter()
+            .map(|game| game.folder.clone())
+            .collect();
+        (exe, data_dir, codepage, program_files, folders)
+    };
+    let mut options = adv_shell::Options::new(exe, data_dir);
+    options.codepage = Some(codepage);
+    options.install_dir = program_files;
+    apply(&app, &mut options)?;
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || crate::distribution::prepare_in(&app_data))
+        .await
+        .map_err(|e| e.to_string())??;
+    let app_for_run = app.clone();
+    let found = tauri::async_runtime::spawn_blocking(move || {
+        app_for_run
+            .state::<adv_shell::Execution>()
+            .installed(options)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(found
+        .into_iter()
+        .filter(|program| {
+            !folders
+                .iter()
+                .any(|folder| program.folder.starts_with(folder))
+        })
+        .map(|program| Installed {
+            name: program.name,
+            folder: program.folder,
+        })
+        .collect())
+}

@@ -422,7 +422,7 @@ fn query_volume_in(
     class: u32,
 ) -> Result<(), Error> {
     let mounts = volume::mounts(env);
-    if mounts.roots().next().is_some() {
+    if mounts.has_discs() {
         let fd = server::handle_fd(env, handle)?;
         if let Some(info) = mounts.info(fd.fd) {
             let (bytes, result) = volume::information(&info, class, length)?;
@@ -704,7 +704,7 @@ pub fn control(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         return Outcome::Return(status::INVALID_PARAMETER);
     }
     let mounts = volume::mounts(env);
-    if code == FSCTL_SET_SPARSE && mounts.roots().next().is_some() {
+    if code == FSCTL_SET_SPARSE && mounts.has_discs() {
         match server::handle_fd(env, handle) {
             Ok(fd) if mounts.info(fd.fd).is_some() => {
                 return Outcome::Return(volume::WRITE_PROTECTED);

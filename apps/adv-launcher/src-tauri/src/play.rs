@@ -191,3 +191,16 @@ impl Playback {
         Ok(options)
     }
 }
+
+/// Waits off the UI thread until the game's thread has changed the disc.
+pub async fn disc_changed(
+    result: std::sync::mpsc::Receiver<Result<(), String>>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|_| "the game did not change the disc".to_string())?
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}

@@ -392,6 +392,7 @@ impl Ui {
                 window::Event::AudioSuspended(_)
                 | window::Event::Volume(_)
                 | window::Event::Paused(_)
+                | window::Event::Disc(..)
                 | window::Event::Text(..) => {}
                 #[cfg(host_view)]
                 window::Event::ForceClose => {

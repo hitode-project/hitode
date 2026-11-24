@@ -400,6 +400,20 @@ impl Session {
             .as_ref()
             .map_or_else(Vec::new, |ui| ui.frame_intervals())
     }
+    /// Puts the disc in `image` in drive `letter`; the result arrives once the
+    /// game's thread has changed it.
+    pub fn change_disc(
+        &self,
+        letter: char,
+        image: std::path::PathBuf,
+    ) -> std::sync::mpsc::Receiver<Result<(), String>> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.driver
+            .view
+            .hub()
+            .push(Event::Disc(letter, image, reply));
+        result
+    }
     pub fn set_volume(&self, percent: u8) {
         self.driver.view.hub().push(Event::Volume(percent.min(100)));
     }

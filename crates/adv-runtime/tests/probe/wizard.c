@@ -46,9 +46,10 @@ static INT_PTR CALLBACK page(HWND dialog, UINT message, WPARAM wparam, LPARAM lp
     if (message == WM_NOTIFY && ((NMHDR *)lparam)->code == PSN_SETACTIVE) {
         HWND sheet = GetParent(dialog);
         int index = PropSheet_HwndToIndex(sheet, dialog);
+        PropSheet_SetWizButtons(sheet, index == 2 ? PSWIZB_BACK | PSWIZB_FINISH : PSWIZB_NEXT);
+        /* The page is ready for its answer once this is printed. */
         printf("page=%d\n", index);
         fflush(stdout);
-        PropSheet_SetWizButtons(sheet, index == 2 ? PSWIZB_BACK | PSWIZB_FINISH : PSWIZB_NEXT);
         return TRUE;
     }
     if (message == WM_NOTIFY && ((NMHDR *)lparam)->code == PSN_WIZFINISH)

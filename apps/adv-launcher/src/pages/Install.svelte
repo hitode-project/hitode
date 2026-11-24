@@ -45,6 +45,11 @@
             {#if !device.touch}<button class="quiet sm" style="margin-right: -12px" onclick={() => void flow.changeTarget()}>{t("更改…")}</button>{/if}
           </div>
           <div class="rw">
+            <span class="k" style="flex: 0 0 auto">{t("光盘")}</span>
+            <span class="v mono" style="flex: 1 1 auto; min-width: 0; text-align: right">{[flow.disc, ...flow.more].map((p) => p.split(/[\\/]/).pop()).join(" · ")}</span>
+            {#if flow.canAddDisc}<button class="quiet sm" style="margin-right: -12px" onclick={() => void flow.addDisc()}>{t("添加光盘…")}</button>{/if}
+          </div>
+          <div class="rw">
             <span class="k">{t("游玩时保留光盘")}</span>
             <ImportSwitch checked={flow.keep} label={t("游玩时保留光盘")} onchange={(v) => (flow.keep = v)} />
           </div>

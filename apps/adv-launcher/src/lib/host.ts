@@ -93,6 +93,10 @@ export function libraryInspectDisc(path: string): Promise<DiscInspection | null>
 export function libraryAddInstall(target: string | null, setup: string, codepage: Codepage, title: string): Promise<LibraryGame | null> {
   return call("library_add_install", { target, setup, codepage, title }, null);
 }
+/** Folders setups installed programs into, outside every game's folder. */
+export function libraryInstalled(id: string): Promise<{ name: string; folder: string }[]> {
+  return call("library_installed", { id }, []);
+}
 export function libraryUpdate(id: string, patch: GamePatch): Promise<LibraryGame | null> {
   return call("library_update", { id, patch }, null);
 }

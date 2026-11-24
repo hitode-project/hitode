@@ -289,7 +289,7 @@ fn cabinet(files: &[(&str, &[u8])]) -> Vec<u8> {
     cab
 }
 
-// spec: WINE-SES-10, WINE-SES-12
+// spec: WINE-SES-10, WINE-SES-12, WINE-SES-14
 #[test]
 fn a_disc_setup_installs_a_game_that_then_runs_from_drive_c() {
     let Some(wine::Wine { dist, probes }) = wine::wine() else {
@@ -378,6 +378,26 @@ fn a_disc_setup_installs_a_game_that_then_runs_from_drive_c() {
     assert!(
         system.contains(r"[Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ProbeGame]")
     );
+    // Its uninstall entry tells where it went.
+    let config = Config {
+        dist: &dist,
+        prefix: &prefix,
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: None,
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: None,
+    };
+    let found = host.installed(&config, &SessionOptions::default()).unwrap();
+    assert!(
+        found.iter().any(|program| program.name == "Probe Game"
+            && program.folder == installed.canonicalize().unwrap()),
+        "{found:?}"
+    );
 
     // The installed game keeps its drive C: path, so what the setup wrote
     // about it holds.
@@ -429,13 +449,17 @@ fn a_setup_wizard_shows_natively_and_a_tree_falls_back_to_its_painting() {
         .unwrap();
     let until = Instant::now() + Duration::from_secs(60);
     let mut pressed = Vec::new();
-    // Each page is answered once: a click the guest has not handled yet
-    // leaves the same page showing.
-    let mut answered = None;
     let mut unavailable = std::collections::BTreeSet::new();
     let (mut license, mut banner, mut progress, mut browser) = (false, false, false, false);
     let stop = loop {
         assert!(Instant::now() < until, "the wizard was not answered");
+        // Each page is answered once it says it is ready. Snapshots arrive
+        // after the guest answers them, so the last page waits until one
+        // shows its Finish button; the sheet's other buttons serve every page.
+        let ready = std::fs::read_to_string(root.join("stdout"))
+            .unwrap()
+            .matches("page=")
+            .count();
         session.refresh_ui();
         let dialogs = session.dialogs().dialogs;
         let painted = session
@@ -478,18 +502,17 @@ fn a_setup_wizard_shows_natively_and_a_tree_falls_back_to_its_painting() {
                     && control.visible
                     && control.enabled
             });
-            let page = dialog
-                .controls
-                .iter()
-                .find(|control| control.kind == ControlKind::Container && control.visible)
-                .map(|control| control.target);
+            let expected = if pressed.len() == 2 {
+                "Finish"
+            } else {
+                "&Next >"
+            };
             if let Some(button) = default
-                && page.is_some()
-                && page != answered
+                && ready > pressed.len()
+                && button.text == expected
             {
                 pressed.push(button.text.clone());
                 session.dialog_event(DialogEvent::Click(button.target));
-                answered = page;
             }
         }
         match session.run(Instant::now() + Duration::from_millis(20)) {
@@ -507,5 +530,91 @@ fn a_setup_wizard_shows_natively_and_a_tree_falls_back_to_its_painting() {
     assert!(unavailable.is_empty(), "{unavailable:?}");
     assert!(license && banner && progress && browser, "{text}");
     assert_eq!(pressed, ["&Next >", "&Next >", "Finish"]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// `image` with volume label `label` in its primary and Joliet descriptors.
+fn labelled(mut image: Vec<u8>, label: &str) -> Vec<u8> {
+    let primary = &mut image[16 * 2048 + 40..16 * 2048 + 72];
+    primary.fill(b' ');
+    primary[..label.len()].copy_from_slice(label.as_bytes());
+    let joliet: Vec<u8> = format!("{label:<16}")
+        .encode_utf16()
+        .flat_map(u16::to_be_bytes)
+        .collect();
+    image[17 * 2048 + 40..17 * 2048 + 72].copy_from_slice(&joliet);
+    image
+}
+
+// spec: WINE-SES-13
+#[test]
+fn a_disc_changes_while_a_setup_waits_and_kept_files_read_the_first() {
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
+        return;
+    };
+    if !in_own_process("a_disc_changes_while_a_setup_waits_and_kept_files_read_the_first") {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("adv-wine-swap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    for (name, label, text) in [
+        ("one.iso", "DISC1", "first"),
+        ("two.iso", "DISC2", "second"),
+    ] {
+        let image = with_modules(&[("DISC.TXT", text.as_bytes().to_vec())]);
+        std::fs::write(root.join(name), labelled(image, label)).unwrap();
+    }
+    let log = root.join("stdout");
+    let stdout = std::fs::File::create(&log).unwrap();
+    let config = Config {
+        dist: &dist,
+        prefix: &root.join("prefix"),
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: Some(&probes.join("discswap.exe")),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: Some(stdout.as_raw_fd()),
+    };
+    let options = SessionOptions {
+        cdroms: vec![('D', root.join("one.iso"))],
+        ..SessionOptions::default()
+    };
+    let mut host = Host::default();
+    let mut session = host
+        .start(
+            &config,
+            adv_sync::WakeEvent::new().unwrap(),
+            &options,
+            |_| Ok(()),
+        )
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(60);
+    let mut changed = false;
+    let stop = loop {
+        assert!(Instant::now() < until, "the setup did not finish");
+        if !changed && std::fs::read_to_string(&log).unwrap().contains("insert=2") {
+            session.change_disc('d', &root.join("two.iso")).unwrap();
+            changed = true;
+        }
+        match session.run(Instant::now() + Duration::from_millis(20)) {
+            Stop::Paused => {}
+            stop => break stop,
+        }
+    };
+    drop(session);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert!(
+        changed
+            && text.contains("label=DISC2")
+            && text.contains("second=ok")
+            && text.contains("kept=ok"),
+        "{text}"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

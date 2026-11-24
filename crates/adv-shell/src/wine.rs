@@ -48,6 +48,17 @@ pub(crate) fn restore_registry(
     environment.restore_registry(&config, &session_options(options), file)
 }
 
+/// The programs setups installed on the prefix of `options` (WINE-SES-14).
+pub(crate) fn installed(
+    environment: &mut WineHost,
+    options: &Options,
+    dist: &Path,
+) -> Result<Vec<adv_runtime::wine::session::Installed>, String> {
+    let (prefix, debug, codepage) = facts(options)?;
+    let config = config(options, dist, &prefix, &debug, codepage, "", None);
+    environment.installed(&config, &session_options(options))
+}
+
 /// The prefix, `WINEDEBUG` and code page a session of `options` runs with.
 fn facts(options: &Options) -> Result<(std::path::PathBuf, String, u32), String> {
     let prefix = match &options.wine_prefix {
@@ -807,6 +818,9 @@ fn drive(
 
                     window::Event::Volume(percent) => {
                         metrics.audio.set_volume(percent);
+                    }
+                    window::Event::Disc(letter, image, reply) => {
+                        let _ = reply.send(session.change_disc(letter, &image));
                     }
                     window::Event::Repaint => {}
                     window::Event::FocusLost => {

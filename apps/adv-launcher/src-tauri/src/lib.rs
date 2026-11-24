@@ -167,6 +167,7 @@ pub fn run() {
                 post_text,
                 start_game,
                 game::pause_game,
+                game::change_disc,
                 game::set_game_filter,
                 stop_game,
                 overlay::set_overlay_input,
@@ -206,6 +207,7 @@ pub fn run() {
                 game_storage::use_game_copy,
                 drive::reveal_drive,
                 drive::import_registry,
+                drive::library_installed,
                 library::reveal_path,
                 gamepad::gamepad_get_state,
                 gamepad::gamepad_save_config
@@ -261,6 +263,7 @@ pub fn run() {
         start_game,
         stop_game,
         game::pause_game,
+        game::change_disc,
         game::set_game_filter,
         game::set_game_playback,
         game::game_fps,
@@ -308,6 +311,7 @@ pub fn run() {
         game_storage::use_game_copy,
         drive::reveal_drive,
         drive::import_registry,
+        drive::library_installed,
         library::reveal_path,
         gamepad::gamepad_get_state,
         gamepad::gamepad_save_config
@@ -319,6 +323,7 @@ pub fn run() {
         start_game,
         stop_game,
         game::pause_game,
+        game::change_disc,
         game::set_game_filter,
         game::set_game_playback,
         game::game_fps,
@@ -373,6 +378,7 @@ pub fn run() {
         game_storage::use_game_copy,
         drive::reveal_drive,
         drive::import_registry,
+        drive::library_installed,
         library::reveal_path,
         gamepad::gamepad_get_state,
         gamepad::gamepad_save_config

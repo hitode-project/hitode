@@ -737,6 +737,20 @@ Processor counts and affinity MUST describe eight guest cores in one group, inde
 
 > Note: The launcher installs from a disc image this way. A library entry stands for the install, and its first run starts the disc's setup with `C:\Program Files` in the chosen folder. The program the player then picks there becomes the game and keeps that `C:\Program Files`.
 
+### WINE-SES-13 Disc changes
+
+**Rule**: A running session MUST be able to put another disc image in a mounted drive. Paths opened afterwards, and volume queries on the drive, MUST reach the new disc. Files opened before MUST keep reading the disc they were opened on.
+**Verification**: Test
+
+> Note: Setups on several discs ask for the next one in the same drive and check its label.
+
+### WINE-SES-14 Installed programs
+
+**Rule**: A host MUST list the programs whose uninstall entries on the prefix name a folder on drive C:, with that folder on the host. The folder MUST come from `InstallLocation`, else `DisplayIcon`, else `UninstallString`. Drive C: itself, its Windows folder and `C:\Program Files` MUST NOT be listed as a program's folder.
+**Verification**: Test
+
+> Note: A setup told to install outside the chosen folder leaves its game elsewhere on drive C:, and its uninstall entry says where.
+
 ## Conformance
 
 ### WINE-TEST-1 Wine's own tests

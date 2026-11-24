@@ -66,6 +66,16 @@ impl Host {
         registry::restore(self, config, options, file)
     }
 
+    /// The programs setups registered on this host's prefix, where they lie
+    /// on the host (WINE-SES-14).
+    pub fn installed(
+        &mut self,
+        config: &Config<'_>,
+        options: &SessionOptions,
+    ) -> Result<Vec<super::Installed>, String> {
+        super::installed::installed(self, config, options)
+    }
+
     /// As Wine's `run_wineboot`, but restarting: the template stands for
     /// what `--init` installs, and no services run. Once per host.
     #[allow(clippy::too_many_arguments)]

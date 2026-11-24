@@ -690,4 +690,7 @@ export const messages: Record<string, [string, string]> = {
   "再次运行安装程序": ["Run setup again", "セットアップを再実行"],
   "安装完成并选择主程序后才能在此运行程序。": ["Programs can run here once the game is installed and its program chosen.", "インストールして実行ファイルを選ぶと、ここでプログラムを実行できます。"],
   "选择已安装的程序…": ["Choose the installed program…", "インストールしたプログラムを選択…"],
+  "换下一张光盘": ["Insert the next disc", "次のディスクに入れ替え"],
+  "添加光盘…": ["Add disc…", "ディスクを追加…"],
+  "添加…": ["Add…", "追加…"],
 };

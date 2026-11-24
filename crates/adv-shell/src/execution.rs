@@ -70,18 +70,35 @@ impl Execution {
         options: crate::Options,
         file: PathBuf,
     ) -> Result<adv_runtime::wine::session::RegistryReport, String> {
+        self.on_owner("registry restore", move |host, distribution| {
+            crate::wine::restore_registry(host, &options, distribution, &file)
+        })
+    }
+    /// The programs setups installed on the prefix of `options`, where they lie.
+    pub fn installed(
+        &self,
+        options: crate::Options,
+    ) -> Result<Vec<adv_runtime::wine::session::Installed>, String> {
+        self.on_owner("listing installed programs", move |host, distribution| {
+            crate::wine::installed(host, &options, distribution)
+        })
+    }
+    /// Runs `work` on the execution owner while no game runs, and waits.
+    fn on_owner<R: Send + 'static>(
+        &self,
+        what: &'static str,
+        work: impl FnOnce(&mut Host, &Path) -> Result<R, String> + Send + 'static,
+    ) -> Result<R, String> {
         let (tx, rx) = mpsc::sync_channel(1);
         let task = self.submit(move |host, distribution| {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::wine::restore_registry(host, &options, distribution, &file)
-            }))
-            .unwrap_or_else(|_| Err("registry restore panicked".into()));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(host, distribution)))
+                    .unwrap_or_else(|_| Err(format!("{what} panicked")));
             let _ = tx.send(result);
         })?;
-        task.join()
-            .map_err(|_| "registry restore thread failed".to_owned())?;
+        task.join().map_err(|_| format!("{what} thread failed"))?;
         rx.recv()
-            .map_err(|_| "registry restore did not return a result".to_owned())?
+            .map_err(|_| format!("{what} did not return a result"))?
     }
 }
 

@@ -10,7 +10,7 @@ import {
   type Enc,
 } from "./fake-import";
 import { loadGameSetup, saveGameSetup } from "./fake-settings";
-import { libraryAdd, libraryAddInstall, libraryInspect, libraryInspectDisc, libraryPickFolder, libraryScan, type Codepage, type ExeCandidate, type FolderInspection, type LibraryGame, type Novel, type ScanFound } from "./host";
+import { libraryAdd, libraryAddInstall, libraryInspect, libraryInspectDisc, libraryInstalled, libraryPickFolder, libraryScan, libraryUpdate, type Codepage, type ExeCandidate, type FolderInspection, type LibraryGame, type Novel, type ScanFound } from "./host";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
 import { copyExternalFolder, storageSize, takeCopyableUri, type FolderPickOptions } from "./storage";
@@ -485,8 +485,13 @@ export class InstallFlow {
   /** The chosen install folder; the library's own folder when null. */
   target = $state<string | null>(null);
   keep = $state(true);
-  /** What the setup installed, relative to the install folder. */
-  exes = $state<{ value: string; label: string; codepage: Codepage }[]>([]);
+  /** Further discs of a setup on several, mounted after the first and put in drive D: from the pause menu. */
+  more = $state<string[]>([]);
+  /**
+   * What the setup installed: in the install folder, or in a folder its
+   * uninstall entry names when it was told to install elsewhere.
+   */
+  exes = $state<{ value: string; label: string; codepage: Codepage; folder: string; exe: string }[]>([]);
   exe = $state("");
   enc = $state<Enc>("ja");
   readonly encs = $derived(encChoices(this.title));
@@ -531,9 +536,18 @@ export class InstallFlow {
       const exes = found.flatMap((f) =>
         f.exes.map((x) => {
           const path = [f.relative, x.path].filter(Boolean).join("/");
-          return { value: path, label: path, codepage: x.codepage };
+          return { value: path, label: path, codepage: x.codepage, folder: game.path, exe: path };
         }),
       );
+      for (const program of await libraryInstalled(gameId)) {
+        for (const f of await libraryScan(program.folder, 1)) {
+          for (const x of f.exes) {
+            const exe = [f.relative, x.path].filter(Boolean).join("/");
+            const value = `${program.folder}/${exe}`;
+            exes.push({ value, label: `${program.name} · ${exe}`, codepage: x.codepage, folder: program.folder, exe });
+          }
+        }
+      }
       this.exes = exes;
       const suggested = found.find((f) => f.exe);
       this.exe = suggested?.exe ? [suggested.relative, suggested.exe.path].filter(Boolean).join("/") : (exes[0]?.value ?? "");
@@ -549,6 +563,16 @@ export class InstallFlow {
     this.step = "错误";
   }
 
+  /** Up to four discs mount at once (D: to G:). */
+  get canAddDisc(): boolean {
+    return this.more.length < 3;
+  }
+
+  async addDisc(): Promise<void> {
+    const path = await call<string | null>("pick_game_file", { kind: "disc" }, null);
+    if (path && path !== this.disc && !this.more.includes(path)) this.more = [...this.more, path];
+  }
+
   async changeTarget(): Promise<void> {
     const folder = await libraryPickFolder();
     if (folder) this.target = folder;
@@ -560,7 +584,7 @@ export class InstallFlow {
     if (!game) return this.#fail(t("无法添加到游戏库"));
     const entry = library.put(game);
     const setup = loadGameSetup(entry.id, game.codepage);
-    saveGameSetup(entry.id, { ...setup, discs: [this.disc] });
+    saveGameSetup(entry.id, { ...setup, discs: [this.disc, ...this.more] });
     nav.replace({ name: "launch", gameId: entry.id });
   }
 
@@ -577,8 +601,16 @@ export class InstallFlow {
   /** The installed program becomes the game; the disc stays only if asked. */
   async add(): Promise<void> {
     const id = this.#gameId;
-    if (!id || !this.exe) return;
-    await library.setRun(id, { exe: this.exe, codepage: CODEPAGES[this.enc] });
+    const chosen = this.exes.find((x) => x.value === this.exe);
+    if (!id || !chosen) return;
+    const game = library.get(id);
+    if (game && chosen.folder !== game.path) {
+      // Installed elsewhere: the game's folder moves to where it went.
+      const moved = await libraryUpdate(id, { folder: chosen.folder, exe: chosen.exe, codepage: CODEPAGES[this.enc] });
+      if (moved) library.put(moved);
+    } else {
+      await library.setRun(id, { exe: chosen.exe, codepage: CODEPAGES[this.enc] });
+    }
     if (!this.keep) {
       const setup = loadGameSetup(id, CODEPAGES[this.enc]);
       saveGameSetup(id, { ...setup, discs: [] });

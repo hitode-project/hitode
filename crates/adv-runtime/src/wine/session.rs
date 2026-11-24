@@ -11,12 +11,14 @@ mod debug;
 mod files;
 mod fonts;
 mod host;
+mod installed;
 mod registry;
 pub use adv_cpu::backend::GuestExt;
 pub use adv_machine::exception::Checkpoint;
 pub use adv_nt::exception::{Record, StubGaps, WINE_STUB};
 pub use adv_nt::identity::Images;
 pub use host::Host;
+pub use installed::Installed;
 pub use registry::RegistryReport;
 
 use adv_drv::user::project;
@@ -1436,6 +1438,27 @@ impl Session {
     pub fn activate(&mut self, active: bool) -> bool {
         let queued = project::activate(&mut self.machine.ext, active);
         self.queued(queued)
+    }
+
+    /// Puts the disc in `image` in drive `letter`, as a player swaps discs
+    /// (WINE-SES-13). Paths opened from then on read the new disc; files
+    /// already open keep the one they were opened on.
+    pub fn change_disc(&mut self, letter: char, image: &Path) -> Result<(), String> {
+        let letter = letter.to_ascii_uppercase();
+        let volume = files::disc(letter, image, files::codepage(self.settings.locale))?;
+        let root = self
+            .shared
+            .driver
+            .borrow()
+            .mounts
+            .change(letter, volume)
+            .map_err(|e| e.to_string())?;
+        let device = self
+            .settings
+            .prefix
+            .join("dosdevices")
+            .join(format!("{}:", letter.to_ascii_lowercase()));
+        link(&root, &device)
     }
 
     /// Read the guest's windows again for the native views below.

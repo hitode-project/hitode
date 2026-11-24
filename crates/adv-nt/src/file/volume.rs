@@ -108,7 +108,10 @@ struct Namespace {
     registered: Cell<bool>,
     install: Option<PathBuf>,
     root: Option<PathBuf>,
-    volumes: BTreeMap<char, Mounted>,
+    /// A drive's medium changes in place (WINE-SES-13); open files keep theirs.
+    volumes: RefCell<BTreeMap<char, Rc<Mounted>>>,
+    /// Roots of media taken out, which files opened on them still reach.
+    removed: RefCell<Vec<PathBuf>>,
     identities: RefCell<HashMap<(u64, u64), Rc<Identity>>>,
     replaced: Vec<Replaced>,
 }
@@ -117,6 +120,23 @@ struct Replaced {
     identity: (u64, u64),
     original: PathBuf,
     file: PathBuf,
+}
+impl Namespace {
+    fn mount(&self, root: PathBuf, source: Rc<dyn Volume>) -> io::Result<Rc<Mounted>> {
+        std::fs::create_dir(&root)?;
+        let metadata = std::fs::metadata(&root)?;
+        let entry = source.entry("")?;
+        self.identities.borrow_mut().insert(
+            (metadata.dev(), metadata.ino()),
+            Rc::new(Identity {
+                entry,
+                path: String::new(),
+                source: source.clone(),
+                reader: RefCell::new(None),
+            }),
+        );
+        Ok(Rc::new(Mounted { root, source }))
+    }
 }
 impl Drop for Namespace {
     fn drop(&mut self) {
@@ -131,7 +151,8 @@ impl Mounts {
             registered: Cell::new(false),
             install,
             root,
-            volumes: BTreeMap::new(),
+            volumes: RefCell::new(BTreeMap::new()),
+            removed: RefCell::new(Vec::new()),
             identities: RefCell::new(HashMap::new()),
             replaced: Vec::new(),
         }))
@@ -148,20 +169,28 @@ impl Mounts {
         source: Rc<dyn Volume>,
     ) -> io::Result<()> {
         let ns = Rc::get_mut(&mut self.0).expect("mounts precede process startup");
-        std::fs::create_dir(&root)?;
-        let metadata = std::fs::metadata(&root)?;
-        let entry = source.entry("")?;
-        ns.identities.get_mut().insert(
-            (metadata.dev(), metadata.ino()),
-            Rc::new(Identity {
-                entry,
-                path: String::new(),
-                source: source.clone(),
-                reader: RefCell::new(None),
-            }),
-        );
-        ns.volumes.insert(letter, Mounted { root, source });
+        let mounted = ns.mount(root, source)?;
+        ns.volumes.get_mut().insert(letter, mounted);
         Ok(())
+    }
+    /// Puts another medium in drive `letter` and returns the directory it
+    /// shows under. Files opened before keep reading the medium they were
+    /// opened on.
+    pub fn change(&self, letter: char, source: Rc<dyn Volume>) -> io::Result<PathBuf> {
+        let (Some(files), true) = (&self.0.root, self.0.volumes.borrow().contains_key(&letter))
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no disc drive {letter}:"),
+            ));
+        };
+        let changes = self.0.removed.borrow().len();
+        let root = files.join(format!("{letter}.{}", changes + 1));
+        let mounted = self.0.mount(root.clone(), source)?;
+        if let Some(out) = self.0.volumes.borrow_mut().insert(letter, mounted) {
+            self.0.removed.borrow_mut().push(out.root.clone());
+        }
+        Ok(root)
     }
     /// Opens that resolve to `original` reach `file` instead (NT-FILE-5).
     /// Called before the namespace is shared with any process.
@@ -200,15 +229,22 @@ impl Mounts {
     pub fn device_name(&self, letter: char) -> Option<String> {
         self.0
             .volumes
+            .borrow()
             .keys()
             .position(|mounted| *mounted == letter)
             .map(|index| format!(r"\Device\CdRom{index}"))
     }
-    pub fn roots(&self) -> impl Iterator<Item = (char, &Path)> {
+    pub fn has_discs(&self) -> bool {
+        !self.0.volumes.borrow().is_empty()
+    }
+    /// Each drive and the directory its medium shows under.
+    pub fn roots(&self) -> Vec<(char, PathBuf)> {
         self.0
             .volumes
+            .borrow()
             .iter()
-            .map(|(letter, mount)| (*letter, mount.root.as_path()))
+            .map(|(letter, mount)| (*letter, mount.root.clone()))
+            .collect()
     }
     pub fn lookup(&self, devices: &Path, name: &[u16]) -> Option<Result<Lookup, u32>> {
         let text = String::from_utf16(name).ok()?;
@@ -236,7 +272,7 @@ impl Mounts {
                 ));
             }
         }
-        let mount = self.0.volumes.get(&letter)?;
+        let mount = self.0.volumes.borrow().get(&letter)?.clone();
         Some((|| {
             let rest = rest.strip_prefix('\\').unwrap_or(rest);
             path::validate_components(rest, false)?;
@@ -279,7 +315,7 @@ impl Mounts {
                 }
                 source.push_str(&entry.name);
                 host.push(&entry.name);
-                self.identity(mount, &host, &source, entry)
+                self.identity(&mount, &host, &source, entry)
                     .map_err(|_| 0xc000_0022u32)?;
             }
             if rest.ends_with('\\') && !host.is_dir() {
@@ -323,7 +359,14 @@ impl Mounts {
         Ok(())
     }
     pub fn prepare_directory(&self, host: &Path) -> io::Result<()> {
-        for mount in self.0.volumes.values() {
+        let volumes = self
+            .0
+            .volumes
+            .borrow()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for mount in &volumes {
             if let Ok(relative) = host.strip_prefix(&mount.root) {
                 let relative = relative.to_string_lossy().replace('/', "\\");
                 for entry in mount.source.list(&relative)? {
@@ -342,8 +385,15 @@ impl Mounts {
     pub fn read_only(&self, host: &Path) -> bool {
         self.0
             .volumes
+            .borrow()
             .values()
             .any(|mount| host.starts_with(&mount.root))
+            || self
+                .0
+                .removed
+                .borrow()
+                .iter()
+                .any(|root| host.starts_with(root))
     }
     pub fn nt_name(&self, host: &Path) -> Option<String> {
         let install = self.0.install.as_ref()?;

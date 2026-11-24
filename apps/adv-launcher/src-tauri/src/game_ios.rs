@@ -493,6 +493,20 @@ pub async fn pause_game(window: WebviewWindow, paused: bool) -> Result<(), Strin
     .await
 }
 
+/// Puts another of the game's disc images in drive `letter` while it runs.
+#[tauri::command]
+pub async fn change_disc(
+    window: WebviewWindow,
+    letter: char,
+    path: std::path::PathBuf,
+) -> Result<(), String> {
+    let changed = on_ui(window.app_handle(), move || {
+        with_session(|_, session| session.change_disc(letter, path))
+    })
+    .await?;
+    crate::play::disc_changed(changed).await
+}
+
 #[tauri::command]
 pub async fn set_game_filter(window: WebviewWindow, filter: String) -> Result<(), String> {
     let filter = crate::play::upscaler(&filter)?;
