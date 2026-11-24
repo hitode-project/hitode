@@ -777,6 +777,8 @@ impl Session {
             &wake,
             &shared,
             &prepared.mounts,
+            (&ntdll, &apisets),
+            &audio,
         )?;
 
         let mut fonts = host.fonts.prepare(&config, &drive, options)?;

@@ -103,7 +103,8 @@ impl Host {
     }
 
     /// As Wine's `run_wineboot`, but restarting: the template stands for
-    /// what `--init` installs, and no services run. Once per host.
+    /// what `--init` installs, and no services run. Once per host. The boot
+    /// shares the caller's modules and audio, so it holds no second copy.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn boot(
         &mut self,
@@ -115,21 +116,17 @@ impl Host {
         wake: &WakeEvent,
         shared: &Shared,
         mounts: &adv_nt::file::volume::Mounts,
+        (ntdll, apisets): (&[u8], &[u8]),
+        audio: &adv_device::AudioControl,
     ) -> Result<(), String> {
         if self.booted() {
             return Ok(());
         }
-        let module = |name: &str| {
-            let path = config.dist.join(MODULES).join(name);
-            std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
-        };
-        let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
         let process_config = Config {
             fonts: "",
             ..*config
         };
-        let audio = adv_device::AudioControl::new(true);
-        let mut boot = new_machine(&process_config, drive, clock.clone(), wake, &audio)?;
+        let mut boot = new_machine(&process_config, drive, clock.clone(), wake, audio)?;
         boot.cpu.executor_mut().use_tier1_only();
         boot.ext.insert(mounts.clone());
         let command_line = format!("\"{WINEBOOT}\" --restart");
@@ -148,8 +145,8 @@ impl Host {
         };
         process::start(
             &mut boot,
-            &ntdll,
-            &apisets,
+            ntdll,
+            apisets,
             &startup,
             prefix,
             socket,
@@ -157,7 +154,7 @@ impl Host {
         )
         .map_err(|e| format!("wineboot: {e}"))?;
         boot.ext.insert(shared.clone());
-        adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), &ntdll);
+        adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), ntdll);
         match run(
             &mut boot,
             wake,
@@ -194,9 +191,26 @@ impl Host {
             .server
             .socket_dir()
             .ok_or("the server has no socket")?;
-        self.boot(
-            config, &prefix, &drive, &socket, &mut clock, &wake, &shared, &mounts,
-        )?;
+        if !self.booted() {
+            let module = |name: &str| {
+                let path = config.dist.join(MODULES).join(name);
+                std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+            };
+            let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
+            let audio = adv_device::AudioControl::new(true);
+            self.boot(
+                config,
+                &prefix,
+                &drive,
+                &socket,
+                &mut clock,
+                &wake,
+                &shared,
+                &mounts,
+                (&ntdll, &apisets),
+                &audio,
+            )?;
+        }
         work(&socket, &mut shared, Time::now(&mut clock))
     }
 
