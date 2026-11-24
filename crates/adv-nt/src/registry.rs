@@ -5,12 +5,13 @@
 
 use adv_machine::{Env, Outcome};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::object::{Attributes, read_u32, read_unicode_string, write_bytes, write_u32};
 use crate::protocol::{
     CreateKeyRequest, DeleteKeyRequest, DeleteKeyValueRequest, EnumKeyRequest, EnumKeyValueRequest,
-    FlushKeyRequest, GetKeyValueRequest, OpenKeyRequest, Request, SetKeyValueRequest,
+    FlushKeyRequest, GetKeyValueRequest, GetTokenSidRequest, OpenKeyRequest, Request,
+    SetKeyValueRequest,
 };
 use crate::server;
 use crate::status::{self, Error, Status};
@@ -996,6 +997,334 @@ pub fn query_license(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         server::close(env, key)?;
         result
     })())
+}
+
+/// Snapshot of a registry subtree: relative subkey path (empty string for root)
+/// to value name (empty string for the default value) to `(reg_type, raw_bytes)`.
+pub type TreeSnapshot = BTreeMap<String, BTreeMap<String, (u32, Vec<u8>)>>;
+
+/// Direct server-side registry access outside a guest machine.
+pub struct Client<'a> {
+    connection: &'a mut server::Connection,
+    progress: &'a mut dyn server::Progress,
+    time: server::Time,
+}
+
+impl<'a> Client<'a> {
+    pub fn new(
+        connection: &'a mut server::Connection,
+        progress: &'a mut dyn server::Progress,
+        time: server::Time,
+    ) -> Self {
+        Self {
+            connection,
+            progress,
+            time,
+        }
+    }
+
+    fn call<R: Request>(
+        &mut self,
+        request: &mut R,
+        data: &[&[u8]],
+        reply_data: &mut [u8],
+    ) -> Result<(R::Reply, usize), Error> {
+        self.connection
+            .request(self.progress, self.time, request, data, reply_data)
+            .map_err(|e| Error::Unsupported(format!("registry server: {e}")))
+    }
+
+    fn close(&mut self, handle: u32) -> Result<(), Error> {
+        self.connection
+            .close(self.progress, self.time, handle)
+            .map_err(|e| Error::Unsupported(format!("registry close: {e}")))
+    }
+
+    /// `\Registry\User\<sid>` for the prefix's user.
+    pub fn user_key(&mut self) -> Result<String, Error> {
+        const EFFECTIVE_TOKEN: u32 = 0xffff_fffa;
+        const TOKEN_USER: u32 = 1;
+        let mut request = GetTokenSidRequest {
+            handle: EFFECTIVE_TOKEN,
+            which_sid: TOKEN_USER,
+            ..Default::default()
+        };
+        let mut sid = [0u8; 68];
+        let (reply, size) = self.call(&mut request, &[], &mut sid)?;
+        status::check(reply.header.error)?;
+        crate::environment::user_key_from_sid(&sid[..size])
+    }
+
+    fn open_key(&mut self, parent: u32, access: u32, name: &str) -> Result<u32, Error> {
+        let name = bytes(&name.encode_utf16().collect::<Vec<_>>());
+        let mut request = OpenKeyRequest {
+            parent,
+            access,
+            attributes: OBJ_CASE_INSENSITIVE,
+            ..Default::default()
+        };
+        let (reply, _) = self.call(&mut request, &[&name], &mut [])?;
+        status::check(reply.header.error)?;
+        Ok(reply.hkey)
+    }
+
+    fn ensure_key(&mut self, key: &str, leaf_access: u32) -> Result<u32, Error> {
+        let elements: Vec<&str> = key
+            .split('\\')
+            .filter(|element| !element.is_empty())
+            .collect();
+        if elements.len() < 2 {
+            return Err(status::OBJECT_PATH_NOT_FOUND.into());
+        }
+        let (root, rest) = elements.split_at(2);
+        let mut path = vec![format!("\\{}", root.join("\\"))];
+        path.extend(rest.iter().map(|element| (*element).to_string()));
+        let mut hkey = 0;
+        for (index, element) in path.iter().enumerate() {
+            let last = index + 1 == path.len();
+            let attributes = Attributes {
+                security: Vec::new(),
+                root: hkey,
+                attributes: OBJ_OPENIF | OBJ_CASE_INSENSITIVE,
+                name: Some(element.encode_utf16().collect()),
+            };
+            let mut request = CreateKeyRequest {
+                access: if last {
+                    leaf_access
+                } else {
+                    KEY_CREATE_SUB_KEY
+                },
+                options: 0,
+                ..Default::default()
+            };
+            let created = self.call(&mut request, &[&attributes.wire(), &[]], &mut []);
+            if hkey != 0 {
+                let _ = self.close(hkey);
+            }
+            let (reply, _) = created?;
+            if !matches!(
+                reply.header.error,
+                status::SUCCESS | status::OBJECT_NAME_EXISTS
+            ) {
+                return Err(reply.header.error.into());
+            }
+            hkey = reply.hkey;
+        }
+        Ok(hkey)
+    }
+
+    /// Creates a persistent registry key and any missing parents.
+    pub fn create_key(&mut self, key: &str) -> Result<(), Error> {
+        let hkey = self.ensure_key(key, KEY_CREATE_SUB_KEY)?;
+        self.close(hkey)
+    }
+
+    /// Sets a persistent registry value, creating missing keys along the path.
+    pub fn set_value(
+        &mut self,
+        key: &str,
+        name: &str,
+        kind: i32,
+        value: &[u8],
+    ) -> Result<(), Error> {
+        let hkey = self.ensure_key(key, KEY_SET_VALUE)?;
+        let name = bytes(&name.encode_utf16().collect::<Vec<_>>());
+        let mut request = SetKeyValueRequest {
+            hkey,
+            r#type: kind,
+            namelen: name.len() as u32,
+            ..Default::default()
+        };
+        let result = self
+            .call(&mut request, &[&name, value], &mut [])
+            .and_then(|(reply, _)| status::check(reply.header.error));
+        let _ = self.close(hkey);
+        result
+    }
+
+    /// Deletes a value if both the key and value exist. Returns `true` if deleted.
+    pub fn delete_value(&mut self, key: &str, name: &str) -> Result<bool, Error> {
+        let hkey = match self.open_key(0, KEY_SET_VALUE, key) {
+            Ok(hkey) => hkey,
+            Err(Error::Status(status::OBJECT_NAME_NOT_FOUND | status::OBJECT_PATH_NOT_FOUND)) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let name = bytes(&name.encode_utf16().collect::<Vec<_>>());
+        let mut request = DeleteKeyValueRequest {
+            hkey,
+            ..Default::default()
+        };
+        let result = self.call(&mut request, &[&name], &mut []);
+        let _ = self.close(hkey);
+        match result {
+            Ok((reply, _)) if reply.header.error == status::SUCCESS => Ok(true),
+            Ok((reply, _)) if reply.header.error == status::OBJECT_NAME_NOT_FOUND => Ok(false),
+            Ok((reply, _)) => Err(reply.header.error.into()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Recursively deletes a key and its subkeys if it exists. Returns `true` if deleted.
+    pub fn delete_key_tree(&mut self, key: &str) -> Result<bool, Error> {
+        const DELETE: u32 = 0x1_0000;
+        let hkey = match self.open_key(0, KEY_READ | DELETE, key) {
+            Ok(hkey) => hkey,
+            Err(Error::Status(status::OBJECT_NAME_NOT_FOUND | status::OBJECT_PATH_NOT_FOUND)) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let subkeys = self.list_subkeys(hkey);
+        let subkeys = match subkeys {
+            Ok(subkeys) => subkeys,
+            Err(error) => {
+                let _ = self.close(hkey);
+                return Err(error);
+            }
+        };
+        for sub in subkeys {
+            let child = format!("{key}\\{sub}");
+            if let Err(error) = self.delete_key_tree(&child) {
+                let _ = self.close(hkey);
+                return Err(error);
+            }
+        }
+        let mut request = DeleteKeyRequest {
+            hkey,
+            ..Default::default()
+        };
+        let result = self
+            .call(&mut request, &[], &mut [])
+            .and_then(|(reply, _)| status::check(reply.header.error));
+        let _ = self.close(hkey);
+        result.map(|()| true)
+    }
+
+    /// Lists direct subkey names under `root_key`, or empty if absent.
+    pub fn subkeys(&mut self, root_key: &str) -> Result<Vec<String>, Error> {
+        let hkey = match self.open_key(0, KEY_READ, root_key) {
+            Ok(hkey) => hkey,
+            Err(Error::Status(status::OBJECT_NAME_NOT_FOUND | status::OBJECT_PATH_NOT_FOUND)) => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
+        let result = self.list_subkeys(hkey);
+        let _ = self.close(hkey);
+        result
+    }
+
+    /// Snapshots every key and value beneath `root_key`, or empty if absent.
+    pub fn snapshot(&mut self, root_key: &str) -> Result<TreeSnapshot, Error> {
+        let mut tree = TreeSnapshot::new();
+        self.snapshot_into(root_key, "", &mut tree)?;
+        Ok(tree)
+    }
+
+    fn snapshot_into(
+        &mut self,
+        full_key: &str,
+        relative: &str,
+        tree: &mut TreeSnapshot,
+    ) -> Result<(), Error> {
+        let hkey = match self.open_key(0, KEY_READ, full_key) {
+            Ok(hkey) => hkey,
+            Err(Error::Status(status::OBJECT_NAME_NOT_FOUND | status::OBJECT_PATH_NOT_FOUND)) => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let values = self.list_values(hkey);
+        let subkeys = match values {
+            Ok(values) => {
+                tree.insert(relative.to_owned(), values);
+                self.list_subkeys(hkey)
+            }
+            Err(error) => {
+                let _ = self.close(hkey);
+                return Err(error);
+            }
+        };
+        let _ = self.close(hkey);
+        for sub in subkeys? {
+            let child_full = format!("{full_key}\\{sub}");
+            let child_rel = if relative.is_empty() {
+                sub
+            } else {
+                format!("{relative}\\{sub}")
+            };
+            self.snapshot_into(&child_full, &child_rel, tree)?;
+        }
+        Ok(())
+    }
+
+    fn list_subkeys(&mut self, hkey: u32) -> Result<Vec<String>, Error> {
+        let mut out = Vec::new();
+        for index in 0.. {
+            let mut request = EnumKeyRequest {
+                hkey,
+                index,
+                info_class: KEY_BASIC_INFORMATION,
+                ..Default::default()
+            };
+            let mut buf = vec![0u8; MAX_KEY_NAME];
+            let (reply, size) = self.call(&mut request, &[], &mut buf)?;
+            match reply.header.error {
+                NO_MORE_ENTRIES => break,
+                error => status::check(error)?,
+            }
+            let size = size.min(reply.namelen as usize);
+            let units: Vec<u16> = buf[..size]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| u16::from_le_bytes(pair))
+                .collect();
+            out.push(String::from_utf16_lossy(&units));
+        }
+        Ok(out)
+    }
+
+    fn list_values(&mut self, hkey: u32) -> Result<BTreeMap<String, (u32, Vec<u8>)>, Error> {
+        let mut out = BTreeMap::new();
+        for index in 0.. {
+            let mut limit = 4096usize;
+            loop {
+                let mut request = EnumKeyValueRequest {
+                    hkey,
+                    index,
+                    info_class: KEY_VALUE_FULL as i32,
+                    ..Default::default()
+                };
+                let mut buf = vec![0u8; MAX_KEY_NAME + limit];
+                let (reply, size) = self.call(&mut request, &[], &mut buf)?;
+                match reply.header.error {
+                    NO_MORE_ENTRIES => return Ok(out),
+                    BUFFER_OVERFLOW => {
+                        let needed = (reply.total as usize).saturating_add(64);
+                        if needed > limit && needed <= 16 * 1024 * 1024 {
+                            limit = needed;
+                            continue;
+                        }
+                    }
+                    error => status::check(error)?,
+                }
+                let name_len = (reply.namelen as usize).min(size);
+                let units: Vec<u16> = buf[..name_len]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&pair| u16::from_le_bytes(pair))
+                    .collect();
+                let name = String::from_utf16_lossy(&units);
+                out.insert(name, (reply.r#type as u32, buf[name_len..size].to_vec()));
+                break;
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

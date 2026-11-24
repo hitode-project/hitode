@@ -203,6 +203,7 @@ pub fn run() {
                 game_storage::export_game_copy,
                 game_storage::use_game_copy,
                 drive::reveal_drive,
+                drive::import_registry,
                 library::reveal_path,
                 gamepad::gamepad_get_state,
                 gamepad::gamepad_save_config
@@ -300,6 +301,7 @@ pub fn run() {
         game_storage::export_game_copy,
         game_storage::use_game_copy,
         drive::reveal_drive,
+        drive::import_registry,
         library::reveal_path,
         gamepad::gamepad_get_state,
         gamepad::gamepad_save_config
@@ -362,6 +364,7 @@ pub fn run() {
         game_storage::export_game_copy,
         game_storage::use_game_copy,
         drive::reveal_drive,
+        drive::import_registry,
         library::reveal_path,
         gamepad::gamepad_get_state,
         gamepad::gamepad_save_config

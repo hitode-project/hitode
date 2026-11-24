@@ -98,6 +98,15 @@
               {t("添加光盘镜像…")}
             </button>
           </div>
+          <div class="row">
+            <span class="t">{t("运行其他文件")}</span>
+            {#if form.otherRunHint}
+              <span class="val ellipsis" style="font-size: 12px">{form.otherRunHint}</span>
+            {/if}
+            <button class="quiet" style="margin-right: -10px" onclick={() => nav.go({ name: "game-run", gameId: game.id })}>
+              {t("打开…")}
+            </button>
+          </div>
         {/if}
       </section>
 

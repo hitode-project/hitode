@@ -62,6 +62,27 @@ impl Execution {
         }
         Ok(Task::Shared(result))
     }
+
+    /// Imports a `.reg` file or executes a registry restore `.bat` / `.cmd`
+    /// script against the player's shared Wine prefix on the execution owner.
+    pub fn restore_registry(
+        &self,
+        options: crate::Options,
+        file: PathBuf,
+    ) -> Result<adv_runtime::wine::session::RegistryReport, String> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let task = self.submit(move |host, distribution| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::wine::restore_registry(host, &options, distribution, &file)
+            }))
+            .unwrap_or_else(|_| Err("registry restore panicked".into()));
+            let _ = tx.send(result);
+        })?;
+        task.join()
+            .map_err(|_| "registry restore thread failed".to_owned())?;
+        rx.recv()
+            .map_err(|_| "registry restore did not return a result".to_owned())?
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]

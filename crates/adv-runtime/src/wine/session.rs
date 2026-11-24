@@ -11,11 +11,13 @@ mod debug;
 mod files;
 mod fonts;
 mod host;
+mod registry;
 pub use adv_cpu::backend::GuestExt;
 pub use adv_machine::exception::Checkpoint;
 pub use adv_nt::exception::{Record, StubGaps, WINE_STUB};
 pub use adv_nt::identity::Images;
 pub use host::Host;
+pub use registry::RegistryReport;
 
 use adv_drv::user::project;
 use std::cell::{Cell, RefCell};
@@ -719,50 +721,17 @@ impl Session {
         // As Wine's `run_wineboot`, but restarting: the template stands for
         // what `--init` installs, and no services run.
         let audio = adv_device::AudioControl::new(true);
-        if !host.booted() {
-            let mut boot = new_machine(&process_config, &drive, clock.clone(), &wake, &audio)?;
-            boot.cpu.executor_mut().use_tier1_only();
-            boot.ext.insert(prepared.mounts.clone());
-            let command_line = format!("\"{WINEBOOT}\" --restart");
-            let startup = Startup {
-                image: WINEBOOT,
-                command_line: &command_line,
-                directory: r"C:\windows\system32\",
-                environment: ENVIRONMENT,
-                locale: config.locale,
-                debug: config.debug,
-                stdin: None,
-                stdout: None,
-                stderr: None,
-                graphics_driver: super::GRAPHICS_DRIVER,
-                fonts: process_config.fonts,
-            };
-            process::start(
-                &mut boot,
-                &ntdll,
-                &apisets,
-                &startup,
-                &prefix,
-                &socket,
-                Box::new(shared.clone()),
-            )
-            .map_err(|e| format!("wineboot: {e}"))?;
-            boot.ext.insert(shared.clone());
-            adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), &ntdll);
-            match run(
-                &mut boot,
-                &wake,
-                Instant::now() + BOOT,
-                |_| Ok(false),
-                None,
-                None,
-            ) {
-                Stop::Exited(0) => {}
-                stop => return Err(format!("wineboot: {stop:?}")),
-            }
-            drop(boot);
-            host.finish_boot();
-        }
+        registry::ensure_booted(
+            host,
+            &config,
+            &prefix,
+            &drive,
+            &socket,
+            &mut clock,
+            &wake,
+            &shared,
+            &prepared.mounts,
+        )?;
 
         let mut fonts = host.fonts.prepare(&config, &drive, options)?;
         let config = process_config;
@@ -993,7 +962,17 @@ impl Session {
                         self.retired_boundaries
                             .merge(&adv_nt::counters::Boundaries::of(&retired.ext));
                         debug::merge_api_diagnostics(&retired, &mut self.stub_gaps.borrow_mut());
+                        drop(retired);
                         self.idle.remove(&id);
+                        // Closing the exited process's channels signals waiters in the server.
+                        let _ = self.machine.visit_context(None, adv_nt::server::run);
+                        if self
+                            .machine
+                            .visit_context(None, adv_nt::server::deliver)
+                            .unwrap_or(false)
+                        {
+                            self.idle.remove(&next);
+                        }
                         check_children = true;
                     } else {
                         self.finished = Some(code);

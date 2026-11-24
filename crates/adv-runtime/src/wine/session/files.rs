@@ -121,6 +121,15 @@ pub(super) fn prepare(
     options: &SessionOptions,
     prefix: &Path,
 ) -> Result<Prepared, String> {
+    prepare_with_replacement(config, options, prefix, None)
+}
+
+pub(super) fn prepare_with_replacement(
+    config: &Config<'_>,
+    options: &SessionOptions,
+    prefix: &Path,
+    extra_replacement: Option<(&Path, Vec<u8>)>,
+) -> Result<Prepared, String> {
     let game_drive = ('D'..='Z')
         .find(|letter| {
             !options
@@ -173,15 +182,16 @@ pub(super) fn prepare(
         None
     };
     let configuration = crate::reallive::configuration(&game);
-    let root = if options.cdroms.is_empty() && configuration.is_none() {
-        None
-    } else {
-        let root =
-            std::path::absolute(prefix.join(format!(".hitode-files-{}", std::process::id())))
-                .map_err(|e| e.to_string())?;
-        std::fs::create_dir(&root).map_err(|e| e.to_string())?;
-        Some(root.canonicalize().map_err(|e| e.to_string())?)
-    };
+    let root =
+        if options.cdroms.is_empty() && configuration.is_none() && extra_replacement.is_none() {
+            None
+        } else {
+            let root =
+                std::path::absolute(prefix.join(format!(".hitode-files-{}", std::process::id())))
+                    .map_err(|e| e.to_string())?;
+            std::fs::create_dir(&root).map_err(|e| e.to_string())?;
+            Some(root.canonicalize().map_err(|e| e.to_string())?)
+        };
     let mut mounts = Mounts::new(install, root.clone());
     for (letter, _) in vfs.optical_drives() {
         let path = root
@@ -205,9 +215,20 @@ pub(super) fn prepare(
             .expect("session files directory")
             .join("replaced");
         let file = directory.join(original.file_name().expect("a file name"));
-        std::fs::create_dir(&directory)
+        std::fs::create_dir_all(&directory)
             .and_then(|()| std::fs::write(&file, text))
             .and_then(|()| mounts.replace(&original, file))
+            .map_err(|e| format!("{}: {e}", original.display()))?;
+    }
+    if let Some((original, bytes)) = extra_replacement {
+        let directory = root
+            .as_ref()
+            .expect("session files directory")
+            .join("replaced-extra");
+        let file = directory.join(original.file_name().expect("a file name"));
+        std::fs::create_dir_all(&directory)
+            .and_then(|()| std::fs::write(&file, bytes))
+            .and_then(|()| mounts.replace(original, file))
             .map_err(|e| format!("{}: {e}", original.display()))?;
     }
     let devices = prefix.join("dosdevices");

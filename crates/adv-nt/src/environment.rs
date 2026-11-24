@@ -283,7 +283,10 @@ pub fn user_key(env: &mut Env<'_>) -> Result<String, Error> {
     let mut sid = [0u8; 68];
     let (reply, size) = server::request(env, &mut request, &[], &mut sid)?;
     status::check(reply.header.error)?;
-    let sid = &sid[..size];
+    user_key_from_sid(&sid[..size])
+}
+
+pub(crate) fn user_key_from_sid(sid: &[u8]) -> Result<String, Error> {
     if sid.len() < 8 {
         return Err(Error::Unsupported(
             "a user SID without its authority".into(),

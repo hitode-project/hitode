@@ -864,6 +864,11 @@ Processor counts and affinity MUST describe eight guest cores in one group, inde
 **Rule**: Wine sessions MUST apply ISO mounts and installation-directory mappings before process startup. Files, directories, sections, children, and volume queries MUST retain the same mounted backing. Reused prefixes MUST NOT retain removed host mappings.
 **Verification**: Test
 
+### WINE-SES-11 Registry restoration
+
+**Rule**: Registry restoration MUST persist `.reg` imports and `.bat` scripts on the shared prefix with the game's drive layout and code page. Imports and scripts MUST map `WOW6432Node` keys to 32-bit `SOFTWARE`. Batch runs MUST leave source scripts unmodified and neutralize elevation and pauses.
+**Verification**: Test
+
 ## Conformance
 
 ### WINE-TEST-1 Wine's own tests

@@ -245,6 +245,12 @@ Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFr
 **Applies to**: Launcher, desktop and Android
 **Verification**: Test
 
+### HOST-LIB-11 Registry file discovery
+
+**Rule**: Folder inspection MUST list top-level `.bat`, `.cmd` and `.reg` files case-insensitively. Ordering MUST place registry-named scripts before registry `.reg` files and other entries.
+**Applies to**: Launcher
+**Verification**: Test
+
 ### HOST-LIB-2 Executable candidates
 
 **Rule**: Top-level `.exe` candidates, all listed in scan results, MUST use case-insensitive extensions, decreasing size, automatic code pages and Machine mappings `0x14c=x86`, `0x8664=x64`, otherwise `other`. Suggestion MUST select the largest x86 excluding stems starting with `setup`, `install`, `unins` or `config`, NSIS or mostly-appended-payload packages and console programs, or null. Candidate and scan `inLibrary` MUST match canonical folder and case-insensitive exe, while inspection-level `inLibrary` MUST match any entry in the folder.

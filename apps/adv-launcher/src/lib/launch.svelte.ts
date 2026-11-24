@@ -100,14 +100,24 @@ class Runs {
   stopping = $state<Record<string, boolean>>({});
   /** start_game calls that have not answered yet, by game id. */
   #starting: Record<string, Promise<void>> = {};
+  /** Optional one-shot executable override for the next launch of `gameId`. */
+  #pendingExe: Record<string, string> = {};
 
   constructor() {
     onHostEvent<GameFinished>("game_finished", (event) => this.#finished(event));
   }
 
+  /** Launches a specific executable in `gameId`'s environment without changing its main exe. */
+  launchExe(gameId: string, exe: string): void {
+    this.#pendingExe[gameId] = exe;
+    nav.go({ name: "launch", gameId });
+  }
+
   /** Starts `gameId` through the host. */
   start(gameId: string): Promise<void> {
-    const started = startGame(gameId).then(() => {
+    const exe = this.#pendingExe[gameId];
+    delete this.#pendingExe[gameId];
+    const started = startGame(gameId, exe).then(() => {
       this.running = gameId;
       pauser.reset();
     });

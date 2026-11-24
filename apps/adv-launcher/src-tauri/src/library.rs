@@ -322,11 +322,20 @@ type Known = Vec<(PathBuf, String, String)>;
 fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
     let folder = fs::canonicalize(folder)?;
     let mut exes = Vec::new();
+    let mut registry_files = Vec::new();
     for entry in fs::read_dir(&folder)? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !path.is_file() || !name.to_ascii_lowercase().ends_with(".exe") {
+        if !path.is_file() {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".reg") || lower.ends_with(".bat") || lower.ends_with(".cmd") {
+            registry_files.push(name);
+            continue;
+        }
+        if !lower.ends_with(".exe") {
             continue;
         }
         // An unreadable executable is not a candidate; it must not hide the others.
@@ -346,6 +355,7 @@ fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
         });
     }
     exes.sort_by_key(|e| std::cmp::Reverse(e.size));
+    registry_files.sort_by_key(|name| registry_file_rank(name));
     let suggested = exes.iter().position(|e| {
         e.arch == "x86"
             && !prefixed(&e.path, &["setup", "install", "unins", "config"])
@@ -361,6 +371,7 @@ fn inspect(known: &Known, folder: &Path) -> io::Result<FolderInspection> {
         exes,
         suggested,
         in_library,
+        registry_files,
     })
 }
 fn scan(known: &Known, root: PathBuf, depth: u8) -> io::Result<Vec<ScanFound>> {
@@ -572,6 +583,21 @@ pub struct ExeCandidate {
     codepage: u32,
     in_library: Option<String>,
 }
+fn registry_file_rank(name: &str) -> (u8, u8, String) {
+    let lower = name.to_ascii_lowercase();
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+    let stem_lower = stem.to_ascii_lowercase();
+    let named_registry =
+        stem_lower.contains("reg") || stem.contains("注册表") || stem.contains("レジストリ");
+    let is_script = lower.ends_with(".bat") || lower.ends_with(".cmd");
+    // Prefer registry-named scripts (e.g. `注册表恢复.bat`), then registry `.reg`,
+    // then other `.bat`/`.cmd` scripts, then other `.reg` files.
+    (u8::from(!named_registry), u8::from(!is_script), lower)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderInspection {
@@ -580,6 +606,7 @@ pub struct FolderInspection {
     exes: Vec<ExeCandidate>,
     suggested: Option<usize>,
     in_library: Option<String>,
+    registry_files: Vec<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1120,6 +1147,26 @@ mod tests {
             Some("missing")
         );
         assert_eq!(offline(p("/storage/9C33-6BBD/Games/Novel")), Some("disk"));
+    }
+
+    // spec: HOST-LIB-11
+    #[test]
+    fn inspection_lists_and_ranks_top_level_registry_files() {
+        let (dir, lib) = fixture("registry-files");
+        pe(&dir, "game.exe", 0x14c, 100);
+        fs::write(dir.join("notes.txt"), b"ignore").unwrap();
+        fs::write(dir.join("other.REG"), b"").unwrap();
+        fs::write(dir.join("launch.bat"), b"").unwrap();
+        fs::write(dir.join("注册表.reg"), b"").unwrap();
+        fs::write(dir.join("注册表恢复.BAT"), b"").unwrap();
+        fs::create_dir(dir.join("nested")).unwrap();
+        fs::write(dir.join("nested/deep.reg"), b"").unwrap();
+        let found = inspect(&lib.known(), &dir).unwrap();
+        assert_eq!(
+            found.registry_files,
+            vec!["注册表恢复.BAT", "注册表.reg", "launch.bat", "other.REG"]
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }
 

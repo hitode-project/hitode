@@ -2,6 +2,7 @@ import { t } from "./i18n.svelte";
 import {
   GAME_DEFAULTS,
   codepagePreview,
+  fakeRegistryFiles,
   fakeReports,
   fakeRoots,
   loadGameSetup,
@@ -66,6 +67,8 @@ export class GameForm {
   setup: GameSetup;
   /** The folder's x86 programs in Tauri; read once when the form opens. */
   #candidates = $state<ExeCandidate[]>([]);
+  /** Top-level `.bat`/`.cmd`/`.reg` files discovered in the game folder. */
+  #scripts = $state<string[]>([]);
   /** Local or imported fonts picked this session, offered in both font menus. */
   picked = $state<string[]>([]);
   error = $state("");
@@ -100,6 +103,8 @@ export class GameForm {
   /** Main program choices; in Tauri the current one stays listed even if it is gone. */
   readonly exes: string[];
   readonly exe: string;
+  /** Short hint summarizing extra runnable tools, scripts or registry files in the folder. */
+  readonly otherRunHint: string;
 
   constructor(game: Game) {
     this.#initial = game;
@@ -112,10 +117,19 @@ export class GameForm {
       return paths.some((p) => p.toLowerCase() === current) ? paths : [this.game.exe, ...paths];
     });
     this.exe = $derived(inTauri ? this.game.exe : this.setup.exe);
+    this.otherRunHint = $derived.by(() => {
+      const main = this.exe.toLowerCase();
+      const extraExes = this.exes.filter((name) => name.toLowerCase() !== main);
+      const all = [...this.#scripts, ...extraExes];
+      if (all.length === 0) return "";
+      return all.length === 1 ? all[0]! : t("{0} 等 {1} 项", all[0]!, all.length);
+    });
     $effect(() => saveGameSetup(this.game.id, $state.snapshot(this.setup)));
     if (inTauri) {
       void this.#inspect();
       void call<string[]>("font_families", { path: null }, []).then((names) => this.picked = names).catch((e) => this.error = String(e));
+    } else {
+      this.#scripts = [...(fakeRegistryFiles[game.id] ?? [])];
     }
   }
 
@@ -128,6 +142,7 @@ export class GameForm {
     try {
       const found = await libraryInspect(this.game.path);
       this.#candidates = found?.exes.filter((e) => e.arch === "x86") ?? [];
+      this.#scripts = found?.registryFiles ?? [];
     } catch (error) {
       console.error("library_inspect failed", error);
     }

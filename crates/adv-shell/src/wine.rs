@@ -35,6 +35,50 @@ struct Host {
     pacer: Option<super::frame_pacer::HostPacer>,
 }
 
+/// Imports a `.reg` file or runs a `.bat` / `.cmd` registry restore script in
+/// the game's Wine environment (same prefix, drive letter, discs and code page).
+pub(crate) fn restore_registry(
+    environment: &mut WineHost,
+    options: &Options,
+    dist: &Path,
+    file: &Path,
+) -> Result<adv_runtime::wine::session::RegistryReport, String> {
+    let prefix = match &options.wine_prefix {
+        Some(prefix) => prefix.clone(),
+        None => options
+            .data_dir
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("wine"),
+    };
+    let prefix = std::path::absolute(prefix).map_err(|e| e.to_string())?;
+    let debug = std::env::var("WINEDEBUG").unwrap_or_default();
+    let codepage = match options.codepage {
+        Some(codepage) => codepage,
+        None => crate::detect_codepage(&options.exe).map_err(|e| e.to_string())?,
+    };
+    let config = Config {
+        dist,
+        prefix: &prefix,
+        drive: options.wine_drive.as_deref(),
+        locale: adv_runtime::wine::session::locale(codepage),
+        fonts: "",
+        exe: &options.exe,
+        width: options.width,
+        height: options.height,
+        jit: options.jit,
+        debug: &debug,
+        stdout: None,
+    };
+    let session_options = SessionOptions {
+        fonts: adv_runtime::FontOverrides::default(),
+        font_files: Vec::new(),
+        cdroms: options.cdroms.clone(),
+        install_dir: options.install_dir.clone(),
+    };
+    environment.restore_registry(&config, &session_options, file)
+}
+
 fn start(
     environment: &mut WineHost,
     options: &Options,

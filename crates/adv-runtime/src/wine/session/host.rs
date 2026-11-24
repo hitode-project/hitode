@@ -55,6 +55,17 @@ impl Host {
         Session::start_on(self, config, wake, options, prepare)
     }
 
+    /// Imports a `.reg` file or executes a registry restore `.bat` / `.cmd`
+    /// script against this host's Wine prefix using the game's mount layout.
+    pub fn restore_registry(
+        &mut self,
+        config: &Config<'_>,
+        options: &SessionOptions,
+        file: &Path,
+    ) -> Result<registry::RegistryReport, String> {
+        registry::restore(self, config, options, file)
+    }
+
     pub(super) fn check(&self, config: &Config<'_>) -> Result<(), String> {
         if let Some(binding) = &self.binding {
             if binding.prefix != config.prefix || binding.dist != config.dist {

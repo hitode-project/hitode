@@ -18,6 +18,7 @@
   import Game from "./pages/Game.svelte";
   import Gamepad from "./pages/Gamepad.svelte";
   import GameStorage from "./pages/GameStorage.svelte";
+  import GameRun from "./pages/GameRun.svelte";
   import GameSettings from "./pages/GameSettings.svelte";
   import Import from "./pages/Import.svelte";
   import Launch from "./pages/Launch.svelte";
@@ -143,6 +144,8 @@
         <Gamepad />
       {:else if route.name === "game-storage" || route.name === "game-files"}
         <GameStorage gameId={route.name === "game-files" ? route.gameId : undefined} />
+      {:else if route.name === "game-run"}
+        <GameRun gameId={route.gameId} />
       {:else if route.name === "game-settings"}
         {#if phonePage}<PhoneGameSettings gameId={route.gameId} />{:else}<GameSettings gameId={route.gameId} />{/if}
       {:else if route.name === "launch"}

@@ -9,6 +9,7 @@
   import { revealFolder, type OverrideKey } from "../lib/fake-settings";
   import { prefs } from "../lib/prefs.svelte";
   import { library } from "../lib/library.svelte";
+  import { nav } from "../lib/nav.svelte";
   import { GameForm } from "../lib/settings-form.svelte";
   import type { Codepage } from "../lib/host";
   import type { Game } from "../lib/types";
@@ -90,6 +91,15 @@
         {/each}
         <div class="row sm">
           <button class="quiet" style="margin-left: -12px" onclick={() => form.addDisc()} disabled={form.discsFull}>{t("添加光盘镜像…")}</button>
+        </div>
+        <div class="row">
+          <span class="t">{t("运行其他文件")}</span>
+          {#if form.otherRunHint}
+            <span class="val ellipsis" style="font-size: 12px">{form.otherRunHint}</span>
+          {/if}
+          <button class="quiet" style="margin-right: -12px" onclick={() => nav.go({ name: "game-run", gameId: game.id })}>
+            {t("打开…")}
+          </button>
         </div>
       {/if}
     </section>

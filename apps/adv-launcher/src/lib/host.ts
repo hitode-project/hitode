@@ -26,6 +26,10 @@ export interface ExeCandidate {
 export interface FolderInspection {
   folder: string; title: string; exes: ExeCandidate[];
   suggested: number | null; inLibrary: string | null;
+  registryFiles?: string[];
+}
+export interface RegistryImportResult {
+  entries: number; normalizedWow64: number;
 }
 export interface ScanFound {
   folder: string; relative: string; depth: number; title: string;
@@ -92,8 +96,8 @@ export function hapticTick(): void {
 export function libraryRestore(game: LibraryGame, index: number): Promise<void> {
   return call("library_restore", { game, index }, undefined);
 }
-export function startGame(id: string): Promise<void> {
-  return call("start_game", { id, filter: gameFilter(id), playback: playback(id) }, undefined);
+export function startGame(id: string, exe?: string): Promise<void> {
+  return call("start_game", { id, filter: gameFilter(id), playback: playback(id, exe) }, undefined);
 }
 /** Pause or resume the running game, e.g. while the pause menu or report page is open. */
 export function pauseGame(paused: boolean): Promise<void> {
@@ -106,6 +110,10 @@ export function stopGame(force = false): Promise<void> {
 /** Opens drive C: of the Wine prefix, where games' other saved data is. */
 export function revealDrive(): Promise<void> {
   return call("reveal_drive", {}, undefined);
+}
+/** Imports a `.reg` file or executes a registry restore `.bat`/`.cmd` script for a game. */
+export function importRegistry(id: string, path: string, discs: string[]): Promise<RegistryImportResult | null> {
+  return call("import_registry", { id, path, discs }, null);
 }
 export function revealPath(path: string): Promise<void> {
   return call("reveal_path", { path }, undefined);

@@ -91,6 +91,11 @@ const exes: Record<string, string[]> = {
   g12: ["Momiji.exe", "Setup.exe"],
 };
 
+/** Browser-preview registry files for sample library entries. */
+export const fakeRegistryFiles: Record<string, string[]> = {
+  g1: ["注册表恢复.bat", "注册表.reg"],
+};
+
 // Persisted separately from the library, keyed by its stable game id.
 const SETUP_KEY = "adv-launcher.game-settings";
 function savedSetups(): [string, GameSetup][] {

@@ -88,6 +88,10 @@ pub struct Playback {
     font_files: Vec<std::path::PathBuf>,
     font_families: std::collections::BTreeMap<String, String>,
     smoothing: Option<bool>,
+    /// Optional one-shot executable (relative to the game folder or absolute)
+    /// launched in this game's Wine environment without changing its main exe.
+    #[serde(default)]
+    exe: Option<String>,
 }
 impl Playback {
     /// Prepare files off the UI thread before creating the native view.
@@ -98,6 +102,19 @@ impl Playback {
         data_dir: std::path::PathBuf,
         codepage: u32,
     ) -> Result<adv_shell::Options, String> {
+        let exe = match &self.exe {
+            Some(target) => {
+                let candidate = std::path::Path::new(target);
+                if candidate.is_relative() {
+                    exe.parent()
+                        .ok_or("the program has no directory")?
+                        .join(candidate)
+                } else {
+                    candidate.to_path_buf()
+                }
+            }
+            None => exe,
+        };
         match std::fs::metadata(&exe) {
             Ok(meta) if meta.is_file() => {}
             Ok(_) => return Err("launch_missing_file".into()),

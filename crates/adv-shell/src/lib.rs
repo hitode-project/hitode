@@ -11,6 +11,8 @@ mod heap;
 #[cfg(host_view)]
 pub use adv_runtime::system_font_families;
 #[cfg(host_view)]
+pub use adv_runtime::wine::session::RegistryReport;
+#[cfg(host_view)]
 pub use execution::Execution;
 pub use heap::CountingAllocator;
 #[cfg(host_view)]
