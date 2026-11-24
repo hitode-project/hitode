@@ -307,6 +307,7 @@ are ignored. The supported fields restore without changing the current reserved 
 
 **Rule**: Memory flush, lock, prefetch and WoW64 services MUST follow Wine 11.0 statuses, lengths and server requests. Process write barriers MUST order prior guest writes.
 An unconstrained private allocation MUST be able to use free user addresses outside the dynamic arena.
+An allocation without a base MUST be placed first-fit bottom-up from the lowest user granule (0x10000), as on Windows; the main image's preferred range MUST be held from process creation until the image is mapped there, so early allocations fill around it. Thread stacks are placed bottom-up as well; the host's own reservations fill the dynamic range top-down, as Windows places system memory, so they never take the low addresses the guest expects.
 Control-flow-guard protection bits MUST follow Windows. Allocation accepts `PAGE_TARGETS_INVALID` with an executable protection; with any other protection the status is `STATUS_INVALID_PARAMETER`. A protection change accepts `PAGE_TARGETS_NO_UPDATE` and `0x20000000` with an executable protection; with any other protection the status is `STATUS_INVALID_PARAMETER_4`. Accepted bits MUST NOT be stored in the page protection.
 **Verification**: Test
 

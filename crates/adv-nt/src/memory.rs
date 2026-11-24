@@ -1716,7 +1716,6 @@ mod volume_tests {
         .unwrap();
         let args = GRANULE;
         let size = 8 * 1024 * 1024;
-        assert!(machine.sys.vm.reserve_at(args, PAGE));
         machine.cpu.map(args, PAGE, Prot::RW).unwrap();
         assert!(machine.sys.vm.reserve_at(DYN_START, DYN_END - DYN_START));
         machine.cpu.write_u32(args + 4, size).unwrap();
@@ -1743,8 +1742,57 @@ mod volume_tests {
         )
         .unwrap();
         let base = env.cpu.read_u32(args).unwrap();
-        assert!((GRANULE..DYN_START).contains(&base));
+        assert!(base >= DYN_END);
         assert_eq!(env.sys.vm.region(base), Some(size));
+    }
+
+    // spec: NT-SYS-2
+    #[test]
+    fn unconstrained_allocation_fills_bottom_up_from_the_lowest_user_granule() {
+        use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, false).unwrap(),
+            crate::dispatch::Platform,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        // A held image range, as the main image's before it is mapped.
+        let image = 0x40_0000;
+        assert!(machine.sys.vm.reserve_at(image, 0x2_9000));
+        let args = 0x30_0000;
+        machine.cpu.map(args, PAGE, Prot::RW).unwrap();
+        assert!(machine.sys.vm.reserve_at(args, PAGE));
+        let mut env = Env {
+            context: 0,
+            cpu: &mut machine.cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        let place = |env: &mut Env<'_>, size: u32| {
+            env.cpu.write_u32(args, 0).unwrap();
+            env.cpu.write_u32(args + 4, size).unwrap();
+            allocate_in(
+                env,
+                &[
+                    CURRENT_PROCESS,
+                    args,
+                    0,
+                    args + 4,
+                    MEM_RESERVE,
+                    PAGE_READWRITE,
+                ],
+                0,
+                0,
+                GRANULE,
+            )
+            .unwrap();
+            env.cpu.read_u32(args).unwrap()
+        };
+        assert_eq!(place(&mut env, PAGE), GRANULE);
+        // Too large for the hole below the image: it goes past the image.
+        assert_eq!(place(&mut env, 0x40_0000), 0x43_0000);
+        assert_eq!(place(&mut env, 0x2_0000), 0x2_0000);
     }
 
     // spec: A64-MEM-4
