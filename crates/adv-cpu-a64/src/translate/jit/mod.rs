@@ -576,6 +576,12 @@ impl Drop for Lowering<'_> {
                 insts.last().map_or(0, |inst| inst.pc),
                 self.computation,
             );
+            for inst in insts {
+                eprintln!(
+                    "a64:   {:#010x}..{:#010x} {:?} next {:?} taken {:?}",
+                    inst.pc, inst.next_pc, inst.op, inst.next, inst.taken
+                );
+            }
         }
     }
 }
