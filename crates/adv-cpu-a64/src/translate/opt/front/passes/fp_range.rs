@@ -2016,8 +2016,12 @@ fn detect_counted_latch(
             a,
             ..
         } if cc == ConditionCode::ne => {
-            let (idx, dir) = match_step(a)?;
-            (dir == -1).then(|| CountedLatch {
+            // `DEC` builds `Op::Flags(Decrement, old, 1)` with the pre-decrement
+            // induction value, while the back-edge carries `Sub(old, 1)`.
+            let idx = head_params.iter().position(|&p| p == a)?;
+            let back = *back_args.get(idx)?;
+            let (step_idx, dir) = match_step(back)?;
+            (step_idx == idx && dir == -1).then(|| CountedLatch {
                 i_0: entry_args[idx],
                 limit: None,
                 dir,

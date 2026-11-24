@@ -619,3 +619,59 @@ fn instruction_cache_saturation_also_revokes_successor_generation() {
     interpreter.run_block(&mut s, &mut m, 64, STOP, None);
     assert_eq!(interpreter.decode_count(), decodes);
 }
+
+#[test]
+fn bound_passes_inside_signed_bounds_and_faults_br_outside() {
+    // bound eax, [TABLE]
+    let code = [0x62, 0x05, 0x00, 0x00, 0x02, 0x00];
+    let mut m = memory(&code);
+    m.write(TABLE, &(-4i32).to_le_bytes()).unwrap();
+    m.write(TABLE + 4, &7i32.to_le_bytes()).unwrap();
+    let mut interpreter = Interpreter::new();
+    for (index, faults) in [(-4i32, false), (7, false), (-5, true), (8, true)] {
+        let mut s = state();
+        s.regs[0] = index as u32;
+        let result = interpreter.run_block(&mut s, &mut m, 256, STOP, None).0;
+        if faults {
+            assert_eq!(
+                result.step,
+                Step::Trap {
+                    pc: CODE,
+                    vector: 5
+                }
+            );
+            assert_eq!((s.eip, s.regs[1]), (CODE, 31));
+        } else {
+            assert_eq!(result.step, Step::Executed);
+            assert_eq!(s.eip, CODE + 6);
+        }
+    }
+}
+
+#[test]
+fn int_through_a_kernel_only_gate_faults_gp_at_the_instruction() {
+    let mut interpreter = Interpreter::new();
+    for (code, step, eip) in [
+        (
+            [0xcd, 0x01],
+            Step::Trap {
+                pc: CODE,
+                vector: 13,
+            },
+            CODE,
+        ),
+        (
+            [0xcd, 0x20],
+            Step::Trap {
+                pc: CODE,
+                vector: 13,
+            },
+            CODE,
+        ),
+    ] {
+        let mut m = memory(&code);
+        let mut s = state();
+        let result = interpreter.run_block(&mut s, &mut m, 256, STOP, None).0;
+        assert_eq!((result.step, s.eip), (step, eip));
+    }
+}

@@ -265,7 +265,7 @@ Unmatched libraries MUST execute their guest implementations.
 
 ### DEV-DISC-1 Mount configuration
 
-**Rule**: Startup configuration MAY mount multiple ISO images on distinct drive letters. Mounts MUST NOT replace the system drive or the game-root drive.
+**Rule**: Startup configuration MAY mount multiple disc images on distinct drive letters. Mounts MUST NOT replace the system drive or the game-root drive.
 **Verification**: Test
 
 ### DEV-DISC-2 Installation and authentication
@@ -280,8 +280,16 @@ Unmatched libraries MUST execute their guest implementations.
 
 ### DEV-DISC-4 Supported image data
 
-**Rule**: Optical media MUST support ISO9660 and Joliet with 2048-byte logical sectors, including noncontiguous multi-extent files. Reads MUST honor file bounds and independent cursors.
+**Rule**: Optical media MUST support ISO9660 and Joliet with 2048-byte logical sectors, including noncontiguous multi-extent files. Reads MUST honor file bounds and independent cursors. The volume MUST be the first track of a container below, and a first track without data MUST fail the mount.
 **Verification**: Test
+
+| Container | First track |
+|---|---|
+| `.iso`, or any image without a sync pattern | 2048-byte user data |
+| `.bin`, `.img`, `.mdf` | Mode 1 or Mode 2 Form 1 raw sectors of 2352 or 2448 bytes, found by sync pattern |
+| `.cue` | The named file at `INDEX 01` with the declared sector size |
+| `.ccd`, `.mds` | The same-stem `.img` or `.mdf` |
+| `.nrg` | The first `DAOX`, `DAOI`, `ETN2` or `ETNF` track |
 
 ### DEV-DISC-5 Bounded image access
 
@@ -300,7 +308,7 @@ Unmatched libraries MUST execute their guest implementations.
 
 ### DEV-DISC-8 Unsupported media operations
 
-**Rule**: UDF, BIN/CUE, multisession audio, raw device IOCTLs, CD audio, and physical-medium information MUST NOT be inferred from ISO data support. Runtime eject and media-change notifications MUST remain unavailable.
+**Rule**: UDF, sessions after the first track, subchannel data, raw device IOCTLs, CD audio, and physical-medium information MUST NOT be inferred from ISO data support. Runtime eject and media-change notifications MUST remain unavailable.
 **Verification**: Review — no test enumerates all unsupported formats and device operations or runtime media-change requests.
 
 Withdrawn: DEV-CODEC-2

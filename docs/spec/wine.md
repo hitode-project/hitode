@@ -307,6 +307,7 @@ are ignored. The supported fields restore without changing the current reserved 
 
 **Rule**: Memory flush, lock, prefetch and WoW64 services MUST follow Wine 11.0 statuses, lengths and server requests. Process write barriers MUST order prior guest writes.
 An unconstrained private allocation MUST be able to use free user addresses outside the dynamic arena.
+An allocation without a base MUST be placed first-fit bottom-up from the lowest user granule (0x10000), as on Windows; the main image's preferred range MUST be held from process creation until the image is mapped there, so early allocations fill around it. Thread stacks are placed bottom-up as well; the host's own reservations fill the dynamic range top-down, as Windows places system memory, so they never take the low addresses the guest expects.
 Control-flow-guard protection bits MUST follow Windows. Allocation accepts `PAGE_TARGETS_INVALID` with an executable protection; with any other protection the status is `STATUS_INVALID_PARAMETER`. A protection change accepts `PAGE_TARGETS_NO_UPDATE` and `0x20000000` with an executable protection; with any other protection the status is `STATUS_INVALID_PARAMETER_4`. Accepted bits MUST NOT be stored in the page protection.
 **Verification**: Test
 
@@ -330,6 +331,13 @@ Control-flow-guard protection bits MUST follow Windows. Allocation accepts `PAGE
 **Rule**: Exception delivery MUST stop with a terminal guest stack overflow when its frame would cross the guard at the bottom of the thread stack. The failure MUST identify the exception that required the frame.
 **Verification**: Review — the frame boundary is checked before any guest stack write.
 **Basis**: Wine 11.0 `virtual_setup_exception` aborts when the exception frame reaches the last stack page.
+
+### NT-SYS-7 CPU exception records
+
+**Rule**: A CPU exception MUST reach the guest with the code, address, saved EIP and parameters that Windows x86 delivers.
+**Verification**: Test — the probe's output is compared with its output on Windows 11 x86, on both engines.
+
+BOUND out of range raises `STATUS_ARRAY_BOUNDS_EXCEEDED` at the instruction. User mode may use the gates for vectors 3, 4, 0x29, 0x2c, 0x2d and 0x2e. `INT n` through any other gate raises an access violation at the instruction, with parameters 0 and 0xffffffff. `INT 1` is therefore not a single step. `INT 4` raises `STATUS_INTEGER_OVERFLOW` one byte before the next instruction, where EIP stays. `INT 0x2c` raises `STATUS_ASSERTION_FAILURE` with the address and EIP at the instruction.
 
 ## Unix libraries
 

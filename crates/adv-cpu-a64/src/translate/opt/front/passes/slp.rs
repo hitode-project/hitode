@@ -700,33 +700,78 @@ fn slp_profitable(
     header_words < saved.saturating_mul(min_trips)
 }
 
+fn block_has_slp_candidates(insts: &[(Option<Value>, Op)]) -> bool {
+    let mut count = 0usize;
+    for &(res, op) in insts {
+        if res.is_some()
+            && matches!(
+                op,
+                Op::X87Store {
+                    width,
+                    integer,
+                    proved: true,
+                    ..
+                } if (integer && width <= 4) || (!integer && width == 4)
+            )
+        {
+            count += 1;
+            if count >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+struct FunctionTables {
+    def_block: Vec<Option<usize>>,
+    const_f64: Vec<Option<u64>>,
+    inst_uses: Vec<u32>,
+    inline_records: Vec<bool>,
+}
+
 /// Run intra-iteration cross-channel SLP across all blocks of `func`.
 pub(super) fn run(func: &mut Func) -> bool {
     let mut any_changed = false;
+    let mut tables: Option<FunctionTables> = None;
 
     for block_idx in 0..func.blocks.len() {
-        let n = func.types.len();
-        let mut def_block = vec![None; n];
-        let mut const_f64 = vec![None; n];
-        for (bi, block) in func.blocks.iter().enumerate() {
-            for &p in &block.params {
-                def_block[p.0 as usize] = Some(bi);
-            }
-            for &(res, op) in &block.insts {
-                if let Some(v) = res {
-                    def_block[v.0 as usize] = Some(bi);
-                    if let Op::Constant(Type::F64, bits) = op {
-                        const_f64[v.0 as usize] = Some(bits as u64);
+        if !block_has_slp_candidates(&func.blocks[block_idx].insts) {
+            continue;
+        }
+        let cached = tables.get_or_insert_with(|| {
+            let n = func.types.len();
+            let mut def_block = vec![None; n];
+            let mut const_f64 = vec![None; n];
+            for (bi, block) in func.blocks.iter().enumerate() {
+                for &p in &block.params {
+                    def_block[p.0 as usize] = Some(bi);
+                }
+                for &(res, op) in &block.insts {
+                    if let Some(v) = res {
+                        def_block[v.0 as usize] = Some(bi);
+                        if let Op::Constant(Type::F64, bits) = op {
+                            const_f64[v.0 as usize] = Some(bits as u64);
+                        }
                     }
                 }
             }
-        }
-        let inst_uses = count_inst_uses(func);
-        let inline_records = inline_exit_records(func);
-        let channels = collect_channels(func, block_idx, &inst_uses, &inline_records);
+            let inst_uses = count_inst_uses(func);
+            let inline_records = inline_exit_records(func);
+            FunctionTables {
+                def_block,
+                const_f64,
+                inst_uses,
+                inline_records,
+            }
+        });
+        let channels = collect_channels(func, block_idx, &cached.inst_uses, &cached.inline_records);
         if channels.len() < 2 {
             continue;
         }
+        let n = func.types.len();
+        let def_block: &[Option<usize>] = &cached.def_block;
+        let const_f64: &[Option<u64>] = &cached.const_f64;
 
         let mut def_pos_in_block = BTreeMap::<Value, usize>::new();
         for (idx, &(res, _)) in func.blocks[block_idx].insts.iter().enumerate() {
@@ -757,9 +802,9 @@ pub(super) fn run(func: &mut Func) -> bool {
                                 v,
                                 block_idx,
                                 insert_at,
-                                &def_block,
+                                def_block,
                                 &def_pos_in_block,
-                                &const_f64,
+                                const_f64,
                             )
                         })
                     });
@@ -816,8 +861,8 @@ pub(super) fn run(func: &mut Func) -> bool {
         // only breaks even when amortized across >= 2 groups of the same key.
         let price_ctx = PriceCtx {
             block_idx,
-            def_block: &def_block,
-            const_f64: &const_f64,
+            def_block,
+            const_f64,
             loop_uses: &loop_uses,
         };
         let mut shared_bcasts = BTreeSet::<(bool, Value)>::new();
@@ -1056,8 +1101,8 @@ pub(super) fn run(func: &mut Func) -> bool {
                     &lanes,
                     is_single,
                     block_idx,
-                    &def_block,
-                    &const_f64,
+                    def_block,
+                    const_f64,
                     &mut header_insts,
                     body_out,
                     &mut header_bcasts,
@@ -1252,8 +1297,72 @@ pub(super) fn run(func: &mut Func) -> bool {
         if !header_insts.is_empty() {
             func.blocks[0].insts.extend(header_insts);
         }
+        tables = None;
         any_changed = true;
     }
 
     any_changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // spec: A64-OPT-2
+    #[test]
+    fn phase4_slp_skips_pure_integer_blocks_without_scanning_func() {
+        use crate::translate::opt::{
+            ir::{Head, Source, Target},
+            recovery::IrRecord,
+            verify,
+        };
+
+        const OPS: usize = 1024;
+        const BLOCKS: usize = 128;
+        let mut func = Func {
+            kept: 0x00ff_fffe,
+            entry: vec![Source::Reg(0), Source::Eflags],
+            ..Func::default()
+        };
+        let mut block = func.block(None);
+        let mut value = func.param(block, Type::I32);
+        let flags = func.param(block, Type::Flags);
+        let mut record = IrRecord {
+            eip: 0,
+            refund: 0,
+            regs: [None; 8],
+            eflags: Some(Location::At(flags)),
+            flag_groups: vec![],
+            x87: None,
+            xmm: [None; 8],
+            mmx: [None; 8],
+            mmx_meta: None,
+            frame: vec![],
+        };
+        record.regs[0] = Some(Location::At(value));
+        let entry = func.record(record.clone());
+        func.blocks[0].head = Some(Head { record: entry });
+        for index in 0..BLOCKS {
+            if index != 0 {
+                let next = func.block(None);
+                func.end(
+                    block,
+                    End::Jump(Target {
+                        block: next,
+                        args: vec![],
+                        charge: 0,
+                    }),
+                );
+                block = next;
+            }
+            for _ in 0..OPS / BLOCKS {
+                value = func.push(block, Op::Int(IntOp::Add, value, value)).unwrap();
+            }
+        }
+        record.regs[0] = Some(Location::At(value));
+        let exit = func.record(record);
+        func.end(block, End::Exit(exit));
+        assert_eq!(verify::verify(&func), Ok(()));
+        assert!(!run(&mut func));
+    }
 }

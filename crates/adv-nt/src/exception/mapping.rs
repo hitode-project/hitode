@@ -17,7 +17,9 @@ const ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
 const INTEGER_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
 const INTEGER_OVERFLOW: u32 = 0xc000_0095;
 const PRIVILEGED_INSTRUCTION: u32 = 0xc000_0096;
+const ARRAY_BOUNDS_EXCEEDED: u32 = 0xc000_008c;
 const BREAKPOINT: u32 = 0x8000_0003;
+const ASSERTION_FAILURE: u32 = 0xc000_0420;
 
 pub fn map(
     cpu: &dyn Guest,
@@ -155,6 +157,19 @@ fn map_stop(
         }
         Exception::Trap { vector: 1, .. } => 0x8000_0004,
         Exception::Trap { vector: 6, .. } => ILLEGAL_INSTRUCTION,
+        // BOUND's #BR, at the instruction with no parameters.
+        Exception::Trap { vector: 5, .. } => ARRAY_BOUNDS_EXCEEDED,
+        // Measured on Windows 11 WoW64: `int 4` reports one byte back from
+        // the retired EIP, which stays after the instruction.
+        Exception::Trap { vector: 4, .. } => {
+            record.address = pc.wrapping_sub(1);
+            INTEGER_OVERFLOW
+        }
+        // `int 0x2c` reports and resumes at the instruction itself.
+        Exception::Trap { vector: 0x2c, .. } => {
+            record.address = pc.wrapping_sub(2);
+            ASSERTION_FAILURE
+        }
         Exception::Trap { vector: 13, .. }
             if matches!(
                 instruction(cpu, pc).mnemonic(),
@@ -193,6 +208,8 @@ pub fn normalize_context(record: &Record, state: &mut ArchitecturalState) {
         } else {
             record.address
         };
+    } else if record.code == ASSERTION_FAILURE {
+        state.eip = record.address;
     } else if record.code == 0x8000_0004 {
         state.eflags &= !0x100;
     } else {

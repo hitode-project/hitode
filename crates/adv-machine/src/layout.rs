@@ -1,16 +1,21 @@
 //! Guest address-space layout for the host-owned regions.
 //!
-//! Images load at their preferred base (TL2026 has no relocations), so everything the host
-//! owns lives where Win32 x86 processes never put images: 0x1000_0000..0x7000_0000 is the
-//! dynamic region (heaps, stacks, VirtualAlloc), 0x7e00_0000.. holds host code/tables, and the
-//! TEB/PEB sit where Windows puts them.
+//! Guest allocations without a base (VirtualAlloc, thread stacks) fill the
+//! user range bottom-up from its lowest granule, as on Windows; the host's own
+//! reservations fill it top-down (see `vm`).
+//! The main image is mapped before them (see `adv_nt::process`), and images
+//! that find their preferred base taken are relocated, as on Windows. Host code
+//! and tables live at 0x7e00_0000.., and the TEB/PEB sit where Windows puts them.
 
 pub const PAGE: u32 = 0x1000;
 /// Windows' allocation granularity; VirtualAlloc and stacks are aligned to this.
 pub const GRANULE: u32 = 0x1_0000;
 
-/// Dynamic allocations (heaps, stacks, VirtualAlloc, resource DLL mappings).
-pub const DYN_START: u32 = 0x1000_0000;
+/// Dynamic allocations (heaps, stacks, VirtualAlloc, resource DLL mappings),
+/// from Windows' lowest user address (`MM_LOWEST_USER_ADDRESS`). Guest code
+/// relies on what Windows leaves free: a protector can probe an address it
+/// expects to be unmapped in a process this young.
+pub const DYN_START: u32 = GRANULE;
 pub const DYN_END: u32 = 0x7000_0000;
 
 /// Hookable host thunks with a relocatable trap token, one per 32-byte slot.

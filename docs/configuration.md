@@ -103,7 +103,7 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_STATIC_CODEC_TEST_IMAGE` | Fixture | Unset: skip the local PE fixtures. Takes a path list with a Theora and SSE MDCT image first, and an optional x87 MDCT image second. |
 | `ADV_TEST_FFMPEG` | Fixture | `ffmpeg` |
 | `ADV_TEST_GPU_BACKEND` | Fixture | Automatic; `vulkan` or `metal` |
-| `ADV_TEST_ISO` | Fixture | None; a read-only image must be given |
+| `ADV_TEST_DISC` | Fixture | None; a read-only disc image must be given |
 | `ADV_TEXT_DIAGNOSTICS` | Diagnostic | Off |
 | `ADV_TIER1_CENSUS` | Diagnostic | Off; census of x87 exact-path forms |
 | `ADV_VERIFY_FRAMES` | Diagnostic | Off; `1` executes every D3D9 frame and asynchronously compares pixels outside computed damage with the previous readback |
@@ -148,7 +148,7 @@ device loss; builds without it omit the executor hooks.
 | `--frames` | Fixture | No frame limit |
 | `--seconds` | Fixture | No wall-clock limit |
 | `--data-dir` | Feature | `target/adv-data/<exe>` |
-| `--cdrom` | Feature | None; repeat to mount read-only ISO images |
+| `--cdrom` | Feature | None; repeat to mount read-only disc images |
 | `--install-dir` | Feature | None: `C:\Program Files` lives in the data folder |
 | `--report` | Diagnostic | No output |
 | `--screenshot` | Diagnostic | No output |
@@ -170,7 +170,8 @@ font files, family substitutions and smoothing, frame and time limits, and audio
 It writes the final stop reason and full guest exit code even on a guest failure;
 control snapshots retain `running` until execution stops. Ctrl acceleration uses the shared live key policy for
 eligible delays and stays disabled once a child process has been created.
-`--cdrom` uses the shared ISO9660/Joliet reader. The program directory takes the first
+`--cdrom` accepts `.iso`, raw `.bin`/`.img`/`.mdf`, `.cue`, `.ccd`, `.mds` and `.nrg` images and reads
+their first data track with the shared ISO9660/Joliet reader. The program directory takes the first
 unmounted letter from D: onward. `--install-dir` redirects `C:\Program Files` to the
 selected host directory without replacing the prefix's own directory. Children inherit
 both mappings; removing settings on the next run restores the prefix namespace.

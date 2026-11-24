@@ -119,11 +119,20 @@ fn display_child_session() {
         Ok(())
     })
     .unwrap();
-    let stop = session.run(Instant::now() + Duration::from_secs(5));
-    assert!(matches!(stop, Stop::Paused), "{stop:?}");
-    let frame = ui
-        .frame(&mut session)
-        .expect("child frame did not reach the UI");
+    // Two Wine process starts take about 5 s in a debug build: run until the
+    // child's first frame, and fail rather than hang if it never comes.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let frame = loop {
+        let stop = session.run(Instant::now() + Duration::from_millis(100));
+        assert!(matches!(stop, Stop::Paused), "{stop:?}");
+        if let Some(frame) = ui.frame(&mut session) {
+            break frame;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child frame did not reach the UI"
+        );
+    };
     assert_eq!((frame.width, frame.height), (80, 40));
     assert!(
         frame

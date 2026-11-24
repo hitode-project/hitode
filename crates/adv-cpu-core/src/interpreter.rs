@@ -1030,6 +1030,7 @@ impl DecodedBlock {
                         Action::Int(..)
                             | Action::Ud2
                             | Action::Privileged
+                            | Action::Bound(..)
                             | Action::String(..)
                             | Action::PopFlags(..)
                             | Action::Rdtsc
@@ -1300,6 +1301,8 @@ enum Action {
     Int(u8),
     Ud2,
     Privileged,
+    /// BOUND: the signed register against the bounds pair at the address.
+    Bound(Reg, Address, u8),
 }
 
 impl Action {
@@ -1765,10 +1768,20 @@ fn predecode(i: &Instruction) -> Option<Action> {
         M::Clc | M::Stc | M::Cmc | M::Cld | M::Std | M::Lahf | M::Sahf => {
             Action::Flags(i.mnemonic())
         }
+        M::Int if !crate::cpu_profile::user_interrupt_gate(i.immediate8()) => Action::Privileged,
         M::Int => Action::Int(i.immediate8()),
         M::Int3 => Action::Int(3),
         M::Sldt => Action::StoreLdt(op(0)?),
         M::Ud2 => Action::Ud2,
+        M::Bound if i.op1_kind() == OpKind::Memory => Action::Bound(
+            Reg::decode(i.op0_register())?,
+            Address::decode(i, false)?,
+            if i.code() == Code::Bound_r16_m1616 {
+                2
+            } else {
+                4
+            },
+        ),
         // The flat Windows profile is CPL3 with IOPL0: neither instruction
         // changes IF or retires before delivering the general protection fault.
         M::Cli | M::Sti => Action::Privileged,
@@ -2332,6 +2345,23 @@ impl Transaction {
                     pc: self.pc,
                     vector: 13,
                 });
+            }
+            Action::Bound(index, lower, width) => {
+                let mut upper = lower;
+                upper.displacement = upper.displacement.wrapping_add(u32::from(width));
+                let bound = |cpu: &mut Self, address| {
+                    cpu.read(memory, Operand::Memory(address, width))
+                        .map(|value| signed(value, width))
+                };
+                let (low, high) = (bound(self, lower)?, bound(self, upper)?);
+                let value = signed(self.read(memory, Operand::Register(index))?, width);
+                if value < low || value > high {
+                    // #BR is a fault: nothing retires.
+                    return Err(Step::Trap {
+                        pc: self.pc,
+                        vector: 5,
+                    });
+                }
             }
         }
         Ok(None)

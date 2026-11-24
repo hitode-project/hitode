@@ -304,7 +304,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --seconds N             stop after N seconds of host wall time\n\
   --data-dir PATH         guest write overlay (default: target/adv-data/<exe>)\n\
   --no-code-cache         troubleshoot startup: bypass native cache and image precompilation\n\
-  --cdrom D=PATH          attach a read-only ISO to guest drive D (repeatable)\n\
+  --cdrom D=PATH          attach a read-only disc image to guest drive D (repeatable)\n\
   --install-dir DIR       back guest C:\\Program Files with DIR, written in place\n\
   --report PATH           write a JSON execution report\n\
   --screenshot PATH       write the final frame as PNG\n\
@@ -397,7 +397,9 @@ impl Options {
                         || !letter.as_bytes()[0].is_ascii_uppercase()
                         || path.is_empty()
                     {
-                        return Err("--cdrom requires one drive letter and an ISO path".into());
+                        return Err(
+                            "--cdrom requires one drive letter and a disc image path".into()
+                        );
                     }
                     let letter = letter.as_bytes()[0] as char;
                     if letter == 'C' || options.cdroms.iter().any(|(d, _)| *d == letter) {

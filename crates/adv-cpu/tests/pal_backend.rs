@@ -849,15 +849,20 @@ fn every_interrupt_vector_reaches_raw_handler_and_can_resume() {
     }
     impl TrapHandler for Interrupts {
         fn on_trap(&mut self, cpu: &mut dyn Guest, vector: u8) -> TrapAction {
-            self.seen.push((vector, cpu.reg(Reg::Eip)));
+            let eip = cpu.reg(Reg::Eip);
+            self.seen.push((vector, eip));
             cpu.set_reg(Reg::Eax, u32::from(vector));
+            if vector == 13 {
+                // A kernel-only gate faults at the INT; the handler skips it.
+                cpu.set_reg(Reg::Eip, eip + 2);
+            }
             TrapAction::Continue
         }
     }
     for jit in [false, true] {
         let mut cpu = cpu(jit);
         cpu.map(CODE, 4096, Prot::RX).unwrap();
-        let bytes = [0xcc, 0xcd, 0x80, 0xcd, 0x2e, 0xc3];
+        let bytes = [0xcc, 0xcd, 0x2c, 0xcd, 0x80, 0xcd, 0x2e, 0xc3];
         cpu.write(CODE, &bytes).unwrap();
         if jit {
             cpu.executor_mut()
@@ -869,7 +874,12 @@ fn every_interrupt_vector_reaches_raw_handler_and_can_resume() {
         assert_eq!(cpu.run(&mut interrupts), Exit::Parked);
         assert_eq!(
             interrupts.seen,
-            [(3, CODE + 1), (0x80, CODE + 3), (0x2e, CODE + 5)]
+            [
+                (3, CODE + 1),
+                (0x2c, CODE + 3),
+                (13, CODE + 3),
+                (0x2e, CODE + 7)
+            ]
         );
         assert_eq!(cpu.reg(Reg::Eax), 0x2e);
     }

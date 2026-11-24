@@ -1172,12 +1172,28 @@ impl Builder<'_> {
         Some(id)
     }
 
+    fn known_exact_f32(&self, v: Value) -> bool {
+        let v = self.resolve(v);
+        let defs = self.values.defs;
+        if let Some(bits) = defs.constant(v) {
+            let f = f64::from_bits(bits as u64);
+            return f64::from(f as f32).to_bits() == f.to_bits();
+        }
+        match defs.op(v) {
+            Some(
+                Op::X87Load { single: true, .. } | Op::X87Single(..) | Op::Fma { single: true, .. },
+            ) => true,
+            Some(Op::FpUnary(FpUnary::Neg | FpUnary::Abs, a)) => self.known_exact_f32(a),
+            _ => false,
+        }
+    }
+
     fn float_store(&mut self, v: Value, width: u8) -> Option<usize> {
         let v = self.resolve(v);
         let double = self.shape == Shape::Float64;
         // Direct F64 store (`FSTP m64`) in a 2-wide binary64 strip.
         if double && width == 8 && self.values.func.ty(v) == Type::F64 {
-            return self.float_val(v, false);
+            return self.float_val(v, false, false);
         }
         // Only admit explicit `Op::X87Store` conversions here; never reuse a
         // raw `Op::Load` from `self.mapped`, whose packed lane width may differ
@@ -1202,7 +1218,9 @@ impl Builder<'_> {
             if width != 4 {
                 return None;
             }
-            let src = self.float_val(value, !proved)?;
+            // `proved` proves the rounded integer fits in i32, not that `value`
+            // is binary32-exact; `.4s` broadcasts must still prove exactness.
+            let src = self.float_val(value, !proved, false)?;
             if !proved {
                 self.effect(OpCode::CheckIntRange { double, rounding }, vec![src]);
             }
@@ -1212,7 +1230,7 @@ impl Builder<'_> {
             if width != expected_width {
                 return None;
             }
-            let src = self.float_val(value, !proved)?;
+            let src = self.float_val(value, !proved, false)?;
             if !proved {
                 self.effect(
                     OpCode::CheckNormal {
@@ -1228,7 +1246,7 @@ impl Builder<'_> {
         Some(id)
     }
 
-    fn float_val(&mut self, v: Value, need_check: bool) -> Option<usize> {
+    fn float_val(&mut self, v: Value, need_check: bool, exact_f32: bool) -> Option<usize> {
         let v = self.resolve(v);
         let double = self.shape == Shape::Float64;
         if let Some(&id) = self.mapped.get(&(v, u32::MAX)) {
@@ -1264,7 +1282,7 @@ impl Builder<'_> {
         if defs.invariant(&self.values.loop_.blocks, v)
             || self.values.stable.get(&v) == Some(&u32::MAX)
         {
-            let id = if !double && need_check {
+            let id = if !double && !(exact_f32 || self.known_exact_f32(v)) {
                 self.emit(OpCode::BroadcastExactF32(v), vec![])
             } else {
                 self.emit(OpCode::Broadcast(v), vec![])
@@ -1340,8 +1358,8 @@ impl Builder<'_> {
                 let proved_all = single_proved(proved);
                 let a_exact = proved & (SINGLE_A | SINGLE_EXACT) != 0;
                 let b_exact = proved & (SINGLE_B | SINGLE_EXACT) != 0;
-                let av = self.float_val(a, !a_exact)?;
-                let bv = self.float_val(b, !b_exact)?;
+                let av = self.float_val(a, !a_exact, a_exact)?;
+                let bv = self.float_val(b, !b_exact, b_exact)?;
                 let res = self.binary(Binary::Fp(op, false), av, bv);
                 if !proved_all {
                     // Exclude min-normal exponent 1 (2^-126) just like scalar
@@ -1368,8 +1386,8 @@ impl Builder<'_> {
                 res
             }
             Op::Fp(op, a, b, proved) if double => {
-                let av = self.float_val(a, !proved)?;
-                let bv = self.float_val(b, !proved)?;
+                let av = self.float_val(a, !proved, false)?;
+                let bv = self.float_val(b, !proved, false)?;
                 let res = self.binary(Binary::Fp(op, true), av, bv);
                 if !proved {
                     // Exclude min-normal exponent 1 (2^-1022) so tininess-before-
@@ -1408,9 +1426,9 @@ impl Builder<'_> {
                     proved & SINGLE_RESULT != 0
                 } =>
             {
-                let av = self.float_val(a, false)?;
-                let bv = self.float_val(b, false)?;
-                let cv = self.float_val(c, false)?;
+                let av = self.float_val(a, false, single)?;
+                let bv = self.float_val(b, false, single)?;
+                let cv = self.float_val(c, false, single)?;
                 self.emit(
                     OpCode::FpFma {
                         sub: fma_op == FmaOp::RevSub,
@@ -1420,7 +1438,7 @@ impl Builder<'_> {
                 )
             }
             Op::FpUnary(op @ (FpUnary::Neg | FpUnary::Abs), a) => {
-                let av = self.float_val(a, need_check)?;
+                let av = self.float_val(a, need_check, exact_f32)?;
                 self.emit(
                     OpCode::Unary(if op == FpUnary::Neg {
                         Unary::FpNeg(double)
