@@ -1074,12 +1074,16 @@ impl Translator<'_> {
             self.asm.bind(converted);
             self.emit(vins_general(2, V0, lane, X6));
         }
-        // Commit sticky flags even on an unmasked exception. The result
-        // remains in the temporary until the architectural check passes.
+        // Commit sticky flags even on an unmasked exception, respecting Intel
+        // SDM §11.5.3.2 priority: if pre-computation IE (bit 0) is unmasked,
+        // commit only IE before #XM rather than also committing PE from another lane.
         let bail = self.architectural_exception(19);
+        let commit_flags = self.asm.label();
+        self.emit_all(&[lsr_imm(W, X1, X13, 7), bic(W, X2, X0, X1, Shift::Lsl, 0)]);
+        self.asm.tbz(false, X2, 0, commit_flags);
+        self.emit(and_imm(W, X0, X0, 1));
+        self.asm.bind(commit_flags);
         self.emit_all(&[
-            lsr_imm(W, X1, X13, 7),
-            bic(W, X2, X0, X1, Shift::Lsl, 0),
             orr(W, X13, X13, X0, Shift::Lsl, 0),
             str(W, X13, X5, runtime::MXCSR),
         ]);

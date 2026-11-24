@@ -451,7 +451,9 @@ fn frintts_packed_float_to_int_matches_interpreter_and_fallback() {
                 p.state.xmm[3][4 * n..4 * n + 4].copy_from_slice(&v.to_le_bytes());
             }
             for &frintts in modes {
-                for control in [0x1f80, 0x1fa0, 0x1fc0, 0x1f00, 0x0f80, 0x3f80] {
+                for control in [
+                    0x1f80, 0x1fa0, 0x1fc0, 0x1f00, 0x0f80, 0x3f80, 0x0000, 0x1000,
+                ] {
                     p.state.mxcsr = control;
                     let config = (
                         Features {
@@ -492,13 +494,16 @@ fn frintts_packed_float_to_int_matches_interpreter_and_fallback() {
                 (-2_147_483_649.0f64).to_bits(),
             ], // out-of-range
             [1u64, 0x8000_0000_0000_0001u64],                    // ±min subnormal
+            [1.5f64.to_bits(), 0x7ff8_0000_0000_0001u64],        // mixed inexact + qNaN
             [0x7ff8_0000_0000_0001u64, f64::INFINITY.to_bits()], // qNaN + +Inf
         ] {
             for (n, v) in values.iter().enumerate() {
                 p.state.xmm[3][8 * n..8 * n + 8].copy_from_slice(&v.to_le_bytes());
             }
             for &frintts in modes {
-                for control in [0x1f80, 0x1fa0, 0x1fc0, 0x1f00, 0x0f80, 0x3f80] {
+                for control in [
+                    0x1f80, 0x1fa0, 0x1fc0, 0x1f00, 0x0f80, 0x3f80, 0x0000, 0x1000,
+                ] {
                     p.state.mxcsr = control;
                     let config = (
                         Features {
