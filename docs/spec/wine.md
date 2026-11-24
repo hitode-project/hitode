@@ -207,6 +207,13 @@ over 65536 names, or unreadable ones, keep host lookups. File writes and
 metadata changes leave listings intact. Lookups remember a drive by its link, so
 relinking the game drive for the next session ends them.
 
+### WINE-SYS-16 Heap blocks shrink in place
+
+**Rule**: A heap reallocation that does not grow a block MUST return the same block, as Windows 7 did. This includes blocks the low-fragmentation heap serves.
+**Verification**: Test
+
+> Note: Windows 10's low-fragmentation heap moves a block shrunk into another size class. Engines of the Windows 7 era keep using the pointer they shrank, and crash there.
+
 ### NT-SOCK-1 Wine socket I/O
 
 **Rule**: The NT platform MUST transfer Winsock stream and datagram payloads between guest buffers and server-owned sockets. It MUST preserve receive addresses, byte counts, readiness and asynchronous completion.
