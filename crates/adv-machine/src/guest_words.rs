@@ -61,7 +61,7 @@ impl GuestWordPool {
             let storage = match cpu.map_shared_counters(address, SIZE) {
                 Ok(storage) => storage,
                 Err(_) => {
-                    vm.cancel_reservation(address);
+                    vm.release_reservation(address);
                     return None;
                 }
             };
@@ -136,7 +136,8 @@ mod tests {
             Clock::virtual_time(),
         )
         .unwrap();
-        let base = crate::layout::DYN_START;
+        // The host's first reservation takes the top of the dynamic range.
+        let base = crate::layout::DYN_END - crate::layout::GRANULE;
         m.cpu.map(base, 65536, Prot::RW).unwrap();
         m.cpu.write_u32(base, 0x12345678).unwrap();
         assert!(

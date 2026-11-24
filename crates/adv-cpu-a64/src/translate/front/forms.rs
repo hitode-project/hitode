@@ -45,6 +45,9 @@ pub enum Integer {
     ClearWord(u8),
     Touch(Mem),
     Xlat(Mem),
+    /// `bound reg, mem` of `width` bytes: #BR unless the signed register is
+    /// inside the signed pair at `mem`.
+    Bound(u8, Mem, u8),
     CarryFlag(M),
 }
 
@@ -72,7 +75,7 @@ impl Integer {
             Integer::Extend(_, src, _, _, _) => (F::NONE, F::NONE, matches!(src, Part::Mem(_))),
             Integer::Cwd | Integer::ClearWord(_) => (F::NONE, F::NONE, false),
             Integer::Complement(dst, _) => (F::NONE, F::NONE, matches!(dst, Part::Mem(_))),
-            Integer::Touch(_) | Integer::Xlat(_) => (F::NONE, F::NONE, true),
+            Integer::Touch(_) | Integer::Xlat(_) | Integer::Bound(..) => (F::NONE, F::NONE, true),
             Integer::CarryFlag(kind) => {
                 (if kind == M::Cmc { F::CF } else { F::NONE }, F::CF, false)
             }

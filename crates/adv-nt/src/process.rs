@@ -260,8 +260,10 @@ fn api_set_map(dll: &[u8]) -> Result<&[u8], Error> {
 }
 
 /// Maps the main image as Wine's `load_main_exe` does: through a section of
-/// the file, so the server knows the process's image.
-fn load_main_image(env: &mut Env<'_>, image: &str) -> Result<View, Error> {
+/// the file, so the server knows the process's image. `hold` is the image's
+/// preferred range, held until the view is placed so that nothing opening
+/// the file allocates there first.
+fn load_main_image(env: &mut Env<'_>, image: &str, hold: Option<u32>) -> Result<View, Error> {
     let name: Vec<u16> = format!(r"\??\{image}").encode_utf16().collect();
     let failed = |what: &str, error: status::Error| match error {
         status::Error::Status(code) => Error::Status("main image", code),
@@ -286,6 +288,9 @@ fn load_main_image(env: &mut Env<'_>, image: &str) -> Result<View, Error> {
     );
     server::close(env, file).map_err(|error| failed("main image", error))?;
     let (mapping, _) = mapping.map_err(|error| failed("main image section", error))?;
+    if let Some(base) = hold {
+        env.sys.vm.release_reservation(base);
+    }
     let view = section::map_image(env, mapping);
     server::close(env, mapping).map_err(|error| failed("main image", error))?;
     let view = view.map_err(|error| failed("main image view", error))?;
@@ -295,10 +300,15 @@ fn load_main_image(env: &mut Env<'_>, image: &str) -> Result<View, Error> {
     Ok(view)
 }
 
-/// The main thread's stack, as Wine's `virtual_alloc_thread_stack` sizes it:
-/// the image's reserve, and no less than the default. The thread exists
-/// before the image is mapped, so its file is read through the prefix.
-fn main_stack_size(prefix: &Path, image: &str, mounts: Option<&file::volume::Mounts>) -> u32 {
+/// The main image's preferred range and its thread's stack size, as Wine's
+/// `virtual_alloc_thread_stack` sizes it: the image's reserve, and no less
+/// than the default. The thread exists before the image is mapped, so its
+/// file is read through the prefix.
+fn main_image_layout(
+    prefix: &Path,
+    image: &str,
+    mounts: Option<&file::volume::Mounts>,
+) -> (Option<(u32, u32)>, u32) {
     use std::os::fd::AsRawFd;
     let devices = prefix.join("dosdevices");
     let name: Vec<u16> = format!(r"\??\{image}").encode_utf16().collect();
@@ -306,14 +316,16 @@ fn main_stack_size(prefix: &Path, image: &str, mounts: Option<&file::volume::Mou
     let lookup = mounts
         .lookup(&devices, &name)
         .unwrap_or_else(|| crate::path::lookup(&devices, &name));
-    let reserve = match lookup {
+    let pe = match lookup {
         Ok(crate::path::Lookup::Found(host)) => std::fs::File::open(host)
             .ok()
             .and_then(|file| file::volume::read_all(&mounts, file.as_raw_fd()).ok())
-            .and_then(|bytes| Pe::parse(&bytes).ok().map(|pe| pe.stack_reserve)),
+            .and_then(|bytes| Pe::parse(&bytes).ok()),
         _ => None,
     };
-    reserve.unwrap_or(0).max(DEFAULT_STACK)
+    let range = pe.as_ref().map(|pe| (pe.image_base, pe.size_of_image));
+    let stack = pe.map_or(0, |pe| pe.stack_reserve).max(DEFAULT_STACK);
+    (range, stack)
 }
 
 const DISPLAY_DEVICE: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Video\{00000000-0000-0000-0000-000000000000}\0000";
@@ -386,6 +398,17 @@ pub fn start_connected<B: Backend>(
         &u64::from(dispatch::NTDLL_UNIXLIB).to_le_bytes(),
     )?;
 
+    // Windows maps the main image when it creates the process, before any
+    // allocation. Its range stays held until the image is mapped there, so
+    // bottom-up allocations fill around it as they do on Windows.
+    let (image_range, stack_size) = main_image_layout(
+        prefix,
+        startup.image,
+        machine.ext.try_get::<file::volume::Mounts>(),
+    );
+    let image_hold = image_range
+        .filter(|&(base, size)| machine.sys.vm.reserve_at(base, size))
+        .map(|(base, _)| base);
     let block = memory::allocate_committed(
         &mut machine.cpu,
         &mut machine.sys.vm,
@@ -438,11 +461,7 @@ pub fn start_connected<B: Backend>(
         ldr_initialize_thunk,
         syscall,
         registered.tid,
-        main_stack_size(
-            prefix,
-            startup.image,
-            machine.ext.try_get::<file::volume::Mounts>(),
-        ),
+        stack_size,
     )?;
     let teb = machine.sys.contexts[main as usize].teb;
     machine.ext.insert(memory);
@@ -561,7 +580,7 @@ pub fn start_connected<B: Backend>(
                 status::Error::Status(code) => Error::Status("drive letters", code),
                 status::Error::Unsupported(reason) => Error::Context(reason),
             })?;
-            let view = load_main_image(env, startup.image)?;
+            let view = load_main_image(env, startup.image, image_hold)?;
             let state = env
                 .cpu
                 .capture_architecture()
@@ -955,7 +974,8 @@ mod tests {
             .visit_context(Some(main), |env| {
                 let args = env.sys.vm.alloc(env.cpu, PAGE, Prot::RW).unwrap();
                 // A hole under the stack lets a reservation start below it.
-                let hole = env.sys.vm.reserve(0x8_0000).unwrap();
+                let hole = env.sys.vm.first_free();
+                assert!(env.sys.vm.reserve_at(hole, 0x8_0000));
                 let memory = env.ext.get_mut::<Memory>();
                 let thread =
                     new_context(env.cpu, env.sys, memory, PARK_ADDR, 0, 0, DEFAULT_STACK).unwrap();

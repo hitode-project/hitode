@@ -94,7 +94,7 @@ pub(super) fn analyze(
         let mut read = Set::empty(frame.len());
         let mut define = Set::empty(frame.len());
         let raises = match inst.op {
-            decode::Op::Integer(Integer::Divide(..)) => true,
+            decode::Op::Integer(Integer::Divide(..) | Integer::Bound(..)) => true,
             decode::Op::X87(_) | decode::Op::Fild64(..) => {
                 models[i].control.is_none_or(|c| c & 0x3f != 0x3f)
             }

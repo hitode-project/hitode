@@ -421,6 +421,9 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         M::Rdtsc => Op::Timestamp,
         M::Cpuid => Op::Cpuid,
         M::Int if instruction.immediate8() == 0x2e => Op::Syscall,
+        M::Int if !adv_cpu_core::cpu_profile::user_interrupt_gate(instruction.immediate8()) => {
+            Op::Event(EventOp::Exception(13))
+        }
         M::Int => Op::Event(EventOp::Software(instruction.immediate8())),
         M::Int3 => Op::Event(EventOp::Software(3)),
         M::Ud2 => Op::Event(EventOp::Exception(6)),

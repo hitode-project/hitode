@@ -203,6 +203,15 @@ pub(in crate::translate) fn integer(instruction: &Instruction, helper: u8) -> Op
         }
     }
     Some(match mnemonic {
+        M::Bound if instruction.op1_kind() == OpKind::Memory => Integer::Bound(
+            instruction.op0_register().number() as u8,
+            memory_sized(instruction)?,
+            if instruction.op0_register().is_gpr16() {
+                2
+            } else {
+                4
+            },
+        ),
         M::Cbw => Integer::Cbw,
         M::Cwd => Integer::Cwd,
         M::Clc | M::Stc | M::Cmc => Integer::CarryFlag(mnemonic),
