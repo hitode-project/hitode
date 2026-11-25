@@ -12,6 +12,7 @@ mod native_forms;
 mod native_regions;
 mod pixel_loops;
 mod sse_afp;
+mod x87_tier1;
 mod x87_wide;
 
 fn fixture(build: impl FnOnce(&mut CodeAssembler)) -> Program {

@@ -738,9 +738,45 @@ pub(in crate::translate) fn x87(
     helper: u8,
     opcode: Option<u16>,
 ) -> Option<X87> {
-    let fast = match instruction.mnemonic() {
-        iced_x86::Mnemonic::Fld if instruction.memory_size().size() == 10 => Fast::Load80,
-        iced_x86::Mnemonic::Fstp if instruction.memory_size().size() == 10 => Fast::Store80,
+    if instruction.has_lock_prefix() {
+        return None;
+    }
+    let (fast, flag_compare) = match instruction.mnemonic() {
+        iced_x86::Mnemonic::Fld if instruction.memory_size().size() == 10 => (Fast::Load80, None),
+        iced_x86::Mnemonic::Fstp if instruction.memory_size().size() == 10 => (Fast::Store80, None),
+        m @ (iced_x86::Mnemonic::Fcomi
+        | iced_x86::Mnemonic::Fcomip
+        | iced_x86::Mnemonic::Fucomi
+        | iced_x86::Mnemonic::Fucomip) => {
+            let reg = if instruction.op_count() == 2 {
+                instruction.op1_register()
+            } else {
+                instruction.op0_register()
+            };
+            let index = match reg {
+                Register::ST0 => 0,
+                Register::ST1 => 1,
+                Register::ST2 => 2,
+                Register::ST3 => 3,
+                Register::ST4 => 4,
+                Register::ST5 => 5,
+                Register::ST6 => 6,
+                Register::ST7 => 7,
+                _ => return None,
+            };
+            let pops = u8::from(matches!(
+                m,
+                iced_x86::Mnemonic::Fcomip | iced_x86::Mnemonic::Fucomip
+            ));
+            let quiet = matches!(m, iced_x86::Mnemonic::Fucomi | iced_x86::Mnemonic::Fucomip);
+            (
+                Fast::Compare {
+                    source: adv_cpu_core::floating::fast::Source::St(index),
+                    pops,
+                },
+                Some(quiet),
+            )
+        }
         m @ (iced_x86::Mnemonic::Fsin
         | iced_x86::Mnemonic::Fcos
         | iced_x86::Mnemonic::Fsincos
@@ -751,8 +787,8 @@ pub(in crate::translate) fn x87(
         | iced_x86::Mnemonic::Fyl2xp1
         | iced_x86::Mnemonic::Fscale
         | iced_x86::Mnemonic::Fprem
-        | iced_x86::Mnemonic::Fprem1) => Fast::Leaf(m),
-        _ => fast::classify(instruction)?,
+        | iced_x86::Mnemonic::Fprem1) => (Fast::Leaf(m), None),
+        _ => (fast::classify(instruction)?, None),
     };
     let mem = if instruction.op0_kind() == OpKind::Memory {
         Some(memory(instruction)?)
@@ -770,5 +806,6 @@ pub(in crate::translate) fn x87(
         mem,
         helper,
         opcode,
+        flag_compare,
     })
 }

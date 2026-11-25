@@ -68,6 +68,44 @@ pub(in super::super) enum Slot {
     Freed(Option<u8>),
 }
 
+/// Lazy status-word C1 / C0–C3 recipe not yet materialized into `w13`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum StatusRecipe {
+    /// C0–C3 and C1 are materialized in `w13`.
+    #[default]
+    Materialized,
+    /// C1 is logically 0 (bit 9 of `w13` not yet cleared); C0/C2/C3 are in `w13`.
+    C1Zero,
+    /// C1 is the rounding direction of `op(v(a), v(b)) -> v(r)` with `PE`
+    /// already set; C0/C2/C3 are in `w13`.
+    C1Round {
+        op: adv_cpu_core::floating::fast::Op,
+        single: bool,
+        a: u8,
+        b: u8,
+        r: u8,
+    },
+    /// C0, C1 (= 0), C2, C3 are the ordered compare result of `v(a)` vs `v(b)`.
+    Compare {
+        a: u8,
+        b: u8,
+        a_narrow: bool,
+        b_narrow: bool,
+    },
+}
+
+impl StatusRecipe {
+    /// Host pair registers (`0..8`) whose contents must survive until this recipe
+    /// is materialized or overwritten.
+    pub(super) fn regs(self) -> u8 {
+        match self {
+            Self::Materialized | Self::C1Zero => 0,
+            Self::C1Round { a, b, r, .. } => (1 << a) | (1 << b) | (1 << r),
+            Self::Compare { a, b, .. } => (1 << a) | (1 << b),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) struct Model {
     slots: [Slot; 8],
@@ -80,6 +118,12 @@ pub(in super::super) struct Model {
     shared: bool,
     /// The host registers whose values are narrow.
     pub(super) narrow: u8,
+    /// The host registers whose values are narrow with at most 24 significand bits.
+    pub(super) single_exact: u8,
+    /// The host registers whose values are `single_exact` and exact binary32 zero/normal.
+    pub(super) f32_normal: u8,
+    /// Lazy C1 / C0–C3 recipe not yet materialized into `w13`.
+    pub(super) status_recipe: StatusRecipe,
 }
 
 impl Default for Model {
@@ -92,6 +136,9 @@ impl Default for Model {
             cyclic: false,
             shared: false,
             narrow: 0,
+            single_exact: 0,
+            f32_normal: 0,
+            status_recipe: StatusRecipe::Materialized,
         }
     }
 }
@@ -123,6 +170,11 @@ impl Model {
             Slot::Clean(n) | Slot::Dirty(n) | Slot::Freed(Some(n)) => used | 1 << n,
             _ => used,
         })
+    }
+
+    /// The host registers referenced by a live lazy status recipe.
+    pub(super) fn recipe_regs(&self) -> u8 {
+        self.status_recipe.regs()
     }
 
     pub(super) fn push(&mut self) {
@@ -177,20 +229,53 @@ pub(in super::super) fn entry_facts(trace: &Trace) -> u64 {
                     next.op,
                     Op::X87(X87 {
                         fast: Fast::Exchange(_)
-                            | Fast::Compare {
-                                source: Source::St(_),
-                                ..
-                            }
                             | Fast::Load(Source::St(_))
                             | Fast::StoreSt { .. }
                             | Fast::Negate
                             | Fast::Absolute
                             | Fast::Constant(_),
                         ..
+                    }) | Op::X87(X87 {
+                        fast: Fast::Compare {
+                            source: Source::St(_),
+                            ..
+                        },
+                        flag_compare: None,
+                        ..
                     })
                 )
             })
         {
+            mask |= facts::PE;
+        }
+        // Lazy C1Round also benefits from `facts::PE` when a register-register
+        // arithmetic op is followed later in the trace by another C1 writer.
+        if matches!(
+            x.fast,
+            Fast::Arith {
+                source: Source::St(_),
+                ..
+            }
+        ) && trace.insts[index + 1..].iter().any(|later| {
+            matches!(
+                later.op,
+                Op::X87(X87 {
+                    fast: Fast::Arith { .. }
+                        | Fast::Load(_)
+                        | Fast::Store { .. }
+                        | Fast::StoreSt { .. }
+                        | Fast::Exchange(_)
+                        | Fast::Negate
+                        | Fast::Absolute
+                        | Fast::Constant(_),
+                    ..
+                }) | Op::X87(X87 {
+                    fast: Fast::Compare { .. },
+                    flag_compare: None,
+                    ..
+                })
+            )
+        }) {
             mask |= facts::PE;
         }
         match x.fast {
@@ -554,6 +639,13 @@ struct ControlBits {
 }
 
 impl ControlBits {
+    fn constant(value: u16) -> Self {
+        Self {
+            set: value,
+            clear: !value,
+        }
+    }
+
     fn logical(self, op: Alu, mask: u16) -> Self {
         match op {
             Alu::And => Self {
@@ -572,12 +664,51 @@ impl ControlBits {
         }
     }
 
+    fn logical_byte(self, op: Alu, value: u8, high: bool) -> Self {
+        let shifted = u16::from(value) << if high { 8 } else { 0 };
+        let mask = match op {
+            Alu::And => shifted | if high { 0x00ff } else { 0xff00 },
+            Alu::Or | Alu::Xor => shifted,
+            _ => unreachable!(),
+        };
+        self.logical(op, mask)
+    }
+
     fn rounding(self) -> Option<u8> {
         ((self.set | self.clear) & 0xc00 == 0xc00).then_some((self.set >> 10 & 3) as u8)
     }
 
     fn masks_all(self) -> bool {
         self.set & 0x3f == 0x3f
+    }
+
+    fn exact_identity(self) -> bool {
+        self.set == 0 && self.clear == 0
+    }
+}
+
+/// Control word provenance: known forced bits plus an optional symbolic base
+/// captured by an earlier `fnstcw` in the same straight-line segment.
+#[derive(Clone, Copy, Default)]
+struct ControlWord {
+    bits: ControlBits,
+    /// Index of the `fnstcw` that captured the baseline control word, if any.
+    base: Option<usize>,
+}
+
+impl ControlWord {
+    fn logical(self, op: Alu, mask: u16) -> Self {
+        Self {
+            bits: self.bits.logical(op, mask),
+            base: self.base,
+        }
+    }
+
+    fn logical_byte(self, op: Alu, value: u8, high: bool) -> Self {
+        Self {
+            bits: self.bits.logical_byte(op, value, high),
+            base: self.base,
+        }
     }
 }
 
@@ -586,9 +717,15 @@ impl ControlBits {
 #[derive(Default)]
 struct MemoryRun {
     addresses: [Option<(usize, u32)>; 8],
-    words: [Option<ControlBits>; 8],
-    saved: Vec<((usize, u32), ControlBits)>,
-    control: Option<ControlBits>,
+    words: [Option<ControlWord>; 8],
+    saved: Vec<((usize, u32), ControlWord)>,
+    control: Option<ControlWord>,
+    /// Active `fnstcw` baseline ID (`base`) and whether any intervening `fldcw`
+    /// changed exception mask bits `[5:0]`.
+    baseline: Option<(usize, bool)>,
+    /// Pending chop/modified `fldcw` awaiting its matching restore `fldcw`:
+    /// `(fldcw_index, baseline_id, saw_arith)`.
+    open_sandwich: Option<(usize, usize, bool)>,
     transfers: Vec<((usize, u32), usize)>,
 }
 
@@ -601,7 +738,7 @@ impl MemoryRun {
         Some((origin, offset.wrapping_add(mem.disp)))
     }
 
-    fn store(&mut self, mem: Mem, width: u32, word: Option<ControlBits>, transfer: Option<usize>) {
+    fn store(&mut self, mem: Mem, width: u32, word: Option<ControlWord>, transfer: Option<usize>) {
         let address = self.address(mem);
         let disjoint = |other: (usize, u32)| {
             address.is_some_and(|(origin, offset)| {
@@ -622,9 +759,33 @@ impl MemoryRun {
         }
     }
 
-    fn word(&self, mem: Mem) -> Option<ControlBits> {
+    fn word(&self, mem: Mem) -> Option<ControlWord> {
         let at = self.address(mem)?;
         self.saved.iter().find(|w| w.0 == at).map(|w| w.1)
+    }
+
+    /// Update a saved 2-byte control word modified in place by an 8-bit or 16-bit
+    /// logical operation (e.g. `or byte ptr [esp+1], 0x0c` or `or word ptr [esp], 0x0c00`).
+    fn modify_saved(&mut self, mem: Mem, width: u8, op: Alu, bits: u16) {
+        if let Some((origin, offset)) = self.address(mem) {
+            if width == 2 {
+                if let Some(entry) = self.saved.iter_mut().find(|w| w.0 == (origin, offset)) {
+                    entry.1 = entry.1.logical(op, bits);
+                    return;
+                }
+            } else if width == 1 {
+                if let Some(entry) = self.saved.iter_mut().find(|w| w.0 == (origin, offset)) {
+                    entry.1 = entry.1.logical_byte(op, bits as u8, false);
+                    return;
+                }
+                let base_offset = offset.wrapping_sub(1);
+                if let Some(entry) = self.saved.iter_mut().find(|w| w.0 == (origin, base_offset)) {
+                    entry.1 = entry.1.logical_byte(op, bits as u8, true);
+                    return;
+                }
+            }
+        }
+        self.store(mem, u32::from(width), None, None);
     }
 }
 
@@ -636,6 +797,9 @@ struct MemoryFacts {
     crossings: Vec<usize>,
     masks_all: Vec<usize>,
     rounding: Vec<(usize, u8)>,
+    /// Matched `FLDCW` sandwich pairs `(fldcw_set, fldcw_restore)` with no
+    /// intervening `Fast::Arith`, so entry control remains stable outside them.
+    sandwiches: Vec<(usize, usize)>,
 }
 
 fn memory_runs(trace: &Trace) -> MemoryFacts {
@@ -656,17 +820,66 @@ fn memory_runs(trace: &Trace) -> MemoryFacts {
         match inst.op {
             Op::X87(x) => match x.fast {
                 Fast::StoreControl => {
+                    let word = facts.control.unwrap_or(ControlWord {
+                        bits: ControlBits::default(),
+                        base: Some(index),
+                    });
+                    if facts.control.is_none() {
+                        facts.control = Some(word);
+                        facts.baseline = Some((index, false));
+                    }
                     if let Some(mem) = x.mem {
-                        facts.store(mem, 2, facts.control, None);
+                        facts.store(mem, 2, Some(word), None);
                     }
                     out.crossings.push(index);
                 }
                 Fast::LoadControl => {
                     let word = x.mem.and_then(|m| facts.word(m));
-                    if word.is_some_and(ControlBits::masks_all) {
+                    let same_masks = word.is_some_and(|w| {
+                        facts.baseline.is_some_and(|(id, changed)| {
+                            w.base == Some(id)
+                                && !changed
+                                && (w.bits.set | w.bits.clear) & 0x3f == 0
+                        })
+                    });
+                    if word.is_some_and(|w| w.bits.masks_all()) || same_masks {
                         out.masks_all.push(index);
                     }
+                    if let Some(w) = word {
+                        if let Some((start_idx, id, saw_arith)) = facts.open_sandwich
+                            && w.base == Some(id)
+                            && w.bits.exact_identity()
+                        {
+                            if !saw_arith {
+                                out.sandwiches.push((start_idx, index));
+                            }
+                            facts.open_sandwich = None;
+                        } else if let Some((id, _)) = facts.baseline
+                            && w.base == Some(id)
+                            && !w.bits.exact_identity()
+                        {
+                            if (w.bits.set | w.bits.clear) & 0x3f != 0 {
+                                facts.baseline = Some((id, true));
+                            }
+                            facts.open_sandwich = Some((index, id, false));
+                        } else {
+                            if let Some((id, _)) = facts.baseline {
+                                facts.baseline = Some((id, true));
+                            }
+                            facts.open_sandwich = None;
+                        }
+                    } else {
+                        if let Some((id, _)) = facts.baseline {
+                            facts.baseline = Some((id, true));
+                        }
+                        facts.open_sandwich = None;
+                    }
                     facts.control = word;
+                }
+                Fast::Arith { .. } => {
+                    if let Some((_, _, ref mut saw_arith)) = facts.open_sandwich {
+                        *saw_arith = true;
+                    }
                 }
                 Fast::Load(Source::F64) => {
                     if let Some(from) = x.mem.and_then(|mem| transfer(&facts, mem)) {
@@ -674,7 +887,7 @@ fn memory_runs(trace: &Trace) -> MemoryFacts {
                     }
                 }
                 Fast::Store { width, integer, .. } => {
-                    if integer && let Some(rc) = facts.control.and_then(ControlBits::rounding) {
+                    if integer && let Some(rc) = facts.control.and_then(|w| w.bits.rounding()) {
                         out.rounding.push((index, rc));
                     }
                     if let Some(mem) = x.mem {
@@ -725,12 +938,30 @@ fn memory_runs(trace: &Trace) -> MemoryFacts {
                 facts.addresses[usize::from(to)] = facts.addresses[usize::from(from)];
                 facts.words[usize::from(to)] = facts.words[usize::from(from)];
             }
-            Op::Mov(Src::Reg(r), _) => {
+            Op::Mov(Src::Reg(r), Src::Imm(imm)) => {
                 facts.addresses[usize::from(r)] = None;
-                facts.words[usize::from(r)] = None;
+                facts.words[usize::from(r)] = Some(ControlWord {
+                    bits: ControlBits::constant(imm as u16),
+                    base: None,
+                });
+            }
+            Op::Mov(Src::Reg(r), Src::Mem(mem)) => {
+                facts.addresses[usize::from(r)] = None;
+                facts.words[usize::from(r)] = facts.word(mem);
             }
             Op::Mov(Src::Mem(mem), Src::Reg(r)) => {
                 facts.store(mem, 4, facts.words[usize::from(r)], None);
+            }
+            Op::Mov(Src::Mem(mem), Src::Imm(imm)) => {
+                facts.store(
+                    mem,
+                    4,
+                    Some(ControlWord {
+                        bits: ControlBits::constant(imm as u16),
+                        base: None,
+                    }),
+                    None,
+                );
             }
             Op::Extend(r, Narrow8or16::Mem(mem, true), false) => {
                 facts.words[usize::from(r)] = facts.word(mem);
@@ -761,14 +992,51 @@ fn memory_runs(trace: &Trace) -> MemoryFacts {
                 facts.words[r] = Some(facts.words[r].unwrap_or_default().logical(op, bits as u16));
                 facts.addresses[r] = None;
             }
+            Op::Narrow(
+                Some(op @ (Alu::And | Alu::Or | Alu::Xor)),
+                1,
+                OperandPart::Reg(r),
+                OperandPart::Imm(bits),
+            ) => {
+                let high = r >= 4;
+                let reg = usize::from(if high { r - 4 } else { r });
+                facts.words[reg] = Some(
+                    facts.words[reg]
+                        .unwrap_or_default()
+                        .logical_byte(op, bits as u8, high),
+                );
+                facts.addresses[reg] = None;
+            }
+            Op::Narrow(
+                Some(op @ (Alu::And | Alu::Or | Alu::Xor)),
+                width @ (1 | 2),
+                OperandPart::Mem(mem),
+                OperandPart::Imm(bits),
+            ) => {
+                facts.modify_saved(mem, width, op, bits as u16);
+            }
             Op::Narrow(None, 2, OperandPart::Mem(mem), OperandPart::Reg(r)) => {
                 facts.store(mem, 2, facts.words[usize::from(r)], None);
+            }
+            Op::Narrow(None, 2, OperandPart::Mem(mem), OperandPart::Imm(bits)) => {
+                facts.store(
+                    mem,
+                    2,
+                    Some(ControlWord {
+                        bits: ControlBits::constant(bits as u16),
+                        base: None,
+                    }),
+                    None,
+                );
             }
             Op::Narrow(None, 2, OperandPart::Reg(r), src) => {
                 facts.words[usize::from(r)] = match src {
                     OperandPart::Reg(from) => facts.words[usize::from(from)],
                     OperandPart::Mem(mem) => facts.word(mem),
-                    _ => None,
+                    OperandPart::Imm(imm) => Some(ControlWord {
+                        bits: ControlBits::constant(imm as u16),
+                        base: None,
+                    }),
                 };
                 facts.addresses[usize::from(r)] = None;
             }
@@ -777,6 +1045,14 @@ fn memory_runs(trace: &Trace) -> MemoryFacts {
                 facts.addresses[4] = facts.addresses[4].map(|(o, n)| (o, n.wrapping_sub(4)));
                 facts.saved.clear();
                 facts.transfers.clear();
+            }
+            Op::Pop(r) => {
+                facts.words[4] = None;
+                facts.addresses[4] = facts.addresses[4].map(|(o, n)| (o, n.wrapping_add(4)));
+                if r != 4 {
+                    facts.words[usize::from(r)] = None;
+                    facts.addresses[usize::from(r)] = None;
+                }
             }
             Op::Ret(pop) => {
                 facts.words[4] = None;
@@ -807,6 +1083,8 @@ fn memory_runs(trace: &Trace) -> MemoryFacts {
                 // An unmodelled writer cannot contribute to a saved-word proof.
                 facts.words = [None; 8];
                 facts.control = None;
+                facts.baseline = None;
+                facts.open_sandwich = None;
                 facts.addresses = [None; 8];
                 facts.saved.clear();
                 facts.transfers.clear();
@@ -979,6 +1257,11 @@ pub(in super::super) struct Cache {
     dispatch: bool,
     pub(super) pe: bool,
     pub(super) control_stable: bool,
+    /// Whether live canonical guest flags are currently in hardware NZCV rather than `x4`
+    /// (set by `pair_fcomi` when handing straight off to a following integer consumer).
+    pub(super) nzcv_in_host: bool,
+    /// Whether the trace contains any non-MMX SSE instruction (which may arm AFP FPSR/FPCR).
+    pub(super) has_sse: bool,
     publishers: Vec<(Model, Reg, Label)>,
     memory_facts: MemoryFacts,
 }
@@ -994,7 +1277,11 @@ impl Cache {
         let mut loops = Vec::new();
         let mut loop_head = vec![false; trace.len()];
         let mut incoming = vec![Vec::new(); trace.len()];
-        for from in 0..trace.len() {
+        let mut has_sse = false;
+        for (from, inst) in trace.insts.iter().enumerate() {
+            if matches!(inst.op, Op::Simd(simd) if !simd.mmx()) {
+                has_sse = true;
+            }
             for to in edges(trace, from) {
                 incoming[to].push(from);
                 if to <= from {
@@ -1008,6 +1295,7 @@ impl Cache {
             loops,
             loop_head,
             incoming,
+            has_sse,
             owners: vec![None; trace.len()],
             ..Self::default()
         }
@@ -1190,7 +1478,9 @@ impl Translator<'_> {
     }
 
     pub(in super::super) fn x87_live_pairs(&self) -> Option<u8> {
-        self.x87.active.then(|| self.x87.model.used())
+        self.x87
+            .active
+            .then(|| self.x87.model.used() | self.x87.model.recipe_regs())
     }
 
     pub(super) fn x87_masks_all(&self) -> bool {
@@ -1719,9 +2009,17 @@ impl Translator<'_> {
 
     fn pe_candidate(&self, index: usize, fast: Fast, slots: [Known; 8], delta: u8) -> bool {
         self.facts.pe()
-            && (matches!(fast, Fast::Store { .. })
-                || matches!(fast, Fast::Arith { .. }) && self.pair_precision())
-            && self.c1_dead_after(index, slots, delta)
+            && (matches!(fast, Fast::Store { .. }) && self.c1_dead_after(index, slots, delta)
+                || matches!(fast, Fast::Arith { .. })
+                    && self.pair_precision()
+                    && (self.c1_dead_after(index, slots, delta)
+                        || matches!(
+                            fast,
+                            Fast::Arith {
+                                source: Source::St(_),
+                                ..
+                            }
+                        )))
     }
 
     /// Whether the C1 that the instruction at `index` computes is dead:
@@ -1744,6 +2042,10 @@ impl Translator<'_> {
         let Some(next) = self.cacheable(index + 1) else {
             return false;
         };
+        if next.flag_compare().is_some() {
+            // FCOMI/FUCOMI/FCOMIP/FUCOMIP preserve C1 (A64-FLAG-6).
+            return false;
+        }
         let cached = |i: u8| known[usize::from((delta + i) & 7)] == Known::Value;
         match next.fast {
             Fast::Exchange(i)
@@ -1758,11 +2060,98 @@ impl Translator<'_> {
         }
     }
 
+    /// Whether `fnstsw ax` at `index` does not expose bit 9 (`C1` = `0x0200`) to
+    /// any observer: either immediately followed by `and ah/ax/eax, imm` masking
+    /// out bit 9, or by `test ah/ax/eax, imm` masking out bit 9 when `AH`/`AX`/`EAX`
+    /// is overwritten before any read, fault site, branch exit, or merge.
+    pub(super) fn fnstsw_c1_dead(&self, index: usize) -> bool {
+        let inst = self.trace.insts[index];
+        if !matches!(
+            inst.op,
+            Op::X87(X87 {
+                fast: Fast::StoreStatus,
+                mem: None,
+                ..
+            })
+        ) || inst.next != Next::Fall
+            || index + 1 >= self.trace.len()
+            || self.trace.merge[index + 1]
+            || self.trace.head(index + 1)
+        {
+            return false;
+        }
+        let consumer = self.trace.insts[index + 1];
+        let (is_and, masks_c1) = match consumer.op {
+            Op::Narrow(Some(Alu::And), 1, OperandPart::Reg(4), OperandPart::Imm(imm)) => {
+                (true, imm & 0x02 == 0)
+            }
+            Op::Narrow(Some(Alu::And), 2, OperandPart::Reg(0), OperandPart::Imm(imm)) => {
+                (true, imm & 0x0200 == 0)
+            }
+            Op::Alu(Alu::And, Src::Reg(0), Src::Imm(imm)) => (true, imm & 0x0200 == 0),
+            Op::Narrow(Some(Alu::Test), 1, OperandPart::Reg(4), OperandPart::Imm(imm)) => {
+                (false, imm & 0x02 == 0)
+            }
+            Op::Narrow(Some(Alu::Test), 2, OperandPart::Reg(0), OperandPart::Imm(imm)) => {
+                (false, imm & 0x0200 == 0)
+            }
+            Op::Alu(Alu::Test, Src::Reg(0), Src::Imm(imm)) => (false, imm & 0x0200 == 0),
+            _ => (false, false),
+        };
+        if !masks_c1 {
+            return false;
+        }
+        if is_and {
+            return true;
+        }
+        // For `test`, bit 9 remains in `AX`; C1 elision is sound only if `AX`/`AH`/`EAX`
+        // is dead (overwritten along a non-faulting straight-line suffix before any read or exit).
+        if consumer.next != Next::Fall {
+            return false;
+        }
+        for i in (index + 2)..self.trace.len().min(index + 10) {
+            if self.trace.merge[i] || self.trace.head(i) {
+                return false;
+            }
+            let op = self.trace.insts[i].op;
+            match op {
+                Op::Nop | Op::Pause => {}
+                Op::Mov(Src::Reg(0), Src::Imm(_))
+                | Op::Alu(Alu::Xor, Src::Reg(0), Src::Reg(0))
+                | Op::Narrow(None, 2, OperandPart::Reg(0), OperandPart::Imm(_))
+                | Op::Narrow(None, 1, OperandPart::Reg(4), OperandPart::Imm(_)) => return true,
+                Op::Mov(Src::Reg(0), Src::Reg(src)) if src != 0 => return true,
+                Op::Narrow(Some(Alu::And), 1, OperandPart::Reg(4), OperandPart::Imm(imm))
+                    if imm & 0x02 == 0 =>
+                {
+                    return true;
+                }
+                Op::Narrow(Some(Alu::And), 2, OperandPart::Reg(0), OperandPart::Imm(imm))
+                    if imm & 0x0200 == 0 =>
+                {
+                    return true;
+                }
+                Op::Alu(Alu::And, Src::Reg(0), Src::Imm(imm)) if imm & 0x0200 == 0 => return true,
+                Op::Setcc(_, r) if r != 0 && r != 4 => {}
+                Op::Mov(Src::Reg(dst), Src::Imm(_)) if dst != 0 => {}
+                Op::Mov(Src::Reg(dst), Src::Reg(src)) if dst != 0 && src != 0 => {}
+                _ => return false,
+            }
+            if self.trace.insts[i].next != Next::Fall {
+                return false;
+            }
+        }
+        false
+    }
+
     /// Emits instruction `x` in a run, opening one if none is; false when
     /// it is not cacheable here.
     pub(in super::super) fn x87_cached(&mut self, x: X87) -> bool {
         if !self.x87.active && !self.x87_open() {
             return false;
+        }
+        if self.tier1 {
+            self.invalidate_mmx();
         }
         if self.x87.suspended {
             self.x87_resume();
@@ -1772,8 +2161,45 @@ impl Translator<'_> {
         if !std::mem::take(&mut self.x87.bound) {
             self.asm.bind(self.x87.hot[offset]);
         }
+        let (list, _) = effects(x.fast);
+        let recipe = self.x87.model.status_recipe;
+        if recipe != StatusRecipe::Materialized {
+            let mut needed_regs = 0usize;
+            for effect in &list {
+                match *effect {
+                    Effect::Read(i) if self.x87.model.get(i) == Slot::Entry => needed_regs += 1,
+                    Effect::Push => break,
+                    _ => {}
+                }
+            }
+            if matches!(
+                x.fast,
+                Fast::Load80
+                    | Fast::Constant(_)
+                    | Fast::Arith { .. }
+                    | Fast::Negate
+                    | Fast::Absolute
+            ) || matches!(x.fast, Fast::Load(src) if !matches!(src, Source::St(_)))
+            {
+                needed_regs += 1;
+            }
+            let busy = self.x87.model.used() | recipe.regs();
+            let pressure = (busy.count_zeros() as usize) < needed_regs;
+            let need_for_compare = matches!(recipe, StatusRecipe::Compare { .. })
+                && !matches!(
+                    x.fast,
+                    Fast::Wait | Fast::LoadControl | Fast::StoreControl | Fast::Compare { .. }
+                );
+            let need_for_status = x.fast == Fast::StoreStatus
+                && (matches!(recipe, StatusRecipe::Compare { .. }) || !self.fnstsw_c1_dead(index));
+            let need_for_leaf = matches!(x.fast, Fast::Leaf(_));
+            if pressure || need_for_compare || need_for_status || need_for_leaf {
+                self.emit_materialize_status_recipe(recipe, X13);
+                self.x87.model.status_recipe = StatusRecipe::Materialized;
+            }
+        }
         self.x87.before = self.x87.model;
-        self.x87.reserved = self.x87.model.used();
+        self.x87.reserved = self.x87.model.used() | self.x87.model.recipe_regs();
         self.x87.saved = matches!(x.fast, Fast::Arith { .. } | Fast::Store { .. });
         if self.x87.saved {
             self.emit(mov(W, X14, X13));
@@ -1784,7 +2210,6 @@ impl Translator<'_> {
         }
         // Values read come into host registers before any other branch.
         let bail = self.asm.label();
-        let (list, _) = effects(x.fast);
         let (mut top, mut writes) = (self.x87.before.delta, 0);
         for effect in &list {
             match *effect {
@@ -1805,7 +2230,14 @@ impl Translator<'_> {
             }
         }
         let c1_dead = self.c1_dead(index, x, self.x87.model);
-        let (metadata, generic) = self.pair_body(x, bail, c1_dead);
+        let can_keep_nzcv = x.flag_compare().is_some()
+            && self.features.flagm2
+            && index < self.x87.end
+            && self.trace.insts[index].next == Next::Fall
+            && !self.trace.merge[index + 1]
+            && !self.trace.head(index + 1)
+            && self.cacheable(index + 1).is_none();
+        let (metadata, generic) = self.pair_body(x, bail, c1_dead, can_keep_nzcv);
         let mut model = self.x87.model;
         if metadata {
             model.ip = Some(self.trace.insts[index].pc);
@@ -1889,16 +2321,22 @@ impl Translator<'_> {
         if self.x87.suspended {
             return;
         }
+        let skip_nzcv = std::mem::take(&mut self.x87.nzcv_in_host);
         if self.x87.model.cyclic {
             self.emit_all(&[
                 bfi(W, X13, X15, 11, 3),
                 vins_general(2, RUN, 0, X13),
                 vins_general(2, RUN, 1, X8),
-                msr_nzcv(X4),
             ]);
+            if !skip_nzcv {
+                self.emit(msr_nzcv(X4));
+            }
         } else {
             self.x87_status();
-            self.emit_all(&[strh(X13, X5, runtime::X87_STATUS), msr_nzcv(X4)]);
+            self.emit(strh(X13, X5, runtime::X87_STATUS));
+            if !skip_nzcv {
+                self.emit(msr_nzcv(X4));
+            }
         }
         self.x87.suspended = true;
     }
@@ -1982,7 +2420,14 @@ impl Translator<'_> {
         self.remark(Part::X87Publish);
         self.canonicalize();
         self.emit_all(&[mrs_nzcv(X4), ldr(X, X5, RUNTIME, runtime::CPU_STATE)]);
+        if self.x87.has_sse {
+            self.x87_prepare_fp_state();
+        }
         self.x87_reload(from.delta);
+        if from.status_recipe != StatusRecipe::Materialized {
+            self.emit_materialize_status_recipe(from.status_recipe, X13);
+            self.emit(strh(X13, X5, runtime::X87_STATUS));
+        }
         // Stale values the merge leaves empty go to CpuState first.
         for (r, &slot) in from.slots.iter().enumerate() {
             if let (Slot::Freed(Some(n)), Slot::Freed(None)) = (slot, to.slots[r]) {
@@ -2045,34 +2490,44 @@ impl Translator<'_> {
                 _ => fetches.push((r, n)),
             }
         }
-        if !fetches.is_empty() {
+        if !fetches.is_empty() || from.status_recipe != StatusRecipe::Materialized {
             self.canonicalize();
             self.emit_all(&[mrs_nzcv(X4), ldr(X, X5, RUNTIME, runtime::CPU_STATE)]);
-            self.x87_unspill_status();
-            let mut published = to;
-            published.ip = from.ip;
-            published.opcode = from.opcode;
-            for (r, _) in &fetches {
-                published.slots[*r] = from.slots[*r];
+            if self.x87.has_sse {
+                self.x87_prepare_fp_state();
             }
-            // Once the old registers move, a failed load publishes their
-            // new placement and leaves all unfetched slots in CpuState.
+            self.x87_unspill_status();
+            if from.status_recipe != StatusRecipe::Materialized {
+                self.emit_materialize_status_recipe(from.status_recipe, X13);
+                self.emit(vins_general(2, RUN, 0, X13));
+            }
             if !moves.is_empty() {
                 self.x87_moves(moves);
             }
-            let moved_fail = self.asm.label();
-            self.push_cold(UnitCold::Leave {
-                label: moved_fail,
-                state: State::CANONICAL,
-                simd_dirty: self.vector.dirty,
-                refund,
-                exit: Exit::Dispatch,
-                eip,
-                link: false,
-                x87: Some(Leave::Restore(Some(published))),
-            });
-            for (r, n) in fetches {
-                self.x87_fetch(r, n, false, moved_fail);
+            if !fetches.is_empty() {
+                let mut published = to;
+                published.ip = from.ip;
+                published.opcode = from.opcode;
+                published.status_recipe = StatusRecipe::Materialized;
+                for (r, _) in &fetches {
+                    published.slots[*r] = from.slots[*r];
+                }
+                // Once the old registers move, a failed load publishes their
+                // new placement and leaves all unfetched slots in CpuState.
+                let moved_fail = self.asm.label();
+                self.push_cold(UnitCold::Leave {
+                    label: moved_fail,
+                    state: State::CANONICAL,
+                    simd_dirty: self.vector.dirty,
+                    refund,
+                    exit: Exit::Dispatch,
+                    eip,
+                    link: false,
+                    x87: Some(Leave::Restore(Some(published))),
+                });
+                for (r, n) in fetches {
+                    self.x87_fetch(r, n, false, moved_fail);
+                }
             }
             self.emit(msr_nzcv(X4));
         } else {
@@ -2116,6 +2571,9 @@ impl Translator<'_> {
         self.canonicalize();
         self.cpu();
         self.emit(mrs_nzcv(X4));
+        if self.x87.has_sse {
+            self.x87_prepare_fp_state();
+        }
         if self.x87.model.cyclic {
             self.x87_unspill_status();
             self.emit(vumov(2, X8, RUN, 1));
@@ -2179,6 +2637,7 @@ impl Translator<'_> {
             Leave::Publish(model) => {
                 self.canonicalize();
                 self.emit_all(&[mrs_nzcv(X4), ldr(X, X5, RUNTIME, runtime::CPU_STATE)]);
+                self.x87_prepare_fp_state();
                 if model.cyclic {
                     self.x87_unspill_status();
                 } else {
@@ -2208,11 +2667,19 @@ impl Translator<'_> {
     /// The prologue of a run from the current instruction.
     fn x87_open(&mut self) -> bool {
         let start = self.index;
+        let start_store_control = self.tier1
+            && matches!(
+                self.trace.insts[start].op,
+                Op::X87(X87 {
+                    fast: Fast::StoreControl,
+                    ..
+                })
+            );
         if self.tier1
             && matches!(
                 self.trace.insts[start].op,
                 Op::X87(X87 {
-                    fast: Fast::StoreControl | Fast::StoreStatus,
+                    fast: Fast::StoreStatus,
                     ..
                 })
             )
@@ -2234,6 +2701,7 @@ impl Translator<'_> {
             self.x87.model = run.models[position].1;
             self.x87.suspended = true;
             self.x87.pe = run.need.pe;
+            self.x87.nzcv_in_host = false;
             self.x87.control_stable =
                 self.stable_control(run.models[0].0, run.models.last().unwrap().0);
             self.x87.dispatch = true;
@@ -2300,15 +2768,30 @@ impl Translator<'_> {
         }) else {
             return false;
         };
+        if start_store_control && end == start {
+            // Standalone `fnstcw` keeps its direct 3-instruction fast path.
+            return false;
+        }
         self.remark(Part::X87Entry);
-        self.flush_simd();
-        if cyclic {
-            // Backedges skip this prologue for the loop entry, bringing the
-            // XMM registers the head counts dirty; runs hold no MMX writes.
-            self.vector.dirty = self.entry[start].dirty & 0xff00;
+        if self.tier1 {
+            // Keep XMM registers resident across Tier-1 x87 runs (A64F-FP-7);
+            // only MMX aliases share the x87 stack.
+            self.publish(0xff);
+            if cyclic {
+                self.vector.dirty = (self.vector.dirty | self.entry[start].dirty) & 0xff00;
+            }
+        } else {
+            self.flush_simd();
+            if cyclic {
+                // Backedges skip this prologue for the loop entry, bringing the
+                // XMM registers the head counts dirty; runs hold no MMX writes.
+                self.vector.dirty = self.entry[start].dirty & 0xff00;
+            }
         }
         self.canonicalize();
         self.cpu();
+        self.x87_prepare_fp_state();
+        self.x87.nzcv_in_host = false;
         let sparse = cyclic && merges.windows(2).any(|m| m[1].0 > m[0].0 + 1);
         let segment_end = if sparse {
             merges
@@ -2513,7 +2996,17 @@ impl Translator<'_> {
                 Op::X87(X87 {
                     fast: Fast::LoadControl,
                     ..
-                }) => return false,
+                }) => {
+                    let in_sandwich = self
+                        .x87
+                        .memory_facts
+                        .sandwiches
+                        .iter()
+                        .any(|&(s, r)| (s == index || r == index) && s >= start && r <= end);
+                    if !in_sandwich {
+                        return false;
+                    }
+                }
                 _ => {}
             }
         }
@@ -2615,6 +3108,8 @@ impl Translator<'_> {
         self.x87_fetch(r, n, false, fail);
         self.x87.model.set(i, Slot::Clean(n));
         self.x87.model.narrow &= !(1 << n);
+        self.x87.model.single_exact &= !(1 << n);
+        self.x87.model.f32_normal &= !(1 << n);
     }
 
     /// Loads physical register `r` into host register `n`, branching to
@@ -2708,6 +3203,9 @@ impl Translator<'_> {
     /// Stores `model` with status word `status` into `CpuState`; uses x0
     /// to x2, x16, x17, d0 and d1, and x3 for shared cold bodies.
     pub(super) fn x87_publish(&mut self, model: Model, status: Reg) {
+        if model.status_recipe != StatusRecipe::Materialized {
+            self.emit_materialize_status_recipe(model.status_recipe, status);
+        }
         if let Some(x87) = self.x87_stubs() {
             let mut desc = u64::from(model.delta) << 40;
             let mut modified = false;
@@ -2740,6 +3238,10 @@ impl Translator<'_> {
                 ip: None,
                 opcode: None,
                 cyclic: false,
+                narrow: 0,
+                single_exact: 0,
+                f32_normal: 0,
+                status_recipe: StatusRecipe::Materialized,
                 ..model
             };
             let entry = self
@@ -2848,8 +3350,13 @@ impl Translator<'_> {
         self.remark(Part::X87Publish);
         self.x87_publish(model, X13);
         self.emit(msr_nzcv(X4));
-        self.flush_simd();
-        self.x87_end();
+        let keep_xmm = self.tier1;
+        if keep_xmm {
+            self.publish(0xff);
+        } else {
+            self.flush_simd();
+        }
+        self.x87_end(keep_xmm, false);
     }
 
     pub(in super::super) fn x87_before_edge(&mut self) {
@@ -2865,6 +3372,7 @@ impl Translator<'_> {
         if !self.x87.active || self.x87.end != self.index {
             return;
         }
+        let mut flushed_dirty = false;
         if self.trace.insts[self.index].next == Next::Fall {
             self.x87_suspend();
             self.canonicalize();
@@ -2877,19 +3385,29 @@ impl Translator<'_> {
                 leave: self.x87_leaving().expect("a suspended run"),
                 done: self.x87.done.expect("an open run"),
             });
+            flushed_dirty = true;
         }
-        self.x87_end();
+        self.x87_end(self.tier1, flushed_dirty);
         self.vector.cpu = false;
     }
 
-    fn x87_end(&mut self) {
+    fn x87_end(&mut self, keep_xmm: bool, flushed_dirty: bool) {
         let done = self.x87.done.take().expect("an open run");
         self.asm.bind(done);
         self.remark(Part::Body);
         self.x87.active = false;
         self.x87.suspended = false;
-        // The stack may have changed under the MMX registers.
-        self.vector = super::super::simd::Vector::default();
+        self.x87.nzcv_in_host = false;
+        // The stack may have changed under the MMX registers, while XMM
+        // registers (v16-v23) remain intact across non-leaf Tier-1 runs.
+        if keep_xmm {
+            self.invalidate_mmx();
+            if flushed_dirty {
+                self.vector.dirty = 0;
+            }
+        } else {
+            self.vector = super::super::simd::Vector::default();
+        }
         self.vector.cpu = true;
     }
 
@@ -2939,6 +3457,7 @@ impl Translator<'_> {
                 and_imm(W, X15, X15, 7),
             ]);
         }
+        self.x87_prepare_fp_state();
         self.x87_publish(model, if saved { X14 } else { X13 });
         self.emit(msr_nzcv(X4));
         self.far(self.stubs.fault);
@@ -3036,6 +3555,7 @@ impl Translator<'_> {
                 self.vector = super::super::simd::Vector::at(self.entry[index]);
                 self.mark(self.trace.insts[index].pc, Part::X87Entry);
                 self.emit_all(&[mrs_nzcv(X4), ldr(X, X5, RUNTIME, runtime::CPU_STATE)]);
+                self.x87_prepare_fp_state();
                 let fail = self.asm.label();
                 self.push_cold(UnitCold::Leave {
                     label: fail,
@@ -3153,14 +3673,20 @@ impl Translator<'_> {
             self.asm.b(resume);
             self.asm.bind(fallback);
             self.emit(msr_nzcv(X4));
-            self.x87_value(cold.helper, Some(cold.before.used()));
+            self.x87_value(
+                cold.helper,
+                Some(cold.before.used() | cold.before.recipe_regs()),
+            );
             if crate::jit_map::enabled() {
                 self.emit(movz(W, X7, 1, 0));
             }
             self.asm.bind(resume);
         } else {
             self.emit(msr_nzcv(X4));
-            self.x87_value(cold.helper, Some(cold.before.used()));
+            self.x87_value(
+                cold.helper,
+                Some(cold.before.used() | cold.before.recipe_regs()),
+            );
         }
         if cold.dispatch {
             self.x87_value_dispatch(cold.index, leaf.is_some());
@@ -3168,7 +3694,11 @@ impl Translator<'_> {
         }
         self.emit(ldr(X, X5, RUNTIME, runtime::CPU_STATE));
         let Some((hot, next_help, need)) = cold.next else {
-            self.flush_simd();
+            if preserve_vector {
+                self.publish(0xff);
+            } else {
+                self.flush_simd();
+            }
             self.asm.b(cold.done);
             return;
         };
@@ -3188,6 +3718,15 @@ impl Translator<'_> {
             self.asm.bind(check);
         }
         self.x87_checks(cold.after, need, state_miss, state_miss);
+        match cold.after.status_recipe {
+            StatusRecipe::Materialized => {}
+            StatusRecipe::C1Zero => {
+                self.asm.tbz(true, X13, 9, state_miss);
+            }
+            StatusRecipe::C1Round { .. } | StatusRecipe::Compare { .. } => {
+                self.asm.b(state_miss);
+            }
+        }
         // Reload only replacements and slots that were absent on the
         // arriving path. A shared host pair must match each of its slots.
         let mut loaded = 0u8;
@@ -3208,13 +3747,34 @@ impl Translator<'_> {
                     let retained = reuse.is_some()
                         && previous == Some(n)
                         && cold.writes & (1 << r) == 0
-                        && (cold.before.narrow ^ cold.after.narrow) & (1 << n) == 0;
+                        && (cold.before.narrow ^ cold.after.narrow) & (1 << n) == 0
+                        && (cold.before.single_exact ^ cold.after.single_exact) & (1 << n) == 0
+                        && (cold.before.f32_normal ^ cold.after.f32_normal) & (1 << n) == 0;
                     let ready = self.asm.label();
                     if retained {
                         self.asm.cbz(W, true, X7, ready);
                     }
                     let narrow = cold.after.narrow & (1 << n) != 0;
                     self.x87_fetch(r, n, narrow, state_miss);
+                    if cold.after.single_exact & (1 << n) != 0 {
+                        self.emit_all(&[
+                            fmov_from_v(X, X16, v(n)),
+                            and_imm(X, X16, X16, adv_cpu_core::floating::fast::SINGLE_TAIL),
+                        ]);
+                        self.asm.cbz(X, true, X16, state_miss);
+                    }
+                    if cold.after.f32_normal & (1 << n) != 0 {
+                        let ok = self.asm.label();
+                        self.emit_all(&[fmov_from_v(X, X16, v(n)), lsl_imm(X, X17, X16, 1)]);
+                        self.asm.cbz(X, false, X17, ok);
+                        self.emit_all(&[
+                            ubfx(X, X17, X16, 52, 11),
+                            sub_imm(W, X17, X17, 1023 - 126, false),
+                            cmp_imm(W, X17, 253, false),
+                        ]);
+                        self.asm.b_cond(Cond::Hi, state_miss);
+                        self.asm.bind(ok);
+                    }
                     self.asm.bind(ready);
                 }
                 loaded |= 1 << n;
