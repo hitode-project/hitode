@@ -1288,3 +1288,127 @@ fn shared_clock_loads_mark_the_state_in_every_tier() {
         }
     }
 }
+
+fn seven_arg_mix<M: crate::body::Mem>(
+    _: &mut M,
+    args: [u32; 7],
+) -> Result<crate::body::Ret, crate::body::Stop> {
+    BODY_CALLS.set(BODY_CALLS.get() + 1);
+    let weights = [1u32, 3, 7, 13, 31, 61, 127];
+    let mut sum = 0u32;
+    for (v, w) in args.into_iter().zip(weights) {
+        sum = sum.wrapping_add(v.wrapping_mul(w));
+    }
+    Ok(sum.into())
+}
+
+const SEVEN_ARGS: &[crate::body::Input] = &[
+    crate::body::Input::Stack(0),
+    crate::body::Input::Stack(1),
+    crate::body::Input::Stack(2),
+    crate::body::Input::Stack(3),
+    crate::body::Input::Stack(4),
+    crate::body::Input::Stack(5),
+    crate::body::Input::Stack(6),
+];
+crate::body!(SEVEN_ARG_BODY = seven_arg_mix, inputs: SEVEN_ARGS, outputs: crate::body::EAX, pop: 28);
+
+// spec: A64-CALL-2, A64-MEM-7
+#[test]
+fn checked_direct_body_loads_preserve_all_seven_stack_arguments() {
+    use iced_x86::code_asm::*;
+    struct SevenTrap {
+        full: u32,
+    }
+    impl ExecutionTrap for SevenTrap {
+        fn redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
+            (pc == BODY_ENTRY).then_some((THUNK, &[0xc3]))
+        }
+        fn direct_body(&self, pc: u32) -> Option<crate::body::DirectBody> {
+            (pc == BODY_ENTRY).then_some(SEVEN_ARG_BODY.direct)
+        }
+        fn call(
+            &mut self,
+            state: &mut CpuState,
+            memory: &mut Memory,
+            vector: u32,
+        ) -> Result<bool, String> {
+            assert_eq!(vector, 0x2e);
+            self.full += 1;
+            let stack_ptr = state.regs[4];
+            let ret = read_word(memory, stack_ptr + 4)?;
+            let weights = [1u32, 3, 7, 13, 31, 61, 127];
+            let mut sum = 0u32;
+            for (i, w) in weights.into_iter().enumerate() {
+                let v = read_word(memory, stack_ptr + 8 + (i as u32) * 4)?;
+                sum = sum.wrapping_add(v.wrapping_mul(w));
+            }
+            state.regs[0] = sum;
+            state.regs[4] = stack_ptr.wrapping_add(36);
+            state.eip = ret;
+            Ok(false)
+        }
+    }
+    let vals = [
+        0x1111_0001u32,
+        0x2222_0002,
+        0x3333_0003,
+        0x4444_0004,
+        0x5555_0005,
+        0x6666_0006,
+        0x7777_0007,
+    ];
+    let expected: u32 = vals
+        .into_iter()
+        .zip([1u32, 3, 7, 13, 31, 61, 127])
+        .fold(0u32, |acc, (v, w)| acc.wrapping_add(v.wrapping_mul(w)));
+    for checks in [Checks::Slow, Checks::Adaptive] {
+        // Test both an aligned stack and a page-crossing unaligned stack so
+        // checked loads exercise both the checked_base fast path (x3/x4) and
+        // Cold::Access (x1-x4).
+        for guest_sp in [STACK + 0x1ff4, STACK + 0x1ffe] {
+            let (mut cpu, _) = fixture((false, true, checks));
+            cpu.write(BODY_ENTRY, &[0xc3]).unwrap();
+            cpu.write(DATA, &BODY_ENTRY.to_le_bytes()).unwrap();
+            let mut a = CodeAssembler::new(32).unwrap();
+            a.call(dword_ptr(DATA as i32)).unwrap();
+            let code = a.assemble(u64::from(CODE)).unwrap();
+            let stop = CODE + code.len() as u32;
+            cpu.write(CODE, &code).unwrap();
+            let mut trap = SevenTrap { full: 0 };
+            BODY_CALLS.set(0);
+            // Visit 1 interprets/warms; visit 2 compiles and runs the checked JIT site.
+            for _ in 0..2 {
+                cpu.state.eip = CODE;
+                cpu.state.regs[4] = guest_sp;
+                cpu.state.regs[0] = 0;
+                for (i, v) in vals.into_iter().enumerate() {
+                    cpu.write(guest_sp + (i as u32) * 4, &v.to_le_bytes())
+                        .unwrap();
+                }
+                assert_eq!(
+                    cpu.run_with_traps(stop, 100, &mut trap, false).unwrap(),
+                    RunOutcome::ReachedStop
+                );
+                assert_eq!(
+                    cpu.state.regs[0], expected,
+                    "checks={checks:?} sp={guest_sp:#x}"
+                );
+                assert_eq!(
+                    cpu.state.regs[4],
+                    guest_sp + 28,
+                    "checks={checks:?} sp={guest_sp:#x}"
+                );
+            }
+            assert_eq!(
+                trap.full, 1,
+                "only the first interpreted visit uses the thunk"
+            );
+            assert_eq!(
+                BODY_CALLS.get(),
+                1,
+                "the translated checked site runs the direct body"
+            );
+        }
+    }
+}
