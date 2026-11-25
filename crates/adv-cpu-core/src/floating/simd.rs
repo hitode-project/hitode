@@ -669,6 +669,45 @@ fn sse_minmax_qnan_raises_ie_and_float_to_int_skips_de() {
             i32::MIN
         );
     }
+
+    // On x86 (and ARM FPCR.AH=1), a NaN operand suppresses DE on a denormal peer
+    // when DAZ=0, while DAZ=1 still flushes the denormal operand to signed zero.
+    let mut sub_d = [0u8; 16];
+    sub_d[..4].copy_from_slice(&0x0040_0000u32.to_le_bytes());
+    let mut snan32 = [0u8; 16];
+    snan32[..4].copy_from_slice(&0x7f80_0001u32.to_le_bytes());
+    // addss(D, QNaN) and addss(QNaN, D): no DE, returns QNaN.
+    let (step, st) = run(&[0xf3, 0x0f, 0x58, 0xc1], 0x1f80, sub_d, q32);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x00);
+    let (step, st) = run(&[0xf3, 0x0f, 0x58, 0xc1], 0x1f80, q32, sub_d);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x00);
+    // addss(D, SNaN): IE only (no DE).
+    let (step, st) = run(&[0xf3, 0x0f, 0x58, 0xc1], 0x1f80, sub_d, snan32);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x01);
+    // ucomiss(D, QNaN): no DE, no IE; comiss(D, QNaN): IE only (no DE).
+    let (step, st) = run(&[0x0f, 0x2e, 0xc1], 0x1f80, sub_d, q32);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x00);
+    let (step, st) = run(&[0x0f, 0x2f, 0xc1], 0x1f80, sub_d, q32);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x01);
+    // minss(QNaN, D): DAZ=0 returns D with IE only (no DE); DAZ=1 returns +0 with IE.
+    let (step, st) = run(&[0xf3, 0x0f, 0x5d, 0xc1], 0x1f80, q32, sub_d);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x01);
+    assert_eq!(&st.xmm[0][..4], &0x0040_0000u32.to_le_bytes());
+    let (step, st) = run(&[0xf3, 0x0f, 0x5d, 0xc1], 0x1fc0, q32, sub_d);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x01);
+    assert_eq!(&st.xmm[0][..4], &0u32.to_le_bytes());
+    // minss(D, 1.0) under FTZ=1, DAZ=0 preserves subnormal output with DE only (no UE|PE).
+    let (step, st) = run(&[0xf3, 0x0f, 0x5d, 0xc1], 0x9f80, sub_d, one32);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x02);
+    assert_eq!(&st.xmm[0][..4], &0x0040_0000u32.to_le_bytes());
 }
 fn nan(a: u64, width: usize) -> bool {
     if width == 4 {
@@ -687,15 +726,18 @@ fn denormal(a: u64, width: usize) -> bool {
         a & 0x7ff0_0000_0000_0000 == 0 && a & 0x000f_ffff_ffff_ffff != 0
     }
 }
-fn input(tx: &mut Transaction, mut a: u64, width: usize) -> u64 {
+fn input_checked(tx: &mut Transaction, mut a: u64, width: usize, report_de: bool) -> u64 {
     if denormal(a, width) {
         if *tx.state.mxcsr & 0x40 != 0 {
             a &= if width == 4 { 1 << 31 } else { 1 << 63 };
-        } else {
+        } else if report_de {
             finish(tx, 2);
         }
     }
     a
+}
+fn input(tx: &mut Transaction, a: u64, width: usize) -> u64 {
+    input_checked(tx, a, width, true)
 }
 /// Denormal handling for SSE float-to-integer conversions: `DAZ = 1` flushes
 /// subnormals to signed zero (`PE = 0`), while `DAZ = 0` converts subnormals
@@ -841,12 +883,22 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
     let destination = tx.state.xmm[slot];
     for lane in 0..count {
         let offset = lane * width;
-        let a = if matches!(m, M::Sqrtss | M::Sqrtsd | M::Sqrtps | M::Sqrtpd) {
+        let unary_sqrt = matches!(m, M::Sqrtss | M::Sqrtsd | M::Sqrtps | M::Sqrtpd);
+        let raw_a = if unary_sqrt {
             0
         } else {
-            input(tx, bits(&destination[offset..offset + width]), width)
+            bits(&destination[offset..offset + width])
         };
-        let b = input(tx, bits(&source[offset..offset + width]), width);
+        let raw_b = bits(&source[offset..offset + width]);
+        // On x86, a NaN operand suppresses DE on a denormal peer when DAZ=0,
+        // while DAZ=1 still flushes the denormal operand to signed zero.
+        let report_de = !(nan(raw_a, width) || nan(raw_b, width));
+        let a = if unary_sqrt {
+            0
+        } else {
+            input_checked(tx, raw_a, width, report_de)
+        };
+        let b = input_checked(tx, raw_b, width, report_de);
         if matches!(m, M::Comiss | M::Comisd | M::Ucomiss | M::Ucomisd) {
             if signaling(a, width)
                 || signaling(b, width)
@@ -915,7 +967,13 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
         };
         finish(tx, sf::flags());
         let mut result = result;
-        if *tx.state.mxcsr & 0x8000 != 0 && denormal(result, width) {
+        // MIN*/MAX* select an operand directly and do not apply FTZ or underflow.
+        if !matches!(
+            m,
+            M::Minss | M::Minsd | M::Minps | M::Minpd | M::Maxss | M::Maxsd | M::Maxps | M::Maxpd
+        ) && *tx.state.mxcsr & 0x8000 != 0
+            && denormal(result, width)
+        {
             finish(tx, 0x30);
             result &= if width == 4 { 1 << 31 } else { 1 << 63 };
         }
