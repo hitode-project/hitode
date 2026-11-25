@@ -1703,3 +1703,95 @@ fn rep_word_comparison_carries_restart_flags_across_a_slice() {
         }
     }
 }
+
+#[test]
+fn approximate_instructions_match_interpreter_across_all_buckets_and_edge_cases() {
+    let mut inputs: Vec<u32> = vec![
+        0x0000_0000,
+        0x8000_0000,
+        0x0000_0001,
+        0x8040_0000,
+        0x007f_ffff,
+        0x807f_ffff,
+        0x0080_0000,
+        0x8080_0000,
+        0x3f80_0000,
+        0xbf80_0000,
+        0x4020_0000,
+        0xc060_0000,
+        0x7e00_0000,
+        0xfe00_0000,
+        0x7e80_0000,
+        0xfe80_0000,
+        0x7f7f_ffff,
+        0xff7f_ffff,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7f80_0001,
+        0xff80_0001,
+        0x7fc0_0011,
+        0xffc0_0011,
+    ];
+    for i in 0..2048u32 {
+        inputs.push((127u32 << 23) | (i << 12) | (i & 0xfff));
+        let exp = if i < 1024 { 127u32 } else { 128u32 };
+        inputs.push((exp << 23) | ((i & 0x3ff) << 13) | (i & 0x1fff));
+    }
+    while !inputs.len().is_multiple_of(4) {
+        inputs.push(0x3f80_0000);
+    }
+
+    for root in [false, true] {
+        for scalar in [false, true] {
+            for chunk in inputs.chunks(1024) {
+                let mut p = fixture(|a| {
+                    let mut loop_head = a.create_label();
+                    a.set_label(&mut loop_head).unwrap();
+                    if scalar {
+                        a.movss(xmm0, dword_ptr(ebx)).unwrap();
+                        if root {
+                            a.rsqrtss(xmm0, xmm0).unwrap();
+                        } else {
+                            a.rcpss(xmm0, xmm0).unwrap();
+                        }
+                        a.movss(dword_ptr(edi), xmm0).unwrap();
+                        a.add(ebx, 4).unwrap();
+                        a.add(edi, 4).unwrap();
+                        a.sub(ecx, 1).unwrap();
+                    } else {
+                        a.movups(xmm1, xmmword_ptr(ebx)).unwrap();
+                        if root {
+                            a.rsqrtps(xmm0, xmm1).unwrap();
+                        } else {
+                            a.rcpps(xmm0, xmm1).unwrap();
+                        }
+                        a.movups(xmmword_ptr(edi), xmm0).unwrap();
+                        a.add(ebx, 16).unwrap();
+                        a.add(edi, 16).unwrap();
+                        a.sub(ecx, 4).unwrap();
+                    }
+                    a.jnz(loop_head).unwrap();
+                });
+                let src_addr = DATA;
+                let dst_addr = DATA + 0x2000;
+                for (idx, bits) in chunk.iter().enumerate() {
+                    p.data[idx * 4..idx * 4 + 4].copy_from_slice(&bits.to_le_bytes());
+                }
+                p.state.regs[3] = src_addr;
+                p.state.regs[7] = dst_addr;
+                p.state.regs[1] = chunk.len() as u32;
+                p.state.xmm[0] = [0x5a; 16];
+                p.state.mxcsr = 0x3f80; // non-default RC must be ignored
+
+                let config = (Features::default(), false, Checks::Adaptive);
+                let mut native = executor(&p, config, false);
+                let mut oracle = executor(&p, config, true);
+                let outcome = native.run(p.stop, 100_000).unwrap();
+                assert_eq!(outcome, RunOutcome::ReachedStop);
+                assert_eq!(outcome, oracle.run(p.stop, 100_000).unwrap());
+                assert_eq!(native.stats.interpreter_entries, 0);
+                same(&native, &oracle);
+            }
+        }
+    }
+}

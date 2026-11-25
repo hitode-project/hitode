@@ -1151,7 +1151,7 @@ impl Translator<'_> {
     }
 
     fn approximate(&mut self, simd: Simd, address: Reg, root: bool, scalar: bool) {
-        use super::{X0, X1};
+        use super::{X0, X1, X2, X3};
         let source = if simd.src == Loc::Mem {
             self.simd_access(if scalar { VMem::S } else { VMem::Q }, V1, address, false);
             V1
@@ -1159,17 +1159,22 @@ impl Translator<'_> {
             self.register(simd.src)
         };
         self.canonicalize();
-        // Approximations ignore MXCSR and never publish exceptions.
-        self.emit_all(&[mrs_nzcv(X13), mrs_fpcr(X14), msr_fpcr(Reg::ZR)]);
-        let v3 = VReg::new(3);
+        // Approximations ignore MXCSR and never publish exceptions; the exact
+        // 12-bit integer closed form matches x86/RPRES without touching FPCR.
+        self.emit_all(&[mrs_nzcv(X13), movz(W, X0, 0x7f80, 16)]);
+        if root {
+            // 1u64 << 39
+            self.emit(movz(X, X2, 0x0080, 32));
+        } else {
+            // exp >= 253 threshold (0x7e80_0000) and 1u32 << 26 (0x0400_0000)
+            self.emit_all(&[movz(W, X2, 0x7e80, 16), movz(W, X3, 0x0400, 16)]);
+        }
         for lane in 0..if scalar { 1 } else { 4 } {
-            let [nan, small, negative, infinite, finish] =
-                std::array::from_fn(|_| self.asm.label());
+            let [nan, small, negative, zero, finish] = std::array::from_fn(|_| self.asm.label());
             self.emit_all(&[
                 vumov(2, X16, source, lane),
                 and_imm(W, X17, X16, 0x7fff_ffff),
                 and_imm(W, X1, X16, 1 << 31),
-                movz(W, X0, 0x7f80, 16),
                 cmp(W, X17, X0, Shift::Lsl, 0),
             ]);
             self.asm.b_cond(Cond::Hi, nan);
@@ -1177,23 +1182,63 @@ impl Translator<'_> {
             self.asm.b_cond(Cond::Lo, small);
             if root {
                 self.asm.tbz(true, X16, 31, negative);
+                self.emit(cmp(W, X17, X0, Shift::Lsl, 0));
+                self.asm.b_cond(Cond::Eq, zero);
+                // b = (2048 + 2*i + 1) << ((e & 1) ^ 1), q = (1 << 39) / b.
+                // 3 Newton steps from 12288 + exactness fixup yield floor(sqrt(q))
+                // for every b in [2049, 8190]; sig = (r + 1) >> 1.
+                self.emit_all(&[
+                    ubfx(X, X6, X16, 13, 10),
+                    movz(X, X14, 2049, 0),
+                    add(X, X6, X14, X6, Shift::Lsl, 1),
+                    ubfx(W, X14, X16, 23, 1),
+                    cmp_imm(W, X14, 0, false),
+                    lsl_imm(X, X14, X6, 1),
+                    csel(X, X6, X14, X6, Cond::Eq),
+                    udiv(X, X14, X2, X6),
+                    movz(X, X6, 12288, 0),
+                    udiv(X, X3, X14, X6),
+                    add(X, X6, X6, X3, Shift::Lsl, 0),
+                    lsr_imm(X, X6, X6, 1),
+                    udiv(X, X3, X14, X6),
+                    add(X, X6, X6, X3, Shift::Lsl, 0),
+                    lsr_imm(X, X6, X6, 1),
+                    udiv(X, X3, X14, X6),
+                    add(X, X6, X6, X3, Shift::Lsl, 0),
+                    lsr_imm(X, X6, X6, 1),
+                    mul(X, X3, X6, X6),
+                    cmp(X, X3, X14, Shift::Lsl, 0),
+                    sub_imm(X, X3, X6, 1, false),
+                    csel(X, X6, X3, X6, Cond::Hi),
+                    add_imm(W, X6, X6, 1, false),
+                    lsr_imm(W, X6, X6, 1),
+                    and_imm(W, X6, X6, 0xfff),
+                    lsr_imm(W, X14, X17, 23),
+                    movz(W, X17, 380, 0),
+                    sub(W, X14, X17, X14, Shift::Lsl, 0),
+                    lsr_imm(W, X14, X14, 1),
+                    lsl_imm(W, X6, X6, 11),
+                    orr(W, X6, X6, X14, Shift::Lsl, 23),
+                ]);
+            } else {
+                self.emit(cmp(W, X17, X2, Shift::Lsl, 0));
+                self.asm.b_cond(Cond::Hs, zero);
+                // a = 4096 + 2*i + 1, sig = (((1 << 26) / a) + 1) >> 1.
+                self.emit_all(&[
+                    ubfx(W, X6, X16, 12, 11),
+                    movz(W, X14, 4097, 0),
+                    add(W, X6, X14, X6, Shift::Lsl, 1),
+                    udiv(W, X6, X3, X6),
+                    add_imm(W, X6, X6, 1, false),
+                    lsr_imm(W, X6, X6, 1),
+                    and_imm(W, X6, X6, 0xfff),
+                    lsr_imm(W, X14, X17, 23),
+                    movz(W, X17, 253, 0),
+                    sub(W, X14, X17, X14, Shift::Lsl, 0),
+                    orr(W, X6, X1, X6, Shift::Lsl, 11),
+                    orr(W, X6, X6, X14, Shift::Lsl, 23),
+                ]);
             }
-            self.emit(cmp(W, X17, X0, Shift::Lsl, 0));
-            self.asm.b_cond(Cond::Eq, infinite);
-            self.emit(fmov_to_v(W, V2, X16));
-            if root {
-                self.emit(fsqrt(true, false, V2, V2));
-            }
-            self.emit_all(&[
-                movz(W, X0, 0x3f80, 16),
-                fmov_to_v(W, v3, X0),
-                sfloat(Float::Fdiv, V2, v3, V2),
-                fmov_from_v(W, X6, V2),
-                add_imm(W, X6, X6, 0x800, false),
-                and_imm(W, X6, X6, 0xffff_f000),
-                and_imm(W, X17, X6, 0x7f80_0000),
-            ]);
-            self.asm.cbz(W, false, X17, infinite);
             self.asm.b(finish);
             self.asm.bind(nan);
             self.emit(orr_imm(W, X6, X16, 0x0040_0000));
@@ -1204,12 +1249,12 @@ impl Translator<'_> {
             self.asm.bind(negative);
             self.emit(movz(W, X6, 0xffc0, 16));
             self.asm.b(finish);
-            self.asm.bind(infinite);
+            self.asm.bind(zero);
             self.emit(mov(W, X6, X1));
             self.asm.bind(finish);
             self.emit(vins_general(2, V0, lane, X6));
         }
-        self.emit_all(&[msr_fpcr(X14), msr_nzcv(X13)]);
+        self.emit(msr_nzcv(X13));
         let destination = self.destination(simd.dst, scalar);
         self.emit(if scalar {
             vins(2, destination, 0, V0, 0)
