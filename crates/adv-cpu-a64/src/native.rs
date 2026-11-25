@@ -4153,8 +4153,10 @@ mod tests {
         let f32_xmm = |v: f32| u128::from(v.to_bits()).to_le_bytes();
 
         // 1) addss xmm0, xmm1; int3
-        //    Under non-default rounding (RC=down, 0x3f80) with PE already set (0x3fa0),
-        //    Tier-1 emits `rounded_op` (2 `msr fpcr` writes).
+        //    Under non-default rounding (RC=down, 0x3f80) with PE already set (0x3fa0):
+        //    - With FEAT_AFP: Tier-1 lazily syncs FPCR (1 write) + arms FPSR,
+        //      and root exit folds FPSR (1 read, 1 fold) + restores FPCR (1 write).
+        //    - Without FEAT_AFP: Tier-1 emits `rounded_op` (2 FPCR writes, 0 FPSR reads).
         let (mut memory, mut native) = setup_code(&[0xf3, 0x0f, 0x58, 0xc1, 0xcc]);
         let mut cpu = CpuState {
             eip: ENTRY,
@@ -4165,7 +4167,9 @@ mod tests {
         cpu.xmm[1] = f32_xmm(0.25);
         enter(&mut native, &mut memory, ENTRY + 4, &mut cpu);
         assert_eq!(native.diagnostics.fp.fpcr_writes, 2);
-        assert_eq!(native.diagnostics.fp.fpsr_reads, 0);
+        let afp = adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP);
+        assert_eq!(native.diagnostics.fp.fpsr_reads, u64::from(afp));
+        assert_eq!(native.diagnostics.fp.fpsr_folds, u64::from(afp));
 
         // 2) Same unit under default rounding (0x1f80) with PE=0 and inexact add
         //    (1.0f32 + 1e-8f32) takes `floating_cold` -> 1 FPSR read + 1 FPSR fold.

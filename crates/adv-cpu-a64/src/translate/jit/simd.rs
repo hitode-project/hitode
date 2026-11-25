@@ -45,8 +45,10 @@
 //! forms ignore upper lanes; NaN signaling follows each x86 predicate.
 //! EFLAGS comparisons use the value entry on a NaN.
 
-use super::{X1, X2};
+use super::{FpcrMode, X1, X2};
+use crate::translate::front::flags::FlagSet;
 use crate::translate::lower::fp_class;
+use crate::translate::lower::fp_state;
 use crate::translate::lower::stubs;
 
 #[cfg(test)]
@@ -71,12 +73,43 @@ const V1: VReg = VReg::new(1);
 const V2: VReg = VReg::new(2);
 
 impl Simd {
-    pub(super) fn control_helper(self, key: crate::facts::Key) -> bool {
+    /// Whether a same-register logical or equality instruction defines a
+    /// constant (`0` or all-ones) without reading its operand.
+    fn is_const_idiom(&self) -> bool {
+        self.dst == self.src
+            && matches!(self.dst, Loc::Mmx(_) | Loc::Xmm(_))
+            && matches!(
+                self.kind,
+                Kind::Logic(Logic::Eor) | Kind::AndNot | Kind::Same(Same::Cmeq, _)
+            )
+    }
+
+    /// ARMv8.0 (non-AFP) control-helper gate: requires default MXCSR, or
+    /// masked non-DAZ/FTZ MXCSR for single-instruction directed-rounding ops.
+    fn v8_control_helper(self, key: crate::facts::Key) -> bool {
         self.floating()
             && !key.mxcsr().is_some_and(|class| {
                 crate::facts::default_mxcsr(class)
                     || self.directed_rounding() && crate::facts::masked_mxcsr(class)
             })
+    }
+
+    pub(super) fn control_helper(self, key: crate::facts::Key) -> bool {
+        if !self.floating() {
+            return false;
+        }
+        let Some(class) = key.mxcsr() else {
+            return true;
+        };
+        if !fp_state::sse_exceptions_masked(class) {
+            return true;
+        }
+        if crate::facts::default_mxcsr(class)
+            || self.directed_rounding() && crate::facts::masked_mxcsr(class)
+        {
+            return false;
+        }
+        !adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP)
     }
 
     /// Whether a `floating` instruction can be inexact.
@@ -160,6 +193,9 @@ impl Simd {
             Loc::Xmm(n) => 1 << (8 + n),
             _ => 0,
         };
+        if self.is_const_idiom() {
+            return (0, bit(self.dst));
+        }
         // As the lowering below reads its destination.
         let reads_dst = match self.kind {
             Kind::Emms
@@ -169,6 +205,7 @@ impl Simd {
             | Kind::StoreControl
             | Kind::PackedToInt(..)
             | Kind::SignMask(_)
+            | Kind::Shuffle(_)
             | Kind::ShuffleWords(_) => false,
             Kind::ShiftBytes(_) => self.imm < 16,
             Kind::ShiftImm(op, log2) => {
@@ -199,15 +236,57 @@ pub struct Operands {
 
 /// The slow path of a `floating` instruction.
 pub struct Slow {
-    simd: Simd,
-    operands: Operands,
-    slow: Label,
-    /// Checks a zero or subnormal result, then goes on or takes `slow`.
-    tiny: Option<Label>,
-    resume: Label,
-    bail: Label,
-    rounded: Option<Label>,
-    value: Option<ValueContinuation>,
+    kind: SlowKind,
+}
+
+enum SlowKind {
+    Legacy {
+        simd: Simd,
+        operands: Operands,
+        slow: Label,
+        /// Checks a zero or subnormal result, then goes on or takes `slow`.
+        tiny: Option<Label>,
+        resume: Label,
+        bail: Label,
+        rounded: Option<Label>,
+        value: Option<ValueContinuation>,
+    },
+    /// Out-of-line NaN flag materialization for `ucomis*`/`comis*` without `FEAT_FlagM2`.
+    UnorderedFlags {
+        label: Label,
+        resume: Label,
+        need_nzcv: bool,
+        need_pf: bool,
+        need_af: bool,
+    },
+    /// Dynamic unmasked-exception fallback for `FEAT_AFP` paths where MXCSR
+    /// control bits are not statically known to mask all six SSE exceptions.
+    AfpUnmasked {
+        label: Label,
+        after: Label,
+        simd: Simd,
+        s: VReg,
+        value: ValueContinuation,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum KnownFpcr {
+    #[default]
+    Unknown,
+    /// Active hardware FPCR holds this exact `FPCR` image (with `AH = 1`).
+    Const(u32),
+    /// Active hardware FPCR was dynamically synced from live `MXCSR` (with `AH = 1`).
+    MatchesMxcsr,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FpTrack {
+    /// `index + 1` of the trace instruction that established this state (`0` = unknown).
+    valid_at: u32,
+    fpcr: KnownFpcr,
+    fpsr_armed: bool,
+    all_masked: bool,
 }
 
 struct ValueContinuation {
@@ -237,6 +316,8 @@ pub struct Vector {
     /// x5 holds the `CpuState` pointer.
     pub cpu: bool,
     pub guards: Guards,
+    /// Straight-line `FEAT_AFP` FPCR/FPSR state within the current basic block.
+    fp: FpTrack,
 }
 
 /// Facts about `CpuState` that guards established on every path here.
@@ -327,7 +408,11 @@ impl Translator<'_> {
             }
         }
         let mmx = simd.mmx();
-        let first_pe = mmx && simd.floating() && simd.inexact() && !self.vector.guards.fp_pe;
+        let first_pe = !self.features.afp
+            && mmx
+            && simd.floating()
+            && simd.inexact()
+            && !self.vector.guards.fp_pe;
         let ready = self.vector.guards.ready;
         if mmx && !ready {
             self.as_part(Part::SimdGuard, |t| {
@@ -352,13 +437,29 @@ impl Translator<'_> {
         } else {
             Reg::ZR
         };
-        if self.tier1 && simd.control_helper(self.facts) {
+        let use_afp = self.features.afp
+            && !(matches!(simd.kind, Kind::ScalarToInt(..)) && !self.features.frintts);
+        let needs_control_helper = if use_afp {
+            simd.floating()
+                && !self
+                    .facts
+                    .mxcsr()
+                    .is_some_and(fp_state::sse_exceptions_masked)
+        } else {
+            simd.v8_control_helper(self.facts)
+        };
+        if self.tier1 && needs_control_helper {
             self.simd_value(
                 simd,
                 ValueOperand::Address(address),
                 self.x87_leaving(),
                 self.x87_live_pairs(),
             );
+            // Keep residency guard monotonicity if a test overrides `Features`
+            // below `HostFeatures::get()`.
+            if !simd.control_helper(self.facts) {
+                self.vector.guards = simd.guarding(self.vector.guards);
+            }
         } else {
             self.simd_body(simd, address);
         }
@@ -428,6 +529,11 @@ impl Translator<'_> {
         if reads_dst && simd.dst != simd.src {
             self.publish_value_simd(simd.dst);
         }
+        if self.features.afp {
+            // Fold any lazy SSE FPSR sticky bits before copying `CpuState::mxcsr`
+            // into `VALUE_MXCSR`.
+            fp_state::emit_fold_fpsr(self.asm, super::X0, super::X1, super::X2);
+        }
         self.cpu();
         self.emit_all(&[
             ldr(W, X16, X5, runtime::MXCSR),
@@ -446,6 +552,7 @@ impl Translator<'_> {
             x87,
         });
         self.call_prepared_value(simd.helper, stubs::ValueTarget::Float(None), pairs);
+        self.reset_fp_track();
         self.emit_all(&[
             ldr(W, X16, RUNTIME, runtime::VALUE_MXCSR),
             str(W, X16, X5, runtime::MXCSR),
@@ -654,12 +761,25 @@ impl Translator<'_> {
                 self.asm.cbz(W, true, X17, bail);
                 self.cpu();
                 self.emit(str(W, X13, X5, runtime::MXCSR));
+                if self.features.afp {
+                    // LDMXCSR replaces all MXCSR sticky bits: discard lazy FPSR
+                    // and invalidate cached FPCR assumptions (A64F-FP-5).
+                    fp_state::emit_discard_fpsr(self.asm);
+                    self.reset_fp_track();
+                }
                 self.vector.guards.fp_masked = false;
                 self.vector.guards.fp_default = false;
                 self.vector.guards.fp_pe = false;
                 return;
             }
             Kind::StoreControl => {
+                if self.features.afp {
+                    // Fold lazy SSE FPSR sticky bits before observing MXCSR.
+                    // `address` may live in X16 or X17, so use X0/X1/X2.
+                    fp_state::emit_fold_fpsr(self.asm, super::X0, super::X1, super::X2);
+                    self.vector.fp.fpsr_armed = false;
+                    self.fpsr_armed = false;
+                }
                 self.cpu();
                 self.emit(ldr(W, X13, X5, runtime::MXCSR));
                 self.access(
@@ -668,6 +788,9 @@ impl Translator<'_> {
                     crate::translate::lower::access::Dir::Store,
                     X13,
                 );
+                if self.checking {
+                    self.reset_fp_track();
+                }
                 return;
             }
             Kind::Half(high) => return self.half(simd, high, address),
@@ -737,6 +860,17 @@ impl Translator<'_> {
             }
             _ => {}
         }
+        if simd.is_const_idiom() {
+            let d = self.destination(simd.dst, false);
+            match simd.kind {
+                Kind::Logic(Logic::Eor) | Kind::AndNot => self.emit(vzero(full, d)),
+                Kind::Same(Same::Cmeq, _) => {
+                    self.emit_all(&[vzero(full, d), vnot(full, d, d)]);
+                }
+                _ => unreachable!(),
+            }
+            return self.written(simd.dst);
+        }
         let s = match simd.src {
             Loc::Mem => {
                 self.simd_access(vmem(simd.width), V1, address, false);
@@ -745,7 +879,10 @@ impl Translator<'_> {
             Loc::Imm => unreachable!("handled above"),
             loc => self.register(loc),
         };
-        let d = self.destination(simd.dst, !matches!(simd.kind, Kind::ShuffleWords(_)));
+        let d = self.destination(
+            simd.dst,
+            !matches!(simd.kind, Kind::ShuffleWords(_) | Kind::Shuffle(_)),
+        );
         match simd.kind {
             Kind::ShuffleWords(high) => {
                 self.emit(vmov(true, V0, s));
@@ -834,24 +971,14 @@ impl Translator<'_> {
                 }
             }
             Kind::Shuffle(log2) => {
-                let log2 = u32::from(log2);
-                let lane = u32::from(simd.imm & 3);
-                if u32::from(simd.imm) == lane * 0x55 {
-                    self.emit(vdup_lane(Arr::new(log2, full), d, s, lane));
-                    return self.written(simd.dst);
-                }
-                for lane in 0..4 {
-                    let from = u32::from(simd.imm) >> (2 * lane) & 3;
-                    self.emit(vins(log2, V0, lane, s, from));
-                }
-                self.emit(vmov(full, d, V0));
+                self.emit_shuffle(u32::from(log2), full, d, s, simd.imm);
             }
             Kind::Shufps => {
-                for lane in 0..4 {
-                    let from = u32::from(simd.imm) >> (2 * lane) & 3;
-                    self.emit(vins(2, V0, lane, if lane < 2 { d } else { s }, from));
+                if d == s {
+                    self.emit_shuffle(2, true, d, s, simd.imm);
+                } else {
+                    self.emit_shufps(d, s, simd.imm);
                 }
-                self.emit(vmov(true, d, V0));
             }
             Kind::Move
             | Kind::InsertWord
@@ -884,10 +1011,118 @@ impl Translator<'_> {
         self.written(simd.dst);
     }
 
-    /// Packed binary32 conversions use the interpreter's rounding and sticky
-    /// exception rules, including integer indefinite on every invalid lane.
+    /// Fast NEON lowering for `PSHUFD` (`log2 == 2`, `full == true`) and
+    /// `PSHUFW` (`log2 == 1`, `full == false`), using 1-instruction permutes
+    /// for common immediates and 1-register `TBL` otherwise.
+    fn emit_shuffle(&mut self, log2: u32, full: bool, d: VReg, s: VReg, imm: u8) {
+        let arr = Arr::new(log2, full);
+        match imm {
+            // Identity `[0, 1, 2, 3]`.
+            0xe4 => {
+                if d != s {
+                    self.emit(vmov(full, d, s));
+                }
+            }
+            // Broadcast `[k, k, k, k]`.
+            0x00 | 0x55 | 0xaa | 0xff => {
+                self.emit(vdup_lane(arr, d, s, u32::from(imm & 3)));
+            }
+            // 16-byte rotations (`PSHUFD` / same-reg `SHUFPS`).
+            0x4e if full => self.emit(vext(d, s, s, 8)),
+            0x39 if full => self.emit(vext(d, s, s, 4)),
+            0x93 if full => self.emit(vext(d, s, s, 12)),
+            // Standard NEON permutes (`[0,0,1,1]`, `[2,2,3,3]`, `[0,2,0,2]`,
+            // `[1,3,1,3]`, `[0,0,2,2]`, `[1,1,3,3]`).
+            0x50 => self.emit(vpermute(Permute::Zip1, arr, d, s, s)),
+            0xfa => self.emit(vpermute(Permute::Zip2, arr, d, s, s)),
+            0x88 => self.emit(vpermute(Permute::Uzp1, arr, d, s, s)),
+            0xdd => self.emit(vpermute(Permute::Uzp2, arr, d, s, s)),
+            0xa0 => self.emit(vpermute(Permute::Trn1, arr, d, s, s)),
+            0xf5 => self.emit(vpermute(Permute::Trn2, arr, d, s, s)),
+            // Duplicate low/high half (`[0,1,0,1]` / `[2,3,2,3]`).
+            0x44 => self.emit(vdup_lane(Arr::new(log2 + 1, full), d, s, 0)),
+            0xee => self.emit(vdup_lane(Arr::new(log2 + 1, full), d, s, 1)),
+            _ => {
+                let lanes = [imm & 3, (imm >> 2) & 3, (imm >> 4) & 3, (imm >> 6) & 3];
+                if log2 == 2 {
+                    let lane_bytes =
+                        |base: u8| u32::from_le_bytes([base, base + 1, base + 2, base + 3]);
+                    let lo = u64::from(lane_bytes(lanes[0] * 4))
+                        | (u64::from(lane_bytes(lanes[1] * 4)) << 32);
+                    let hi = u64::from(lane_bytes(lanes[2] * 4))
+                        | (u64::from(lane_bytes(lanes[3] * 4)) << 32);
+                    self.mov_u64(X16, lo);
+                    self.mov_u64(X17, hi);
+                    self.emit_all(&[
+                        fmov_to_v(X, V0, X16),
+                        vins_general(3, V0, 1, X17),
+                        vtbl(true, 1, d, s, V0),
+                    ]);
+                } else {
+                    let word_bytes = |base: u8| u16::from_le_bytes([base, base + 1]);
+                    let mask = u64::from(word_bytes(lanes[0] * 2))
+                        | (u64::from(word_bytes(lanes[1] * 2)) << 16)
+                        | (u64::from(word_bytes(lanes[2] * 2)) << 32)
+                        | (u64::from(word_bytes(lanes[3] * 2)) << 48);
+                    self.mov_u64(X16, mask);
+                    self.emit_all(&[fmov_to_v(X, V0, X16), vtbl(false, 1, d, s, V0)]);
+                }
+            }
+        }
+    }
+
+    /// Fast NEON lowering for two-register `SHUFPS d, s, imm` (`d != s`),
+    /// using 1-instruction permutes for common immediates and 2-register `TBL`
+    /// otherwise.
+    fn emit_shufps(&mut self, d: VReg, s: VReg, imm: u8) {
+        match imm {
+            // `[d0, d1, s2, s3]`
+            0xe4 => self.emit(vins(3, d, 1, s, 1)),
+            // `[d0, d1, s0, s1]`
+            0x44 => self.emit(vpermute(Permute::Zip1, Arr::D2, d, d, s)),
+            // `[d2, d3, s2, s3]`
+            0xee => self.emit(vpermute(Permute::Zip2, Arr::D2, d, d, s)),
+            // `[d2, d3, s0, s1]`
+            0x4e => self.emit(vext(d, d, s, 8)),
+            // `[d0, d2, s0, s2]`
+            0x88 => self.emit(vpermute(Permute::Uzp1, Arr::S4, d, d, s)),
+            // `[d1, d3, s1, s3]`
+            0xdd => self.emit(vpermute(Permute::Uzp2, Arr::S4, d, d, s)),
+            _ => {
+                let lanes = [imm & 3, (imm >> 2) & 3, (imm >> 4) & 3, (imm >> 6) & 3];
+                let (table_base, d_off, s_off) = if s.number() == d.number() + 1 {
+                    (d, 0u8, 16u8)
+                } else if d.number() == s.number() + 1 {
+                    (s, 16u8, 0u8)
+                } else {
+                    self.emit(vmov(true, V0, d));
+                    if s != V1 {
+                        self.emit(vmov(true, V1, s));
+                    }
+                    (V0, 0u8, 16u8)
+                };
+                let lane_bytes =
+                    |base: u8| u32::from_le_bytes([base, base + 1, base + 2, base + 3]);
+                let lo = u64::from(lane_bytes(d_off + lanes[0] * 4))
+                    | (u64::from(lane_bytes(d_off + lanes[1] * 4)) << 32);
+                let hi = u64::from(lane_bytes(s_off + lanes[2] * 4))
+                    | (u64::from(lane_bytes(s_off + lanes[3] * 4)) << 32);
+                self.mov_u64(X16, lo);
+                self.mov_u64(X17, hi);
+                self.emit_all(&[
+                    fmov_to_v(X, V2, X16),
+                    vins_general(3, V2, 1, X17),
+                    vtbl(true, 2, d, table_base, V2),
+                ]);
+            }
+        }
+    }
+
+    /// Packed float-to-integer conversions use the interpreter's rounding and
+    /// sticky exception rules, including integer indefinite on every invalid
+    /// lane and Intel SDM §11.5.3.2 pre/post priority before unmasked `#XM`.
     fn packed_to_int(&mut self, simd: Simd, address: Reg, truncate: bool, double: bool) {
-        use super::{X0, X1, X2, X6};
+        use super::{X0, X1, X2};
         let s = if simd.src == Loc::Mem {
             self.simd_access(
                 if simd.width == 8 { VMem::D } else { VMem::Q },
@@ -899,6 +1134,108 @@ impl Translator<'_> {
         } else {
             self.register(simd.src)
         };
+        if self.features.afp && self.features.frintts {
+            self.refresh_fp_track();
+            let unit_mxcsr = self.unit_mxcsr_constant();
+            if let Some(class) = unit_mxcsr
+                && fp_state::sse_exceptions_masked(class)
+            {
+                let desired = fp_state::fpcr_from_mxcsr(class);
+                self.emit_sync_fpcr_const(desired);
+                self.emit_arm_fpsr_if_needed();
+                self.set_fp_track(KnownFpcr::Const(desired), true, true);
+                let d = self.destination(simd.dst, false);
+                if double {
+                    self.emit_all(&[
+                        vfrint32(true, true, truncate, V0, s),
+                        vfcvtzs_2d(V0, V0),
+                        vxtn_2s(d, V0),
+                    ]);
+                } else {
+                    let full = !matches!(simd.dst, Loc::Mmx(_));
+                    self.emit_all(&[
+                        vfrint32(full, false, truncate, V0, s),
+                        vtoint(true, full, d, V0),
+                    ]);
+                }
+                return self.written(simd.dst);
+            }
+            if unit_mxcsr.is_none()
+                && self.vector.fp.all_masked
+                && self.vector.fp.fpcr == KnownFpcr::MatchesMxcsr
+                && self.vector.fp.fpsr_armed
+            {
+                self.vector.fp.valid_at = self.index as u32 + 1;
+                let d = self.destination(simd.dst, false);
+                if double {
+                    self.emit_all(&[
+                        vfrint32(true, true, truncate, V0, s),
+                        vfcvtzs_2d(V0, V0),
+                        vxtn_2s(d, V0),
+                    ]);
+                } else {
+                    let full = !matches!(simd.dst, Loc::Mmx(_));
+                    self.emit_all(&[
+                        vfrint32(full, false, truncate, V0, s),
+                        vtoint(true, full, d, V0),
+                    ]);
+                }
+                return self.written(simd.dst);
+            }
+            if unit_mxcsr.is_none() {
+                let (slow, done) = (self.asm.label(), self.asm.label());
+                self.cpu();
+                self.emit_all(&[
+                    ldr(W, X13, X5, runtime::MXCSR),
+                    and_imm(W, X17, X13, u64::from(fp_state::MXCSR_ALL_MASKED)),
+                    eor_imm(W, X17, X17, u64::from(fp_state::MXCSR_ALL_MASKED)),
+                ]);
+                self.asm.cbz(W, true, X17, slow);
+                self.emit_sync_fpcr_from_mxcsr(X13);
+                fp_state::emit_arm_sse_fpsr(self.asm, X17);
+                if double {
+                    self.emit_all(&[
+                        vfrint32(true, true, truncate, V0, s),
+                        vfcvtzs_2d(V0, V0),
+                        vxtn_2s(V0, V0),
+                    ]);
+                } else {
+                    let full = !matches!(simd.dst, Loc::Mmx(_));
+                    self.emit_all(&[
+                        vfrint32(full, false, truncate, V0, s),
+                        vtoint(true, full, V0, V0),
+                    ]);
+                }
+                self.asm.b(done);
+                self.asm.bind(slow);
+                fp_state::emit_fold_fpsr(self.asm, X0, X1, X2);
+                fp_state::emit_restore_host_fpcr(self.asm, X0, X1);
+                self.emit(ldr(W, X13, X5, runtime::MXCSR));
+                self.packed_to_int_slow(simd, s, truncate, double);
+                self.asm.bind(done);
+                self.reset_fp_track();
+                let d = self.destination(simd.dst, false);
+                self.emit(vmov(simd.full(), d, V0));
+                return self.written(simd.dst);
+            }
+            // Statically known unmasked SSE exception: keep exact pre/post path.
+            fp_state::emit_fold_fpsr(self.asm, X0, X1, X2);
+            fp_state::emit_restore_host_fpcr(self.asm, X0, X1);
+            self.reset_fp_track();
+            self.cpu();
+            self.emit(ldr(W, X13, X5, runtime::MXCSR));
+            self.packed_to_int_slow(simd, s, truncate, double);
+            let d = self.destination(simd.dst, false);
+            self.emit(vmov(simd.full(), d, V0));
+            return self.written(simd.dst);
+        }
+        if self.features.afp {
+            // `afp && !frintts`: fold lazy FPSR and restore host FPCR before
+            // the non-FRINTTS path reads MXCSR or clears FPSR.
+            fp_state::emit_fold_fpsr(self.asm, X0, X1, X2);
+            fp_state::emit_restore_host_fpcr(self.asm, X0, X1);
+            self.reset_fp_track();
+        }
         self.cpu();
         self.emit(ldr(W, X13, X5, runtime::MXCSR));
         let (slow, done) = (self.asm.label(), self.asm.label());
@@ -917,7 +1254,8 @@ impl Translator<'_> {
         } else {
             slow
         };
-        if !self.vector.guards.fp_pe {
+        let pe_known = !self.features.afp && self.vector.guards.fp_pe && self.trust_v8_guards();
+        if !pe_known {
             self.asm.tbz(false, X13, 5, after_zero_fpsr);
         }
         if double {
@@ -972,8 +1310,8 @@ impl Translator<'_> {
         }
         self.asm.b(done);
         if self.features.frintts {
-            // Tier B (FEAT_FRINTTS): handles PE = 0 and exact -2^31 in one vector
-            // FRINT32Z/FRINT32X + FCVTZS pair and one FPSR read instead of per-lane.
+            // Tier B (FEAT_FRINTTS without AFP): handles PE = 0 and exact -2^31
+            // in one vector FRINT32Z/FRINT32X + FCVTZS pair and one FPSR read.
             self.asm.bind(after_zero_fpsr);
             self.emit(msr_fpsr(Reg::ZR));
             if double {
@@ -992,7 +1330,7 @@ impl Translator<'_> {
             self.emit(mrs_fpsr(X17));
             runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_READS, 1, X16);
             self.asm.tbz(true, X17, 0, slow);
-            if !self.vector.guards.fp_pe {
+            if !pe_known {
                 // FPSR.IXC (bit 4) maps directly to MXCSR.PE (bit 5).
                 self.emit_all(&[
                     and_imm(W, X17, X17, 0x10),
@@ -1004,6 +1342,17 @@ impl Translator<'_> {
             self.asm.b(done);
         }
         self.asm.bind(slow);
+        self.packed_to_int_slow(simd, s, truncate, double);
+        self.asm.bind(done);
+        let d = self.destination(simd.dst, false);
+        self.emit(vmov(simd.full(), d, V0));
+        self.written(simd.dst);
+    }
+
+    /// Exact per-lane float-to-int slow path with Intel SDM §11.5.3.2 pre/post
+    /// exception priority. Expects `X5 = CpuState` and `X13 = MXCSR`.
+    fn packed_to_int_slow(&mut self, simd: Simd, s: VReg, truncate: bool, double: bool) {
+        use super::{X0, X1, X2, X6};
         self.emit(movz(W, X0, 0, 0));
         let temp = VReg::new(3);
         self.emit(vzero(true, V0));
@@ -1092,10 +1441,6 @@ impl Translator<'_> {
         ]);
         runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_FOLDS, 1, X16);
         self.asm.cbz(W, true, X2, bail);
-        self.asm.bind(done);
-        let d = self.destination(simd.dst, false);
-        self.emit(vmov(simd.full(), d, V0));
-        self.written(simd.dst);
     }
 
     fn simd_move(&mut self, simd: Simd, address: Reg) {
@@ -1132,6 +1477,11 @@ impl Translator<'_> {
 
     fn simd_access(&mut self, size: VMem, value: VReg, address: Reg, store: bool) {
         self.vector_access(size, value, address, store);
+        if self.checking {
+            // Checked access slow path calls `stubs.access`, which restores
+            // `host_fpcr` and may fold/clear `fpsr_owner`.
+            self.reset_fp_track();
+        }
     }
 
     /// `movlps` or `movhps`: one 64-bit lane of an XMM register.
@@ -1162,6 +1512,22 @@ impl Translator<'_> {
         } else {
             self.register(simd.src)
         };
+        if self.features.afp && self.features.rpres {
+            // Under FPCR.AH=1 + FEAT_RPRES, `frecpe`/`frsqrte` match the exact
+            // 12-bit x86 reciprocal tables across all 2^32 inputs without
+            // raising any FPSR flags or depending on FIZ/FZ/RMode (A64F-FP-9).
+            self.ensure_ah1_for_rpres();
+            let destination = self.destination(simd.dst, scalar);
+            if scalar {
+                self.emit_all(&[
+                    sfrecpe(root, false, V0, source),
+                    vins(2, destination, 0, V0, 0),
+                ]);
+            } else {
+                self.emit(vfrecpe(root, true, false, destination, source));
+            }
+            return self.written(simd.dst);
+        }
         self.canonicalize();
         // Approximations ignore MXCSR and never publish exceptions; the exact
         // 12-bit integer closed form matches x86/RPRES without touching FPCR.
@@ -1302,14 +1668,26 @@ impl Translator<'_> {
         }
     }
 
-    /// Arithmetic, conversions and binary32/64 compares. The fast path
-    /// never touches FPSR: it runs once PE is set, or
-    /// for operations that cannot be inexact, with no denormal operand, and
-    /// sends values that could raise anything else to the slow path, which
-    /// retries between a cleared and a read FPSR and uses a value call on
-    /// any exception but inexact. Uses x13, x14 and
-    /// v0-v6.
+    /// Arithmetic, conversions and binary32/64 compares.
+    ///
+    /// With `FEAT_AFP` and all six SSE exceptions masked, runs directly under
+    /// `FPCR.AH = 1` with lazy FPSR sticky-bit accumulation (A64F-FP-5).
+    /// Without `FEAT_AFP` (or for `ScalarToInt` without `FEAT_FRINTTS`), runs
+    /// the ARMv8.0 fallback that never touches FPSR on the fast path and sends
+    /// exceptional cases to the slow path.
     fn floating(&mut self, simd: Simd, address: Reg) {
+        if self.features.afp
+            && !(matches!(simd.kind, Kind::ScalarToInt(..)) && !self.features.frintts)
+        {
+            return self.floating_afp(simd, address);
+        }
+        if self.features.afp {
+            // `ScalarToInt` with `afp && !frintts`: fold lazy FPSR and restore
+            // host FPCR before entering the ARMv8.0 fallback.
+            fp_state::emit_fold_fpsr(self.asm, super::X0, super::X1, super::X2);
+            fp_state::emit_restore_host_fpcr(self.asm, super::X0, super::X1);
+            self.reset_fp_track();
+        }
         self.cpu();
         let bail = if self.tier1 {
             self.asm.label()
@@ -1319,8 +1697,16 @@ impl Translator<'_> {
         let (slow, resume) = (self.asm.label(), self.asm.label());
         let after = self.tier1.then(|| self.asm.label());
         let inexact = simd.inexact();
-        let first_pe = inexact && !self.vector.guards.fp_pe;
-        let guards = self.vector.guards;
+        let trust = !self.features.afp && self.trust_v8_guards();
+        let guards = if trust {
+            self.vector.guards
+        } else {
+            Guards {
+                ready: self.vector.guards.ready,
+                ..Guards::default()
+            }
+        };
+        let first_pe = inexact && !guards.fp_pe;
         let directed = !guards.fp_default && simd.directed_rounding();
         let admission = if self.tier1 && !guards.fp_default {
             let inst = self.trace.insts[self.index];
@@ -1369,7 +1755,7 @@ impl Translator<'_> {
             _ => [None, Some(s)],
         };
         let operands = Operands { s, inputs };
-        if inexact && !self.vector.guards.fp_pe {
+        if inexact && !guards.fp_pe {
             self.as_part(Part::SimdGuard, |t| t.asm.tbz(false, X13, 5, slow));
             self.vector.guards.fp_pe = true;
         }
@@ -1383,21 +1769,23 @@ impl Translator<'_> {
         let tiny = self.floating_fast(simd, operands, slow, false);
         self.asm.bind(resume);
         self.push_cold(Cold::Floating(Slow {
-            simd,
-            operands,
-            slow,
-            tiny,
-            resume,
-            bail,
-            rounded,
-            value: after.map(|after| ValueContinuation {
-                after,
-                state: self.state,
-                vector: self.vector,
-                x87: self.x87_leaving(),
-                pairs: self.x87_live_pairs(),
-                first_pe: first_pe && !simd.mmx(),
-            }),
+            kind: SlowKind::Legacy {
+                simd,
+                operands,
+                slow,
+                tiny,
+                resume,
+                bail,
+                rounded,
+                value: after.map(|after| ValueContinuation {
+                    after,
+                    state: self.state,
+                    vector: self.vector,
+                    x87: self.x87_leaving(),
+                    pairs: self.x87_live_pairs(),
+                    first_pe: first_pe && !simd.mmx(),
+                }),
+            },
         }));
         if matches!(simd.kind, Kind::ScalarToInt(..)) {
             let Loc::Gpr(index) = simd.dst else {
@@ -1413,18 +1801,7 @@ impl Translator<'_> {
             return;
         }
         if matches!(simd.kind, Kind::FlagCompare(..)) {
-            self.emit_all(&[
-                fmov_from_v(W, X16, V0),
-                fmov_from_v(W, X17, V2),
-                and_imm(W, X16, X16, 1 << 30),
-                mvn(W, X17, X17),
-                and_imm(W, X17, X17, 1 << 29),
-                orr(W, X16, X16, X17, Shift::Lsl, 0),
-                msr_nzcv(X16),
-                movz(W, super::X10, 1, 0),
-                movz(W, super::X11, 0, 0),
-            ]);
-            self.state = super::State::CANONICAL;
+            self.finish_flag_compare();
             if let Some(after) = after {
                 self.asm.bind(after);
             }
@@ -1469,6 +1846,282 @@ impl Translator<'_> {
         if let Some(after) = after {
             self.asm.bind(after);
         }
+    }
+
+    /// Direct `FEAT_AFP` (`FPCR.AH = 1`) lowering for SSE arithmetic, `min`/`max`,
+    /// compares, `ucomis*`/`comis*`, and conversions when all six SSE exceptions
+    /// are masked (A64F-FP-5, A64-FLAG-6).
+    fn floating_afp(&mut self, simd: Simd, address: Reg) {
+        let s = match simd.src {
+            Loc::Mem => {
+                self.simd_access(vmem(simd.width), V1, address, false);
+                V1
+            }
+            Loc::Gpr(_) => V1,
+            loc => self.register(loc),
+        };
+        let d_in = match simd.kind {
+            Kind::Float(..)
+            | Kind::Double(..)
+            | Kind::Compare(..)
+            | Kind::MinMax(..)
+            | Kind::FlagCompare(..) => Some(self.register(simd.dst)),
+            _ => None,
+        };
+        if let Kind::ScalarToInt(..) = simd.kind {
+            let Loc::Gpr(index) = simd.dst else {
+                unreachable!()
+            };
+            self.clobber(Operand::Guest(index));
+        }
+        let unmasked_after = self.ensure_afp_masked(simd, s);
+        match simd.kind {
+            Kind::Float(op, false) => {
+                let d = d_in.unwrap();
+                self.emit(vfloat(op, true, d, d, s));
+                self.written(simd.dst);
+            }
+            Kind::Float(op, true) => {
+                let d = d_in.unwrap();
+                self.emit_all(&[sfloat(op, V0, d, s), vins(2, d, 0, V0, 0)]);
+                self.written(simd.dst);
+            }
+            Kind::Double(op, false) => {
+                let d = d_in.unwrap();
+                self.emit(vfloat_2d(op, d, d, s));
+                self.written(simd.dst);
+            }
+            Kind::Double(op, true) => {
+                let d = d_in.unwrap();
+                self.emit_all(&[dfloat(op, V0, d, s), vins(3, d, 0, V0, 0)]);
+                self.written(simd.dst);
+            }
+            Kind::Sqrt(false, double) => {
+                let d = self.destination(simd.dst, false);
+                self.emit(fsqrt(false, double, d, s));
+                self.written(simd.dst);
+            }
+            Kind::Sqrt(true, double) => {
+                let d = self.destination(simd.dst, true);
+                self.emit_all(&[
+                    fsqrt(true, double, V0, s),
+                    vins(if double { 3 } else { 2 }, d, 0, V0, 0),
+                ]);
+                self.written(simd.dst);
+            }
+            Kind::MinMax(max, false, double) => {
+                let d = d_in.unwrap();
+                self.emit(vfminmax(max, true, double, d, d, s));
+                self.written(simd.dst);
+            }
+            Kind::MinMax(max, true, double) => {
+                let d = d_in.unwrap();
+                self.emit_all(&[
+                    fminmax(max, double, V0, d, s),
+                    vins(if double { 3 } else { 2 }, d, 0, V0, 0),
+                ]);
+                self.written(simd.dst);
+            }
+            Kind::Compare(scalar, double) => {
+                let d = d_in.unwrap();
+                let out = if scalar { V0 } else { d };
+                match simd.imm & 7 {
+                    0 | 4 => self.emit(vcompare(Float::Fcmeq, scalar, double, out, d, s)),
+                    1 | 5 => self.emit(vcompare(Float::Fcmgt, scalar, double, out, s, d)),
+                    2 | 6 => self.emit(vcompare(Float::Fcmge, scalar, double, out, s, d)),
+                    3 | 7 => {
+                        // `fcmeq(d, s)` produces the exact x86 FPSR flags for
+                        // `cmpord`/`cmpunord` (IOC on SNaN, quiet on QNaN, IDC
+                        // on denormal iff neither operand is NaN). Compute the
+                        // ordered mask bitwise so `(QNaN, denormal)` never
+                        // triggers a spurious `IDC` from `fcmeq(s, s)`.
+                        let arr = if double { Arr::D2 } else { Arr::S4 };
+                        let (v3, v4, v5) = (VReg::new(3), VReg::new(4), VReg::new(5));
+                        self.emit(vcompare(Float::Fcmeq, scalar, double, V0, d, s));
+                        if double {
+                            self.emit(movz(X, X16, 0xffe0, 48));
+                        } else {
+                            self.emit(movz(W, X16, 0xff00, 16));
+                        }
+                        self.emit_all(&[
+                            vdup(arr, V2, X16),
+                            vshift(ShiftImm::Shl, arr, v3, d, 1),
+                            vshift(ShiftImm::Shl, arr, v4, s, 1),
+                            vsame(Same::Uqsub, arr, v3, v3, V2),
+                            vsame(Same::Uqsub, arr, v4, v4, V2),
+                            vlogic(Logic::Orr, true, v3, v3, v4),
+                            vzero(true, v5),
+                            vsame(Same::Cmeq, arr, out, v3, v5),
+                        ]);
+                    }
+                    _ => unreachable!(),
+                }
+                if matches!(simd.imm & 7, 3..=6) {
+                    self.emit(vnot(true, out, out));
+                }
+                if scalar {
+                    self.emit(vins(if double { 3 } else { 2 }, d, 0, V0, 0));
+                }
+                self.written(simd.dst);
+            }
+            Kind::FlagCompare(double, signaling) => {
+                let d = d_in.unwrap();
+                self.emit(match (double, signaling) {
+                    (false, false) => fcmps(d, s),
+                    (false, true) => fcmpes(d, s),
+                    (true, false) => fcmp(d, s),
+                    (true, true) => fcmpe(d, s),
+                });
+                self.finish_flag_compare();
+            }
+            Kind::Widen(false) => {
+                let d = self.destination(simd.dst, false);
+                self.emit(vwiden(d, s));
+                self.written(simd.dst);
+            }
+            Kind::Widen(true) => {
+                let d = self.destination(simd.dst, true);
+                self.emit_all(&[unary(Unary::Widen, V0, s), vins(3, d, 0, V0, 0)]);
+                self.written(simd.dst);
+            }
+            Kind::Narrow(true) => {
+                let d = self.destination(simd.dst, true);
+                self.emit_all(&[unary(Unary::Narrow, V0, s), vins(2, d, 0, V0, 0)]);
+                self.written(simd.dst);
+            }
+            Kind::Narrow(false) => {
+                let d = self.destination(simd.dst, false);
+                self.emit_all(&[
+                    unary(Unary::Narrow, V0, s),
+                    vins(3, V2, 0, s, 1),
+                    unary(Unary::Narrow, V2, V2),
+                    vins(2, V0, 1, V2, 0),
+                    vmov(true, d, V0),
+                ]);
+                self.written(simd.dst);
+            }
+            Kind::ScalarFromInt(double) => {
+                let gpr = match simd.src {
+                    Loc::Gpr(index) => host(index),
+                    Loc::Mem => {
+                        self.emit(fmov_from_v(W, X16, s));
+                        X16
+                    }
+                    _ => unreachable!(),
+                };
+                let d = self.destination(simd.dst, true);
+                if double {
+                    self.emit_all(&[scvtf(W, V0, gpr), vins(3, d, 0, V0, 0)]);
+                } else {
+                    self.emit_all(&[scvtf_s(W, V0, gpr), vins(2, d, 0, V0, 0)]);
+                }
+                self.written(simd.dst);
+            }
+            Kind::FromInt(false) => {
+                if simd.width == 8 {
+                    let d = self.register(simd.dst);
+                    self.emit_all(&[vfromint(V0, s), vins(3, d, 0, V0, 0)]);
+                } else {
+                    let d = self.destination(simd.dst, false);
+                    self.emit(vfromint(d, s));
+                }
+                self.written(simd.dst);
+            }
+            Kind::FromInt(true) => {
+                let d = self.destination(simd.dst, false);
+                self.emit_all(&[
+                    vumov(2, X16, s, 0),
+                    scvtf(W, V0, X16),
+                    vumov(2, X16, s, 1),
+                    scvtf(W, V2, X16),
+                    vins(3, V0, 1, V2, 0),
+                    vmov(true, d, V0),
+                ]);
+                self.written(simd.dst);
+            }
+            Kind::ScalarToInt(double, truncate) => {
+                debug_assert!(self.features.frintts);
+                let Loc::Gpr(index) = simd.dst else {
+                    unreachable!()
+                };
+                let dst = super::ops::result(index);
+                self.emit(sfrint_ts(false, double, truncate, V0, s));
+                self.emit(if double {
+                    fcvt_int(W, true, dst, V0)
+                } else {
+                    fcvt_int_s_mode(W, 3, dst, V0)
+                });
+                self.commit(index);
+            }
+            _ => unreachable!(),
+        }
+        self.vector.guards = simd.guarding(self.vector.guards);
+        if let Some(after) = unmasked_after {
+            self.asm.bind(after);
+            self.reset_fp_track();
+        }
+    }
+
+    /// Converts AArch64 `fcmp`/`fcmpe` NZCV flags into `State::CANONICAL`
+    /// (`N=SF=0, Z=ZF, C=!CF, V=OF=0`, `x10 = !PF`, `x11 = AF = 0`) using
+    /// `axflag` when `FEAT_FlagM2` is present or an out-of-line NaN fixup
+    /// otherwise (A64-FLAG-6).
+    fn finish_flag_compare(&mut self) {
+        let need_nzcv = self
+            .out
+            .any(FlagSet::CF.or(FlagSet::ZF).or(FlagSet::SF).or(FlagSet::OF));
+        let need_pf = self.out.any(FlagSet::PF);
+        let need_af = self.out.any(FlagSet::AF);
+        if self.features.flagm2 {
+            if need_pf {
+                self.emit(cset(W, super::X10, Cond::Vc));
+            }
+            if need_af {
+                self.emit(movz(W, super::X11, 0, 0));
+            }
+            if need_nzcv {
+                self.emit(AXFLAG);
+            }
+        } else if need_nzcv {
+            let unordered = self.asm.label();
+            let resume = self.asm.label();
+            self.asm.b_cond(Cond::Vs, unordered);
+            if self.out.any(FlagSet::SF) {
+                if self.features.flagm {
+                    self.emit(rmif(Reg::ZR, 0, 0b1000));
+                } else {
+                    self.emit_all(&[
+                        mrs_nzcv(X16),
+                        and_imm(X, X16, X16, !(1u64 << 31)),
+                        msr_nzcv(X16),
+                    ]);
+                }
+            }
+            if need_pf {
+                self.emit(movz(W, super::X10, 1, 0));
+            }
+            if need_af {
+                self.emit(movz(W, super::X11, 0, 0));
+            }
+            self.asm.bind(resume);
+            self.push_cold(Cold::Floating(Slow {
+                kind: SlowKind::UnorderedFlags {
+                    label: unordered,
+                    resume,
+                    need_nzcv,
+                    need_pf,
+                    need_af,
+                },
+            }));
+        } else {
+            if need_pf {
+                self.emit(cset(W, super::X10, Cond::Vc));
+            }
+            if need_af {
+                self.emit(movz(W, super::X11, 0, 0));
+            }
+        }
+        self.state = super::State::CANONICAL;
     }
 
     /// An exact slow operation can leave PE clear; finish it, then leave
@@ -1617,8 +2270,21 @@ impl Translator<'_> {
         let double = simd.double();
         let inputs = operands.inputs;
         if simd.scalar() {
+            let skip = if to.is_none()
+                && let [Some(a), Some(b)] = inputs
+            {
+                // On x86, a NaN peer suppresses DE when reporting into MXCSR.
+                let skip = self.asm.label();
+                fp_class::nan_operands(self.asm, true, double, &[a, b], X16, [v4, v5], skip);
+                Some(skip)
+            } else {
+                None
+            };
             for input in inputs.into_iter().flatten() {
                 fp_class::scalar_denormal(self.asm, double, input, X16, X17, to, X13);
+            }
+            if let Some(skip) = skip {
+                self.asm.bind(skip);
             }
             return;
         }
@@ -1628,6 +2294,17 @@ impl Translator<'_> {
             _ => Arr::S4,
         };
         fp_class::packed_denormals(self.asm, arr, double, inputs, X16, [v4, v5, v6, V0]);
+        if to.is_none()
+            && let [Some(a), Some(b)] = inputs
+        {
+            // Suppress DE on any lane where either operand is NaN.
+            self.emit_all(&[
+                vcompare(Float::Fcmeq, false, double, v4, a, a),
+                vcompare(Float::Fcmeq, false, double, v5, b, b),
+                vlogic(Logic::And, true, v4, v4, v5),
+                vlogic(Logic::And, true, v6, v6, v4),
+            ]);
+        }
         fp_class::finish_denormals(self.asm, double, v6, [X14, X17, X13], to);
     }
 
@@ -1677,14 +2354,14 @@ impl Translator<'_> {
                     ]);
                 }
             }
-            Kind::FlagCompare(double, _) => {
+            Kind::FlagCompare(double, signaling) => {
                 let d = d.unwrap();
-                // Relational comparisons send every NaN to the original helper,
-                // which distinguishes COMIS from UCOMIS exception behavior.
-                self.emit_all(&[
-                    vcompare(Float::Fcmeq, true, double, V0, d, s),
-                    vcompare(Float::Fcmgt, true, double, V2, s, d),
-                ]);
+                self.emit(match (double, signaling) {
+                    (false, false) => fcmps(d, s),
+                    (false, true) => fcmpes(d, s),
+                    (true, false) => fcmp(d, s),
+                    (true, true) => fcmpe(d, s),
+                });
             }
             Kind::Float(op, false) => self.emit(vfloat(op, true, V0, d.unwrap(), s)),
             Kind::Float(op, true) => self.emit(sfloat(op, V0, d.unwrap(), s)),
@@ -1755,65 +2432,334 @@ impl Translator<'_> {
 
     /// The out-of-line paths of a `floating` instruction.
     pub(super) fn floating_cold(&mut self, cold: Slow) {
-        let Slow {
-            simd,
-            operands,
-            slow,
-            tiny,
-            resume,
-            bail,
-            rounded,
-            value,
-        } = cold;
-        if let Some(rounded) = rounded {
-            self.asm.bind(rounded);
-            self.remark(Part::Body);
-            let tiny = self.floating_fast(simd, operands, slow, true);
-            self.asm.b(resume);
-            if let Some(tiny) = tiny {
-                self.asm.bind(tiny);
-                self.floating_tiny(simd, operands, slow, resume);
-                self.asm.b(slow);
+        match cold.kind {
+            SlowKind::UnorderedFlags {
+                label,
+                resume,
+                need_nzcv,
+                need_pf,
+                need_af,
+            } => {
+                self.asm.bind(label);
+                if need_nzcv {
+                    // Canonical x86 unordered flags: SF=0, ZF=1, CF=1 (C=0), OF=0.
+                    self.emit_all(&[movz(W, X16, 0x4000, 16), msr_nzcv(X16)]);
+                }
+                if need_pf {
+                    self.emit(movz(W, super::X10, 0, 0));
+                }
+                if need_af {
+                    self.emit(movz(W, super::X11, 0, 0));
+                }
+                self.asm.b(resume);
+            }
+            SlowKind::AfpUnmasked {
+                label,
+                after,
+                simd,
+                s,
+                value,
+            } => {
+                self.asm.bind(label);
+                self.state = value.state;
+                self.vector = value.vector;
+                self.simd_value(simd, ValueOperand::Loaded(s), value.x87, value.pairs);
+                self.asm.b(after);
+            }
+            SlowKind::Legacy {
+                simd,
+                operands,
+                slow,
+                tiny,
+                resume,
+                bail,
+                rounded,
+                value,
+            } => {
+                if let Some(rounded) = rounded {
+                    self.asm.bind(rounded);
+                    self.remark(Part::Body);
+                    let tiny = self.floating_fast(simd, operands, slow, true);
+                    self.asm.b(resume);
+                    if let Some(tiny) = tiny {
+                        self.asm.bind(tiny);
+                        self.floating_tiny(simd, operands, slow, resume);
+                        self.asm.b(slow);
+                    }
+                }
+                if let Some(tiny) = tiny {
+                    self.asm.bind(tiny);
+                    self.floating_tiny(simd, operands, slow, resume);
+                }
+                self.asm.bind(slow);
+                self.remark(crate::jit_map::Part::FpStatus);
+                self.emit(ldr(W, X13, X5, runtime::MXCSR));
+                self.denormals(simd, operands, None);
+                self.emit(msr_fpsr(Reg::ZR));
+                if rounded.is_some() {
+                    self.rounded_op(simd, operands);
+                } else {
+                    self.floating_op(simd, operands);
+                }
+                // Anything but inexact leaves; inexact sets PE.
+                self.emit_all(&[mrs_fpsr(X17), and_imm(X, X14, X17, 0xf)]);
+                runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_READS, 1, X16);
+                self.asm.cbz(X, true, X14, bail);
+                self.emit_all(&[
+                    ubfx(W, X17, X17, 4, 1),
+                    orr(W, X13, X13, X17, Shift::Lsl, 5),
+                    str(W, X13, X5, runtime::MXCSR),
+                ]);
+                runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_FOLDS, 1, X16);
+                self.asm.b(resume);
+                if let Some(value) = value {
+                    self.asm.bind(bail);
+                    self.state = value.state;
+                    self.vector = value.vector;
+                    self.simd_value(
+                        simd,
+                        ValueOperand::Loaded(operands.s),
+                        value.x87,
+                        value.pairs,
+                    );
+                    self.pe_ready(value.first_pe, value.x87);
+                    self.asm.b(value.after);
+                }
             }
         }
-        if let Some(tiny) = tiny {
-            self.asm.bind(tiny);
-            self.floating_tiny(simd, operands, slow, resume);
+    }
+
+    fn reset_fp_track(&mut self) {
+        self.vector.fp = FpTrack::default();
+        self.invalidate_fp_state();
+    }
+
+    fn set_fp_track(&mut self, fpcr: KnownFpcr, fpsr_armed: bool, all_masked: bool) {
+        self.vector.fp = FpTrack {
+            valid_at: self.index as u32 + 1,
+            fpcr,
+            fpsr_armed,
+            all_masked,
+        };
+        self.fpcr_mode = match fpcr {
+            KnownFpcr::Unknown => FpcrMode::Unknown,
+            KnownFpcr::Const(fp_state::FPCR_X87_DEFAULT) => FpcrMode::DefaultAfp,
+            KnownFpcr::Const(val) => FpcrMode::Exact(val),
+            KnownFpcr::MatchesMxcsr => FpcrMode::Exact(fp_state::FPCR_AH),
+        };
+        self.fpsr_armed = fpsr_armed;
+    }
+
+    /// Whether legacy ARMv8.0 `Guards` can be trusted without re-checking MXCSR.
+    /// False only when a Tier-1 unit is lowered with `Features::afp = false`
+    /// on an AFP host under a non-default MXCSR class (where `control_helper`
+    /// and `v8_control_helper` diverge).
+    fn trust_v8_guards(&self) -> bool {
+        !(self.tier1
+            && adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP)
+            && self
+                .facts
+                .mxcsr()
+                .is_some_and(|class| !crate::facts::default_mxcsr(class)))
+    }
+
+    /// Returns the unit's entry MXCSR control class when no instruction in the
+    /// trace can alter `MXCSR[15:6]`.
+    fn unit_mxcsr_constant(&self) -> Option<u32> {
+        use crate::translate::front::{decode::Op, trace::Mode};
+        if !self.tier1 {
+            return None;
         }
-        self.asm.bind(slow);
-        self.remark(crate::jit_map::Part::FpStatus);
-        self.emit(ldr(W, X13, X5, runtime::MXCSR));
-        self.denormals(simd, operands, None);
-        self.emit(msr_fpsr(Reg::ZR));
-        if rounded.is_some() {
-            self.rounded_op(simd, operands);
+        let class = self.facts.mxcsr()?;
+        let invariant = self.trace.insts.iter().all(|inst| {
+            inst.call.is_none()
+                && inst.mode != Mode::Real
+                && !matches!(
+                    inst.op,
+                    Op::Value(_)
+                        | Op::Body(_)
+                        | Op::Syscall
+                        | Op::Simd(Simd {
+                            kind: Kind::LoadControl,
+                            ..
+                        })
+                )
+        });
+        invariant.then_some(class)
+    }
+
+    /// Validates that `self.vector.fp` still holds across all straight-line
+    /// trace instructions between `valid_at - 1` and `self.index`.
+    fn refresh_fp_track(&mut self) {
+        use crate::translate::front::{
+            decode::Op,
+            trace::{Mode, Next},
+        };
+        if self.vector.fp.valid_at == 0 || self.fpcr_mode == FpcrMode::Unknown {
+            self.vector.fp = FpTrack::default();
+            return;
+        }
+        let prev = (self.vector.fp.valid_at - 1) as usize;
+        if prev >= self.index {
+            self.vector.fp = FpTrack::default();
+            return;
+        }
+        for i in prev + 1..=self.index {
+            if self.trace.head(i)
+                || self.trace.merge[i]
+                || self.trace.insts[i - 1].next != Next::Fall
+            {
+                self.vector.fp = FpTrack::default();
+                return;
+            }
+            if i == self.index {
+                break;
+            }
+            let inst = self.trace.insts[i];
+            let disturbs = inst.call.is_some()
+                || inst.locked.is_some()
+                || inst.mode == Mode::Real
+                || (self.checked)(inst.pc)
+                || matches!(
+                    inst.op,
+                    Op::X87(_)
+                        | Op::Fild64(..)
+                        | Op::Value(_)
+                        | Op::Body(_)
+                        | Op::Syscall
+                        | Op::Timestamp
+                        | Op::PopFlags(..)
+                        | Op::Stack(..)
+                        | Op::Call(_)
+                        | Op::CallIndirect(_)
+                        | Op::JmpIndirect(_)
+                        | Op::Ret(_)
+                );
+            if disturbs {
+                self.vector.fp = FpTrack::default();
+                return;
+            }
+        }
+        if !self.fpsr_armed {
+            self.vector.fp.fpsr_armed = false;
+        }
+    }
+
+    fn emit_sync_fpcr_const(&mut self, desired: u32) {
+        if self.vector.fp.fpcr != KnownFpcr::Const(desired) {
+            self.as_part(Part::SimdGuard, |t| {
+                fp_state::emit_sync_fpcr_imm(t.asm, desired, X16, X17);
+            });
+        }
+    }
+
+    fn emit_arm_fpsr_if_needed(&mut self) {
+        if !self.vector.fp.fpsr_armed {
+            self.as_part(Part::SimdGuard, |t| {
+                fp_state::emit_arm_sse_fpsr(t.asm, X17);
+            });
+        }
+    }
+
+    /// Computes hardware `FEAT_AFP` FPCR from MXCSR in `mxcsr_reg` (`X13`) into
+    /// `X16` and lazily syncs hardware FPCR (preserving NZCV and `mxcsr_reg`).
+    fn emit_sync_fpcr_from_mxcsr(&mut self, mxcsr_reg: Reg) {
+        debug_assert!(mxcsr_reg != X16 && mxcsr_reg != X17);
+        self.as_part(Part::SimdGuard, |t| {
+            t.emit_all(&[
+                // AH = 1 (bit 1), FIZ = MXCSR[6] (bit 0), FZ = MXCSR[15] (bit 24).
+                movz(W, X16, fp_state::FPCR_AH as u16, 0),
+                ubfx(W, X17, mxcsr_reg, 6, 1),
+                orr(W, X16, X16, X17, Shift::Lsl, 0),
+                ubfx(W, X17, mxcsr_reg, 15, 1),
+                orr(W, X16, X16, X17, Shift::Lsl, 24),
+                // RMode[23:22] = bit-reversed MXCSR[14:13] (swaps RD/RU).
+                and_imm(W, X17, mxcsr_reg, 0x6000),
+                rbit(W, X17, X17),
+                lsl_imm(W, X17, X17, 5),
+                orr(W, X16, X16, X17, Shift::Lsl, 0),
+            ]);
+            fp_state::emit_sync_fpcr(t.asm, X16, X17);
+        });
+    }
+
+    /// Ensures `FPCR.AH = 1` is active for `frecpe`/`frsqrte` (`FEAT_RPRES`),
+    /// skipping FPCR sync completely when any `AH = 1` mode is already tracked.
+    fn ensure_ah1_for_rpres(&mut self) {
+        self.refresh_fp_track();
+        match self.vector.fp.fpcr {
+            KnownFpcr::Const(_) | KnownFpcr::MatchesMxcsr => {
+                // `frecpe`/`frsqrte` under `AH = 1` ignore FIZ/FZ/RMode and
+                // never write FPSR, so existing tracking stays valid.
+                self.vector.fp.valid_at = self.index as u32 + 1;
+            }
+            KnownFpcr::Unknown => {
+                self.emit_sync_fpcr_const(fp_state::FPCR_X87_DEFAULT);
+                self.set_fp_track(KnownFpcr::Const(fp_state::FPCR_X87_DEFAULT), false, false);
+            }
+        }
+    }
+
+    /// Ensures all six SSE exceptions are masked, hardware FPCR matches MXCSR
+    /// under `FPCR.AH = 1`, and lazy SSE FPSR accumulation is armed.
+    /// Returns `Some(after)` when a dynamic unmasked fallback path was emitted.
+    fn ensure_afp_masked(&mut self, simd: Simd, s: VReg) -> Option<Label> {
+        self.refresh_fp_track();
+        if let Some(class) = self.unit_mxcsr_constant()
+            && fp_state::sse_exceptions_masked(class)
+        {
+            let desired = fp_state::fpcr_from_mxcsr(class);
+            self.emit_sync_fpcr_const(desired);
+            self.emit_arm_fpsr_if_needed();
+            self.set_fp_track(KnownFpcr::Const(desired), true, true);
+            return None;
+        }
+        if self.vector.fp.all_masked
+            && self.vector.fp.fpcr == KnownFpcr::MatchesMxcsr
+            && self.vector.fp.fpsr_armed
+        {
+            self.vector.fp.valid_at = self.index as u32 + 1;
+            return None;
+        }
+        self.cpu();
+        let (unmasked, after) = if self.tier1 {
+            let (u, a) = (self.asm.label(), self.asm.label());
+            self.push_cold(Cold::Floating(Slow {
+                kind: SlowKind::AfpUnmasked {
+                    label: u,
+                    after: a,
+                    simd,
+                    s,
+                    value: ValueContinuation {
+                        after: a,
+                        state: self.state,
+                        vector: self.vector,
+                        x87: self.x87_leaving(),
+                        pairs: self.x87_live_pairs(),
+                        first_pe: false,
+                    },
+                },
+            }));
+            (u, Some(a))
         } else {
-            self.floating_op(simd, operands);
+            (self.bail(), None)
+        };
+        self.as_part(Part::SimdGuard, |t| {
+            t.emit_all(&[
+                ldr(W, X13, X5, runtime::MXCSR),
+                and_imm(W, X17, X13, u64::from(fp_state::MXCSR_ALL_MASKED)),
+                eor_imm(W, X17, X17, u64::from(fp_state::MXCSR_ALL_MASKED)),
+            ]);
+            t.asm.cbz(W, true, X17, unmasked);
+        });
+        self.emit_sync_fpcr_from_mxcsr(X13);
+        self.as_part(Part::SimdGuard, |t| {
+            fp_state::emit_arm_sse_fpsr(t.asm, X17);
+        });
+        if after.is_none() {
+            self.set_fp_track(KnownFpcr::MatchesMxcsr, true, true);
         }
-        // Anything but inexact leaves; inexact sets PE.
-        self.emit_all(&[mrs_fpsr(X17), and_imm(X, X14, X17, 0xf)]);
-        runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_READS, 1, X16);
-        self.asm.cbz(X, true, X14, bail);
-        self.emit_all(&[
-            ubfx(W, X17, X17, 4, 1),
-            orr(W, X13, X13, X17, Shift::Lsl, 5),
-            str(W, X13, X5, runtime::MXCSR),
-        ]);
-        runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_FOLDS, 1, X16);
-        self.asm.b(resume);
-        if let Some(value) = value {
-            self.asm.bind(bail);
-            self.state = value.state;
-            self.vector = value.vector;
-            self.simd_value(
-                simd,
-                ValueOperand::Loaded(operands.s),
-                value.x87,
-                value.pairs,
-            );
-            self.pe_ready(value.first_pe, value.x87);
-            self.asm.b(value.after);
-        }
+        after
     }
 
     /// The host register of an MMX or XMM operand, loaded if the unit has
@@ -2045,6 +2991,9 @@ impl Translator<'_> {
                 self.emit(add_imm(X, sp, sp, count * 16, false));
             }
         }
+        if restore {
+            self.reset_fp_track();
+        }
         self.vector.cpu = false;
     }
 
@@ -2054,6 +3003,7 @@ impl Translator<'_> {
         self.vector.mmx = 0;
         self.vector.guards.ready = false;
         self.aliased = 0;
+        self.reset_fp_track();
     }
 
     pub(super) fn call_prepared_value(
@@ -2062,6 +3012,7 @@ impl Translator<'_> {
         target: stubs::ValueTarget,
         pairs: Option<u8>,
     ) {
+        let resets_fp = matches!(target, stubs::ValueTarget::Float(_));
         let index = self.helpers + u32::from(helper);
         if let (Some(x87), Some(_), stubs::ValueTarget::Float(access)) =
             (self.x87_stubs(), pairs, &target)
@@ -2074,12 +3025,22 @@ impl Translator<'_> {
             self.mov_imm(X1, index);
             self.mov_imm(X2, desc);
             self.far_call(x87.value_call);
+            self.reset_fp_track();
             return;
         }
         stubs::emit_value_call(self.asm, index, self.vector.xmm, pairs, target);
+        if resets_fp {
+            self.reset_fp_track();
+        }
     }
 
     pub(super) fn publish_fx_image(&mut self) {
+        if self.features.afp {
+            // Fold lazy SSE sticky bits before FXSAVE reads `CpuState::mxcsr`.
+            fp_state::emit_fold_fpsr(self.asm, super::X0, super::X1, super::X2);
+            self.vector.fp.fpsr_armed = false;
+            self.fpsr_armed = false;
+        }
         for n in 0..8 {
             self.publish_value_simd(Loc::Xmm(n));
         }
@@ -2091,6 +3052,12 @@ impl Translator<'_> {
     }
 
     pub(super) fn reload_fx_image(&mut self) {
+        if self.features.afp {
+            // FXRSTOR replaced MXCSR: ensure uncommitted FPSR is discarded and
+            // cached FPCR assumptions are cleared.
+            fp_state::emit_discard_fpsr(self.asm);
+            self.reset_fp_track();
+        }
         for n in 0..8 {
             if self.vector.xmm & (1 << n) != 0 {
                 let (size, offset) = value_simd_offset(Loc::Xmm(n));
@@ -2333,5 +3300,21 @@ mod tests {
         );
         assert!(sqrt.floating());
         assert!(plan(&decode(|a| a.emms().unwrap()), 0).unwrap().mmx());
+        for (insn, expected_write) in [
+            (decode(|a| a.pxor(xmm0, xmm0).unwrap()), 1u16 << 8),
+            (decode(|a| a.xorps(xmm1, xmm1).unwrap()), 1u16 << 9),
+            (decode(|a| a.xorpd(xmm2, xmm2).unwrap()), 1u16 << 10),
+            (decode(|a| a.pandn(xmm3, xmm3).unwrap()), 1u16 << 11),
+            (decode(|a| a.andnps(xmm4, xmm4).unwrap()), 1u16 << 12),
+            (decode(|a| a.andnpd(xmm5, xmm5).unwrap()), 1u16 << 13),
+            (decode(|a| a.pcmpeqb(xmm0, xmm0).unwrap()), 1u16 << 8),
+            (decode(|a| a.pcmpeqw(xmm1, xmm1).unwrap()), 1u16 << 9),
+            (decode(|a| a.pcmpeqd(xmm2, xmm2).unwrap()), 1u16 << 10),
+            (decode(|a| a.pxor(mm3, mm3).unwrap()), 1u16 << 3),
+            (decode(|a| a.pandn(mm4, mm4).unwrap()), 1u16 << 4),
+            (decode(|a| a.pcmpeqd(mm5, mm5).unwrap()), 1u16 << 5),
+        ] {
+            assert_eq!(plan(&insn, 0).unwrap().footprint(), (0, expected_write));
+        }
     }
 }
