@@ -4780,3 +4780,101 @@ fn sse_loop_fp_state_counters_per_mxcsr_mode() {
         }
     }
 }
+
+// spec: A64F-FP-1, A64F-FP-5, A64-OPT-6
+#[test]
+fn resident_shared_x87_segments_match_the_interpreter_on_nans_and_invalid_conversions() {
+    // x87 add, divide, compare and integer store between SSE arithmetic, so
+    // every x87 op runs in a segment under the SSE FPCR (`AH = 1`).
+    let body = Image::loop_body(|a, head, _| {
+        a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+        a.mulps(xmm0, xmm7).unwrap();
+        a.movups(xmmword_ptr(edi), xmm0).unwrap();
+        a.fld(qword_ptr(esi + 16)).unwrap();
+        a.fadd(qword_ptr(esi + 24)).unwrap();
+        a.fld(qword_ptr(esi + 32)).unwrap();
+        a.fdivp(st1, st0).unwrap();
+        a.fld1().unwrap();
+        a.fcomip(st0, st1).unwrap();
+        a.setb(byte_ptr(edi + 16)).unwrap();
+        a.fistp(dword_ptr(edi + 20)).unwrap();
+        // Leave +0 in both popped registers: native forms do not keep the
+        // stale value of an empty x87 register.
+        a.fldz().unwrap();
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+        a.fstp(st0).unwrap();
+        a.addps(xmm0, xmm7).unwrap();
+        a.movups(xmmword_ptr(edi + 32), xmm0).unwrap();
+        a.add(esi, 48).unwrap();
+        a.add(edi, 48).unwrap();
+        latch(a, head);
+    });
+    const N: u32 = 32;
+    const ONCE: u32 = 7;
+    const QNAN: u64 = 0x7ff8_0000_0000_0001;
+    const SNAN: u64 = 0x7ff0_0000_0000_0002;
+    // (name, a, b, divisor) for iteration ONCE; other iterations are finite.
+    let cases: [(&str, u64, u64, u64); 7] = [
+        ("QNaN operand", QNAN, 1.5f64.to_bits(), 2.0f64.to_bits()),
+        ("SNaN operand", 1.5f64.to_bits(), SNAN, 2.0f64.to_bits()),
+        ("QNaN + SNaN", QNAN, SNAN, 2.0f64.to_bits()),
+        ("SNaN + QNaN", SNAN | 1 << 50, QNAN | 2, 2.0f64.to_bits()),
+        ("0 / 0", 0, 0, 0),
+        ("x / 0", 1.0f64.to_bits(), 0, 0),
+        ("fistp overflow", 1.0e10f64.to_bits(), 0, 1.0f64.to_bits()),
+    ];
+    for (name, a, b, divisor) in cases {
+        // Without and with IE already raised, which lets forms keep NaNs.
+        for status in [0x20u16, 0x21] {
+            let mut state = initial(N);
+            state.mxcsr = 0x1fa0;
+            state.x87.control = 0x027f;
+            state.x87.status = status;
+            state.xmm[7] = [0x3f, 0xc0, 0, 0]
+                .repeat(4)
+                .iter()
+                .rev()
+                .copied()
+                .collect::<Vec<u8>>()
+                .try_into()
+                .unwrap();
+            let mut trial = Trial::new(
+                &body,
+                &state,
+                format!("{name} status={status:#x}"),
+                &[],
+                |m| {
+                    for i in 0..N {
+                        let base = DATA + i * 48;
+                        for c in 0..4u32 {
+                            let x = 1.0f32 + (i * 4 + c) as f32 * 0.3;
+                            m.write(base + c * 4, &x.to_le_bytes()).unwrap();
+                        }
+                        let (x, y, z) = if i == ONCE {
+                            (a, b, divisor)
+                        } else {
+                            (
+                                (1.1 + f64::from(i)).to_bits(),
+                                0.25f64.to_bits(),
+                                3.0f64.to_bits(),
+                            )
+                        };
+                        m.write(base + 16, &x.to_le_bytes()).unwrap();
+                        m.write(base + 24, &y.to_le_bytes()).unwrap();
+                        m.write(base + 32, &z.to_le_bytes()).unwrap();
+                    }
+                },
+            );
+            assert!(trial.try_install_at(state.clone()));
+            assert_eq!(trial.compare(1 << 20).0, RunOutcome::ReachedStop, "{name}");
+            let native = trial.live.native.as_ref().unwrap();
+            // The installed form runs until iteration ONCE leaves it or the loop ends.
+            assert!(
+                native.resident_arrivals(body.head).unwrap() > 0
+                    || native.diagnostics.resident_cold_exits > 0,
+                "{name} status={status:#x}: the form never ran"
+            );
+        }
+    }
+}
