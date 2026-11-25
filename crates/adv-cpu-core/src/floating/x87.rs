@@ -956,12 +956,22 @@ fn remainder(a: Ext, b: Ext, nearest: bool, control: u16) -> (Ext, u16, Option<u
     (result, 0, if partial { None } else { Some(quotient) })
 }
 
+fn apply_rounded(tx: &mut Transaction, flags: u16, rounded_up: bool) {
+    exceptions(tx, flags);
+    tx.state.x87.status = (tx.state.x87.status & !C1)
+        | if flags & 0x20 != 0 && flags & IE == 0 && rounded_up {
+            C1
+        } else {
+            0
+        };
+}
+
 /// Shared by instruction transactions and the run's AAPCS64 leaf.
 pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<(), Step> {
     let m = i.mnemonic();
-    sf::configure(tx.state.x87.control);
     match m {
         M::Fscale => {
+            sf::configure(tx.state.x87.control);
             metadata(tx);
             let a = operand(tx, 0);
             let b = operand(tx, 1);
@@ -971,6 +981,7 @@ pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<()
             set(tx, 0, result);
         }
         M::Fprem | M::Fprem1 => {
+            sf::configure(tx.state.x87.control);
             metadata(tx);
             let a = operand(tx, 0);
             let b = operand(tx, 1);
@@ -990,49 +1001,76 @@ pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<()
             metadata(tx);
             let x = operand(tx, 0);
             let y = operand(tx, 1);
-            let (result, flags) = if m == M::Fpatan {
+            let (result, flags, rounded_up) = if m == M::Fpatan {
                 super::transcendental::atan2(y, x, tx.state.x87.control)
             } else {
                 super::transcendental::log_product(x, y, m == M::Fyl2xp1, tx.state.x87.control)
             };
-            exceptions(tx, flags);
-            rounded(tx);
+            apply_rounded(tx, flags, rounded_up);
             set(tx, 1, result);
             pop(tx);
         }
         M::F2xm1 => {
             metadata(tx);
             let x = operand(tx, 0);
-            let Some((result, flags)) =
+            let Some((result, flags, rounded_up)) =
                 super::transcendental::exp2_minus_one(x, tx.state.x87.control)
             else {
                 return Err(tx.unsupported(i));
             };
-            exceptions(tx, flags);
-            rounded(tx);
+            apply_rounded(tx, flags, rounded_up);
             set(tx, 0, result);
         }
-        M::Fsin | M::Fcos | M::Fsincos | M::Fptan => {
+        M::Fsin => {
             metadata(tx);
             let x = operand(tx, 0);
-            if let Some(((sine, cosine), flags)) =
+            if let Some((sine, flags, rounded_up)) =
+                super::transcendental::sin(x, tx.state.x87.control)
+            {
+                apply_rounded(tx, flags, rounded_up);
+                tx.state.x87.status &= !C2;
+                set(tx, 0, sine);
+            } else {
+                tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
+            }
+        }
+        M::Fcos => {
+            metadata(tx);
+            let x = operand(tx, 0);
+            if let Some((cosine, flags, rounded_up)) =
+                super::transcendental::cos(x, tx.state.x87.control)
+            {
+                apply_rounded(tx, flags, rounded_up);
+                tx.state.x87.status &= !C2;
+                set(tx, 0, cosine);
+            } else {
+                tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
+            }
+        }
+        M::Fsincos => {
+            metadata(tx);
+            let x = operand(tx, 0);
+            if let Some(((sine, cosine), flags, rounded_up)) =
                 super::transcendental::sin_cos(x, tx.state.x87.control)
             {
-                exceptions(tx, flags);
-                rounded(tx);
+                apply_rounded(tx, flags, rounded_up);
                 tx.state.x87.status &= !C2;
-                if m == M::Fptan {
-                    sf::configure(tx.state.x87.control | 0x300);
-                    let result = sf::binary(sine, cosine, 3);
-                    rounded(tx);
-                    set(tx, 0, result);
-                    push(tx, Ext::from_parts(1 << 63, 0x3fff));
-                } else {
-                    set(tx, 0, if m == M::Fcos { cosine } else { sine });
-                    if m == M::Fsincos {
-                        push(tx, cosine);
-                    }
-                }
+                set(tx, 0, sine);
+                push(tx, cosine);
+            } else {
+                tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
+            }
+        }
+        M::Fptan => {
+            metadata(tx);
+            let x = operand(tx, 0);
+            if let Some((tangent, flags, rounded_up)) =
+                super::transcendental::tan(x, tx.state.x87.control)
+            {
+                apply_rounded(tx, flags, rounded_up);
+                tx.state.x87.status &= !C2;
+                set(tx, 0, tangent);
+                push(tx, Ext::from_parts(1 << 63, 0x3fff));
             } else {
                 tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
             }

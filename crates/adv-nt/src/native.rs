@@ -90,6 +90,7 @@ macro_rules! data_layout {
 }
 
 mod crt;
+mod d3dx_math;
 mod dib;
 mod fonts;
 pub use fonts::FontFrontend;
@@ -440,6 +441,7 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
             direct: Some(pixels::LOAD),
         });
     }
+    bodies.extend(d3dx_math::bodies());
     bodies.extend(png::bodies());
     bodies.extend(zlib::bodies());
     bodies.extend(linked::bodies());
@@ -860,7 +862,7 @@ fn bind_one(
                 direct.inputs[4] = Some(adv_cpu::body::Input::Mxcsr);
             }
         }
-        if !name.starts_with("d3dx9_") {
+        if !name.ends_with("!d3dx_load_pixels_from_pixels") {
             sys.direct_bodies.insert(entry, direct);
         }
         ext.get_or_default::<Entries>().insert(index, entry, direct);
