@@ -182,6 +182,15 @@ fn push(tx: &mut Transaction, mut value: Ext) {
     }
     tx.state.x87.push(value);
 }
+fn push_preserving_c1(tx: &mut Transaction, mut value: Ext) {
+    let slot = tx.state.x87.top().wrapping_sub(1) & 7;
+    if tx.state.x87.physical_tag(slot) != 3 {
+        exceptions(tx, IE | 0x40);
+        tx.state.x87.status |= C1;
+        value = INDEFINITE;
+    }
+    tx.state.x87.push(value);
+}
 fn pop(tx: &mut Transaction) {
     let slot = tx.state.x87.top();
     tx.state.x87.set_physical_tag(slot, 3);
@@ -1056,7 +1065,7 @@ pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<()
                 apply_rounded(tx, flags, rounded_up);
                 tx.state.x87.status &= !C2;
                 set(tx, 0, sine);
-                push(tx, cosine);
+                push_preserving_c1(tx, cosine);
             } else {
                 tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
             }
@@ -1070,7 +1079,7 @@ pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<()
                 apply_rounded(tx, flags, rounded_up);
                 tx.state.x87.status &= !C2;
                 set(tx, 0, tangent);
-                push(tx, Ext::from_parts(1 << 63, 0x3fff));
+                push_preserving_c1(tx, Ext::from_parts(1 << 63, 0x3fff));
             } else {
                 tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
             }
@@ -1078,4 +1087,111 @@ pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<()
         _ => unreachable!("transcendental leaf"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CpuState, Memory, backend::x87::encode_f64};
+    use iced_x86::Code;
+
+    fn run_x87(code: Code, state: &mut CpuState) {
+        let mut memory = Memory::new(0x10000, 4096).unwrap();
+        let mut instruction = Instruction::default();
+        instruction.set_code(code);
+        instruction.set_next_ip(0x10002);
+        assert_eq!(
+            super::super::execute(&instruction, Operation::X87, None, state, &mut memory, true),
+            Step::Executed
+        );
+    }
+
+    // spec: A64F-FP-10
+    #[test]
+    fn fsincos_and_fptan_preserve_c1_on_push_and_report_stack_overflow() {
+        // FSINCOS(2^-47) under RN: cos rounds up to 1.0 -> C1 = 1, PE = 1, TOP = 6 -> SW = 0x3220.
+        let mut state = CpuState::default();
+        state.x87.control = 0x037f;
+        state.x87.push(Ext::from_parts(1u64 << 63, 0x3fff - 47));
+        run_x87(Code::Fsincos, &mut state);
+        assert_eq!(state.x87.status, 0x3220);
+        assert_eq!(
+            state.x87.regs[state.x87.physical_index(0)],
+            Ext::from_parts(1 << 63, 0x3fff)
+        );
+
+        // FSINCOS(2^-47) under RD: cos rounds down -> C1 = 0, PE = 1, TOP = 6 -> SW = 0x3020.
+        let mut state = CpuState::default();
+        state.x87.control = 0x077f;
+        state.x87.push(Ext::from_parts(1u64 << 63, 0x3fff - 47));
+        run_x87(Code::Fsincos, &mut state);
+        assert_eq!(state.x87.status, 0x3020);
+
+        // FPTAN(1.0) under RU: tan(1.0) > 0 rounds up -> C1 = 1, PE = 1, TOP = 6 -> SW = 0x3220.
+        let mut state = CpuState::default();
+        state.x87.control = 0x0b7f;
+        state.x87.push(Ext(encode_f64(1.0)));
+        run_x87(Code::Fptan, &mut state);
+        assert_eq!(state.x87.status, 0x3220);
+        assert_eq!(
+            state.x87.regs[state.x87.physical_index(0)],
+            Ext::from_parts(1 << 63, 0x3fff)
+        );
+
+        // FPTAN(1.0) under RD: tan(1.0) > 0 rounds down -> C1 = 0, PE = 1, TOP = 6 -> SW = 0x3020.
+        let mut state = CpuState::default();
+        state.x87.control = 0x077f;
+        state.x87.push(Ext(encode_f64(1.0)));
+        run_x87(Code::Fptan, &mut state);
+        assert_eq!(state.x87.status, 0x3020);
+
+        // FPTAN(0.5) under RN: tan(0.5) rounds up in extended80 -> C1 = 1, PE = 1, SW = 0x3220.
+        let mut state = CpuState::default();
+        state.x87.control = 0x037f;
+        state.x87.push(Ext(encode_f64(0.5)));
+        run_x87(Code::Fptan, &mut state);
+        assert_eq!(state.x87.status, 0x3220);
+
+        // FPTAN(1.0) under RN: tan(1.0) rounds down in extended80 -> C1 = 0, PE = 1, SW = 0x3020.
+        let mut state = CpuState::default();
+        state.x87.control = 0x037f;
+        state.x87.push(Ext(encode_f64(1.0)));
+        run_x87(Code::Fptan, &mut state);
+        assert_eq!(state.x87.status, 0x3020);
+
+        // Stack overflow on FSINCOS and FPTAN (all 8 stack slots occupied) sets SF | IE | C1.
+        for code in [Code::Fsincos, Code::Fptan] {
+            let mut state = CpuState::default();
+            state.x87.control = 0x077f; // RD so arithmetic alone clears C1
+            for _ in 0..8 {
+                state.x87.push(Ext(encode_f64(0.5)));
+            }
+            run_x87(code, &mut state);
+            assert_eq!(
+                state.x87.status & (IE | 0x40 | C1),
+                IE | 0x40 | C1,
+                "{code:?}"
+            );
+            assert_eq!(
+                state.x87.regs[state.x87.physical_index(0)],
+                INDEFINITE,
+                "{code:?}"
+            );
+        }
+    }
+
+    // spec: A64F-FP-10
+    #[test]
+    fn fpatan_one_one_sets_c1_under_rn() {
+        let mut state = CpuState::default();
+        state.x87.control = 0x037f;
+        state.x87.push(Ext(encode_f64(1.0))); // ST(1) = y
+        state.x87.push(Ext(encode_f64(1.0))); // ST(0) = x
+        run_x87(Code::Fpatan, &mut state);
+        assert_eq!(state.x87.status, 0x3a20);
+        assert_eq!(
+            state.x87.regs[state.x87.physical_index(0)],
+            Ext::from_parts(0xc90f_daa2_2168_c235, 0x3ffe)
+        );
+    }
 }
