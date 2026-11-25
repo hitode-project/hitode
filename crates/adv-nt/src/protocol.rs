@@ -1538,6 +1538,33 @@ impl Request for GetTokenGroupsRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct GetTokenPrivilegesRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetTokenPrivilegesRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetTokenPrivilegesRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetTokenPrivilegesReply {
+    pub header: ReplyHeader,
+    pub len: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetTokenPrivilegesReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetTokenPrivilegesReply, len) == 8);
+
+impl Request for GetTokenPrivilegesRequest {
+    const NUMBER: i32 = 223;
+    type Reply = GetTokenPrivilegesReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct GetTokenInfoRequest {
     pub header: RequestHeader,
     pub handle: u32,
@@ -3784,6 +3811,32 @@ const _: () = assert!(size_of::<GetObjectTypeReply>() == 8);
 impl Request for GetObjectTypeRequest {
     const NUMBER: i32 = 247;
     type Reply = GetObjectTypeReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetObjectTypesRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetObjectTypesRequest>() == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetObjectTypesReply {
+    pub header: ReplyHeader,
+    pub count: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetObjectTypesReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetObjectTypesReply, count) == 8);
+
+impl Request for GetObjectTypesRequest {
+    const NUMBER: i32 = 248;
+    type Reply = GetObjectTypesReply;
     fn header(&mut self) -> &mut RequestHeader {
         &mut self.header
     }

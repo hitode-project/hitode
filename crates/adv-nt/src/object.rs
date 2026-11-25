@@ -152,9 +152,36 @@ pub fn open_directory(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     })())
 }
 
+/// Serializes one `object_type_info` server entry into a guest
+/// `OBJECT_TYPE_INFORMATION` (96 bytes) followed by its NUL-terminated UTF-16 name.
+fn write_object_type_entry(src: &[u8], guest_addr: u32, dst: &mut [u8]) -> u32 {
+    let field = |offset| u32::from_le_bytes(src[offset..offset + 4].try_into().unwrap());
+    let name_length = field(0);
+    for (offset, value) in [
+        (0, name_length | ((name_length + 2) << 16)),
+        (4, guest_addr + 96),
+        (8, field(8)),
+        (12, field(12)),
+        (32, field(16)),
+        (36, field(20)),
+        (60, field(28)),
+        (64, field(32)),
+        (68, field(36)),
+        (72, field(40)),
+        (76, field(24)),
+    ] {
+        dst[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    dst[82] = (field(4) + 2) as u8;
+    dst[96..96 + name_length as usize].copy_from_slice(&src[44..44 + name_length as usize]);
+    96 + name_length + 2
+}
+
 /// NtQueryObject(handle, class, *info, length, *used_length)
 pub fn query(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
-    use crate::protocol::{GetObjectInfoRequest, GetObjectNameRequest, GetObjectTypeRequest};
+    use crate::protocol::{
+        GetObjectInfoRequest, GetObjectNameRequest, GetObjectTypeRequest, GetObjectTypesRequest,
+    };
     let &[handle, class, info, length, used_length] = args else {
         unreachable!()
     };
@@ -250,9 +277,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
                 };
                 let (reply, _) = crate::server::request(env, &mut request, &[], &mut buffer)?;
                 status::check(reply.header.error)?;
-                let field =
-                    |offset| u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
-                let name_length = field(0);
+                let name_length = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
                 let used = 96 + name_length + 2;
                 if used_length != 0 {
                     write_u32(env, used_length, used)?;
@@ -261,24 +286,60 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
                     return Err(status::INFO_LENGTH_MISMATCH.into());
                 }
                 let mut bytes = vec![0; used as usize];
-                for (offset, value) in [
-                    (0, name_length | ((name_length + 2) << 16)),
-                    (4, info + 96),
-                    (8, field(8)),
-                    (12, field(12)),
-                    (32, field(16)),
-                    (36, field(20)),
-                    (60, field(28)),
-                    (64, field(32)),
-                    (68, field(36)),
-                    (72, field(40)),
-                    (76, field(24)),
-                ] {
-                    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                write_object_type_entry(&buffer, info, &mut bytes);
+                write_bytes(env, info, &bytes)?;
+                used
+            }
+            3 => {
+                // OBJECT_TYPES_INFORMATION: NumberOfTypes followed by 4-byte-aligned
+                // OBJECT_TYPE_INFORMATION + NUL-terminated UTF-16 name entries.
+                let mut buffer_size = 4096usize;
+                let (count, buffer) = loop {
+                    let mut buffer = vec![0u8; buffer_size];
+                    let mut request = GetObjectTypesRequest::default();
+                    let (reply, size) =
+                        crate::server::request(env, &mut request, &[], &mut buffer)?;
+                    if reply.header.error == 0x8000_0005 {
+                        buffer_size *= 2;
+                        continue;
+                    }
+                    status::check(reply.header.error)?;
+                    buffer.truncate(size);
+                    break (reply.count as u32, buffer);
+                };
+                let mut used = 4u32;
+                let mut src_pos = 0usize;
+                for _ in 0..count {
+                    let name_len =
+                        u32::from_le_bytes(buffer[src_pos..src_pos + 4].try_into().unwrap());
+                    used += 96 + (name_len + 2).next_multiple_of(4);
+                    src_pos += 44 + (name_len as usize).next_multiple_of(4);
                 }
-                bytes[82] = (field(4) + 2) as u8;
-                bytes[96..96 + name_length as usize]
-                    .copy_from_slice(&buffer[44..44 + name_length as usize]);
+                if used_length != 0 {
+                    write_u32(env, used_length, used)?;
+                }
+                if length < used {
+                    if info != 0 && length >= 4 {
+                        write_u32(env, info, count)?;
+                    }
+                    return Err(status::INFO_LENGTH_MISMATCH.into());
+                }
+                let mut bytes = vec![0u8; used as usize];
+                bytes[0..4].copy_from_slice(&count.to_le_bytes());
+                let mut dst_pos = 4usize;
+                let mut src_pos = 0usize;
+                for _ in 0..count {
+                    let name_len =
+                        u32::from_le_bytes(buffer[src_pos..src_pos + 4].try_into().unwrap());
+                    let entry_len = (96 + (name_len + 2).next_multiple_of(4)) as usize;
+                    write_object_type_entry(
+                        &buffer[src_pos..],
+                        info + dst_pos as u32,
+                        &mut bytes[dst_pos..dst_pos + entry_len],
+                    );
+                    dst_pos += entry_len;
+                    src_pos += 44 + (name_len as usize).next_multiple_of(4);
+                }
                 write_bytes(env, info, &bytes)?;
                 used
             }
