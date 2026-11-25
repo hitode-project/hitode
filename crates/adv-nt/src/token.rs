@@ -4,13 +4,15 @@ use adv_machine::{Env, Outcome};
 
 use crate::object::{read_bytes, read_u32, write_bytes, write_u32};
 use crate::protocol::{
-    AllocateLocallyUniqueIdRequest, GetTokenGroupsRequest, GetTokenInfoRequest, GetTokenSidRequest,
+    AllocateLocallyUniqueIdRequest, GetTokenGroupsRequest, GetTokenInfoRequest,
+    GetTokenPrivilegesRequest, GetTokenSidRequest,
 };
 use crate::server;
 use crate::status::{self, Error};
 
 const TOKEN_USER: u32 = 1;
 const TOKEN_GROUPS: u32 = 2;
+const TOKEN_PRIVILEGES: u32 = 3;
 const TOKEN_TYPE: u32 = 8;
 const TOKEN_IMPERSONATION_LEVEL: u32 = 9;
 const TOKEN_SESSION_ID: u32 = 12;
@@ -48,6 +50,9 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     }
     if class == TOKEN_GROUPS || class == TOKEN_LOGON_SID {
         return status::finish(groups(env, token, class, info, length, result_length));
+    }
+    if class == TOKEN_PRIVILEGES {
+        return status::finish(privileges(env, token, info, length, result_length));
     }
     if matches!(
         class,
@@ -145,6 +150,38 @@ fn groups(
     let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     bytes.extend_from_slice(sids);
     Ok(write_bytes(env, info, &bytes)?)
+}
+
+/// TOKEN_PRIVILEGES: the count followed by `LUID_AND_ATTRIBUTES` entries.
+fn privileges(
+    env: &mut Env<'_>,
+    token: u32,
+    info: u32,
+    length: u32,
+    result_length: u32,
+) -> Result<(), Error> {
+    let mut request = GetTokenPrivilegesRequest {
+        handle: token,
+        ..Default::default()
+    };
+    let mut data = vec![0u8; length.saturating_sub(4) as usize];
+    let (reply, size) = server::request(env, &mut request, &[], &mut data)?;
+    let needed = 4 + reply.len;
+    let mut error = reply.header.error;
+    if error == status::SUCCESS && needed > length {
+        error = status::BUFFER_TOO_SMALL;
+    }
+    if result_length != 0 {
+        let reported = if error == status::SUCCESS || error == status::BUFFER_TOO_SMALL {
+            needed
+        } else {
+            0
+        };
+        write_u32(env, result_length, reported)?;
+    }
+    status::check(error)?;
+    write_u32(env, info, reply.len / 12)?;
+    Ok(write_bytes(env, info + 4, &data[..size])?)
 }
 
 /// Fixed 4-byte token queries answered by `get_token_info`.

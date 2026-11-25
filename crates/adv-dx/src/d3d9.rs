@@ -132,6 +132,7 @@ struct Device {
     creation: creation::State,
     needs_reset: bool,
     back_buffer: Option<Id>,
+    extra_back_buffers: Vec<Id>,
     swap_chain: Option<Id>,
     queries: queries::DeviceState,
     depth_stencil: Option<Id>,
@@ -146,6 +147,23 @@ struct Device {
     /// The last refresh boundary, so vsync-locked boundaries keep their phase.
     boundary: Option<u64>,
     misc: Misc,
+}
+impl Device {
+    fn back_buffer_at(&self, index: u32) -> Option<Id> {
+        if index == 0 {
+            self.back_buffer
+        } else {
+            self.extra_back_buffers.get((index - 1) as usize).copied()
+        }
+    }
+    fn is_back_buffer(&self, id: Id) -> bool {
+        self.back_buffer == Some(id) || self.extra_back_buffers.contains(&id)
+    }
+    fn all_back_buffers(&self) -> impl Iterator<Item = Id> + '_ {
+        self.back_buffer
+            .into_iter()
+            .chain(self.extra_back_buffers.iter().copied())
+    }
 }
 #[cfg(test)]
 impl Device {
@@ -729,6 +747,7 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         for binding in [texture, device.back_buffer, device.swap_chain]
             .into_iter()
             .flatten()
+            .chain(device.extra_back_buffers)
         {
             if let Some(Some(resource)) = com(env).release_internal(&mut env.sys.objects, binding) {
                 destroy(env, resource);
@@ -1023,7 +1042,7 @@ fn presentation_unavailable(parameters: D3DPRESENT_PARAMETERS, copy: bool) -> Op
         (
             "BackBufferCount",
             parameters.BackBufferCount,
-            parameters.BackBufferCount <= 1,
+            parameters.BackBufferCount <= 3,
         ),
         (
             "Flags",
@@ -1115,7 +1134,7 @@ fn normalize(
     if parameters.BackBufferFormat == 0 {
         parameters.BackBufferFormat = 22;
     }
-    parameters.BackBufferCount = 1;
+    parameters.BackBufferCount = parameters.BackBufferCount.max(1);
     Ok(parameters)
 }
 #[win32(d3d9, name = "IDirect3D9::CreateDevice", level = implement)]
@@ -1256,6 +1275,7 @@ fn create_device(
         creation,
         needs_reset: false,
         back_buffer: None,
+        extra_back_buffers: Vec::new(),
         swap_chain: None,
         queries: queries::DeviceState::default(),
         depth_stencil: None,
@@ -1287,13 +1307,24 @@ fn create_device(
         .shared
         .borrow_mut()
         .register_device(pointer, hot);
-    let back_buffer = resources::implicit_back_buffer(env, id, normalized, surface);
+    let back_buffer = resources::implicit_back_buffer(env, id, normalized, surface, false);
     let Some(back_buffer) = back_buffer else {
         release(env, pointer);
         return Outcome::Return(OUT_OF_MEMORY);
     };
+    let extra_back_buffers = match resources::extra_back_buffers(env, id, normalized) {
+        Ok(buffers) => buffers,
+        Err(error) => {
+            if let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, back_buffer) {
+                destroy(env, dead);
+            }
+            release(env, pointer);
+            return Outcome::Return(error);
+        }
+    };
     if let Some(Payload::Device(device)) = com(env).get_identity_mut(&mut env.sys.objects, id) {
         device.back_buffer = Some(back_buffer);
+        device.extra_back_buffers = extra_back_buffers;
     }
     targets::refresh_hot_id(env, id);
     let depth = match depth::implicit(env, id, normalized) {
@@ -1400,6 +1431,7 @@ fn reset(
     let preserve_fpu = d.preserve_fpu;
     let surface = d.surface;
     let old_buffer = d.back_buffer;
+    let old_extra_buffers = d.extra_back_buffers.clone();
     let old_depth = d.depth_stencil;
     let old_texture = d.hot.borrow().texture;
     let old_front = d.front;
@@ -1457,13 +1489,24 @@ fn reset(
         Ok(t) => t,
         Err(e) => return gpu_error(e),
     };
-    let Some(new_buffer) = resources::implicit_back_buffer(env, device_id, normalized, surface)
+    let Some(new_buffer) =
+        resources::implicit_back_buffer(env, device_id, normalized, surface, false)
     else {
         return Outcome::Return(OUT_OF_MEMORY);
+    };
+    let new_extra_buffers = match resources::extra_back_buffers(env, device_id, normalized) {
+        Ok(buffers) => buffers,
+        Err(error) => {
+            if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, new_buffer) {
+                destroy(env, dead);
+            }
+            return Outcome::Return(error);
+        }
     };
     let new_depth = match depth::implicit(env, device_id, normalized) {
         Ok(value) => value,
         Err(error) => {
+            resources::release_extra_back_buffers(env, new_extra_buffers);
             if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, new_buffer) {
                 destroy(env, dead);
             }
@@ -1475,6 +1518,7 @@ fn reset(
         && env.cpu.set_fpu_environment(environment).is_err()
     {
         depth::release_binding(env, new_depth);
+        resources::release_extra_back_buffers(env, new_extra_buffers);
         if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, new_buffer) {
             destroy(env, dead);
         }
@@ -1488,6 +1532,7 @@ fn reset(
     .is_err()
     {
         depth::release_binding(env, new_depth);
+        resources::release_extra_back_buffers(env, new_extra_buffers);
         if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, new_buffer) {
             destroy(env, dead);
         }
@@ -1497,6 +1542,7 @@ fn reset(
         d.parameters = normalized;
         d.front = None;
         d.back_buffer = Some(new_buffer);
+        d.extra_back_buffers = new_extra_buffers;
         d.depth_stencil = new_depth;
         d.needs_reset = false;
         d.gpu_lost = false;
@@ -1512,7 +1558,11 @@ fn reset(
     buffers::reset_bindings(env, device_id);
     shaders::reset_bindings(env, device_id);
     targets::reset_binding(env, device_id);
-    for binding in [old_texture, old_buffer].into_iter().flatten() {
+    for binding in [old_texture, old_buffer]
+        .into_iter()
+        .flatten()
+        .chain(old_extra_buffers)
+    {
         if let Some(Some(dead)) = com.release_internal(&mut env.sys.objects, binding) {
             destroy(env, dead);
         }
@@ -1964,7 +2014,7 @@ fn present(
         Err(error) => return Outcome::Return(error),
     };
     let d = device(env, this.addr()).unwrap();
-    if d.back_buffer.is_some_and(|id| {
+    if d.all_back_buffers().any(|id| {
         matches!(com(env).get_identity(&env.sys.objects, id),
             Some(Payload::Resource(r)) if resources::locked(env, r))
     }) {

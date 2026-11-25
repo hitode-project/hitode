@@ -27,6 +27,7 @@ int main(void)
 {
     HANDLE token, imp, thread_token, extended, filtered, created, event, other, copy, reserve;
     BYTE user_buffer[128], created_user[128], acl_buffer[64], sd_buffer[1024], dacl_buffer[128];
+    BYTE priv_buffer[1024], types_buffer[16384];
     TOKEN_USER *user = (TOKEN_USER *)user_buffer;
     TOKEN_GROUPS groups;
     TOKEN_PRIVILEGES privileges = {0}, previous;
@@ -95,6 +96,49 @@ int main(void)
 
     privileges.PrivilegeCount = 1;
     check("lookup_privilege", LookupPrivilegeValueA(NULL, SE_CHANGE_NOTIFY_NAME, &privileges.Privileges[0].Luid));
+    size = 0;
+    check("token_privileges_short", !GetTokenInformation(token, TokenPrivileges, NULL, 0, &size)
+          && GetLastError() == ERROR_INSUFFICIENT_BUFFER && size >= sizeof(DWORD));
+    check("token_privileges", GetTokenInformation(token, TokenPrivileges, priv_buffer, sizeof(priv_buffer), &size)
+          && ((TOKEN_PRIVILEGES *)priv_buffer)->PrivilegeCount > 0
+          && size == sizeof(DWORD) + ((TOKEN_PRIVILEGES *)priv_buffer)->PrivilegeCount * sizeof(LUID_AND_ATTRIBUTES));
+    {
+        TOKEN_PRIVILEGES *tp = (TOKEN_PRIVILEGES *)priv_buffer;
+        BOOL found_notify = FALSE;
+        DWORD i;
+        for (i = 0; i < tp->PrivilegeCount; i++) {
+            if (tp->Privileges[i].Luid.LowPart == privileges.Privileges[0].Luid.LowPart
+                && tp->Privileges[i].Luid.HighPart == privileges.Privileges[0].Luid.HighPart) {
+                found_notify = TRUE;
+                break;
+            }
+        }
+        check("token_privileges_entry", found_notify);
+    }
+    size = 0;
+    check("object_types_short", NtQueryObject(NULL, (OBJECT_INFORMATION_CLASS)3, NULL, 0, &size) == (NTSTATUS)0xc0000004
+          && size > sizeof(ULONG));
+    check("object_types", NtQueryObject(NULL, (OBJECT_INFORMATION_CLASS)3, types_buffer, sizeof(types_buffer), &size) == 0
+          && *(ULONG *)types_buffer > 0 && size <= sizeof(types_buffer));
+    {
+        ULONG count = *(ULONG *)types_buffer;
+        ULONG offset = sizeof(ULONG);
+        ULONG i;
+        BOOL types_ok = TRUE;
+        for (i = 0; i < count; i++) {
+            PUBLIC_OBJECT_TYPE_INFORMATION *entry;
+            ULONG name_padded;
+            if (offset + 96 > size) { types_ok = FALSE; break; }
+            entry = (PUBLIC_OBJECT_TYPE_INFORMATION *)(types_buffer + offset);
+            if (entry->TypeName.Length == 0 || entry->TypeName.Buffer != (PWSTR)(types_buffer + offset + 96)) {
+                types_ok = FALSE;
+                break;
+            }
+            name_padded = (entry->TypeName.Length + 2 + 3) & ~3u;
+            offset += 96 + name_padded;
+        }
+        check("object_types_walk", types_ok && offset == size);
+    }
     privileges.Privileges[0].Attributes = 0;
     check("adjust_privileges", AdjustTokenPrivileges(imp, FALSE, &privileges, sizeof(previous), &previous, &size)
           && GetLastError() == ERROR_SUCCESS && previous.PrivilegeCount == 1 && size == sizeof(previous));

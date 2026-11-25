@@ -320,9 +320,11 @@ pub(super) fn lockable_back_buffer(env: &Env<'_>, pointer: u32, r: &Resource) ->
     if r.desc.Pool != 0 || r.desc.MultiSampleType != 0 || r.desc.MultiSampleQuality != 0 {
         return false;
     }
-    let id = com(env).identity::<Payload>(&env.sys.objects, pointer);
+    let Some(id) = com(env).identity::<Payload>(&env.sys.objects, pointer) else {
+        return false;
+    };
     matches!(com(env).get_identity(&env.sys.objects, r.device),
-        Some(Payload::Device(d)) if d.parameters.Flags & 1 != 0 && d.back_buffer == id)
+        Some(Payload::Device(d)) if d.parameters.Flags & 1 != 0 && d.is_back_buffer(id))
 }
 fn lock_rectangle(
     env: &Env<'_>,
