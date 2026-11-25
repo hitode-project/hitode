@@ -11,6 +11,7 @@ fn main() {
         for framework in ["VideoToolbox", "CoreMedia", "CoreVideo"] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }
+        link_clang_runtime();
     }
     cc::Build::new()
         .file("src/xaudio2/reverb.c")
@@ -42,4 +43,31 @@ fn main() {
     build.file("src/theora/bridge.c").compile("adv_theora");
     println!("cargo:rerun-if-changed={root}");
     println!("cargo:rerun-if-changed=src/theora");
+}
+
+/// Static FFmpeg checks the OS version with `@available`, which calls
+/// `__isPlatformVersionAtLeast` from clang's runtime library; rustc links
+/// Apple targets with `-nodefaultlibs`, which leaves that library out.
+fn link_clang_runtime() {
+    let compiler = cc::Build::new().get_compiler();
+    let Ok(output) = std::process::Command::new(compiler.path())
+        .args(compiler.args())
+        .arg("-print-libgcc-file-name")
+        .output()
+    else {
+        return;
+    };
+    let path = std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let (Some(dir), Some(name)) = (
+        path.parent(),
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.strip_prefix("lib")),
+    ) else {
+        return;
+    };
+    if output.status.success() && path.is_file() {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+        println!("cargo:rustc-link-lib=static={name}");
+    }
 }
