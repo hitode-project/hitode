@@ -324,9 +324,17 @@ fn surface_container(
     let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Surface) else {
         return Outcome::Return(INVALID);
     };
+    let is_back_buffer = com(env)
+        .identity::<Payload>(&env.sys.objects, this.addr())
+        .is_some_and(|id| {
+            matches!(
+                com(env).get_identity(&env.sys.objects, r.device),
+                Some(Payload::Device(d)) if d.is_back_buffer(id)
+            )
+        });
     let parent = if let Some(container) = r.container {
         container
-    } else if r.owns_surface || r.depth.is_some() || r.desc.Pool >= 2 {
+    } else if !is_back_buffer && (r.owns_surface || r.depth.is_some() || r.desc.Pool >= 2) {
         r.device
     } else {
         // Back buffers have a swap-chain container, not a device container.
@@ -461,6 +469,7 @@ pub(super) fn implicit_back_buffer(
     device: Id,
     p: D3DPRESENT_PARAMETERS,
     surface: u32,
+    owns_surface: bool,
 ) -> Option<Id> {
     let (pointer, id) = make(
         env,
@@ -481,7 +490,7 @@ pub(super) fn implicit_back_buffer(
             depth: None,
             surface: Some(surface),
             storage: 0,
-            owns_surface: false,
+            owns_surface,
             lockable: false,
             lock: None,
             container: None,
@@ -499,6 +508,50 @@ pub(super) fn implicit_back_buffer(
     assert_eq!(release(env, pointer), 0);
     Some(id)
 }
+pub(super) fn extra_back_buffers(
+    env: &mut Env<'_>,
+    device: Id,
+    p: D3DPRESENT_PARAMETERS,
+) -> Result<Vec<Id>, u32> {
+    let count = p.BackBufferCount.saturating_sub(1) as usize;
+    let mut created = Vec::with_capacity(count);
+    let provider = env.ext.get::<State>().provider;
+    for _ in 0..count {
+        let target = match env.ext.get::<State>().gpu.as_ref() {
+            Some(gpu) => gpu.target(p.BackBufferWidth, p.BackBufferHeight, false),
+            None => return Err(UNAVAILABLE),
+        };
+        let target = match target {
+            Ok(t) => t.with_alpha_mode(targets::alpha_mode(p.BackBufferFormat)),
+            Err(Error::Invalid(_)) => {
+                release_extra_back_buffers(env, created);
+                return Err(INVALID);
+            }
+            Err(_) => {
+                release_extra_back_buffers(env, created);
+                return Err(DEVICE_LOST);
+            }
+        };
+        let Ok(surface) = (provider.insert)(env.ext, target) else {
+            release_extra_back_buffers(env, created);
+            return Err(OUT_OF_MEMORY);
+        };
+        let Some(id) = implicit_back_buffer(env, device, p, surface, true) else {
+            let _ = (provider.remove)(env.ext, env.cpu, surface);
+            release_extra_back_buffers(env, created);
+            return Err(OUT_OF_MEMORY);
+        };
+        created.push(id);
+    }
+    Ok(created)
+}
+pub(super) fn release_extra_back_buffers(env: &mut Env<'_>, buffers: Vec<Id>) {
+    for id in buffers {
+        if let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id) {
+            super::destroy(env, dead);
+        }
+    }
+}
 #[win32(d3d9,name="IDirect3DDevice9::GetBackBuffer",level=implement)]
 pub(super) fn back_buffer(
     env: &mut Env<'_>,
@@ -514,12 +567,13 @@ pub(super) fn back_buffer(
     let Some(d) = device(env, this.addr()) else {
         return Outcome::Return(INVALID);
     };
-    if swap != 0 || index != 0 || kind != 0 {
+    if swap != 0 || kind != 0 {
         return Outcome::Return(INVALID);
     }
-    let Some(Payload::Resource(r)) =
-        com(env).get_identity(&env.sys.objects, d.back_buffer.unwrap())
-    else {
+    let Some(buffer_id) = d.back_buffer_at(index) else {
+        return Outcome::Return(INVALID);
+    };
+    let Some(Payload::Resource(r)) = com(env).get_identity(&env.sys.objects, buffer_id) else {
         return Outcome::Return(INVALID);
     };
     let pointer = r.pointer;

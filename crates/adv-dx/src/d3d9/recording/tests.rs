@@ -1616,6 +1616,84 @@ fn d3d9_package_b_swap_chain_getters_reset_and_excluded_additional_chains() {
     );
 }
 
+// spec: GFX-SWAP-1
+#[test]
+fn d3d9_discard_multiple_back_buffers_expose_distinct_surfaces_and_reset() {
+    let mut f = fixture();
+    let device = f.device;
+    let chain = package_b_chain(&mut f);
+    let output = f.packet(0u32);
+    let parameters = f.packet(D3DPRESENT_PARAMETERS {
+        BackBufferWidth: 16,
+        BackBufferHeight: 12,
+        BackBufferFormat: 22,
+        BackBufferCount: 2,
+        SwapEffect: 1,
+        hDeviceWindow: 0x7788,
+        Windowed: 1,
+        Flags: 1,
+        ..D3DPRESENT_PARAMETERS::default()
+    });
+    f.okay("IDirect3DDevice9::Reset", &[device, parameters]);
+    let actual = GuestPtr::<D3DPRESENT_PARAMETERS>::new(parameters)
+        .read(&f.m.cpu)
+        .unwrap();
+    assert_eq!(actual.BackBufferCount, 2);
+    f.okay("IDirect3DSwapChain9::GetBackBuffer", &[chain, 0, 0, output]);
+    let back0 = f.m.cpu.read_u32(output).unwrap();
+    f.okay("IDirect3DSwapChain9::GetBackBuffer", &[chain, 1, 0, output]);
+    let back1 = f.m.cpu.read_u32(output).unwrap();
+    assert_ne!(back0, back1);
+    assert_eq!(
+        package_b_call(
+            &mut f,
+            "IDirect3DSwapChain9::GetBackBuffer",
+            &[chain, 2, 0, output]
+        ),
+        INVALID
+    );
+    let locked = f.packet([0u32; 2]);
+    f.okay("IDirect3DSurface9::LockRect", &[back1, locked, 0, 0]);
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DDevice9::Present", &[device, 0, 0, 0, 0]),
+        INVALID
+    );
+    f.okay("IDirect3DSurface9::UnlockRect", &[back1]);
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DSurface9::Release", &[back0]),
+        0
+    );
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DSurface9::Release", &[back1]),
+        0
+    );
+    let mut p = actual;
+    p.SwapEffect = 3;
+    GuestPtr::new(parameters).write(&mut f.m.cpu, p).unwrap();
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DDevice9::Reset", &[device, parameters]),
+        INVALID
+    );
+    p.SwapEffect = 1;
+    p.BackBufferCount = 4;
+    GuestPtr::new(parameters).write(&mut f.m.cpu, p).unwrap();
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DDevice9::Reset", &[device, parameters]),
+        UNAVAILABLE
+    );
+    p.BackBufferCount = 1;
+    GuestPtr::new(parameters).write(&mut f.m.cpu, p).unwrap();
+    f.okay("IDirect3DDevice9::Reset", &[device, parameters]);
+    assert_eq!(
+        package_b_call(
+            &mut f,
+            "IDirect3DSwapChain9::GetBackBuffer",
+            &[chain, 1, 0, output]
+        ),
+        INVALID
+    );
+}
+
 // spec: GFX-SWAP-1, GFX-PACE-1, GFX-REC-4
 #[test]
 fn d3d9_package_b_swap_chain_present_preserves_pacing_damage_and_capture_boundary() {

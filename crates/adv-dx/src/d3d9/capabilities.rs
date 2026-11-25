@@ -175,8 +175,10 @@ fn check_format(
     // Color surface/texture: sampled, dynamic or manual render-target mips.
     // Autogen, sRGB, depth textures, cubes and volumes remain unadvertised.
     // QUERY_FILTER asks for filtering beyond point sampling, which every
-    // sampled 2D format here has.
+    // sampled 2D format here has. QUERY_POSTPIXELSHADER_BLENDING asks whether
+    // post-pixel-shader blending works on render-target color formats.
     let (filter, usage) = (usage & 0x20000 != 0, usage & !0x20000);
+    let (post_ps_blend, usage) = (usage & 0x80000 != 0, usage & !0x80000);
     let vertex_texture_query = usage == 0x100000
         && resource == 3
         && matches!(check, 21 | 22)
@@ -196,7 +198,10 @@ fn check_format(
             })
         || (matches!(check, 28 | super::format::L8) && resource == 3 && matches!(usage, 0 | 0x200))
         || (resource == 1 && usage == 2 && depth::format(check).is_some());
-    let supported = supported && (!filter || resource == 3 && usage & 0x100000 == 0);
+    let supported = supported
+        && (!filter || resource == 3 && usage & 0x100000 == 0)
+        && (!post_ps_blend
+            || matches!(check, 21 | 22) && matches!(resource, 1 | 3) && matches!(usage, 0 | 1));
     if available(env) && format == 22 && supported {
         0
     } else {
@@ -554,6 +559,11 @@ mod tests {
             (0x20200, 3, 26),
             (0x20000, 3, 28),
             (0x20000, 3, super::super::format::L8),
+            (0x80000, 3, 21),
+            (0x80000, 3, 22),
+            (0x80000, 1, 21),
+            (0x80001, 3, 21),
+            (0xa0000, 3, 21),
         ] {
             assert_eq!(
                 check_format(&mut env, this, 0, 1, 22, usage, kind, format),
@@ -571,6 +581,11 @@ mod tests {
             (0, 5, 21),
             (0x20000, 1, 22),
             (0x20001, 3, 26),
+            (0x80000, 3, 23),
+            (0x80000, 3, 26),
+            (0x80000, 3, 28),
+            (0x80200, 3, 21),
+            (0x80002, 1, 75),
         ] {
             assert_eq!(
                 check_format(&mut env, this, 0, 1, 22, usage, kind, format),

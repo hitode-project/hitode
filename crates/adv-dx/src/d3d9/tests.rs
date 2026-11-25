@@ -146,6 +146,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             creation: creation::State::new(0, 1, 0, 0x22).unwrap(),
             needs_reset: false,
             back_buffer: None,
+            extra_back_buffers: Vec::new(),
             swap_chain: None,
             queries: queries::DeviceState::default(),
             depth_stencil: None,

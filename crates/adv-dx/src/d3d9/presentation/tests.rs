@@ -115,7 +115,7 @@ fn unavailable_creation_reports_requested_fields_and_absent_gpu_without_publicat
     let (factory, id) = object(&mut env, "IDirect3D9", IID_FACTORY, Payload::Factory).unwrap();
     let input = D3DPRESENT_PARAMETERS {
         SwapEffect: 2,
-        BackBufferCount: 2,
+        BackBufferCount: 4,
         MultiSampleType: 2,
         MultiSampleQuality: 3,
         Flags: 4,
@@ -153,7 +153,7 @@ fn unavailable_creation_reports_requested_fields_and_absent_gpu_without_publicat
         .clone();
     for field in [
         "SwapEffect=0x2 (2)",
-        "BackBufferCount=0x2 (2)",
+        "BackBufferCount=0x4 (4)",
         "MultiSampleType=0x2 (2)",
         "MultiSampleQuality=0x3 (3)",
         "Flags=0x4 (4)",
