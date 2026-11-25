@@ -4521,3 +4521,262 @@ fn resident_sse_stores_keep_lazy_fpsr_armed_when_mxcsr_holds_every_pending_bit()
         }
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+enum Flag {
+    Denormal,
+    Every,
+}
+
+// spec: A64F-FP-5, A64-OPT-6
+#[test]
+fn resident_sse_cold_exit_after_skipped_fpsr_commits_keeps_mxcsr_exact() {
+    // Per iteration: SSE products stored as a vector pair and a GP pair, then
+    // a byte rewritten in place at a per-iteration address. Iteration FAIL's
+    // address is a watched code line, which leaves the resident form cold.
+    let body = Image::loop_body(|a, head, _| {
+        a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+        a.movups(xmm1, xmmword_ptr(esi + 16)).unwrap();
+        a.mulps(xmm0, xmm1).unwrap();
+        a.addps(xmm1, xmm0).unwrap();
+        a.movups(xmmword_ptr(edi), xmm0).unwrap();
+        a.movups(xmmword_ptr(edi + 16), xmm1).unwrap();
+        a.movd(eax, xmm0).unwrap();
+        a.movd(edx, xmm1).unwrap();
+        a.mov(dword_ptr(edi + 32), eax).unwrap();
+        a.mov(dword_ptr(edi + 36), edx).unwrap();
+        a.mov(ebx, dword_ptr(esi + 32)).unwrap();
+        a.mov(al, byte_ptr(ebx)).unwrap();
+        a.mov(byte_ptr(ebx), al).unwrap();
+        a.add(esi, 48).unwrap();
+        a.add(edi, 48).unwrap();
+        latch(a, head);
+    });
+    const N: u32 = 64;
+    const FAIL: u32 = 40;
+    const SCRATCH: u32 = DATA + 0x2000;
+    const ONCE: u32 = 5;
+    // Resident SSE forms assume PE (`front.rs`), so MXCSR.PE is already set.
+    // With `Denormal`, iteration ONCE alone raises DE, which MXCSR lacks: a
+    // cold exit that dropped the committed FPSR would lose it.
+    for (mxcsr, flag) in [(0x1fa0u32, Flag::Denormal), (0x1fa0, Flag::Every)] {
+        let mut state = initial(N);
+        state.mxcsr = mxcsr;
+        let mut trial = Trial::new(
+            &body,
+            &state,
+            format!("cold exit mxcsr={mxcsr:#x} {flag:?}"),
+            &[],
+            |m| {
+                for i in 0..N {
+                    let base = DATA + i * 48;
+                    for c in 0..8u32 {
+                        let x = match flag {
+                            Flag::Every => 1.0f32 + (i * 8 + c) as f32 * 0.3,
+                            Flag::Denormal if i == ONCE && c == 0 => f32::from_bits(0x0000_0400),
+                            _ => (c % 4 + 1) as f32,
+                        };
+                        m.write(base + c * 4, &x.to_le_bytes()).unwrap();
+                    }
+                    let target = if i == FAIL { CODE + 2 } else { SCRATCH + i };
+                    m.write(base + 32, &target.to_le_bytes()).unwrap();
+                }
+                m.protect(CODE, HOST_PAGE, READ | WRITE | EXEC).unwrap();
+            },
+        );
+        assert!(trial.try_install_at(state.clone()));
+        assert_eq!(trial.compare(1 << 20).0, RunOutcome::ReachedStop);
+        let native = trial.live.native.as_ref().unwrap();
+        let fp = native.diagnostics.fp;
+        assert!(
+            native.diagnostics.resident_cold_exits > 0,
+            "mxcsr={mxcsr:#x} {flag:?}: iteration {FAIL} must leave cold, got {fp:?}"
+        );
+        if adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP) {
+            assert!(
+                fp.fpsr_folds <= 3,
+                "mxcsr={mxcsr:#x} {flag:?}: stores before the cold exit must skip folds, got {fp:?}"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mixed {
+    Normal,
+    /// One iteration's SSE input is denormal while MXCSR.DE is clear.
+    SseDenormal,
+    /// One iteration's x87 input is an f64 denormal while x87 DE is set, so
+    /// the load passes, the product is normal, and only FPSR.IDC tells it apart.
+    X87Denormal,
+}
+
+// spec: A64F-FP-5, A64-OPT-6
+#[test]
+fn resident_mixed_sse_x87_loop_keeps_fpcr_and_fpsr_out_of_the_iteration() {
+    let body = Image::loop_body(|a, head, _| {
+        a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+        a.movups(xmm1, xmmword_ptr(esi + 16)).unwrap();
+        a.mulps(xmm0, xmm1).unwrap();
+        a.addps(xmm1, xmm0).unwrap();
+        a.movups(xmmword_ptr(edi), xmm0).unwrap();
+        a.movups(xmmword_ptr(edi + 16), xmm1).unwrap();
+        a.fld(qword_ptr(esi + 32)).unwrap();
+        a.fmul(qword_ptr(esi + 40)).unwrap();
+        a.fstp(qword_ptr(edi + 40)).unwrap();
+        // Leave +0 in the popped register: native forms do not keep the
+        // stale value of an empty x87 register.
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+        a.add(esi, 48).unwrap();
+        a.add(edi, 48).unwrap();
+        latch(a, head);
+    });
+    const N: u32 = 64;
+    const ONCE: u32 = 9;
+    for case in [Mixed::Normal, Mixed::SseDenormal, Mixed::X87Denormal] {
+        let mut state = initial(N);
+        state.mxcsr = 0x1fa0;
+        state.x87.control = 0x027f;
+        state.x87.status = if case == Mixed::X87Denormal {
+            0x22
+        } else {
+            0x20
+        };
+        let mut trial = Trial::new(&body, &state, format!("mixed {case:?}"), &[], |m| {
+            for i in 0..N {
+                let base = DATA + i * 48;
+                for c in 0..8u32 {
+                    let x = if case == Mixed::SseDenormal && i == ONCE && c == 0 {
+                        f32::from_bits(0x0000_0400)
+                    } else {
+                        1.0f32 + (i * 8 + c) as f32 * 0.3
+                    };
+                    m.write(base + c * 4, &x.to_le_bytes()).unwrap();
+                }
+                let y = if case == Mixed::X87Denormal && i == ONCE {
+                    f64::from_bits(0x0008_0000_0000_0000)
+                } else {
+                    1.1 + f64::from(i)
+                };
+                // A normal, exact product of the denormal: no value check sees it.
+                let z = if case == Mixed::X87Denormal && i == ONCE {
+                    2f64.powi(60)
+                } else {
+                    1.3
+                };
+                m.write(base + 32, &y.to_le_bytes()).unwrap();
+                m.write(base + 40, &z.to_le_bytes()).unwrap();
+            }
+        });
+        assert!(trial.try_install_at(state.clone()));
+        assert_eq!(trial.compare(1 << 20).0, RunOutcome::ReachedStop);
+        let native = trial.live.native.as_ref().unwrap();
+        let fp = native.diagnostics.fp;
+        assert!(native.resident_arrivals(body.head).unwrap() > 0, "{case:?}");
+        if adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP) {
+            assert!(
+                fp.fpcr_writes <= 6,
+                "{case:?}: FPCR must not switch per iteration, got {fp:?}"
+            );
+            assert!(
+                fp.fpsr_folds <= 4,
+                "{case:?}: x87 must not fold FPSR per iteration, got {fp:?}"
+            );
+            // One commit before the SSE stores, the x87 segment's end check,
+            // and the segment's entry check after the SSE arithmetic.
+            assert!(
+                fp.fpsr_reads <= u64::from(3 * N) + 4,
+                "{case:?}: at most three FPSR reads per iteration, got {fp:?}"
+            );
+        }
+        if case == Mixed::X87Denormal
+            && adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP)
+        {
+            assert!(
+                fp.fp_speculation_failures > 0,
+                "{case:?}: x87 IDC must fail the segment, got {fp:?}"
+            );
+        }
+    }
+}
+
+// spec: A64F-FP-5
+#[test]
+fn sse_loop_fp_state_counters_per_mxcsr_mode() {
+    let sse = Image::loop_body(|a, head, _| {
+        a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+        a.mulps(xmm0, xmmword_ptr(esi + 16)).unwrap();
+        a.addps(xmm0, xmm7).unwrap();
+        a.movups(xmmword_ptr(edi), xmm0).unwrap();
+        a.add(esi, 32).unwrap();
+        a.add(edi, 16).unwrap();
+        latch(a, head);
+    });
+    let ldmxcsr = Image::loop_body(|a, head, _| {
+        a.ldmxcsr(dword_ptr(esi + 28)).unwrap();
+        a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+        a.mulps(xmm0, xmm7).unwrap();
+        a.movups(xmmword_ptr(edi), xmm0).unwrap();
+        a.add(esi, 32).unwrap();
+        a.add(edi, 16).unwrap();
+        latch(a, head);
+    });
+    let mixed = Image::loop_body(|a, head, _| {
+        a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+        a.mulps(xmm0, xmm7).unwrap();
+        a.movups(xmmword_ptr(edi), xmm0).unwrap();
+        a.fld(dword_ptr(esi + 16)).unwrap();
+        a.fmul(dword_ptr(esi + 20)).unwrap();
+        a.fstp(dword_ptr(edi + 8)).unwrap();
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+        a.add(esi, 32).unwrap();
+        a.add(edi, 16).unwrap();
+        latch(a, head);
+    });
+    const N: u32 = 64;
+    const K: u64 = N as u64;
+    // (name, loop, MXCSR, at most FPCR writes, FPSR reads, FPSR folds).
+    // Under DAZ the SSE FPCR has FIZ, which x87 must not run under (it would
+    // flush f64-denormal operands), so the mixed loop switches FPCR twice per
+    // iteration; `ldmxcsr` alternating RN and RD changes the rounding mode
+    // once per iteration. Every other loop keeps FP state out of the iteration.
+    #[allow(clippy::type_complexity)]
+    let cases: [(&str, &Image, u32, u64, u64, u64); 8] = [
+        ("default", &sse, 0x1f80, 2, 1, 1),
+        ("DAZ", &sse, 0x1fc0, 2, 1, 1),
+        ("FTZ", &sse, 0x9f80, 2, 1, 1),
+        ("RD", &sse, 0x3f80, 2, 1, 1),
+        ("RZ", &sse, 0x7f80, 2, 1, 1),
+        ("ldmxcsr", &ldmxcsr, 0x1f80, 2, 1, 1),
+        ("ldmxcsr RN/RD", &ldmxcsr, 0x1f80, K + 2, 1, 1),
+        ("mixed DAZ", &mixed, 0x1fc0, 2 * K + 2, K + 1, K + 1),
+    ];
+    for (name, body, mxcsr, writes, reads, folds) in cases {
+        let mut state = initial(N);
+        state.mxcsr = mxcsr;
+        let mut trial = Trial::new(body, &state, name.to_string(), &[], |m| {
+            for i in 0..N * 8 {
+                let x = 1.0f32 + i as f32 * 0.37;
+                m.write(DATA + i * 4, &x.to_le_bytes()).unwrap();
+            }
+            for i in 0..N {
+                let value = if name == "ldmxcsr RN/RD" && i % 2 == 1 {
+                    0x3f80
+                } else {
+                    mxcsr
+                };
+                m.write(DATA + i * 32 + 28, &value.to_le_bytes()).unwrap();
+            }
+        });
+        assert_eq!(trial.compare(1 << 20).0, RunOutcome::ReachedStop);
+        let fp = trial.live.native.as_ref().unwrap().diagnostics.fp;
+        if adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP) {
+            assert!(
+                fp.fpcr_writes <= writes && fp.fpsr_reads <= reads && fp.fpsr_folds <= folds,
+                "{name}: at most {writes} FPCR writes, {reads} FPSR reads and {folds} folds, got {fp:?}"
+            );
+        }
+    }
+}

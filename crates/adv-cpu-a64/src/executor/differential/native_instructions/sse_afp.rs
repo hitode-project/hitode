@@ -733,6 +733,43 @@ fn float_to_int_frintts_and_unmasked_packed_xm_priority() {
             p.state.xmm[1] = xmm_f32([b, 0, 0, 0]);
             run_diff(&p, features, Checks::Adaptive);
         }
+
+        // Packed arithmetic measured on Intel (`probes/x86/truth2.c`): an
+        // unmasked IE or DE in one lane commits only pre-computation flags,
+        // and an unmasked OE commits without PE.
+        const ONE: u32 = 0x3f80_0000;
+        const TINY: u32 = 0x3200_0000;
+        const SNAN: u32 = 0x7f80_0001;
+        for (mxcsr, mul, x0, x1) in [
+            (0x1f00u32, false, [ONE; 4], [TINY, SNAN, ONE, ONE]),
+            (0x0f80, false, [ONE; 4], [TINY, SNAN, ONE, ONE]),
+            (0x1f00, false, [ONE; 4], [SNAN, TINY, ONE, ONE]),
+            (0x1e80, false, [ONE; 4], [1, TINY, ONE, ONE]),
+            (
+                0x1b80,
+                true,
+                [0x7f00_0000, ONE, ONE, ONE],
+                [0x7f00_0000, SNAN, ONE, ONE],
+            ),
+            (
+                0x1b00,
+                true,
+                [0x7f00_0000, ONE, ONE, ONE],
+                [0x7f00_0000, SNAN, ONE, ONE],
+            ),
+        ] {
+            let mut p = fixture(|asm| {
+                if mul {
+                    asm.mulps(xmm0, xmm1).unwrap();
+                } else {
+                    asm.addps(xmm0, xmm1).unwrap();
+                }
+            });
+            p.state.mxcsr = mxcsr;
+            p.state.xmm[0] = xmm_f32(x0);
+            p.state.xmm[1] = xmm_f32(x1);
+            run_diff(&p, features, Checks::Adaptive);
+        }
     }
 }
 
@@ -1109,4 +1146,141 @@ fn tier1_hot_path_instruction_counts_shrink_under_afp_rpres_frintts_flagm2() {
 
     // xorps xmm0, xmm0: 1 word/op (movi v16.2d, #0).
     assert_eq!(marginal(full, |a| a.xorps(xmm0, xmm0).unwrap()), 1);
+}
+
+/// Instructions from extensions `features` lacks, as `(word index, name)`.
+fn unsupported_words(words: &[u32], features: Features) -> Vec<(usize, &'static str)> {
+    let mut found = Vec::new();
+    for (index, &w) in words.iter().enumerate() {
+        let name = if !features.flagm && w & 0xffe0_7c10 == 0xba00_0400 {
+            "rmif"
+        } else if !features.flagm && w == crate::encode::CFINV {
+            "cfinv"
+        } else if !features.flagm && w & 0xffff_bc1f == 0x3a00_080d {
+            "setf8/setf16"
+        } else if !features.flagm2 && w == crate::encode::AXFLAG {
+            "axflag"
+        } else if !features.flagm2 && w == crate::encode::XAFLAG {
+            "xaflag"
+        } else if !features.frintts && w & 0xff3e_7c00 == 0x1e28_4000 {
+            "scalar frint32/frint64"
+        } else if !features.frintts && w & 0x9fbf_ec00 == 0x0e21_e800 {
+            "vector frint32/frint64"
+        } else {
+            continue;
+        };
+        found.push((index, name));
+    }
+    found
+}
+
+// spec: A64-ISA-4, A64-FLAG-6, A64F-FP-9
+#[test]
+fn tier1_never_encodes_extensions_the_features_lack() {
+    #[allow(clippy::type_complexity)]
+    let programs: [(&str, fn(&mut CodeAssembler)); 7] = [
+        ("integer flags", |a| {
+            a.add(eax, ecx).unwrap();
+            a.adc(edx, ebx).unwrap();
+            a.sbb(esi, edi).unwrap();
+            a.setb(al).unwrap();
+            a.cmp(eax, 7).unwrap();
+            a.cmovbe(ecx, edx).unwrap();
+            a.sub(ebx, eax).unwrap();
+            a.setae(cl).unwrap();
+            a.inc(edx).unwrap();
+            a.setc(dl).unwrap();
+        }),
+        ("byte and word flags", |a| {
+            a.add(al, cl).unwrap();
+            a.setc(bl).unwrap();
+            a.sub(ax, dx).unwrap();
+            a.seto(bh).unwrap();
+            a.neg(cx).unwrap();
+            a.sets(dh).unwrap();
+        }),
+        ("SSE compares", |a| {
+            a.comiss(xmm0, xmm1).unwrap();
+            a.setb(al).unwrap();
+            a.ucomisd(xmm2, xmm3).unwrap();
+            a.seta(cl).unwrap();
+            a.cmova(edx, ebx).unwrap();
+            a.cmpps(xmm4, xmm5, 1).unwrap();
+        }),
+        ("SSE conversions", |a| {
+            a.cvttss2si(eax, xmm0).unwrap();
+            a.cvtss2si(ecx, xmm0).unwrap();
+            a.cvttps2dq(xmm2, xmm1).unwrap();
+            a.cvtps2dq(xmm3, xmm1).unwrap();
+            a.cvttsd2si(edx, xmm4).unwrap();
+            a.cvtpd2dq(xmm5, xmm4).unwrap();
+        }),
+        ("SSE arithmetic", |a| {
+            a.addps(xmm0, xmm1).unwrap();
+            a.mulss(xmm2, xmm3).unwrap();
+            a.divpd(xmm4, xmm5).unwrap();
+            a.sqrtps(xmm6, xmm7).unwrap();
+            a.minss(xmm0, xmm2).unwrap();
+            a.maxpd(xmm1, xmm3).unwrap();
+            a.rcpps(xmm4, xmm0).unwrap();
+            a.rsqrtss(xmm5, xmm1).unwrap();
+        }),
+        ("x87", |a| {
+            a.fld(dword_ptr(0x10800)).unwrap();
+            a.fld(qword_ptr(0x10808)).unwrap();
+            a.fmulp(st1, st0).unwrap();
+            a.fld1().unwrap();
+            a.fcomip(st0, st1).unwrap();
+            a.setb(al).unwrap();
+            a.fistp(dword_ptr(0x10810)).unwrap();
+        }),
+        ("x87 rounding", |a| {
+            a.fldcw(word_ptr(0x10820)).unwrap();
+            a.fld(qword_ptr(0x10808)).unwrap();
+            a.frndint().unwrap();
+            a.fistp(qword_ptr(0x10810)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.sahf().unwrap();
+            a.setp(cl).unwrap();
+        }),
+    ];
+    let host = host_features();
+    let none = Features {
+        flagm: false,
+        flagm2: false,
+        frintts: false,
+        afp: false,
+        rpres: false,
+    };
+    // The scanner recognizes what the host's full features emit.
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, program) in programs {
+        for mxcsr in [0x1f80u32, 0x3f80, 0x9fc0] {
+            for (_, name) in unsupported_words(&tier1_words(host, mxcsr, program), none) {
+                seen.insert(name);
+            }
+        }
+    }
+    if host.flagm {
+        assert!(
+            seen.iter()
+                .any(|n| matches!(*n, "rmif" | "cfinv" | "setf8/setf16")),
+            "{seen:?}"
+        );
+    }
+    if host.frintts {
+        assert!(seen.iter().any(|n| n.contains("frint")), "{seen:?}");
+    }
+    for features in feature_modes() {
+        for (name, program) in programs {
+            for mxcsr in [0x1f80u32, 0x3f80, 0x9fc0] {
+                let words = tier1_words(features, mxcsr, program);
+                let found = unsupported_words(&words, features);
+                assert!(
+                    found.is_empty(),
+                    "{name} under {features:?} mxcsr={mxcsr:#x}: {found:?}"
+                );
+            }
+        }
+    }
 }

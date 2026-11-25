@@ -611,6 +611,27 @@ fn emit<'a>(
             }
         )
     });
+    let live_mxcsr = inline.is_some() && resident;
+    let has_afp = features.contains(adv_cpu_core::HostFeatures::AFP);
+    let has_stmxcsr = func.entry.contains(&Source::Mxcsr);
+    let can_use_afp_sse = has_afp && live_mxcsr && !has_stmxcsr;
+    let func_uses_afp_sse = can_use_afp_sse
+        && func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
+            matches!(
+                op,
+                Op::SsePackedFp { .. }
+                    | Op::SseMinMax { .. }
+                    | Op::SseSqrt { .. }
+                    | Op::SseConvert { .. }
+            ) || matches!(
+                op,
+                Op::Flags {
+                    kind: FlagKind::OrderedCompare | FlagKind::UnorderedCompare,
+                    width,
+                    ..
+                } if *width != 10
+            )
+        });
     // Identify any deferred `Op::Fp` segments whose `Op::FpValidate` selects
     // `FpsrMask` so we can arm/clear FPSR before the segment starts and skip
     // per-Mul inline checks.
@@ -632,7 +653,9 @@ fn emit<'a>(
             } else if let Op::FpValidate { values, strict } = op {
                 let count = values.iter().flatten().count();
                 let strict_muls = strict.count_ones() as usize;
-                let fpsr_eligible = !has_directed_rounding && !func.deferred_fp.is_empty();
+                // Shared x87 segments check FPSR themselves (`x87_rn_fpcr`).
+                let fpsr_eligible =
+                    !has_directed_rounding && !func.deferred_fp.is_empty() && !func_uses_afp_sse;
                 let strategy =
                     cost::select_validation(core_class, count, strict_muls, fpsr_eligible, false);
                 fp_validate_strategies.insert((b_idx, i_idx), strategy);
@@ -703,27 +726,7 @@ fn emit<'a>(
                 .rposition(|(_, op)| matches!(op, Op::PlainPage { .. }))
         })
         .flatten();
-    let live_mxcsr = inline.is_some() && resident;
-    let has_afp = features.contains(adv_cpu_core::HostFeatures::AFP);
-    let has_stmxcsr = func.entry.contains(&Source::Mxcsr);
-    let can_use_afp_sse = has_afp && live_mxcsr && !has_stmxcsr;
-    let func_uses_afp_sse = can_use_afp_sse
-        && func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
-            matches!(
-                op,
-                Op::SsePackedFp { .. }
-                    | Op::SseMinMax { .. }
-                    | Op::SseSqrt { .. }
-                    | Op::SseConvert { .. }
-            ) || matches!(
-                op,
-                Op::Flags {
-                    kind: FlagKind::OrderedCompare | FlagKind::UnorderedCompare,
-                    width,
-                    ..
-                } if *width != 10
-            )
-        });
+    let x87_shared = func_uses_afp_sse && !has_directed_rounding;
     let all_sse_ops_afp = can_use_afp_sse
         && !func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
             matches!(
@@ -923,6 +926,10 @@ fn emit<'a>(
         can_use_afp_sse,
         func_uses_afp_sse,
         all_sse_ops_afp,
+        x87_shared,
+        x87_open: false,
+        fpsr_quiet: false,
+        fpsr_committed: false,
         store_only_extract32,
         mul_elem_dup,
         folded_addr_inst,
@@ -1012,6 +1019,7 @@ fn emit<'a>(
             }
             start = e.asm.offset();
         }
+        e.x87_join();
         let mut region_has_load = data.head.is_none();
         let mut i = 0usize;
         while i < data.insts.len() {
@@ -1038,6 +1046,7 @@ fn emit<'a>(
                 i += 1;
                 continue;
             }
+            e.x87_boundary(op);
             if fpsr_clear_before.contains(&(b, i)) {
                 e.uses_fp_state = true;
                 if e.has_afp && e.live_mxcsr {
@@ -1157,6 +1166,7 @@ fn emit<'a>(
                 _ => {}
             }
             if b == 0 && last_fact == Some(i) {
+                e.x87_join();
                 e.entry_frames(&func.entry);
                 e.begin_body(first, count_entries);
                 e.asm.bind(e.blocks[b]);
@@ -1164,6 +1174,7 @@ fn emit<'a>(
             }
             i += 1;
         }
+        e.x87_join();
         match &data.end {
             End::Jump(t) => {
                 let edge = e.asm.offset();
@@ -1496,6 +1507,14 @@ struct Emitter<'a> {
     can_use_afp_sse: bool,
     func_uses_afp_sse: bool,
     all_sse_ops_afp: bool,
+    /// Round-to-nearest x87 ops share the lazy SSE FPSR ([`Self::x87_rn_fpcr`]).
+    x87_shared: bool,
+    /// An x87 segment is open: FPSR may hold x87 bits.
+    x87_open: bool,
+    /// FPSR holds no `0x8f` bit, so an x87 segment may start without a check.
+    fpsr_quiet: bool,
+    /// Folding FPSR would not change MXCSR, so a store need not commit.
+    fpsr_committed: bool,
     store_only_extract32: Vec<bool>,
     mul_elem_dup: Vec<Option<Value>>,
     folded_addr_inst: Vec<bool>,
@@ -2299,19 +2318,25 @@ impl<'a> Emitter<'a> {
     }
 
     /// Before a store: keeps FPSR armed unless it holds a bit MXCSR lacks.
+    /// Skipped when no FP op ran since FPSR last held nothing to fold.
     fn commit_sse_fpsr(&mut self) {
-        if self.func_uses_afp_sse {
+        self.close_x87();
+        if self.func_uses_afp_sse && !self.fpsr_committed {
             fp_state::emit_commit_fpsr(&mut self.asm, T, U, S2);
+            self.fpsr_quiet = true;
+            self.fpsr_committed = true;
         }
     }
 
     fn disarm_sse_fpsr(&mut self) {
+        self.close_x87();
         if self.func_uses_afp_sse {
             fp_state::emit_fold_fpsr(&mut self.asm, T, U, S2);
         }
     }
 
     fn set_fpcr_imm(&mut self, desired: u32) {
+        self.close_x87();
         if desired != fp_state::FPCR_X87_DEFAULT {
             self.disarm_sse_fpsr();
         }
@@ -2321,6 +2346,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn ensure_rn_fpcr(&mut self) {
+        self.close_x87();
         self.disarm_sse_fpsr();
         if self.has_directed_rounding || self.modifies_fpcr || self.func_uses_afp_sse {
             self.set_fpcr_imm(0);
@@ -2330,6 +2356,97 @@ impl<'a> Emitter<'a> {
     fn arm_afp_sse(&mut self) {
         self.set_fpcr_imm(fp_state::FPCR_X87_DEFAULT);
         fp_state::emit_arm_sse_fpsr(&mut self.asm, T);
+        self.fpsr_quiet = false;
+        self.fpsr_committed = false;
+    }
+
+    /// Round-to-nearest x87 arithmetic. In a form whose SSE ops accumulate
+    /// FPSR lazily, x87 runs in the SSE mode instead of folding FPSR and
+    /// switching to `AH = 0` (A64F-FP-5): `AH` changes only NaN handling,
+    /// input-denormal `IDC` and tininess, and every x87 NaN result fails its
+    /// check. FPSR then mixes both units' bits, so the run of x87 ops is a
+    /// segment that [`Self::close_x87`] ends before anything can fold FPSR.
+    fn x87_rn_fpcr(&mut self) {
+        if !self.x87_shared {
+            return self.ensure_rn_fpcr();
+        }
+        if self.x87_open {
+            return;
+        }
+        self.uses_fp_state = true;
+        self.modifies_fpcr = true;
+        if !self.fpsr_quiet {
+            fp_state::emit_quiet_fpsr(&mut self.asm, T, U, S2);
+        }
+        fp_state::emit_sync_fpcr_round_to_nearest(&mut self.asm, T, U);
+        self.x87_open = true;
+        self.fpsr_committed = false;
+    }
+
+    /// Ends an x87 segment. FPSR held at most `IXC` when it began, so a newer
+    /// `0x8f` bit, or `IXC` while `MXCSR.PE` is clear, came from x87 and would
+    /// reach MXCSR at the next fold: such a segment fails, and its cold exit
+    /// discards FPSR.
+    fn close_x87(&mut self) {
+        if self.x87_open {
+            self.x87_open = false;
+            let fail = self.fail();
+            fp_state::emit_check_x87_fpsr(&mut self.asm, fail, T, U);
+            self.fpsr_quiet = true;
+            self.fpsr_committed = true;
+        }
+    }
+
+    /// Before emitting `op`: ends an open x87 segment unless `op` is x87
+    /// arithmetic or register work that cannot exit, fault, call the host or
+    /// touch FPSR, and forgets that FPSR is quiet if `op` may raise flags.
+    fn x87_boundary(&mut self, op: Op) {
+        if !self.x87_shared {
+            return;
+        }
+        let x87 = matches!(
+            op,
+            Op::Fp(..)
+                | Op::X87Single(..)
+                | Op::X87Load { .. }
+                | Op::X87Store { .. }
+                | Op::X87StoreC1 { .. }
+                | Op::X87Arith { .. }
+                | Op::X87Sqrt { .. }
+                | Op::X87Round { .. }
+                | Op::X87Compare { .. }
+                | Op::X87Exam(_)
+                | Op::X87RoundC1 { .. }
+                | Op::X87SqrtC1 { .. }
+                | Op::FpUnary(..)
+                | Op::FpValidate { .. }
+        );
+        let quiet = matches!(
+            op,
+            Op::Constant(..)
+                | Op::Snapshot(_)
+                | Op::Int(..)
+                | Op::IntUnary(..)
+                | Op::Test { .. }
+                | Op::Select { .. }
+                | Op::Bits { .. }
+                | Op::Validate
+        );
+        if !x87 && !quiet {
+            self.close_x87();
+            // A store's commit leaves FPSR without `0x8f` bits if it had none.
+            if !matches!(op, Op::Load { .. } | Op::Store { .. }) {
+                self.fpsr_quiet = false;
+                self.fpsr_committed = false;
+            }
+        }
+    }
+
+    /// Before a label other code branches to.
+    fn x87_join(&mut self) {
+        self.close_x87();
+        self.fpsr_quiet = false;
+        self.fpsr_committed = false;
     }
 
     fn site(&mut self, checked: bool) {
@@ -2628,14 +2745,14 @@ impl<'a> Emitter<'a> {
                 }
             }
             Op::Fp(fp, a, b, true) => {
-                self.ensure_rn_fpcr();
+                self.x87_rn_fpcr();
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 let float = fp_float(fp);
                 self.asm.emit(dfloat(float, q, a, b));
             }
             Op::Fp(fp, a, b, false) => {
-                self.ensure_rn_fpcr();
+                self.x87_rn_fpcr();
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 let deferred = self.func.deferred_fp.contains(&out)
@@ -2798,7 +2915,7 @@ impl<'a> Emitter<'a> {
                 self.x87_round_c1(d, op, a, b, pc, rounding);
             }
             Op::X87SqrtC1 { input, result } => {
-                self.ensure_rn_fpcr();
+                self.x87_rn_fpcr();
                 let a = self.vr(input, A);
                 let r = self.vr(result, B);
                 self.asm
@@ -2835,7 +2952,7 @@ impl<'a> Emitter<'a> {
                 self.sse_scalar_to_int(d, value, double, truncate);
             }
             Op::X87Single(op, a, b, proved) => {
-                self.ensure_rn_fpcr();
+                self.x87_rn_fpcr();
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 self.x87_single(op, q, [a, b], proved);
@@ -2997,7 +3114,7 @@ impl<'a> Emitter<'a> {
                 if !integer && rounding != 0 {
                     self.set_fpcr_imm(fpcr_for_x87_rounding(rounding));
                 } else {
-                    self.ensure_rn_fpcr();
+                    self.x87_rn_fpcr();
                 }
                 let a = self.vr(value, A);
                 if proved {
@@ -3061,7 +3178,7 @@ impl<'a> Emitter<'a> {
                 stored,
                 integer,
             } => {
-                self.ensure_rn_fpcr();
+                self.x87_rn_fpcr();
                 let a = self.vr(value, A);
                 let r = self.gp(stored, T);
                 if integer {
@@ -3746,7 +3863,7 @@ impl<'a> Emitter<'a> {
                 proved,
             } => {
                 if single {
-                    self.ensure_rn_fpcr();
+                    self.x87_rn_fpcr();
                 }
                 let r = self.gp(bits, U);
                 let size = if single { W } else { X };
@@ -3852,7 +3969,7 @@ impl<'a> Emitter<'a> {
         if rounding != 0 {
             self.set_fpcr_imm(fpcr_for_x87_rounding(rounding));
         } else {
-            self.ensure_rn_fpcr();
+            self.x87_rn_fpcr();
         }
         let float = fp_float(op);
         let sum = matches!(op, FpOp::Add | FpOp::Sub);
@@ -3975,7 +4092,7 @@ impl<'a> Emitter<'a> {
         if rounding != 0 {
             self.set_fpcr_imm(fpcr_for_x87_rounding(rounding));
         } else {
-            self.ensure_rn_fpcr();
+            self.x87_rn_fpcr();
         }
         // Reject negative nonzero, NaN, Inf, and subnormal inputs.
         self.asm.emit(fcmp_zero(a));
@@ -4014,7 +4131,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn x87_round(&mut self, q: VReg, value: Value, rounding: u8) {
-        self.ensure_rn_fpcr();
+        self.x87_rn_fpcr();
         let a = self.vr(value, A);
         let fail = self.fail();
         let ok = self.asm.label();
@@ -4251,7 +4368,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn x87_compare(&mut self, d: Reg, a: Value, b: Value, ordered: bool) {
-        self.ensure_rn_fpcr();
+        self.x87_rn_fpcr();
         let b_is_zero = match self.locations[b.0 as usize] {
             Host::Constant(bits) => is_fp_zero_const(bits, false),
             _ => matches!(
@@ -4298,7 +4415,7 @@ impl<'a> Emitter<'a> {
             return;
         }
         if rounding == 0 {
-            self.ensure_rn_fpcr();
+            self.x87_rn_fpcr();
             self.c1(
                 op,
                 self.locations[a.0 as usize],

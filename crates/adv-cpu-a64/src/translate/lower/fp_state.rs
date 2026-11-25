@@ -18,7 +18,7 @@
 //! Every emitter here preserves guest NZCV flags (using `eor`/`cbz`/`tbz`
 //! instead of flag-setting compares).
 
-use crate::asm::Asm;
+use crate::asm::{Asm, Label};
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
@@ -39,7 +39,6 @@ pub(crate) const FPCR_RMODE_SHIFT: u32 = 22;
 #[allow(dead_code)]
 pub(crate) const FPCR_FZ: u32 = 1 << 24;
 /// Canonical `FEAT_AFP` FPCR shared by default MXCSR (`0x1f80`) and x87 RN.
-#[allow(dead_code)]
 pub(crate) const FPCR_X87_DEFAULT: u32 = FPCR_AH;
 
 /// MXCSR bits 12:7 (PM|UM|OM|ZM|DM|IM): all six SSE exceptions masked.
@@ -213,10 +212,11 @@ pub(crate) fn emit_fold_fpsr(asm: &mut Asm, tmp1: Reg, tmp2: Reg, tmp3: Reg) {
 /// Commits live hardware FPSR before a store that later rollbacks cannot undo.
 ///
 /// Folds into `CpuState::mxcsr` only when FPSR holds a bit the fold would
-/// change: any of `0x8f`, or `IXC` while `MXCSR.PE` is clear. Otherwise every
-/// pending bit is already in MXCSR, so `fpsr_owner` stays `SseLive` and a later
-/// cold exit may still discard FPSR exactly. The common path is one `mrs` with
-/// no `msr fpsr`, so a store per loop iteration does not re-arm FPSR.
+/// change: any of `0x8f`, or `IXC` while `MXCSR.PE` is clear; the fold then
+/// clears FPSR and stays `SseLive`. Otherwise every pending bit is already in
+/// MXCSR, so a later cold exit may still discard FPSR exactly. Either way FPSR
+/// ends with nothing to fold. The common path is one `mrs` with no
+/// `msr fpsr`, so a store per loop iteration does not re-arm FPSR.
 ///
 /// Preserves guest NZCV flags. `tmp1`, `tmp2` and `tmp3` must be distinct.
 pub(crate) fn emit_commit_fpsr(asm: &mut Asm, tmp1: Reg, tmp2: Reg, tmp3: Reg) {
@@ -240,6 +240,80 @@ pub(crate) fn emit_commit_fpsr(asm: &mut Asm, tmp1: Reg, tmp2: Reg, tmp3: Reg) {
     asm.tbz(true, tmp2, 5, done);
     asm.bind(fold);
     emit_fold_fpsr_value(asm, tmp1, tmp2, tmp3);
+    asm.emit_all(&[
+        msr_fpsr(Reg::ZR),
+        movz(W, tmp1, u16::from(runtime::FPSR_SSE_LIVE), 0),
+        strb(tmp1, RUNTIME, runtime::FPSR_OWNER),
+    ]);
+    asm.bind(done);
+}
+
+/// Before x87 arithmetic shares FPSR with lazy SSE accumulation: leaves FPSR
+/// holding at most `IXC`. A pending `0x8f` bit is folded into
+/// `CpuState::mxcsr`, then FPSR is cleared and stays `SseLive`.
+///
+/// Preserves guest NZCV flags. `tmp1`, `tmp2` and `tmp3` must be distinct.
+pub(crate) fn emit_quiet_fpsr(asm: &mut Asm, tmp1: Reg, tmp2: Reg, tmp3: Reg) {
+    assert!(tmp1 != tmp2 && tmp1 != tmp3 && tmp2 != tmp3);
+    let done = asm.label();
+    asm.emit(ldrb(tmp1, RUNTIME, runtime::FPSR_OWNER));
+    asm.cbz(W, false, tmp1, done);
+    asm.emit(mrs_fpsr(tmp1));
+    runtime::emit_inc_fp_counter(asm, runtime::FP_FPSR_READS, 1, tmp2);
+    asm.emit_all(&[
+        movz(W, tmp2, FPSR_CHECK_MASK as u16, 0),
+        and(W, tmp2, tmp1, tmp2, Lsl, 0),
+    ]);
+    asm.cbz(W, false, tmp2, done);
+    emit_fold_fpsr_value(asm, tmp1, tmp2, tmp3);
+    asm.emit_all(&[
+        msr_fpsr(Reg::ZR),
+        movz(W, tmp1, u16::from(runtime::FPSR_SSE_LIVE), 0),
+        strb(tmp1, RUNTIME, runtime::FPSR_OWNER),
+    ]);
+    asm.bind(done);
+}
+
+/// Ends an x87 segment begun by [`emit_quiet_fpsr`]: while `SseLive`, branches
+/// to `fail` if FPSR holds a `0x8f` bit, or `IXC` while `MXCSR.PE` is clear,
+/// since those came from x87 and a fold would report them as SSE flags.
+///
+/// Preserves guest NZCV flags. `tmp1` and `tmp2` must be distinct.
+pub(crate) fn emit_check_x87_fpsr(asm: &mut Asm, fail: Label, tmp1: Reg, tmp2: Reg) {
+    assert_ne!(tmp1, tmp2);
+    let done = asm.label();
+    asm.emit(ldrb(tmp1, RUNTIME, runtime::FPSR_OWNER));
+    asm.cbz(W, false, tmp1, done);
+    asm.emit(mrs_fpsr(tmp1));
+    runtime::emit_inc_fp_counter(asm, runtime::FP_FPSR_READS, 1, tmp2);
+    asm.emit_all(&[
+        movz(W, tmp2, FPSR_CHECK_MASK as u16, 0),
+        and(W, tmp2, tmp1, tmp2, Lsl, 0),
+    ]);
+    asm.cbz(W, true, tmp2, fail);
+    asm.tbz(false, tmp1, 4, done);
+    asm.emit_all(&[
+        ldr(X, tmp2, RUNTIME, runtime::CPU_STATE),
+        ldr(W, tmp2, tmp2, runtime::MXCSR),
+    ]);
+    asm.tbz(true, tmp2, 5, done);
+    asm.b(fail);
+    asm.bind(done);
+}
+
+/// Synchronizes FPCR to round-to-nearest without `FZ` or `FIZ`, accepting
+/// either `AH`; a write selects [`FPCR_X87_DEFAULT`].
+///
+/// Preserves guest NZCV flags. `tmp1` and `tmp2` must be distinct.
+pub(crate) fn emit_sync_fpcr_round_to_nearest(asm: &mut Asm, tmp1: Reg, tmp2: Reg) {
+    assert_ne!(tmp1, tmp2);
+    let done = asm.label();
+    asm.emit_all(&[
+        ldr(W, tmp1, RUNTIME, runtime::ACTIVE_FPCR),
+        and_imm(W, tmp1, tmp1, u64::from(!FPCR_AH)),
+    ]);
+    asm.cbz(W, false, tmp1, done);
+    emit_sync_fpcr_imm(asm, FPCR_X87_DEFAULT, tmp1, tmp2);
     asm.bind(done);
 }
 
