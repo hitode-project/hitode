@@ -322,7 +322,10 @@ fn step(
                         {
                             return None;
                         }
-                    } else if !r.is_normal() || r.abs() < f32::from_bits(0x0100_0000) {
+                    } else if !r.is_normal()
+                        || r.abs() < f32::from_bits(0x0100_0000)
+                        || (rounding != 0 && ((r.to_bits() >> 23) & 0xff) == 254)
+                    {
                         return None;
                     }
                     float(f64::from(r))?
@@ -332,7 +335,11 @@ fn step(
                     let bits = softfloat::sse_binary(a.to_bits(), b.to_bits(), op as u8, 8);
                     let fl = softfloat::flags();
                     let r = f64::from_bits(bits);
-                    if fl & 0x3f != 0 || !r.is_finite() || r.is_subnormal() {
+                    if fl & 0x3f != 0
+                        || !r.is_finite()
+                        || r.is_subnormal()
+                        || (rounding != 0 && ((r.to_bits() >> 52) & 0x7ff) == 2046)
+                    {
                         return None;
                     }
                     if matches!(op, FpOp::Mul | FpOp::Div)
@@ -350,6 +357,7 @@ fn step(
                     if r.is_nan()
                         || r.is_infinite() && a.is_finite() && b.is_finite()
                         || r.is_subnormal()
+                        || (rounding != 0 && ((r.to_bits() >> 52) & 0x7ff) == 2046)
                     {
                         return None;
                     }
@@ -834,9 +842,11 @@ fn step(
                         && (!rounded.is_normal()
                             || rounded.abs() == f32::MIN_POSITIVE && f64::from(rounded) != value)
                 } else {
-                    // Unproved backend checks exp in 2..=254, excluding exp == 1 (< 2^-125).
+                    // Unproved backend checks exp in 2..=254 (2..=253 under directed rounding).
                     value != 0.0
-                        && (!rounded.is_normal() || rounded.abs() < f32::from_bits(0x0100_0000))
+                        && (!rounded.is_normal()
+                            || rounded.abs() < f32::from_bits(0x0100_0000)
+                            || (rounding != 0 && ((rounded.to_bits() >> 23) & 0xff) == 254))
                 };
                 if bad {
                     return None;

@@ -510,7 +510,7 @@ struct FpReduction {
     next: Value,
     term: Value,
     single: bool,
-    max_term: f64,
+    max_term: u128,
 }
 
 /// The original scalar iteration can reconstitute an overwritten value if
@@ -534,7 +534,7 @@ impl<'a> Values<'a> {
             stable: BTreeMap::new(),
             reduction: None,
         };
-        let mut exact_int_facts: Option<Vec<Option<(f64, bool)>>> = None;
+        let mut exact_int_facts: Option<Vec<Option<(u128, bool)>>> = None;
         for &(p, a) in &loop_.carried {
             let mask = if p == a {
                 u32::MAX
@@ -573,13 +573,13 @@ impl<'a> Values<'a> {
                     crate::translate::opt::front::passes::exact_integer_facts(func)
                 });
                 let (max_term, f32_exact) = (*facts.get(term.0 as usize)?)?;
-                if max_term <= 0.0 || !max_term.is_finite() {
+                if max_term == 0 {
                     return None;
                 }
-                if single && (!f32_exact || max_term > (1u64 << 20) as f64) {
+                if single && (!f32_exact || max_term > (1u128 << 20)) {
                     return None;
                 }
-                if !single && max_term > (1u64 << 48) as f64 {
+                if !single && max_term > (1u128 << 48) {
                     return None;
                 }
                 values.reduction = Some(FpReduction {
@@ -2267,13 +2267,9 @@ impl Builder<'_> {
             pinned[slot] = true;
             let reg = VReg::new(16 + slot as u8);
             let double = self.shape == Shape::Float64;
-            let half_limit = if double {
-                (1u64 << 52) as f64
-            } else {
-                (1u64 << 23) as f64
-            };
-            let per_strip = f64::from(self.shape.lanes()) * red.max_term;
-            let max_strips = (half_limit / per_strip).floor() as u64;
+            let half_limit: u128 = if double { 1u128 << 52 } else { 1u128 << 23 };
+            let per_strip = u128::from(self.shape.lanes()).saturating_mul(red.max_term);
+            let max_strips = (half_limit / per_strip) as u64;
             if max_strips == 0 {
                 return None;
             }

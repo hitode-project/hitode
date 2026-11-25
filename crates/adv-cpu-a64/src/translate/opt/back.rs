@@ -3030,12 +3030,16 @@ impl<'a> Emitter<'a> {
                             .emit(fcvt_int(if width == 8 { X } else { W }, true, d, operand));
                     } else {
                         let good = self.asm.label();
+                        // Under directed rounding, binary32 overflow saturates to ±f32::MAX
+                        // (exp == 254) without raising SW.OE; reject exp == 254 so overflow
+                        // bails to the interpreter.
+                        let exp_span = if rounding != 0 { 252 } else { 253 };
                         self.asm.emit_all(&[
                             unary(Unary::Narrow, C, a),
                             fmov_from_v(W, d, C),
                             ubfx(W, U, d, 23, 8),
                             sub_imm(W, U, U, 2, false),
-                            cmp_imm(W, U, 253, false),
+                            cmp_imm(W, U, exp_span, false),
                         ]);
                         self.asm.b_cond(Cond::Lo, good);
                         // Zero is exact only when the source was also zero.
@@ -3863,11 +3867,15 @@ impl<'a> Emitter<'a> {
                 self.asm.b_cond(Cond::Ne, fail);
                 self.asm.emit(sfloat(float, C, D, E));
                 let ok = self.asm.label();
+                // Under directed rounding, binary32 overflow saturates to ±f32::MAX
+                // (exp == 254) instead of ±Inf (exp == 255). Reject exp == 254 so x87
+                // preserves its 15-bit extended exponent via the fallback path.
+                let exp_span = if rounding != 0 { 252 } else { 253 };
                 self.asm.emit_all(&[
                     fmov_from_v(W, T, C),
                     ubfx(W, U, T, 23, 8),
                     sub_imm(W, U, U, 2, false),
-                    cmp_imm(W, U, 253, false),
+                    cmp_imm(W, U, exp_span, false),
                 ]);
                 self.asm.b_cond(Cond::Lo, ok);
                 // Accept exact ±0.0 when Add/Sub or zero operand.
@@ -3891,9 +3899,11 @@ impl<'a> Emitter<'a> {
                 self.asm.emit(dfloat(float, C, a, b));
                 let exp_ok = self.asm.label();
                 fp_class::result_bits(&mut self.asm, true, C, T, U, None);
+                let min_exp = if sum { 1 } else { 2 };
+                let max_exp = if rounding != 0 { 2045 } else { 2046 };
                 self.asm.emit_all(&[
-                    sub_imm(W, U, U, if sum { 2 } else { 3 }, false),
-                    cmp_imm(W, U, if sum { 2046 } else { 2045 }, false),
+                    sub_imm(W, U, U, min_exp + 1, false),
+                    cmp_imm(W, U, max_exp - min_exp + 1, false),
                 ]);
                 self.asm.b_cond(Cond::Lo, exp_ok);
                 self.asm.emit(lsl_imm(X, T, T, 1));
@@ -3923,13 +3933,16 @@ impl<'a> Emitter<'a> {
                 self.asm.emit(vmov(false, q, C));
             }
             _ => {
-                // PC53 with directed rounding.
+                // PC53 with directed rounding: reject exp == 2046 when rounding != 0
+                // so saturated binary64 overflow (±f64::MAX) bails to the 80-bit path.
                 self.asm.emit(dfloat(float, C, a, b));
                 let ok = self.asm.label();
                 fp_class::result_bits(&mut self.asm, true, C, T, U, None);
+                let min_exp = if sum { 1 } else { 2 };
+                let max_exp = if rounding != 0 { 2045 } else { 2046 };
                 self.asm.emit_all(&[
-                    sub_imm(W, U, U, if sum { 2 } else { 3 }, false),
-                    cmp_imm(W, U, if sum { 2046 } else { 2045 }, false),
+                    sub_imm(W, U, U, min_exp + 1, false),
+                    cmp_imm(W, U, max_exp - min_exp + 1, false),
                 ]);
                 self.asm.b_cond(Cond::Lo, ok);
                 self.asm.emit(lsl_imm(X, T, T, 1));

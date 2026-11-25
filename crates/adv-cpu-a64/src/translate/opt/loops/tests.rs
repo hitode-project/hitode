@@ -920,3 +920,162 @@ fn wave2c_ir_slp_aos_ld2_ld1r_and_compact_window() {
         "address Add after Op::PageCross must be materialized, not folded/skipped"
     );
 }
+
+// spec: A64-OPT-4, A64-OPT-5, A64-OPT-6
+#[test]
+fn exact_int_reassoc_rejects_boundary_rounding_overflow_and_accepts_exact_fit() {
+    use crate::translate::opt::eval::{self, Outcome};
+    use crate::translate::opt::front::passes::fp_range;
+
+    let build_chain = |a_val: f64, is_single: bool| {
+        let mut f = Func::default();
+        let b0 = f.block(None);
+        let p = [
+            f.param(b0, Type::I32),
+            f.param(b0, Type::I32),
+            f.param(b0, Type::I32),
+        ];
+        let efl = f.param(b0, Type::Flags);
+        f.entry = vec![
+            Source::Reg(0),
+            Source::Reg(1),
+            Source::Reg(2),
+            Source::Eflags,
+        ];
+        let rec = f.record(IrRecord {
+            eip: 0,
+            refund: 0,
+            regs: [None; 8],
+            eflags: Some(Location::At(efl)),
+            flag_groups: Vec::new(),
+            x87: None,
+            xmm: [None; 8],
+            mmx: [None; 8],
+            mmx_meta: None,
+            frame: Vec::new(),
+        });
+        f.blocks[0].head = Some(Head { record: rec });
+        let a = f
+            .push(b0, Op::Constant(Type::F64, u128::from(a_val.to_bits())))
+            .unwrap();
+        let one = f.push(b0, Op::Constant(Type::I32, 1)).unwrap();
+        let mut bcd = [a; 3];
+        for i in 0..3 {
+            let bit = f.push(b0, Op::Int(IntOp::And, p[i], one)).unwrap();
+            bcd[i] = f.push(b0, Op::FromInt(bit)).unwrap();
+        }
+        let mk_add = |lhs, rhs| {
+            if is_single {
+                Op::X87Single(FpOp::Add, lhs, rhs, 0)
+            } else {
+                Op::Fp(FpOp::Add, lhs, rhs, false)
+            }
+        };
+        let s1 = f.push(b0, mk_add(a, bcd[0])).unwrap();
+        let s2 = f.push(b0, mk_add(s1, bcd[1])).unwrap();
+        let s3 = f.push(b0, mk_add(s2, bcd[2])).unwrap();
+        let mut exit_rec = f.records[rec.0 as usize].clone();
+        exit_rec.x87 = Some(crate::translate::opt::recovery::X87 {
+            top: 7,
+            valid: 1 << 7,
+            control: if is_single { 0x003f } else { 0x023f },
+            stack: [
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Location::At(s3)),
+            ],
+            status: 0x20,
+            c1: None,
+            ip: None,
+            opcode: None,
+        });
+        let exit = f.record(exit_rec);
+        f.end(b0, End::Exit(exit));
+        (f, s1, s2, s3, bcd)
+    };
+
+    let op_of = |f: &Func, v: Value| {
+        f.blocks[0]
+            .insts
+            .iter()
+            .find_map(|&(r, op)| (r == Some(v)).then_some(op))
+            .unwrap()
+    };
+
+    // 1) Binary64: a = 2^53, b/c/d in {0, 1}. Total max magnitude is 2^53 + 3 > 2^53.
+    // Reassociation MUST be rejected because ((2^53 + 1) + 1) + 1 == 2^53 while
+    // (2^53 + 1) + (1 + 1) == 2^53 + 2.
+    let two_53 = (1u64 << 53) as f64;
+    let (mut f_rej, _, s2_rej, s3_rej, bcd_rej) = build_chain(two_53, false);
+    fp_range::run(&mut f_rej);
+    assert!(
+        matches!(
+            op_of(&f_rej, s3_rej),
+            Op::Fp(FpOp::Add, lhs, rhs, _) if lhs == s2_rej && rhs == bcd_rej[2]
+        ),
+        "a = 2^53 with b/c/d in {{0,1}} MUST NOT reassociate, got {:?}",
+        op_of(&f_rej, s3_rej)
+    );
+    let mut mem = adv_cpu_core::Memory::new(0, 0x1000).unwrap();
+    let run_rej = eval::run(&f_rej, &[1, 1, 1, 0], &mut mem, 64);
+    assert!(matches!(run_rej.outcome, Outcome::Exit(_)));
+    let res = f64::from_bits(run_rej.values[s3_rej.0 as usize] as u64);
+    assert_eq!(
+        res.to_bits(),
+        two_53.to_bits(),
+        "((2^53 + 1) + 1) + 1 must remain 2^53, got {res}"
+    );
+
+    // 2) Binary64 exact boundary: a = 2^53 - 3, b/c/d in {0, 1}.
+    // Total max magnitude is exactly 2^53 <= 2^53, so reassociation IS accepted.
+    let (mut f_ok, s1_ok, s2_ok, s3_ok, bcd_ok) = build_chain(((1u64 << 53) - 3) as f64, false);
+    fp_range::run(&mut f_ok);
+    assert!(
+        matches!(
+            op_of(&f_ok, s3_ok),
+            Op::Fp(FpOp::Add, lhs, rhs, _) if lhs == s1_ok && rhs == s2_ok
+        ),
+        "a = 2^53 - 3 with b/c/d in {{0,1}} should reassociate, got {:?}",
+        op_of(&f_ok, s3_ok)
+    );
+    assert!(
+        matches!(
+            op_of(&f_ok, s2_ok),
+            Op::Fp(FpOp::Add, lhs, rhs, _) if lhs == bcd_ok[1] && rhs == bcd_ok[2]
+        ),
+        "expected balanced (c + d), got {:?}",
+        op_of(&f_ok, s2_ok)
+    );
+    let run_ok = eval::run(&f_ok, &[1, 1, 1, 0], &mut mem, 64);
+    assert!(matches!(run_ok.outcome, Outcome::Exit(_)));
+    let res_ok = f64::from_bits(run_ok.values[s3_ok.0 as usize] as u64);
+    assert_eq!(res_ok.to_bits(), two_53.to_bits());
+
+    // 3) Binary32 (Op::X87Single): a = 2^24 rejected, a = 2^24 - 3 accepted.
+    let two_24 = (1u64 << 24) as f64;
+    let (mut f32_rej, _, s2_32r, s3_32r, bcd_32r) = build_chain(two_24, true);
+    fp_range::run(&mut f32_rej);
+    assert!(
+        matches!(
+            op_of(&f32_rej, s3_32r),
+            Op::X87Single(FpOp::Add, lhs, rhs, _) if lhs == s2_32r && rhs == bcd_32r[2]
+        ),
+        "a = 2^24 with b/c/d in {{0,1}} MUST NOT reassociate, got {:?}",
+        op_of(&f32_rej, s3_32r)
+    );
+    let (mut f32_ok, s1_32o, s2_32o, s3_32o, _) = build_chain(((1u64 << 24) - 3) as f64, true);
+    fp_range::run(&mut f32_ok);
+    assert!(
+        matches!(
+            op_of(&f32_ok, s3_32o),
+            Op::X87Single(FpOp::Add, lhs, rhs, _) if lhs == s1_32o && rhs == s2_32o
+        ),
+        "a = 2^24 - 3 with b/c/d in {{0,1}} should reassociate, got {:?}",
+        op_of(&f32_ok, s3_32o)
+    );
+}

@@ -4235,3 +4235,235 @@ fn wave2c_a64_mem1_guard_band_folding_ldp_stp_wraparound_and_compact() {
         assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
     });
 }
+
+// spec: A64-OPT-4, A64-OPT-6, A64F-FP-7
+#[test]
+fn resident_x87_pc24_directed_rounding_overflow_does_not_saturate_to_f32_max() {
+    let mul_loop = Image::loop_body(|a, head, _| {
+        a.fld(dword_ptr(esi)).unwrap();
+        a.fmul(dword_ptr(esi + 4)).unwrap();
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+    });
+    let two_127 = 2.0f32.powi(127);
+    let two_128 = 2.0f64.powi(128);
+    type Row = (f32, f32, f64);
+    let mul_cases: &[(u16, &str, [Row; 3])] = &[
+        (
+            0x0c7f,
+            "PC24+RZ",
+            [
+                (2.0, 3.0, 6.0),
+                (two_127, 2.0, two_128),
+                (-two_127, 2.0, -two_128),
+            ],
+        ),
+        (
+            0x047f,
+            "PC24+RD",
+            [
+                (2.0, 3.0, 6.0),
+                (-two_127, 2.0, -two_128),
+                (two_127, 2.0, two_128),
+            ],
+        ),
+        (
+            0x087f,
+            "PC24+RU",
+            [
+                (2.0, 3.0, 6.0),
+                (two_127, 2.0, two_128),
+                (-two_127, 2.0, -two_128),
+            ],
+        ),
+    ];
+    for &(control, label, rows) in mul_cases {
+        let mut st = initial(rows.len() as u32);
+        st.x87.control = control;
+        st.x87.status = 0x20;
+        let mut trial = Trial::new(
+            &mul_loop,
+            &st,
+            format!("resident {label} mul overflow"),
+            &[],
+            |m| {
+                for (i, &(x, y, _)) in rows.iter().enumerate() {
+                    m.write(DATA + i as u32 * 8, &x.to_le_bytes()).unwrap();
+                    m.write(DATA + i as u32 * 8 + 4, &y.to_le_bytes()).unwrap();
+                }
+            },
+        );
+        assert!(trial.try_install_at(st.clone()));
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        assert!(
+            trial
+                .live
+                .native
+                .as_ref()
+                .unwrap()
+                .diagnostics
+                .resident_cold_exits
+                > 0,
+            "{label}: overflow must bail out of resident fast path"
+        );
+        for (i, &(_, _, expected)) in rows.iter().enumerate() {
+            let bytes: [u8; 8] = trial
+                .live
+                .memory
+                .read(OUTPUT + i as u32 * 8, 8)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let got = f64::from_le_bytes(bytes);
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "{label} row {i}: expected {expected:e}, got {got:e} (f32::MAX is {:e})",
+                f64::from(f32::MAX)
+            );
+        }
+    }
+
+    let add_loop = Image::loop_body(|a, head, _| {
+        a.fld(dword_ptr(esi)).unwrap();
+        a.fadd(dword_ptr(esi + 4)).unwrap();
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+    });
+    let ulp_max = 2.0f32.powi(104);
+    let add_cases: &[(u16, &str, [Row; 4])] = &[
+        (
+            0x087f,
+            "PC24+RU add",
+            [
+                (1.0, 2.0, 3.0),
+                (f32::MAX, 1.0, two_128),
+                (f32::MAX, ulp_max, two_128),
+                (-f32::MAX, -ulp_max, -two_128),
+            ],
+        ),
+        (
+            0x047f,
+            "PC24+RD add",
+            [
+                (1.0, 2.0, 3.0),
+                (f32::MAX, 1.0, f64::from(f32::MAX)),
+                (f32::MAX, ulp_max, two_128),
+                (-f32::MAX, -1.0, -two_128),
+            ],
+        ),
+        (
+            0x0c7f,
+            "PC24+RZ add",
+            [
+                (1.0, 2.0, 3.0),
+                (f32::MAX, 1.0, f64::from(f32::MAX)),
+                (f32::MAX, ulp_max, two_128),
+                (-f32::MAX, -ulp_max, -two_128),
+            ],
+        ),
+    ];
+    for &(control, label, rows) in add_cases {
+        let mut st = initial(rows.len() as u32);
+        st.x87.control = control;
+        st.x87.status = 0x20;
+        let mut trial = Trial::new(
+            &add_loop,
+            &st,
+            format!("resident {label} overflow"),
+            &[],
+            |m| {
+                for (i, &(x, y, _)) in rows.iter().enumerate() {
+                    m.write(DATA + i as u32 * 8, &x.to_le_bytes()).unwrap();
+                    m.write(DATA + i as u32 * 8 + 4, &y.to_le_bytes()).unwrap();
+                }
+            },
+        );
+        assert!(trial.try_install_at(st.clone()));
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        assert!(
+            trial
+                .live
+                .native
+                .as_ref()
+                .unwrap()
+                .diagnostics
+                .resident_cold_exits
+                > 0,
+            "{label}: overflow must bail out of resident fast path"
+        );
+        for (i, &(_, _, expected)) in rows.iter().enumerate() {
+            let bytes: [u8; 8] = trial
+                .live
+                .memory
+                .read(OUTPUT + i as u32 * 8, 8)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let got = f64::from_le_bytes(bytes);
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "{label} row {i}: expected {expected:e}, got {got:e}"
+            );
+        }
+    }
+
+    // Also verify PC53 directed rounding overflow (2^1023 * 2 = 2^1024 in x87 80-bit)
+    // does not saturate to f64::MAX.
+    let pc53_mul = Image::loop_body(|a, head, _| {
+        a.fstp(st0).unwrap();
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fmul(qword_ptr(esi + 8)).unwrap();
+        a.add(esi, 16).unwrap();
+        latch(a, head);
+    });
+    let two_1023 = f64::from_bits(0x7fe0_0000_0000_0000);
+    for &(control, x, y, label) in &[
+        (0x0e7fu16, two_1023, 2.0f64, "PC53+RZ"),
+        (0x067f, two_1023, 2.0, "PC53+RD"),
+        (0x0a7f, -two_1023, 2.0, "PC53+RU"),
+    ] {
+        let mut st = initial(2);
+        st.x87.control = control;
+        st.x87.status = 0x20;
+        st.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+        let mut trial = Trial::new(
+            &pc53_mul,
+            &st,
+            format!("resident {label} mul overflow"),
+            &[],
+            |m| {
+                m.write(DATA, &2.0f64.to_le_bytes()).unwrap();
+                m.write(DATA + 8, &3.0f64.to_le_bytes()).unwrap();
+                m.write(DATA + 16, &x.to_le_bytes()).unwrap();
+                m.write(DATA + 24, &y.to_le_bytes()).unwrap();
+            },
+        );
+        assert!(trial.try_install_at(st.clone()));
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        assert!(
+            trial
+                .live
+                .native
+                .as_ref()
+                .unwrap()
+                .diagnostics
+                .resident_cold_exits
+                > 0,
+            "{label}: overflow must bail out of resident fast path"
+        );
+        let top = ((trial.live.state.x87.status >> 11) & 7) as usize;
+        let top_val = trial.live.state.x87.regs[top];
+        let sign = if x.is_sign_negative() { 0x8000u16 } else { 0 };
+        let expected_reg = adv_cpu_core::X87Register::from_parts(1 << 63, sign | (0x3fff + 1024));
+        assert_eq!(
+            top_val, expected_reg,
+            "{label}: expected 80-bit ±2^1024 ({expected_reg:?}), got {top_val:?}"
+        );
+    }
+}

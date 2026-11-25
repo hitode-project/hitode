@@ -2154,6 +2154,20 @@ fn prove_finite_domain(
     })
 }
 
+/// Returns an exact integer upper bound `<= 2^53` on `|x|` when `f` is
+/// statically proved to be a finite, non-negative-zero exact integer
+/// (`dyadic_q >= 0`) with `|x| <= 2^53`.
+fn exact_int_max_abs_u128(f: FpFact) -> Option<u128> {
+    if !f.finite || f.may_be_neg_zero || !f.dyadic_q.is_some_and(|q| q >= 0) {
+        return None;
+    }
+    let max_abs = f.max_abs();
+    if !max_abs.is_finite() || max_abs < 0.0 || max_abs > (1u64 << 53) as f64 {
+        return None;
+    }
+    Some(max_abs.ceil() as u128)
+}
+
 /// Reassociates left-linear intra-block FP addition chains `(((a + b) + c) + d)`
 /// into balanced trees `(a + b) + (c + d)` ONLY when every leaf is statically
 /// proved to be a non-negative-zero exact integer (`dyadic_q >= 0`,
@@ -2192,14 +2206,7 @@ fn reassociate_exact_integer_sums(func: &mut Func, fp_facts: &[Option<FpFact>]) 
         }
     }
 
-    let is_exact_int_leaf = |v: Value| -> Option<f64> {
-        let f = get_fp(v);
-        if f.finite && !f.may_be_neg_zero && f.dyadic_q.is_some_and(|q| q >= 0) {
-            Some(f.max_abs())
-        } else {
-            None
-        }
-    };
+    let is_exact_int_leaf = |v: Value| -> Option<u128> { exact_int_max_abs_u128(get_fp(v)) };
 
     let mut changed = false;
     for block in &mut func.blocks {
@@ -2297,13 +2304,9 @@ fn reassociate_exact_integer_sums(func: &mut Func, fp_facts: &[Option<FpFact>]) 
             ) else {
                 continue;
             };
-            let limit = if is_single {
-                (1u64 << 24) as f64
-            } else {
-                (1u64 << 53) as f64
-            };
-            let total_mag = ma + mb + mc + md;
-            if !total_mag.is_finite() || total_mag > limit {
+            let limit: u128 = if is_single { 1u128 << 24 } else { 1u128 << 53 };
+            let total_mag = ma.saturating_add(mb).saturating_add(mc).saturating_add(md);
+            if total_mag > limit {
                 continue;
             }
             // Rewrite `s2 = s1 + c; root = s2 + d` into `s2 = c + d; root = s1 + s2`.
@@ -2430,18 +2433,18 @@ pub(in crate::translate::opt) fn run(func: &mut Func) -> bool {
     changed
 }
 
-/// Returns per-value static exact-integer proofs (`Some((max_abs, binary32_exact))`)
-/// for `Type::F64` values proved finite, exact integer (`dyadic_q >= 0`), and
-/// never `-0.0`, for exact integer-proven loop reduction reassociation.
-pub(crate) fn exact_integer_facts(func: &Func) -> Vec<Option<(f64, bool)>> {
+/// Returns per-value static exact-integer proofs (`Some((max_abs_u128, binary32_exact))`)
+/// for `Type::F64` values proved finite, exact integer (`dyadic_q >= 0`),
+/// within `|x| <= 2^53`, and never `-0.0`, for exact integer-proven loop
+/// reduction reassociation.
+pub(crate) fn exact_integer_facts(func: &Func) -> Vec<Option<(u128, bool)>> {
     let defs = super::definitions(func);
     let (_, fp_facts) = analyze_fixpoint(func, &defs, &DomainSeeds::default());
     fp_facts
         .into_iter()
         .map(|fact| {
             let f = fact?;
-            (f.finite && !f.may_be_neg_zero && f.dyadic_q.is_some_and(|q| q >= 0))
-                .then(|| (f.max_abs(), f.binary32_exact))
+            exact_int_max_abs_u128(f).map(|max_abs| (max_abs, f.binary32_exact))
         })
         .collect()
 }
