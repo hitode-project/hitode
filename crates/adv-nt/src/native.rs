@@ -600,14 +600,29 @@ fn run_full(
     });
     let mut scratch = std::mem::take(&mut env.ext.get_or_default::<FullScratch>().0);
     let services = env.sys.services(env.ext);
-    let result = (body.full)(
-        &mut GuestMem::for_body(env.cpu, &mut scratch, services),
-        inputs,
-    );
+    let (result, raised_mxcsr) = {
+        let mut guest_mem = GuestMem::for_body(env.cpu, &mut scratch, services);
+        let result = (body.full)(&mut guest_mem, inputs);
+        (result, guest_mem.mxcsr_flags())
+    };
     env.ext.get_or_default::<FullScratch>().0 = scratch;
     let outputs = body.direct.outputs;
     match result {
         Ok(ret) => {
+            if outputs & adv_cpu::body::MXCSR != 0 && raised_mxcsr != 0 {
+                let mut fp = env
+                    .cpu
+                    .fpu_environment()
+                    .expect("body CPU has SSE controls");
+                let updated = fp.mxcsr | (raised_mxcsr & 0x3f);
+                if updated != fp.mxcsr {
+                    fp.mxcsr = updated;
+                    match env.cpu.set_fpu_environment(fp) {
+                        Ok(()) | Err(adv_cpu::backend::FpuEnvironmentError::Unsupported) => {}
+                        Err(error) => panic!("body MXCSR sticky flags are valid: {error}"),
+                    }
+                }
+            }
             if outputs & ECX != 0 {
                 env.cpu.set_reg(Reg::Ecx, ret.ecx);
             }

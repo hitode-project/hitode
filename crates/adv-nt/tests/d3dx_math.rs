@@ -132,33 +132,49 @@ fn build_machine(dist: &Path, dll_name: &str, jit: bool) -> (Machine<Cpu>, Pe) {
     (m, d3dx)
 }
 
-/// Emit a stdcall harness for `argc` dword arguments and invoke `entry`.
-fn call_stdcall(
+/// Emit a stdcall harness for `argc` dword arguments and invoke `entry` under `mxcsr`.
+/// Returns `(eax, esp_delta, post_mxcsr, data_after)`.
+fn call_stdcall_mxcsr(
     m: &mut Machine<Cpu>,
     entry: u32,
     args: &[u32],
     data_before: &[u8],
-) -> Result<(u32, u32, Vec<u8>), String> {
+    mxcsr: u32,
+) -> Result<(u32, u32, u32, Vec<u8>), String> {
+    const MXCSR_IN: u32 = RESULT + 8;
+    const MXCSR_OUT: u32 = RESULT + 12;
+    const MXCSR_DEFAULT: u32 = RESULT + 16;
+
     m.cpu.write(DATA, data_before).unwrap();
     m.cpu.write_u32(SLOT, entry).unwrap();
+    m.cpu.write_u32(MXCSR_IN, mxcsr).unwrap();
+    m.cpu.write_u32(MXCSR_OUT, 0).unwrap();
+    m.cpu.write_u32(MXCSR_DEFAULT, 0x1f80).unwrap();
     for (i, &arg) in args.iter().enumerate() {
         m.cpu.write_u32(ARGS + (i as u32) * 4, arg).unwrap();
     }
     let mut code = Vec::new();
     // Save initial ESP in ESI so we can check callee popped `argc * 4` bytes.
     code.extend_from_slice(&[0x89, 0xe6]); // mov esi, esp
+    // ldmxcsr [MXCSR_IN]
+    code.extend_from_slice(&[0x0f, 0xae, 0x15]);
+    code.extend_from_slice(&MXCSR_IN.to_le_bytes());
     for i in (0..args.len()).rev() {
         code.extend_from_slice(&[0xff, 0x35]);
         code.extend_from_slice(&(ARGS + (i as u32) * 4).to_le_bytes());
     }
     code.extend_from_slice(&[0xff, 0x15]);
     code.extend_from_slice(&SLOT.to_le_bytes());
-    // EAX -> RESULT, (ESP - ESI) -> RESULT + 4
+    // EAX -> RESULT, (ESP - ESI) -> RESULT + 4, post MXCSR -> MXCSR_OUT
     code.push(0xa3);
     code.extend_from_slice(&RESULT.to_le_bytes());
     code.extend_from_slice(&[0x29, 0xf4]); // sub esp, esi
     code.extend_from_slice(&[0x89, 0x25]);
     code.extend_from_slice(&(RESULT + 4).to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0xae, 0x1d]); // stmxcsr [MXCSR_OUT]
+    code.extend_from_slice(&MXCSR_OUT.to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0xae, 0x15]); // ldmxcsr [MXCSR_DEFAULT]
+    code.extend_from_slice(&MXCSR_DEFAULT.to_le_bytes());
     code.extend_from_slice(&[0x89, 0xf4]); // mov esp, esi
     code.push(0xc3);
     m.cpu.write(CODE, &code).unwrap();
@@ -171,8 +187,20 @@ fn call_stdcall(
     }
     let eax = m.cpu.read_u32(RESULT).unwrap();
     let esp_delta = m.cpu.read_u32(RESULT + 4).unwrap();
+    let post_mxcsr = m.cpu.read_u32(MXCSR_OUT).unwrap();
     let mut out = vec![0u8; data_before.len()];
     m.cpu.read(DATA, &mut out).unwrap();
+    Ok((eax, esp_delta, post_mxcsr, out))
+}
+
+/// Emit a stdcall harness for `argc` dword arguments and invoke `entry` under default MXCSR.
+fn call_stdcall(
+    m: &mut Machine<Cpu>,
+    entry: u32,
+    args: &[u32],
+    data_before: &[u8],
+) -> Result<(u32, u32, Vec<u8>), String> {
+    let (eax, esp_delta, _, out) = call_stdcall_mxcsr(m, entry, args, data_before, 0x1f80)?;
     Ok((eax, esp_delta, out))
 }
 
@@ -207,25 +235,50 @@ fn ulp_diff_f32(a: f32, b: f32) -> Option<u32> {
     if a == 0.0 && b == 0.0 {
         return Some(0);
     }
-    let ordered = |v: f32| -> i32 {
-        let bits = v.to_bits() as i32;
-        if bits < 0 { i32::MIN - bits } else { bits }
+    let ordered = |v: f32| -> i64 {
+        let bits = v.to_bits();
+        if bits & 0x8000_0000 != 0 {
+            -((bits & 0x7fff_ffff) as i64)
+        } else {
+            bits as i64
+        }
     };
-    Some(ordered(a).abs_diff(ordered(b)))
+    Some(ordered(a).abs_diff(ordered(b)) as u32)
+}
+
+/// Per-function ULP bound per A64F-FP-10: 2 ULP for scalar functions, 4 ULP
+/// for compound vector/matrix/quaternion functions.
+fn max_ulp_for(name: &str) -> u32 {
+    match name {
+        "D3DXColorAdjustContrast"
+        | "D3DXMatrixOrthoLH"
+        | "D3DXMatrixOrthoRH"
+        | "D3DXMatrixOrthoOffCenterLH"
+        | "D3DXMatrixOrthoOffCenterRH"
+        | "D3DXMatrixPerspectiveFovLH"
+        | "D3DXMatrixPerspectiveFovRH"
+        | "D3DXMatrixPerspectiveLH"
+        | "D3DXMatrixPerspectiveRH"
+        | "D3DXMatrixPerspectiveOffCenterLH"
+        | "D3DXMatrixPerspectiveOffCenterRH"
+        | "D3DXMatrixRotationX"
+        | "D3DXMatrixRotationY"
+        | "D3DXMatrixRotationZ"
+        | "D3DXMatrixScaling"
+        | "D3DXMatrixTranslation"
+        | "D3DXMatrixTranspose"
+        | "D3DXQuaternionToAxisAngle" => 2,
+        _ => 4,
+    }
 }
 
 fn assert_f32s_within_ulp(label: &str, actual: &[f32], expected: &[f32], max_ulp: u32) {
     assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
     for (i, (&a, &b)) in actual.iter().zip(expected.iter()).enumerate() {
-        // Near-zero cancellation (e.g. cos(pi/2) or orthogonal cross terms) can
-        // produce values around 1e-7 where ULP scales with 1e-14; allow tiny
-        // absolute residual <= 4 * f32::EPSILON when exact value is near zero.
         let ulp = ulp_diff_f32(a, b);
-        let ok = ulp.is_some_and(|u| u <= max_ulp)
-            || (a.is_finite() && b.is_finite() && (a - b).abs() <= 4.0 * f32::EPSILON);
         assert!(
-            ok,
-            "{label}[{i}]: actual={a:?} ({:#010x}) expected={b:?} ({:#010x}) ulp={ulp:?}",
+            ulp.is_some_and(|u| u <= max_ulp),
+            "{label}[{i}]: actual={a:?} ({:#010x}) expected={b:?} ({:#010x}) ulp={ulp:?} max_ulp={max_ulp}",
             a.to_bits(),
             b.to_bits()
         );
@@ -827,7 +880,7 @@ fn d3dx9_math_bodies_bind_and_match_wine_within_ulp_bounds() {
             name,
             &read_f32s(&nat_mem, off, count),
             &read_f32s(&ref_mem, off, count),
-            4,
+            max_ulp_for(name),
         );
     }
     assert_eq!(adv_nt::native::declines(&native.ext), 0);
@@ -844,4 +897,279 @@ fn d3dx9_math_bodies_bind_and_match_wine_within_ulp_bounds() {
     let fault = call_stdcall(&mut native, entry, &[DATA + DATA_LEN, m1, m2], &mem).unwrap_err();
     let expected = format!("Fault {{ kind: Write({}), pc: {entry} }}", DATA + DATA_LEN);
     assert!(fault.contains(&expected), "unexpected fault: {fault}");
+}
+
+// spec: A64F-FP-5, A64F-FP-10
+#[test]
+fn d3dx9_math_bodies_honor_mxcsr_rounding_sticky_flags_daz_ftz_and_unmasked_xm() {
+    let Some(dist) = wine::dist() else {
+        return;
+    };
+    let (mut native, d3dx) = build_machine(&dist, "d3dx9_43.dll", true);
+    let (mut reference, _) = build_machine(&dist, "d3dx9_43.dll", false);
+    reference.sys.redirects.clear();
+    reference.sys.direct_bodies.clear();
+
+    let vec4_xform = export_addr(&d3dx, "D3DXVec4Transform");
+    let vec4_array = export_addr(&d3dx, "D3DXVec4TransformArray");
+    let ortho_off = export_addr(&d3dx, "D3DXMatrixOrthoOffCenterLH");
+
+    let out0 = DATA;
+    let v_at = DATA + 0x100;
+    let m_at = DATA + 0x200;
+
+    // 1. Rounding modes (0x1f80 RN, 0x3f80 RD, 0x5f80 RU, 0x7f80 RZ) on (1 + 2^-24) - 1:
+    // Under RU (0x5f80), 1 + 2^-24 rounds up to 1 + 2^-23, minus 1 = 2^-23, and PE (0x20) is set.
+    // Under RN/RD/RZ, 1 + 2^-24 rounds to 1.0, minus 1 = 0.0, and PE (0x20) is set.
+    let mut mem = vec![0u8; DATA_LEN as usize];
+    write_f32s(
+        &mut mem,
+        0x100,
+        &[1.0, f32::from_bits(0x3380_0000), -1.0, 0.0],
+    );
+    write_f32s(
+        &mut mem,
+        0x200,
+        &[
+            1.0, 0.0, 0.0, 0.0, //
+            1.0, 0.0, 0.0, 0.0, //
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0,
+        ],
+    );
+
+    let declines_before = adv_nt::native::declines(&native.ext);
+    for (mxcsr, expected_x, expected_mxcsr) in [
+        (0x1f80u32, 0.0f32, 0x1fa0u32),
+        (0x3f80u32, -0.0f32, 0x3fa0u32), // IEEE-754 RD: 1.0 + (-1.0) = -0.0
+        (0x5f80u32, f32::EPSILON, 0x5fa0u32),
+        (0x7f80u32, 0.0f32, 0x7fa0u32),
+    ] {
+        let (nat_eax, _, nat_mxcsr, nat_mem) =
+            call_stdcall_mxcsr(&mut native, vec4_xform, &[out0, v_at, m_at], &mem, mxcsr).unwrap();
+        let (ref_eax, _, ref_mxcsr, ref_mem) =
+            call_stdcall_mxcsr(&mut reference, vec4_xform, &[out0, v_at, m_at], &mem, mxcsr)
+                .unwrap();
+        assert_eq!(nat_eax, ref_eax);
+        let nat_out = read_f32s(&nat_mem, 0, 4);
+        let ref_out = read_f32s(&ref_mem, 0, 4);
+        assert_eq!(
+            nat_out[0].to_bits(),
+            expected_x.to_bits(),
+            "MXCSR={mxcsr:#x}: native={:?} ref={:?}",
+            nat_out[0],
+            ref_out[0]
+        );
+        assert_eq!(
+            nat_out[0].to_bits(),
+            ref_out[0].to_bits(),
+            "MXCSR={mxcsr:#x} mismatch vs Wine"
+        );
+        assert_eq!(
+            nat_mxcsr, expected_mxcsr,
+            "MXCSR={mxcsr:#x}: post native={nat_mxcsr:#x} ref={ref_mxcsr:#x}"
+        );
+        assert_eq!(
+            nat_mxcsr, ref_mxcsr,
+            "MXCSR={mxcsr:#x}: post MXCSR mismatch vs Wine"
+        );
+
+        // Same check on D3DXVec4TransformArray (single element).
+        let (_, _, arr_nat_mxcsr, arr_nat_mem) = call_stdcall_mxcsr(
+            &mut native,
+            vec4_array,
+            &[out0, 16, v_at, 16, m_at, 1],
+            &mem,
+            mxcsr,
+        )
+        .unwrap();
+        let (_, _, arr_ref_mxcsr, arr_ref_mem) = call_stdcall_mxcsr(
+            &mut reference,
+            vec4_array,
+            &[out0, 16, v_at, 16, m_at, 1],
+            &mem,
+            mxcsr,
+        )
+        .unwrap();
+        assert_eq!(
+            read_f32s(&arr_nat_mem, 0, 4)[0].to_bits(),
+            read_f32s(&arr_ref_mem, 0, 4)[0].to_bits(),
+            "Array MXCSR={mxcsr:#x}"
+        );
+        assert_eq!(
+            arr_nat_mxcsr, arr_ref_mxcsr,
+            "Array MXCSR={mxcsr:#x}: post MXCSR mismatch"
+        );
+    }
+
+    // 7-argument direct body (Input::Args + Input::Mxcsr): verify sticky PE & rounding.
+    let fb = f32::to_bits;
+    let (_, _, nat_7_mxcsr, nat_7_mem) = call_stdcall_mxcsr(
+        &mut native,
+        ortho_off,
+        &[out0, fb(0.0), fb(3.0), fb(0.0), fb(7.0), fb(1.0), fb(10.0)],
+        &mem,
+        0x5f80,
+    )
+    .unwrap();
+    let (_, _, ref_7_mxcsr, ref_7_mem) = call_stdcall_mxcsr(
+        &mut reference,
+        ortho_off,
+        &[out0, fb(0.0), fb(3.0), fb(0.0), fb(7.0), fb(1.0), fb(10.0)],
+        &mem,
+        0x5f80,
+    )
+    .unwrap();
+    assert_f32s_within_ulp(
+        "D3DXMatrixOrthoOffCenterLH(RU)",
+        &read_f32s(&nat_7_mem, 0, 16),
+        &read_f32s(&ref_7_mem, 0, 16),
+        2,
+    );
+    assert_eq!(nat_7_mxcsr, ref_7_mxcsr, "7-arg body post MXCSR mismatch");
+    assert_eq!(
+        adv_nt::native::declines(&native.ext),
+        declines_before,
+        "masked rounding modes must execute directly without declining"
+    );
+
+    // 2. DAZ (0x1fc0) and FTZ (0x9f80): subnormal input and subnormal output.
+    let mut sub_mem = vec![0u8; DATA_LEN as usize];
+    let subnormal = f32::from_bits(0x0040_0000); // 2^-127 (subnormal)
+    let min_normal = f32::from_bits(0x0080_0000); // 2^-126 (smallest normal)
+    write_f32s(&mut sub_mem, 0x100, &[subnormal, min_normal, 0.0, 0.0]);
+    write_f32s(
+        &mut sub_mem,
+        0x200,
+        &[
+            1.0, 0.0, 0.0, 0.0, // col 0: subnormal * 1.0 (tests DAZ)
+            0.0, 0.5, 0.0, 0.0, // col 1: min_normal * 0.5 = 2^-127 (tests FTZ)
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ],
+    );
+    for mxcsr in [0x1fc0u32, 0x9f80u32, 0x9fc0u32] {
+        let (_, _, nat_mxcsr, nat_mem) = call_stdcall_mxcsr(
+            &mut native,
+            vec4_xform,
+            &[out0, v_at, m_at],
+            &sub_mem,
+            mxcsr,
+        )
+        .unwrap();
+        let (_, _, ref_mxcsr, ref_mem) = call_stdcall_mxcsr(
+            &mut reference,
+            vec4_xform,
+            &[out0, v_at, m_at],
+            &sub_mem,
+            mxcsr,
+        )
+        .unwrap();
+        let nat_out = read_f32s(&nat_mem, 0, 4);
+        let ref_out = read_f32s(&ref_mem, 0, 4);
+        for i in 0..4 {
+            assert_eq!(
+                nat_out[i].to_bits(),
+                ref_out[i].to_bits(),
+                "DAZ/FTZ MXCSR={mxcsr:#x} lane {i}"
+            );
+        }
+        assert_eq!(
+            nat_mxcsr, ref_mxcsr,
+            "DAZ/FTZ MXCSR={mxcsr:#x} post MXCSR mismatch"
+        );
+    }
+
+    // 3. Unmasked PE (0x0f80 -> PM=0): must decline to Wine guest code and raise #XM.
+    let declines_before_xm = adv_nt::native::declines(&native.ext);
+    let nat_err =
+        call_stdcall_mxcsr(&mut native, vec4_xform, &[out0, v_at, m_at], &mem, 0x0f80).unwrap_err();
+    let ref_err = call_stdcall_mxcsr(
+        &mut reference,
+        vec4_xform,
+        &[out0, v_at, m_at],
+        &mem,
+        0x0f80,
+    )
+    .unwrap_err();
+    assert!(
+        adv_nt::native::declines(&native.ext) > declines_before_xm,
+        "unmasked MXCSR must decline to guest code"
+    );
+    assert_eq!(
+        nat_err, ref_err,
+        "unmasked #XM must match Wine fault and PC exactly"
+    );
+    assert!(
+        nat_err.contains("Trap { vector: 19"),
+        "expected #XM (vector 19): {nat_err}"
+    );
+}
+
+// spec: A64F-FP-10, NAT-BODY-18
+#[test]
+fn d3dx9_array_transforms_match_wine_when_output_overlaps_matrix() {
+    let Some(dist) = wine::dist() else {
+        return;
+    };
+    let (mut native, d3dx) = build_machine(&dist, "d3dx9_43.dll", true);
+    let (mut reference, _) = build_machine(&dist, "d3dx9_43.dll", false);
+    reference.sys.redirects.clear();
+    reference.sys.direct_bodies.clear();
+
+    let m_at = DATA + 0x200;
+    let in_at = DATA + 0x300;
+    let identity: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0,
+    ];
+
+    let mut mem = vec![0u8; DATA_LEN as usize];
+    write_f32s(&mut mem, 0x200, &identity);
+    write_f32s(&mut mem, 0x300, &[2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0]);
+
+    // Exact repro: D3DXVec4TransformArray with out == matrix, stride 16 -> [(2,0,0,0), (4,0,0,0)].
+    let vec4_arr = export_addr(&d3dx, "D3DXVec4TransformArray");
+    let (_, _, nat_mem) =
+        call_stdcall(&mut native, vec4_arr, &[m_at, 16, in_at, 16, m_at, 2], &mem).unwrap();
+    let (_, _, ref_mem) = call_stdcall(
+        &mut reference,
+        vec4_arr,
+        &[m_at, 16, in_at, 16, m_at, 2],
+        &mem,
+    )
+    .unwrap();
+    let nat_v4 = read_f32s(&nat_mem, 0x200, 8);
+    let ref_v4 = read_f32s(&ref_mem, 0x200, 8);
+    assert_eq!(nat_v4, vec![2.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0]);
+    assert_eq!(nat_v4, ref_v4);
+
+    // Check Vec2, Vec3, and Plane array variants with both contiguous and strided out overlapping m.
+    let cases: &[(&str, u32, u32, usize)] = &[
+        ("D3DXPlaneTransformArray", 16, 16, 8),
+        ("D3DXVec2TransformArray", 16, 16, 8),
+        ("D3DXVec2TransformCoordArray", 8, 16, 4),
+        ("D3DXVec2TransformNormalArray", 8, 16, 4),
+        ("D3DXVec3TransformArray", 16, 16, 8),
+        ("D3DXVec3TransformCoordArray", 12, 16, 6),
+        ("D3DXVec3TransformNormalArray", 12, 16, 6),
+        // Strided (non-contiguous) overlap with matrix:
+        ("D3DXVec4TransformArray", 32, 16, 12),
+        ("D3DXVec3TransformCoordArray", 24, 16, 12),
+    ];
+    for &(name, outstride, instride, check_floats) in cases {
+        let entry = export_addr(&d3dx, name);
+        let args = [m_at, outstride, in_at, instride, m_at, 2];
+        let (_, _, nat_mem) = call_stdcall(&mut native, entry, &args, &mem).unwrap();
+        let (_, _, ref_mem) = call_stdcall(&mut reference, entry, &args, &mem).unwrap();
+        assert_f32s_within_ulp(
+            &format!("{name}(overlap, outstride={outstride})"),
+            &read_f32s(&nat_mem, 0x200, check_floats),
+            &read_f32s(&ref_mem, 0x200, check_floats),
+            4,
+        );
+    }
+    assert_eq!(adv_nt::native::declines(&native.ext), 0);
 }

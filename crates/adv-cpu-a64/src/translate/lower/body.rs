@@ -15,7 +15,7 @@ const X17: Reg = Reg::new(17);
 
 pub(crate) fn emit_call(asm: &mut Asm, body: DirectBody, afp: bool) {
     let call = body.call as usize as u64;
-    let observes_fp = afp && body.reads_fp_state();
+    let observes_fp = afp && (body.reads_fp_state() || body.writes_mxcsr());
     let restore_fpcr = afp && !body.fp_clean;
     let isolate_fpsr = afp && !observes_fp && !body.fp_clean;
     let frame = if isolate_fpsr { 32 } else { 16 };

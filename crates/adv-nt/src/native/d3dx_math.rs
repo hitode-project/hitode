@@ -5,20 +5,26 @@
 //! stay within 2 ULP (scalar) and 4 ULP (compound) of binary32 with exact special
 //! values, aliasing safety, and checked memory accesses (A64-CALL-4, NAT-BODY-17).
 
-use adv_cpu::body::{EAX, Input, Mem, Ret, Stop};
+use adv_cpu::body::{EAX, Input, MXCSR, Mem, Ret, Stop};
 use adv_machine::Conv;
 
 use super::{Body, resume_original};
 
 const D3DERR_INVALIDCALL: u32 = 0x8876_086c;
 
-const IN2: &[Input] = &[Input::Stack(0), Input::Stack(1)];
-const IN3: &[Input] = &[Input::Stack(0), Input::Stack(1), Input::Stack(2)];
+const IN2: &[Input] = &[Input::Stack(0), Input::Stack(1), Input::Mxcsr];
+const IN3: &[Input] = &[
+    Input::Stack(0),
+    Input::Stack(1),
+    Input::Stack(2),
+    Input::Mxcsr,
+];
 const IN4: &[Input] = &[
     Input::Stack(0),
     Input::Stack(1),
     Input::Stack(2),
     Input::Stack(3),
+    Input::Mxcsr,
 ];
 const IN5: &[Input] = &[
     Input::Stack(0),
@@ -26,6 +32,7 @@ const IN5: &[Input] = &[
     Input::Stack(2),
     Input::Stack(3),
     Input::Stack(4),
+    Input::Mxcsr,
 ];
 const IN6: &[Input] = &[
     Input::Stack(0),
@@ -34,16 +41,196 @@ const IN6: &[Input] = &[
     Input::Stack(3),
     Input::Stack(4),
     Input::Stack(5),
+    Input::Mxcsr,
 ];
-const IN7: &[Input] = &[
-    Input::Stack(0),
-    Input::Stack(1),
-    Input::Stack(2),
-    Input::Stack(3),
-    Input::Stack(4),
-    Input::Stack(5),
-    Input::Stack(6),
-];
+const IN7_ARGS: &[Input] = &[Input::Args, Input::Mxcsr];
+
+/// All six x86 SSE exception mask bits (`PM|UM|OM|ZM|DM|IM`).
+const MXCSR_ALL_MASKED: u32 = 0x1f80;
+/// x86 `MXCSR.DAZ` (bit 6) and `MXCSR.FTZ` (bit 15).
+const MXCSR_DAZ_FTZ: u32 = 0x8040;
+
+#[cfg(target_arch = "aarch64")]
+const FPCR_FIZ: u64 = 1 << 0;
+#[cfg(target_arch = "aarch64")]
+const FPCR_AH: u64 = 1 << 1;
+#[cfg(target_arch = "aarch64")]
+const FPCR_NEP: u64 = 1 << 2;
+#[cfg(target_arch = "aarch64")]
+const FPCR_RMODE_SHIFT: u64 = 22;
+#[cfg(target_arch = "aarch64")]
+const FPCR_FZ: u64 = 1 << 24;
+#[cfg(target_arch = "aarch64")]
+const FPCR_DN: u64 = 1 << 25;
+
+/// Verifies that the host can faithfully execute binary32 math under guest
+/// `mxcsr`. Declines to guest code (`Stop::Guest`, which surfaces as `SLOW` on
+/// the `Window` path and runs Wine's x86 implementation on the full path) when
+/// any SSE exception is unmasked or when DAZ/FTZ is requested without hardware
+/// `FEAT_AFP`.
+#[inline]
+fn check_guest_mxcsr(mxcsr: u32) -> Result<(), Stop> {
+    if mxcsr & MXCSR_ALL_MASKED != MXCSR_ALL_MASKED {
+        return Err(Stop::Guest);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let has_afp = adv_cpu::HostFeatures::get().contains(adv_cpu::HostFeatures::AFP);
+        if !has_afp && (mxcsr & MXCSR_DAZ_FTZ != 0) {
+            return Err(Stop::Guest);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = MXCSR_DAZ_FTZ;
+        Err(Stop::Guest)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn fpcr_for_guest(mxcsr: u32, saved_fpcr: u64, has_afp: bool) -> u64 {
+    let rmode: u64 = match (mxcsr >> 13) & 3 {
+        0 => 0, // RN
+        1 => 2, // RD (-Inf) -> RM
+        2 => 1, // RU (+Inf) -> RP
+        _ => 3, // RZ (0) -> RZ
+    };
+    if has_afp {
+        let fiz = u64::from((mxcsr >> 6) & 1);
+        let fz = u64::from((mxcsr >> 15) & 1);
+        FPCR_AH | fiz | (rmode << FPCR_RMODE_SHIFT) | (fz << 24)
+    } else {
+        let clear = (3u64 << FPCR_RMODE_SHIFT) | FPCR_FZ | FPCR_DN | FPCR_AH | FPCR_FIZ | FPCR_NEP;
+        (saved_fpcr & !clear) | (rmode << FPCR_RMODE_SHIFT)
+    }
+}
+
+/// Maps AArch64 hardware `FPSR` sticky bits `{IOC=0, DZC=1, OFC=2, UFC=3, IXC=4, IDC=7}`
+/// to x86 `MXCSR[5:0]` `{IE=0, DE=1, ZE=2, OE=3, UE=4, PE=5}`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+const fn fpsr_to_mxcsr_flags(fpsr: u64) -> u32 {
+    let f = fpsr as u32;
+    (f & 0x01) | ((f & 0x1e) << 1) | (((f >> 7) & 1) << 1)
+}
+
+#[cfg(target_arch = "aarch64")]
+struct FpGuard {
+    saved_fpcr: u64,
+    active: bool,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl FpGuard {
+    #[inline]
+    fn enter(mxcsr: u32) -> Result<Self, Stop> {
+        check_guest_mxcsr(mxcsr)?;
+        let has_afp = adv_cpu::HostFeatures::get().contains(adv_cpu::HostFeatures::AFP);
+        let saved_fpcr: u64;
+        // SAFETY: reading FPCR in EL0 is always valid.
+        unsafe {
+            std::arch::asm!(
+                "mrs {saved}, fpcr",
+                saved = out(reg) saved_fpcr,
+                options(nostack, preserves_flags),
+            );
+        }
+        let target = fpcr_for_guest(mxcsr, saved_fpcr, has_afp);
+        // SAFETY: setting guest-synced FPCR (always restored in `finish`/`Drop`)
+        // and clearing FPSR (caller already folded lazy SSE FPSR) in EL0.
+        unsafe {
+            std::arch::asm!(
+                "msr fpcr, {target}",
+                "msr fpsr, xzr",
+                target = in(reg) target,
+                options(nostack, preserves_flags),
+            );
+        }
+        Ok(Self {
+            saved_fpcr,
+            active: true,
+        })
+    }
+
+    #[inline]
+    fn finish(mut self) -> u32 {
+        let fpsr: u64;
+        // SAFETY: reading FPSR and restoring caller's saved FPCR in EL0.
+        unsafe {
+            std::arch::asm!(
+                "mrs {fpsr}, fpsr",
+                "msr fpcr, {saved}",
+                fpsr = out(reg) fpsr,
+                saved = in(reg) self.saved_fpcr,
+                options(nostack, preserves_flags),
+            );
+        }
+        self.active = false;
+        fpsr_to_mxcsr_flags(fpsr)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Drop for FpGuard {
+    #[inline]
+    fn drop(&mut self) {
+        if self.active {
+            // SAFETY: restoring caller's saved FPCR on early exit or unwind.
+            unsafe {
+                std::arch::asm!(
+                    "msr fpcr, {saved}",
+                    saved = in(reg) self.saved_fpcr,
+                    options(nostack, preserves_flags),
+                );
+            }
+            self.active = false;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+struct FpGuard;
+
+#[cfg(not(target_arch = "aarch64"))]
+impl FpGuard {
+    #[inline]
+    fn enter(mxcsr: u32) -> Result<Self, Stop> {
+        check_guest_mxcsr(mxcsr)?;
+        Ok(Self)
+    }
+
+    #[inline]
+    fn finish(self) -> u32 {
+        0
+    }
+}
+
+/// Runs pure floating-point math `f` under synced host `FPCR` for guest `mxcsr`,
+/// restoring caller `FPCR` before returning and returning the raised `MXCSR[5:0]`
+/// sticky exception flags.
+#[inline]
+fn run_guest_fp<T>(mxcsr: u32, f: impl FnOnce() -> T) -> Result<(T, u32), Stop> {
+    let guard = FpGuard::enter(mxcsr)?;
+    // `black_box` on `f` and its result establishes an opaque compiler data
+    // dependency between `FpGuard::enter` (`msr fpcr`/`msr fpsr`) and
+    // `FpGuard::finish` (`mrs fpsr`/`msr fpcr`) so LLVM cannot hoist or sink
+    // pure FP ops outside the synced FPCR/FPSR window.
+    let f = std::hint::black_box(f);
+    let out = std::hint::black_box(f());
+    let raised = guard.finish();
+    Ok((out, raised))
+}
+
+#[inline]
+fn read_args7<M: Mem>(mem: &mut M, args_ptr: u32) -> Result<[u32; 7], Stop> {
+    let ptr = mem.input(args_ptr, 28)?;
+    // SAFETY: `mem.input` verified 28 readable bytes.
+    Ok(unsafe {
+        std::array::from_fn(|i| u32::from_le(ptr.add(i * 4).cast::<u32>().read_unaligned()))
+    })
+}
 
 type Vec2 = [f32; 2];
 type Vec3 = [f32; 3];
@@ -115,22 +302,26 @@ struct Viewport {
     max_z: f32,
 }
 
-fn read_viewport<M: Mem>(mem: &mut M, at: u32) -> Result<Viewport, Stop> {
+fn read_viewport_raw<M: Mem>(mem: &mut M, at: u32) -> Result<[u32; 6], Stop> {
     let ptr = mem.input(at, 24)?;
     // SAFETY: `mem.input` verified 24 readable bytes.
-    let raw = unsafe {
+    Ok(unsafe {
         std::array::from_fn::<u32, 6, _>(|i| {
             u32::from_le(ptr.add(i * 4).cast::<u32>().read_unaligned())
         })
-    };
-    Ok(Viewport {
+    })
+}
+
+#[inline]
+fn decode_viewport(raw: [u32; 6]) -> Viewport {
+    Viewport {
         x: raw[0] as f32,
         y: raw[1] as f32,
         width: raw[2] as f32,
         height: raw[3] as f32,
         min_z: f32::from_bits(raw[4]),
         max_z: f32::from_bits(raw[5]),
-    })
+    }
 }
 
 // ============================================================================
@@ -535,84 +726,352 @@ fn plane_transform_val(p: Plane, m: &Mat4) -> Plane {
     vec4_transform_val(p, m)
 }
 
-/// Shared checked array transform helper: validates all touched input/output
-/// elements before any guest write so faults never leave partial mutations
-/// (A64-CALL-4, NAT-BODY-16).
+const INLINE_PAGES: usize = 64;
+
+#[derive(Clone, Copy)]
+struct PageGrant {
+    page: u32,
+    write: bool,
+    ptr: *mut u8,
+}
+
+impl PageGrant {
+    const EMPTY: Self = Self {
+        page: 0,
+        write: false,
+        ptr: std::ptr::null_mut(),
+    };
+}
+
+/// Collects distinct 4 KiB pages touched by an array transform on the stack
+/// (zero heap allocation) so each page is validated against the page-class
+/// table at most once (A64-CALL-4) and its live host pointer is reused across
+/// every element without re-checking.
+struct PageTable {
+    inline: [PageGrant; INLINE_PAGES],
+    len: usize,
+}
+
+impl PageTable {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            inline: [PageGrant::EMPTY; INLINE_PAGES],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn mark(&mut self, page: u32, write: bool) -> bool {
+        for entry in &mut self.inline[..self.len] {
+            if entry.page == page {
+                entry.write |= write;
+                return true;
+            }
+        }
+        if self.len < INLINE_PAGES {
+            self.inline[self.len] = PageGrant {
+                page,
+                write,
+                ptr: std::ptr::null_mut(),
+            };
+            self.len += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    fn mark_range(&mut self, at: u32, len: u32, write: bool) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(last) = at.checked_add(len - 1) else {
+            return false;
+        };
+        for page in (at >> 12)..=(last >> 12) {
+            if !self.mark(page, write) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Validates every distinct page at most once. Returns `Ok(true)` when all
+    /// pages have live direct host pointers; `Ok(false)` on `GuestMem` when a
+    /// page requires buffered/faulting per-element fallback.
+    fn validate<M: Mem>(&mut self, mem: &mut M) -> Result<bool, Stop> {
+        for entry in &mut self.inline[..self.len] {
+            if entry.write {
+                let Some(ptr) = mem.write_page(entry.page)? else {
+                    return Ok(false);
+                };
+                entry.ptr = ptr;
+            } else {
+                let Some(ptr) = mem.read_page(entry.page)? else {
+                    return Ok(false);
+                };
+                entry.ptr = ptr.cast_mut();
+            }
+        }
+        Ok(true)
+    }
+
+    #[inline]
+    fn lookup(&self, page: u32) -> *mut u8 {
+        for entry in &self.inline[..self.len] {
+            if entry.page == page {
+                return entry.ptr;
+            }
+        }
+        unreachable!("validated page missing from inline table");
+    }
+}
+
+#[inline]
+unsafe fn load_granted<const N: usize>(
+    table: &PageTable,
+    at: u32,
+    cache: &mut (u32, *mut u8),
+) -> [f32; N] {
+    const { assert!(N * 4 <= 64) };
+    let page = at >> 12;
+    let off = (at & 0xfff) as usize;
+    let base = if cache.0 == page {
+        cache.1
+    } else {
+        let ptr = table.lookup(page);
+        *cache = (page, ptr);
+        ptr
+    };
+    let bytes = N * 4;
+    if off + bytes <= 4096 {
+        // SAFETY: `page` was validated and `[off, off + bytes)` stays within the page.
+        unsafe { load_f32s::<N>(base.add(off)) }
+    } else {
+        let mut buf = [0u8; 64];
+        let first = 4096 - off;
+        let next_base = table.lookup(page + 1);
+        // SAFETY: both pages were validated and cover `[at, at + bytes)`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(base.add(off), buf.as_mut_ptr(), first);
+            std::ptr::copy_nonoverlapping(next_base, buf.as_mut_ptr().add(first), bytes - first);
+            load_f32s::<N>(buf.as_ptr())
+        }
+    }
+}
+
+#[inline]
+unsafe fn store_granted<const N: usize>(
+    table: &PageTable,
+    at: u32,
+    vals: &[f32; N],
+    cache: &mut (u32, *mut u8),
+) {
+    const { assert!(N * 4 <= 64) };
+    let page = at >> 12;
+    let off = (at & 0xfff) as usize;
+    let base = if cache.0 == page {
+        cache.1
+    } else {
+        let ptr = table.lookup(page);
+        *cache = (page, ptr);
+        ptr
+    };
+    let bytes = N * 4;
+    if off + bytes <= 4096 {
+        // SAFETY: `page` was validated writable and `[off, off + bytes)` stays in page.
+        unsafe { store_f32s::<N>(base.add(off), vals) };
+    } else {
+        let mut buf = [0u8; 64];
+        let first = 4096 - off;
+        let next_base = table.lookup(page + 1);
+        // SAFETY: both pages were validated writable and cover `[at, at + bytes)`.
+        unsafe {
+            store_f32s::<N>(buf.as_mut_ptr(), vals);
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), base.add(off), first);
+            std::ptr::copy_nonoverlapping(buf.as_ptr().add(first), next_base, bytes - first);
+        }
+    }
+}
+
+/// Shared checked array transform helper:
+/// - Validates each distinct 4 KiB page at most once before any guest write so
+///   faults never leave partial mutations and page classes are never re-read
+///   per element (A64-CALL-4, NAT-BODY-16).
+/// - Hoists the matrix read only when output writes are proved disjoint from
+///   `[matrix, matrix + 64)`; when overlapping, reloads `m` live per element to
+///   match Wine 11 exactly.
+/// - Runs all element math under synced host FPCR for guest `mxcsr` and merges
+///   raised sticky exception flags back into guest `MXCSR`.
 fn transform_array<M: Mem, const IN_N: usize, const OUT_N: usize>(
     mem: &mut M,
-    [out, outstride, inp, instride, matrix, elements, ..]: [u32; 7],
+    [out, outstride, inp, instride, matrix, elements, mxcsr]: [u32; 7],
     f: impl Fn([f32; IN_N], &Mat4) -> [f32; OUT_N],
 ) -> Result<Ret, Stop> {
     if elements == 0 {
         return Ok(out.into());
     }
-    let m = read_f32s::<M, 16>(mem, matrix)?;
+    check_guest_mxcsr(mxcsr)?;
     let in_bytes = (IN_N * 4) as u32;
     let out_bytes = (OUT_N * 4) as u32;
+    let mat_start = u64::from(matrix);
+    let mat_end = mat_start + 64;
 
-    // Fast path: contiguous, non-wrapping spans. One span check covers all pages
-    // and preserves aliasing identically in Window and GuestMem.
-    if instride == in_bytes
+    let mut table = PageTable::new();
+    let mut wrapped = !table.mark_range(matrix, 64, false);
+    let mut overlaps_matrix = false;
+
+    let contiguous = !wrapped
+        && instride == in_bytes
         && outstride == out_bytes
-        && let (Some(in_total), Some(out_total)) = (
-            elements.checked_mul(in_bytes),
-            elements.checked_mul(out_bytes),
-        )
-        && inp.checked_add(in_total).is_some()
-        && out.checked_add(out_total).is_some()
-    {
-        let [src, dst] = mem.spans([(inp, in_total, false), (out, out_total, true)])?;
-        for i in 0..elements as usize {
-            // SAFETY: both contiguous spans are verified and share live aliasing.
-            let v = unsafe { load_f32s::<IN_N>(src.add(i * IN_N * 4)) };
-            let r = f(v, &m);
-            unsafe { store_f32s::<OUT_N>(dst.add(i * OUT_N * 4), &r) };
+        && elements
+            .checked_mul(in_bytes)
+            .and_then(|t| inp.checked_add(t))
+            .is_some()
+        && elements
+            .checked_mul(out_bytes)
+            .and_then(|t| out.checked_add(t))
+            .is_some();
+
+    if contiguous {
+        let in_total = elements * in_bytes;
+        let out_total = elements * out_bytes;
+        wrapped |= !table.mark_range(inp, in_total, false);
+        wrapped |= !table.mark_range(out, out_total, true);
+        overlaps_matrix =
+            u64::from(out) < mat_end && mat_start < u64::from(out) + u64::from(out_total);
+    } else if !wrapped && instride == 0 && outstride == 0 {
+        wrapped |= !table.mark_range(inp, in_bytes, false);
+        wrapped |= !table.mark_range(out, out_bytes, true);
+        overlaps_matrix =
+            u64::from(out) < mat_end && mat_start < u64::from(out) + u64::from(out_bytes);
+    } else if !wrapped {
+        let mut last_in_page = u32::MAX;
+        let mut last_out_page = u32::MAX;
+        for i in 0..elements {
+            let a = inp.wrapping_add(instride.wrapping_mul(i));
+            let b = out.wrapping_add(outstride.wrapping_mul(i));
+            let (Some(a_last), Some(b_last)) =
+                (a.checked_add(in_bytes - 1), b.checked_add(out_bytes - 1))
+            else {
+                wrapped = true;
+                break;
+            };
+            let a_p0 = a >> 12;
+            let a_p1 = a_last >> 12;
+            if a_p0 != last_in_page || a_p1 != a_p0 {
+                if !table.mark(a_p0, false) || (a_p1 != a_p0 && !table.mark(a_p1, false)) {
+                    wrapped = true;
+                    break;
+                }
+                last_in_page = a_p1;
+            }
+            let b_p0 = b >> 12;
+            let b_p1 = b_last >> 12;
+            if b_p0 != last_out_page || b_p1 != b_p0 {
+                if !table.mark(b_p0, true) || (b_p1 != b_p0 && !table.mark(b_p1, true)) {
+                    wrapped = true;
+                    break;
+                }
+                last_out_page = b_p1;
+            }
+            if u64::from(b) < mat_end && mat_start < u64::from(b) + u64::from(out_bytes) {
+                overlaps_matrix = true;
+            }
         }
+    }
+
+    if wrapped {
+        if M::WINDOW {
+            return Err(Stop::Slow);
+        }
+    } else if table.validate(mem)? {
+        let guard = FpGuard::enter(mxcsr)?;
+        let mut in_cache = (u32::MAX, std::ptr::null_mut());
+        let mut out_cache = (u32::MAX, std::ptr::null_mut());
+        let mut mat_cache = (u32::MAX, std::ptr::null_mut());
+        if !overlaps_matrix {
+            // SAFETY: matrix pages were validated in `table`.
+            let m =
+                std::hint::black_box(unsafe { load_granted::<16>(&table, matrix, &mut mat_cache) });
+            for i in 0..elements {
+                let a = inp.wrapping_add(instride.wrapping_mul(i));
+                let b = out.wrapping_add(outstride.wrapping_mul(i));
+                // SAFETY: all input/output pages were validated in `table`.
+                let v =
+                    std::hint::black_box(unsafe { load_granted::<IN_N>(&table, a, &mut in_cache) });
+                let r = std::hint::black_box(f(v, &m));
+                unsafe { store_granted::<OUT_N>(&table, b, &r, &mut out_cache) };
+            }
+        } else {
+            for i in 0..elements {
+                let a = inp.wrapping_add(instride.wrapping_mul(i));
+                let b = out.wrapping_add(outstride.wrapping_mul(i));
+                // SAFETY: all input/matrix/output pages were validated and share live storage.
+                let v =
+                    std::hint::black_box(unsafe { load_granted::<IN_N>(&table, a, &mut in_cache) });
+                let m = std::hint::black_box(unsafe {
+                    load_granted::<16>(&table, matrix, &mut mat_cache)
+                });
+                let r = std::hint::black_box(f(v, &m));
+                unsafe { store_granted::<OUT_N>(&table, b, &r, &mut out_cache) };
+            }
+        }
+        let raised = guard.finish();
         mem.commit()?;
+        mem.raise_mxcsr(raised);
         return Ok(out.into());
     }
 
-    // Zero-stride special case: single input and output element checked once.
-    if instride == 0 && outstride == 0 {
-        let [src, dst] = mem.spans([(inp, in_bytes, false), (out, out_bytes, true)])?;
-        for _ in 0..elements {
-            // SAFETY: both element spans are verified and share live aliasing.
+    // Full-path fallback for pages that cannot be directly borrowed (unmapped,
+    // watched code, COW, shared): validate all touched spans before any write
+    // so faults surface cleanly at entry without partial mutations.
+    mem.input(matrix, 64)?;
+    for i in 0..elements {
+        let a = inp.wrapping_add(instride.wrapping_mul(i));
+        let b = out.wrapping_add(outstride.wrapping_mul(i));
+        mem.input(a, in_bytes)?;
+        mem.output(b, out_bytes)?;
+        if u64::from(b) < mat_end && mat_start < u64::from(b) + u64::from(out_bytes) {
+            overlaps_matrix = true;
+        }
+    }
+
+    let mut raised = 0u32;
+    if !overlaps_matrix {
+        let m = read_f32s::<M, 16>(mem, matrix)?;
+        for i in 0..elements {
+            let a = inp.wrapping_add(instride.wrapping_mul(i));
+            let b = out.wrapping_add(outstride.wrapping_mul(i));
+            let [src, dst] = mem.spans([(a, in_bytes, false), (b, out_bytes, true)])?;
+            // SAFETY: element spans are verified and share live aliasing.
             let v = unsafe { load_f32s::<IN_N>(src) };
-            let r = f(v, &m);
+            let (r, flags) = run_guest_fp(mxcsr, || f(v, &m))?;
+            raised |= flags;
             unsafe { store_f32s::<OUT_N>(dst, &r) };
+            mem.commit()?;
         }
-        mem.commit()?;
-        return Ok(out.into());
-    }
-
-    // General strided path: check all accessed pages before any write.
-    // Track last checked page to avoid redundant class-table reads (A64-CALL-4).
-    let mut last_in_page = u32::MAX;
-    let mut last_out_page = u32::MAX;
-    for i in 0..elements {
-        let a = inp.wrapping_add(instride.wrapping_mul(i));
-        let b = out.wrapping_add(outstride.wrapping_mul(i));
-        let a_end = a.wrapping_add(in_bytes - 1);
-        if (a >> 12) != last_in_page || (a_end >> 12) != (a >> 12) || a_end < a {
-            mem.input(a, in_bytes)?;
-            last_in_page = a >> 12;
-        }
-        let b_end = b.wrapping_add(out_bytes - 1);
-        if (b >> 12) != last_out_page || (b_end >> 12) != (b >> 12) || b_end < b {
-            mem.output(b, out_bytes)?;
-            last_out_page = b >> 12;
+    } else {
+        for i in 0..elements {
+            let a = inp.wrapping_add(instride.wrapping_mul(i));
+            let b = out.wrapping_add(outstride.wrapping_mul(i));
+            let [src, mat, dst] = mem.spans([
+                (a, in_bytes, false),
+                (matrix, 64, false),
+                (b, out_bytes, true),
+            ])?;
+            // SAFETY: element and matrix spans are verified and share live aliasing.
+            let v = unsafe { load_f32s::<IN_N>(src) };
+            let m = unsafe { load_f32s::<16>(mat) };
+            let (r, flags) = run_guest_fp(mxcsr, || f(v, &m))?;
+            raised |= flags;
+            unsafe { store_f32s::<OUT_N>(dst, &r) };
+            mem.commit()?;
         }
     }
-    for i in 0..elements {
-        let a = inp.wrapping_add(instride.wrapping_mul(i));
-        let b = out.wrapping_add(outstride.wrapping_mul(i));
-        let [src, dst] = mem.spans([(a, in_bytes, false), (b, out_bytes, true)])?;
-        // SAFETY: element spans are verified and share live aliasing.
-        let v = unsafe { load_f32s::<IN_N>(src) };
-        let r = f(v, &m);
-        unsafe { store_f32s::<OUT_N>(dst, &r) };
-        mem.commit()?;
-    }
+    mem.raise_mxcsr(raised);
     Ok(out.into())
 }
 
@@ -620,37 +1079,52 @@ fn transform_array<M: Mem, const IN_N: usize, const OUT_N: usize>(
 // DirectBody implementations
 // ============================================================================
 
-fn color_adjust_contrast<M: Mem>(mem: &mut M, [pout, pc, s, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn color_adjust_contrast<M: Mem>(
+    mem: &mut M,
+    [pout, pc, s, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let c = read_f32s::<M, 4>(mem, pc)?;
     let s = f32_arg(s);
-    let out = [
-        0.5 + s * (c[0] - 0.5),
-        0.5 + s * (c[1] - 0.5),
-        0.5 + s * (c[2] - 0.5),
-        c[3],
-    ];
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        [
+            0.5 + s * (c[0] - 0.5),
+            0.5 + s * (c[1] - 0.5),
+            0.5 + s * (c[2] - 0.5),
+            c[3],
+        ]
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn color_adjust_saturation<M: Mem>(mem: &mut M, [pout, pc, s, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn color_adjust_saturation<M: Mem>(
+    mem: &mut M,
+    [pout, pc, s, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let c = read_f32s::<M, 4>(mem, pc)?;
     let s = f32_arg(s);
-    let grey = c[0] * 0.2125 + c[1] * 0.7154 + c[2] * 0.0721;
-    let out = [
-        grey + s * (c[0] - grey),
-        grey + s * (c[1] - grey),
-        grey + s * (c[2] - grey),
-        c[3],
-    ];
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let grey = c[0] * 0.2125 + c[1] * 0.7154 + c[2] * 0.0721;
+        [
+            grey + s * (c[0] - grey),
+            grey + s * (c[1] - grey),
+            grey + s * (c[2] - grey),
+            c[3],
+        ]
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_affine_transformation<M: Mem>(
     mem: &mut M,
-    [out_ptr, scaling, rc_ptr, rot_ptr, trans_ptr, ..]: [u32; 7],
+    [out_ptr, scaling, rc_ptr, rot_ptr, trans_ptr, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let scaling = f32_arg(scaling);
     let rot = if rot_ptr != 0 {
         Some(read_f32s::<M, 4>(mem, rot_ptr)?)
@@ -667,49 +1141,54 @@ fn matrix_affine_transformation<M: Mem>(
     } else {
         None
     };
-    let mut out = IDENTITY;
-    if let Some([x, y, z, w]) = rot {
-        let t00 = 1.0 - 2.0 * (y * y + z * z);
-        let t01 = 2.0 * (x * y + z * w);
-        let t02 = 2.0 * (x * z - y * w);
-        let t10 = 2.0 * (x * y - z * w);
-        let t11 = 1.0 - 2.0 * (x * x + z * z);
-        let t12 = 2.0 * (y * z + x * w);
-        let t20 = 2.0 * (x * z + y * w);
-        let t21 = 2.0 * (y * z - x * w);
-        let t22 = 1.0 - 2.0 * (x * x + y * y);
-        out[0] = scaling * t00;
-        out[1] = scaling * t01;
-        out[2] = scaling * t02;
-        out[4] = scaling * t10;
-        out[5] = scaling * t11;
-        out[6] = scaling * t12;
-        out[8] = scaling * t20;
-        out[9] = scaling * t21;
-        out[10] = scaling * t22;
-        if let Some([cx, cy, cz]) = rc {
-            out[12] = cx * (1.0 - t00) - cy * t10 - cz * t20;
-            out[13] = cy * (1.0 - t11) - cx * t01 - cz * t21;
-            out[14] = cz * (1.0 - t22) - cx * t02 - cy * t12;
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let mut out = IDENTITY;
+        if let Some([x, y, z, w]) = rot {
+            let t00 = 1.0 - 2.0 * (y * y + z * z);
+            let t01 = 2.0 * (x * y + z * w);
+            let t02 = 2.0 * (x * z - y * w);
+            let t10 = 2.0 * (x * y - z * w);
+            let t11 = 1.0 - 2.0 * (x * x + z * z);
+            let t12 = 2.0 * (y * z + x * w);
+            let t20 = 2.0 * (x * z + y * w);
+            let t21 = 2.0 * (y * z - x * w);
+            let t22 = 1.0 - 2.0 * (x * x + y * y);
+            out[0] = scaling * t00;
+            out[1] = scaling * t01;
+            out[2] = scaling * t02;
+            out[4] = scaling * t10;
+            out[5] = scaling * t11;
+            out[6] = scaling * t12;
+            out[8] = scaling * t20;
+            out[9] = scaling * t21;
+            out[10] = scaling * t22;
+            if let Some([cx, cy, cz]) = rc {
+                out[12] = cx * (1.0 - t00) - cy * t10 - cz * t20;
+                out[13] = cy * (1.0 - t11) - cx * t01 - cz * t21;
+                out[14] = cz * (1.0 - t22) - cx * t02 - cy * t12;
+            }
+        } else {
+            out[0] = scaling;
+            out[5] = scaling;
+            out[10] = scaling;
         }
-    } else {
-        out[0] = scaling;
-        out[5] = scaling;
-        out[10] = scaling;
-    }
-    if let Some([tx, ty, tz]) = trans {
-        out[12] += tx;
-        out[13] += ty;
-        out[14] += tz;
-    }
+        if let Some([tx, ty, tz]) = trans {
+            out[12] += tx;
+            out[13] += ty;
+            out[14] += tz;
+        }
+        out
+    })?;
     write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
 fn matrix_affine_transformation_2d<M: Mem>(
     mem: &mut M,
-    [out_ptr, scaling, rc_ptr, rotation, trans_ptr, ..]: [u32; 7],
+    [out_ptr, scaling, rc_ptr, rotation, trans_ptr, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let scaling = f32_arg(scaling);
     let rotation = f32_arg(rotation);
     let rc = if rc_ptr != 0 {
@@ -722,38 +1201,59 @@ fn matrix_affine_transformation_2d<M: Mem>(
     } else {
         None
     };
-    let half = rotation / 2.0;
-    let s = half.sin();
-    let tmp1 = 1.0 - 2.0 * s * s;
-    let tmp2 = 2.0 * s * half.cos();
-    let mut out = IDENTITY;
-    out[0] = scaling * tmp1;
-    out[1] = scaling * tmp2;
-    out[4] = -scaling * tmp2;
-    out[5] = scaling * tmp1;
-    if let Some([x, y]) = rc {
-        out[12] = y * tmp2 - x * tmp1 + x;
-        out[13] = -x * tmp2 - y * tmp1 + y;
-    }
-    if let Some([tx, ty]) = trans {
-        out[12] += tx;
-        out[13] += ty;
-    }
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let half = rotation / 2.0;
+        let s = half.sin();
+        let tmp1 = 1.0 - 2.0 * s * s;
+        let tmp2 = 2.0 * s * half.cos();
+        let mut out = IDENTITY;
+        out[0] = scaling * tmp1;
+        out[1] = scaling * tmp2;
+        out[4] = -scaling * tmp2;
+        out[5] = scaling * tmp1;
+        if let Some([x, y]) = rc {
+            out[12] = y * tmp2 - x * tmp1 + x;
+            out[13] = -x * tmp2 - y * tmp1 + y;
+        }
+        if let Some([tx, ty]) = trans {
+            out[12] += tx;
+            out[13] += ty;
+        }
+        out
+    })?;
     write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
 fn matrix_decompose<M: Mem>(
     mem: &mut M,
-    [scale_ptr, rot_ptr, trans_ptr, pm, ..]: [u32; 7],
+    [scale_ptr, rot_ptr, trans_ptr, pm, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let m = read_f32s::<M, 16>(mem, pm)?;
-    let sx = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt();
-    let sy = (m[4] * m[4] + m[5] * m[5] + m[6] * m[6]).sqrt();
-    let sz = (m[8] * m[8] + m[9] * m[9] + m[10] * m[10]).sqrt();
-    let scale = [sx, sy, sz];
-    let trans = [m[12], m[13], m[14]];
-    if sx == 0.0 || sy == 0.0 || sz == 0.0 {
+    let ((scale, trans, rot), raised) = run_guest_fp(mxcsr, || {
+        let sx = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt();
+        let sy = (m[4] * m[4] + m[5] * m[5] + m[6] * m[6]).sqrt();
+        let sz = (m[8] * m[8] + m[9] * m[9] + m[10] * m[10]).sqrt();
+        let scale = [sx, sy, sz];
+        let trans = [m[12], m[13], m[14]];
+        if sx == 0.0 || sy == 0.0 || sz == 0.0 {
+            return (scale, trans, None);
+        }
+        let mut normalized = [0.0f32; 16];
+        normalized[0] = m[0] / sx;
+        normalized[1] = m[1] / sx;
+        normalized[2] = m[2] / sx;
+        normalized[4] = m[4] / sy;
+        normalized[5] = m[5] / sy;
+        normalized[6] = m[6] / sy;
+        normalized[8] = m[8] / sz;
+        normalized[9] = m[9] / sz;
+        normalized[10] = m[10] / sz;
+        (scale, trans, Some(quat_rotation_matrix_val(&normalized)))
+    })?;
+    let Some(rot) = rot else {
         let [ps, pt] = mem.spans([(scale_ptr, 12, true), (trans_ptr, 12, true)])?;
         // SAFETY: both spans verified and share live aliasing.
         unsafe {
@@ -761,19 +1261,9 @@ fn matrix_decompose<M: Mem>(
             store_f32s(pt, &trans);
         }
         mem.commit()?;
+        mem.raise_mxcsr(raised);
         return Ok(D3DERR_INVALIDCALL.into());
-    }
-    let mut normalized = [0.0f32; 16];
-    normalized[0] = m[0] / sx;
-    normalized[1] = m[1] / sx;
-    normalized[2] = m[2] / sx;
-    normalized[4] = m[4] / sy;
-    normalized[5] = m[5] / sy;
-    normalized[6] = m[6] / sy;
-    normalized[8] = m[8] / sz;
-    normalized[9] = m[9] / sz;
-    normalized[10] = m[10] / sz;
-    let rot = quat_rotation_matrix_val(&normalized);
+    };
     let [ps, pt, pr] = mem.spans([
         (scale_ptr, 12, true),
         (trans_ptr, 12, true),
@@ -786,12 +1276,16 @@ fn matrix_decompose<M: Mem>(
         store_f32s(pr, &rot);
     }
     mem.commit()?;
+    mem.raise_mxcsr(raised);
     Ok(0u32.into())
 }
 
-fn matrix_inverse<M: Mem>(mem: &mut M, [pout, pdet, pm, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn matrix_inverse<M: Mem>(mem: &mut M, [pout, pdet, pm, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let m = read_f32s::<M, 16>(mem, pm)?;
-    let Some((inv, det)) = mat_inverse_val(&m) else {
+    let (res, raised) = run_guest_fp(mxcsr, || mat_inverse_val(&m))?;
+    let Some((inv, det)) = res else {
+        mem.raise_mxcsr(raised);
         return Ok(0u32.into());
     };
     if pdet != 0 {
@@ -805,100 +1299,119 @@ fn matrix_inverse<M: Mem>(mem: &mut M, [pout, pdet, pm, ..]: [u32; 7]) -> Result
     } else {
         write_f32s(mem, pout, &inv)?;
     }
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_look_at<M: Mem, const RH: bool>(
     mem: &mut M,
-    [out_ptr, eye_ptr, at_ptr, up_ptr, ..]: [u32; 7],
+    [out_ptr, eye_ptr, at_ptr, up_ptr, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let eye = read_f32s::<M, 3>(mem, eye_ptr)?;
     let at = read_f32s::<M, 3>(mem, at_ptr)?;
     let up = read_f32s::<M, 3>(mem, up_ptr)?;
-    let vec = vec3_normalize_val([at[0] - eye[0], at[1] - eye[1], at[2] - eye[2]]);
-    let right = vec3_cross(up, vec);
-    let upn = vec3_normalize_val(vec3_cross(vec, right));
-    let right = vec3_normalize_val(right);
-    let out = if RH {
-        [
-            -right[0],
-            upn[0],
-            -vec[0],
-            0.0,
-            -right[1],
-            upn[1],
-            -vec[1],
-            0.0,
-            -right[2],
-            upn[2],
-            -vec[2],
-            0.0,
-            vec3_dot(right, eye),
-            -vec3_dot(upn, eye),
-            vec3_dot(vec, eye),
-            1.0,
-        ]
-    } else {
-        [
-            right[0],
-            upn[0],
-            vec[0],
-            0.0,
-            right[1],
-            upn[1],
-            vec[1],
-            0.0,
-            right[2],
-            upn[2],
-            vec[2],
-            0.0,
-            -vec3_dot(right, eye),
-            -vec3_dot(upn, eye),
-            -vec3_dot(vec, eye),
-            1.0,
-        ]
-    };
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let vec = vec3_normalize_val([at[0] - eye[0], at[1] - eye[1], at[2] - eye[2]]);
+        let right = vec3_cross(up, vec);
+        let upn = vec3_normalize_val(vec3_cross(vec, right));
+        let right = vec3_normalize_val(right);
+        if RH {
+            [
+                -right[0],
+                upn[0],
+                -vec[0],
+                0.0,
+                -right[1],
+                upn[1],
+                -vec[1],
+                0.0,
+                -right[2],
+                upn[2],
+                -vec[2],
+                0.0,
+                vec3_dot(right, eye),
+                -vec3_dot(upn, eye),
+                vec3_dot(vec, eye),
+                1.0,
+            ]
+        } else {
+            [
+                right[0],
+                upn[0],
+                vec[0],
+                0.0,
+                right[1],
+                upn[1],
+                vec[1],
+                0.0,
+                right[2],
+                upn[2],
+                vec[2],
+                0.0,
+                -vec3_dot(right, eye),
+                -vec3_dot(upn, eye),
+                -vec3_dot(vec, eye),
+                1.0,
+            ]
+        }
+    })?;
     write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
-fn matrix_multiply<M: Mem>(mem: &mut M, [pout, pm1, pm2, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn matrix_multiply<M: Mem>(
+    mem: &mut M,
+    [pout, pm1, pm2, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let m1 = read_f32s::<M, 16>(mem, pm1)?;
     let m2 = read_f32s::<M, 16>(mem, pm2)?;
-    let out = mat_mul_val(&m1, &m2);
+    let (out, raised) = run_guest_fp(mxcsr, || mat_mul_val(&m1, &m2))?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_multiply_transpose<M: Mem>(
     mem: &mut M,
-    [pout, pm1, pm2, ..]: [u32; 7],
+    [pout, pm1, pm2, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let m1 = read_f32s::<M, 16>(mem, pm1)?;
     let m2 = read_f32s::<M, 16>(mem, pm2)?;
-    let out = mat_mul_transpose_val(&m1, &m2);
+    let (out, raised) = run_guest_fp(mxcsr, || mat_mul_transpose_val(&m1, &m2))?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_ortho<M: Mem, const RH: bool>(
     mem: &mut M,
-    [pout, w, h, zn, zf, ..]: [u32; 7],
+    [pout, w, h, zn, zf, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let (w, h, zn, zf) = (f32_arg(w), f32_arg(h), f32_arg(zn), f32_arg(zf));
-    let mut out = IDENTITY;
-    out[0] = 2.0 / w;
-    out[5] = 2.0 / h;
-    out[10] = if RH { 1.0 / (zn - zf) } else { 1.0 / (zf - zn) };
-    out[14] = zn / (zn - zf);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let mut out = IDENTITY;
+        out[0] = 2.0 / w;
+        out[5] = 2.0 / h;
+        out[10] = if RH { 1.0 / (zn - zf) } else { 1.0 / (zf - zn) };
+        out[14] = zn / (zn - zf);
+        out
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_ortho_off_center<M: Mem, const RH: bool>(
     mem: &mut M,
-    [pout, l, r, b, t, zn, zf]: [u32; 7],
+    [args_ptr, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
+    let [pout, l, r, b, t, zn, zf] = read_args7(mem, args_ptr)?;
     let (l, r, b, t, zn, zf) = (
         f32_arg(l),
         f32_arg(r),
@@ -907,54 +1420,70 @@ fn matrix_ortho_off_center<M: Mem, const RH: bool>(
         f32_arg(zn),
         f32_arg(zf),
     );
-    let mut out = IDENTITY;
-    out[0] = 2.0 / (r - l);
-    out[5] = 2.0 / (t - b);
-    out[10] = if RH { 1.0 / (zn - zf) } else { 1.0 / (zf - zn) };
-    out[12] = -1.0 - 2.0 * l / (r - l);
-    out[13] = 1.0 + 2.0 * t / (b - t);
-    out[14] = zn / (zn - zf);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let mut out = IDENTITY;
+        out[0] = 2.0 / (r - l);
+        out[5] = 2.0 / (t - b);
+        out[10] = if RH { 1.0 / (zn - zf) } else { 1.0 / (zf - zn) };
+        out[12] = -1.0 - 2.0 * l / (r - l);
+        out[13] = 1.0 + 2.0 * t / (b - t);
+        out[14] = zn / (zn - zf);
+        out
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_perspective_fov<M: Mem, const RH: bool>(
     mem: &mut M,
-    [pout, fovy, aspect, zn, zf, ..]: [u32; 7],
+    [pout, fovy, aspect, zn, zf, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let (fovy, aspect, zn, zf) = (f32_arg(fovy), f32_arg(aspect), f32_arg(zn), f32_arg(zf));
-    let tan_half = (fovy / 2.0).tan();
-    let mut out = IDENTITY;
-    out[0] = 1.0 / (aspect * tan_half);
-    out[5] = 1.0 / tan_half;
-    out[10] = if RH { zf / (zn - zf) } else { zf / (zf - zn) };
-    out[11] = if RH { -1.0 } else { 1.0 };
-    out[14] = (zf * zn) / (zn - zf);
-    out[15] = 0.0;
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let tan_half = (fovy / 2.0).tan();
+        let mut out = IDENTITY;
+        out[0] = 1.0 / (aspect * tan_half);
+        out[5] = 1.0 / tan_half;
+        out[10] = if RH { zf / (zn - zf) } else { zf / (zf - zn) };
+        out[11] = if RH { -1.0 } else { 1.0 };
+        out[14] = (zf * zn) / (zn - zf);
+        out[15] = 0.0;
+        out
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_perspective<M: Mem, const RH: bool>(
     mem: &mut M,
-    [pout, w, h, zn, zf, ..]: [u32; 7],
+    [pout, w, h, zn, zf, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let (w, h, zn, zf) = (f32_arg(w), f32_arg(h), f32_arg(zn), f32_arg(zf));
-    let mut out = IDENTITY;
-    out[0] = 2.0 * zn / w;
-    out[5] = 2.0 * zn / h;
-    out[10] = if RH { zf / (zn - zf) } else { zf / (zf - zn) };
-    out[11] = if RH { -1.0 } else { 1.0 };
-    out[14] = (zn * zf) / (zn - zf);
-    out[15] = 0.0;
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let mut out = IDENTITY;
+        out[0] = 2.0 * zn / w;
+        out[5] = 2.0 * zn / h;
+        out[10] = if RH { zf / (zn - zf) } else { zf / (zf - zn) };
+        out[11] = if RH { -1.0 } else { 1.0 };
+        out[14] = (zn * zf) / (zn - zf);
+        out[15] = 0.0;
+        out
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_perspective_off_center<M: Mem, const RH: bool>(
     mem: &mut M,
-    [pout, l, r, b, t, zn, zf]: [u32; 7],
+    [args_ptr, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
+    let [pout, l, r, b, t, zn, zf] = read_args7(mem, args_ptr)?;
     let (l, r, b, t, zn, zf) = (
         f32_arg(l),
         f32_arg(r),
@@ -963,140 +1492,184 @@ fn matrix_perspective_off_center<M: Mem, const RH: bool>(
         f32_arg(zn),
         f32_arg(zf),
     );
-    let mut out = IDENTITY;
-    out[0] = 2.0 * zn / (r - l);
-    out[5] = -2.0 * zn / (b - t);
-    if RH {
-        out[8] = 1.0 + 2.0 * l / (r - l);
-        out[9] = -1.0 - 2.0 * t / (b - t);
-        out[10] = zf / (zn - zf);
-        out[11] = -1.0;
-    } else {
-        out[8] = -1.0 - 2.0 * l / (r - l);
-        out[9] = 1.0 + 2.0 * t / (b - t);
-        out[10] = -zf / (zn - zf);
-        out[11] = 1.0;
-    }
-    out[14] = (zn * zf) / (zn - zf);
-    out[15] = 0.0;
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let mut out = IDENTITY;
+        out[0] = 2.0 * zn / (r - l);
+        out[5] = -2.0 * zn / (b - t);
+        if RH {
+            out[8] = 1.0 + 2.0 * l / (r - l);
+            out[9] = -1.0 - 2.0 * t / (b - t);
+            out[10] = zf / (zn - zf);
+            out[11] = -1.0;
+        } else {
+            out[8] = -1.0 - 2.0 * l / (r - l);
+            out[9] = 1.0 + 2.0 * t / (b - t);
+            out[10] = -zf / (zn - zf);
+            out[11] = 1.0;
+        }
+        out[14] = (zn * zf) / (zn - zf);
+        out[15] = 0.0;
+        out
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn matrix_reflect<M: Mem>(mem: &mut M, [pout, pplane, ..]: [u32; 7]) -> Result<Ret, Stop> {
-    let [a, b, c, d] = plane_normalize_val(read_f32s::<M, 4>(mem, pplane)?);
-    let mut out = IDENTITY;
-    out[0] = 1.0 - 2.0 * a * a;
-    out[1] = -2.0 * a * b;
-    out[2] = -2.0 * a * c;
-    out[4] = -2.0 * a * b;
-    out[5] = 1.0 - 2.0 * b * b;
-    out[6] = -2.0 * b * c;
-    out[8] = -2.0 * c * a;
-    out[9] = -2.0 * c * b;
-    out[10] = 1.0 - 2.0 * c * c;
-    out[12] = -2.0 * d * a;
-    out[13] = -2.0 * d * b;
-    out[14] = -2.0 * d * c;
+fn matrix_reflect<M: Mem>(mem: &mut M, [pout, pplane, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
+    let plane = read_f32s::<M, 4>(mem, pplane)?;
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let [a, b, c, d] = plane_normalize_val(plane);
+        let mut out = IDENTITY;
+        out[0] = 1.0 - 2.0 * a * a;
+        out[1] = -2.0 * a * b;
+        out[2] = -2.0 * a * c;
+        out[4] = -2.0 * a * b;
+        out[5] = 1.0 - 2.0 * b * b;
+        out[6] = -2.0 * b * c;
+        out[8] = -2.0 * c * a;
+        out[9] = -2.0 * c * b;
+        out[10] = 1.0 - 2.0 * c * c;
+        out[12] = -2.0 * d * a;
+        out[13] = -2.0 * d * b;
+        out[14] = -2.0 * d * c;
+        out
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_rotation_axis<M: Mem>(
     mem: &mut M,
-    [out_ptr, v_ptr, angle, ..]: [u32; 7],
+    [out_ptr, v_ptr, angle, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
-    let nv = vec3_normalize_val(read_f32s::<M, 3>(mem, v_ptr)?);
-    let (sangle, cangle) = f32_arg(angle).sin_cos();
-    let cdiff = 1.0 - cangle;
-    let out = [
-        cdiff * nv[0] * nv[0] + cangle,
-        cdiff * nv[1] * nv[0] + sangle * nv[2],
-        cdiff * nv[2] * nv[0] - sangle * nv[1],
-        0.0,
-        cdiff * nv[0] * nv[1] - sangle * nv[2],
-        cdiff * nv[1] * nv[1] + cangle,
-        cdiff * nv[2] * nv[1] + sangle * nv[0],
-        0.0,
-        cdiff * nv[0] * nv[2] + sangle * nv[1],
-        cdiff * nv[1] * nv[2] - sangle * nv[0],
-        cdiff * nv[2] * nv[2] + cangle,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ];
+    check_guest_mxcsr(mxcsr)?;
+    let v = read_f32s::<M, 3>(mem, v_ptr)?;
+    let angle = f32_arg(angle);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let nv = vec3_normalize_val(v);
+        let (sangle, cangle) = angle.sin_cos();
+        let cdiff = 1.0 - cangle;
+        [
+            cdiff * nv[0] * nv[0] + cangle,
+            cdiff * nv[1] * nv[0] + sangle * nv[2],
+            cdiff * nv[2] * nv[0] - sangle * nv[1],
+            0.0,
+            cdiff * nv[0] * nv[1] - sangle * nv[2],
+            cdiff * nv[1] * nv[1] + cangle,
+            cdiff * nv[2] * nv[1] + sangle * nv[0],
+            0.0,
+            cdiff * nv[0] * nv[2] + sangle * nv[1],
+            cdiff * nv[1] * nv[2] - sangle * nv[0],
+            cdiff * nv[2] * nv[2] + cangle,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ]
+    })?;
     write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
-fn matrix_rotation_quaternion<M: Mem>(mem: &mut M, [pout, pq, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn matrix_rotation_quaternion<M: Mem>(
+    mem: &mut M,
+    [pout, pq, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let q = read_f32s::<M, 4>(mem, pq)?;
-    let out = mat_rotation_quat_val(q);
+    let (out, raised) = run_guest_fp(mxcsr, || mat_rotation_quat_val(q))?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn matrix_rotation_x<M: Mem>(mem: &mut M, [pout, angle, ..]: [u32; 7]) -> Result<Ret, Stop> {
-    let (s, c) = f32_arg(angle).sin_cos();
-    let mut out = IDENTITY;
-    out[5] = c;
-    out[10] = c;
-    out[6] = s;
-    out[9] = -s;
+fn matrix_rotation_x<M: Mem>(mem: &mut M, [pout, angle, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
+    let angle = f32_arg(angle);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let (s, c) = angle.sin_cos();
+        let mut out = IDENTITY;
+        out[5] = c;
+        out[10] = c;
+        out[6] = s;
+        out[9] = -s;
+        out
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn matrix_rotation_y<M: Mem>(mem: &mut M, [pout, angle, ..]: [u32; 7]) -> Result<Ret, Stop> {
-    let (s, c) = f32_arg(angle).sin_cos();
-    let mut out = IDENTITY;
-    out[0] = c;
-    out[10] = c;
-    out[2] = -s;
-    out[8] = s;
+fn matrix_rotation_y<M: Mem>(mem: &mut M, [pout, angle, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
+    let angle = f32_arg(angle);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let (s, c) = angle.sin_cos();
+        let mut out = IDENTITY;
+        out[0] = c;
+        out[10] = c;
+        out[2] = -s;
+        out[8] = s;
+        out
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn matrix_rotation_z<M: Mem>(mem: &mut M, [pout, angle, ..]: [u32; 7]) -> Result<Ret, Stop> {
-    let (s, c) = f32_arg(angle).sin_cos();
-    let mut out = IDENTITY;
-    out[0] = c;
-    out[5] = c;
-    out[1] = s;
-    out[4] = -s;
+fn matrix_rotation_z<M: Mem>(mem: &mut M, [pout, angle, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
+    let angle = f32_arg(angle);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let (s, c) = angle.sin_cos();
+        let mut out = IDENTITY;
+        out[0] = c;
+        out[5] = c;
+        out[1] = s;
+        out[4] = -s;
+        out
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_rotation_yaw_pitch_roll<M: Mem>(
     mem: &mut M,
-    [out_ptr, yaw, pitch, roll, ..]: [u32; 7],
+    [out_ptr, yaw, pitch, roll, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
-    let (syaw, cyaw) = f32_arg(yaw).sin_cos();
-    let (spitch, cpitch) = f32_arg(pitch).sin_cos();
-    let (sroll, croll) = f32_arg(roll).sin_cos();
-    let out = [
-        sroll * spitch * syaw + croll * cyaw,
-        sroll * cpitch,
-        sroll * spitch * cyaw - croll * syaw,
-        0.0,
-        croll * spitch * syaw - sroll * cyaw,
-        croll * cpitch,
-        croll * spitch * cyaw + sroll * syaw,
-        0.0,
-        cpitch * syaw,
-        -spitch,
-        cpitch * cyaw,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ];
+    check_guest_mxcsr(mxcsr)?;
+    let (yaw, pitch, roll) = (f32_arg(yaw), f32_arg(pitch), f32_arg(roll));
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let (syaw, cyaw) = yaw.sin_cos();
+        let (spitch, cpitch) = pitch.sin_cos();
+        let (sroll, croll) = roll.sin_cos();
+        [
+            sroll * spitch * syaw + croll * cyaw,
+            sroll * cpitch,
+            sroll * spitch * cyaw - croll * syaw,
+            0.0,
+            croll * spitch * syaw - sroll * cyaw,
+            croll * cpitch,
+            croll * spitch * cyaw + sroll * syaw,
+            0.0,
+            cpitch * syaw,
+            -spitch,
+            cpitch * cyaw,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ]
+    })?;
     write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
@@ -1106,36 +1679,46 @@ fn matrix_scaling<M: Mem>(mem: &mut M, [pout, sx, sy, sz, ..]: [u32; 7]) -> Resu
     Ok(pout.into())
 }
 
-fn matrix_shadow<M: Mem>(mem: &mut M, [pout, plight, pplane, ..]: [u32; 7]) -> Result<Ret, Stop> {
-    let [a, b, c, d] = plane_normalize_val(read_f32s::<M, 4>(mem, pplane)?);
+fn matrix_shadow<M: Mem>(
+    mem: &mut M,
+    [pout, plight, pplane, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
+    let plane = read_f32s::<M, 4>(mem, pplane)?;
     let [lx, ly, lz, lw] = read_f32s::<M, 4>(mem, plight)?;
-    let dot = a * lx + b * ly + c * lz + d * lw;
-    let out = [
-        dot - a * lx,
-        -a * ly,
-        -a * lz,
-        -a * lw,
-        -b * lx,
-        dot - b * ly,
-        -b * lz,
-        -b * lw,
-        -c * lx,
-        -c * ly,
-        dot - c * lz,
-        -c * lw,
-        -d * lx,
-        -d * ly,
-        -d * lz,
-        dot - d * lw,
-    ];
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let [a, b, c, d] = plane_normalize_val(plane);
+        let dot = a * lx + b * ly + c * lz + d * lw;
+        [
+            dot - a * lx,
+            -a * ly,
+            -a * lz,
+            -a * lw,
+            -b * lx,
+            dot - b * ly,
+            -b * lz,
+            -b * lw,
+            -c * lx,
+            -c * ly,
+            dot - c * lz,
+            -c * lw,
+            -d * lx,
+            -d * ly,
+            -d * lz,
+            dot - d * lw,
+        ]
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn matrix_transformation<M: Mem>(
     mem: &mut M,
-    [out_ptr, sc_ptr, sr_ptr, s_ptr, rc_ptr, r_ptr, t_ptr]: [u32; 7],
+    [args_ptr, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
+    let [out_ptr, sc_ptr, sr_ptr, s_ptr, rc_ptr, r_ptr, t_ptr] = read_args7(mem, args_ptr)?;
     let s = if s_ptr != 0 {
         Some(read_f32s::<M, 3>(mem, s_ptr)?)
     } else {
@@ -1166,15 +1749,18 @@ fn matrix_transformation<M: Mem>(
     } else {
         None
     };
-    let out = mat_transformation_val(sc, sr, s, rc, r, t);
+    let (out, raised) = run_guest_fp(mxcsr, || mat_transformation_val(sc, sr, s, rc, r, t))?;
     write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
 fn matrix_transformation_2d<M: Mem>(
     mem: &mut M,
-    [out_ptr, sc_ptr, sr_angle, s_ptr, rc_ptr, r_angle, t_ptr]: [u32; 7],
+    [args_ptr, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
+    let [out_ptr, sc_ptr, sr_angle, s_ptr, rc_ptr, r_angle, t_ptr] = read_args7(mem, args_ptr)?;
     let sc = if sc_ptr != 0 {
         let v = read_f32s::<M, 2>(mem, sc_ptr)?;
         Some([v[0], v[1], 0.0])
@@ -1200,21 +1786,24 @@ fn matrix_transformation_2d<M: Mem>(
         None
     };
     let r_angle = f32_arg(r_angle);
-    let r = if r_angle != 0.0 {
-        let (sn, cs) = (r_angle / 2.0).sin_cos();
-        Some([0.0, 0.0, sn, cs])
-    } else {
-        None
-    };
     let sr_angle = f32_arg(sr_angle);
-    let sr = if sr_angle != 0.0 {
-        let (sn, cs) = (sr_angle / 2.0).sin_cos();
-        Some([0.0, 0.0, sn, cs])
-    } else {
-        None
-    };
-    let out = mat_transformation_val(sc, sr, s, rc, r, t);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let r = if r_angle != 0.0 {
+            let (sn, cs) = (r_angle / 2.0).sin_cos();
+            Some([0.0, 0.0, sn, cs])
+        } else {
+            None
+        };
+        let sr = if sr_angle != 0.0 {
+            let (sn, cs) = (sr_angle / 2.0).sin_cos();
+            Some([0.0, 0.0, sn, cs])
+        } else {
+            None
+        };
+        mat_transformation_val(sc, sr, s, rc, r, t)
+    })?;
     write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
@@ -1238,63 +1827,89 @@ fn matrix_transpose<M: Mem>(mem: &mut M, [out_ptr, in_ptr, ..]: [u32; 7]) -> Res
 
 fn plane_from_point_normal<M: Mem>(
     mem: &mut M,
-    [pout, pvpoint, pvnormal, ..]: [u32; 7],
+    [pout, pvpoint, pvnormal, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let pt = read_f32s::<M, 3>(mem, pvpoint)?;
     let n = read_f32s::<M, 3>(mem, pvnormal)?;
-    let out = [n[0], n[1], n[2], -vec3_dot(pt, n)];
+    let (out, raised) = run_guest_fp(mxcsr, || [n[0], n[1], n[2], -vec3_dot(pt, n)])?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn plane_from_points<M: Mem>(
     mem: &mut M,
-    [pout, pv1, pv2, pv3, ..]: [u32; 7],
+    [pout, pv1, pv2, pv3, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v1 = read_f32s::<M, 3>(mem, pv1)?;
     let v2 = read_f32s::<M, 3>(mem, pv2)?;
     let v3 = read_f32s::<M, 3>(mem, pv3)?;
-    let edge1 = [v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2]];
-    let edge2 = [v3[0] - v1[0], v3[1] - v1[1], v3[2] - v1[2]];
-    let n = vec3_normalize_val(vec3_cross(edge1, edge2));
-    let out = [n[0], n[1], n[2], -vec3_dot(v1, n)];
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let edge1 = [v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2]];
+        let edge2 = [v3[0] - v1[0], v3[1] - v1[1], v3[2] - v1[2]];
+        let n = vec3_normalize_val(vec3_cross(edge1, edge2));
+        [n[0], n[1], n[2], -vec3_dot(v1, n)]
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn plane_intersect_line<M: Mem>(
     mem: &mut M,
-    [pout, pp, pv1, pv2, ..]: [u32; 7],
+    [pout, pp, pv1, pv2, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let p = read_f32s::<M, 4>(mem, pp)?;
     let v1 = read_f32s::<M, 3>(mem, pv1)?;
     let v2 = read_f32s::<M, 3>(mem, pv2)?;
-    let normal = [p[0], p[1], p[2]];
-    let dir = [v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2]];
-    let dot = vec3_dot(normal, dir);
-    if dot == 0.0 {
+    let (res, raised) = run_guest_fp(mxcsr, || {
+        let normal = [p[0], p[1], p[2]];
+        let dir = [v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2]];
+        let dot = vec3_dot(normal, dir);
+        if dot == 0.0 {
+            return None;
+        }
+        let temp = (p[3] + vec3_dot(normal, v1)) / dot;
+        Some([
+            v1[0] - temp * dir[0],
+            v1[1] - temp * dir[1],
+            v1[2] - temp * dir[2],
+        ])
+    })?;
+    let Some(out) = res else {
+        mem.raise_mxcsr(raised);
         return Ok(0u32.into());
-    }
-    let temp = (p[3] + vec3_dot(normal, v1)) / dot;
-    let out = [
-        v1[0] - temp * dir[0],
-        v1[1] - temp * dir[1],
-        v1[2] - temp * dir[2],
-    ];
+    };
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn plane_normalize<M: Mem>(mem: &mut M, [out_ptr, p_ptr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn plane_normalize<M: Mem>(
+    mem: &mut M,
+    [out_ptr, p_ptr, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let p = read_f32s::<M, 4>(mem, p_ptr)?;
-    write_f32s(mem, out_ptr, &plane_normalize_val(p))?;
+    let (out, raised) = run_guest_fp(mxcsr, || plane_normalize_val(p))?;
+    write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
-fn plane_transform<M: Mem>(mem: &mut M, [pout, pplane, pm, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn plane_transform<M: Mem>(
+    mem: &mut M,
+    [pout, pplane, pm, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let p = read_f32s::<M, 4>(mem, pplane)?;
     let m = read_f32s::<M, 16>(mem, pm)?;
-    write_f32s(mem, pout, &plane_transform_val(p, &m))?;
+    let (out, raised) = run_guest_fp(mxcsr, || plane_transform_val(p, &m))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
@@ -1304,162 +1919,215 @@ fn plane_transform_array<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret, Sto
 
 fn quaternion_bary_centric<M: Mem>(
     mem: &mut M,
-    [pout, pq1, pq2, pq3, f, g, ..]: [u32; 7],
+    [pout, pq1, pq2, pq3, f, g, mxcsr]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let q1 = read_f32s::<M, 4>(mem, pq1)?;
     let q2 = read_f32s::<M, 4>(mem, pq2)?;
     let q3 = read_f32s::<M, 4>(mem, pq3)?;
     let (f, g) = (f32_arg(f), f32_arg(g));
-    let fg = f + g;
-    let t1 = quat_slerp_val(q1, q2, fg);
-    let t2 = quat_slerp_val(q1, q3, fg);
-    let out = quat_slerp_val(t1, t2, g / fg);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let fg = f + g;
+        let t1 = quat_slerp_val(q1, q2, fg);
+        let t2 = quat_slerp_val(q1, q3, fg);
+        quat_slerp_val(t1, t2, g / fg)
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn quaternion_exp<M: Mem>(mem: &mut M, [out_ptr, q_ptr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn quaternion_exp<M: Mem>(mem: &mut M, [out_ptr, q_ptr, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let q = read_f32s::<M, 4>(mem, q_ptr)?;
-    write_f32s(mem, out_ptr, &quat_exp_val(q))?;
+    let (out, raised) = run_guest_fp(mxcsr, || quat_exp_val(q))?;
+    write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
-fn quaternion_inverse<M: Mem>(mem: &mut M, [pout, pq, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn quaternion_inverse<M: Mem>(mem: &mut M, [pout, pq, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let q = read_f32s::<M, 4>(mem, pq)?;
-    write_f32s(mem, pout, &quat_inverse_val(q))?;
+    let (out, raised) = run_guest_fp(mxcsr, || quat_inverse_val(q))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn quaternion_ln<M: Mem>(mem: &mut M, [out_ptr, q_ptr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn quaternion_ln<M: Mem>(mem: &mut M, [out_ptr, q_ptr, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let q = read_f32s::<M, 4>(mem, q_ptr)?;
-    write_f32s(mem, out_ptr, &quat_ln_val(q))?;
+    let (out, raised) = run_guest_fp(mxcsr, || quat_ln_val(q))?;
+    write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
-fn quaternion_multiply<M: Mem>(mem: &mut M, [pout, pq1, pq2, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn quaternion_multiply<M: Mem>(
+    mem: &mut M,
+    [pout, pq1, pq2, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let q1 = read_f32s::<M, 4>(mem, pq1)?;
     let q2 = read_f32s::<M, 4>(mem, pq2)?;
-    write_f32s(mem, pout, &quat_mul_val(q1, q2))?;
+    let (out, raised) = run_guest_fp(mxcsr, || quat_mul_val(q1, q2))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn quaternion_normalize<M: Mem>(mem: &mut M, [out_ptr, q_ptr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn quaternion_normalize<M: Mem>(
+    mem: &mut M,
+    [out_ptr, q_ptr, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let q = read_f32s::<M, 4>(mem, q_ptr)?;
-    let norm = quat_dot(q, q).sqrt();
-    let out = [q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm];
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let norm = quat_dot(q, q).sqrt();
+        [q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm]
+    })?;
     write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
 fn quaternion_rotation_axis<M: Mem>(
     mem: &mut M,
-    [out_ptr, v_ptr, angle, ..]: [u32; 7],
+    [out_ptr, v_ptr, angle, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
-    let v = vec3_normalize_val(read_f32s::<M, 3>(mem, v_ptr)?);
-    let (s, c) = (f32_arg(angle) / 2.0).sin_cos();
-    let out = [s * v[0], s * v[1], s * v[2], c];
+    check_guest_mxcsr(mxcsr)?;
+    let v = read_f32s::<M, 3>(mem, v_ptr)?;
+    let angle = f32_arg(angle);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let v = vec3_normalize_val(v);
+        let (s, c) = (angle / 2.0).sin_cos();
+        [s * v[0], s * v[1], s * v[2], c]
+    })?;
     write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
 fn quaternion_rotation_matrix<M: Mem>(
     mem: &mut M,
-    [out_ptr, m_ptr, ..]: [u32; 7],
+    [out_ptr, m_ptr, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let m = read_f32s::<M, 16>(mem, m_ptr)?;
-    write_f32s(mem, out_ptr, &quat_rotation_matrix_val(&m))?;
+    let (out, raised) = run_guest_fp(mxcsr, || quat_rotation_matrix_val(&m))?;
+    write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
 fn quaternion_rotation_yaw_pitch_roll<M: Mem>(
     mem: &mut M,
-    [out_ptr, yaw, pitch, roll, ..]: [u32; 7],
+    [out_ptr, yaw, pitch, roll, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
-    let (syaw, cyaw) = (f32_arg(yaw) / 2.0).sin_cos();
-    let (spitch, cpitch) = (f32_arg(pitch) / 2.0).sin_cos();
-    let (sroll, croll) = (f32_arg(roll) / 2.0).sin_cos();
-    let out = [
-        syaw * cpitch * sroll + cyaw * spitch * croll,
-        syaw * cpitch * croll - cyaw * spitch * sroll,
-        cyaw * cpitch * sroll - syaw * spitch * croll,
-        cyaw * cpitch * croll + syaw * spitch * sroll,
-    ];
+    check_guest_mxcsr(mxcsr)?;
+    let (yaw, pitch, roll) = (f32_arg(yaw), f32_arg(pitch), f32_arg(roll));
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let (syaw, cyaw) = (yaw / 2.0).sin_cos();
+        let (spitch, cpitch) = (pitch / 2.0).sin_cos();
+        let (sroll, croll) = (roll / 2.0).sin_cos();
+        [
+            syaw * cpitch * sroll + cyaw * spitch * croll,
+            syaw * cpitch * croll - cyaw * spitch * sroll,
+            cyaw * cpitch * sroll - syaw * spitch * croll,
+            cyaw * cpitch * croll + syaw * spitch * sroll,
+        ]
+    })?;
     write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
 fn quaternion_slerp<M: Mem>(
     mem: &mut M,
-    [out_ptr, q1_ptr, q2_ptr, t, ..]: [u32; 7],
+    [out_ptr, q1_ptr, q2_ptr, t, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let q1 = read_f32s::<M, 4>(mem, q1_ptr)?;
     let q2 = read_f32s::<M, 4>(mem, q2_ptr)?;
-    write_f32s(mem, out_ptr, &quat_slerp_val(q1, q2, f32_arg(t)))?;
+    let t = f32_arg(t);
+    let (out, raised) = run_guest_fp(mxcsr, || quat_slerp_val(q1, q2, t))?;
+    write_f32s(mem, out_ptr, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(out_ptr.into())
 }
 
 fn quaternion_squad<M: Mem>(
     mem: &mut M,
-    [pout, pq1, pq2, pq3, pq4, t, ..]: [u32; 7],
+    [pout, pq1, pq2, pq3, pq4, t, mxcsr]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let q1 = read_f32s::<M, 4>(mem, pq1)?;
     let q2 = read_f32s::<M, 4>(mem, pq2)?;
     let q3 = read_f32s::<M, 4>(mem, pq3)?;
     let q4 = read_f32s::<M, 4>(mem, pq4)?;
     let t = f32_arg(t);
-    let t1 = quat_slerp_val(q1, q4, t);
-    let t2 = quat_slerp_val(q2, q3, t);
-    let out = quat_slerp_val(t1, t2, 2.0 * t * (1.0 - t));
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let t1 = quat_slerp_val(q1, q4, t);
+        let t2 = quat_slerp_val(q2, q3, t);
+        quat_slerp_val(t1, t2, 2.0 * t * (1.0 - t))
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn quaternion_squad_setup<M: Mem>(
     mem: &mut M,
-    [paout, pbout, pcout, pq0, pq1, pq2, pq3]: [u32; 7],
+    [args_ptr, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
+    let [paout, pbout, pcout, pq0, pq1, pq2, pq3] = read_args7(mem, args_ptr)?;
     let q0 = read_f32s::<M, 4>(mem, pq0)?;
     let q1 = read_f32s::<M, 4>(mem, pq1)?;
     let q2 = read_f32s::<M, 4>(mem, pq2)?;
     let q3 = read_f32s::<M, 4>(mem, pq3)?;
-    let add_diff = |a: Quat, b: Quat, s: f32| -> Quat {
-        [
-            a[0] + s * b[0],
-            a[1] + s * b[1],
-            a[2] + s * b[2],
-            a[3] + s * b[3],
-        ]
-    };
-    let zero = [0.0f32; 4];
-    let temp2 = if quat_dot(q0, q1) < 0.0 {
-        add_diff(zero, q0, -1.0)
-    } else {
-        q0
-    };
-    let cout = if quat_dot(q1, q2) < 0.0 {
-        add_diff(zero, q2, -1.0)
-    } else {
-        q2
-    };
-    let temp3 = if quat_dot(cout, q3) < 0.0 {
-        add_diff(zero, q3, -1.0)
-    } else {
-        q3
-    };
+    let ((aout, bout, cout), raised) = run_guest_fp(mxcsr, || {
+        let add_diff = |a: Quat, b: Quat, s: f32| -> Quat {
+            [
+                a[0] + s * b[0],
+                a[1] + s * b[1],
+                a[2] + s * b[2],
+                a[3] + s * b[3],
+            ]
+        };
+        let zero = [0.0f32; 4];
+        let temp2 = if quat_dot(q0, q1) < 0.0 {
+            add_diff(zero, q0, -1.0)
+        } else {
+            q0
+        };
+        let cout = if quat_dot(q1, q2) < 0.0 {
+            add_diff(zero, q2, -1.0)
+        } else {
+            q2
+        };
+        let temp3 = if quat_dot(cout, q3) < 0.0 {
+            add_diff(zero, q3, -1.0)
+        } else {
+            q3
+        };
 
-    let inv1 = quat_inverse_val(q1);
-    let l1 = quat_ln_val(quat_mul_val(inv1, temp2));
-    let l2 = quat_ln_val(quat_mul_val(inv1, cout));
-    let s1 = add_diff(l1, l2, 1.0);
-    let e1 = quat_exp_val([s1[0] * -0.25, s1[1] * -0.25, s1[2] * -0.25, s1[3] * -0.25]);
-    let aout = quat_mul_val(q1, e1);
+        let inv1 = quat_inverse_val(q1);
+        let l1 = quat_ln_val(quat_mul_val(inv1, temp2));
+        let l2 = quat_ln_val(quat_mul_val(inv1, cout));
+        let s1 = add_diff(l1, l2, 1.0);
+        let e1 = quat_exp_val([s1[0] * -0.25, s1[1] * -0.25, s1[2] * -0.25, s1[3] * -0.25]);
+        let aout = quat_mul_val(q1, e1);
 
-    let inv2 = quat_inverse_val(cout);
-    let l3 = quat_ln_val(quat_mul_val(inv2, q1));
-    let l4 = quat_ln_val(quat_mul_val(inv2, temp3));
-    let s2 = add_diff(l3, l4, 1.0);
-    let e2 = quat_exp_val([s2[0] * -0.25, s2[1] * -0.25, s2[2] * -0.25, s2[3] * -0.25]);
-    let bout = quat_mul_val(cout, e2);
+        let inv2 = quat_inverse_val(cout);
+        let l3 = quat_ln_val(quat_mul_val(inv2, q1));
+        let l4 = quat_ln_val(quat_mul_val(inv2, temp3));
+        let s2 = add_diff(l3, l4, 1.0);
+        let e2 = quat_exp_val([s2[0] * -0.25, s2[1] * -0.25, s2[2] * -0.25, s2[3] * -0.25]);
+        let bout = quat_mul_val(cout, e2);
+        (aout, bout, cout)
+    })?;
 
     let [pb, pa, pc] = mem.spans([(pbout, 16, true), (paout, 16, true), (pcout, 16, true)])?;
     // SAFETY: all three spans verified and share live aliasing.
@@ -1469,19 +2137,27 @@ fn quaternion_squad_setup<M: Mem>(
         store_f32s(pc, &cout);
     }
     mem.commit()?;
+    mem.raise_mxcsr(raised);
     Ok(Ret::default())
 }
 
 fn quaternion_to_axis_angle<M: Mem>(
     mem: &mut M,
-    [pq, paxis, pangle, ..]: [u32; 7],
+    [pq, paxis, pangle, mxcsr, ..]: [u32; 7],
 ) -> Result<Ret, Stop> {
     if paxis == 0 && pangle == 0 {
         return Ok(Ret::default());
     }
+    if pangle != 0 {
+        check_guest_mxcsr(mxcsr)?;
+    }
     let q = read_f32s::<M, 4>(mem, pq)?;
     let axis = [q[0], q[1], q[2]];
-    let angle = [2.0 * q[3].acos()];
+    let (angle, raised) = if pangle != 0 {
+        run_guest_fp(mxcsr, || [2.0 * q[3].acos()])?
+    } else {
+        ([0.0], 0)
+    };
     match (paxis != 0, pangle != 0) {
         (true, true) => {
             let [pa, pan] = mem.spans([(paxis, 12, true), (pangle, 4, true)])?;
@@ -1496,77 +2172,98 @@ fn quaternion_to_axis_angle<M: Mem>(
         (false, true) => write_f32s(mem, pangle, &angle)?,
         (false, false) => {}
     }
+    if raised != 0 {
+        mem.raise_mxcsr(raised);
+    }
     Ok(Ret::default())
 }
 
 fn vec_bary_centric<M: Mem, const N: usize>(
     mem: &mut M,
-    [pout, pv1, pv2, pv3, f, g, ..]: [u32; 7],
+    [pout, pv1, pv2, pv3, f, g, mxcsr]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v1 = read_f32s::<M, N>(mem, pv1)?;
     let v2 = read_f32s::<M, N>(mem, pv2)?;
     let v3 = read_f32s::<M, N>(mem, pv3)?;
     let (f, g) = (f32_arg(f), f32_arg(g));
-    let w1 = 1.0 - f - g;
-    let out = std::array::from_fn::<f32, N, _>(|i| w1 * v1[i] + f * v2[i] + g * v3[i]);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let w1 = 1.0 - f - g;
+        std::array::from_fn::<f32, N, _>(|i| w1 * v1[i] + f * v2[i] + g * v3[i])
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn vec_catmull_rom<M: Mem, const N: usize>(
     mem: &mut M,
-    [pout, pv0, pv1, pv2, pv3, s, ..]: [u32; 7],
+    [pout, pv0, pv1, pv2, pv3, s, mxcsr]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v0 = read_f32s::<M, N>(mem, pv0)?;
     let v1 = read_f32s::<M, N>(mem, pv1)?;
     let v2 = read_f32s::<M, N>(mem, pv2)?;
     let v3 = read_f32s::<M, N>(mem, pv3)?;
     let s = f32_arg(s);
-    let out = std::array::from_fn::<f32, N, _>(|i| {
-        0.5 * (2.0 * v1[i]
-            + (v2[i] - v0[i]) * s
-            + (2.0 * v0[i] - 5.0 * v1[i] + 4.0 * v2[i] - v3[i]) * s * s
-            + (v3[i] - 3.0 * v2[i] + 3.0 * v1[i] - v0[i]) * s * s * s)
-    });
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        std::array::from_fn::<f32, N, _>(|i| {
+            0.5 * (2.0 * v1[i]
+                + (v2[i] - v0[i]) * s
+                + (2.0 * v0[i] - 5.0 * v1[i] + 4.0 * v2[i] - v3[i]) * s * s
+                + (v3[i] - 3.0 * v2[i] + 3.0 * v1[i] - v0[i]) * s * s * s)
+        })
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn vec_hermite<M: Mem, const N: usize>(
     mem: &mut M,
-    [pout, pv1, pt1, pv2, pt2, s, ..]: [u32; 7],
+    [pout, pv1, pt1, pv2, pt2, s, mxcsr]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v1 = read_f32s::<M, N>(mem, pv1)?;
     let t1 = read_f32s::<M, N>(mem, pt1)?;
     let v2 = read_f32s::<M, N>(mem, pv2)?;
     let t2 = read_f32s::<M, N>(mem, pt2)?;
     let s = f32_arg(s);
-    let h1 = 2.0 * s * s * s - 3.0 * s * s + 1.0;
-    let h2 = s * s * s - 2.0 * s * s + s;
-    let h3 = -2.0 * s * s * s + 3.0 * s * s;
-    let h4 = s * s * s - s * s;
-    let out =
-        std::array::from_fn::<f32, N, _>(|i| h1 * v1[i] + h2 * t1[i] + h3 * v2[i] + h4 * t2[i]);
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let h1 = 2.0 * s * s * s - 3.0 * s * s + 1.0;
+        let h2 = s * s * s - 2.0 * s * s + s;
+        let h3 = -2.0 * s * s * s + 3.0 * s * s;
+        let h4 = s * s * s - s * s;
+        std::array::from_fn::<f32, N, _>(|i| h1 * v1[i] + h2 * t1[i] + h3 * v2[i] + h4 * t2[i])
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn vec2_normalize<M: Mem>(mem: &mut M, [pout, pv, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec2_normalize<M: Mem>(mem: &mut M, [pout, pv, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 2>(mem, pv)?;
-    let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
-    let out = if norm == 0.0 {
-        [0.0, 0.0]
-    } else {
-        [v[0] / norm, v[1] / norm]
-    };
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        if norm == 0.0 {
+            [0.0, 0.0]
+        } else {
+            [v[0] / norm, v[1] / norm]
+        }
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn vec2_transform<M: Mem>(mem: &mut M, [pout, pv, pm, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec2_transform<M: Mem>(mem: &mut M, [pout, pv, pm, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 2>(mem, pv)?;
     let m = read_f32s::<M, 16>(mem, pm)?;
-    write_f32s(mem, pout, &vec2_transform_val(v, &m))?;
+    let (out, raised) = run_guest_fp(mxcsr, || vec2_transform_val(v, &m))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
@@ -1574,10 +2271,16 @@ fn vec2_transform_array<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret, Stop
     transform_array::<M, 2, 4>(mem, args, vec2_transform_val)
 }
 
-fn vec2_transform_coord<M: Mem>(mem: &mut M, [pout, pv, pm, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec2_transform_coord<M: Mem>(
+    mem: &mut M,
+    [pout, pv, pm, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 2>(mem, pv)?;
     let m = read_f32s::<M, 16>(mem, pm)?;
-    write_f32s(mem, pout, &vec2_transform_coord_val(v, &m))?;
+    let (out, raised) = run_guest_fp(mxcsr, || vec2_transform_coord_val(v, &m))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
@@ -1585,10 +2288,16 @@ fn vec2_transform_coord_array<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret
     transform_array::<M, 2, 2>(mem, args, vec2_transform_coord_val)
 }
 
-fn vec2_transform_normal<M: Mem>(mem: &mut M, [pout, pv, pm, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec2_transform_normal<M: Mem>(
+    mem: &mut M,
+    [pout, pv, pm, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 2>(mem, pv)?;
     let m = read_f32s::<M, 16>(mem, pm)?;
-    write_f32s(mem, pout, &vec2_transform_normal_val(v, &m))?;
+    let (out, raised) = run_guest_fp(mxcsr, || vec2_transform_normal_val(v, &m))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
@@ -1596,86 +2305,127 @@ fn vec2_transform_normal_array<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Re
     transform_array::<M, 2, 2>(mem, args, vec2_transform_normal_val)
 }
 
-fn vec3_normalize<M: Mem>(mem: &mut M, [pout, pv, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec3_normalize<M: Mem>(mem: &mut M, [pout, pv, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 3>(mem, pv)?;
-    write_f32s(mem, pout, &vec3_normalize_val(v))?;
+    let (out, raised) = run_guest_fp(mxcsr, || vec3_normalize_val(v))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn vec3_project<M: Mem>(
     mem: &mut M,
-    [pout, pv, pvp, pproj, pview, pworld, ..]: [u32; 7],
+    [pout, pv, pvp, pproj, pview, pworld, mxcsr]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 3>(mem, pv)?;
-    let mut m = IDENTITY;
-    if pworld != 0 {
-        let w = read_f32s::<M, 16>(mem, pworld)?;
-        m = mat_mul_val(&m, &w);
-    }
-    if pview != 0 {
-        let vw = read_f32s::<M, 16>(mem, pview)?;
-        m = mat_mul_val(&m, &vw);
-    }
-    if pproj != 0 {
-        let pr = read_f32s::<M, 16>(mem, pproj)?;
-        m = mat_mul_val(&m, &pr);
-    }
-    let vp = if pvp != 0 {
-        Some(read_viewport(mem, pvp)?)
+    let world = if pworld != 0 {
+        Some(read_f32s::<M, 16>(mem, pworld)?)
     } else {
         None
     };
-    let mut out = vec3_transform_coord_val(v, &m);
-    if let Some(vp) = vp {
-        out[0] = vp.x + (1.0 + out[0]) * vp.width / 2.0;
-        out[1] = vp.y + (1.0 - out[1]) * vp.height / 2.0;
-        out[2] = vp.min_z + out[2] * (vp.max_z - vp.min_z);
-    }
+    let view = if pview != 0 {
+        Some(read_f32s::<M, 16>(mem, pview)?)
+    } else {
+        None
+    };
+    let proj = if pproj != 0 {
+        Some(read_f32s::<M, 16>(mem, pproj)?)
+    } else {
+        None
+    };
+    let vp_raw = if pvp != 0 {
+        Some(read_viewport_raw(mem, pvp)?)
+    } else {
+        None
+    };
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let mut m = IDENTITY;
+        if let Some(w) = world {
+            m = mat_mul_val(&m, &w);
+        }
+        if let Some(vw) = view {
+            m = mat_mul_val(&m, &vw);
+        }
+        if let Some(pr) = proj {
+            m = mat_mul_val(&m, &pr);
+        }
+        let mut out = vec3_transform_coord_val(v, &m);
+        if let Some(raw) = vp_raw {
+            let vp = decode_viewport(raw);
+            out[0] = vp.x + (1.0 + out[0]) * vp.width / 2.0;
+            out[1] = vp.y + (1.0 - out[1]) * vp.height / 2.0;
+            out[2] = vp.min_z + out[2] * (vp.max_z - vp.min_z);
+        }
+        out
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
 fn vec3_unproject<M: Mem>(
     mem: &mut M,
-    [pout, pv, pvp, pproj, pview, pworld, ..]: [u32; 7],
+    [pout, pv, pvp, pproj, pview, pworld, mxcsr]: [u32; 7],
 ) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 3>(mem, pv)?;
-    let mut m = IDENTITY;
-    if pworld != 0 {
-        let w = read_f32s::<M, 16>(mem, pworld)?;
-        m = mat_mul_val(&m, &w);
-    }
-    if pview != 0 {
-        let vw = read_f32s::<M, 16>(mem, pview)?;
-        m = mat_mul_val(&m, &vw);
-    }
-    if pproj != 0 {
-        let pr = read_f32s::<M, 16>(mem, pproj)?;
-        m = mat_mul_val(&m, &pr);
-    }
-    let vp = if pvp != 0 {
-        Some(read_viewport(mem, pvp)?)
+    let world = if pworld != 0 {
+        Some(read_f32s::<M, 16>(mem, pworld)?)
     } else {
         None
     };
-    if let Some((inv, _)) = mat_inverse_val(&m) {
-        m = inv;
-    }
-    let mut cur = v;
-    if let Some(vp) = vp {
-        cur[0] = 2.0 * (cur[0] - vp.x) / vp.width - 1.0;
-        cur[1] = 1.0 - 2.0 * (cur[1] - vp.y) / vp.height;
-        cur[2] = (cur[2] - vp.min_z) / (vp.max_z - vp.min_z);
-    }
-    let out = vec3_transform_coord_val(cur, &m);
+    let view = if pview != 0 {
+        Some(read_f32s::<M, 16>(mem, pview)?)
+    } else {
+        None
+    };
+    let proj = if pproj != 0 {
+        Some(read_f32s::<M, 16>(mem, pproj)?)
+    } else {
+        None
+    };
+    let vp_raw = if pvp != 0 {
+        Some(read_viewport_raw(mem, pvp)?)
+    } else {
+        None
+    };
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let mut m = IDENTITY;
+        if let Some(w) = world {
+            m = mat_mul_val(&m, &w);
+        }
+        if let Some(vw) = view {
+            m = mat_mul_val(&m, &vw);
+        }
+        if let Some(pr) = proj {
+            m = mat_mul_val(&m, &pr);
+        }
+        if let Some((inv, _)) = mat_inverse_val(&m) {
+            m = inv;
+        }
+        let mut cur = v;
+        if let Some(raw) = vp_raw {
+            let vp = decode_viewport(raw);
+            cur[0] = 2.0 * (cur[0] - vp.x) / vp.width - 1.0;
+            cur[1] = 1.0 - 2.0 * (cur[1] - vp.y) / vp.height;
+            cur[2] = (cur[2] - vp.min_z) / (vp.max_z - vp.min_z);
+        }
+        vec3_transform_coord_val(cur, &m)
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn vec3_transform<M: Mem>(mem: &mut M, [pout, pv, pm, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec3_transform<M: Mem>(mem: &mut M, [pout, pv, pm, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 3>(mem, pv)?;
     let m = read_f32s::<M, 16>(mem, pm)?;
-    write_f32s(mem, pout, &vec3_transform_val(v, &m))?;
+    let (out, raised) = run_guest_fp(mxcsr, || vec3_transform_val(v, &m))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
@@ -1683,10 +2433,16 @@ fn vec3_transform_array<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret, Stop
     transform_array::<M, 3, 4>(mem, args, vec3_transform_val)
 }
 
-fn vec3_transform_coord<M: Mem>(mem: &mut M, [pout, pv, pm, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec3_transform_coord<M: Mem>(
+    mem: &mut M,
+    [pout, pv, pm, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 3>(mem, pv)?;
     let m = read_f32s::<M, 16>(mem, pm)?;
-    write_f32s(mem, pout, &vec3_transform_coord_val(v, &m))?;
+    let (out, raised) = run_guest_fp(mxcsr, || vec3_transform_coord_val(v, &m))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
@@ -1694,10 +2450,16 @@ fn vec3_transform_coord_array<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret
     transform_array::<M, 3, 3>(mem, args, vec3_transform_coord_val)
 }
 
-fn vec3_transform_normal<M: Mem>(mem: &mut M, [pout, pv, pm, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec3_transform_normal<M: Mem>(
+    mem: &mut M,
+    [pout, pv, pm, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 3>(mem, pv)?;
     let m = read_f32s::<M, 16>(mem, pm)?;
-    write_f32s(mem, pout, &vec3_transform_normal_val(v, &m))?;
+    let (out, raised) = run_guest_fp(mxcsr, || vec3_transform_normal_val(v, &m))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
@@ -1705,36 +2467,50 @@ fn vec3_transform_normal_array<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Re
     transform_array::<M, 3, 3>(mem, args, vec3_transform_normal_val)
 }
 
-fn vec4_cross<M: Mem>(mem: &mut M, [pout, pv1, pv2, pv3, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec4_cross<M: Mem>(
+    mem: &mut M,
+    [pout, pv1, pv2, pv3, mxcsr, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v1 = read_f32s::<M, 4>(mem, pv1)?;
     let v2 = read_f32s::<M, 4>(mem, pv2)?;
     let v3 = read_f32s::<M, 4>(mem, pv3)?;
-    let out = [
-        v1[1] * (v2[2] * v3[3] - v3[2] * v2[3]) - v1[2] * (v2[1] * v3[3] - v3[1] * v2[3])
-            + v1[3] * (v2[1] * v3[2] - v2[2] * v3[1]),
-        -(v1[0] * (v2[2] * v3[3] - v3[2] * v2[3]) - v1[2] * (v2[0] * v3[3] - v3[0] * v2[3])
-            + v1[3] * (v2[0] * v3[2] - v3[0] * v2[2])),
-        v1[0] * (v2[1] * v3[3] - v3[1] * v2[3]) - v1[1] * (v2[0] * v3[3] - v3[0] * v2[3])
-            + v1[3] * (v2[0] * v3[1] - v3[0] * v2[1]),
-        -(v1[0] * (v2[1] * v3[2] - v3[1] * v2[2]) - v1[1] * (v2[0] * v3[2] - v3[0] * v2[2])
-            + v1[2] * (v2[0] * v3[1] - v3[0] * v2[1])),
-    ];
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        [
+            v1[1] * (v2[2] * v3[3] - v3[2] * v2[3]) - v1[2] * (v2[1] * v3[3] - v3[1] * v2[3])
+                + v1[3] * (v2[1] * v3[2] - v2[2] * v3[1]),
+            -(v1[0] * (v2[2] * v3[3] - v3[2] * v2[3]) - v1[2] * (v2[0] * v3[3] - v3[0] * v2[3])
+                + v1[3] * (v2[0] * v3[2] - v3[0] * v2[2])),
+            v1[0] * (v2[1] * v3[3] - v3[1] * v2[3]) - v1[1] * (v2[0] * v3[3] - v3[0] * v2[3])
+                + v1[3] * (v2[0] * v3[1] - v3[0] * v2[1]),
+            -(v1[0] * (v2[1] * v3[2] - v3[1] * v2[2]) - v1[1] * (v2[0] * v3[2] - v3[0] * v2[2])
+                + v1[2] * (v2[0] * v3[1] - v3[0] * v2[1])),
+        ]
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn vec4_normalize<M: Mem>(mem: &mut M, [pout, pv, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec4_normalize<M: Mem>(mem: &mut M, [pout, pv, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 4>(mem, pv)?;
-    let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]).sqrt();
-    let out = [v[0] / norm, v[1] / norm, v[2] / norm, v[3] / norm];
+    let (out, raised) = run_guest_fp(mxcsr, || {
+        let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]).sqrt();
+        [v[0] / norm, v[1] / norm, v[2] / norm, v[3] / norm]
+    })?;
     write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
-fn vec4_transform<M: Mem>(mem: &mut M, [pout, pv, pm, ..]: [u32; 7]) -> Result<Ret, Stop> {
+fn vec4_transform<M: Mem>(mem: &mut M, [pout, pv, pm, mxcsr, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    check_guest_mxcsr(mxcsr)?;
     let v = read_f32s::<M, 4>(mem, pv)?;
     let m = read_f32s::<M, 16>(mem, pm)?;
-    write_f32s(mem, pout, &vec4_transform_val(v, &m))?;
+    let (out, raised) = run_guest_fp(mxcsr, || vec4_transform_val(v, &m))?;
+    write_f32s(mem, pout, &out)?;
+    mem.raise_mxcsr(raised);
     Ok(pout.into())
 }
 
@@ -1748,22 +2524,22 @@ fn vec4_transform_array<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret, Stop
 
 macro_rules! d3dx_body {
     ($name:ident, $func:path, 2, $out:expr) => {
-        adv_cpu::body!($name = $func, inputs: IN2, outputs: $out, pop: 8);
+        adv_cpu::body!($name = $func, inputs: IN2, outputs: $out | MXCSR, pop: 8);
     };
     ($name:ident, $func:path, 3, $out:expr) => {
-        adv_cpu::body!($name = $func, inputs: IN3, outputs: $out, pop: 12);
+        adv_cpu::body!($name = $func, inputs: IN3, outputs: $out | MXCSR, pop: 12);
     };
     ($name:ident, $func:path, 4, $out:expr) => {
-        adv_cpu::body!($name = $func, inputs: IN4, outputs: $out, pop: 16);
+        adv_cpu::body!($name = $func, inputs: IN4, outputs: $out | MXCSR, pop: 16);
     };
     ($name:ident, $func:path, 5, $out:expr) => {
-        adv_cpu::body!($name = $func, inputs: IN5, outputs: $out, pop: 20);
+        adv_cpu::body!($name = $func, inputs: IN5, outputs: $out | MXCSR, pop: 20);
     };
     ($name:ident, $func:path, 6, $out:expr) => {
-        adv_cpu::body!($name = $func, inputs: IN6, outputs: $out, pop: 24);
+        adv_cpu::body!($name = $func, inputs: IN6, outputs: $out | MXCSR, pop: 24);
     };
     ($name:ident, $func:path, 7, $out:expr) => {
-        adv_cpu::body!($name = $func, inputs: IN7, outputs: $out, pop: 28);
+        adv_cpu::body!($name = $func, inputs: IN7_ARGS, outputs: $out | MXCSR, pop: 28);
     };
 }
 
@@ -2069,15 +2845,36 @@ pub(super) fn bodies() -> Vec<Body> {
 mod tests {
     use super::*;
     use adv_cpu::backend::{Guest, Prot};
-    use adv_cpu::body::{GuestMem, Scratch};
+    use adv_cpu::body::{BodyContext, GuestMem, Scratch, Window};
+    use adv_cpu::memory::{READ, WRITE};
+    use std::collections::HashMap;
+
+    fn run_body_mxcsr(
+        body: adv_cpu::body::Body,
+        cpu: &mut adv_cpu::Cpu,
+        stack_args: &[u32],
+        mxcsr: u32,
+    ) -> Result<(Ret, u32), Stop> {
+        let mut args = [0u32; 7];
+        for (i, input) in body.direct.inputs.iter().enumerate() {
+            match input {
+                Some(Input::Stack(k)) => args[i] = stack_args[usize::from(*k)],
+                Some(Input::Mxcsr) => args[i] = mxcsr,
+                _ => {}
+            }
+        }
+        let mut scratch = Scratch::default();
+        let mut mem = GuestMem::new(cpu, &mut scratch);
+        let ret = (body.full)(&mut mem, args)?;
+        Ok((ret, mem.mxcsr_flags()))
+    }
 
     fn run_body(
         body: adv_cpu::body::Body,
         cpu: &mut adv_cpu::Cpu,
-        args: [u32; 7],
+        stack_args: &[u32],
     ) -> Result<Ret, Stop> {
-        let mut scratch = Scratch::default();
-        (body.full)(&mut GuestMem::new(cpu, &mut scratch), args)
+        run_body_mxcsr(body, cpu, stack_args, MXCSR_ALL_MASKED).map(|(ret, _)| ret)
     }
 
     fn put_f32s(cpu: &mut adv_cpu::Cpu, at: u32, vals: &[f32]) {
@@ -2108,33 +2905,21 @@ mod tests {
         let m_prod = 0x1_0080;
         let angle = std::f32::consts::FRAC_PI_4;
         assert_eq!(
-            run_body(
-                MATRIX_ROTATION_X,
-                &mut cpu,
-                [m_pos, angle.to_bits(), 0, 0, 0, 0, 0]
-            )
-            .unwrap()
-            .value as u32,
+            run_body(MATRIX_ROTATION_X, &mut cpu, &[m_pos, angle.to_bits()])
+                .unwrap()
+                .value as u32,
             m_pos
         );
         assert_eq!(
-            run_body(
-                MATRIX_ROTATION_X,
-                &mut cpu,
-                [m_neg, (-angle).to_bits(), 0, 0, 0, 0, 0]
-            )
-            .unwrap()
-            .value as u32,
+            run_body(MATRIX_ROTATION_X, &mut cpu, &[m_neg, (-angle).to_bits()])
+                .unwrap()
+                .value as u32,
             m_neg
         );
         assert_eq!(
-            run_body(
-                MATRIX_MULTIPLY,
-                &mut cpu,
-                [m_prod, m_pos, m_neg, 0, 0, 0, 0]
-            )
-            .unwrap()
-            .value as u32,
+            run_body(MATRIX_MULTIPLY, &mut cpu, &[m_prod, m_pos, m_neg])
+                .unwrap()
+                .value as u32,
             m_prod
         );
         let prod = get_f32s(&cpu, m_prod, 16);
@@ -2158,17 +2943,12 @@ mod tests {
         put_f32s(&mut cpu, m_orig, &sample);
         put_f32s(&mut cpu, m_inv, &sample);
         assert_eq!(
-            run_body(MATRIX_INVERSE, &mut cpu, [m_inv, det_at, m_inv, 0, 0, 0, 0])
+            run_body(MATRIX_INVERSE, &mut cpu, &[m_inv, det_at, m_inv])
                 .unwrap()
                 .value as u32,
             m_inv
         );
-        run_body(
-            MATRIX_MULTIPLY,
-            &mut cpu,
-            [m_prod, m_orig, m_inv, 0, 0, 0, 0],
-        )
-        .unwrap();
+        run_body(MATRIX_MULTIPLY, &mut cpu, &[m_prod, m_orig, m_inv]).unwrap();
         let prod = get_f32s(&cpu, m_prod, 16);
         for (i, (&actual, &expected)) in prod.iter().zip(IDENTITY.iter()).enumerate() {
             assert!(
@@ -2182,13 +2962,9 @@ mod tests {
         put_f32s(&mut cpu, m_zero, &[0.0; 16]);
         put_f32s(&mut cpu, det_at, &[42.0]);
         assert_eq!(
-            run_body(
-                MATRIX_INVERSE,
-                &mut cpu,
-                [0x9000_0000, det_at, m_zero, 0, 0, 0, 0]
-            )
-            .unwrap()
-            .value as u32,
+            run_body(MATRIX_INVERSE, &mut cpu, &[0x9000_0000, det_at, m_zero])
+                .unwrap()
+                .value as u32,
             0
         );
         assert_eq!(get_f32s(&cpu, det_at, 1), vec![42.0]);
@@ -2197,9 +2973,9 @@ mod tests {
         let v_zero = 0x1_0240;
         let v_out = 0x1_0260;
         put_f32s(&mut cpu, v_zero, &[0.0, 0.0, 0.0, 0.0]);
-        run_body(VEC3_NORMALIZE, &mut cpu, [v_out, v_zero, 0, 0, 0, 0, 0]).unwrap();
+        run_body(VEC3_NORMALIZE, &mut cpu, &[v_out, v_zero]).unwrap();
         assert_eq!(get_f32s(&cpu, v_out, 3), vec![0.0, 0.0, 0.0]);
-        run_body(VEC4_NORMALIZE, &mut cpu, [v_out, v_zero, 0, 0, 0, 0, 0]).unwrap();
+        run_body(VEC4_NORMALIZE, &mut cpu, &[v_out, v_zero]).unwrap();
         assert!(get_f32s(&cpu, v_out, 4).iter().all(|v| v.is_nan()));
 
         // Strided Vec3TransformCoordArray faults before mutating when tail element is unmapped.
@@ -2210,10 +2986,199 @@ mod tests {
         let err = run_body(
             VEC3_TRANSFORM_COORD_ARRAY,
             &mut cpu,
-            [arr_out, 24, arr_in, 12, m_orig, 2, 0],
+            &[arr_out, 24, arr_in, 12, m_orig, 2],
         )
         .unwrap_err();
         assert!(matches!(err, Stop::Fault { write: true, .. }));
         assert_eq!(get_f32s(&cpu, arr_out, 3), vec![99.0, 99.0, 99.0]);
+    }
+
+    struct CountingMem {
+        inner: Window,
+        page_checks: HashMap<u32, usize>,
+    }
+
+    impl CountingMem {
+        fn record_span(&mut self, at: u32, len: u32) {
+            if len == 0 {
+                return;
+            }
+            let last = at.saturating_add(len - 1);
+            for page in (at >> 12)..=(last >> 12) {
+                *self.page_checks.entry(page).or_default() += 1;
+            }
+        }
+    }
+
+    impl Mem for CountingMem {
+        const WINDOW: bool = true;
+
+        fn read_page(&mut self, page: u32) -> Result<Option<*const u8>, Stop> {
+            *self.page_checks.entry(page).or_default() += 1;
+            self.inner.read_page(page)
+        }
+
+        fn write_page(&mut self, page: u32) -> Result<Option<*mut u8>, Stop> {
+            *self.page_checks.entry(page).or_default() += 1;
+            self.inner.write_page(page)
+        }
+
+        fn raise_mxcsr(&mut self, flags: u32) {
+            self.inner.raise_mxcsr(flags);
+        }
+
+        fn input(&mut self, at: u32, len: u32) -> Result<*const u8, Stop> {
+            self.record_span(at, len);
+            self.inner.input(at, len)
+        }
+
+        fn output(&mut self, at: u32, len: u32) -> Result<*mut u8, Stop> {
+            self.record_span(at, len);
+            self.inner.output(at, len)
+        }
+
+        fn terminated(&mut self, at: u32, unit: u32, max: u32) -> Result<u32, Stop> {
+            self.inner.terminated(at, unit, max)
+        }
+
+        fn commit(&mut self) -> Result<(), Stop> {
+            self.inner.commit()
+        }
+    }
+
+    // spec: A64-CALL-4
+    #[test]
+    fn strided_array_transform_checks_each_page_at_most_once() {
+        let mut backing = vec![0u8; 2 << 12];
+        let mut classes = vec![0u8; 1 << 20];
+        classes[0] = READ | WRITE;
+        classes[1] = READ | WRITE;
+
+        // Place matrix at page 0 offset 0, 64 strided inputs (stride 48, 3072 bytes)
+        // starting at 0x0080 (all on page 0), and 64 strided outputs (stride 48, 3072 bytes)
+        // starting at 0x1000 (all on page 1).
+        let mat_at = 0x0000u32;
+        let in_at = 0x0080u32;
+        let out_at = 0x1000u32;
+        for (i, &val) in IDENTITY.iter().enumerate() {
+            backing[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+        }
+        for k in 0..64usize {
+            let off = in_at as usize + k * 48;
+            for (j, v) in [k as f32 + 1.0, -2.0, 3.5, 1.0].into_iter().enumerate() {
+                backing[off + j * 4..off + (j + 1) * 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        let context = BodyContext {
+            window: backing.as_mut_ptr(),
+            alias: backing.as_mut_ptr(),
+            classes: classes.as_ptr(),
+            ..BodyContext::default()
+        };
+        // SAFETY: `backing` and `classes` outlive `mem`.
+        let mut mem = CountingMem {
+            inner: unsafe { Window::new(&context) },
+            page_checks: HashMap::new(),
+        };
+
+        let ret = vec4_transform_array(
+            &mut mem,
+            [out_at, 48, in_at, 48, mat_at, 64, MXCSR_ALL_MASKED],
+        )
+        .unwrap();
+        assert_eq!(ret.value as u32, out_at);
+        assert_eq!(mem.page_checks.len(), 2, "only pages 0 and 1 touched");
+        assert_eq!(
+            mem.page_checks.get(&0),
+            Some(&1),
+            "page 0 checked more than once"
+        );
+        assert_eq!(
+            mem.page_checks.get(&1),
+            Some(&1),
+            "page 1 checked more than once"
+        );
+
+        for k in 0..64usize {
+            let off = out_at as usize + k * 48;
+            let got = [0, 1, 2, 3].map(|j| {
+                f32::from_le_bytes(backing[off + j * 4..off + (j + 1) * 4].try_into().unwrap())
+            });
+            assert_eq!(got, [k as f32 + 1.0, -2.0, 3.5, 1.0]);
+        }
+    }
+
+    // spec: A64F-FP-10, NAT-BODY-18
+    #[test]
+    fn array_transform_overlapping_matrix_reloads_updated_matrix_per_element() {
+        let mut cpu = adv_cpu::Cpu::new(0x1000, false).unwrap();
+        cpu.map(0x1_0000, 0x1000, Prot::RW).unwrap();
+
+        let m_at = 0x1_0000u32;
+        let in_at = 0x1_0100u32;
+        put_f32s(&mut cpu, m_at, &IDENTITY);
+        put_f32s(&mut cpu, in_at, &[2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0]);
+
+        // Writing out == matrix overwrites row 0 with (2,0,0,0) on element 0, so
+        // element 1 sees m[0] = 2.0 and computes (4,0,0,0).
+        run_body(
+            VEC4_TRANSFORM_ARRAY,
+            &mut cpu,
+            &[m_at, 16, in_at, 16, m_at, 2],
+        )
+        .unwrap();
+        assert_eq!(get_f32s(&cpu, m_at, 4), vec![2.0, 0.0, 0.0, 0.0]);
+        assert_eq!(get_f32s(&cpu, m_at + 16, 4), vec![4.0, 0.0, 0.0, 0.0]);
+    }
+
+    // spec: A64F-FP-5, A64F-FP-10
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn d3dx_bodies_honor_mxcsr_rounding_and_sticky_flags_and_decline_unmasked() {
+        let mut cpu = adv_cpu::Cpu::new(0x1000, false).unwrap();
+        cpu.map(0x1_0000, 0x1000, Prot::RW).unwrap();
+
+        let out_at = 0x1_0000u32;
+        let v_at = 0x1_0040u32;
+        let m_at = 0x1_0080u32;
+        // Component 0 computes ((1.0 * 1.0) + (1.0 * 2^-24)) + (1.0 * -1.0) + 0.0.
+        put_f32s(
+            &mut cpu,
+            v_at,
+            &[1.0, f32::from_bits(0x3380_0000), -1.0, 0.0],
+        );
+        put_f32s(
+            &mut cpu,
+            m_at,
+            &[
+                1.0, 0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0,
+            ],
+        );
+
+        // Default RN (0x1f80): rounds 1 + 2^-24 to 1.0 -> 0.0 and raises PE (0x20).
+        let (_, flags) =
+            run_body_mxcsr(VEC4_TRANSFORM, &mut cpu, &[out_at, v_at, m_at], 0x1f80).unwrap();
+        assert_eq!(get_f32s(&cpu, out_at, 1)[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(flags & 0x20, 0x20, "RN must raise PE");
+
+        // RU (0x5f80): rounds 1 + 2^-24 up to 1 + 2^-23 -> 2^-23 and raises PE (0x20).
+        let (_, flags) =
+            run_body_mxcsr(VEC4_TRANSFORM, &mut cpu, &[out_at, v_at, m_at], 0x5f80).unwrap();
+        assert_eq!(
+            get_f32s(&cpu, out_at, 1)[0].to_bits(),
+            f32::EPSILON.to_bits()
+        );
+        assert_eq!(flags & 0x20, 0x20, "RU must raise PE");
+
+        // Unmasked PE (0x0f80) declines cleanly to guest code before any writes.
+        put_f32s(&mut cpu, out_at, &[99.0, 99.0, 99.0, 99.0]);
+        let err =
+            run_body_mxcsr(VEC4_TRANSFORM, &mut cpu, &[out_at, v_at, m_at], 0x0f80).unwrap_err();
+        assert_eq!(err, Stop::Guest);
+        assert_eq!(get_f32s(&cpu, out_at, 4), vec![99.0, 99.0, 99.0, 99.0]);
     }
 }

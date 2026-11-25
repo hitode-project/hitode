@@ -841,6 +841,21 @@ impl Translator<'_> {
             self.clobber(Operand::Guest(1));
             self.emit(mov(W, host(1), X1));
         }
+        if body.outputs & adv_cpu_core::body::MXCSR != 0 {
+            self.emit_all(&[
+                ubfx(
+                    X,
+                    X16,
+                    X1,
+                    u32::from(adv_cpu_core::body::MXCSR_FLAGS_SHIFT),
+                    6,
+                ),
+                ldr(X, X17, RUNTIME, runtime::CPU_STATE),
+                ldr(W, X6, X17, runtime::MXCSR),
+                orr(W, X6, X6, X16, Lsl, 0),
+                str(W, X6, X17, runtime::MXCSR),
+            ]);
+        }
         if !bound.entry && body.pop != 0 {
             self.emit(add_imm(X, host(ESP), host(ESP), u32::from(body.pop), false));
         }
