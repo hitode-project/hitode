@@ -396,6 +396,7 @@ fn execute(
         runtime.recovery.recalled = 0;
     }
     scratch.capture.pc.set(0);
+    scratch.capture.second_lane.set(false);
     let faults = WorkerFaults {
         code,
         stub: entry.fault,

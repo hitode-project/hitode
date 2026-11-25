@@ -403,6 +403,7 @@ unsafe extern "C" fn access(
             native.diagnostics.refused += 1;
             let faults = &native.code.faults;
             faults.capture.pc.set(site);
+            faults.capture.second_lane.set(false);
             let resume = faults.site(site).map_or(0, |site| site.resume);
             runtime::AccessResult {
                 value: if resume != 0 {
@@ -1452,6 +1453,7 @@ mod tests {
             resume: 0,
             opt_record: None,
             checked: false,
+            pair_second: None,
         };
         let words = [
             load,
@@ -3273,6 +3275,7 @@ mod tests {
                 simd_dirty: 0,
                 resume: 0,
                 opt_record: None,
+                pair_second: None,
             },
             [0; 2],
         );

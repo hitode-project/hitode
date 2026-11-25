@@ -1592,6 +1592,7 @@ impl Translator<'_> {
                 simd_dirty: self.vector.dirty,
                 resume: 0,
                 opt_record: None,
+                pair_second: None,
             },
         ));
         self.x87_site();

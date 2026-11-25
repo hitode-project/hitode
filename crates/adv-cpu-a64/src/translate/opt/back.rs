@@ -171,7 +171,8 @@ fn pair_address(
     if b1 != b2 || d1.checked_add(w) != Some(d2) {
         return None;
     }
-    if matches!(locations[b1.0 as usize], Host::Register(_))
+    if folded[addr1.0 as usize]
+        && matches!(locations[b1.0 as usize], Host::Register(_))
         && !folded[b1.0 as usize]
         && d1 % w == 0
         && (-64..64).contains(&(d1 / w))
@@ -2325,6 +2326,10 @@ impl<'a> Emitter<'a> {
     }
 
     fn site(&mut self, checked: bool) {
+        self.site_with_pair(checked, None);
+    }
+
+    fn site_with_pair(&mut self, checked: bool, pair_second: Option<(u32, i32)>) {
         let record = &self.func.records[self.region.0 as usize];
         self.sites.push((
             self.asm.offset(),
@@ -2344,6 +2349,7 @@ impl<'a> Emitter<'a> {
                 simd_dirty: 0,
                 resume: 0,
                 opt_record: Some(self.region.0),
+                pair_second: if self.resident { pair_second } else { None },
             },
         ));
     }
@@ -3538,6 +3544,7 @@ impl<'a> Emitter<'a> {
                     && !checked
                     && !clock
                     && self.page_cross.is_none()
+                    && self.folded_addr_inst[addr.0 as usize]
                     && let Some((base_val, disp)) = affine_disp(&self.defs, addr)
                     && let Host::Register(base_reg) = self.locations[base_val.0 as usize]
                     && let Some(word) = guard_band_imm_word(true, ty, width, d, q, U, disp)
@@ -3629,6 +3636,7 @@ impl<'a> Emitter<'a> {
                 if self.guard_band
                     && !checked
                     && self.page_cross.is_none()
+                    && self.folded_addr_inst[addr.0 as usize]
                     && let Some((base_val, disp)) = affine_disp(&self.defs, addr)
                     && let Host::Register(base_reg) = self.locations[base_val.0 as usize]
                 {
@@ -4056,9 +4064,9 @@ impl<'a> Emitter<'a> {
                 width: w2,
                 addr: a2,
                 checked: false,
+                pc: pc2,
                 scope: None,
                 clock: false,
-                ..
             },
         ) = second
         else {
@@ -4081,6 +4089,7 @@ impl<'a> Emitter<'a> {
         let loc1 = self.locations[v1.0 as usize];
         let loc2 = self.locations[v2.0 as usize];
         let base = self.data_view();
+        let pair_second = (pc2 != pc1).then_some((pc2, disp + i32::from(w1)));
         if matches!(ty1, Type::I32 | Type::I64) {
             let size = match w1 {
                 4 => W,
@@ -4096,7 +4105,7 @@ impl<'a> Emitter<'a> {
             self.guest_eip = pc1;
             let br = self.gp(base_val, U);
             self.asm.emit(add_ext(X, U, base, br, Extend::Uxtw, 0));
-            self.site(false);
+            self.site_with_pair(false, pair_second);
             self.asm.emit(ldp(size, Index::Offset, r1, r2, U, disp));
             Some(2)
         } else {
@@ -4115,7 +4124,7 @@ impl<'a> Emitter<'a> {
             self.guest_eip = pc1;
             let br = self.gp(base_val, U);
             self.asm.emit(add_ext(X, U, base, br, Extend::Uxtw, 0));
-            self.site(false);
+            self.site_with_pair(false, pair_second);
             self.asm.emit(ldp_v(vsize, Index::Offset, r1, r2, U, disp));
             Some(2)
         }
@@ -4149,6 +4158,7 @@ impl<'a> Emitter<'a> {
                 value: val2,
                 after: after2,
                 checked: false,
+                pc: pc2,
                 scope: None,
                 ..
             },
@@ -4177,6 +4187,7 @@ impl<'a> Emitter<'a> {
             w1,
         )?;
         let base = self.data_view();
+        let pair_second = (pc2 != pc1).then_some((pc2, disp + i32::from(w1)));
         if is_int1 {
             let size = match w1 {
                 4 => W,
@@ -4193,7 +4204,7 @@ impl<'a> Emitter<'a> {
             self.guest_eip = pc1;
             let br = self.gp(base_val, U);
             self.asm.emit(add_ext(X, U, base, br, Extend::Uxtw, 0));
-            self.site(false);
+            self.site_with_pair(false, pair_second);
             self.asm.emit(stp(size, Index::Offset, r1, r2, U, disp));
             self.region = after2;
             self.mark(Part::Body, self.func.records[after2.0 as usize].eip);
@@ -4211,7 +4222,7 @@ impl<'a> Emitter<'a> {
             let r2 = self.vr(val2, B);
             let br = self.gp(base_val, U);
             self.asm.emit(add_ext(X, U, base, br, Extend::Uxtw, 0));
-            self.site(false);
+            self.site_with_pair(false, pair_second);
             self.asm.emit(stp_v(vsize, Index::Offset, r1, r2, U, disp));
             self.region = after2;
             self.mark(Part::Body, self.func.records[after2.0 as usize].eip);

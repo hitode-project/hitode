@@ -417,6 +417,7 @@ impl Native {
             (word.as_ptr(), self.pending_mask)
         });
         self.code.faults.capture.pc.set(0);
+        self.code.faults.capture.second_lane.set(false);
         let runtime = &mut *self.runtime;
         if self.count_resident_entries {
             runtime.resident_entry_counter = (&raw mut self.diagnostics.resident_entries) as u64;
@@ -476,7 +477,11 @@ impl Native {
         if let Some((site, reason)) = ResidentCold::decode(recovery.detail) {
             (refund, site, reason, false)
         } else if let Some(site) = fault {
-            (refund, site.eip, ResidentCold::HostFault, site.checked)
+            let eip = match site.pair_second {
+                Some((pc2, _)) if self.code.faults.capture.second_lane.get() => pc2,
+                _ => site.eip,
+            };
+            (refund, eip, ResidentCold::HostFault, site.checked)
         } else {
             (refund, record.eip, ResidentCold::Other, false)
         }

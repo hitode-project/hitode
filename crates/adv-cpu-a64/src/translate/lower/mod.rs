@@ -59,6 +59,9 @@ pub struct Site {
     pub resume: i32,
     /// Optimized region record, when this access belongs to an optimized form.
     pub opt_record: Option<u32>,
+    /// Second guest instruction and base-relative byte offset (`disp + width`
+    /// from `x17`) when a paired `LDP`/`STP` merges two distinct guest PCs.
+    pub pair_second: Option<(u32, i32)>,
 }
 
 /// Offsets of the body and the patchable miss branch in a checked unit.
