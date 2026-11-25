@@ -2298,6 +2298,13 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Before a store: keeps FPSR armed unless it holds a bit MXCSR lacks.
+    fn commit_sse_fpsr(&mut self) {
+        if self.func_uses_afp_sse {
+            fp_state::emit_commit_fpsr(&mut self.asm, T, U, S2);
+        }
+    }
+
     fn disarm_sse_fpsr(&mut self) {
         if self.func_uses_afp_sse {
             fp_state::emit_fold_fpsr(&mut self.asm, T, U, S2);
@@ -3619,9 +3626,9 @@ impl<'a> Emitter<'a> {
                 pc,
                 scope,
             } => {
-                // Fold live AFP SSE FPSR before committing a store so later region
+                // Commit live AFP SSE FPSR before the store so later region
                 // rollbacks preserve this committed region's SSE sticky flags.
-                self.disarm_sse_fpsr();
+                self.commit_sse_fpsr();
                 if let Some(cell) = scope {
                     let offset = runtime::SCOPE_FRAME + 4 * u32::from(cell);
                     let word = if matches!(self.func.ty(value), Type::I32 | Type::I64) {
@@ -4213,7 +4220,7 @@ impl<'a> Emitter<'a> {
             ) else {
                 return None;
             };
-            self.disarm_sse_fpsr();
+            self.commit_sse_fpsr();
             self.guest_eip = pc1;
             let br = self.gp(base_val, U);
             self.asm.emit(add_ext(X, U, base, br, Extend::Uxtw, 0));
@@ -4229,7 +4236,7 @@ impl<'a> Emitter<'a> {
                 16 => VSize::Q,
                 _ => return None,
             };
-            self.disarm_sse_fpsr();
+            self.commit_sse_fpsr();
             self.guest_eip = pc1;
             let r1 = self.vr(val1, A);
             let r2 = self.vr(val2, B);

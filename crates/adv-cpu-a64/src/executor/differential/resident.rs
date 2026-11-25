@@ -4467,3 +4467,57 @@ fn resident_x87_pc24_directed_rounding_overflow_does_not_saturate_to_f32_max() {
         );
     }
 }
+
+// spec: A64F-FP-5, A64-OPT-6
+#[test]
+fn resident_sse_stores_keep_lazy_fpsr_armed_when_mxcsr_holds_every_pending_bit() {
+    let body = Image::loop_body(|a, head, _| {
+        a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+        a.movups(xmm1, xmmword_ptr(esi + 16)).unwrap();
+        a.mulps(xmm0, xmm1).unwrap();
+        a.addps(xmm0, xmm1).unwrap();
+        a.movups(xmmword_ptr(edi), xmm0).unwrap();
+        a.add(esi, 32).unwrap();
+        a.add(edi, 16).unwrap();
+        latch(a, head);
+    });
+    const N: u32 = 64;
+    // `tiny` puts a subnormal input in iteration 40, which raises DE and UE
+    // midway; otherwise every iteration raises only PE.
+    for (mxcsr, tiny, max_folds) in [
+        (0x1fa0u32, false, 1u64),
+        (0x1f80, false, 2),
+        (0x1fa0, true, N as u64),
+        (0x1f80, true, N as u64),
+    ] {
+        let mut state = initial(N);
+        state.mxcsr = mxcsr;
+        let mut trial = Trial::new(
+            &body,
+            &state,
+            format!("store loop mxcsr={mxcsr:#x} tiny={tiny}"),
+            &[],
+            |m| {
+                for i in 0..N * 8 {
+                    let x = if tiny && i == 40 * 8 {
+                        f32::from_bits(0x0000_0400)
+                    } else {
+                        1.0f32 + i as f32 * 0.3
+                    };
+                    m.write(DATA + i * 4, &x.to_le_bytes()).unwrap();
+                }
+            },
+        );
+        assert!(trial.try_install_at(state.clone()));
+        assert_eq!(trial.compare(1 << 20).0, RunOutcome::ReachedStop);
+        let native = trial.live.native.as_ref().unwrap();
+        assert!(native.resident_arrivals(body.head).unwrap() > 0);
+        if adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP) {
+            let folds = native.diagnostics.fp.fpsr_folds;
+            assert!(
+                folds <= max_folds,
+                "mxcsr={mxcsr:#x} tiny={tiny}: {folds} FPSR folds for {N} stores"
+            );
+        }
+    }
+}

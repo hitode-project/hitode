@@ -45,7 +45,6 @@ pub(crate) const FPCR_X87_DEFAULT: u32 = FPCR_AH;
 /// MXCSR bits 12:7 (PM|UM|OM|ZM|DM|IM): all six SSE exceptions masked.
 pub(crate) const MXCSR_ALL_MASKED: u32 = 0x1f80;
 /// Hardware FPSR check mask for non-inexact exceptions, including `IDC` (bit 7).
-#[allow(dead_code)]
 pub(crate) const FPSR_CHECK_MASK: u32 = 0x8f;
 /// All six hardware FPSR sticky exception bits (`IDC|IXC|UFC|OFC|DZC|IOC`).
 pub(crate) const FPSR_STICKY_MASK: u32 = 0x9f;
@@ -209,6 +208,39 @@ pub(crate) fn emit_fold_fpsr(asm: &mut Asm, tmp1: Reg, tmp2: Reg, tmp3: Reg) {
     runtime::emit_inc_fp_counter(asm, runtime::FP_FPSR_READS, 1, tmp2);
     emit_fold_fpsr_value(asm, tmp1, tmp2, tmp3);
     asm.bind(clean);
+}
+
+/// Commits live hardware FPSR before a store that later rollbacks cannot undo.
+///
+/// Folds into `CpuState::mxcsr` only when FPSR holds a bit the fold would
+/// change: any of `0x8f`, or `IXC` while `MXCSR.PE` is clear. Otherwise every
+/// pending bit is already in MXCSR, so `fpsr_owner` stays `SseLive` and a later
+/// cold exit may still discard FPSR exactly. The common path is one `mrs` with
+/// no `msr fpsr`, so a store per loop iteration does not re-arm FPSR.
+///
+/// Preserves guest NZCV flags. `tmp1`, `tmp2` and `tmp3` must be distinct.
+pub(crate) fn emit_commit_fpsr(asm: &mut Asm, tmp1: Reg, tmp2: Reg, tmp3: Reg) {
+    assert!(tmp1 != tmp2 && tmp1 != tmp3 && tmp2 != tmp3);
+    let (done, fold) = (asm.label(), asm.label());
+    asm.emit(ldrb(tmp1, RUNTIME, runtime::FPSR_OWNER));
+    asm.cbz(W, false, tmp1, done);
+    asm.emit(mrs_fpsr(tmp1));
+    runtime::emit_inc_fp_counter(asm, runtime::FP_FPSR_READS, 1, tmp2);
+    // 0x8f is not a logical immediate.
+    asm.emit_all(&[
+        movz(W, tmp2, FPSR_CHECK_MASK as u16, 0),
+        and(W, tmp2, tmp1, tmp2, Lsl, 0),
+    ]);
+    asm.cbz(W, true, tmp2, fold);
+    asm.tbz(false, tmp1, 4, done);
+    asm.emit_all(&[
+        ldr(X, tmp2, RUNTIME, runtime::CPU_STATE),
+        ldr(W, tmp2, tmp2, runtime::MXCSR),
+    ]);
+    asm.tbz(true, tmp2, 5, done);
+    asm.bind(fold);
+    emit_fold_fpsr_value(asm, tmp1, tmp2, tmp3);
+    asm.bind(done);
 }
 
 /// Discards uncommitted hardware FPSR (`fpsr_owner = Clean`) without folding
