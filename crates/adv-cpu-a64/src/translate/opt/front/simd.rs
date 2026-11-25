@@ -1,4 +1,7 @@
-use super::{FlagKind, FpOp, Front, IntOp, Op, Reject, Type, Value, VecOp, VecToInt, VecUnary};
+use super::{
+    FlagKind, FpOp, Front, IntOp, Op, Reject, SseConvertKind, Type, Value, VecOp, VecToInt,
+    VecUnary,
+};
 use crate::encode::{Float, Logic};
 use crate::translate::front::forms::{Loc, Simd, SimdKind as Kind};
 
@@ -128,7 +131,7 @@ impl Front<'_> {
                 self.sse_input(dst, Some(src), true, false);
                 self.value(Op::Vec(VecOp::LessF64, dst, src))
             }
-            Kind::Double(op, true) | Kind::Float(op, true) => {
+            Kind::Double(op, scalar) | Kind::Float(op, scalar) => {
                 let op = match op {
                     Float::Fadd => FpOp::Add,
                     Float::Fsub => FpOp::Sub,
@@ -137,8 +140,16 @@ impl Front<'_> {
                     _ => return Err(Reject::Unsupported(self.index)),
                 };
                 let single = matches!(s.kind, Kind::Float(..));
-                self.sse_input(dst, Some(src), false, single);
-                if single {
+                self.sse_input(dst, Some(src), !scalar, single);
+                if !scalar {
+                    self.value(Op::SsePackedFp {
+                        op,
+                        double: !single,
+                        a: dst,
+                        b: src,
+                        proved: false,
+                    })
+                } else if single {
                     let result = self.value(Op::Fp32(op, dst, src));
                     self.value(Op::Vec(VecOp::MoveLow32, dst, result))
                 } else {
@@ -146,6 +157,76 @@ impl Front<'_> {
                     let b = self.bits(Type::F64, src);
                     let result = self.value(Op::SseFp64(op, a, b));
                     self.low(dst, result)
+                }
+            }
+            Kind::MinMax(max, scalar, double) => {
+                self.sse_input(dst, Some(src), !scalar, !double);
+                let result = self.value(Op::SseMinMax {
+                    max,
+                    scalar,
+                    double,
+                    a: dst,
+                    b: src,
+                    proved: false,
+                });
+                if !scalar {
+                    result
+                } else if double {
+                    self.value(Op::Vec(VecOp::Insert64(false, false), dst, result))
+                } else {
+                    self.value(Op::Vec(VecOp::MoveLow32, dst, result))
+                }
+            }
+            Kind::Sqrt(scalar, double) => {
+                self.sse_input(src, None, !scalar, !double);
+                let result = self.value(Op::SseSqrt {
+                    scalar,
+                    double,
+                    a: src,
+                    proved: false,
+                });
+                if !scalar {
+                    result
+                } else if double {
+                    self.value(Op::Vec(VecOp::Insert64(false, false), dst, result))
+                } else {
+                    self.value(Op::Vec(VecOp::MoveLow32, dst, result))
+                }
+            }
+            Kind::Widen(scalar) => {
+                // `cvtss2sd` (scalar) / `cvtps2pd` (packed low 2 f32 -> 2 f64).
+                self.sse_input(src, None, !scalar, true);
+                let result = self.value(Op::SseConvert {
+                    kind: if scalar {
+                        SseConvertKind::WidenScalar
+                    } else {
+                        SseConvertKind::WidenPacked
+                    },
+                    a: src,
+                    proved: false,
+                });
+                if scalar {
+                    self.value(Op::Vec(VecOp::Insert64(false, false), dst, result))
+                } else {
+                    result
+                }
+            }
+            Kind::Narrow(scalar) => {
+                // `cvtsd2ss` (scalar) / `cvtpd2ps` (packed 2 f64 -> low 2 f32).
+                self.sse_input(src, None, !scalar, false);
+                let result = self.value(Op::SseConvert {
+                    kind: if scalar {
+                        SseConvertKind::NarrowScalar
+                    } else {
+                        SseConvertKind::NarrowPacked
+                    },
+                    a: src,
+                    proved: false,
+                });
+                if scalar {
+                    self.value(Op::Vec(VecOp::MoveLow32, dst, result))
+                } else {
+                    result
                 }
             }
             Kind::ScalarFromInt(double) => {
@@ -159,19 +240,27 @@ impl Front<'_> {
                     self.value(Op::Vec(VecOp::MoveLow32, dst, result))
                 }
             }
-            Kind::ScalarToInt(double, true) => {
-                // CVTTSD2SI / CVTTSS2SI never raise DE under DAZ = 0 (assumed.mxcsr & 0xffc0 == 0x1f80).
-                let value = if double {
-                    self.bits(Type::F64, src)
+            Kind::ScalarToInt(double, truncate) => {
+                // CVT[T]SD2SI / CVT[T]SS2SI never raise DE under DAZ = 0.
+                if truncate {
+                    let value = if double {
+                        self.bits(Type::F64, src)
+                    } else {
+                        let widened = self.value(Op::VecUnary(VecUnary::WidenScalar, src));
+                        self.bits(Type::F64, widened)
+                    };
+                    self.value(Op::ToInt {
+                        value,
+                        wide: false,
+                        sse: true,
+                    })
                 } else {
-                    let widened = self.value(Op::VecUnary(VecUnary::WidenScalar, src));
-                    self.bits(Type::F64, widened)
-                };
-                self.value(Op::ToInt {
-                    value,
-                    wide: false,
-                    sse: true,
-                })
+                    self.value(Op::SseScalarToInt {
+                        value: src,
+                        double,
+                        truncate: false,
+                    })
+                }
             }
             Kind::PackedToInt(truncate, double) if !s.mmx() => {
                 // CVTTPS2DQ / CVTPS2DQ / CVTTPD2DQ / CVTPD2DQ never raise DE;
@@ -186,17 +275,20 @@ impl Front<'_> {
                 self.value(Op::VecUnary(VecUnary::FromInt4s, src))
             }
             Kind::FromInt(true) if !s.mmx() => self.value(Op::VecUnary(VecUnary::FromInt2d, src)),
-            Kind::FlagCompare(true, ordered) => {
-                self.sse_input(dst, Some(src), false, false);
-                let a = self.bits(Type::F64, dst);
-                let b = self.bits(Type::F64, src);
+            Kind::FlagCompare(double, ordered) => {
+                self.sse_input(dst, Some(src), false, !double);
+                let (width, a, b) = if double {
+                    (8, self.bits(Type::F64, dst), self.bits(Type::F64, src))
+                } else {
+                    (32, dst, src)
+                };
                 self.state.flags = self.value(Op::Flags {
                     kind: if ordered {
                         FlagKind::OrderedCompare
                     } else {
                         FlagKind::UnorderedCompare
                     },
-                    width: 8,
+                    width,
                     a,
                     b,
                     prior: Some(self.state.flags),

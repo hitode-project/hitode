@@ -3357,3 +3357,346 @@ fn post_review_xor_flags_and_f32_strip_fistp_precision_match_reference() {
         assert_eq!(i32::from_le_bytes(out), 42);
     }
 }
+
+// spec: A64-OPT-4, A64-OPT-5, A64-OPT-6, A64F-FP-5
+#[test]
+fn track_d_resident_x87_extended_admission_and_ssa_validation() {
+    // 1) Pure `+ −` DAG with `Op::FpValidate` runs hot in resident mode on normal
+    // values and exact zeros, and rolls back cleanly on overflow/NaN.
+    let dag_loop = Image::loop_body(|a, head, _| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fadd(qword_ptr(esi + 8)).unwrap();
+        a.fsub(qword_ptr(esi + 16)).unwrap();
+        a.fadd(qword_ptr(esi + 24)).unwrap();
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.add(esi, 32).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+    });
+    let mut state = initial(4);
+    state.x87.control = 0x027f;
+    state.x87.status = 0x20;
+    let mut trial = Trial::new(&dag_loop, &state, "resident FpValidate DAG", &[], |m| {
+        let rows = [
+            [1.0f64, 2.0, 0.5, 3.0],
+            [4.0, 1.0, 5.0, 0.0], // exact 0.0 sink
+            [-2.5, 7.5, 1.25, 0.25],
+            [10.0, -10.0, 0.0, 0.0], // exact 0.0 sink
+        ];
+        for (r, row) in rows.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                m.write(DATA + (r * 4 + c) as u32 * 8, &v.to_le_bytes())
+                    .unwrap();
+            }
+        }
+    });
+    assert!(trial.try_install_at(state.clone()));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    let native = trial.live.native.as_ref().unwrap();
+    assert!(native.resident_arrivals(dag_loop.head).unwrap() > 0);
+    assert_eq!(native.diagnostics.resident_cold_exits, 0);
+
+    // Overflow in row 2 triggers cold recovery and matches Tier-0 exactly.
+    let mut trial_ovf = Trial::new(
+        &dag_loop,
+        &state,
+        "resident FpValidate overflow rollback",
+        &[],
+        |m| {
+            let rows = [
+                [1.0f64, 2.0, 0.5, 3.0],
+                [1e308, 1e308, 0.0, 1.0],
+                [2.0, 3.0, 1.0, 4.0],
+                [5.0, 6.0, 7.0, 8.0],
+            ];
+            for (r, row) in rows.iter().enumerate() {
+                for (c, v) in row.iter().enumerate() {
+                    m.write(DATA + (r * 4 + c) as u32 * 8, &v.to_le_bytes())
+                        .unwrap();
+                }
+            }
+        },
+    );
+    assert!(trial_ovf.try_install_at(state.clone()));
+    assert_eq!(trial_ovf.compare(4096).0, RunOutcome::ReachedStop);
+
+    // 2) Resident loop with fcom+fnstsw+sahf fold, fcomi+fcmovb, fsqrt, frndint, fxam,
+    // PC64 exact, and directed rounding (RD).
+    let x87_loop = Image::loop_body(|a, head, _| {
+        let mut not_less = a.create_label();
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fsqrt().unwrap();
+        a.frndint().unwrap();
+        a.fld(qword_ptr(esi + 8)).unwrap();
+        a.fcomi(st0, st1).unwrap();
+        a.fcmovb(st0, st1).unwrap();
+        a.fcom_2(st0, st1).unwrap();
+        a.fnstsw(ax).unwrap();
+        a.sahf().unwrap();
+        a.jae(not_less).unwrap();
+        a.inc(ebx).unwrap();
+        a.set_label(&mut not_less).unwrap();
+        a.fxam().unwrap();
+        a.fnstsw(ax).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.fstp(qword_ptr(edi + 8)).unwrap();
+        a.fstp(st0).unwrap();
+        a.add(esi, 16).unwrap();
+        a.add(edi, 16).unwrap();
+        latch(a, head);
+        // Zero popped empty x87 slots so Trial::same_state compares identical raw bytes.
+        a.fldz().unwrap();
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+        a.fstp(st0).unwrap();
+    });
+    for control in [0x027fu16, 0x067f, 0x037f] {
+        let mut st = initial(4);
+        st.x87.control = control;
+        st.x87.status = 0x20;
+        let mut trial = Trial::new(
+            &x87_loop,
+            &st,
+            format!("resident x87 extended ctrl={control:#x}"),
+            &[],
+            |m| {
+                // Perfect squares keep PC64 exact while testing all ops.
+                for (i, (x, y)) in [(4.0f64, 1.0f64), (9.0, 5.0), (16.0, 2.0), (25.0, 6.0)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    m.write(DATA + i as u32 * 16, &x.to_le_bytes()).unwrap();
+                    m.write(DATA + i as u32 * 16 + 8, &y.to_le_bytes()).unwrap();
+                }
+            },
+        );
+        assert!(trial.try_install_at(st.clone()));
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        let native = trial.live.native.as_ref().unwrap();
+        assert!(native.resident_arrivals(x87_loop.head).unwrap() > 0);
+        assert_eq!(native.diagnostics.resident_cold_exits, 0);
+    }
+}
+
+// spec: A64-OPT-4, A64-OPT-6, A64F-FP-5
+#[test]
+fn track_d_resident_sse_packed_fp_minmax_sqrt_cvt_and_sticky_key() {
+    let sse_loop = Image::loop_body(|a, head, _| {
+        a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+        a.movups(xmm1, xmmword_ptr(esi + 16)).unwrap();
+        a.addps(xmm0, xmm1).unwrap();
+        a.minps(xmm0, xmm1).unwrap();
+        a.sqrtps(xmm0, xmm0).unwrap();
+        a.cvtps2pd(xmm2, xmm0).unwrap();
+        a.maxsd(xmm2, xmm2).unwrap();
+        a.cvtpd2ps(xmm3, xmm2).unwrap();
+        a.ucomiss(xmm3, xmm1).unwrap();
+        a.setb(al).unwrap();
+        a.cvtss2si(edx, xmm3).unwrap();
+        a.cvtsd2si(ebp, xmm2).unwrap();
+        a.movups(xmmword_ptr(edi), xmm3).unwrap();
+        a.mov(dword_ptr(edi + 16), edx).unwrap();
+        a.mov(dword_ptr(edi + 20), ebp).unwrap();
+        a.add(esi, 32).unwrap();
+        a.add(edi, 32).unwrap();
+        latch(a, head);
+    });
+    let mut compile_state = initial(4);
+    compile_state.mxcsr = 0x1fa0;
+    let init_data = |m: &mut adv_cpu_core::Memory| {
+        for r in 0..4u32 {
+            let base = DATA + r * 32;
+            for c in 0..4u32 {
+                let x = (r + c + 1) as f32;
+                let y = (r + c + 2) as f32 * 2.0;
+                m.write(base + c * 4, &x.to_le_bytes()).unwrap();
+                m.write(base + 16 + c * 4, &y.to_le_bytes()).unwrap();
+            }
+        }
+    };
+    // Verify resident execution + MXCSR sticky flag reuse across IE/DE/ZE/OE/UE.
+    for mxcsr in [0x1fa0u32, 0x1fa1, 0x1fa2, 0x1fbf] {
+        let mut run_state = compile_state.clone();
+        run_state.mxcsr = mxcsr;
+        let mut trial = Trial::new(
+            &sse_loop,
+            &run_state,
+            format!("resident SSE extended mxcsr={mxcsr:#x}"),
+            &[],
+            init_data,
+        );
+        assert!(trial.try_install_at(compile_state.clone()));
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+        let native = trial.live.native.as_ref().unwrap();
+        assert!(
+            native.resident_arrivals(sse_loop.head).unwrap() > 0,
+            "sticky mxcsr={mxcsr:#x} must reuse the single compiled resident version"
+        );
+        assert_eq!(native.diagnostics.resident_cold_exits, 0);
+    }
+}
+
+// spec: A64-OPT-4, A64-OPT-5, A64-OPT-6, A64F-FP-5
+#[test]
+fn track_d_resident_edge_cases_two_diff_sqrtss_narrow_and_afp_coherence() {
+    // 1) PC64 `fsub` (exact + inexact bail) and directed-rounding `fsub` C1 via `fnstsw ax`.
+    let x87_sub = Image::loop_body(|a, head, _| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fsub(qword_ptr(esi + 8)).unwrap();
+        a.fnstsw(ax).unwrap();
+        a.mov(word_ptr(edi + 8), ax).unwrap();
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.add(esi, 16).unwrap();
+        a.add(edi, 16).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    for (control, pairs) in [
+        (0x037fu16, [(5.5f64, 2.25f64), (1.0, 2.0f64.powi(-54))]), // PC64 exact + inexact
+        (0x067f, [(1.0, 0.3), (-1.0, 0.3)]),                       // RD fsub C1 (0 vs 1)
+        (0x0a7f, [(1.0, 0.3), (-1.0, 0.3)]),                       // RU fsub C1 (1 vs 0)
+    ] {
+        let mut state = initial(2);
+        state.x87.control = control;
+        state.x87.status = 0x20;
+        let mut trial = Trial::new(
+            &x87_sub,
+            &state,
+            format!("x87 fsub control={control:#06x}"),
+            &[],
+            |m| {
+                for (i, &(x, y)) in pairs.iter().enumerate() {
+                    let base = DATA + i as u32 * 16;
+                    m.write(base, &x.to_le_bytes()).unwrap();
+                    m.write(base + 8, &y.to_le_bytes()).unwrap();
+                }
+            },
+        );
+        assert!(trial.try_install_at(state.clone()));
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    }
+
+    // 2) Scalar `sqrtss` with subnormal and `+Inf` inputs (exact `MXCSR.DE` and result).
+    let sqrt_ss = Image::loop_body(|a, head, _| {
+        a.movss(xmm0, dword_ptr(esi)).unwrap();
+        a.sqrtss(xmm0, xmm0).unwrap();
+        a.movss(dword_ptr(edi), xmm0).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        latch(a, head);
+    });
+    for (name, vals) in [
+        ("sqrtss subnormal", [4.0f32, f32::from_bits(1)]),
+        ("sqrtss +inf", [9.0f32, f32::INFINITY]),
+    ] {
+        let mut state = initial(2);
+        state.mxcsr = 0x1fa0;
+        let mut trial = Trial::new(&sqrt_ss, &state, name, &[], |m| {
+            for (i, v) in vals.iter().enumerate() {
+                m.write(DATA + i as u32 * 4, &v.to_le_bytes()).unwrap();
+            }
+        });
+        assert!(trial.try_install_at(state.clone()));
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    }
+
+    // 3) `cvtsd2ss` & `cvtpd2ps` tininess-before-rounding (`exp == 1` boundary sets MXCSR.UE).
+    let narrow_ue = Image::loop_body(|a, head, _| {
+        a.movupd(xmm0, xmmword_ptr(esi)).unwrap();
+        a.cvtsd2ss(xmm1, xmm0).unwrap();
+        a.cvtpd2ps(xmm2, xmm0).unwrap();
+        a.movss(dword_ptr(edi), xmm1).unwrap();
+        a.movups(xmmword_ptr(edi + 16), xmm2).unwrap();
+        a.add(esi, 16).unwrap();
+        a.add(edi, 32).unwrap();
+        latch(a, head);
+    });
+    // Just below f32::MIN_POSITIVE; rounds up to f32::MIN_POSITIVE (exp == 1) and raises UE.
+    let tiny_boundary = f64::from(f32::MIN_POSITIVE) * (1.0 - 2.0f64.powi(-25));
+    let mut state = initial(2);
+    state.mxcsr = 0x1fa0;
+    let mut trial = Trial::new(&narrow_ue, &state, "narrow exp==1 UE", &[], |m| {
+        for (i, (x, y)) in [(1.5f64, 2.5f64), (tiny_boundary, tiny_boundary)]
+            .iter()
+            .enumerate()
+        {
+            let base = DATA + i as u32 * 16;
+            m.write(base, &x.to_le_bytes()).unwrap();
+            m.write(base + 8, &y.to_le_bytes()).unwrap();
+        }
+    });
+    assert!(trial.try_install_at(state.clone()));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+
+    // 4) Mixed AFP SSE + x87: x87 divide-by-zero/inexact/underflow must NOT leak into MXCSR,
+    // while SSE subnormal input MUST update MXCSR.DE.
+    let mixed_sse_x87 = Image::loop_body(|a, head, _| {
+        a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+        a.movups(xmm1, xmmword_ptr(esi + 16)).unwrap();
+        a.addps(xmm0, xmm1).unwrap();
+        a.movups(xmmword_ptr(edi), xmm0).unwrap();
+        // x87 division by small value (sets host FPSR.IXC/OFC/etc. when x87 runs).
+        a.fld(qword_ptr(esi + 32)).unwrap();
+        a.fdiv(qword_ptr(esi + 40)).unwrap();
+        a.fstp(qword_ptr(edi + 16)).unwrap();
+        a.add(esi, 48).unwrap();
+        a.add(edi, 32).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    for (name, subnormal_sse, x87_rhs) in [
+        ("mixed normal SSE + x87 div-by-zero", false, 0.0f64),
+        ("mixed subnormal SSE + x87 div", true, 3.0f64),
+    ] {
+        let mut state = initial(2);
+        state.mxcsr = 0x1fa0;
+        state.x87.status = 0x20;
+        let mut trial = Trial::new(&mixed_sse_x87, &state, name, &[], |m| {
+            for r in 0..2u32 {
+                let base = DATA + r * 48;
+                let s0 = if subnormal_sse && r == 1 {
+                    f32::from_bits(1)
+                } else {
+                    1.5f32
+                };
+                for c in 0..4u32 {
+                    m.write(base + c * 4, &s0.to_le_bytes()).unwrap();
+                    m.write(base + 16 + c * 4, &2.0f32.to_le_bytes()).unwrap();
+                }
+                m.write(base + 32, &1.0f64.to_le_bytes()).unwrap();
+                let rhs = if r == 1 { x87_rhs } else { 2.0f64 };
+                m.write(base + 40, &rhs.to_le_bytes()).unwrap();
+            }
+        });
+        assert!(trial.try_install_at(state.clone()));
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    }
+
+    // 5) AFP SSE + `stmxcsr` coherence: `stmxcsr` must observe DE raised by earlier `addps`.
+    let sse_stmxcsr = Image::loop_body(|a, head, _| {
+        a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+        a.movups(xmm1, xmmword_ptr(esi + 16)).unwrap();
+        a.addps(xmm0, xmm1).unwrap();
+        a.stmxcsr(dword_ptr(edi + 16)).unwrap();
+        a.movups(xmmword_ptr(edi), xmm0).unwrap();
+        a.add(esi, 32).unwrap();
+        a.add(edi, 32).unwrap();
+        latch(a, head);
+    });
+    let mut state = initial(2);
+    state.mxcsr = 0x1fa0;
+    let mut trial = Trial::new(&sse_stmxcsr, &state, "SSE addps + stmxcsr DE", &[], |m| {
+        for r in 0..2u32 {
+            let base = DATA + r * 32;
+            let x = if r == 1 { f32::from_bits(1) } else { 1.25f32 };
+            for c in 0..4u32 {
+                m.write(base + c * 4, &x.to_le_bytes()).unwrap();
+                m.write(base + 16 + c * 4, &2.5f32.to_le_bytes()).unwrap();
+            }
+        }
+    });
+    assert!(trial.try_install_at(state.clone()));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+}

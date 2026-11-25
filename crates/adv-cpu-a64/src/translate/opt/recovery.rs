@@ -414,9 +414,21 @@ impl Locations<'_> {
 
 fn compute_flags(kind: super::ir::FlagKind, width: u8, a: u128, b: u128, prior: u32) -> u32 {
     use adv_cpu_core::integer::{AF, CF, OF, PF, SF, ZF};
+    if kind == super::ir::FlagKind::Sahf {
+        let ah = a as u32 & 0xff;
+        let mask = SF | ZF | AF | PF | CF;
+        return (prior & !mask) | (ah & mask);
+    }
     if kind.floating() {
         // Recovery already knows the comparison completed.
-        let (a, b) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
+        let (a, b) = if kind != super::ir::FlagKind::X87CompareFold && width == 32 {
+            (
+                f64::from(f32::from_bits(a as u32)),
+                f64::from(f32::from_bits(b as u32)),
+            )
+        } else {
+            (f64::from_bits(a as u64), f64::from_bits(b as u64))
+        };
         let set = if a.is_nan() || b.is_nan() {
             ZF | PF | CF
         } else if a < b {
@@ -426,7 +438,12 @@ fn compute_flags(kind: super::ir::FlagKind, width: u8, a: u128, b: u128, prior: 
         } else {
             0
         };
-        prior & !(ZF | PF | CF | OF | SF | AF) | set
+        if kind == super::ir::FlagKind::X87CompareFold {
+            let af = if width & 1 != 0 { AF } else { 0 };
+            prior & !(ZF | PF | CF | SF | AF) | set | af
+        } else {
+            prior & !(ZF | PF | CF | OF | SF | AF) | set
+        }
     } else {
         super::eval::flags(kind, width, a, b, prior).unwrap()
     }
@@ -528,7 +545,13 @@ fn materialize_x87(x87: &X87<Host>, values: &Locations, cpu: &mut adv_cpu_core::
     cpu.x87.control = x87.control;
     cpu.x87.status = x87.status & !((7 << 11) | (1 << 9)) | u16::from(x87.top) << 11;
     if let Some(location) = x87.c1 {
-        cpu.x87.status |= (values.locate(location) as u16 & 1) << 9;
+        let raw = values.locate(location) as u32;
+        if raw & (1 << 16) != 0 {
+            cpu.x87.status =
+                (cpu.x87.status & !0x4700) | (raw as u16 & 0x4500) | ((raw as u16 & 1) << 9);
+        } else {
+            cpu.x87.status |= (raw as u16 & 1) << 9;
+        }
     }
     if let Some(location) = x87.ip {
         cpu.x87.ip = values.locate(location) as u32;

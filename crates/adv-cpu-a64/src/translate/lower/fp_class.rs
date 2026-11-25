@@ -254,6 +254,54 @@ pub(in crate::translate) fn snan(asm: &mut Asm, input: VReg, bits: Reg, fail: La
     asm.bind(clean);
 }
 
+/// Branches on a binary32 signaling NaN.
+pub(in crate::translate) fn snan32(asm: &mut Asm, input: VReg, bits: Reg, fail: Label) {
+    let clean = asm.label();
+    asm.emit(fcmps(input, input));
+    asm.b_cond(Cond::Vc, clean);
+    asm.emit(fmov_from_v(W, bits, input));
+    asm.tbz(false, bits, 22, fail);
+    asm.bind(clean);
+}
+
+/// Batched NEON `.4s` exponent-window witness for 1..=4 binary64 values.
+///
+/// Packs each value's high 32-bit word into `vhi.4s`, extracts biased exponents
+/// (`exp = (hi << 1) >> 21`), and branches to `check` if any lane has
+/// `exp < lo || exp > 2046` (where `lo = 1` when `!strict` and `lo = 2` when
+/// `strict`). Unused lanes are initialized to `1.0` (`exp = 1023`), which
+/// always passes.
+pub(in crate::translate) fn vector_f64_witness(
+    asm: &mut Asm,
+    inputs: &[VReg],
+    strict: bool,
+    tmp: Reg,
+    [vhi, vlo, vmax]: [VReg; 3],
+    check: Label,
+) {
+    debug_assert!(!inputs.is_empty() && inputs.len() <= 4);
+    if inputs.len() < 4 {
+        asm.emit_all(&[movz(W, tmp, 0x3ff0, 16), vdup(Arr::S4, vhi, tmp)]);
+    }
+    for (lane, &src) in inputs.iter().enumerate() {
+        asm.emit(vins(2, vhi, lane as u32, src, 1));
+    }
+    let (lo, max): (u16, u16) = if strict { (2, 2044) } else { (1, 2045) };
+    asm.emit_all(&[
+        vshift(ShiftImm::Shl, Arr::S4, vhi, vhi, 1),
+        vshift(ShiftImm::Ushr, Arr::S4, vhi, vhi, 21),
+        movz(W, tmp, lo, 0),
+        vdup(Arr::S4, vlo, tmp),
+        movz(W, tmp, max, 0),
+        vdup(Arr::S4, vmax, tmp),
+        vsame(Same::Sub, Arr::S4, vhi, vhi, vlo),
+        vsame(Same::Uqsub, Arr::S4, vhi, vhi, vmax),
+        umaxv(vhi, vhi),
+        fmov_from_v(W, tmp, vhi),
+    ]);
+    asm.cbz(W, true, tmp, check);
+}
+
 /// TwoSum residual: given `s = fl(a + b)`, writes `(a + b) - s` into `e` using
 /// `tmp` as scratch. `e` and `tmp` must be distinct from `a`, `b`, `s` and each
 /// other.
@@ -274,6 +322,29 @@ pub(in crate::translate) fn two_sum_error(
         dfloat(Float::Fsub, e, a, e),
         dfloat(Float::Fsub, tmp, b, tmp),
         dfloat(Float::Fadd, e, e, tmp),
+    ]);
+}
+
+/// TwoDiff residual: given `s = fl(a - b)`, writes `(a - b) - s` into `e`
+/// using `tmp` as scratch without clobbering `b`. `e` and `tmp` must be
+/// distinct from `a`, `b`, `s` and each other.
+pub(in crate::translate) fn two_diff_error(
+    asm: &mut Asm,
+    a: VReg,
+    b: VReg,
+    s: VReg,
+    e: VReg,
+    tmp: VReg,
+) {
+    debug_assert_ne!(e, tmp);
+    debug_assert!(![a, b, s].contains(&e));
+    debug_assert!(![a, b, s].contains(&tmp));
+    asm.emit_all(&[
+        dfloat(Float::Fsub, tmp, s, a),
+        dfloat(Float::Fsub, e, s, tmp),
+        dfloat(Float::Fsub, e, a, e),
+        dfloat(Float::Fadd, tmp, b, tmp),
+        dfloat(Float::Fsub, e, e, tmp),
     ]);
 }
 

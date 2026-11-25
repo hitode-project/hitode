@@ -3520,7 +3520,7 @@ mod tests {
         cpu.regs[ESP] = STACK + 0x8000;
         cpu.regs[6] = SRC;
         cpu.regs[7] = DST;
-        cpu.x87.control = 0x37f;
+        cpu.x87.control = 0x37e;
         cpu.mxcsr = 0x1f80;
         native.observe_stop(stop);
         native

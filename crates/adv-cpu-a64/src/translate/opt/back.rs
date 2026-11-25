@@ -30,6 +30,7 @@ use crate::runtime::{self, Runtime};
 use crate::translate::lower::access::{CheckedEmitter, Value as AccessReg, page_crossing};
 use crate::translate::lower::flags::{Carry, Overflow, Sense};
 use crate::translate::lower::fp_class;
+use crate::translate::lower::fp_state;
 use crate::translate::lower::resident::ResidentCold;
 use crate::translate::lower::{Site, WINDOW, X0, X1, X2, X3};
 pub(super) use batch::BatchEmitter;
@@ -37,6 +38,7 @@ use std::mem::offset_of;
 
 const T: Reg = Reg::new(16);
 const U: Reg = Reg::new(17);
+const S2: Reg = Reg::new(2);
 const RT: Reg = Reg::new(29);
 const SP: Reg = Reg::new(31);
 const ALIAS: Reg = Reg::new(28);
@@ -288,7 +290,9 @@ fn lower_form(
         .map(|(word, label)| (word, e.asm.position(label) / 4));
     let words = e.asm.finish();
     #[cfg(test)]
-    assert_no_fp_state(&words);
+    if !e.uses_fp_state {
+        assert_no_fp_state(&words);
+    }
     Lowered {
         entry: 0,
         body: e.body,
@@ -376,6 +380,123 @@ fn emit<'a>(
     {
         branch_only[v.0 as usize] = false;
     }
+    // Keep values in V registers: when `Extract32` feeds only a same-block
+    // 4-byte `Op::Store` (with no intervening write to the source vector
+    // register), store directly from the V lane via `vstr_reg(VMem::S, ...)`.
+    let mut store_only_extract32 = vec![false; func.types.len()];
+    {
+        let mut use_count = vec![0usize; func.types.len()];
+        for b in &func.blocks {
+            for &(_, op) in &b.insts {
+                for u in op.uses() {
+                    use_count[u.0 as usize] += 1;
+                }
+            }
+            if let End::Branch { cond, .. } = b.end {
+                use_count[cond.0 as usize] += 1;
+            }
+            for t in b.end.targets() {
+                for &u in &t.args {
+                    use_count[u.0 as usize] += 1;
+                }
+            }
+        }
+        for r in &func.records {
+            for u in r.uses() {
+                use_count[u.0 as usize] += 1;
+            }
+        }
+        for b in &func.blocks {
+            for (idx, &(res, op)) in b.insts.iter().enumerate() {
+                let (Some(v), Op::VecToInt(VecToInt::Extract32(_), vec)) = (res, op) else {
+                    continue;
+                };
+                if use_count[v.0 as usize] != 1 {
+                    continue;
+                }
+                let vec_loc = allocation.locations[vec.0 as usize];
+                let mut ok = false;
+                for &(later_res, later_op) in &b.insts[idx + 1..] {
+                    if let Op::Store {
+                        width: 4,
+                        value,
+                        scope: None,
+                        ..
+                    } = later_op
+                        && value == v
+                    {
+                        ok = true;
+                        break;
+                    }
+                    if later_op.uses().any(|u| u == v) {
+                        break;
+                    }
+                    if let Some(r) = later_res
+                        && allocation.locations[r.0 as usize] == vec_loc
+                    {
+                        break;
+                    }
+                }
+                if ok {
+                    store_only_extract32[v.0 as usize] = true;
+                }
+            }
+        }
+    }
+    let features = adv_cpu_core::HostFeatures::get();
+    let core_class = cost::CoreClass::detect();
+    let has_directed_rounding = func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
+        matches!(
+            op,
+            Op::X87Arith {
+                rounding: 1..=3,
+                ..
+            } | Op::X87Store {
+                integer: false,
+                rounding: 1..=3,
+                ..
+            } | Op::X87Sqrt {
+                rounding: 1..=3,
+                ..
+            }
+        )
+    });
+    // Identify any deferred `Op::Fp` segments whose `Op::FpValidate` selects
+    // `FpsrMask` so we can arm/clear FPSR before the segment starts and skip
+    // per-Mul inline checks.
+    let mut fpsr_deferred_ops = std::collections::BTreeSet::<Value>::new();
+    let mut fpsr_clear_before = std::collections::BTreeSet::<(usize, usize)>::new();
+    let mut fp_validate_strategies =
+        std::collections::BTreeMap::<(usize, usize), cost::ValidationStrategy>::new();
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        let mut seg_first: Option<usize> = None;
+        let mut seg_vals: Vec<Value> = Vec::new();
+        for (i_idx, &(res, op)) in block.insts.iter().enumerate() {
+            if let Some(v) = res
+                && func.deferred_fp.contains(&v)
+            {
+                if seg_first.is_none() {
+                    seg_first = Some(i_idx);
+                }
+                seg_vals.push(v);
+            } else if let Op::FpValidate { values, strict } = op {
+                let count = values.iter().flatten().count();
+                let strict_muls = strict.count_ones() as usize;
+                let fpsr_eligible = !has_directed_rounding && !func.deferred_fp.is_empty();
+                let strategy =
+                    cost::select_validation(core_class, count, strict_muls, fpsr_eligible, false);
+                fp_validate_strategies.insert((b_idx, i_idx), strategy);
+                if strategy == cost::ValidationStrategy::FpsrMask {
+                    if let Some(first_i) = seg_first {
+                        fpsr_clear_before.insert((b_idx, first_i));
+                    }
+                    fpsr_deferred_ops.extend(seg_vals.iter().copied());
+                }
+                seg_first = None;
+                seg_vals.clear();
+            }
+        }
+    }
     let env_miss = resident.then(|| asm.label());
     let domain_miss = (resident && !func.domain_guards.is_empty()).then(|| asm.label());
     let domain_fallback = (resident && !func.domain_guards.is_empty()).then(|| asm.label());
@@ -432,6 +553,34 @@ fn emit<'a>(
                 .rposition(|(_, op)| matches!(op, Op::PlainPage { .. }))
         })
         .flatten();
+    let live_mxcsr = inline.is_some() && resident;
+    let has_afp = features.contains(adv_cpu_core::HostFeatures::AFP);
+    let has_stmxcsr = func.entry.contains(&Source::Mxcsr);
+    let can_use_afp_sse = has_afp && live_mxcsr && !has_stmxcsr;
+    let func_uses_afp_sse = can_use_afp_sse
+        && func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
+            matches!(
+                op,
+                Op::SsePackedFp { .. }
+                    | Op::SseMinMax { .. }
+                    | Op::SseSqrt { .. }
+                    | Op::SseConvert { .. }
+            ) || matches!(
+                op,
+                Op::Flags {
+                    kind: FlagKind::OrderedCompare | FlagKind::UnorderedCompare,
+                    width,
+                    ..
+                } if *width != 10
+            )
+        });
+    let all_sse_ops_afp = can_use_afp_sse
+        && !func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
+            matches!(
+                op,
+                Op::SseFp64(..) | Op::Fp32(..) | Op::Vec(VecOp::LessF64, ..)
+            )
+        });
     let mmx_miss = (resident && count_entries).then(|| asm.label());
     let mut e = Emitter {
         func,
@@ -473,9 +622,23 @@ fn emit<'a>(
         region: RecordId(0),
         checkpoints: Vec::new(),
         fp_checks: Vec::new(),
+        fp_validate_checks: Vec::new(),
         invalid_ints: Vec::new(),
         mxcsr_guards: Vec::new(),
-        live_mxcsr: inline.is_some() && resident,
+        live_mxcsr,
+        has_afp,
+        has_frintts: features.contains(adv_cpu_core::HostFeatures::FRINTTS),
+        has_directed_rounding,
+        uses_fp_state: false,
+        modifies_fpcr: false,
+        can_use_afp_sse,
+        func_uses_afp_sse,
+        all_sse_ops_afp,
+        store_only_extract32,
+        fpsr_deferred_ops,
+        fp_validate_strategies,
+        cur_block_idx: 0,
+        cur_inst_idx: 0,
         edges: Vec::new(),
         links: Vec::new(),
         transitions: Vec::new(),
@@ -562,6 +725,20 @@ fn emit<'a>(
             if matches!(op, Op::Test { .. }) && result.is_some_and(|v| branch_only[v.0 as usize]) {
                 continue;
             }
+            if matches!(op, Op::VecToInt(VecToInt::Extract32(_), _))
+                && result.is_some_and(|v| e.store_only_extract32[v.0 as usize])
+            {
+                continue;
+            }
+            if fpsr_clear_before.contains(&(b, i)) {
+                e.uses_fp_state = true;
+                if e.has_afp && e.live_mxcsr {
+                    fp_state::emit_fold_fpsr(&mut e.asm, T, U, S2);
+                }
+                e.asm.emit(msr_fpsr(Reg::ZR));
+            }
+            e.cur_block_idx = b;
+            e.cur_inst_idx = i;
             e.guest_eip = if op.region_guard().is_some() {
                 data.insts[i + 1..]
                     .iter()
@@ -672,6 +849,7 @@ fn emit<'a>(
         e.checkpoints();
     }
     e.fp_checks();
+    e.emit_fp_validate_checks();
     for (check, dst, resume, fail) in std::mem::take(&mut e.invalid_ints) {
         e.asm.bind(check);
         e.asm.emit_all(&[
@@ -714,6 +892,7 @@ fn emit<'a>(
         e.domain_misses_tail(bytes, refund, d_miss, d_fallback);
     }
     // spec: A64-OPT-6
+    let restore_exit = e.asm.label();
     let exit = e.asm.label();
     for (i, record) in func.records.iter().enumerate() {
         e.asm.bind(e.cold[i]);
@@ -725,7 +904,11 @@ fn emit<'a>(
         }
         e.imm(T, i as u64);
         e.asm.emit(str(W, T, RT, RECORD));
-        e.asm.b(exit);
+        e.asm.b(restore_exit);
+    }
+    e.asm.bind(restore_exit);
+    if e.modifies_fpcr {
+        fp_state::emit_restore_host_fpcr(&mut e.asm, T, U);
     }
     e.asm.bind(exit);
     // Permanently undefined until placed.
@@ -854,6 +1037,13 @@ struct FpCheck {
     fail: Label,
 }
 
+struct FpValidateCheck {
+    values: Vec<Host>,
+    check: Label,
+    resume: Label,
+    fail: Label,
+}
+
 struct Emitter<'a> {
     func: &'a Func,
     asm: Asm,
@@ -890,9 +1080,23 @@ struct Emitter<'a> {
     region: RecordId,
     checkpoints: Vec<(Label, RecordId, Label)>,
     fp_checks: Vec<FpCheck>,
+    fp_validate_checks: Vec<FpValidateCheck>,
     invalid_ints: Vec<(Label, Reg, Label, Label)>,
     mxcsr_guards: Vec<(Label, u32, Label, Label)>,
     live_mxcsr: bool,
+    has_afp: bool,
+    has_frintts: bool,
+    has_directed_rounding: bool,
+    uses_fp_state: bool,
+    modifies_fpcr: bool,
+    can_use_afp_sse: bool,
+    func_uses_afp_sse: bool,
+    all_sse_ops_afp: bool,
+    store_only_extract32: Vec<bool>,
+    fpsr_deferred_ops: std::collections::BTreeSet<Value>,
+    fp_validate_strategies: std::collections::BTreeMap<(usize, usize), cost::ValidationStrategy>,
+    cur_block_idx: usize,
+    cur_inst_idx: usize,
     edges: Vec<(Label, Target, usize, usize)>,
     links: Vec<(usize, u32)>,
     transitions: Vec<(usize, usize)>,
@@ -1671,6 +1875,50 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn emit_fp_validate_checks(&mut self) {
+        for check in std::mem::take(&mut self.fp_validate_checks) {
+            self.asm.bind(check.check);
+            for loc in check.values {
+                let v = self.v_at(loc, A);
+                let lane_ok = self.asm.label();
+                fp_class::result_bits(&mut self.asm, true, v, T, U, Some(U));
+                self.asm.cbz(W, true, U, lane_ok);
+                // Accept exact ±0.0; reject subnormal, infinity, and NaN.
+                self.asm.emit(lsl_imm(X, T, T, 1));
+                self.asm.cbz(X, true, T, check.fail);
+                self.asm.bind(lane_ok);
+            }
+            self.asm.b(check.resume);
+        }
+    }
+
+    fn disarm_sse_fpsr(&mut self) {
+        if self.func_uses_afp_sse {
+            fp_state::emit_fold_fpsr(&mut self.asm, T, U, S2);
+        }
+    }
+
+    fn set_fpcr_imm(&mut self, desired: u32) {
+        if desired != fp_state::FPCR_X87_DEFAULT {
+            self.disarm_sse_fpsr();
+        }
+        self.uses_fp_state = true;
+        self.modifies_fpcr = true;
+        fp_state::emit_sync_fpcr_imm(&mut self.asm, desired, T, U);
+    }
+
+    fn ensure_rn_fpcr(&mut self) {
+        self.disarm_sse_fpsr();
+        if self.has_directed_rounding || self.modifies_fpcr || self.func_uses_afp_sse {
+            self.set_fpcr_imm(0);
+        }
+    }
+
+    fn arm_afp_sse(&mut self) {
+        self.set_fpcr_imm(fp_state::FPCR_X87_DEFAULT);
+        fp_state::emit_arm_sse_fpsr(&mut self.asm, T);
+    }
+
     fn site(&mut self, checked: bool) {
         let record = &self.func.records[self.region.0 as usize];
         self.sites.push((
@@ -1736,34 +1984,51 @@ impl<'a> Emitter<'a> {
                 }
                 return;
             }
-            Op::Flags { kind, a, b, .. } if kind.floating() => {
+            Op::Flags {
+                kind, width, a, b, ..
+            } if kind.floating() => {
+                let is_sse = kind != FlagKind::X87CompareFold && width != 10;
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
-                self.asm.emit(compare(kind, a, b));
-                let fail = self.fail();
-                let (target, resume) = if self.live_mxcsr {
-                    let (check, resume) = (self.asm.label(), self.asm.label());
-                    self.mxcsr_guards.push((check, 0, resume, fail));
-                    (check, Some(resume))
+                if is_sse && self.can_use_afp_sse {
+                    self.arm_afp_sse();
+                    self.asm.emit(compare(kind, width, a, b));
                 } else {
-                    (fail, None)
-                };
-                if kind == FlagKind::OrderedCompare {
-                    self.asm.b_cond(Cond::Vs, target);
-                    if let Some(resume) = resume {
-                        self.asm.bind(resume);
+                    self.ensure_rn_fpcr();
+                    self.asm.emit(compare(kind, width, a, b));
+                    let fail = self.fail();
+                    let (target, resume) = if is_sse && self.live_mxcsr {
+                        let (check, resume) = (self.asm.label(), self.asm.label());
+                        self.mxcsr_guards.push((check, 0, resume, fail));
+                        (check, Some(resume))
+                    } else {
+                        (fail, None)
+                    };
+                    let ordered = kind == FlagKind::OrderedCompare
+                        || (kind == FlagKind::X87CompareFold && width & 2 != 0);
+                    let single = is_sse && width == 32;
+                    if ordered {
+                        self.asm.b_cond(Cond::Vs, target);
+                        if let Some(resume) = resume {
+                            self.asm.bind(resume);
+                        }
+                    } else {
+                        let ok = self.asm.label();
+                        self.asm.b_cond(Cond::Vc, ok);
+                        if single {
+                            fp_class::snan32(&mut self.asm, a, T, target);
+                            fp_class::snan32(&mut self.asm, b, T, target);
+                        } else {
+                            fp_class::snan(&mut self.asm, a, T, target);
+                            fp_class::snan(&mut self.asm, b, T, target);
+                        }
+                        if let Some(resume) = resume {
+                            self.asm.bind(resume);
+                        }
+                        // `snan` uses `fcmp`/`fcmps` internally; restore the unordered NZCV.
+                        self.asm.emit(compare(kind, width, a, b));
+                        self.asm.bind(ok);
                     }
-                } else {
-                    let ordered = self.asm.label();
-                    self.asm.b_cond(Cond::Vc, ordered);
-                    fp_class::snan(&mut self.asm, a, T, target);
-                    fp_class::snan(&mut self.asm, b, T, target);
-                    if let Some(resume) = resume {
-                        self.asm.bind(resume);
-                    }
-                    // `snan` uses `fcmp` internally; restore the unordered NZCV.
-                    self.asm.emit(compare(kind, a, b));
-                    self.asm.bind(ordered);
                 }
             }
             Op::Flags { .. } | Op::Snapshot(_) => {}
@@ -1927,28 +2192,214 @@ impl<'a> Emitter<'a> {
                 }
             }
             Op::Fp(fp, a, b, true) => {
+                self.ensure_rn_fpcr();
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
-                let float = match fp {
-                    FpOp::Add => Float::Fadd,
-                    FpOp::Sub => Float::Fsub,
-                    FpOp::Mul => Float::Fmul,
-                    FpOp::Div => Float::Fdiv,
-                };
+                let float = fp_float(fp);
                 self.asm.emit(dfloat(float, q, a, b));
             }
-            Op::Fp(fp, a, b, false) | Op::SseFp64(fp, a, b) | Op::Fp32(fp, a, b) => {
+            Op::Fp(fp, a, b, false) => {
+                self.ensure_rn_fpcr();
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
-                self.fp(
-                    fp,
-                    q,
-                    [a, b],
-                    !matches!(op, Op::Fp32(..)),
-                    !matches!(op, Op::Fp(..)),
-                );
+                let deferred = self.func.deferred_fp.contains(&out)
+                    && (matches!(fp, FpOp::Add | FpOp::Sub)
+                        || self.fpsr_deferred_ops.contains(&out));
+                if deferred {
+                    self.asm.emit(dfloat(fp_float(fp), q, a, b));
+                } else {
+                    self.fp(fp, q, [a, b], true, false);
+                }
+            }
+            Op::SseFp64(fp, a, b) | Op::Fp32(fp, a, b) => {
+                self.ensure_rn_fpcr();
+                let a = self.vr(a, A);
+                let b = self.vr(b, B);
+                self.fp(fp, q, [a, b], !matches!(op, Op::Fp32(..)), true);
+            }
+            Op::FpValidate { values, strict } => {
+                let strategy = self
+                    .fp_validate_strategies
+                    .get(&(self.cur_block_idx, self.cur_inst_idx))
+                    .copied()
+                    .unwrap_or(cost::ValidationStrategy::VectorWitness);
+                match strategy {
+                    cost::ValidationStrategy::StaticProof => {}
+                    cost::ValidationStrategy::FpsrMask => {
+                        self.uses_fp_state = true;
+                        let fail = self.fail();
+                        self.asm.emit(mrs_fpsr(T));
+                        runtime::emit_inc_fp_counter(&mut self.asm, runtime::FP_FPSR_READS, 1, U);
+                        self.asm
+                            .emit(and_imm(W, T, T, u64::from(fp_state::FPSR_CHECK_MASK)));
+                        self.asm.cbz(W, true, T, fail);
+                    }
+                    cost::ValidationStrategy::VectorWitness
+                    | cost::ValidationStrategy::ScalarWitness => {
+                        // Strict Mul lanes already emitted their own inline checks
+                        // (preserving 0.0 * x hotness) whenever strategy != FpsrMask.
+                        let non_strict: Vec<Value> = values
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(idx, v)| ((strict >> idx) & 1 == 0).then_some(v)?)
+                            .collect();
+                        if non_strict.is_empty() {
+                            // All lanes were strict Muls already checked inline.
+                        } else if non_strict.len() == 1 {
+                            let v = self.vr(non_strict[0], A);
+                            let fail = self.fail();
+                            let check = self.asm.label();
+                            let resume = self.asm.label();
+                            fp_class::result_bits(&mut self.asm, true, v, T, U, Some(U));
+                            self.asm.cbz(W, false, U, check);
+                            self.asm.bind(resume);
+                            self.fp_validate_checks.push(FpValidateCheck {
+                                values: vec![self.locations[non_strict[0].0 as usize]],
+                                check,
+                                resume,
+                                fail,
+                            });
+                        } else {
+                            let spilled = non_strict
+                                .iter()
+                                .filter(|v| {
+                                    !matches!(self.locations[v.0 as usize], Host::Vector(_))
+                                })
+                                .count();
+                            if spilled > 2 {
+                                // Extreme spill pressure: fall back to scalar checks per lane.
+                                let fail = self.fail();
+                                for &val in &non_strict {
+                                    let v = self.vr(val, A);
+                                    let check = self.asm.label();
+                                    let resume = self.asm.label();
+                                    fp_class::result_bits(&mut self.asm, true, v, T, U, Some(U));
+                                    self.asm.cbz(W, false, U, check);
+                                    self.asm.bind(resume);
+                                    self.fp_validate_checks.push(FpValidateCheck {
+                                        values: vec![self.locations[val.0 as usize]],
+                                        check,
+                                        resume,
+                                        fail,
+                                    });
+                                }
+                            } else {
+                                let mut regs = Vec::with_capacity(non_strict.len());
+                                let mut locs = Vec::with_capacity(non_strict.len());
+                                let scratch = [A, B];
+                                let mut next_scratch = 0usize;
+                                for &val in &non_strict {
+                                    let loc = self.locations[val.0 as usize];
+                                    locs.push(loc);
+                                    let r = if let Host::Vector(vr) = loc {
+                                        vr
+                                    } else {
+                                        let s = scratch[next_scratch];
+                                        next_scratch += 1;
+                                        self.v_at(loc, s)
+                                    };
+                                    regs.push(r);
+                                }
+                                let fail = self.fail();
+                                let check = self.asm.label();
+                                let resume = self.asm.label();
+                                fp_class::vector_f64_witness(
+                                    &mut self.asm,
+                                    &regs,
+                                    false,
+                                    T,
+                                    [C, D, E],
+                                    check,
+                                );
+                                self.asm.bind(resume);
+                                self.fp_validate_checks.push(FpValidateCheck {
+                                    values: locs,
+                                    check,
+                                    resume,
+                                    fail,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Op::X87Arith {
+                op,
+                a,
+                b,
+                pc,
+                rounding,
+                ..
+            } => {
+                self.x87_arith(op, q, a, b, pc, rounding);
+            }
+            Op::X87Sqrt {
+                value,
+                pc,
+                rounding,
+                ..
+            } => {
+                self.x87_sqrt(q, value, pc, rounding);
+            }
+            Op::X87Round {
+                value, rounding, ..
+            } => {
+                self.x87_round(q, value, rounding);
+            }
+            Op::X87Compare { a, b, ordered } => {
+                self.x87_compare(d, a, b, ordered);
+            }
+            Op::X87Exam(value) => {
+                self.x87_exam(d, value);
+            }
+            Op::X87RoundC1 {
+                op,
+                a,
+                b,
+                pc,
+                rounding,
+            } => {
+                self.x87_round_c1(d, op, a, b, pc, rounding);
+            }
+            Op::X87SqrtC1 { input, result } => {
+                self.ensure_rn_fpcr();
+                let a = self.vr(input, A);
+                let r = self.vr(result, B);
+                self.asm
+                    .emit_all(&[fnmsub(C, r, r, a), fcmp_zero(C), cset(W, d, Cond::Gt)]);
+            }
+            Op::SsePackedFp {
+                op, double, a, b, ..
+            } => {
+                self.sse_packed_fp(op, double, q, a, b);
+            }
+            Op::SseMinMax {
+                max,
+                scalar,
+                double,
+                a,
+                b,
+                ..
+            } => {
+                self.sse_minmax(max, double, !scalar, q, a, b);
+            }
+            Op::SseSqrt {
+                scalar, double, a, ..
+            } => {
+                self.sse_sqrt(double, !scalar, q, a);
+            }
+            Op::SseConvert { kind, a, .. } => {
+                self.sse_convert(kind, q, a);
+            }
+            Op::SseScalarToInt {
+                value,
+                double,
+                truncate,
+            } => {
+                self.sse_scalar_to_int(d, value, double, truncate);
             }
             Op::X87Single(op, a, b, proved) => {
+                self.ensure_rn_fpcr();
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 self.x87_single(op, q, [a, b], proved);
@@ -1961,6 +2412,7 @@ impl<'a> Emitter<'a> {
                 single,
                 proved,
             } => {
+                self.ensure_rn_fpcr();
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 let c = self.vr(c, C);
@@ -1986,6 +2438,7 @@ impl<'a> Emitter<'a> {
                 ]);
             }
             Op::FromInt(a) => {
+                self.ensure_rn_fpcr();
                 let r = self.gp(a, T);
                 self.asm.emit(scvtf(self.size(a), q, r));
                 if self.size(a) == X {
@@ -2005,6 +2458,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             Op::ToInt { value, wide, sse } => {
+                self.ensure_rn_fpcr();
                 let a = self.vr(value, A);
                 // Compare the magnitude to the exclusive limit for the
                 // operand's sign. NaNs and infinities also exceed either limit.
@@ -2026,8 +2480,13 @@ impl<'a> Emitter<'a> {
                     (fail, None)
                 };
                 self.asm.b_cond(Cond::Hs, bound.0);
-                self.asm
-                    .emit(fcvt_int(if wide { X } else { W }, true, d, a));
+                if !wide && self.has_frintts {
+                    self.asm
+                        .emit_all(&[sfrint_ts(false, true, true, C, a), fcvt_int(W, true, d, C)]);
+                } else {
+                    self.asm
+                        .emit(fcvt_int(if wide { X } else { W }, true, d, a));
+                }
                 if let Some(resume) = bound.1 {
                     self.asm.bind(resume);
                 }
@@ -2037,6 +2496,9 @@ impl<'a> Emitter<'a> {
                 double,
                 truncate,
             } => {
+                // Keep FPCR.AH=0 on float-to-int conversions: x86 cvt*2dq never
+                // sets MXCSR.DE on subnormal inputs, whereas AH=1 sets FPSR.IDC.
+                self.ensure_rn_fpcr();
                 let a = self.vr(value, A);
                 let fail = self.fail();
                 if double {
@@ -2054,14 +2516,22 @@ impl<'a> Emitter<'a> {
                         cmp(W, T, U, Lsl, 0),
                     ]);
                     self.asm.b_cond(Cond::Hs, fail);
-                    self.asm.emit_all(&[
-                        if truncate {
-                            vfcvtzs_2d(q, a)
-                        } else {
-                            vfcvtns_2d(q, a)
-                        },
-                        vxtn_2s(q, q),
-                    ]);
+                    if self.has_frintts {
+                        self.asm.emit_all(&[
+                            vfrint32(true, true, truncate, C, a),
+                            vfcvtzs_2d(q, C),
+                            vxtn_2s(q, q),
+                        ]);
+                    } else {
+                        self.asm.emit_all(&[
+                            if truncate {
+                                vfcvtzs_2d(q, a)
+                            } else {
+                                vfcvtns_2d(q, a)
+                            },
+                            vxtn_2s(q, q),
+                        ]);
+                    }
                 } else {
                     self.asm.emit_all(&[
                         vshift(ShiftImm::Shl, Arr::S4, B, a, 1),
@@ -2071,7 +2541,14 @@ impl<'a> Emitter<'a> {
                         cmp(W, T, U, Lsl, 0),
                     ]);
                     self.asm.b_cond(Cond::Hs, fail);
-                    self.asm.emit(vtoint(truncate, true, q, a));
+                    if self.has_frintts {
+                        self.asm.emit_all(&[
+                            vfrint32(true, false, truncate, C, a),
+                            vtoint(true, true, q, C),
+                        ]);
+                    } else {
+                        self.asm.emit(vtoint(truncate, true, q, a));
+                    }
                 }
             }
             Op::X87Store {
@@ -2081,6 +2558,11 @@ impl<'a> Emitter<'a> {
                 integer,
                 proved,
             } => {
+                if !integer && rounding != 0 {
+                    self.set_fpcr_imm(fpcr_for_x87_rounding(rounding));
+                } else {
+                    self.ensure_rn_fpcr();
+                }
                 let a = self.vr(value, A);
                 if proved {
                     if integer {
@@ -2139,6 +2621,7 @@ impl<'a> Emitter<'a> {
                 stored,
                 integer,
             } => {
+                self.ensure_rn_fpcr();
                 let a = self.vr(value, A);
                 let r = self.gp(stored, T);
                 if integer {
@@ -2155,6 +2638,15 @@ impl<'a> Emitter<'a> {
                 ]);
             }
             Op::VecUnary(op, a) => {
+                if matches!(
+                    op,
+                    VecUnary::NarrowScalar
+                        | VecUnary::WidenScalar
+                        | VecUnary::FromInt4s
+                        | VecUnary::FromInt2d
+                ) {
+                    self.ensure_rn_fpcr();
+                }
                 let a = self.vr(a, A);
                 match op {
                     VecUnary::NarrowScalar => self.asm.emit(unary(Unary::Narrow, q, a)),
@@ -2232,6 +2724,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             Op::VecFp { op, double, a, b } => {
+                self.ensure_rn_fpcr();
                 let a = self.vr(a, A);
                 let b = self.vr(b, B);
                 let float = match op {
@@ -2253,6 +2746,7 @@ impl<'a> Emitter<'a> {
                 b,
                 c,
             } => {
+                self.ensure_rn_fpcr();
                 let va = self.vr(a, A);
                 let vb = self.vr(b, B);
                 let vc = self.vr(c, C);
@@ -2270,6 +2764,7 @@ impl<'a> Emitter<'a> {
                 double,
                 rounding,
             } => {
+                self.ensure_rn_fpcr();
                 let a = self.vr(value, A);
                 self.asm.emit(vfcvt_int_mode(double, rounding, q, a));
             }
@@ -2510,6 +3005,7 @@ impl<'a> Emitter<'a> {
                         }
                     }
                     VecOp::LessF64 => {
+                        self.ensure_rn_fpcr();
                         let fail = self.fail();
                         let (target, resume) = if self.live_mxcsr {
                             let (check, resume) = (self.asm.label(), self.asm.label());
@@ -2619,6 +3115,9 @@ impl<'a> Emitter<'a> {
                 pc,
                 scope,
             } => {
+                // Fold live AFP SSE FPSR before committing a store so later region
+                // rollbacks preserve this committed region's SSE sticky flags.
+                self.disarm_sse_fpsr();
                 if let Some(cell) = scope {
                     let offset = runtime::SCOPE_FRAME + 4 * u32::from(cell);
                     let word = if matches!(self.func.ty(value), Type::I32 | Type::I64) {
@@ -2634,7 +3133,23 @@ impl<'a> Emitter<'a> {
                 self.guest_eip = pc;
                 let addr = self.gp(addr, U);
                 let base = self.data_view();
-                let (word, reg) = if matches!(self.func.ty(value), Type::I32 | Type::I64) {
+                let (word, reg) = if width == 4
+                    && self.store_only_extract32[value.0 as usize]
+                    && let Some(Op::VecToInt(VecToInt::Extract32(lane), vec)) =
+                        self.defs[value.0 as usize]
+                {
+                    let vec_reg = self.vr(vec, A);
+                    let src = if lane == 0 {
+                        vec_reg
+                    } else {
+                        self.asm.emit(vins(2, C, 0, vec_reg, u32::from(lane)));
+                        C
+                    };
+                    (
+                        vstr_reg(VMem::S, src, base, addr),
+                        AccessReg::Vector(VMem::S, src),
+                    )
+                } else if matches!(self.func.ty(value), Type::I32 | Type::I64) {
                     let src = self.gp(value, T);
                     (
                         match width {
@@ -2662,6 +3177,9 @@ impl<'a> Emitter<'a> {
                 single,
                 proved,
             } => {
+                if single {
+                    self.ensure_rn_fpcr();
+                }
                 let r = self.gp(bits, U);
                 let size = if single { W } else { X };
                 if !proved {
@@ -2698,6 +3216,11 @@ impl<'a> Emitter<'a> {
                 single,
                 pc,
             } => {
+                if self.all_sse_ops_afp {
+                    // Every SSE op in this function runs under `FPCR.AH=1` + `SseLive`,
+                    // so hardware `FPSR.IDC` records subnormal inputs directly.
+                    return;
+                }
                 self.guest_eip = pc;
                 let a = self.vr(a, A);
                 let b = b.map(|b| self.vr(b, B));
@@ -2712,8 +3235,8 @@ impl<'a> Emitter<'a> {
                 if packed {
                     fp_class::packed_denormals(
                         &mut self.asm,
-                        Arr::D2,
-                        true,
+                        if single { Arr::S4 } else { Arr::D2 },
+                        !single,
                         [Some(a), b],
                         T,
                         [D, E, C, F],
@@ -2753,6 +3276,604 @@ impl<'a> Emitter<'a> {
             self.copy(loc, src, ty);
         }
     }
+
+    fn x87_arith(&mut self, op: FpOp, q: VReg, a: Value, b: Value, pc: u8, rounding: u8) {
+        let a = self.vr(a, A);
+        let b = self.vr(b, B);
+        let fail = self.fail();
+        if rounding != 0 {
+            self.set_fpcr_imm(fpcr_for_x87_rounding(rounding));
+        } else {
+            self.ensure_rn_fpcr();
+        }
+        let float = fp_float(op);
+        let sum = matches!(op, FpOp::Add | FpOp::Sub);
+        match pc {
+            0 => {
+                // PC24 with directed rounding: verify operands are exact binary32,
+                // compute in f32 under active FPCR, reject subnormal/overflow/exp==1.
+                self.asm.emit_all(&[
+                    unary(Unary::Narrow, D, a),
+                    unary(Unary::Widen, E, D),
+                    fcmp(a, E),
+                ]);
+                self.asm.b_cond(Cond::Ne, fail);
+                self.asm.emit_all(&[
+                    unary(Unary::Narrow, E, b),
+                    unary(Unary::Widen, C, E),
+                    fcmp(b, C),
+                ]);
+                self.asm.b_cond(Cond::Ne, fail);
+                self.asm.emit(sfloat(float, C, D, E));
+                let ok = self.asm.label();
+                self.asm.emit_all(&[
+                    fmov_from_v(W, T, C),
+                    ubfx(W, U, T, 23, 8),
+                    sub_imm(W, U, U, 2, false),
+                    cmp_imm(W, U, 253, false),
+                ]);
+                self.asm.b_cond(Cond::Lo, ok);
+                // Accept exact ±0.0 when Add/Sub or zero operand.
+                self.asm.emit(lsl_imm(W, T, T, 1));
+                self.asm.cbz(W, true, T, fail);
+                if !sum {
+                    self.asm.emit(fcmp_zero(a));
+                    self.asm.b_cond(Cond::Eq, ok);
+                    if op == FpOp::Mul {
+                        self.asm.emit(fcmp_zero(b));
+                        self.asm.b_cond(Cond::Eq, ok);
+                    }
+                    self.asm.b(fail);
+                }
+                self.asm.bind(ok);
+                self.asm.emit(unary(Unary::Widen, q, C));
+            }
+            3 => {
+                // PC64: execute in binary64 and discriminate exact results
+                // (zero residual error); inexact results bail to 80-bit fallback.
+                self.asm.emit(dfloat(float, C, a, b));
+                let exp_ok = self.asm.label();
+                fp_class::result_bits(&mut self.asm, true, C, T, U, None);
+                self.asm.emit_all(&[
+                    sub_imm(W, U, U, if sum { 2 } else { 3 }, false),
+                    cmp_imm(W, U, if sum { 2046 } else { 2045 }, false),
+                ]);
+                self.asm.b_cond(Cond::Lo, exp_ok);
+                self.asm.emit(lsl_imm(X, T, T, 1));
+                self.asm.cbz(X, true, T, fail);
+                if !sum {
+                    self.asm.emit(fcmp_zero(a));
+                    self.asm.b_cond(Cond::Eq, exp_ok);
+                    if op == FpOp::Mul {
+                        self.asm.emit(fcmp_zero(b));
+                        self.asm.b_cond(Cond::Eq, exp_ok);
+                    }
+                    self.asm.b(fail);
+                }
+                self.asm.bind(exp_ok);
+                if rounding != 0 {
+                    // Residual formulas require RN.
+                    self.set_fpcr_imm(0);
+                }
+                match op {
+                    FpOp::Add => fp_class::two_sum_error(&mut self.asm, a, b, C, D, E),
+                    FpOp::Sub => fp_class::two_diff_error(&mut self.asm, a, b, C, D, E),
+                    FpOp::Mul => self.asm.emit(fnmsub(D, a, b, C)),
+                    FpOp::Div => self.asm.emit(fmsub(D, C, b, a)),
+                }
+                self.asm.emit(fcmp_zero(D));
+                self.asm.b_cond(Cond::Ne, fail);
+                self.asm.emit(vmov(false, q, C));
+            }
+            _ => {
+                // PC53 with directed rounding.
+                self.asm.emit(dfloat(float, C, a, b));
+                let ok = self.asm.label();
+                fp_class::result_bits(&mut self.asm, true, C, T, U, None);
+                self.asm.emit_all(&[
+                    sub_imm(W, U, U, if sum { 2 } else { 3 }, false),
+                    cmp_imm(W, U, if sum { 2046 } else { 2045 }, false),
+                ]);
+                self.asm.b_cond(Cond::Lo, ok);
+                self.asm.emit(lsl_imm(X, T, T, 1));
+                self.asm.cbz(X, true, T, fail);
+                if !sum {
+                    self.asm.emit(fcmp_zero(a));
+                    self.asm.b_cond(Cond::Eq, ok);
+                    if op == FpOp::Mul {
+                        self.asm.emit(fcmp_zero(b));
+                        self.asm.b_cond(Cond::Eq, ok);
+                    }
+                    self.asm.b(fail);
+                }
+                self.asm.bind(ok);
+                self.asm.emit(vmov(false, q, C));
+            }
+        }
+    }
+
+    fn x87_sqrt(&mut self, q: VReg, value: Value, pc: u8, rounding: u8) {
+        let a = self.vr(value, A);
+        let fail = self.fail();
+        if rounding != 0 {
+            self.set_fpcr_imm(fpcr_for_x87_rounding(rounding));
+        } else {
+            self.ensure_rn_fpcr();
+        }
+        // Reject negative nonzero, NaN, Inf, and subnormal inputs.
+        self.asm.emit(fcmp_zero(a));
+        self.asm.b_cond(Cond::Mi, fail);
+        self.asm.b_cond(Cond::Vs, fail);
+        let input_ok = self.asm.label();
+        fp_class::result_bits(&mut self.asm, true, a, T, U, Some(U));
+        self.asm.cbz(W, true, U, input_ok);
+        self.asm.emit(lsl_imm(X, T, T, 1));
+        self.asm.cbz(X, true, T, fail);
+        self.asm.bind(input_ok);
+        match pc {
+            0 => {
+                self.asm.emit_all(&[
+                    unary(Unary::Narrow, D, a),
+                    unary(Unary::Widen, E, D),
+                    fcmp(a, E),
+                ]);
+                self.asm.b_cond(Cond::Ne, fail);
+                self.asm
+                    .emit_all(&[fsqrt(true, false, C, D), unary(Unary::Widen, q, C)]);
+            }
+            3 => {
+                self.asm.emit(fsqrt(true, true, C, a));
+                if rounding != 0 {
+                    self.set_fpcr_imm(0);
+                }
+                self.asm.emit_all(&[fnmsub(D, C, C, a), fcmp_zero(D)]);
+                self.asm.b_cond(Cond::Ne, fail);
+                self.asm.emit(vmov(false, q, C));
+            }
+            _ => {
+                self.asm.emit(fsqrt(true, true, q, a));
+            }
+        }
+    }
+
+    fn x87_round(&mut self, q: VReg, value: Value, rounding: u8) {
+        self.ensure_rn_fpcr();
+        let a = self.vr(value, A);
+        let fail = self.fail();
+        let ok = self.asm.label();
+        fp_class::result_bits(&mut self.asm, true, a, T, U, Some(U));
+        self.asm.cbz(W, true, U, ok);
+        self.asm.emit(lsl_imm(X, T, T, 1));
+        self.asm.cbz(X, true, T, fail);
+        self.asm.bind(ok);
+        let op = match rounding {
+            0 => Unary::Frintn,
+            1 => Unary::Frintm,
+            2 => Unary::Frintp,
+            _ => Unary::Frintz,
+        };
+        self.asm.emit(unary(op, q, a));
+    }
+
+    fn x87_compare(&mut self, d: Reg, a: Value, b: Value, ordered: bool) {
+        self.ensure_rn_fpcr();
+        let a = self.vr(a, A);
+        let b = self.vr(b, B);
+        let fail = self.fail();
+        let unordered = self.asm.label();
+        let done = self.asm.label();
+        self.asm.emit(fcmp(a, b));
+        self.asm.b_cond(Cond::Vs, unordered);
+        self.asm.emit_all(&[
+            movz(W, d, 0x4000, 0),
+            csel(W, d, d, Reg::ZR, Cond::Eq),
+            movz(W, T, 0x0100, 0),
+            csel(W, d, T, d, Cond::Lt),
+        ]);
+        self.asm.b(done);
+        self.asm.bind(unordered);
+        if ordered {
+            self.asm.b(fail);
+        } else {
+            fp_class::snan(&mut self.asm, a, T, fail);
+            fp_class::snan(&mut self.asm, b, T, fail);
+            self.asm.emit(movz(W, d, 0x4500, 0));
+        }
+        self.asm.bind(done);
+    }
+
+    fn x87_round_c1(&mut self, d: Reg, op: FpOp, a: Value, b: Value, pc: u8, rounding: u8) {
+        if pc == 3 || rounding == 3 {
+            // PC64 fast path admits only exact results; RZ never increases magnitude.
+            self.asm.emit(movz(W, d, 0, 0));
+            return;
+        }
+        if rounding == 0 {
+            self.ensure_rn_fpcr();
+            self.c1(
+                op,
+                self.locations[a.0 as usize],
+                self.locations[b.0 as usize],
+                pc == 0,
+            );
+            if d != T {
+                self.asm.emit(mov(W, d, T));
+            }
+            return;
+        }
+        // Directed RD (1) or RU (2): C1 = 1 iff inexact AND
+        // (RD && result < 0) || (RU && result > 0).
+        let va = self.vr(a, A);
+        let vb = self.vr(b, B);
+        let float = fp_float(op);
+        self.set_fpcr_imm(fpcr_for_x87_rounding(rounding));
+        if pc == 0 {
+            self.asm.emit_all(&[
+                unary(Unary::Narrow, D, va),
+                unary(Unary::Narrow, E, vb),
+                sfloat(float, C, D, E),
+                unary(Unary::Widen, C, C),
+            ]);
+        } else {
+            self.asm.emit(dfloat(float, C, va, vb));
+        }
+        self.set_fpcr_imm(0);
+        // Compute exact residual in D (RN): zero iff exact.
+        match op {
+            FpOp::Add => fp_class::two_sum_error(&mut self.asm, va, vb, C, D, E),
+            FpOp::Sub => fp_class::two_diff_error(&mut self.asm, va, vb, C, D, E),
+            FpOp::Mul => self.asm.emit(fnmsub(D, va, vb, C)),
+            FpOp::Div => self.asm.emit(fmsub(D, C, vb, va)),
+        }
+        self.asm.emit_all(&[
+            fcmp_zero(D),
+            cset(W, T, Cond::Ne),
+            fcmp_zero(C),
+            cset(W, U, if rounding == 1 { Cond::Mi } else { Cond::Gt }),
+            and(W, d, T, U, Lsl, 0),
+        ]);
+    }
+
+    fn x87_exam(&mut self, d: Reg, value: Value) {
+        let a = self.vr(value, A);
+        let zero_exp = self.asm.label();
+        let max_exp = self.asm.label();
+        let done = self.asm.label();
+        self.asm.emit_all(&[
+            fmov_from_v(X, T, a),
+            ubfx(X, U, T, 63, 1),
+            lsl_imm(W, d, U, 9),
+            ubfx(X, U, T, 52, 11),
+            ubfx(X, T, T, 0, 52),
+        ]);
+        self.asm.cbz(W, false, U, zero_exp);
+        self.asm.emit(cmp_imm(W, U, 0x7ff, false));
+        self.asm.b_cond(Cond::Eq, max_exp);
+        // Normal: C2 (0x0400).
+        self.asm.emit(orr_imm(W, d, d, 0x0400));
+        self.asm.b(done);
+        self.asm.bind(zero_exp);
+        // Zero: C3 (0x4000); Denormal: C3|C2 (0x4400).
+        self.asm.emit_all(&[
+            cmp_imm(X, T, 0, false),
+            movz(W, T, 0x4000, 0),
+            movz(W, U, 0x4400, 0),
+            csel(W, T, T, U, Cond::Eq),
+            orr(W, d, d, T, Lsl, 0),
+        ]);
+        self.asm.b(done);
+        self.asm.bind(max_exp);
+        // Inf: C2|C0 (0x0500); NaN: C0 (0x0100).
+        self.asm.emit_all(&[
+            cmp_imm(X, T, 0, false),
+            movz(W, T, 0x0500, 0),
+            movz(W, U, 0x0100, 0),
+            csel(W, T, T, U, Cond::Eq),
+            orr(W, d, d, T, Lsl, 0),
+        ]);
+        self.asm.bind(done);
+    }
+
+    fn sse_packed_fp(&mut self, op: FpOp, double: bool, q: VReg, a: Value, b: Value) {
+        let a = self.vr(a, A);
+        let b = self.vr(b, B);
+        let float = fp_float(op);
+        if self.can_use_afp_sse {
+            self.arm_afp_sse();
+            self.asm.emit(if double {
+                vfloat_2d(float, q, a, b)
+            } else {
+                vfloat(float, true, q, a, b)
+            });
+            return;
+        }
+        self.ensure_rn_fpcr();
+        let fail = self.fail();
+        self.asm.emit(if double {
+            vfloat_2d(float, C, a, b)
+        } else {
+            vfloat(float, true, C, a, b)
+        });
+        fp_class::packed_arithmetic_mask(
+            &mut self.asm,
+            double,
+            float,
+            false,
+            [C, a, b],
+            T,
+            [F, D, E, B, A],
+        );
+        fp_class::any_lane(&mut self.asm, A, T, fail);
+        // Reject subnormal results on Add/Sub (Mul/Div already rejected exp < 2).
+        if matches!(op, FpOp::Add | FpOp::Sub) {
+            fp_class::packed_denormals(
+                &mut self.asm,
+                if double { Arr::D2 } else { Arr::S4 },
+                double,
+                [Some(C), None],
+                T,
+                [D, E, B, F],
+            );
+            fp_class::any_lane(&mut self.asm, B, T, fail);
+        }
+        self.asm.emit(vmov(true, q, C));
+    }
+
+    fn sse_minmax(&mut self, max: bool, double: bool, packed: bool, q: VReg, a: Value, b: Value) {
+        let a = self.vr(a, A);
+        let b = self.vr(b, B);
+        if self.can_use_afp_sse {
+            self.arm_afp_sse();
+            self.asm.emit(if packed {
+                vfminmax(max, true, double, q, a, b)
+            } else {
+                fminmax(max, double, q, a, b)
+            });
+            return;
+        }
+        self.ensure_rn_fpcr();
+        let fail = self.fail();
+        fp_class::nan_operands(&mut self.asm, !packed, double, &[a, b], T, [C, D], fail);
+        if packed {
+            let (lhs, rhs) = if max { (a, b) } else { (b, a) };
+            self.asm.emit_all(&[
+                vcompare(Float::Fcmgt, false, double, C, lhs, rhs),
+                vlogic(Logic::Bsl, true, C, a, b),
+                vmov(true, q, C),
+            ]);
+        } else {
+            self.asm.emit(if double { fcmp(a, b) } else { fcmps(a, b) });
+            // For `a == b` (including +0.0 vs -0.0), select `b` matching x86 min/max.
+            let cond = if max { Cond::Gt } else { Cond::Lt };
+            if double {
+                self.asm.emit(fcsel(q, a, b, cond));
+            } else {
+                self.asm.emit_all(&[
+                    fmov_from_v(W, T, a),
+                    fmov_from_v(W, U, b),
+                    csel(W, T, T, U, cond),
+                    fmov_to_v(W, q, T),
+                ]);
+            }
+        }
+    }
+
+    fn sse_sqrt(&mut self, double: bool, packed: bool, q: VReg, value: Value) {
+        let a = self.vr(value, A);
+        if self.can_use_afp_sse {
+            self.arm_afp_sse();
+            self.asm.emit(fsqrt(!packed, double, q, a));
+            return;
+        }
+        self.ensure_rn_fpcr();
+        let fail = self.fail();
+        if packed {
+            // Reject negative, NaN, Inf, and subnormal lanes.
+            self.asm.emit_all(&[
+                vzero(true, D),
+                vcompare(Float::Fcmge, false, double, C, a, D),
+                vnot(true, C, C),
+            ]);
+            fp_class::any_lane(&mut self.asm, C, T, fail);
+            if double {
+                self.asm.emit(movz(X, T, 0x7ff0, 48));
+            } else {
+                self.asm.emit(movz(W, T, 0x7f80, 16));
+            }
+            let arr = if double { Arr::D2 } else { Arr::S4 };
+            self.asm.emit_all(&[
+                vdup(arr, D, T),
+                vlogic(Logic::And, true, C, a, D),
+                vsame(Same::Cmeq, arr, C, C, D),
+            ]);
+            fp_class::any_lane(&mut self.asm, C, T, fail);
+            fp_class::packed_denormals(
+                &mut self.asm,
+                arr,
+                double,
+                [Some(a), None],
+                T,
+                [D, E, C, F],
+            );
+            fp_class::any_lane(&mut self.asm, C, T, fail);
+            self.asm.emit(fsqrt(false, double, q, a));
+        } else {
+            self.asm
+                .emit(if double { fcmp_zero(a) } else { fcmps_zero(a) });
+            self.asm.b_cond(Cond::Mi, fail);
+            self.asm.b_cond(Cond::Vs, fail);
+            let ok = self.asm.label();
+            fp_class::result_bits(&mut self.asm, double, a, T, U, Some(U));
+            self.asm.cbz(W, true, U, ok);
+            if double {
+                self.asm.emit(lsl_imm(X, T, T, 1));
+                self.asm.cbz(X, true, T, fail);
+            } else {
+                self.asm.emit(lsl_imm(W, T, T, 1));
+                self.asm.cbz(W, true, T, fail);
+            }
+            self.asm.bind(ok);
+            self.asm.emit(fsqrt(true, double, q, a));
+        }
+    }
+
+    fn sse_convert(&mut self, kind: SseConvertKind, q: VReg, value: Value) {
+        let a = self.vr(value, A);
+        let afp = self.can_use_afp_sse;
+        if afp {
+            self.arm_afp_sse();
+        } else {
+            self.ensure_rn_fpcr();
+        }
+        match kind {
+            SseConvertKind::WidenScalar => {
+                if !afp {
+                    let fail = self.fail();
+                    self.asm.emit(fcmps(a, a));
+                    self.asm.b_cond(Cond::Vs, fail);
+                }
+                self.asm.emit(unary(Unary::Widen, q, a));
+            }
+            SseConvertKind::WidenPacked => {
+                if !afp {
+                    let fail = self.fail();
+                    fp_class::nan_low_pair(&mut self.asm, a, C, T, fail);
+                }
+                self.asm.emit(vwiden(q, a));
+            }
+            SseConvertKind::NarrowScalar => {
+                if afp {
+                    self.asm.emit(unary(Unary::Narrow, q, a));
+                    return;
+                }
+                let fail = self.fail();
+                let ok = self.asm.label();
+                self.asm.emit_all(&[
+                    unary(Unary::Narrow, C, a),
+                    fmov_from_v(W, T, C),
+                    ubfx(W, U, T, 23, 8),
+                    sub_imm(W, U, U, 2, false),
+                    cmp_imm(W, U, 253, false),
+                ]);
+                self.asm.b_cond(Cond::Lo, ok);
+                self.asm.emit(fcmp_zero(a));
+                self.asm.b_cond(Cond::Ne, fail);
+                self.asm.bind(ok);
+                self.asm.emit(vmov(false, q, C));
+            }
+            SseConvertKind::NarrowPacked => {
+                self.asm.emit_all(&[
+                    unary(Unary::Narrow, C, a),
+                    vins(3, B, 0, a, 1),
+                    unary(Unary::Narrow, B, B),
+                    vins(2, C, 1, B, 0),
+                ]);
+                if afp {
+                    self.asm.emit(vmov(false, q, C));
+                    return;
+                }
+                let fail = self.fail();
+                for lane in 0..2u32 {
+                    let ok = self.asm.label();
+                    self.asm.emit_all(&[
+                        vumov(2, T, C, lane),
+                        ubfx(W, U, T, 23, 8),
+                        sub_imm(W, U, U, 2, false),
+                        cmp_imm(W, U, 253, false),
+                    ]);
+                    self.asm.b_cond(Cond::Lo, ok);
+                    self.asm
+                        .emit_all(&[vumov(3, T, a, lane), lsl_imm(X, T, T, 1)]);
+                    self.asm.cbz(X, true, T, fail);
+                    self.asm.bind(ok);
+                }
+                self.asm.emit(vmov(false, q, C));
+            }
+        }
+    }
+
+    fn sse_scalar_to_int(&mut self, d: Reg, value: Value, double: bool, truncate: bool) {
+        self.ensure_rn_fpcr();
+        let a = self.vr(value, A);
+        let fail = self.fail();
+        let bound = if self.live_mxcsr {
+            let (check, resume) = (self.asm.label(), self.asm.label());
+            self.invalid_ints.push((check, d, resume, fail));
+            (check, Some(resume))
+        } else {
+            (fail, None)
+        };
+        if double {
+            let operand = if truncate {
+                a
+            } else {
+                self.asm.emit(unary(Unary::Frintn, C, a));
+                C
+            };
+            self.asm.emit_all(&[
+                fmov_from_v(X, T, operand),
+                asr_imm(X, U, T, 63),
+                and_imm(X, U, U, 1 << 21),
+                movk(X, U, 0x41e0, 48),
+                and_imm(X, T, T, i64::MAX as u64),
+                cmp(X, T, U, Lsl, 0),
+            ]);
+            self.asm.b_cond(Cond::Hs, bound.0);
+            if self.has_frintts {
+                self.asm.emit_all(&[
+                    sfrint_ts(false, true, truncate, C, a),
+                    fcvt_int(W, true, d, C),
+                ]);
+            } else {
+                self.asm
+                    .emit(fcvt_int_mode(W, if truncate { 3 } else { 0 }, d, operand));
+            }
+        } else {
+            // Exact binary32 range check: |x| < 2^31 (+1 ulp for -2^31).
+            self.asm.emit_all(&[
+                fmov_from_v(W, T, a),
+                asr_imm(W, U, T, 31),
+                and_imm(W, U, U, 1),
+                movk(W, U, 0x4f00, 16),
+                and_imm(W, T, T, i32::MAX as u64),
+                cmp(W, T, U, Lsl, 0),
+            ]);
+            self.asm.b_cond(Cond::Hs, bound.0);
+            if self.has_frintts {
+                self.asm.emit_all(&[
+                    sfrint_ts(false, false, truncate, C, a),
+                    fcvt_int_s_mode(W, 3, d, C),
+                ]);
+            } else {
+                self.asm
+                    .emit(fcvt_int_s_mode(W, if truncate { 3 } else { 0 }, d, a));
+            }
+        }
+        if let Some(resume) = bound.1 {
+            self.asm.bind(resume);
+        }
+    }
+}
+
+fn fp_float(op: FpOp) -> Float {
+    match op {
+        FpOp::Add => Float::Fadd,
+        FpOp::Sub => Float::Fsub,
+        FpOp::Mul => Float::Fmul,
+        FpOp::Div => Float::Fdiv,
+    }
+}
+
+/// Maps x87 rounding control (`rc = 0..=3`: RN, RD, RU, RZ) to AArch64 FPCR
+/// (`AH = 0`, `NEP = 0`, `RMode` in bits 23:22).
+const fn fpcr_for_x87_rounding(rc: u8) -> u32 {
+    let rmode = match rc & 3 {
+        0 => 0, // RN
+        1 => 2, // RD -> RM
+        2 => 1, // RU -> RP
+        _ => 3, // RZ
+    };
+    rmode << fp_state::FPCR_RMODE_SHIFT
 }
 
 #[repr(C)]
@@ -2839,12 +3960,16 @@ fn mem_type(ty: Type) -> VMem {
     [VMem::S, VMem::D, VMem::D, VMem::Q, VMem::S][ty as usize]
 }
 
-/// The NZCV compare of a floating `Flags` kind; `comisd` raises invalid
-/// for a quiet NaN as well.
-pub(super) fn compare(kind: FlagKind, a: VReg, b: VReg) -> u32 {
-    if kind == FlagKind::OrderedCompare {
-        fcmpe(a, b)
-    } else {
-        fcmp(a, b)
+/// The NZCV compare of a floating `Flags` kind; `comisd`/`comiss` and ordered
+/// x87 compares raise invalid for a quiet NaN as well.
+pub(super) fn compare(kind: FlagKind, width: u8, a: VReg, b: VReg) -> u32 {
+    let ordered =
+        kind == FlagKind::OrderedCompare || (kind == FlagKind::X87CompareFold && width & 2 != 0);
+    let single = kind != FlagKind::X87CompareFold && width == 32;
+    match (single, ordered) {
+        (true, true) => fcmpes(a, b),
+        (true, false) => fcmps(a, b),
+        (false, true) => fcmpe(a, b),
+        (false, false) => fcmp(a, b),
     }
 }

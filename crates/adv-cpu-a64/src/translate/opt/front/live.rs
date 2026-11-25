@@ -98,6 +98,9 @@ pub(super) fn analyze(
             decode::Op::X87(_) | decode::Op::Fild64(..) => {
                 models[i].control.is_none_or(|c| c & 0x3f != 0x3f)
             }
+            decode::Op::Value(_) if super::x87::value_x87(unit, i).is_some() => {
+                models[i].control.is_none_or(|c| c & 0x3f != 0x3f)
+            }
             _ => false,
         };
         // A nop accesses nothing, also where it stands for a cut instruction

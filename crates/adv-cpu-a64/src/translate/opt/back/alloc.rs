@@ -49,8 +49,17 @@ pub(super) fn allocate(
     for data in &func.blocks {
         for &(result, op) in &data.insts {
             match op {
-                Op::SseInput { packed: true, .. } => vectors = vectors.min(F.number() as u8),
-                Op::Vec(VecOp::LessF64, ..) => vectors = vectors.min(D.number() as u8),
+                Op::SseInput { packed: true, .. }
+                | Op::SsePackedFp { .. }
+                | Op::SseMinMax { .. }
+                | Op::SseSqrt { .. }
+                | Op::SseConvert { .. } => vectors = vectors.min(F.number() as u8),
+                Op::FpValidate { .. } | Op::X87Arith { .. } | Op::X87RoundC1 { .. } => {
+                    vectors = vectors.min(E.number() as u8);
+                }
+                Op::Vec(VecOp::LessF64, ..) | Op::SsePackedToInt { .. } => {
+                    vectors = vectors.min(D.number() as u8);
+                }
                 _ => {}
             }
             if let Some(v) = result {

@@ -160,12 +160,21 @@ impl FpFact {
         self.lo.abs().max(self.hi.abs())
     }
 
-    /// Lower bound on `|x|` for all nonzero values in `self`, or `0.0` if unknown.
+    /// Lower bound on `|x|` for all nonzero values (`0.0` if unknown,
+    /// `f64::INFINITY` if identically zero). Even when `finite == false` (e.g.,
+    /// an `X87Load` that rejects subnormals but allows `±Inf`), `min_nonzero`
+    /// still records a valid lower bound on nonzero magnitudes so non-subnormal
+    /// proofs can elide runtime denormal checks.
     fn min_nonzero_abs(self) -> f64 {
-        if !self.finite {
-            return 0.0;
-        }
         let mut bound = self.min_nonzero;
+        if self.f32_safe_nonzero {
+            bound = bound.max(F32_SAFE_MIN_F64);
+        } else if self.f32_normal_or_zero {
+            bound = bound.max(F32_MIN_NORMAL_F64);
+        }
+        if !self.finite {
+            return bound;
+        }
         if self.lo > 0.0 {
             bound = bound.max(self.lo);
         } else if self.hi < 0.0 {
@@ -179,15 +188,21 @@ impl FpFact {
                 bound = bound.max(pow2_f64(i32::from(q)));
             }
         }
-        if self.f32_safe_nonzero {
-            bound = bound.max(F32_SAFE_MIN_F64);
-        } else if self.f32_normal_or_zero {
-            bound = bound.max(F32_MIN_NORMAL_F64);
-        } else if self.binary32_exact {
+        if self.binary32_exact {
             // Every nonzero finite f32 (even subnormal) has |x| >= 2^-149.
             bound = bound.max(f64::from(f32::from_bits(1)));
         }
         bound
+    }
+
+    /// Whether `self` is statically proved to never hold a nonzero binary64 subnormal.
+    fn non_subnormal_f64(self) -> bool {
+        self.is_zero() || self.min_nonzero_abs() >= f64::MIN_POSITIVE
+    }
+
+    /// Whether `self` is statically proved to never hold a nonzero binary32 subnormal.
+    fn non_subnormal_f32(self) -> bool {
+        self.is_zero() || self.f32_normal_or_zero || self.min_nonzero_abs() >= F32_MIN_NORMAL_F64
     }
 
     fn singleton_pow2(self) -> Option<i16> {
@@ -219,7 +234,13 @@ impl FpFact {
                 dyadic_min(self.dyadic_q, other.dyadic_q),
             )
         } else {
-            (f64::NEG_INFINITY, f64::INFINITY, 0.0, None, None)
+            (
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                self.min_nonzero_abs().min(other.min_nonzero_abs()),
+                None,
+                None,
+            )
         };
         let may_be_neg_zero =
             (self.may_be_neg_zero || other.may_be_neg_zero) && !(finite && (lo > 0.0 || hi < 0.0));
@@ -1480,6 +1501,100 @@ fn apply_proved(
                         changed = true;
                     }
                 }
+                Op::X87Arith {
+                    op: fp_op,
+                    a,
+                    b: b_val,
+                    pc,
+                    rounding,
+                    proved: false,
+                } => {
+                    let fa = get_fp(a);
+                    let fb = get_fp(b_val);
+                    let ok = match pc {
+                        3 => {
+                            // PC64: statically proved only when binary64 arithmetic is exact
+                            // with no overflow/subnormal.
+                            let (p, fact) = eval_fp(fp_op, fa, fb, a == b_val);
+                            p && fact.dyadic_q.is_some()
+                                && fact.finite
+                                && fits_mantissa_bits(
+                                    fact.max_abs().next_up(),
+                                    fact.dyadic_q.unwrap(),
+                                    53,
+                                )
+                        }
+                        2 => eval_fp(fp_op, fa, fb, a == b_val).0,
+                        _ => false,
+                    };
+                    if ok {
+                        if in_loop {
+                            saved_per_iter = saved_per_iter.saturating_add(5);
+                        }
+                        if commit {
+                            *op = Op::X87Arith {
+                                op: fp_op,
+                                a,
+                                b: b_val,
+                                pc,
+                                rounding,
+                                proved: true,
+                            };
+                        }
+                        changed = true;
+                    }
+                }
+                Op::X87Sqrt {
+                    value,
+                    pc,
+                    rounding,
+                    proved: false,
+                } => {
+                    let fv = get_fp(value);
+                    let ok = fv.finite
+                        && fv.lo >= 0.0
+                        && match pc {
+                            2 => fv.non_subnormal_f64(),
+                            0 => fv.binary32_exact && fv.f32_safe_nonzero,
+                            _ => false,
+                        };
+                    if ok {
+                        if in_loop {
+                            saved_per_iter = saved_per_iter.saturating_add(5);
+                        }
+                        if commit {
+                            *op = Op::X87Sqrt {
+                                value,
+                                pc,
+                                rounding,
+                                proved: true,
+                            };
+                        }
+                        changed = true;
+                    }
+                }
+                Op::X87Round {
+                    value,
+                    rounding,
+                    denormal,
+                    proved: false,
+                } => {
+                    let fv = get_fp(value);
+                    if fv.finite && (!denormal || fv.non_subnormal_f64()) {
+                        if in_loop {
+                            saved_per_iter = saved_per_iter.saturating_add(4);
+                        }
+                        if commit {
+                            *op = Op::X87Round {
+                                value,
+                                rounding,
+                                denormal,
+                                proved: true,
+                            };
+                        }
+                        changed = true;
+                    }
+                }
                 Op::X87StoreC1 { value, integer, .. } => {
                     let fv = get_fp(value);
                     let exact = if integer {
@@ -1523,23 +1638,39 @@ fn apply_proved(
 }
 
 pub(super) fn run(func: &mut Func) -> bool {
-    let has_x87 = func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
+    let has_fp = func.blocks.iter().flat_map(|b| &b.insts).any(|(_, op)| {
         matches!(
             op,
             Op::Fp(..)
                 | Op::X87Single(..)
+                | Op::X87Arith { .. }
+                | Op::X87Sqrt { .. }
+                | Op::X87Round { .. }
                 | Op::X87Load { .. }
                 | Op::X87Store { .. }
                 | Op::X87StoreC1 { .. }
+                | Op::SseFp64(..)
         )
     });
-    if !has_x87 {
+    if !has_fp {
         return false;
     }
 
     let defs = super::definitions(func);
     let (_, fp_facts) = analyze_fixpoint(func, &defs, &DomainSeeds::default());
     apply_proved(func, &defs, &fp_facts, None, true).0
+}
+
+/// Returns per-value static non-subnormal proofs (`min_abs_nonzero >= f64::MIN_POSITIVE`
+/// or identically zero) derived from `fp_range` for `Type::F64` values so
+/// `sse_inputs` can elide runtime denormal checks.
+pub(super) fn non_subnormal_f64(func: &Func) -> Vec<bool> {
+    let defs = super::definitions(func);
+    let (_, fp_facts) = analyze_fixpoint(func, &defs, &DomainSeeds::default());
+    fp_facts
+        .into_iter()
+        .map(|fact| fact.is_some_and(FpFact::non_subnormal_f64))
+        .collect()
 }
 
 fn const_x87_load(defs: &[Option<Op>], bits: Value, denormal: bool, single: bool) -> Option<u64> {
@@ -1646,8 +1777,83 @@ fn eval_fp_op(
                 }
             }
         }
-        Op::Fp(fp_op, a, b, _) => eval_fp(fp_op, get_fp(a), get_fp(b), a == b).1,
+        Op::Fp(fp_op, a, b, _) | Op::SseFp64(fp_op, a, b) => {
+            eval_fp(fp_op, get_fp(a), get_fp(b), a == b).1
+        }
         Op::X87Single(fp_op, a, b, _) => eval_x87_single(fp_op, get_fp(a), get_fp(b), a == b).1,
+        Op::X87Arith {
+            op: fp_op,
+            a,
+            b,
+            pc,
+            ..
+        } => {
+            if pc == 0 {
+                eval_x87_single(fp_op, get_fp(a), get_fp(b), a == b).1
+            } else {
+                let mut fact = eval_fp(fp_op, get_fp(a), get_fp(b), a == b).1;
+                // Directed rounding can shift an inexact result by 1 ULP; keep conservative bounds.
+                if fact.finite {
+                    fact.lo = fact.lo.next_down();
+                    fact.hi = fact.hi.next_up();
+                    if !fact.lo.is_finite() || !fact.hi.is_finite() {
+                        return FpFact::TOP;
+                    }
+                }
+                fact
+            }
+        }
+        Op::X87Sqrt { value, pc, .. } => {
+            let a = get_fp(value);
+            if !a.finite || a.hi < 0.0 {
+                return FpFact::TOP;
+            }
+            let lo = a.lo.max(0.0).sqrt().next_down().max(0.0);
+            let hi = a.hi.max(0.0).sqrt().next_up();
+            let mn = if a.is_zero() {
+                f64::INFINITY
+            } else if a.min_nonzero_abs() > 0.0 {
+                a.min_nonzero_abs().sqrt().next_down().max(0.0)
+            } else {
+                0.0
+            };
+            FpFact {
+                finite: hi.is_finite(),
+                binary32_exact: pc == 0,
+                f32_normal_or_zero: pc == 0 || mn >= F32_MIN_NORMAL_F64,
+                f32_safe_nonzero: mn >= F32_SAFE_MIN_F64,
+                lo,
+                hi,
+                min_nonzero: mn,
+                may_be_neg_zero: a.may_be_neg_zero && lo == 0.0,
+                sig_bits: (pc == 0).then_some(24),
+                dyadic_q: None,
+            }
+        }
+        Op::X87Round {
+            value, rounding, ..
+        } => {
+            let a = get_fp(value);
+            if !a.finite {
+                return FpFact::TOP;
+            }
+            let lo = round_mode(a.lo, rounding);
+            let hi = round_mode(a.hi, rounding);
+            let max_abs = lo.abs().max(hi.abs());
+            let q = if lo == 0.0 && hi == 0.0 { ZERO_Q } else { 0 };
+            FpFact {
+                finite: true,
+                binary32_exact: max_abs <= (1u64 << 24) as f64,
+                f32_normal_or_zero: true,
+                f32_safe_nonzero: true,
+                lo,
+                hi,
+                min_nonzero: if q == ZERO_Q { f64::INFINITY } else { 1.0 },
+                may_be_neg_zero: a.may_be_neg_zero || (lo <= 0.0 && a.lo < 0.0),
+                sig_bits: None,
+                dyadic_q: Some(q),
+            }
+        }
         Op::X87Load {
             bits,
             denormal,
@@ -1702,6 +1908,8 @@ fn eval_fp_op(
             }
             // General X87Load admits ±Inf (so finite = false) and, when
             // denormal == false, admits subnormals (so f32_normal_or_zero = single && denormal).
+            // When denormal == true, nonzero subnormals are rejected, giving a
+            // sound `min_nonzero` lower bound even before finiteness is proved.
             FpFact {
                 finite: false,
                 binary32_exact: single,
@@ -1709,7 +1917,15 @@ fn eval_fp_op(
                 f32_safe_nonzero: false,
                 lo: f64::NEG_INFINITY,
                 hi: f64::INFINITY,
-                min_nonzero: 0.0,
+                min_nonzero: if denormal {
+                    if single {
+                        F32_MIN_NORMAL_F64
+                    } else {
+                        f64::MIN_POSITIVE
+                    }
+                } else {
+                    0.0
+                },
                 may_be_neg_zero: true,
                 sig_bits: None,
                 dyadic_q: None,

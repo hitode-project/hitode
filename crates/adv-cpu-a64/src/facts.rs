@@ -1,16 +1,18 @@
-//! Entry facts are projected from canonical CPU state before lowering. Joins
-//! forget whole fields, including each independently tracked x87 tag.
+//! Entry facts are projected from canonical CPU state before lowering. Control
+//! bitfields (`CONTROL`, `MXCSR`, `MXCSR_STICKY`, `X87_STATUS_REST`,
+//! `X87_EXACT`) join bitwise over agreed bits while multi-bit indices (`TOP`,
+//! `MMX`, per-slot tags, `ESP_LOW`, `EBP_DELTA`) stay atomic.
 
-use adv_cpu_core::CpuState;
 use adv_cpu_core::memory::{READ, SHARED, WINDOW_SPAN_WORDS, WRITE};
+use adv_cpu_core::{CpuState, HostFeatures};
 
 use crate::asm::{Asm, Label};
 use crate::encode::Shift::{Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::{
-    Cond, Extend, Narrow, Reg, Shift, add, add_ext, add_imm, and, and_imm, clz, cmp, cmp_imm, eor,
-    eor_imm, ldr, ldr_narrow, ldr_reg, ldrh, ldur, lsl_imm, lsr_imm, mov, movk, movz, orr, rbit,
-    ret, shiftv, str, strh, sub, sub_ext, tst_imm, ubfx,
+    Cond, Extend, Narrow, Reg, Shift, add, add_ext, add_imm, and, and_imm, bitmask, clz, cmp,
+    cmp_imm, eor, eor_imm, ldr, ldr_narrow, ldr_reg, ldrh, ldur, lsl_imm, lsr_imm, mov, movk, movz,
+    orr, rbit, ret, shiftv, str, strh, sub, sub_ext, tst_imm, ubfx,
 };
 use crate::runtime;
 
@@ -74,12 +76,19 @@ pub(crate) fn tags(slots: u8) -> u64 {
     })
 }
 
+/// Extra-word bit budget for extended resident/opt facts beyond the primary
+/// 64-bit value and context words (e.g., per-slot binary32 exactness).
+pub(crate) const EXTRA_X87_EXACT_F32_SHIFT: u32 = 0;
+pub(crate) const EXTRA_X87_EXACT_F32: u64 = 0xff << EXTRA_X87_EXACT_F32_SHIFT;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Key {
     mask: u64,
     value: u64,
     context_mask: u64,
     context: u64,
+    extra_mask: u64,
+    extra: u64,
 }
 
 impl Key {
@@ -96,6 +105,11 @@ impl Key {
     }
 
     pub(crate) fn resident(assumed: &Assumed, exact: u8) -> Self {
+        let has_afp = HostFeatures::get().contains(HostFeatures::AFP);
+        Self::resident_with_afp(assumed, exact, has_afp)
+    }
+
+    pub(crate) fn resident_with_afp(assumed: &Assumed, exact: u8, has_afp: bool) -> Self {
         let mut mask = MMX;
         let mut context_mask = u64::from(exact) << X87_EXACT_SHIFT;
         let mut context = context_mask;
@@ -108,11 +122,22 @@ impl Key {
             mask |= ES;
         }
         if assumed.mxcsr_mask != 0 {
-            mask |= MXCSR;
-        }
-        if assumed.mxcsr_mask == u32::MAX {
-            context_mask |= MXCSR_STICKY;
-            context |= u64::from(assumed.mxcsr & 0x3f) << MXCSR_STICKY_SHIFT;
+            let ctrl = u64::from(assumed.mxcsr_mask & MXCSR_CLASS);
+            mask |= ctrl << 47;
+            // With FEAT_AFP and all SSE exceptions masked, sticky bits live lazily
+            // in hardware FPSR; keep PE (bit 5) only so sticky churn across
+            // IE/DE/ZE/OE/UE never causes version bloat or thrashing. Without
+            // FEAT_AFP, with unmasked exceptions, or when the caller explicitly
+            // requests a full 32-bit exact match (`u32::MAX`), match every requested
+            // sticky bit.
+            let mut sticky = assumed.mxcsr_mask & 0x3f;
+            if has_afp && assumed.mxcsr_mask != u32::MAX && assumed.mxcsr & 0x1f80 == 0x1f80 {
+                sticky &= 0x20;
+            }
+            if sticky != 0 {
+                context_mask |= u64::from(sticky) << MXCSR_STICKY_SHIFT;
+                context |= u64::from(assumed.mxcsr & sticky) << MXCSR_STICKY_SHIFT;
+            }
         }
         if let Some(low) = assumed.esp_low {
             context_mask |= ESP_LOW;
@@ -132,7 +157,17 @@ impl Key {
             value: floating_facts(assumed.control, status, assumed.tags, 0, assumed.mxcsr) & mask,
             context_mask,
             context,
+            extra_mask: 0,
+            extra: 0,
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_exact_f32(mut self, slots: u8) -> Self {
+        let bits = u64::from(slots) << EXTRA_X87_EXACT_F32_SHIFT;
+        self.extra_mask |= bits;
+        self.extra |= bits;
+        self
     }
 
     pub(crate) fn holds(self, cpu: &CpuState) -> bool {
@@ -145,9 +180,18 @@ impl Key {
             | (u64::from(cpu.regs[5].wrapping_sub(cpu.regs[4])) << EBP_DELTA_SHIFT)
             | (u64::from(cpu.mxcsr & 0x3f) << MXCSR_STICKY_SHIFT);
         let exact = (self.context_mask >> X87_EXACT_SHIFT) as u8;
+        let exact_f32 =
+            ((self.extra_mask & EXTRA_X87_EXACT_F32) >> EXTRA_X87_EXACT_F32_SHIFT) as u8;
         context & (self.context_mask & ((1 << X87_EXACT_SHIFT) - 1))
             == self.context & ((1 << X87_EXACT_SHIFT) - 1)
             && (0..8).all(|slot| exact & (1 << slot) == 0 || binary64(cpu.x87.regs[slot]).is_some())
+            && (0..8).all(|slot| {
+                exact_f32 & (1 << slot) == 0
+                    || binary64(cpu.x87.regs[slot]).is_some_and(|bits| {
+                        let d = f64::from_bits(bits);
+                        f64::from(d as f32).to_bits() == bits
+                    })
+            })
     }
 
     /// Standalone lowering and the worker path still supply these two facts.
@@ -160,7 +204,12 @@ impl Key {
     }
 
     pub(crate) fn control(self) -> Option<u16> {
-        (self.mask & CONTROL != 0).then_some(self.value as u16)
+        (self.mask & CONTROL == CONTROL).then_some(self.value as u16)
+    }
+
+    /// Known `(value, mask)` bitfield for the x87 control word after bitwise joins.
+    pub(crate) fn control_bits(self) -> (u16, u16) {
+        ((self.value & CONTROL) as u16, (self.mask & CONTROL) as u16)
     }
 
     pub(crate) fn pe(self) -> bool {
@@ -172,16 +221,25 @@ impl Key {
     }
 
     pub(crate) fn mmx(self) -> Option<u32> {
-        (self.mask & MMX != 0).then_some(((self.value & MMX) >> 35) as u32)
+        (self.mask & MMX == MMX).then_some(((self.value & MMX) >> 35) as u32)
     }
 
     pub(crate) fn tag(self, slot: usize) -> Option<u8> {
         let shift = TAG_SHIFT + 2 * slot as u32;
-        (self.mask & (3 << shift) != 0).then_some(((self.value >> shift) & 3) as u8)
+        (self.mask & (3 << shift) == 3 << shift).then_some(((self.value >> shift) & 3) as u8)
     }
 
     pub(crate) fn mxcsr(self) -> Option<u32> {
-        (self.mask & MXCSR != 0).then_some(((self.value & MXCSR) >> 47) as u32)
+        (self.mask & MXCSR == MXCSR).then_some(((self.value & MXCSR) >> 47) as u32)
+    }
+
+    /// Known `(value, mask)` bitfield for MXCSR (control bits 15:6 and sticky bits 5:0).
+    pub(crate) fn mxcsr_bits(self) -> (u32, u32) {
+        let ctrl_val = ((self.value & MXCSR) >> 47) as u32;
+        let ctrl_mask = ((self.mask & MXCSR) >> 47) as u32;
+        let sticky_val = ((self.context & MXCSR_STICKY) >> MXCSR_STICKY_SHIFT) as u32;
+        let sticky_mask = ((self.context_mask & MXCSR_STICKY) >> MXCSR_STICKY_SHIFT) as u32;
+        (ctrl_val | sticky_val, ctrl_mask | sticky_mask)
     }
 
     pub(crate) fn mask(self) -> u64 {
@@ -189,7 +247,7 @@ impl Key {
     }
 
     pub(crate) fn uses_resident_context(self) -> bool {
-        self.context_mask != 0
+        self.context_mask != 0 || self.extra_mask != 0
     }
 
     pub(crate) fn proves(self, other: Self) -> bool {
@@ -197,6 +255,8 @@ impl Key {
             && self.value & other.mask == other.value
             && self.context_mask & other.context_mask == other.context_mask
             && self.context & other.context_mask == other.context
+            && self.extra_mask & other.extra_mask == other.extra_mask
+            && self.extra & other.extra_mask == other.extra
     }
 
     pub(crate) fn project(self, mask: u64) -> Self {
@@ -207,11 +267,15 @@ impl Key {
         }
     }
 
+    /// Bitwise join over control/status bitfields (`CONTROL`, `MXCSR`, `ES`, `PE`,
+    /// `X87_STATUS_REST`, `MXCSR_STICKY`, `X87_EXACT`, `extra`), preserving
+    /// whole-field atomicity only for multi-bit indices (`TOP`, `MMX`, per-slot
+    /// tags, `ESP_LOW`, `EBP_DELTA`).
     pub(crate) fn join(self, other: Self) -> Self {
         let both = self.mask & other.mask;
         let different = self.value ^ other.value;
-        let mut mask = both;
-        for field in [CONTROL, TOP, MMX, ES, PE, MXCSR] {
+        let mut mask = both & !(different & (CONTROL | ES | PE | MXCSR));
+        for field in [TOP, MMX] {
             if different & field != 0 {
                 mask &= !field;
             }
@@ -222,19 +286,22 @@ impl Key {
                 mask &= !field;
             }
         }
-        let mut context_mask = self.context_mask & other.context_mask;
         let context_difference = self.context ^ other.context;
-        for field in [X87_STATUS_REST, ESP_LOW, EBP_DELTA, MXCSR_STICKY] {
+        let mut context_mask = (self.context_mask & other.context_mask)
+            & !(context_difference & (X87_STATUS_REST | MXCSR_STICKY | (0xff << X87_EXACT_SHIFT)));
+        for field in [ESP_LOW, EBP_DELTA] {
             if context_difference & field != 0 {
                 context_mask &= !field;
             }
         }
-        context_mask &= !(context_difference & (0xff << X87_EXACT_SHIFT));
+        let extra_mask = (self.extra_mask & other.extra_mask) & !(self.extra ^ other.extra);
         Self {
             mask,
             value: self.value & mask,
             context_mask,
             context: self.context & context_mask,
+            extra_mask,
+            extra: self.extra & extra_mask,
         }
     }
 
@@ -280,13 +347,14 @@ impl Key {
     }
 
     fn guard_cpu(self, asm: &mut Asm, cpu: Reg, resident: bool, miss: Label) {
-        if let Some(control) = self.control() {
+        let (control_val, control_mask) = self.control_bits();
+        if control_mask != 0 {
             asm.emit(ldrh(VALUE, cpu, runtime::X87_CONTROL));
-            compare(asm, control, u16::MAX, true, resident, miss);
+            compare(asm, control_val, control_mask, true, resident, miss);
         }
         let top = ((self.value & TOP) >> 16) as u32;
-        let full_status = self.context_mask & X87_STATUS_REST != 0;
-        let mask = if full_status { 0xc75f } else { 0 }
+        let rest_mask = (self.context_mask & X87_STATUS_REST) as u16;
+        let mask = status_word(rest_mask)
             | if self.mask & TOP != 0 { 0x3800 } else { 0 }
             | if self.mask & ES != 0 { 0x80 } else { 0 }
             | if self.mask & PE != 0 { 0x20 } else { 0 };
@@ -322,14 +390,14 @@ impl Key {
         if !resident && self.mask & MMX != 0 {
             self.guard_mmx(asm, cpu, false, miss);
         }
-        if let Some(mxcsr) = self.mxcsr() {
+        let (mxcsr_val, mxcsr_mask) = self.mxcsr_bits();
+        if mxcsr_mask != 0 {
             asm.emit(ldr(W, VALUE, cpu, runtime::MXCSR));
-            let full = self.context_mask & MXCSR_STICKY != 0;
-            let value = mxcsr as u16 | ((self.context & MXCSR_STICKY) >> MXCSR_STICKY_SHIFT) as u16;
+            let full = mxcsr_mask as u16 == u16::MAX;
             compare(
                 asm,
-                value,
-                if full { u16::MAX } else { MXCSR_CLASS as u16 },
+                mxcsr_val as u16,
+                mxcsr_mask as u16,
                 full,
                 resident,
                 miss,
@@ -421,7 +489,7 @@ fn compare(asm: &mut Asm, value: u16, mask: u16, full_load: bool, resident: bool
         ]);
     }
     if !full_load || mask != u16::MAX {
-        if resident && mask == MXCSR_CLASS as u16 {
+        if resident && bitmask(W, u64::from(mask)).is_some() {
             asm.emit(and_imm(W, VALUE, VALUE, u64::from(mask)));
         } else {
             asm.emit_all(&[
@@ -768,9 +836,9 @@ mod tests {
         }
     }
 
-    // spec: A64A-ROLE-3 A64A-FALL-3
+    // spec: A64A-ROLE-3 A64A-FALL-3 A64F-FP-5
     #[test]
-    fn joins_keep_whole_fields() {
+    fn joins_keep_agreed_control_bits_and_atomic_indices() {
         let mut cpu = CpuState::default();
         let mask = CONTROL | TOP | tags(1) | MMX | ES | MXCSR;
         let original = Key::read(&cpu, mask);
@@ -778,9 +846,87 @@ mod tests {
         cpu.x87.set_top(3);
         let observed = Key::read(&cpu, mask);
         let joined = original.join(observed);
-        assert_eq!(joined.mask(), mask & !(CONTROL | TOP));
+        // Bitwise join keeps all agreed CONTROL bits (e.g. rounding mode and
+        // exception masks) while dropping only the differing PC bit 9 and the
+        // atomic 3-bit TOP index.
+        assert_eq!(joined.mask(), (mask & !TOP) & !0x0200);
+        assert_eq!(joined.control(), None);
+        assert_eq!(joined.control_bits().1, 0xffff & !0x0200);
         assert!(original.proves(joined));
         assert!(observed.proves(joined));
+    }
+
+    // spec: A64F-FP-5 A64-OPT-4
+    #[test]
+    fn resident_key_trims_mxcsr_sticky_bits_with_afp_when_masked() {
+        let mut cpu = CpuState::default();
+        cpu.mxcsr = 0x1fa0; // all masked + PE set
+        let assumed = Assumed {
+            control: cpu.x87.control,
+            status: cpu.x87.status & !0x3800,
+            mxcsr: cpu.mxcsr,
+            top: cpu.x87.top() as u8,
+            tags: cpu.x87.tag,
+            esp_low: None,
+            ebp: None,
+            denormal: false,
+            x87: false,
+            mmx: false,
+            mxcsr_mask: 0xffff,
+        };
+        // With FEAT_AFP and masked exceptions, only PE (bit 5) stays in the key.
+        let afp_key = Key::resident_with_afp(&assumed, 0, true);
+        assert_eq!(afp_key.mxcsr_bits().1, 0xffe0);
+        for sticky in [0x01u32, 0x02, 0x04, 0x08, 0x10, 0x1f] {
+            let mut variant = cpu.clone();
+            variant.mxcsr = 0x1fa0 | sticky;
+            assert!(
+                afp_key.holds(&variant),
+                "AFP masked key must accept sticky={sticky:#x} without version bloat"
+            );
+        }
+        let mut no_pe = cpu.clone();
+        no_pe.mxcsr = 0x1f80;
+        assert!(!afp_key.holds(&no_pe));
+
+        // Without FEAT_AFP, all 6 sticky bits are matched exactly.
+        let no_afp_key = Key::resident_with_afp(&assumed, 0, false);
+        assert_eq!(no_afp_key.mxcsr_bits().1, 0xffff);
+        let mut with_de = cpu.clone();
+        with_de.mxcsr = 0x1fa2;
+        assert!(!no_afp_key.holds(&with_de));
+
+        // With unmasked exceptions, even with FEAT_AFP all 6 sticky bits stay exact.
+        let mut unmasked = assumed;
+        unmasked.mxcsr = 0x1f20; // IM unmasked + PE
+        let unmasked_key = Key::resident_with_afp(&unmasked, 0, true);
+        assert_eq!(unmasked_key.mxcsr_bits().1, 0xffff);
+    }
+
+    // spec: A64A-ROLE-3 A64-OPT-4
+    #[test]
+    fn key_extra_tracks_exact_f32_slots_and_joins_bitwise() {
+        use adv_cpu_core::state::X87Register;
+
+        let mut cpu = CpuState::default();
+        // Slot 0 holds 1.5 (exact f32), slot 1 holds 1.0 + 2^-40 (f64 only).
+        let exact_bits = 1.5f64.to_bits();
+        let wide_bits = (1.0f64 + f64::from_bits(0x3d70_0000_0000_0000)).to_bits();
+        let to_raw = |bits: u64| {
+            let exp = ((bits >> 52) & 0x7ff) as u16 + (16383 - 1023);
+            let frac = bits & ((1 << 52) - 1);
+            X87Register::from_parts((1 << 63) | (frac << 11), exp)
+        };
+        cpu.x87.regs[0] = to_raw(exact_bits);
+        cpu.x87.regs[1] = to_raw(wide_bits);
+        let k0 = Key::default().with_exact_f32(1);
+        let k01 = Key::default().with_exact_f32(3);
+        assert!(k0.holds(&cpu));
+        assert!(!k01.holds(&cpu));
+        let joined = k0.join(k01);
+        assert!(joined.holds(&cpu));
+        assert!(k0.proves(joined));
+        assert!(k01.proves(joined));
     }
 
     // spec: A64A-ROLE-3

@@ -428,12 +428,24 @@ pub(super) struct Arbiter {
     pub(super) offer_resume: Option<u32>,
 }
 
+/// Fast probation cutoff for repeated validation cold exits so persistently
+/// failing forms converge well below scenario iteration minimums.
+const FAST_PROBATION_COLD: u64 = 16;
+/// Window size in visits before `ColdWindow` resets transient bursts.
+const COLD_WINDOW_VISITS: u64 = 64;
+/// Baseline arrivals to wait before re-probing a site declined for validation
+/// (e.g. after an initialization NaN/sentinel burst).
+const VALIDATION_REPROBE_COOLDOWN: u32 = 64;
+/// Maximum bounded re-probes after validation declines.
+const MAX_VALIDATION_REPROBES: u8 = 2;
+
 #[derive(Default)]
 pub(super) struct SitePlan {
     samples: u8,
     promoted: bool,
     strikes: u32,
     checked: bool,
+    validation_reprobes: u8,
     pub(super) force_tier1: bool,
     counter: Option<Box<Cell<u32>>>,
     pub(super) resident: Option<Box<ResidentPlan>>,
@@ -470,11 +482,16 @@ impl Arbiter {
         if let Some(job) = &site.job {
             return Arrival::Offerable(job);
         }
-        match site.resident.as_ref().map(|head| &head.state) {
+        match site.resident.as_ref().map(|head| (head, &head.state)) {
             None => Arrival::Baseline,
-            Some(ResidentState::Profiling) => Arrival::Profiling,
-            Some(ResidentState::Installed) => Arrival::Resident,
-            Some(ResidentState::Declined(_)) => Arrival::Declined,
+            Some((_, ResidentState::Profiling)) => Arrival::Profiling,
+            Some((_, ResidentState::Installed)) => Arrival::Resident,
+            Some((head, ResidentState::Declined(Decline::Cold(ResidentCold::Validation))))
+                if site.validation_reprobes < MAX_VALIDATION_REPROBES && head.tick_reprobe() =>
+            {
+                Arrival::Baseline
+            }
+            Some((_, ResidentState::Declined(_))) => Arrival::Declined,
         }
     }
 
@@ -536,7 +553,16 @@ impl Arbiter {
     }
 
     pub(super) fn discover(&mut self, eip: u32, source: u32, code: usize) {
-        self.site(eip).resident = Some(Box::new(ResidentPlan::new(code, source)));
+        let site = self.site(eip);
+        if matches!(
+            site.resident.as_ref().map(|r| &r.state),
+            Some(ResidentState::Declined(Decline::Cold(
+                ResidentCold::Validation
+            )))
+        ) {
+            site.validation_reprobes = site.validation_reprobes.saturating_add(1);
+        }
+        site.resident = Some(Box::new(ResidentPlan::new(code, source)));
     }
 
     pub(super) fn counter(&mut self, eip: u32) -> (u64, u32) {
@@ -580,6 +606,7 @@ impl Arbiter {
                 count.set(if site.force_tier1 { u32::MAX } else { HOT });
             }
             site.promoted = false;
+            site.validation_reprobes = 0;
             site.resident = None;
             site.job = None;
         }
@@ -699,6 +726,8 @@ pub(super) struct ResidentPlan {
     pub row: RowLedger,
     // Prices change on rebuild. Keep credits already measured at their old price.
     row_history: Vec<RowLedger>,
+    /// Remaining baseline arrivals before a validation-declined site re-probes.
+    reprobe_after: Cell<u32>,
 }
 
 #[derive(Default)]
@@ -733,7 +762,17 @@ impl ResidentPlan {
             row_targets: Vec::new(),
             row: RowLedger::default(),
             row_history: Vec::new(),
+            reprobe_after: Cell::new(0),
         }
+    }
+
+    pub(super) fn tick_reprobe(&self) -> bool {
+        let left = self.reprobe_after.get();
+        if left == 0 {
+            return true;
+        }
+        self.reprobe_after.set(left - 1);
+        left == 1
     }
     pub(super) fn declined(&self) -> bool {
         self.decline().is_some()
@@ -826,7 +865,11 @@ impl ResidentPlan {
         if let Some(probation) = &mut self.probation[version] {
             probation.cold_entries += 1;
             probation.cold_retired += retired;
-            if probation.cold_entries == u64::from(PROBATION) {
+            if probation.cold_entries == u64::from(PROBATION)
+                || (reason != ResidentCold::HostFault
+                    && probation.cold_entries >= FAST_PROBATION_COLD
+                    && !probation.profitable(0, 0))
+            {
                 return ColdAction::FinishProbation;
             }
         }
@@ -857,7 +900,7 @@ impl ResidentPlan {
         window.cold_entries += 1;
         let visits = (entries - window.start_entries + window.cold_entries)
             .max(iterations - window.start_iterations + window.cold_iterations);
-        if visits > u64::from(PROBATION) {
+        if visits > COLD_WINDOW_VISITS {
             *window = ColdWindow {
                 start_entries: entries,
                 start_iterations: iterations,
@@ -939,8 +982,14 @@ impl ResidentPlan {
     pub(super) fn decline_with(&mut self, reason: Decline) -> bool {
         let gap = self.has_proof && !self.recorded_gap;
         self.recorded_gap |= gap;
+        let validation = matches!(reason, Decline::Cold(ResidentCold::Validation));
         self.state = ResidentState::Declined(reason);
         self.probation.clear();
+        self.reprobe_after.set(if validation {
+            VALIDATION_REPROBE_COOLDOWN
+        } else {
+            0
+        });
         gap
     }
 
@@ -1016,5 +1065,45 @@ mod tests {
             wake.decay();
         }
         assert_eq!(wake.ns, WAKE_NS);
+    }
+
+    // spec: A64-OPT-4 A64-OPT-6
+    #[test]
+    fn probation_converges_fast_and_validation_declines_allow_bounded_reprobe() {
+        let mut plan = ResidentPlan::new(0x1000, 0x1000);
+        let prob = Probation::price(Some(40), 10, 4, 60).unwrap().unwrap();
+        plan.installed(0, Some(prob));
+        for i in 1..FAST_PROBATION_COLD {
+            let action = plan.cold_action(0, 0x1004, ResidentCold::Validation, false, i, 2);
+            assert!(matches!(action, ColdAction::Observe));
+        }
+        let action = plan.cold_action(
+            0,
+            0x1004,
+            ResidentCold::Validation,
+            false,
+            FAST_PROBATION_COLD,
+            2,
+        );
+        assert!(matches!(action, ColdAction::FinishProbation));
+
+        // Bounded re-probe after an initialization NaN/sentinel burst.
+        let mut arbiter = Arbiter::new(false);
+        for attempt in 0..=MAX_VALIDATION_REPROBES {
+            arbiter.discover(0x2000, 0x2000, 0x1000);
+            let head = arbiter.resident_mut(0x2000).unwrap();
+            head.installed(0, None);
+            head.decline_with(Decline::Cold(ResidentCold::Validation));
+            if attempt < MAX_VALIDATION_REPROBES {
+                for _ in 1..VALIDATION_REPROBE_COOLDOWN {
+                    assert!(matches!(arbiter.arrival(0x2000), Arrival::Declined));
+                }
+                assert!(matches!(arbiter.arrival(0x2000), Arrival::Baseline));
+            } else {
+                for _ in 0..VALIDATION_REPROBE_COOLDOWN * 2 {
+                    assert!(matches!(arbiter.arrival(0x2000), Arrival::Declined));
+                }
+            }
+        }
     }
 }

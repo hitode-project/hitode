@@ -9,7 +9,7 @@ use crate::translate::front::tags::ConditionCode as CC;
 
 // Positive conditions: O, B, E, BE, S, P, L, LE; their partners invert.
 // A cleared mask bit selects a recipe over just the needed guest status bits.
-const CONDITIONS: [(u8, [Cond; 8]); 18] = {
+const CONDITIONS: [(u8, [Cond; 8]); 20] = {
     use Cond::*;
     [
         (0xd7, [Vs, Hs, Eq, Eq, Mi, Eq, Lt, Le]), // Add
@@ -24,20 +24,22 @@ const CONDITIONS: [(u8, [Cond; 8]); 18] = {
         (0, [Eq; 8]),
         (0, [Eq; 8]),
         (0, [Eq; 8]),
-        (0x2a, [Eq, Lt, Eq, Le, Eq, Vs, Eq, Eq]), // UCOMISD
-        (0x2a, [Eq, Lt, Eq, Le, Eq, Vs, Eq, Eq]), // COMISD
+        (0x2a, [Eq, Lt, Eq, Le, Eq, Vs, Eq, Eq]), // UCOMISD/UCOMISS
+        (0x2a, [Eq, Lt, Eq, Le, Eq, Vs, Eq, Eq]), // COMISD/COMISS
         (0, [Eq; 8]),
         (0, [Eq; 8]),
         (0, [Eq; 8]),
         (0, [Eq; 8]),
+        (0, [Eq; 8]),                             // Sahf
+        (0x2a, [Eq, Lt, Eq, Le, Eq, Vs, Eq, Eq]), // X87CompareFold
     ]
 };
 
 impl Emitter<'_> {
-    fn compare_floats(&mut self, kind: FlagKind, a: Host, b: Host) {
+    fn compare_floats(&mut self, kind: FlagKind, width: u8, a: Host, b: Host) {
         let a = self.v_at(a, A);
         let b = self.v_at(b, B);
-        self.asm.emit(super::compare(kind, a, b));
+        self.asm.emit(super::compare(kind, width, a, b));
     }
 
     pub(super) fn condition(&mut self, flags: Host, cc: CC) -> Cond {
@@ -92,7 +94,7 @@ impl Emitter<'_> {
             return None;
         }
         if kind.floating() {
-            self.compare_floats(kind, a, b);
+            self.compare_floats(kind, width, a, b);
         } else {
             self.arithmetic(flags, Reg::ZR);
         }
@@ -190,8 +192,14 @@ impl Emitter<'_> {
         if matches!(kind, Increment | Decrement) && bit == 0
             || matches!(kind, MulSigned | MulUnsigned | Rol | Ror) && !matches!(bit, 0 | 11)
             || kind == CarryBit && bit != 0
+            || matches!(kind, Sahf | X87CompareFold) && bit == 11
         {
             self.prior_bit(prior, bit);
+            return;
+        }
+        if kind == Sahf {
+            let ar = self.gp_at(a, T);
+            self.asm.emit(ubfx(W, T, ar, bit, 1));
             return;
         }
         if matches!(kind, CarryBit | MulUnsigned) {
@@ -212,6 +220,7 @@ impl Emitter<'_> {
             match kind {
                 Shl | Shr | Sar => self.prior_bit(prior, bit),
                 Logic | UnorderedCompare | OrderedCompare => self.imm(T, 0),
+                X87CompareFold => self.imm(T, u64::from(width & 1)),
                 _ => {
                     self.arithmetic(flags, T);
                     let ar = self.gp_at(a, U);
@@ -260,7 +269,7 @@ impl Emitter<'_> {
         }
         if kind.floating() {
             if bit == 6 {
-                self.compare_floats(kind, a, b);
+                self.compare_floats(kind, width, a, b);
                 self.asm.emit_all(&[
                     cset(W, T, Cond::Eq),
                     cset(W, U, Cond::Vs),

@@ -10,7 +10,7 @@ use adv_cpu_core::integer::{self, CF, OF, PF, ZF};
 
 use super::ir::{
     Block, DomainGuardKind, End, FlagKind, FmaOp, FpOp, FpUnary, Func, IntOp, IntUnary, Op,
-    RecordId, SINGLE_EXACT, SINGLE_RESULT, Type, Value, VecOp, VecToInt, VecUnary,
+    RecordId, SINGLE_EXACT, SINGLE_RESULT, SseConvertKind, Type, Value, VecOp, VecToInt, VecUnary,
 };
 use super::recovery::{Location, Recipe};
 
@@ -55,7 +55,7 @@ pub(crate) fn run(func: &Func, params: &[u128], memory: &mut Memory, limit: usiz
             if steps > limit {
                 break 'run Outcome::Limit;
             }
-            match step(func, op, &values, memory) {
+            match step(func, *result, op, &values, memory) {
                 Some(bits) => {
                     if let Some(r) = result {
                         values[r.0 as usize] = bits;
@@ -92,7 +92,13 @@ pub(crate) fn run(func: &Func, params: &[u128], memory: &mut Memory, limit: usiz
 }
 
 /// One instruction's result bits, or `None` when it fails.
-fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u128> {
+fn step(
+    func: &Func,
+    result: Option<Value>,
+    op: &Op,
+    values: &[u128],
+    memory: &mut Memory,
+) -> Option<u128> {
     let get = |v: Value| values[v.0 as usize];
     let wide = |v: Value| func.ty(v) == Type::I64;
     let f = |v: Value| f64::from_bits(get(v) as u64);
@@ -169,7 +175,23 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 Type::Flags => unreachable!("no reinterpretation as flags"),
             }
         }
-        Op::Fp(op, a, b, _) | Op::SseFp64(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
+        Op::Fp(op, a, b, _) => {
+            if let Some(r) = result
+                && func.deferred_fp.contains(&r)
+                && matches!(op, FpOp::Add | FpOp::Sub)
+            {
+                let (x, y) = (f(a), f(b));
+                let res = match op {
+                    FpOp::Add => x + y,
+                    FpOp::Sub => x - y,
+                    _ => unreachable!(),
+                };
+                float(res)?
+            } else {
+                float(arithmetic(op, f(a), f(b))?)?
+            }
+        }
+        Op::SseFp64(op, a, b) => float(arithmetic(op, f(a), f(b))?)?,
         Op::X87Single(op, a, b, proved) => {
             let (a, b) = (f(a), f(b));
             let (sa, sb) = (a as f32, b as f32);
@@ -265,6 +287,418 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                 }
                 float(r)?
             }
+        }
+        Op::X87Arith {
+            op,
+            a,
+            b,
+            pc,
+            rounding,
+            ..
+        } => {
+            use adv_cpu_core::floating::softfloat;
+            let (a, b) = (f(a), f(b));
+            if a.is_nan() || b.is_nan() {
+                return None;
+            }
+            softfloat::configure_sse(0x1f80 | (u32::from(rounding) << 13));
+            match pc {
+                0 => {
+                    let (sa, sb) = (a as f32, b as f32);
+                    if f64::from(sa) != a || f64::from(sb) != b {
+                        return None;
+                    }
+                    let bits = softfloat::sse_binary(
+                        u64::from(sa.to_bits()),
+                        u64::from(sb.to_bits()),
+                        op as u8,
+                        4,
+                    );
+                    let r = f32::from_bits(bits as u32);
+                    if r == 0.0 {
+                        if !(matches!(op, FpOp::Add | FpOp::Sub)
+                            || a == 0.0
+                            || op == FpOp::Mul && b == 0.0)
+                        {
+                            return None;
+                        }
+                    } else if !r.is_normal() || r.abs() < f32::from_bits(0x0100_0000) {
+                        return None;
+                    }
+                    float(f64::from(r))?
+                }
+                3 => {
+                    // PC64: exact binary64 discrimination (zero rounding error).
+                    let bits = softfloat::sse_binary(a.to_bits(), b.to_bits(), op as u8, 8);
+                    let fl = softfloat::flags();
+                    let r = f64::from_bits(bits);
+                    if fl & 0x3f != 0 || !r.is_finite() || r.is_subnormal() {
+                        return None;
+                    }
+                    if matches!(op, FpOp::Mul | FpOp::Div)
+                        && (r.abs() == f64::MIN_POSITIVE
+                            || r == 0.0 && a != 0.0 && (op != FpOp::Mul || b != 0.0))
+                    {
+                        return None;
+                    }
+                    float(r)?
+                }
+                _ => {
+                    // PC53 with directed rounding.
+                    let bits = softfloat::sse_binary(a.to_bits(), b.to_bits(), op as u8, 8);
+                    let r = f64::from_bits(bits);
+                    if r.is_nan()
+                        || r.is_infinite() && a.is_finite() && b.is_finite()
+                        || r.is_subnormal()
+                    {
+                        return None;
+                    }
+                    if matches!(op, FpOp::Mul | FpOp::Div)
+                        && (r.abs() == f64::MIN_POSITIVE
+                            || r == 0.0 && a != 0.0 && (op != FpOp::Mul || b != 0.0))
+                    {
+                        return None;
+                    }
+                    float(r)?
+                }
+            }
+        }
+        Op::X87Sqrt {
+            value,
+            pc,
+            rounding,
+            ..
+        } => {
+            use adv_cpu_core::floating::softfloat;
+            let a = f(value);
+            if a.is_nan() || (a < 0.0) || a.is_subnormal() {
+                return None;
+            }
+            if a == 0.0 {
+                return float(a);
+            }
+            if a.is_infinite() {
+                return float(a);
+            }
+            softfloat::configure_sse(0x1f80 | (u32::from(rounding) << 13));
+            match pc {
+                0 => {
+                    let sa = a as f32;
+                    if f64::from(sa) != a || sa.is_subnormal() {
+                        return None;
+                    }
+                    let bits = softfloat::sse_binary(0, u64::from(sa.to_bits()), 4, 4);
+                    let r = f32::from_bits(bits as u32);
+                    if !r.is_normal() || r.abs() < f32::from_bits(0x0100_0000) {
+                        return None;
+                    }
+                    float(f64::from(r))?
+                }
+                3 => {
+                    let r = a.sqrt();
+                    if !r.is_normal() || r * r != a {
+                        return None;
+                    }
+                    float(r)?
+                }
+                _ => {
+                    let bits = softfloat::sse_binary(0, a.to_bits(), 4, 8);
+                    let r = f64::from_bits(bits);
+                    if !r.is_normal() {
+                        return None;
+                    }
+                    float(r)?
+                }
+            }
+        }
+        Op::X87Round {
+            value,
+            rounding,
+            denormal,
+            ..
+        } => {
+            let a = f(value);
+            if a.is_nan() || (denormal && a.is_subnormal()) {
+                return None;
+            }
+            let r = match rounding {
+                0 => a.round_ties_even(),
+                1 => a.floor(),
+                2 => a.ceil(),
+                _ => a.trunc(),
+            };
+            float(r)?
+        }
+        Op::X87Compare { a, b, ordered } => {
+            let (a, b) = (f(a), f(b));
+            if signaling(a) || signaling(b) || (ordered && (a.is_nan() || b.is_nan())) {
+                return None;
+            }
+            let cc = if a.is_nan() || b.is_nan() {
+                0x4500u32
+            } else if a < b {
+                0x0100
+            } else if a == b {
+                0x4000
+            } else {
+                0x0000
+            };
+            u128::from(cc)
+        }
+        Op::X87Exam(value) => {
+            let x = f(value);
+            let sign = u32::from(x.to_bits() >> 63 != 0) << 9;
+            let cc = if x.is_nan() {
+                0x0100u32
+            } else if x.is_infinite() {
+                0x0500
+            } else if x == 0.0 {
+                0x4000
+            } else if x.is_subnormal() {
+                0x4400
+            } else {
+                0x0400
+            };
+            u128::from(cc | sign)
+        }
+        Op::X87RoundC1 {
+            op,
+            a,
+            b,
+            pc,
+            rounding,
+        } => {
+            let (a, b) = (f(a), f(b));
+            let up = if rounding == 0 && pc != 3 {
+                rounded_up(op, a, b, pc == 0)
+            } else if pc == 3 || rounding == 3 {
+                false
+            } else {
+                use adv_cpu_core::floating::softfloat;
+                softfloat::configure_sse(0x1f80 | (u32::from(rounding) << 13));
+                let (bits, res) = if pc == 0 {
+                    let bits = softfloat::sse_binary(
+                        u64::from((a as f32).to_bits()),
+                        u64::from((b as f32).to_bits()),
+                        op as u8,
+                        4,
+                    );
+                    (bits, f64::from(f32::from_bits(bits as u32)))
+                } else {
+                    let bits = softfloat::sse_binary(a.to_bits(), b.to_bits(), op as u8, 8);
+                    (bits, f64::from_bits(bits))
+                };
+                let _ = bits;
+                let inexact = softfloat::flags() & 0x20 != 0;
+                inexact && ((rounding == 1 && res < 0.0) || (rounding == 2 && res > 0.0))
+            };
+            u128::from(up)
+        }
+        Op::X87SqrtC1 { input, result } => {
+            let (a, r) = (f(input), f(result));
+            u128::from(r.mul_add(r, -a) > 0.0)
+        }
+        Op::SsePackedFp {
+            op, double, a, b, ..
+        } => {
+            let (av, bv) = (get(a), get(b));
+            if double {
+                let mut out = 0u128;
+                for shift in [0usize, 64] {
+                    let x = f64::from_bits((av >> shift) as u64);
+                    let y = f64::from_bits((bv >> shift) as u64);
+                    let r = arithmetic(op, x, y)?;
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+                out
+            } else {
+                let mut out = 0u128;
+                let sum = matches!(op, FpOp::Add | FpOp::Sub);
+                for lane in 0..4usize {
+                    let shift = lane * 32;
+                    let x = f32::from_bits((av >> shift) as u32);
+                    let y = f32::from_bits((bv >> shift) as u32);
+                    let r = match op {
+                        FpOp::Add => x + y,
+                        FpOp::Sub => x - y,
+                        FpOp::Mul => x * y,
+                        FpOp::Div => x / y,
+                    };
+                    if !r.is_finite() || (!sum && r.abs() <= f32::MIN_POSITIVE) {
+                        return None;
+                    }
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+                out
+            }
+        }
+        Op::SseMinMax {
+            max,
+            scalar,
+            double,
+            a,
+            b,
+            ..
+        } => {
+            let (av, bv) = (get(a), get(b));
+            let lanes = if scalar {
+                1
+            } else if double {
+                2
+            } else {
+                4
+            };
+            let mut out = 0u128;
+            if double {
+                for lane in 0..lanes {
+                    let shift = lane * 64;
+                    let x = f64::from_bits((av >> shift) as u64);
+                    let y = f64::from_bits((bv >> shift) as u64);
+                    if x.is_nan() || y.is_nan() {
+                        return None;
+                    }
+                    let take_x = if max { x > y } else { x < y };
+                    let r = if take_x { x } else { y };
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+            } else {
+                for lane in 0..lanes {
+                    let shift = lane * 32;
+                    let x = f32::from_bits((av >> shift) as u32);
+                    let y = f32::from_bits((bv >> shift) as u32);
+                    if x.is_nan() || y.is_nan() {
+                        return None;
+                    }
+                    let take_x = if max { x > y } else { x < y };
+                    let r = if take_x { x } else { y };
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+            }
+            out
+        }
+        Op::SseSqrt {
+            scalar, double, a, ..
+        } => {
+            let av = get(a);
+            let lanes = if scalar {
+                1
+            } else if double {
+                2
+            } else {
+                4
+            };
+            let mut out = 0u128;
+            if double {
+                for lane in 0..lanes {
+                    let shift = lane * 64;
+                    let x = f64::from_bits((av >> shift) as u64);
+                    if x.is_nan() || x < 0.0 {
+                        return None;
+                    }
+                    let r = x.sqrt();
+                    if r.is_subnormal() || (r != 0.0 && r.abs() <= f64::MIN_POSITIVE) {
+                        return None;
+                    }
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+            } else {
+                for lane in 0..lanes {
+                    let shift = lane * 32;
+                    let x = f32::from_bits((av >> shift) as u32);
+                    if x.is_nan() || x < 0.0 {
+                        return None;
+                    }
+                    let r = x.sqrt();
+                    if r.is_subnormal() || (r != 0.0 && r.abs() <= f32::MIN_POSITIVE) {
+                        return None;
+                    }
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+            }
+            out
+        }
+        Op::SseConvert { kind, a, .. } => {
+            let av = get(a);
+            match kind {
+                SseConvertKind::WidenScalar => {
+                    let x = f32::from_bits(av as u32);
+                    if x.is_nan() {
+                        return None;
+                    }
+                    u128::from(f64::from(x).to_bits())
+                }
+                SseConvertKind::WidenPacked => {
+                    let mut out = 0u128;
+                    for lane in 0..2usize {
+                        let x = f32::from_bits((av >> (lane * 32)) as u32);
+                        if x.is_nan() {
+                            return None;
+                        }
+                        out |= u128::from(f64::from(x).to_bits()) << (lane * 64);
+                    }
+                    out
+                }
+                SseConvertKind::NarrowScalar => {
+                    let x = f64::from_bits(av as u64);
+                    let r = x as f32;
+                    if !r.is_finite() || (x != 0.0 && r.abs() < f32::from_bits(0x0100_0000)) {
+                        return None;
+                    }
+                    u128::from(r.to_bits())
+                }
+                SseConvertKind::NarrowPacked => {
+                    let mut out = 0u128;
+                    for lane in 0..2usize {
+                        let x = f64::from_bits((av >> (lane * 64)) as u64);
+                        let r = x as f32;
+                        if !r.is_finite() || (x != 0.0 && r.abs() < f32::from_bits(0x0100_0000)) {
+                            return None;
+                        }
+                        out |= u128::from(r.to_bits()) << (lane * 32);
+                    }
+                    out
+                }
+            }
+        }
+        Op::SseScalarToInt {
+            value,
+            double,
+            truncate,
+        } => {
+            let av = get(value);
+            let x = if double {
+                f64::from_bits(av as u64)
+            } else {
+                f64::from(f32::from_bits(av as u32))
+            };
+            let rounded = if truncate {
+                x.trunc()
+            } else {
+                x.round_ties_even()
+            };
+            if x.is_nan() || rounded < f64::from(i32::MIN) || rounded >= -f64::from(i32::MIN) {
+                return None;
+            }
+            u128::from((rounded as i32) as u32)
+        }
+        Op::FpValidate { values, strict } => {
+            for (idx, v) in values.into_iter().enumerate() {
+                let Some(v) = v else { continue };
+                let x = f(v);
+                if !x.is_finite() || x.is_subnormal() {
+                    return None;
+                }
+                // Non-strict lanes (`Add`/`Sub`) accept `±0.0`; strict lanes (`Mul`)
+                // already verified exact `0.0` at the op or via FPSR, so only reject
+                // subnormal / smallest normal binade / non-finite here.
+                if (strict >> idx) & 1 != 0
+                    && x != 0.0
+                    && x.abs() < f64::from_bits(0x0020_0000_0000_0000)
+                {
+                    return None;
+                }
+            }
+            0
         }
         Op::Fp32(op, a, b) => {
             let a = f32::from_bits(get(a) as u32);
@@ -394,7 +828,7 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
                     n as u32 as u128
                 }
             } else {
-                let rounded = value as f32;
+                let rounded = round_f64_to_f32(value, rounding);
                 let bad = if proved {
                     value != 0.0
                         && (!rounded.is_normal()
@@ -644,7 +1078,12 @@ fn step(func: &Func, op: &Op, values: &[u128], memory: &mut Memory) -> Option<u1
             for v in [Some(a), b].into_iter().flatten() {
                 let bits = get(v);
                 if if single {
-                    f32::from_bits(bits as u32).is_subnormal()
+                    if packed {
+                        (0..4)
+                            .any(|lane| f32::from_bits((bits >> (lane * 32)) as u32).is_subnormal())
+                    } else {
+                        f32::from_bits(bits as u32).is_subnormal()
+                    }
                 } else {
                     f64::from_bits(bits as u64).is_subnormal()
                         || packed && f64::from_bits((bits >> 64) as u64).is_subnormal()
@@ -840,9 +1279,42 @@ pub(super) fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32) -> 
             out = out & !(CF | OF) | if overflow { CF | OF } else { 0 };
         }
         FlagKind::UnorderedCompare | FlagKind::OrderedCompare => {
+            let ordered = kind == FlagKind::OrderedCompare;
+            let (p, q) = if width == 32 {
+                let pf = f32::from_bits(a as u32);
+                let qf = f32::from_bits(b as u32);
+                if signaling32(pf) || signaling32(qf) || ordered && (pf.is_nan() || qf.is_nan()) {
+                    return None;
+                }
+                (f64::from(pf), f64::from(qf))
+            } else {
+                let pd = f64::from_bits(a as u64);
+                let qd = f64::from_bits(b as u64);
+                if signaling(pd) || signaling(qd) || ordered && (pd.is_nan() || qd.is_nan()) {
+                    return None;
+                }
+                (pd, qd)
+            };
+            let set = if p.is_nan() || q.is_nan() {
+                ZF | PF | CF
+            } else if p < q {
+                CF
+            } else if p == q {
+                ZF
+            } else {
+                0
+            };
+            out = out & !(ZF | PF | CF | OF | integer::SF | integer::AF) | set;
+        }
+        FlagKind::Sahf => {
+            let ah = x & 0xff;
+            let mask = integer::SF | ZF | integer::AF | PF | CF;
+            out = (out & !mask) | (ah & mask);
+        }
+        FlagKind::X87CompareFold => {
             let p = f64::from_bits(a as u64);
             let q = f64::from_bits(b as u64);
-            let ordered = kind == FlagKind::OrderedCompare;
+            let ordered = width & 2 != 0;
             if signaling(p) || signaling(q) || ordered && (p.is_nan() || q.is_nan()) {
                 return None;
             }
@@ -855,7 +1327,8 @@ pub(super) fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32) -> 
             } else {
                 0
             };
-            out = out & !(ZF | PF | CF | OF | integer::SF | integer::AF) | set;
+            let af = if width & 1 != 0 { integer::AF } else { 0 };
+            out = out & !(ZF | PF | CF | integer::SF | integer::AF) | set | af;
         }
     }
     Some(out)
@@ -863,6 +1336,58 @@ pub(super) fn flags(kind: FlagKind, width: u8, a: u128, b: u128, prior: u32) -> 
 
 fn signaling(x: f64) -> bool {
     x.is_nan() && x.to_bits() & 1 << 51 == 0
+}
+
+fn signaling32(x: f32) -> bool {
+    x.is_nan() && x.to_bits() & 1 << 22 == 0
+}
+
+fn round_f64_to_f32(x: f64, rounding: u8) -> f32 {
+    let s = x as f32;
+    if !x.is_finite() || f64::from(s) == x {
+        return s;
+    }
+    let w = f64::from(s);
+    match rounding {
+        0 => s,
+        1 => {
+            if w > x {
+                s.next_down()
+            } else {
+                s
+            }
+        }
+        2 => {
+            if w < x {
+                s.next_up()
+            } else {
+                s
+            }
+        }
+        _ => {
+            if w.abs() > x.abs() {
+                if x < 0.0 { s.next_up() } else { s.next_down() }
+            } else {
+                s
+            }
+        }
+    }
+}
+
+fn binary80_eval(bits: u64) -> adv_cpu_core::state::X87Register {
+    let sign = ((bits >> 48) as u16) & 0x8000;
+    let exponent = (bits >> 52) & 0x7ff;
+    let fraction = bits & ((1 << 52) - 1);
+    let (significand, exponent) = match exponent {
+        0 if fraction == 0 => (0, 0),
+        0 => {
+            let shift = fraction.leading_zeros();
+            (fraction << shift, (16383 - 1074 + 63 - shift) as u16)
+        }
+        0x7ff => ((1 << 63) | fraction << 11, 0x7fff),
+        _ => ((1 << 63) | fraction << 11, (exponent + 16383 - 1023) as u16),
+    };
+    adv_cpu_core::state::X87Register::from_parts(significand, sign | exponent)
 }
 
 fn arithmetic(op: FpOp, a: f64, b: f64) -> Option<f64> {

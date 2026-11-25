@@ -21,6 +21,8 @@ pub(super) struct Model {
     pub valid: u8,
     pub control: Option<u16>,
     pub c1: C1,
+    /// Whether `C0/C2/C3` in x87 status word may differ dynamically from entry.
+    pub has_cc: bool,
     pub floats: Rc<BTreeSet<i32>>,
     /// Frame positions where an x87 binary64 store on some path wrote the
     /// bytes last: the cell is best held as F64 there.
@@ -78,6 +80,7 @@ pub(super) fn analyze(
         valid: (0..8).fold(0, |v, i| v | (u8::from(at.x87.physical_tag(i) != 3) << i)),
         control: Some(at.x87.control),
         c1: C1::Constant(at.x87.status & 0x200 != 0),
+        has_cc: false,
         floats: Default::default(),
         stored: Default::default(),
         dirty: Default::default(),
@@ -97,7 +100,7 @@ pub(super) fn analyze(
         if inst.effects.writes != crate::translate::front::flags::FlagSet::NONE {
             m.flags = None;
         }
-        m.step(inst.op, &offsets[i], i)?;
+        m.step(unit, inst.op, &offsets[i], i)?;
         if matches!(inst.op, decode::Op::Call(_)) {
             m.write(
                 Part::Mem(Mem {
@@ -176,7 +179,12 @@ pub(super) fn analyze(
                 if old.flags != m.flags {
                     old.flags = None;
                 }
-                old.c1 = merge_c1(old.c1, m.c1, to)?;
+                old.has_cc |= m.has_cc;
+                old.c1 = if old.has_cc {
+                    C1::Value
+                } else {
+                    merge_c1(old.c1, m.c1)
+                };
                 *old != before
             } else {
                 states[to] = Some(m.clone());
@@ -199,13 +207,13 @@ pub(super) fn analyze(
     })
 }
 
-fn merge_c1(a: C1, b: C1, i: usize) -> Result<C1, Reject> {
-    Ok(match (a, b) {
+fn merge_c1(a: C1, b: C1) -> C1 {
+    match (a, b) {
         (a, b) if a == b => a,
-        (C1::Round(..), C1::Round(..)) => return Err(Reject::StaticX87(i)),
+        (C1::Round(..), C1::Round(..)) => C1::Value,
         (round @ C1::Round(..), _) | (_, round @ C1::Round(..)) => round,
         _ => C1::Value,
-    })
+    }
 }
 
 impl Model {
@@ -302,7 +310,13 @@ impl Model {
         };
         self.write_bits(dst, width, bits, known, offsets);
     }
-    fn step(&mut self, op: decode::Op, offsets: &[Option<i32>; 8], i: usize) -> Result<(), Reject> {
+    fn step(
+        &mut self,
+        unit: &Unit,
+        op: decode::Op,
+        offsets: &[Option<i32>; 8],
+        i: usize,
+    ) -> Result<(), Reject> {
         use crate::translate::front::forms::Integer;
         use decode::Op as D;
         let part = |s| match s {
@@ -393,11 +407,64 @@ impl Model {
                         if let adv_cpu_core::floating::fast::Source::St(s) = source {
                             need(slot(s))?;
                         }
-                        self.c1 = C1::Round(fp(op), self.control.is_some_and(|c| c & 0x300 == 0));
+                        let pc = self.control.map_or(2, |c| ((c >> 8) & 3) as u8);
+                        let rc = self.control.map_or(0, |c| ((c >> 10) & 3) as u8);
+                        self.c1 = if pc == 3 {
+                            C1::Constant(false)
+                        } else if rc == 0 {
+                            C1::Round(fp(op), pc == 0)
+                        } else if rc == 3 {
+                            C1::Constant(false)
+                        } else {
+                            C1::Value
+                        };
                         if pop {
                             self.valid &= !(1 << self.top);
                             self.top = (self.top + 1) & 7;
                         }
+                    }
+                    Fast::Compare { source, pops } => {
+                        need(self.top)?;
+                        if let adv_cpu_core::floating::fast::Source::St(s) = source {
+                            need(slot(s))?;
+                        }
+                        if x.flag_compare().is_none() {
+                            self.c1 = C1::Value;
+                            self.has_cc = true;
+                        }
+                        for _ in 0..pops {
+                            if self.valid & (1 << self.top) == 0 {
+                                return Err(Reject::StaticX87(i));
+                            }
+                            self.valid &= !(1 << self.top);
+                            self.top = (self.top + 1) & 7;
+                        }
+                    }
+                    Fast::StoreStatus => {
+                        if let Some(mem) = x.mem {
+                            self.write(Part::Mem(mem), 2, None, offsets);
+                        } else {
+                            self.write(Part::Reg(0), 2, None, offsets);
+                        }
+                    }
+                    Fast::Round => {
+                        need(self.top)?;
+                        let chop = self.control.is_some_and(|c| c & 0x0c00 == 0x0c00);
+                        self.c1 = if chop { C1::Constant(false) } else { C1::Value };
+                    }
+                    Fast::Sqrt => {
+                        need(self.top)?;
+                        let pc = self.control.map_or(2, |c| ((c >> 8) & 3) as u8);
+                        self.c1 = if pc == 3 {
+                            C1::Constant(false)
+                        } else {
+                            C1::Value
+                        };
+                    }
+                    Fast::Examine => {
+                        need(self.top)?;
+                        self.c1 = C1::Value;
+                        self.has_cc = true;
                     }
                     Fast::Exchange(index) => {
                         need(self.top)?;
@@ -418,6 +485,46 @@ impl Model {
                     }
                     _ => {}
                 }
+                if self.has_cc {
+                    self.c1 = C1::Value;
+                }
+            }
+            D::Value(_) => {
+                if let Some(vx) = super::x87::value_x87(unit, i) {
+                    let slot = |index: u8| (self.top + index) & 7;
+                    let need = |s: u8| {
+                        if self.valid & (1 << s) == 0 {
+                            Err(Reject::StaticX87(i))
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    match vx {
+                        super::x87::ValueX87::Fcomi { index, pop, .. } => {
+                            need(self.top)?;
+                            need(slot(index))?;
+                            // fcomi/fucomi preserve C1 (A64-FLAG-6).
+                            self.flags = None;
+                            if pop {
+                                self.valid &= !(1 << self.top);
+                                self.top = (self.top + 1) & 7;
+                            }
+                        }
+                        super::x87::ValueX87::Fcmov { index, .. } => {
+                            need(self.top)?;
+                            need(slot(index))?;
+                            self.c1 = C1::Constant(false);
+                        }
+                        super::x87::ValueX87::Ftst => {
+                            need(self.top)?;
+                            self.c1 = C1::Value;
+                            self.has_cc = true;
+                        }
+                    }
+                    if self.has_cc {
+                        self.c1 = C1::Value;
+                    }
+                }
             }
             D::Fild64(..) => {
                 let top = self.top.wrapping_sub(1) & 7;
@@ -426,7 +533,11 @@ impl Model {
                 }
                 self.top = top;
                 self.valid |= 1 << top;
-                self.c1 = C1::Constant(false);
+                self.c1 = if self.has_cc {
+                    C1::Value
+                } else {
+                    C1::Constant(false)
+                };
             }
             D::Simd(s) if s.kind == crate::translate::front::forms::SimdKind::StoreControl => {
                 // Control bits (0xffc0) are invariant; sticky bits (0x3f) are dynamic.
