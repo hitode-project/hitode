@@ -149,12 +149,22 @@ fn operand(tx: &mut Transaction, logical: usize) -> Ext {
         return INDEFINITE;
     }
     if exp == 0 && v.significand() != 0 {
+        // A pseudo-denormal is a denormal operand too, read as exponent 1.
+        exceptions(tx, DE);
         if v.significand() >> 63 != 0 {
             return Ext::from_parts(v.significand(), v.sign_exponent() | 1);
         }
-        exceptions(tx, DE);
     }
     v
+}
+/// `ST(logical)` as stored, for `FSTP m80`, which copies unsupported and
+/// pseudo-denormal encodings unchanged (measured on Intel).
+fn raw_operand(tx: &mut Transaction, logical: usize) -> Ext {
+    let slot = tx.state.x87.physical_index(logical);
+    if tx.state.x87.physical_tag(slot) == 3 {
+        return operand(tx, logical);
+    }
+    tx.state.x87.regs[slot]
 }
 fn rounded(tx: &mut Transaction) {
     let flags = sf::flags();
@@ -374,11 +384,15 @@ pub(super) fn execute(
             } else {
                 None
             };
-            let value = operand(tx, 0);
+            let width = i.memory_size().size();
+            let integer = matches!(m, M::Fist | M::Fistp | M::Fisttp);
+            let value = if address.is_some() && !integer && width == 10 {
+                raw_operand(tx, 0)
+            } else {
+                operand(tx, 0)
+            };
             tx.state.x87.status &= !C1;
             if let Some(addr) = address {
-                let width = i.memory_size().size();
-                let integer = matches!(m, M::Fist | M::Fistp | M::Fisttp);
                 let rc = if m == M::Fisttp {
                     1
                 } else {

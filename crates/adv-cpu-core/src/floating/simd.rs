@@ -736,6 +736,18 @@ fn input_checked(tx: &mut Transaction, mut a: u64, width: usize, report_de: bool
     }
     a
 }
+/// [`input_checked`] for arithmetic that commits its flags itself: returns
+/// the operand and the `DE` it raises.
+fn input_flags(tx: &Transaction, mut a: u64, width: usize, report_de: bool) -> (u64, u16) {
+    if denormal(a, width) {
+        if *tx.state.mxcsr & 0x40 != 0 {
+            a &= if width == 4 { 1 << 31 } else { 1 << 63 };
+        } else if report_de {
+            return (a, 2);
+        }
+    }
+    (a, 0)
+}
 fn input(tx: &mut Transaction, a: u64, width: usize) -> u64 {
     input_checked(tx, a, width, true)
 }
@@ -881,7 +893,12 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
     let source = read(i, 1, tx, memory, if packed { 16 } else { width })?;
     let slot = xmm(i.op0_register()).ok_or(tx.unsupported(i))?;
     let destination = tx.state.xmm[slot];
+    let masks = (*tx.state.mxcsr >> 7) as u16 & 0x3f;
+    // Pre-computation (IE/DE/ZE) and post-computation (OE/UE/PE) flags of
+    // every lane, committed together after the last lane.
+    let (mut pre, mut post) = (0u16, 0u16);
     for lane in 0..count {
+        sf::configure_sse(*tx.state.mxcsr);
         let offset = lane * width;
         let unary_sqrt = matches!(m, M::Sqrtss | M::Sqrtsd | M::Sqrtps | M::Sqrtpd);
         let raw_a = if unary_sqrt {
@@ -893,18 +910,19 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
         // On x86, a NaN operand suppresses DE on a denormal peer when DAZ=0,
         // while DAZ=1 still flushes the denormal operand to signed zero.
         let report_de = !(nan(raw_a, width) || nan(raw_b, width));
-        let a = if unary_sqrt {
-            0
+        let (a, a_flags) = if unary_sqrt {
+            (0, 0)
         } else {
-            input_checked(tx, raw_a, width, report_de)
+            input_flags(tx, raw_a, width, report_de)
         };
-        let b = input_checked(tx, raw_b, width, report_de);
+        let (b, b_flags) = input_flags(tx, raw_b, width, report_de);
+        pre |= a_flags | b_flags;
         if matches!(m, M::Comiss | M::Comisd | M::Ucomiss | M::Ucomisd) {
             if signaling(a, width)
                 || signaling(b, width)
                 || matches!(m, M::Comiss | M::Comisd) && (nan(a, width) || nan(b, width))
             {
-                finish(tx, 1);
+                pre |= 1;
             }
             let c = comparison(a, b, width);
             *tx.state.eflags = (*tx.state.eflags & !0x8d5)
@@ -923,7 +941,7 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
                 || signaling(b, width)
                 || matches!(predicate, 1 | 2 | 5 | 6) && c == 3
             {
-                finish(tx, 1);
+                pre |= 1;
             }
             let yes = match predicate {
                 0 => c == 0,
@@ -941,7 +959,7 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
             M::Minss | M::Minsd | M::Minps | M::Minpd | M::Maxss | M::Maxsd | M::Maxps | M::Maxpd
         ) {
             if nan(a, width) || nan(b, width) {
-                finish(tx, 1);
+                pre |= 1;
             }
             let c = comparison(a, b, width);
             if matches!(m, M::Minss | M::Minsd | M::Minps | M::Minpd) && c == 1
@@ -965,7 +983,7 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
             };
             sf::sse_binary(a, b, op, width as u8)
         };
-        finish(tx, sf::flags());
+        let mut flags = sf::flags();
         let mut result = result;
         // MIN*/MAX* select an operand directly and do not apply FTZ or underflow.
         if !matches!(
@@ -974,12 +992,25 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
         ) && *tx.state.mxcsr & 0x8000 != 0
             && denormal(result, width)
         {
-            finish(tx, 0x30);
+            flags |= 0x30;
             result &= if width == 4 { 1 << 31 } else { 1 << 63 };
         }
+        // An unmasked overflow does not also report PE (measured on Intel:
+        // `mulps` overflow under MXCSR 0x1b80 commits OE alone).
+        if flags & 0x08 != 0 && masks & 0x08 == 0 {
+            flags &= !0x20;
+        }
+        pre |= flags & 0x07;
+        post |= flags & 0x38;
         tx.state.xmm[slot][offset..offset + width].copy_from_slice(&result.to_le_bytes()[..width]);
     }
-    finish(tx, sf::flags());
+    // Intel SDM Vol. 1 11.5.3.2: an unmasked pre-computation exception in any
+    // lane commits pre-computation flags alone before #XM.
+    if pre & !masks != 0 {
+        finish(tx, pre);
+    } else {
+        finish(tx, pre | post);
+    }
     Ok(())
 }
 fn signed(value: u64, width: usize) -> i64 {

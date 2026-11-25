@@ -616,3 +616,38 @@ fn fld_m32_m64_denormal_sets_sw_de_accurately() {
         }
     }
 }
+
+// spec: A64F-FP-1
+#[test]
+fn fld_fstp_m80_keep_special_encodings_and_arithmetic_sees_them() {
+    // Encodings measured on Intel (`probes/x86/truth2.c`): `fld m80` and
+    // `fstp m80` copy them unchanged; `+ 0` raises DE for the denormals and IE
+    // for the unsupported ones.
+    let cases: [(u16, u64); 8] = [
+        (0x0000, 1),                     // denormal
+        (0x0000, 0x8000_0000_0000_0001), // pseudo-denormal
+        (0x3fff, 0x4000_0000_0000_0000), // unnormal
+        (0x7fff, 0),                     // pseudo-infinity
+        (0x7fff, 0x4000_0000_0000_0000), // pseudo-NaN
+        (0x7fff, 0x8000_0000_0000_0001), // SNaN
+        (0x7fff, 0xc000_0000_0000_0001), // QNaN
+        (0x3fff, 0x8000_0000_0000_0000), // 1.0
+    ];
+    for (se, sig) in cases {
+        for add in [false, true] {
+            let mut program = fixture(|code| {
+                code.fld(tword_ptr(ebx)).unwrap();
+                if add {
+                    code.fldz().unwrap();
+                    code.faddp(st1, st0).unwrap();
+                }
+                code.fstp(tword_ptr(ebx + 16)).unwrap();
+            });
+            program.data[..8].copy_from_slice(&sig.to_le_bytes());
+            program.data[8..10].copy_from_slice(&se.to_le_bytes());
+            for config in test_configs(false, false, true) {
+                run_diff_tier1(&program, config, 200);
+            }
+        }
+    }
+}
