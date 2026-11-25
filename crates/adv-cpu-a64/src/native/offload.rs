@@ -425,6 +425,15 @@ fn execute(
     }
     ACTIVE.set(previous);
     runtime.cpu = std::ptr::null_mut();
+    debug_assert_eq!(
+        runtime.fpsr_owner,
+        crate::runtime::FPSR_CLEAN,
+        "worker exit must fold or discard hardware FPSR before merging sticky bits (A64-TR-9, A64F-FP-5)"
+    );
+    debug_assert_eq!(
+        runtime.active_fpcr, runtime.host_fpcr,
+        "worker exit must restore host FPCR (A64F-FP-5)"
+    );
     let mut exit = Exit::from_raw(returned.reason as u32).expect("computation exit");
     if let Exit::Plan(event @ crate::runtime::PlanEvent::WorkerBranch(kind)) = exit {
         record_branch(

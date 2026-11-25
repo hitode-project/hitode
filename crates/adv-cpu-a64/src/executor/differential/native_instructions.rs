@@ -3,6 +3,7 @@ use super::*;
 
 mod biased_cmov;
 mod channels;
+mod fp_boundary;
 mod helper_gaps;
 mod jump_tables;
 mod loop_units;

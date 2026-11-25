@@ -14,7 +14,8 @@ mod inline;
 mod resident;
 
 #[cfg(any(native, test))]
-pub(crate) use resident::access_stub;
+#[allow(unused_imports)]
+pub(crate) use resident::{access_stub, access_stub_for};
 
 use super::ir::*;
 use super::loops;
@@ -330,8 +331,10 @@ fn lower_form(
     }
 }
 
+/// Verifies that non-AFP optimized code (and non-AFP stubs) never read or write
+/// FPCR or FPSR (A64-OPT-4).
 #[cfg(test)]
-pub(in crate::translate) fn assert_no_fp_state(words: &[u32]) {
+pub(crate) fn assert_no_fp_state(words: &[u32]) {
     let accesses = [
         mrs_fpcr(Reg::ZR),
         msr_fpcr(Reg::ZR),
@@ -1662,7 +1665,9 @@ impl<'a> Emitter<'a> {
         }
         if uses_exact {
             self.asm.bind(exact);
-            resident::preserve_call(&mut self.asm, exact_sse as *const () as u64);
+            // `exact_sse` runs pure-integer softfloat (FpClean): no FP instructions
+            // or host C math libraries, so FPCR restore and FPSR isolation are skipped.
+            resident::preserve_call(&mut self.asm, exact_sse as *const () as u64, false);
         }
     }
 
@@ -1963,14 +1968,22 @@ impl<'a> Emitter<'a> {
             }
             Op::FpUnary(op, a) => {
                 let a = self.vr(a, A);
-                self.asm.emit(unary(
-                    match op {
-                        FpUnary::Neg => Unary::Fneg,
-                        FpUnary::Abs => Unary::Fabs,
-                    },
-                    q,
-                    a,
-                ));
+                // Under FPCR.AH=1, scalar `fneg`/`fabs` leave NaN sign bits
+                // unchanged, whereas x86 `fchs`/`fabs` always flip or clear bit 63.
+                self.asm.emit_all(&[
+                    movz(X, T, 0x8000, 48),
+                    fmov_to_v(X, B, T),
+                    vlogic(
+                        match op {
+                            FpUnary::Neg => Logic::Eor,
+                            FpUnary::Abs => Logic::Bic,
+                        },
+                        false,
+                        q,
+                        a,
+                        B,
+                    ),
+                ]);
             }
             Op::FromInt(a) => {
                 let r = self.gp(a, T);

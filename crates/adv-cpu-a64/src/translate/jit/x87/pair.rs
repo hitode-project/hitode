@@ -206,6 +206,10 @@ impl Translator<'_> {
                 let from = self.x87.model.reg(0);
                 let to = self.x87_alloc();
                 if x.fast == Fast::Negate {
+                    // Pair slots hold only finite zeros and normals (exponents in
+                    // [64..2045]; `pair_from_extended` and `memory_operand` reject
+                    // NaNs), so `fneg v.2d` matches x86 `fchs` even under FPCR.AH=1.
+                    // Switch to bitwise EOR if NaNs are ever admitted to pair slots.
                     self.emit(vfneg2d(v(to), v(from)));
                 } else {
                     // Both lanes take the sign of the high one off.

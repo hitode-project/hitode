@@ -121,7 +121,10 @@ fn features() -> Features {
     let host = adv_cpu_core::HostFeatures::get();
     Features {
         flagm: host.contains(adv_cpu_core::HostFeatures::FLAGM),
+        flagm2: host.contains(adv_cpu_core::HostFeatures::FLAGM2),
         frintts: host.contains(adv_cpu_core::HostFeatures::FRINTTS),
+        afp: host.contains(adv_cpu_core::HostFeatures::AFP),
+        rpres: host.contains(adv_cpu_core::HostFeatures::RPRES),
     }
 }
 
@@ -947,12 +950,13 @@ unsafe extern "C" fn resident_access(
     }
 }
 
-fn build_stubs() -> (stubs::Stubs, usize) {
-    let mut stubs = stubs::stubs();
+fn build_stubs(afp: bool) -> (stubs::Stubs, usize) {
+    let mut stubs = stubs::stubs_for(afp);
     let access_entry = stubs.code.len() * 4;
-    stubs
-        .code
-        .extend(opt::back::access_stub(resident_access as *const () as u64));
+    stubs.code.extend(opt::back::access_stub_for(
+        resident_access as *const () as u64,
+        afp,
+    ));
     (stubs, access_entry)
 }
 
@@ -991,7 +995,8 @@ impl Native {
     /// `GuestWindow`, which must outlive this.
     pub fn new(window: usize) -> Result<Self, String> {
         adv_cpu_core::fault_recovery::install_translated(on_fault)?;
-        let (stubs, access_entry) = build_stubs();
+        let features = features();
+        let (stubs, access_entry) = build_stubs(features.afp);
         let (cache, base) = store::place_stubs(
             INITIAL_CACHE_LEN,
             MAX_CACHE_LEN,
@@ -1101,7 +1106,7 @@ impl Native {
             scoped_offer: None,
             inline_saved: Vec::new(),
             compiler: compile::Compiler::new(),
-            features: features(),
+            features,
             runtime,
             want_relocate: false,
             clock: std::ptr::null_mut(),
@@ -1117,7 +1122,9 @@ impl Native {
         let Some(base) = self.code.cache.relocate(target) else {
             return;
         };
-        let (stubs, access_entry) = build_stubs();
+        let (stubs, access_entry) = build_stubs(
+            adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP),
+        );
         let placed = self
             .code
             .cache
@@ -1243,6 +1250,18 @@ impl Native {
     pub(crate) fn flush_fp_runtime(&mut self) {
         let counters = self.runtime.fp.take();
         self.diagnostics.fp.absorb_runtime(counters);
+    }
+
+    pub(crate) fn assert_fp_boundary_clean(&self) {
+        debug_assert_eq!(
+            self.runtime.fpsr_owner,
+            crate::runtime::FPSR_CLEAN,
+            "boundary must observe clean FPSR ownership (A64F-FP-5)"
+        );
+        debug_assert_eq!(
+            self.runtime.active_fpcr, self.runtime.host_fpcr,
+            "boundary must run under restored host FPCR (A64F-FP-5)"
+        );
     }
 
     pub(crate) fn record_region_speculation(&mut self, head: u32, speculation: RegionSpeculation) {
@@ -1937,18 +1956,24 @@ mod tests {
         assert_eq!(enter(&mut native, &mut memory, stop, &mut state).retired, 6);
 
         let stubs = native.code.stubs;
+        let afp = native.features.afp;
+        let dispatch_words = if afp { 20 } else { 19 };
+        let enter_br = if afp { 41 } else { 37 };
         assert_eq!((stubs.lookup_slow - stubs.lookup) / 4, 8);
-        assert_eq!((stubs.lookup - stubs.dispatch) / 4 - 2, 19);
+        assert_eq!((stubs.lookup - stubs.dispatch) / 4 - 2, dispatch_words);
         assert_eq!(
             native.code.cache.word(stubs.lookup + 7 * 4),
             crate::encode::br(crate::encode::Reg::new(17))
         );
         assert_eq!(
-            native.code.cache.word(stubs.dispatch + 18 * 4),
+            native
+                .code
+                .cache
+                .word(stubs.dispatch + (dispatch_words - 1) * 4),
             crate::encode::br(crate::encode::Reg::new(0))
         );
         assert_eq!(
-            native.code.cache.word(native.code.enter.0 + 37 * 4),
+            native.code.cache.word(native.code.enter.0 + enter_br * 4),
             crate::encode::br(crate::encode::Reg::new(17))
         );
     }

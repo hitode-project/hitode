@@ -1704,6 +1704,7 @@ fn rep_word_comparison_carries_restart_flags_across_a_slice() {
     }
 }
 
+// spec: A64F-FP-9
 #[test]
 fn approximate_instructions_match_interpreter_across_all_buckets_and_edge_cases() {
     let mut inputs: Vec<u32> = vec![

@@ -207,6 +207,24 @@ pub struct DirectBody {
     pub outputs: u8,
     /// Argument bytes the function's return pops.
     pub pop: u16,
+    /// Pure integer/NEON leaf body that touches no FP instructions, MXCSR, or
+    /// host C libraries, so the call site may skip host FPCR restoration and
+    /// FPSR isolation (A64-CALL-3, A64F-FP-5).
+    pub fp_clean: bool,
+}
+
+impl DirectBody {
+    /// Whether any declared input reads MXCSR or combined floating-point control state.
+    pub const fn reads_fp_state(&self) -> bool {
+        let mut i = 0;
+        while i < self.inputs.len() {
+            if matches!(self.inputs[i], Some(Input::Mxcsr | Input::FloatControl)) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
 }
 
 /// Cold preparation of fixed inputs from the bound function's guest bytes.
@@ -225,9 +243,15 @@ pub struct Body {
 #[macro_export]
 macro_rules! body {
     ($vis:vis $name:ident = $body:path, inputs: $inputs:expr, outputs: $outputs:expr, pop: $pop:expr) => {
-        $crate::body!($vis $name = $body, inputs: $inputs, outputs: $outputs, pop: $pop, inline: None);
+        $crate::body!($vis $name = $body, inputs: $inputs, outputs: $outputs, pop: $pop, inline: None, fp_clean: false);
     };
     ($vis:vis $name:ident = $body:path, inputs: $inputs:expr, outputs: $outputs:expr, pop: $pop:expr, inline: $inline:expr) => {
+        $crate::body!($vis $name = $body, inputs: $inputs, outputs: $outputs, pop: $pop, inline: $inline, fp_clean: false);
+    };
+    ($vis:vis $name:ident = $body:path, inputs: $inputs:expr, outputs: $outputs:expr, pop: $pop:expr, fp_clean: $fp_clean:expr) => {
+        $crate::body!($vis $name = $body, inputs: $inputs, outputs: $outputs, pop: $pop, inline: None, fp_clean: $fp_clean);
+    };
+    ($vis:vis $name:ident = $body:path, inputs: $inputs:expr, outputs: $outputs:expr, pop: $pop:expr, inline: $inline:expr, fp_clean: $fp_clean:expr) => {
         $vis const $name: $crate::body::Body = {
             #[allow(clippy::too_many_arguments)]
             unsafe extern "C" fn call(
@@ -258,6 +282,7 @@ macro_rules! body {
                     inputs,
                     outputs: $outputs,
                     pop: $pop,
+                    fp_clean: $fp_clean,
                 },
                 bind: None,
                 full: |memory, inputs| $body(memory, inputs),

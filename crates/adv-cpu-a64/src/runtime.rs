@@ -120,6 +120,13 @@ pub struct Runtime {
     /// each run. Placed at the end so all architectural `Runtime` field offsets
     /// remain unchanged.
     pub fp: FpCounters,
+    /// Host FPCR captured on root entry (`enter`/`opt_enter`) and restored on
+    /// root exits and non-`FpClean` host calls (A64F-FP-5).
+    pub host_fpcr: u32,
+    /// Shadow of the currently active hardware FPCR on this host thread.
+    pub active_fpcr: u32,
+    /// Ownership of live hardware FPSR sticky bits (`FPSR_CLEAN` or `FPSR_SSE_LIVE`).
+    pub fpsr_owner: u8,
 }
 
 /// Generated-code FP counters owned by one execution `Runtime` (owner or worker).
@@ -177,6 +184,9 @@ impl Runtime {
             #[cfg(test)]
             vector_regions: 0,
             fp: FpCounters::default(),
+            host_fpcr: 0,
+            active_fpcr: 0,
+            fpsr_owner: FPSR_CLEAN,
             cpu,
             window,
             shadow: 0,
@@ -773,7 +783,6 @@ const FP_COUNTERS: u32 = field(offset_of!(Runtime, fp));
 pub(crate) const FP_FPCR_WRITES: u32 = FP_COUNTERS + field(offset_of!(FpCounters, fpcr_writes));
 pub(crate) const FP_FPSR_READS: u32 = FP_COUNTERS + field(offset_of!(FpCounters, fpsr_reads));
 pub(crate) const FP_FPSR_FOLDS: u32 = FP_COUNTERS + field(offset_of!(FpCounters, fpsr_folds));
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const FP_FPSR_ISOLATIONS: u32 =
     FP_COUNTERS + field(offset_of!(FpCounters, fpsr_isolations));
 pub(crate) const FP_FAST_COMPLETIONS: u32 =
@@ -781,6 +790,14 @@ pub(crate) const FP_FAST_COMPLETIONS: u32 =
 pub(crate) const FP_VECTOR_STRIPS: u32 = FP_COUNTERS + field(offset_of!(FpCounters, vector_strips));
 pub(crate) const FP_STRIP_BAILS: u32 = FP_COUNTERS + field(offset_of!(FpCounters, strip_bails));
 pub(crate) const FP_STRIP_REPLAYS: u32 = FP_COUNTERS + field(offset_of!(FpCounters, strip_replays));
+
+/// `Runtime::fpsr_owner`: hardware FPSR holds no uncommitted guest sticky bits.
+pub(crate) const FPSR_CLEAN: u8 = 0;
+/// `Runtime::fpsr_owner`: hardware FPSR accumulates lazy SSE sticky bits (A64F-FP-5).
+pub(crate) const FPSR_SSE_LIVE: u8 = 1;
+pub(crate) const HOST_FPCR: u32 = field(offset_of!(Runtime, host_fpcr));
+pub(crate) const ACTIVE_FPCR: u32 = field(offset_of!(Runtime, active_fpcr));
+pub(crate) const FPSR_OWNER: u32 = field(offset_of!(Runtime, fpsr_owner));
 
 /// Increments a 64-bit counter in `Runtime::fp` by a small constant without
 /// clobbering guest NZCV flags.

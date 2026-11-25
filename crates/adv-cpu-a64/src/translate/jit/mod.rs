@@ -87,7 +87,23 @@ use trace::{Edge, Next, Trace};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Features {
     pub flagm: bool,
+    pub flagm2: bool,
     pub frintts: bool,
+    pub afp: bool,
+    pub rpres: bool,
+}
+
+/// Statically known hardware FPCR state along the current translated path (A64F-FP-5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum FpcrMode {
+    /// Active FPCR is unknown (at entry, merges, or after control updates/calls).
+    #[default]
+    Unknown,
+    /// Active FPCR matches the canonical `FEAT_AFP` mode (`AH=1`, RN, no FIZ/FZ).
+    DefaultAfp,
+    /// Active FPCR matches a specific `FPCR` image derived from MXCSR controls.
+    Exact(u32),
 }
 
 impl Unit {
@@ -471,6 +487,12 @@ struct Translator<'a> {
     /// the guarded Tier-1 entry, cleared at merges, secondary heads, and any
     /// instruction that may change `CpuState.x87.control`.
     x87_control_known: Option<u16>,
+    /// Statically known hardware FPCR state along the current translated path.
+    #[allow(dead_code)]
+    fpcr_mode: FpcrMode,
+    /// Whether `Runtime::fpsr_owner` is statically known to be `FPSR_SSE_LIVE`.
+    #[allow(dead_code)]
+    fpsr_armed: bool,
     tier1: bool,
     computation: bool,
     resident_links: bool,
@@ -660,6 +682,8 @@ impl Jit<'_> {
             aliased: 0,
             facts: self.facts,
             x87_control_known: self.tier1.then(|| self.facts.control()).flatten(),
+            fpcr_mode: FpcrMode::Unknown,
+            fpsr_armed: false,
             tier1: self.tier1,
             computation,
             resident_links: *resident_links && !computation,
@@ -764,6 +788,11 @@ impl Translator<'_> {
 
     fn emit_all(&mut self, words: &[u32]) {
         self.asm.emit_all(words);
+    }
+
+    pub(super) fn invalidate_fp_state(&mut self) {
+        self.fpcr_mode = FpcrMode::Unknown;
+        self.fpsr_armed = false;
     }
 
     fn mov_imm(&mut self, rd: Reg, value: u32) {
@@ -1891,6 +1920,12 @@ impl Translator<'_> {
                     self.canonicalize();
                     self.emit(ldr(X, X0, RUNTIME, crate::runtime::CPU_STATE));
                     stubs::emit_store_guest(self.asm, X0);
+                    if self.features.afp {
+                        crate::translate::lower::fp_state::emit_fold_fpsr(self.asm, X0, X16, X17);
+                        crate::translate::lower::fp_state::emit_restore_host_fpcr(
+                            self.asm, X0, X16,
+                        );
+                    }
                     self.target(eip);
                     self.asm.adr(X2, point);
                     self.emit_all(&[

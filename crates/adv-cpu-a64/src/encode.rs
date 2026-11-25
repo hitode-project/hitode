@@ -796,6 +796,12 @@ pub const fn fcsel(rd: VReg, rn: VReg, rm: VReg, cond: Cond) -> u32 {
 /// `cfinv` (FEAT_FlagM): inverts C, which flips the carry sense.
 pub const CFINV: u32 = 0xD500_401F;
 
+/// `axflag` (FEAT_FlagM2): converts AArch64 floating-point compare flags to x86-style NZCV.
+pub const AXFLAG: u32 = 0xD500_405F;
+
+/// `xaflag` (FEAT_FlagM2): converts x86-style NZCV flags back to AArch64 compare flags.
+pub const XAFLAG: u32 = 0xD500_403F;
+
 /// `rmif xn, #rotate, #mask` (FEAT_FlagM): rotates `xn` right and inserts
 /// its low four bits into the NZCV bits selected by `mask`.
 pub const fn rmif(rn: Reg, rotate: u32, mask: u32) -> u32 {
@@ -1105,6 +1111,111 @@ pub const fn fcmp_zero(rn: VReg) -> u32 {
     0x1E60_2008 | rn.number() << 5
 }
 
+/// `fcmp sn, sm`.
+pub const fn fcmps(rn: VReg, rm: VReg) -> u32 {
+    0x1E20_2000 | rm.number() << 16 | rn.number() << 5
+}
+
+/// `fcmpe sn, sm`: also raises invalid for a quiet NaN.
+pub const fn fcmpes(rn: VReg, rm: VReg) -> u32 {
+    fcmps(rn, rm) | 0x10
+}
+
+/// `fcmp sn, #0.0`.
+pub const fn fcmps_zero(rn: VReg) -> u32 {
+    0x1E20_2008 | rn.number() << 5
+}
+
+/// Scalar `fmin`/`fmax sd, sn, sm` or `dd, dn, dm`.
+pub const fn fminmax(max: bool, double: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    let op = if max { 0x4800 } else { 0x5800 };
+    0x1E20_0000 | (double as u32) << 22 | op | rm.number() << 16 | rn.number() << 5 | rd.number()
+}
+
+/// Vector `fmin`/`fmax vd.<2s/4s/2d>, vn, vm`.
+pub const fn vfminmax(max: bool, full: bool, double: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    assert!(!double || full);
+    0x0E20_F400
+        | (full as u32) << 30
+        | (!max as u32) << 23
+        | (double as u32) << 22
+        | rm.number() << 16
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// Scalar `frecpe` (`!sqrt`) or `frsqrte` (`sqrt`) `sd/dd, sn/dn`.
+pub const fn sfrecpe(sqrt: bool, double: bool, rd: VReg, rn: VReg) -> u32 {
+    0x5EA1_D800 | (sqrt as u32) << 29 | (double as u32) << 22 | rn.number() << 5 | rd.number()
+}
+
+/// Vector `frecpe` (`!sqrt`) or `frsqrte` (`sqrt`) `vd.<2s/4s/2d>, vn`.
+pub const fn vfrecpe(sqrt: bool, full: bool, double: bool, rd: VReg, rn: VReg) -> u32 {
+    assert!(!double || full);
+    0x0EA1_D800
+        | (full as u32) << 30
+        | (sqrt as u32) << 29
+        | (double as u32) << 22
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// Scalar `frint32z`/`frint32x`/`frint64z`/`frint64x sd/dd, sn/dn` (FEAT_FRINTTS).
+pub const fn sfrint_ts(bits64: bool, double: bool, truncate: bool, rd: VReg, rn: VReg) -> u32 {
+    0x1E28_4000
+        | (double as u32) << 22
+        | (bits64 as u32) << 16
+        | (!truncate as u32) << 15
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// Vector `frint64z` (`truncate`) or `frint64x` (`!truncate`) `vd.2s/4s/2d, vn.2s/4s/2d` (FEAT_FRINTTS).
+pub const fn vfrint64(full: bool, double: bool, truncate: bool, rd: VReg, rn: VReg) -> u32 {
+    assert!(!double || full);
+    0x0E21_F800
+        | (full as u32) << 30
+        | (!truncate as u32) << 29
+        | (double as u32) << 22
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// `tbl vd.<8b/16b>, {vn.16b{, v(n+1).16b}}, vm.<8b/16b>` for 1 or 2 table registers.
+pub const fn vtbl(full: bool, regs: u32, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    assert!(regs == 1 || regs == 2);
+    0x0E00_0000
+        | (full as u32) << 30
+        | rm.number() << 16
+        | (regs - 1) << 13
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// Vector by-element `fmul vd.<2s/4s/2d>, vn, vm.<s/d>[lane]`.
+pub const fn vfmul_elem(full: bool, double: bool, rd: VReg, rn: VReg, rm: VReg, lane: u32) -> u32 {
+    assert!(!double || full);
+    assert!(lane < if double { 2 } else { 4 });
+    let (h, l) = if double {
+        (lane, 0)
+    } else {
+        (lane >> 1, lane & 1)
+    };
+    0x0F80_9000
+        | (full as u32) << 30
+        | (double as u32) << 22
+        | l << 21
+        | rm.number() << 16
+        | h << 11
+        | rn.number() << 5
+        | rd.number()
+}
+
+/// Scalar by-element `fmul sd/dd, sn/dn, vm.<s/d>[lane]`.
+pub const fn sfmul_elem(double: bool, rd: VReg, rn: VReg, rm: VReg, lane: u32) -> u32 {
+    vfmul_elem(true, double, rd, rn, rm, lane) | 1 << 28
+}
+
 /// One-operand scalar floating-point operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unary {
@@ -1135,6 +1246,11 @@ pub const fn scvtf(size: Size, rd: VReg, rn: Reg) -> u32 {
     0x1E62_0000 | size.sf() | rn.number() << 5 | rd.number()
 }
 
+/// `scvtf sd, wn` (`W`) or `scvtf sd, xn` (`X`).
+pub const fn scvtf_s(size: Size, rd: VReg, rn: Reg) -> u32 {
+    0x1E22_0000 | size.sf() | rn.number() << 5 | rd.number()
+}
+
 /// `fcvtns` (nearest) or `fcvtzs` (`truncate`) from `dn` to `wd`/`xd`.
 pub const fn fcvt_int(size: Size, truncate: bool, rd: Reg, rn: VReg) -> u32 {
     fcvt_int_mode(size, if truncate { 3 } else { 0 }, rd, rn)
@@ -1149,6 +1265,11 @@ pub const fn fcvt_int_mode(size: Size, rounding: u8, rd: Reg, rn: VReg) -> u32 {
         _ => 0x1E78_0000, // fcvtzs (toward zero)
     };
     base | size.sf() | rn.number() << 5 | rd.number()
+}
+
+/// `fcvtns`/`fcvtms`/`fcvtps`/`fcvtzs` from `sn` to `wd`/`xd` for x87 RC 0..=3.
+pub const fn fcvt_int_s_mode(size: Size, rounding: u8, rd: Reg, rn: VReg) -> u32 {
+    fcvt_int_mode(size, rounding, rd, rn) & !(1 << 22)
 }
 
 /// `fcmgt sd, sn, sm`: the scalar compare, all ones when greater.
@@ -1440,6 +1561,37 @@ pub const fn vst_interleaved(channels: u32, rt: VReg, rn: Reg) -> u32 {
         _ => panic!("invalid channel count"),
     };
     0x4C00_0000 | op | rn.number() << 5 | rt.number()
+}
+
+/// `ld2/ld3/ld4 {vt.<arr>, ...}, [rn]`: de-interleave 2, 3, or 4 structures.
+pub const fn vld_interleaved(channels: u32, arr: Arr, rt: VReg, rn: Reg) -> u32 {
+    let op = match channels {
+        2 => 0x8000,
+        3 => 0x4000,
+        4 => 0,
+        _ => panic!("invalid channel count"),
+    };
+    0x0C40_0000 | arr.q() | op | arr.log2() << 10 | rn.number() << 5 | rt.number()
+}
+
+/// `ld2/ld3/ld4 {vt.<arr>, ...}, [rn], #imm`: post-increment de-interleaved load.
+pub const fn vld_interleaved_post(channels: u32, arr: Arr, rt: VReg, rn: Reg) -> u32 {
+    vld_interleaved(channels, arr, rt, rn) | 0x009F_0000
+}
+
+/// `ld1r {vt.<arr>}, [rn]`: load one element and replicate to every lane.
+pub const fn vld1r(arr: Arr, rt: VReg, rn: Reg) -> u32 {
+    0x0D40_C000 | arr.q() | arr.log2() << 10 | rn.number() << 5 | rt.number()
+}
+
+/// `ldrb wt, [rn, #offset]`, unsigned byte offset.
+pub const fn ldrb(rt: Reg, rn: Reg, offset: u32) -> u32 {
+    unsigned_offset(0x3940_0000, 1, rt.number(), rn, offset)
+}
+
+/// `strb wt, [rn, #offset]`, unsigned byte offset.
+pub const fn strb(rt: Reg, rn: Reg, offset: u32) -> u32 {
+    unsigned_offset(0x3900_0000, 1, rt.number(), rn, offset)
 }
 
 /// `ldur st/dt/qt, [rn, #offset]` with an unscaled signed offset.
@@ -2143,6 +2295,177 @@ mod tests {
             (vfcvt_int_mode(false, 3, v(1), v(2)), "fcvtzs v1.4s, v2.4s"),
             (vfcvt_int_mode(true, 1, v(1), v(2)), "fcvtms v1.2d, v2.2d"),
             (vfcvt_int_mode(true, 2, v(1), v(2)), "fcvtps v1.2d, v2.2d"),
+            (ldrb(r(16), r(29), 0x10), "ldrb w16, [x29, #0x10]"),
+            (strb(Reg::ZR, r(29), 0x10), "strb wzr, [x29, #0x10]"),
+            (fminmax(false, false, v(0), v(1), v(2)), "fmin s0, s1, s2"),
+            (fminmax(true, false, v(0), v(1), v(2)), "fmax s0, s1, s2"),
+            (fminmax(false, true, v(3), v(4), v(5)), "fmin d3, d4, d5"),
+            (fminmax(true, true, v(3), v(4), v(5)), "fmax d3, d4, d5"),
+            (
+                vfminmax(false, false, false, v(0), v(1), v(2)),
+                "fmin v0.2s, v1.2s, v2.2s",
+            ),
+            (
+                vfminmax(true, false, false, v(0), v(1), v(2)),
+                "fmax v0.2s, v1.2s, v2.2s",
+            ),
+            (
+                vfminmax(false, true, false, v(0), v(1), v(2)),
+                "fmin v0.4s, v1.4s, v2.4s",
+            ),
+            (
+                vfminmax(true, true, false, v(0), v(1), v(2)),
+                "fmax v0.4s, v1.4s, v2.4s",
+            ),
+            (
+                vfminmax(false, true, true, v(3), v(4), v(5)),
+                "fmin v3.2d, v4.2d, v5.2d",
+            ),
+            (
+                vfminmax(true, true, true, v(3), v(4), v(5)),
+                "fmax v3.2d, v4.2d, v5.2d",
+            ),
+            (sfrecpe(false, false, v(0), v(1)), "frecpe s0, s1"),
+            (sfrecpe(false, true, v(2), v(3)), "frecpe d2, d3"),
+            (sfrecpe(true, false, v(0), v(1)), "frsqrte s0, s1"),
+            (sfrecpe(true, true, v(2), v(3)), "frsqrte d2, d3"),
+            (
+                vfrecpe(false, false, false, v(0), v(1)),
+                "frecpe v0.2s, v1.2s",
+            ),
+            (
+                vfrecpe(false, true, false, v(0), v(1)),
+                "frecpe v0.4s, v1.4s",
+            ),
+            (
+                vfrecpe(false, true, true, v(2), v(3)),
+                "frecpe v2.2d, v3.2d",
+            ),
+            (
+                vfrecpe(true, false, false, v(0), v(1)),
+                "frsqrte v0.2s, v1.2s",
+            ),
+            (
+                vfrecpe(true, true, false, v(0), v(1)),
+                "frsqrte v0.4s, v1.4s",
+            ),
+            (
+                vfrecpe(true, true, true, v(2), v(3)),
+                "frsqrte v2.2d, v3.2d",
+            ),
+            (AXFLAG, "axflag"),
+            (XAFLAG, "xaflag"),
+            (sfrint_ts(false, false, true, v(0), v(1)), "frint32z s0, s1"),
+            (
+                sfrint_ts(false, false, false, v(0), v(1)),
+                "frint32x s0, s1",
+            ),
+            (sfrint_ts(true, false, true, v(0), v(1)), "frint64z s0, s1"),
+            (sfrint_ts(true, false, false, v(0), v(1)), "frint64x s0, s1"),
+            (sfrint_ts(false, true, true, v(2), v(3)), "frint32z d2, d3"),
+            (sfrint_ts(false, true, false, v(2), v(3)), "frint32x d2, d3"),
+            (sfrint_ts(true, true, true, v(2), v(3)), "frint64z d2, d3"),
+            (sfrint_ts(true, true, false, v(2), v(3)), "frint64x d2, d3"),
+            (
+                vfrint64(false, false, true, v(0), v(1)),
+                "frint64z v0.2s, v1.2s",
+            ),
+            (
+                vfrint64(true, false, true, v(0), v(1)),
+                "frint64z v0.4s, v1.4s",
+            ),
+            (
+                vfrint64(true, true, true, v(2), v(3)),
+                "frint64z v2.2d, v3.2d",
+            ),
+            (
+                vfrint64(false, false, false, v(0), v(1)),
+                "frint64x v0.2s, v1.2s",
+            ),
+            (
+                vfrint64(true, false, false, v(0), v(1)),
+                "frint64x v0.4s, v1.4s",
+            ),
+            (
+                vfrint64(true, true, false, v(2), v(3)),
+                "frint64x v2.2d, v3.2d",
+            ),
+            (
+                vtbl(false, 1, v(0), v(1), v(2)),
+                "tbl v0.8b, { v1.16b }, v2.8b",
+            ),
+            (
+                vtbl(true, 1, v(0), v(1), v(2)),
+                "tbl v0.16b, { v1.16b }, v2.16b",
+            ),
+            (
+                vtbl(false, 2, v(0), v(1), v(3)),
+                "tbl v0.8b, { v1.16b, v2.16b }, v3.8b",
+            ),
+            (
+                vtbl(true, 2, v(0), v(1), v(3)),
+                "tbl v0.16b, { v1.16b, v2.16b }, v3.16b",
+            ),
+            (
+                vld_interleaved(2, Arr::S4, v(0), r(16)),
+                "ld2 { v0.4s, v1.4s }, [x16]",
+            ),
+            (
+                vld_interleaved(3, Arr::S4, v(2), r(17)),
+                "ld3 { v2.4s, v3.4s, v4.4s }, [x17]",
+            ),
+            (
+                vld_interleaved(4, Arr::B16, v(0), r(16)),
+                "ld4 { v0.16b, v1.16b, v2.16b, v3.16b }, [x16]",
+            ),
+            (
+                vld_interleaved(2, Arr::D2, v(4), r(16)),
+                "ld2 { v4.2d, v5.2d }, [x16]",
+            ),
+            (
+                vld_interleaved_post(2, Arr::S4, v(0), r(16)),
+                "ld2 { v0.4s, v1.4s }, [x16], #32",
+            ),
+            (
+                vld_interleaved_post(3, Arr::S4, v(2), r(17)),
+                "ld3 { v2.4s, v3.4s, v4.4s }, [x17], #48",
+            ),
+            (
+                vld_interleaved_post(4, Arr::B16, v(0), r(16)),
+                "ld4 { v0.16b, v1.16b, v2.16b, v3.16b }, [x16], #64",
+            ),
+            (vld1r(Arr::S4, v(0), r(16)), "ld1r { v0.4s }, [x16]"),
+            (vld1r(Arr::D2, v(1), r(17)), "ld1r { v1.2d }, [x17]"),
+            (vld1r(Arr::B16, v(2), r(0)), "ld1r { v2.16b }, [x0]"),
+            (
+                vfmul_elem(false, false, v(0), v(1), v(2), 3),
+                "fmul v0.2s, v1.2s, v2.s[3]",
+            ),
+            (
+                vfmul_elem(true, false, v(0), v(1), v(17), 2),
+                "fmul v0.4s, v1.4s, v17.s[2]",
+            ),
+            (
+                vfmul_elem(true, true, v(3), v(4), v(20), 1),
+                "fmul v3.2d, v4.2d, v20.d[1]",
+            ),
+            (
+                sfmul_elem(false, v(0), v(1), v(2), 3),
+                "fmul s0, s1, v2.s[3]",
+            ),
+            (
+                sfmul_elem(true, v(3), v(4), v(20), 1),
+                "fmul d3, d4, v20.d[1]",
+            ),
+            (fcmps(v(1), v(2)), "fcmp s1, s2"),
+            (fcmpes(v(1), v(2)), "fcmpe s1, s2"),
+            (fcmps_zero(v(1)), "fcmp s1, #0.0"),
+            (fcvt_int_s_mode(W, 0, r(0), v(1)), "fcvtns w0, s1"),
+            (fcvt_int_s_mode(X, 3, r(0), v(1)), "fcvtzs x0, s1"),
+            (fcvt_int_s_mode(W, 1, r(0), v(1)), "fcvtms w0, s1"),
+            (fcvt_int_s_mode(X, 2, r(0), v(1)), "fcvtps x0, s1"),
+            (scvtf_s(W, v(0), r(1)), "scvtf s0, w1"),
+            (scvtf_s(X, v(0), r(1)), "scvtf s0, x1"),
         ]
     }
 

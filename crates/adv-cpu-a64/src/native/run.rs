@@ -213,6 +213,15 @@ impl Native {
         self.runtime.cpu = std::ptr::null_mut();
         self.runtime.owner = 0;
         self.runtime.body.memory = std::ptr::null();
+        debug_assert_eq!(
+            self.runtime.fpsr_owner,
+            crate::runtime::FPSR_CLEAN,
+            "root exit must fold or discard hardware FPSR (A64F-FP-5)"
+        );
+        debug_assert_eq!(
+            self.runtime.active_fpcr, self.runtime.host_fpcr,
+            "root exit must restore host FPCR (A64F-FP-5)"
+        );
         self.flush_fp_runtime();
         if returned.reason as u32 != Exit::Optimized.raw() {
             self.runtime.shadow = returned.shadow;

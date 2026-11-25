@@ -97,7 +97,7 @@ impl X87Stubs {
 }
 
 /// Emits all shared x87 cold stubs into `asm` and returns their byte offsets.
-pub(super) fn emit(asm: &mut Asm) -> X87Stubs {
+pub(super) fn emit(asm: &mut Asm, fp_boundary: Option<Label>) -> X87Stubs {
     let pair_to_extended_label = asm.label();
     asm.bind(pair_to_extended_label);
     let pair_to_extended = asm.offset();
@@ -136,7 +136,7 @@ pub(super) fn emit(asm: &mut Asm) -> X87Stubs {
     asm.emit(ret(Reg::LR));
 
     let value_call = asm.offset();
-    emit_value_call(asm);
+    emit_value_call(asm, fp_boundary);
 
     X87Stubs {
         pair_to_extended,
@@ -437,7 +437,7 @@ fn emit_tags(asm: &mut Asm) {
     asm.emit_all(&[movz(W, X0, 1, 0), ret(Reg::LR)]);
 }
 
-fn emit_value_call(asm: &mut Asm) {
+fn emit_value_call(asm: &mut Asm, fp_boundary: Option<Label>) {
     const FRAME: i32 = 384;
     asm.emit_all(&[
         stp(X, Pre, X7, X8, SP, -FRAME),
@@ -458,6 +458,9 @@ fn emit_value_call(asm: &mut Asm) {
         stp_v(VSize::Q, Offset, VReg::new(30), VReg::new(31), SP, 336),
         vstr(VMem::Q, VReg::new(7), SP, 368),
     ]);
+    if let Some(fp_boundary) = fp_boundary {
+        asm.bl(fp_boundary);
+    }
     let (call_value, done) = (asm.label(), asm.label());
     asm.emit(lsr_imm(W, X16, X2, 16));
     asm.cbz(W, false, X16, call_value);

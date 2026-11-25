@@ -11,9 +11,10 @@ use crate::runtime::{self, Exit};
 use flags::{Carry, Operand, Overflow, Recipe, Sense};
 
 pub(crate) mod access;
-pub(super) mod body;
+pub(crate) mod body;
 pub(crate) mod flags;
 pub(super) mod fp_class;
+pub(crate) mod fp_state;
 pub(crate) mod resident;
 pub(crate) mod stubs;
 pub(crate) mod x87_stubs;
