@@ -161,7 +161,6 @@ struct Program {
 }
 
 impl BatchBody for Program {
-    #[cfg(test)]
     fn is_float(&self) -> bool {
         self.shape.is_float()
     }

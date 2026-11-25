@@ -244,26 +244,26 @@ impl Emitter<'_> {
             self.batch_add(dst, src, (iv.stride as u32).wrapping_mul(lanes), U);
             self.copy(loc, Host::Register(dst), Type::I32);
         }
-        #[cfg(test)]
-        let count_strips = batch.plan.body.is_float();
-        #[cfg(not(test))]
-        let count_strips = false;
-        #[cfg(test)]
-        if count_strips {
-            use super::{Runtime, offset_of, str};
-
-            // Incremented only after a full FP strip completes (past admission
-            // guards and any pre-store validation bailouts).
-            let strips = offset_of!(Runtime, vector_strips) as u32;
-            self.asm.emit_all(&[
-                ldr(X, T, RT, strips),
-                add_imm(X, T, T, 1, false),
-                str(X, T, RT, strips),
-            ]);
-        }
         self.asm.emit(sub_imm(X, X4, X4, 1, false));
         self.asm.cbz(X, true, X4, inner);
-        let words = self.words_since(inner_start) - if count_strips { 3 } else { 0 };
+        let words = self.words_since(inner_start);
+        let is_float = batch.plan.body.is_float();
+        if is_float {
+            // Count completed FP strips once per batch outside the inner loop
+            // (zero inner-loop overhead; `X3` still holds the completed count).
+            crate::runtime::emit_add_fp_counter(
+                &mut self.asm,
+                crate::runtime::FP_VECTOR_STRIPS,
+                X3,
+                T,
+            );
+            crate::runtime::emit_add_fp_counter(
+                &mut self.asm,
+                crate::runtime::FP_FAST_COMPLETIONS,
+                X3,
+                T,
+            );
+        }
         let recovery_start = self.asm.offset();
         // Publish the last logical latch's recovery operands once per strip.
         for &(param, value) in &batch.recovery {
@@ -281,9 +281,37 @@ impl Emitter<'_> {
 
         if let Some(bail) = bail {
             self.asm.bind(bail);
+            if is_float {
+                crate::runtime::emit_inc_fp_counter(
+                    &mut self.asm,
+                    crate::runtime::FP_STRIP_BAILS,
+                    1,
+                    T,
+                );
+                crate::runtime::emit_inc_fp_counter(
+                    &mut self.asm,
+                    crate::runtime::FP_STRIP_REPLAYS,
+                    lanes,
+                    T,
+                );
+            }
             // Completed strips = planned (`X3`) - remaining (`X4`).
             self.asm.emit(sub(X, X3, X3, X4, Lsl, 0));
             self.asm.cbz(X, false, X3, scalar);
+            if is_float {
+                crate::runtime::emit_add_fp_counter(
+                    &mut self.asm,
+                    crate::runtime::FP_VECTOR_STRIPS,
+                    X3,
+                    T,
+                );
+                crate::runtime::emit_add_fp_counter(
+                    &mut self.asm,
+                    crate::runtime::FP_FAST_COMPLETIONS,
+                    X3,
+                    T,
+                );
+            }
             self.imm(T, charge);
             self.asm.emit(mul(X, X5, X3, T));
             for &(param, value) in &batch.recovery {

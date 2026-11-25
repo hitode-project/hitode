@@ -18,6 +18,10 @@ pub(super) struct Allocation {
     pub locations: Vec<Host>,
     pub regions: Vec<RecordId>,
     pub spill_cells: usize,
+    /// Values spilled due to register pressure (excludes `Op::Snapshot`).
+    pub spills: usize,
+    /// Vector/FP (`F64`/`V128`) values spilled due to register pressure.
+    pub vector_spills: usize,
     pub defs: Vec<Option<Op>>,
 }
 
@@ -244,6 +248,8 @@ pub(super) fn allocate(
     let mut cells: Vec<(usize, u32)> = Vec::new();
     let mut locations = vec![Host::Constant(0); n];
     let mut slots = 0;
+    let mut spills = 0usize;
+    let mut vector_spills = 0usize;
     let mut spill = |i: usize, cells: &mut Vec<(usize, u32)>| {
         let cell = match cells.iter().position(|&(end, _)| end < starts[i]) {
             Some(k) => cells.swap_remove(k).1,
@@ -310,10 +316,16 @@ pub(super) fn allocate(
             Some(k) if (weight[active[k].2], ends[i]) < (weight[i], active[k].0) => {
                 let (_, loc, held) = active.swap_remove(k);
                 locations[held] = spill(held, &mut cells);
+                spills += 1;
+                vector_spills += usize::from(vector);
                 locations[i] = loc;
                 active.push((ends[i], loc, i));
             }
-            _ => locations[i] = spill(i, &mut cells),
+            _ => {
+                locations[i] = spill(i, &mut cells);
+                spills += 1;
+                vector_spills += usize::from(vector);
+            }
         }
     }
     // An integer constant takes a register only where one stays free for its
@@ -349,6 +361,8 @@ pub(super) fn allocate(
         locations,
         regions,
         spill_cells: slots as usize,
+        spills,
+        vector_spills,
         defs: operations,
     }
 }

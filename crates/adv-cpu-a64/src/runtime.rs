@@ -116,13 +116,53 @@ pub struct Runtime {
     pub row_work: u32,
     pub row_count: u32,
     pub row_suppressed: u64,
-    /// Completed FP vector strips (test-only; placed at the end to keep all
-    /// architectural `Runtime` field offsets unchanged).
-    #[cfg(test)]
+    /// Generated FP telemetry counters, flushed into `Diagnostics::fp` after
+    /// each run. Placed at the end so all architectural `Runtime` field offsets
+    /// remain unchanged.
+    pub fp: FpCounters,
+}
+
+/// Generated-code FP counters owned by one execution `Runtime` (owner or worker).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FpCounters {
+    /// Host `msr fpcr` writes performed by translated code.
+    pub fpcr_writes: u64,
+    /// Host `mrs fpsr` reads performed by translated code.
+    pub fpsr_reads: u64,
+    /// Lazy or slow-path FPSR folds into `CpuState::mxcsr`.
+    pub fpsr_folds: u64,
+    /// Host-call or cross-domain FPSR isolations.
+    pub fpsr_isolations: u64,
+    /// Completed FP fast-path operations / vector strips.
+    pub fast_completions: u64,
+    /// Completed FP vector strips (past admission and pre-store validation).
     pub vector_strips: u64,
+    /// Speculative FP vector strip validation bailouts (replayed in scalar tail).
+    pub strip_bails: u64,
+    /// Scalar iterations replayed due to speculative FP vector strip bailouts.
+    pub strip_replays: u64,
+}
+
+impl FpCounters {
+    pub fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.fpcr_writes += other.fpcr_writes;
+        self.fpsr_reads += other.fpsr_reads;
+        self.fpsr_folds += other.fpsr_folds;
+        self.fpsr_isolations += other.fpsr_isolations;
+        self.fast_completions += other.fast_completions;
+        self.vector_strips += other.vector_strips;
+        self.strip_bails += other.strip_bails;
+        self.strip_replays += other.strip_replays;
+    }
 }
 
 const _: () = assert!(offset_of!(Runtime, host_sp) + size_of::<u64>() <= 64);
+const _: () = assert!(size_of::<Runtime>() <= 0x1000);
 
 impl Runtime {
     pub fn new(cpu: *mut CpuState, window: u64) -> Self {
@@ -136,8 +176,7 @@ impl Runtime {
             native_batches: 0,
             #[cfg(test)]
             vector_regions: 0,
-            #[cfg(test)]
-            vector_strips: 0,
+            fp: FpCounters::default(),
             cpu,
             window,
             shadow: 0,
@@ -729,6 +768,43 @@ pub(crate) const VALUE_REGS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, re
 pub(crate) const VALUE_EFLAGS: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, eflags));
 pub(crate) const VALUE_MXCSR: u32 = VALUE_FRAME + field(offset_of!(ValueFrame, mxcsr));
 const VALUE_FRAME: u32 = field(offset_of!(Runtime, value_frame));
+
+const FP_COUNTERS: u32 = field(offset_of!(Runtime, fp));
+pub(crate) const FP_FPCR_WRITES: u32 = FP_COUNTERS + field(offset_of!(FpCounters, fpcr_writes));
+pub(crate) const FP_FPSR_READS: u32 = FP_COUNTERS + field(offset_of!(FpCounters, fpsr_reads));
+pub(crate) const FP_FPSR_FOLDS: u32 = FP_COUNTERS + field(offset_of!(FpCounters, fpsr_folds));
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const FP_FPSR_ISOLATIONS: u32 =
+    FP_COUNTERS + field(offset_of!(FpCounters, fpsr_isolations));
+pub(crate) const FP_FAST_COMPLETIONS: u32 =
+    FP_COUNTERS + field(offset_of!(FpCounters, fast_completions));
+pub(crate) const FP_VECTOR_STRIPS: u32 = FP_COUNTERS + field(offset_of!(FpCounters, vector_strips));
+pub(crate) const FP_STRIP_BAILS: u32 = FP_COUNTERS + field(offset_of!(FpCounters, strip_bails));
+pub(crate) const FP_STRIP_REPLAYS: u32 = FP_COUNTERS + field(offset_of!(FpCounters, strip_replays));
+
+/// Increments a 64-bit counter in `Runtime::fp` by a small constant without
+/// clobbering guest NZCV flags.
+pub(crate) fn emit_inc_fp_counter(asm: &mut Asm, offset: u32, delta: u32, scratch: Reg) {
+    use crate::encode::Size::X;
+    let rt = Reg::new(29);
+    asm.emit_all(&[
+        ldr(X, scratch, rt, offset),
+        add_imm(X, scratch, scratch, delta, false),
+        str(X, scratch, rt, offset),
+    ]);
+}
+
+/// Adds a 64-bit register `amount` to a counter in `Runtime::fp` without
+/// clobbering guest NZCV flags.
+pub(crate) fn emit_add_fp_counter(asm: &mut Asm, offset: u32, amount: Reg, scratch: Reg) {
+    use crate::encode::Size::X;
+    let rt = Reg::new(29);
+    asm.emit_all(&[
+        ldr(X, scratch, rt, offset),
+        add(X, scratch, scratch, amount, Shift::Lsl, 0),
+        str(X, scratch, rt, offset),
+    ]);
+}
 
 /// Host base of the alias data view relative to guest address zero.
 #[cfg(native)]

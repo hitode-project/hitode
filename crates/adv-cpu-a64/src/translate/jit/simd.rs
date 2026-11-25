@@ -990,6 +990,7 @@ impl Translator<'_> {
                 ]);
             }
             self.emit(mrs_fpsr(X17));
+            runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_READS, 1, X16);
             self.asm.tbz(true, X17, 0, slow);
             if !self.vector.guards.fp_pe {
                 // FPSR.IXC (bit 4) maps directly to MXCSR.PE (bit 5).
@@ -998,6 +999,7 @@ impl Translator<'_> {
                     orr(W, X13, X13, X17, Shift::Lsl, 1),
                     str(W, X13, X5, runtime::MXCSR),
                 ]);
+                runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_FOLDS, 1, X16);
             }
             self.asm.b(done);
         }
@@ -1064,6 +1066,7 @@ impl Translator<'_> {
                 self.asm.bind(rounded);
             }
             self.emit_all(&[fcvt_int(W, true, X6, V2), mrs_fpsr(X17)]);
+            runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_READS, 1, X16);
             self.asm.tbz(true, X17, 0, invalid);
             self.emit_all(&[fmov_from_v(X, X17, V2), eor(X, X17, X17, X1, Shift::Lsl, 0)]);
             self.asm.cbz(X, false, X17, converted);
@@ -1087,6 +1090,7 @@ impl Translator<'_> {
             orr(W, X13, X13, X0, Shift::Lsl, 0),
             str(W, X13, X5, runtime::MXCSR),
         ]);
+        runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_FOLDS, 1, X16);
         self.asm.cbz(W, true, X2, bail);
         self.asm.bind(done);
         let d = self.destination(simd.dst, false);
@@ -1731,6 +1735,7 @@ impl Translator<'_> {
         ]);
         self.floating_op(simd, operands);
         self.emit(msr_fpcr(X14));
+        runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPCR_WRITES, 2, X17);
     }
 
     fn floating_tiny(&mut self, simd: Simd, operands: Operands, slow: Label, resume: Label) {
@@ -1787,12 +1792,14 @@ impl Translator<'_> {
         }
         // Anything but inexact leaves; inexact sets PE.
         self.emit_all(&[mrs_fpsr(X17), and_imm(X, X14, X17, 0xf)]);
+        runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_READS, 1, X16);
         self.asm.cbz(X, true, X14, bail);
         self.emit_all(&[
             ubfx(W, X17, X17, 4, 1),
             orr(W, X13, X13, X17, Shift::Lsl, 5),
             str(W, X13, X5, runtime::MXCSR),
         ]);
+        runtime::emit_inc_fp_counter(self.asm, runtime::FP_FPSR_FOLDS, 1, X16);
         self.asm.b(resume);
         if let Some(value) = value {
             self.asm.bind(bail);

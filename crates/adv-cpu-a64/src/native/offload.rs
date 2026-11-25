@@ -95,11 +95,11 @@ impl<U> WorkerJob<U> {
         eip: u32,
         built: Built,
         mut lowered: Lowered,
-    ) {
+    ) -> bool {
         let Some(placed) =
             store.place_worker_form(&mut lowered.words, lowered.exit, &lowered.sites)
         else {
-            return;
+            return false;
         };
         crate::jit_map::record(
             placed.entry,
@@ -118,6 +118,7 @@ impl<U> WorkerJob<U> {
             cells: lowered.spill_cells,
             previous: self.code.optimized.take(),
         }));
+        true
     }
 }
 
@@ -159,6 +160,8 @@ struct Done {
     scope: Option<Scope>,
     /// Whether the optimized form admitted the entry state, if there is one.
     admitted: Option<bool>,
+    fp: crate::runtime::FpCounters,
+    speculation: super::RegionSpeculation,
 }
 
 struct Scope {
@@ -250,14 +253,17 @@ fn run(
         cpu.refresh_mmx();
     }
     let optimized = admit(code, cpu, entry.alias, &mut scratch.params);
-    let (exit, retired, deferred) =
+    let (exit, retired, deferred, speculation) =
         execute(runtime, cpu, entry, code, optimized, scratch, execution);
+    let fp = runtime.fp.take();
     let elapsed = started.map_or(Duration::ZERO, |at| at.elapsed());
     context.finish_computation(exit);
     Done {
         rows: 0,
         scope: None,
         admitted: code.optimized.as_ref().map(|_| optimized.is_some()),
+        fp,
+        speculation,
         deadline_recall: (exit == Exit::Recall || deferred)
             && signals.pending.0.load(Ordering::Acquire)
                 & signals.pending.1
@@ -293,6 +299,8 @@ fn run_scoped(
     let started = Instant::now();
     let mut execution = Duration::ZERO;
     let (mut retired, mut optimized, mut rows, mut mmx, mut gpr) = (0, 0, 0, 0, 0);
+    let mut fp = crate::runtime::FpCounters::default();
+    let mut speculation = super::RegionSpeculation::default();
     let mut size = batch.size.unwrap_or(1);
     loop {
         let left = batch.rows - rows;
@@ -309,6 +317,8 @@ fn run_scoped(
         );
         retired += done.completion.retired;
         optimized += done.completion.optimized;
+        fp.merge(done.fp);
+        speculation.merge(done.speculation);
         rows += count;
         mmx |= runtime.scope_written as u16;
         gpr |= runtime.scope_gpr_written;
@@ -317,6 +327,8 @@ fn run_scoped(
             done.completion.optimized = optimized;
             done.completion.elapsed = started.elapsed();
             done.rows = rows;
+            done.fp = fp;
+            done.speculation = speculation;
             done.scope = Some(Scope {
                 frame: runtime.scope_frame,
                 mmx,
@@ -369,7 +381,7 @@ fn execute(
     optimized: Option<&Optimized>,
     scratch: &mut ExecuteScratch,
     execution: Option<&mut Duration>,
-) -> (Exit, u64, bool) {
+) -> (Exit, u64, bool, super::RegionSpeculation) {
     let host = |addr: u32| entry.alias.wrapping_add(u64::from(addr)) as *mut u8;
     let entry_esp = cpu.regs[ESP];
     let scoped_mmx = code.scoped_mmx;
@@ -424,6 +436,7 @@ fn execute(
     }
     // An optimized form may leave with a negative countdown.
     let mut retired = countdown.wrapping_sub(returned.remaining);
+    let mut speculation = super::RegionSpeculation::default();
     if exit == Exit::Optimized {
         let o = optimized.expect("optimized entry");
         let recovery = &runtime.recovery;
@@ -449,6 +462,9 @@ fn execute(
         exit = if recovery.recalled != 0 {
             Exit::Recall
         } else {
+            speculation.failures += 1;
+            speculation.replays += 1;
+            speculation.replayed_instructions += u64::from(refund);
             Exit::Dispatch
         };
     }
@@ -461,7 +477,7 @@ fn execute(
     if optimized.is_none_or(|o| o.assumed.mmx) || cpu.mmx_mode != 0 {
         cpu.refresh_mmx();
     }
-    (exit, retired, returned.deferred != 0)
+    (exit, retired, returned.deferred != 0, speculation)
 }
 
 /// How split loops ran, for reports.
@@ -517,6 +533,8 @@ struct Drained {
     last: Option<LastBlock>,
     mmx: MmxJoin,
     gpr: Option<Box<GprJoin>>,
+    fp: crate::runtime::FpCounters,
+    speculation: super::RegionSpeculation,
 }
 
 impl Drained {
@@ -526,6 +544,8 @@ impl Drained {
         self.optimized += other.optimized;
         self.execution += other.execution;
         self.sticky |= other.sticky;
+        self.fp.merge(other.fp);
+        self.speculation.merge(other.speculation);
         self.mmx.merge(other.mmx);
         if let Some(gpr) = other.gpr {
             if let Some(total) = &mut self.gpr {
@@ -776,7 +796,7 @@ impl Blocks {
         let last = index + 1 == self.count;
         let iterations = if last { 0 } else { self.size };
         let context = self.enter(index * self.size, thread);
-        let done = run(
+        let result = run(
             runtime,
             0,
             context,
@@ -784,8 +804,10 @@ impl Blocks {
             (&self.code, iterations),
             (quiet, 0),
             (scratch, Timing::Block(&mut out.execution)),
-        )
-        .completion;
+        );
+        out.fp.merge(result.fp);
+        out.speculation.merge(result.speculation);
+        let done = result.completion;
         let cpu = done.context.as_ref().expect("block context").cpu();
         assert!(
             last || (!done.requires_owner && cpu.eip == self.start.cpu().eip),
@@ -1236,6 +1258,8 @@ pub(super) struct Session<'a, U, R> {
     runtime: Runtime,
     pace: Option<Pace>,
     counts: &'a mut SplitCounts,
+    fp: &'a mut super::FpDiagnostics,
+    region_speculation: &'a mut std::collections::BTreeMap<u32, super::RegionSpeculation>,
     wake_estimate: &'a mut WakeEstimate,
     scope_updates: Vec<u32>,
 }
@@ -1252,7 +1276,12 @@ impl<'a, U, R> Session<'a, U, R> {
         offload: &'a mut Offload,
         (retired, forms): (&'a mut u64, &'a mut Option<[u64; 5]>),
         notifications: Notifications,
-        (pace, counts): (Option<Pace>, &'a mut SplitCounts),
+        (pace, counts, fp, region_speculation): (
+            Option<Pace>,
+            &'a mut SplitCounts,
+            &'a mut super::FpDiagnostics,
+            &'a mut std::collections::BTreeMap<u32, super::RegionSpeculation>,
+        ),
     ) -> Option<Self> {
         let pool = Pool::get()?;
         let (send, recv) = sync_channel(pool.limit);
@@ -1280,6 +1309,8 @@ impl<'a, U, R> Session<'a, U, R> {
             runtime: Runtime::new(std::ptr::null_mut(), entry.window),
             pace,
             counts,
+            fp,
+            region_speculation,
             wake_estimate: &mut offload.wake,
             scope_updates: Vec::new(),
         })
@@ -1457,6 +1488,8 @@ impl<'a, U, R> Session<'a, U, R> {
         }
         self.counts.blocks += u64::from(total.blocks);
         let execution = total.execution;
+        let fp = total.fp;
+        let speculation = total.speculation;
         let (mut completion, iterations) = blocks.finish(id, total);
         self.counts.split_retired += completion.retired;
         completion.elapsed = started.elapsed();
@@ -1474,6 +1507,8 @@ impl<'a, U, R> Session<'a, U, R> {
             admitted: None,
             rows: if scoped { iterations } else { 0 },
             scope: None,
+            fp,
+            speculation,
         })
     }
 
@@ -1485,6 +1520,25 @@ impl<'a, U, R> Session<'a, U, R> {
         done: Done,
     ) -> Completion<Option<ExecutionContext>> {
         let (eip, version) = key;
+        self.fp.absorb_runtime(done.fp);
+        if done.fp.strip_bails != 0 {
+            self.region_speculation
+                .entry(eip)
+                .or_default()
+                .merge(super::RegionSpeculation {
+                    failures: done.fp.strip_bails,
+                    replays: done.fp.strip_bails,
+                    replayed_instructions: done.fp.strip_replays,
+                    validation_failures: done.fp.strip_bails,
+                });
+        }
+        if done.speculation.failures != 0 || done.speculation.replays != 0 {
+            self.fp.record_speculation(done.speculation);
+            self.region_speculation
+                .entry(eip)
+                .or_default()
+                .merge(done.speculation);
+        }
         if let Some(version) = version {
             self.code.resident(eip).unwrap().versions[usize::from(version)]
                 .account_rows(done.rows, row_work);
@@ -4802,6 +4856,8 @@ mod tests {
             admitted: None,
             rows: 0,
             scope: None,
+            fp: crate::runtime::FpCounters::default(),
+            speculation: crate::native::RegionSpeculation::default(),
         };
         prepared.observe(
             CODE,

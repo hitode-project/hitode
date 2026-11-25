@@ -90,6 +90,10 @@ pub(crate) struct Lowered {
     pub flags: Vec<Option<FlagRecipe>>,
     /// 16-byte cells at the captured SP, discarded by `opt_exit`.
     pub spill_cells: usize,
+    /// Register-pressure spills in this form (excluding `Op::Snapshot`).
+    pub spills: usize,
+    /// Vector/FP (`F64`/`V128`) register-pressure spills in this form.
+    pub vector_spills: usize,
     /// The word job and cold inline exits leave through. Placement binds
     /// it to `opt_exit`.
     pub exit: usize,
@@ -174,7 +178,7 @@ fn lower_form(
     assert_eq!(super::verify::verify(func), Ok(()));
     let mut batches = loops::plan(func, &[&loops::vector::Vector]);
     let mut asm = Asm::new();
-    let (mut e, exit, miss, cold, spill_cells) = loop {
+    let (mut e, exit, miss, cold, spill_cells, spills, vector_spills) = loop {
         let allocation = alloc::allocate(func, inline.is_some(), resident, &batches);
         let (mut e, exit, miss, cold) = emit(
             func,
@@ -202,7 +206,15 @@ fn lower_form(
             asm = e.asm;
             asm.rewind();
         } else {
-            break (e, exit, miss, cold, allocation.spill_cells);
+            break (
+                e,
+                exit,
+                miss,
+                cold,
+                allocation.spill_cells,
+                allocation.spills,
+                allocation.vector_spills,
+            );
         }
     };
     for batch in &batches {
@@ -306,6 +318,8 @@ fn lower_form(
         records,
         flags: e.flags,
         spill_cells,
+        spills,
+        vector_spills,
         counters,
         rows,
         row_price: e.row_price,

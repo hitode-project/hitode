@@ -1337,6 +1337,9 @@ fn phase4_independent_fp_vector_strips_and_serial_prefix_recovery() {
         7,
         "expected 7 completed .4s strips (28 vector + 4 scalar tail = 32 iters)"
     );
+    assert_eq!(native.diagnostics.fp.fp_vector_strips, 7);
+    assert!(native.diagnostics.fp.fp_fast_completions >= 7);
+    assert_eq!(native.diagnostics.fp.fp_speculation_failures, 0);
     assert_eq!(native.diagnostics.resident_cold_exits, 0);
 
     // 1-iteration call must report 0 completed strips (unlike pre-guard vector_regions).
@@ -1376,6 +1379,12 @@ fn phase4_independent_fp_vector_strips_and_serial_prefix_recovery() {
         5,
         "strips 0, 1, 2, 4, 6 commit; only strips 3 (subnormal) and 5 (NaN) bail pre-store"
     );
+    assert_eq!(native.diagnostics.fp.fp_vector_strips, 5);
+    assert!(native.diagnostics.fp.fp_fast_completions >= 5);
+    assert!(native.diagnostics.fp.fp_speculation_failures >= 2);
+    assert!(native.diagnostics.fp.fp_speculation_replays >= 2);
+    assert!(native.diagnostics.fp.fp_replayed_instructions >= 8);
+    assert!(native.diagnostics.fp.fp_validation_failures >= 2);
     assert_eq!(
         trial.live.state.x87.status & 2,
         2,

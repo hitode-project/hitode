@@ -125,6 +125,88 @@ fn features() -> Features {
     }
 }
 
+/// Per-region speculative failure and replay counts (keyed by region head EIP).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RegionSpeculation {
+    /// Speculative guard or validation failures observed for this region.
+    pub failures: u64,
+    /// Rollbacks that replayed guest work (Tier-1, interpreter, or scalar tail).
+    pub replays: u64,
+    /// Guest instructions or strip lanes rolled back for speculative replay.
+    pub replayed_instructions: u64,
+    /// Failures specifically attributed to FP/numerical validation.
+    pub validation_failures: u64,
+}
+
+impl RegionSpeculation {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.failures += other.failures;
+        self.replays += other.replays;
+        self.replayed_instructions += other.replayed_instructions;
+        self.validation_failures += other.validation_failures;
+    }
+}
+
+/// Floating-point protocol, speculation, versioning, spill, and fast-path
+/// counters reported inside `Diagnostics`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FpDiagnostics {
+    /// Host `msr fpcr` writes performed by translated code.
+    pub fpcr_writes: u64,
+    /// Host `mrs fpsr` reads performed by translated code.
+    pub fpsr_reads: u64,
+    /// FPSR sticky-bit folds into `CpuState::mxcsr`.
+    pub fpsr_folds: u64,
+    /// Host-call or cross-domain FPSR isolations.
+    pub fpsr_isolations: u64,
+    /// Speculative failures across regions (cold exits, domain misses, strip bailouts).
+    pub fp_speculation_failures: u64,
+    /// Speculative rollbacks that replayed guest work.
+    pub fp_speculation_replays: u64,
+    /// Guest instructions or strip lanes rolled back for speculative replay.
+    pub fp_replayed_instructions: u64,
+    /// Speculative failures attributed to FP/numerical validation.
+    pub fp_validation_failures: u64,
+    /// Specialized versions built across Tier-1 fact chains and optimized forms.
+    pub fp_versions: u64,
+    /// Version guard misses across Tier-1 fact chains and resident forms.
+    pub fp_version_misses: u64,
+    /// Tier-1 fact-version joins (key widenings on chain overflow).
+    pub fp_version_joins: u64,
+    /// Register-pressure spills in lowered optimized forms (excluding `Op::Snapshot`).
+    pub fp_opt_spills: u64,
+    /// Vector/FP (`F64`/`V128`) register-pressure spills in lowered optimized forms.
+    pub fp_opt_vector_spills: u64,
+    /// Total 16-byte spill cells allocated across lowered optimized forms.
+    pub fp_opt_spill_cells: u64,
+    /// Floating-point fast-path completions (vector strips and native FP fast paths).
+    pub fp_fast_completions: u64,
+    /// Completed FP vector strips (past admission and pre-store validation).
+    pub fp_vector_strips: u64,
+}
+
+impl FpDiagnostics {
+    pub(crate) fn absorb_runtime(&mut self, counters: runtime::FpCounters) {
+        self.fpcr_writes += counters.fpcr_writes;
+        self.fpsr_reads += counters.fpsr_reads;
+        self.fpsr_folds += counters.fpsr_folds;
+        self.fpsr_isolations += counters.fpsr_isolations;
+        self.fp_fast_completions += counters.fast_completions;
+        self.fp_vector_strips += counters.vector_strips;
+        self.fp_speculation_failures += counters.strip_bails;
+        self.fp_speculation_replays += counters.strip_bails;
+        self.fp_replayed_instructions += counters.strip_replays;
+        self.fp_validation_failures += counters.strip_bails;
+    }
+
+    pub(crate) fn record_speculation(&mut self, speculation: RegionSpeculation) {
+        self.fp_speculation_failures += speculation.failures;
+        self.fp_speculation_replays += speculation.replays;
+        self.fp_replayed_instructions += speculation.replayed_instructions;
+        self.fp_validation_failures += speculation.validation_failures;
+    }
+}
+
 /// One trip through translated code.
 /// How runs ended and what the cache went through, for reports.
 #[derive(Clone, Debug, Default)]
@@ -186,6 +268,8 @@ pub(crate) struct Diagnostics {
     pub sensor_decisions: std::collections::BTreeMap<&'static str, u64>,
     /// Fills of the whole indirect table, which also reset the shadow stack.
     pub global_invalidations: u64,
+    /// Floating-point protocol, speculation, versioning, spill, and fast-path counters.
+    pub fp: FpDiagnostics,
 }
 
 pub(crate) struct Run {
@@ -233,6 +317,7 @@ unsafe extern "C" fn plan_observation(
     }
     if kind == runtime::RESIDENT_VERSION_MISS {
         native.count_plan_event("resident_version_miss");
+        native.diagnostics.fp.fp_version_misses += 1;
         let mut at = cpu.clone();
         at.eip = eip;
         native.retry_resident(&at);
@@ -596,6 +681,8 @@ pub(crate) struct Native {
     pub(crate) deadline: Option<u64>,
     /// Diagnostic counts of how runs end; see `Diagnostics`.
     pub(crate) diagnostics: Diagnostics,
+    /// Per-region speculation failure and replay counts, keyed by region head EIP.
+    pub(crate) region_speculation: std::collections::BTreeMap<u32, RegionSpeculation>,
     pub(crate) retired_forms: Option<[u64; 5]>,
     /// The memory epoch last classified, and the all-slow test table.
     classified_epoch: Option<u64>,
@@ -821,6 +908,13 @@ impl Native {
                 let _ = write!(output, " value {eip:#010x}={count}");
             }
         }
+        for (&eip, spec) in &self.region_speculation {
+            let _ = write!(
+                output,
+                " region_speculation {eip:#010x}=[failures {}, replays {}, replayed_instructions {}, validation_failures {}]",
+                spec.failures, spec.replays, spec.replayed_instructions, spec.validation_failures
+            );
+        }
         Some(output)
     }
 }
@@ -989,6 +1083,7 @@ impl Native {
             unchecked_faults: 0,
             deadline: None,
             diagnostics: Diagnostics::default(),
+            region_speculation: std::collections::BTreeMap::new(),
             classified_epoch: None,
             #[cfg(test)]
             classifications: 0,
@@ -1145,9 +1240,41 @@ impl Native {
         self.runtime.vector_regions
     }
 
+    pub(crate) fn flush_fp_runtime(&mut self) {
+        let counters = self.runtime.fp.take();
+        self.diagnostics.fp.absorb_runtime(counters);
+    }
+
+    pub(crate) fn record_region_speculation(&mut self, head: u32, speculation: RegionSpeculation) {
+        self.diagnostics.fp.record_speculation(speculation);
+        self.region_speculation
+            .entry(head)
+            .or_default()
+            .merge(speculation);
+    }
+
+    pub(crate) fn record_opt_spills(
+        &mut self,
+        spills: usize,
+        vector_spills: usize,
+        spill_cells: usize,
+    ) {
+        self.diagnostics.fp.fp_opt_spills += spills as u64;
+        self.diagnostics.fp.fp_opt_vector_spills += vector_spills as u64;
+        self.diagnostics.fp.fp_opt_spill_cells += spill_cells as u64;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn region_speculation(&self, head: u32) -> RegionSpeculation {
+        self.region_speculation
+            .get(&head)
+            .copied()
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub(crate) fn vector_strips(&self) -> u64 {
-        self.runtime.vector_strips
+        self.diagnostics.fp.fp_vector_strips + self.runtime.fp.vector_strips
     }
 
     #[cfg(test)]
@@ -3895,5 +4022,324 @@ mod tests {
                 .contains(&range_guard),
             "ordinal 0 (base range guard) must remain intact when only ordinal 1 misses"
         );
+        assert!(native.region_speculation(HEAD).failures >= 1);
+        assert_eq!(native.region_speculation(HEAD).replays, 0);
+    }
+
+    #[test]
+    fn fp_diagnostics_serialization_and_runtime_hooks() {
+        use adv_cpu_core::Engine;
+
+        let cpu = crate::Cpu::new(0x12000, true).unwrap();
+        let report = cpu.report_fields();
+        for name in [
+            "fpcr_writes: 0",
+            "fpsr_reads: 0",
+            "fpsr_folds: 0",
+            "fpsr_isolations: 0",
+            "fp_speculation_failures: 0",
+            "fp_speculation_replays: 0",
+            "fp_replayed_instructions: 0",
+            "fp_validation_failures: 0",
+            "fp_versions: 0",
+            "fp_version_misses: 0",
+            "fp_version_joins: 0",
+            "fp_opt_spills: 0",
+            "fp_opt_vector_spills: 0",
+            "fp_opt_spill_cells: 0",
+            "fp_fast_completions: 0",
+            "fp_vector_strips: 0",
+        ] {
+            assert!(
+                report.contains(name),
+                "report_fields missing {name:?} in:\n{report}"
+            );
+        }
+
+        // Verify Runtime::fp offsets and emitter helpers stay well-formed.
+        let mut asm = crate::asm::Asm::new();
+        runtime::emit_inc_fp_counter(
+            &mut asm,
+            runtime::FP_FPSR_ISOLATIONS,
+            1,
+            crate::encode::Reg::new(16),
+        );
+        runtime::emit_add_fp_counter(
+            &mut asm,
+            runtime::FP_FAST_COMPLETIONS,
+            crate::encode::Reg::new(3),
+            crate::encode::Reg::new(16),
+        );
+        assert_eq!(asm.finish().len(), 6);
+
+        let mut fp = FpDiagnostics::default();
+        fp.absorb_runtime(runtime::FpCounters {
+            fpcr_writes: 4,
+            fpsr_reads: 3,
+            fpsr_folds: 2,
+            fpsr_isolations: 5,
+            fast_completions: 11,
+            vector_strips: 7,
+            strip_bails: 2,
+            strip_replays: 8,
+        });
+        assert_eq!(fp.fpcr_writes, 4);
+        assert_eq!(fp.fpsr_reads, 3);
+        assert_eq!(fp.fpsr_folds, 2);
+        assert_eq!(fp.fpsr_isolations, 5);
+        assert_eq!(fp.fp_fast_completions, 11);
+        assert_eq!(fp.fp_vector_strips, 7);
+        assert_eq!(fp.fp_speculation_failures, 2);
+        assert_eq!(fp.fp_speculation_replays, 2);
+        assert_eq!(fp.fp_replayed_instructions, 8);
+        assert_eq!(fp.fp_validation_failures, 2);
+
+        // Per-region speculation entries render in version_diagnostics when enabled.
+        let (_, mut native) = native();
+        native.code.version_stats = Some(FxHashMap::default());
+        native.record_region_speculation(
+            0x401000,
+            RegionSpeculation {
+                failures: 3,
+                replays: 2,
+                replayed_instructions: 14,
+                validation_failures: 1,
+            },
+        );
+        let versions = native.version_diagnostics().unwrap();
+        assert!(
+            versions.contains(
+                "region_speculation 0x00401000=[failures 3, replays 2, replayed_instructions 14, validation_failures 1]"
+            ),
+            "unexpected version_diagnostics:\n{versions}"
+        );
+    }
+
+    #[test]
+    fn fp_counters_track_fpcr_writes_fpsr_reads_and_folds() {
+        const ENTRY: u32 = 0x1_0000;
+        let setup_code = |bytes: &[u8]| {
+            let (mut memory, mut native) = native();
+            native.first_visits = false;
+            memory.map(ENTRY, 4096, 7).unwrap();
+            memory.write(ENTRY, bytes).unwrap();
+            (memory, native)
+        };
+        let f32_xmm = |v: f32| u128::from(v.to_bits()).to_le_bytes();
+
+        // 1) addss xmm0, xmm1; int3
+        //    Under non-default rounding (RC=down, 0x3f80) with PE already set (0x3fa0),
+        //    Tier-1 emits `rounded_op` (2 `msr fpcr` writes).
+        let (mut memory, mut native) = setup_code(&[0xf3, 0x0f, 0x58, 0xc1, 0xcc]);
+        let mut cpu = CpuState {
+            eip: ENTRY,
+            mxcsr: 0x3fa0, // RC=down, masked, PE=1
+            ..CpuState::default()
+        };
+        cpu.xmm[0] = f32_xmm(1.0);
+        cpu.xmm[1] = f32_xmm(0.25);
+        enter(&mut native, &mut memory, ENTRY + 4, &mut cpu);
+        assert_eq!(native.diagnostics.fp.fpcr_writes, 2);
+        assert_eq!(native.diagnostics.fp.fpsr_reads, 0);
+
+        // 2) Same unit under default rounding (0x1f80) with PE=0 and inexact add
+        //    (1.0f32 + 1e-8f32) takes `floating_cold` -> 1 FPSR read + 1 FPSR fold.
+        let mut cpu = CpuState {
+            eip: ENTRY,
+            mxcsr: 0x1f80,
+            ..CpuState::default()
+        };
+        cpu.xmm[0] = f32_xmm(1.0);
+        cpu.xmm[1] = f32_xmm(1e-8);
+        enter(&mut native, &mut memory, ENTRY + 4, &mut cpu);
+        assert_eq!(cpu.mxcsr & 0x20, 0x20, "PE must be folded into MXCSR");
+        assert!(native.diagnostics.fp.fpsr_reads >= 1);
+        assert!(native.diagnostics.fp.fpsr_folds >= 1);
+
+        // 3) cvttps2dq xmm0, xmm1 with PE=0 -> exercises packed_to_int FPSR path.
+        let (mut memory, mut native) = setup_code(&[0xf3, 0x0f, 0x5b, 0xc1, 0xcc]);
+        let mut cpu = CpuState {
+            eip: ENTRY,
+            mxcsr: 0x1f80,
+            ..CpuState::default()
+        };
+        let lanes: [u32; 4] = [
+            1.5f32.to_bits(),
+            (-2.25f32).to_bits(),
+            3.75f32.to_bits(),
+            4.0f32.to_bits(),
+        ];
+        cpu.xmm[1] = lanes
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        enter(&mut native, &mut memory, ENTRY + 4, &mut cpu);
+        assert_eq!(cpu.mxcsr & 0x20, 0x20);
+        assert!(native.diagnostics.fp.fpsr_reads >= 1);
+        assert!(native.diagnostics.fp.fpsr_folds >= 1);
+    }
+
+    #[test]
+    fn fp_counters_track_versions_misses_and_joins() {
+        const ENTRY: u32 = 0x1_0000;
+        let (mut memory, mut native) = native();
+        native.first_visits = false;
+        memory.map(ENTRY, 4096, 7).unwrap();
+        // addss xmm0, xmm1; int3 — specialized by MXCSR fact key.
+        memory
+            .write(ENTRY, &[0xf3, 0x0f, 0x58, 0xc1, 0xcc])
+            .unwrap();
+        // Run with distinct MXCSR classes (RN, RD, RU, RZ, DAZ) to build
+        // CHAIN_LEN versions and trigger a version join on overflow.
+        for mxcsr in [0x1fa0u32, 0x3fa0, 0x5fa0, 0x7fa0, 0x1fc0] {
+            let mut cpu = CpuState {
+                eip: ENTRY,
+                mxcsr,
+                ..CpuState::default()
+            };
+            cpu.xmm[0] = u128::from(1.0f32.to_bits()).to_le_bytes();
+            cpu.xmm[1] = u128::from(2.0f32.to_bits()).to_le_bytes();
+            enter(&mut native, &mut memory, ENTRY + 4, &mut cpu);
+        }
+        assert!(
+            native.diagnostics.fp.fp_versions >= 3,
+            "expected multiple versions built: {:?}",
+            native.diagnostics.fp
+        );
+        assert!(
+            native.diagnostics.fp.fp_version_misses >= 3,
+            "expected version misses: {:?}",
+            native.diagnostics.fp
+        );
+        assert!(
+            native.diagnostics.fp.fp_version_joins >= 1,
+            "expected chain join after exceeding CHAIN_LEN: {:?}",
+            native.diagnostics.fp
+        );
+    }
+
+    #[test]
+    fn fp_counters_track_region_speculation_and_opt_spills() {
+        // Simple resident x87 loop:
+        //   HEAD:
+        //     fld dword ptr [esi]   ; d9 06
+        //     fadd st(0), st(1)     ; d8 c1
+        //     fstp dword ptr [edi]  ; d9 1f
+        //     add esi, 4            ; 83 c6 04
+        //     add edi, 4            ; 83 c7 04
+        //     dec ecx               ; 49
+        //     jnz HEAD              ; 75 f1
+        //     int3                  ; cc
+        let body: &[u8] = &[
+            0xd9, 0x06, 0xd8, 0xc1, 0xd9, 0x1f, 0x83, 0xc6, 0x04, 0x83, 0xc7, 0x04, 0x49, 0x75,
+            0xf1, 0xcc,
+        ];
+        let (mut memory, mut native, stop) = resident_loop(body);
+        let input = OUTPUT + 0x400;
+        for i in 0..8u32 {
+            memory
+                .write(input + i * 4, &(i as f32 + 1.0).to_le_bytes())
+                .unwrap();
+        }
+        let make_cpu = |eip: u32, count: u32| {
+            let mut state = resident_cpu(eip, count);
+            state.regs[6] = input;
+            state.regs[7] = OUTPUT;
+            state.x87.control = 0x023f;
+            state.x87.status = 0x20;
+            state.x87.push(adv_cpu_core::floating::fast::extended(1.0));
+            state
+        };
+        assert!(native.force_resident_at(&mut memory, make_cpu(HEAD, 8)));
+        assert!(native.diagnostics.fp.fp_versions >= 2);
+
+        // Inject a NaN at index 2 to force a `ResidentCold::Validation` recovery.
+        memory
+            .write(input + 2 * 4, &0x7fc0_0001u32.to_le_bytes())
+            .unwrap();
+        let mut state = make_cpu(OUTSIDE, 4);
+        let mut steps = 0;
+        while state.eip != stop {
+            let run = enter(&mut native, &mut memory, stop, &mut state);
+            steps += 1;
+            if run.exit == Exit::Event(runtime::Event::Fetch)
+                || native.region_speculation(HEAD).validation_failures >= 1
+            {
+                break;
+            }
+            assert!(steps <= 16, "stuck at {:#x} ({:?})", state.eip, run.exit);
+        }
+        let region = native.region_speculation(HEAD);
+        assert!(region.failures >= 1, "expected region failure: {region:?}");
+        assert!(region.replays >= 1, "expected region replay: {region:?}");
+        assert!(
+            region.validation_failures >= 1,
+            "expected validation failure: {region:?}"
+        );
+        assert!(native.diagnostics.fp.fp_speculation_failures >= region.failures);
+        assert!(native.diagnostics.fp.fp_speculation_replays >= region.replays);
+        assert!(native.diagnostics.fp.fp_validation_failures >= region.validation_failures);
+
+        // Verify opt register allocator spill counters distinguish real vector spills.
+        use crate::translate::opt::ir::{End, FpOp, Func, Head, Op, Source, Type};
+        use crate::translate::opt::recovery::{IrRecord, Location};
+        let empty_record = |eip: u32| IrRecord {
+            eip,
+            refund: 0,
+            regs: [None; 8],
+            eflags: None,
+            flag_groups: Vec::new(),
+            x87: None,
+            xmm: [None; 8],
+            mmx: [None; 8],
+            mmx_meta: None,
+            frame: Vec::new(),
+        };
+        let mut func = Func {
+            kept: (1 << 24) - 1,
+            ..Func::default()
+        };
+        let entry_rec = func.record(empty_record(HEAD));
+        let b = func.block(Some(Head { record: entry_rec }));
+        let seed = func.param(b, Type::F64);
+        func.entry.push(Source::X87(0));
+        // Keep 30 live F64 values simultaneously (exceeds available V registers).
+        let mut live = Vec::with_capacity(30);
+        for k in 0..30usize {
+            let lhs = if k == 0 { seed } else { live[k - 1] };
+            let v = func.push(b, Op::Fp(FpOp::Add, lhs, seed, true)).unwrap();
+            live.push(v);
+        }
+        let mut acc = live[0];
+        for &v in &live[1..] {
+            acc = func.push(b, Op::Fp(FpOp::Add, acc, v, true)).unwrap();
+        }
+        let bits = func
+            .push(
+                b,
+                Op::Bits {
+                    value: acc,
+                    to: Type::I64,
+                },
+            )
+            .unwrap();
+        let mut exit_rec = empty_record(HEAD + 4);
+        exit_rec.eflags = Some(Location::Constant(0));
+        exit_rec.frame.push((0, 8, Location::At(bits)));
+        let done = func.record(exit_rec);
+        func.end(b, End::Exit(done));
+        let lowered = opt::back::lower(&func);
+        assert!(lowered.spills > 0, "expected allocator spills");
+        assert!(
+            lowered.vector_spills > 0,
+            "expected vector allocator spills"
+        );
+        assert!(lowered.spill_cells > 0, "expected spill cells");
+        native.record_opt_spills(lowered.spills, lowered.vector_spills, lowered.spill_cells);
+        assert!(native.diagnostics.fp.fp_opt_spills >= lowered.spills as u64);
+        assert!(native.diagnostics.fp.fp_opt_vector_spills >= lowered.vector_spills as u64);
+        assert!(native.diagnostics.fp.fp_opt_spill_cells >= lowered.spill_cells as u64);
     }
 }

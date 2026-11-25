@@ -187,6 +187,44 @@ class Judge(unittest.TestCase):
         self.assertIn("steady splits fell below 0.500", failures[0])
         self.assertIn("second head run", failures[0])
 
+    def test_counters_parses_fp_diagnostics_fields(self):
+        report = {
+            "a64_diagnostics": (
+                "Diagnostics { first_visits: 1, split: SplitCounts { splits: 2 }, "
+                "fp: FpDiagnostics { fpcr_writes: 4, fpsr_reads: 7, fpsr_folds: 3, "
+                "fpsr_isolations: 1, fp_speculation_failures: 5, fp_speculation_replays: 4, "
+                "fp_replayed_instructions: 18, fp_validation_failures: 2, fp_versions: 6, "
+                "fp_version_misses: 9, fp_version_joins: 1, fp_opt_spills: 3, "
+                "fp_opt_vector_spills: 2, fp_opt_spill_cells: 4, fp_fast_completions: 12, "
+                "fp_vector_strips: 10 } } "
+                "tier1 versions region_speculation 0x00401000=[failures 5, replays 4, "
+                "replayed_instructions 18, validation_failures 2]"
+            ),
+            "compilations": 3,
+        }
+        got = run.counters(report)
+        expected = {
+            "fpcr_writes": 4,
+            "fpsr_reads": 7,
+            "fpsr_folds": 3,
+            "fpsr_isolations": 1,
+            "fp_speculation_failures": 5,
+            "fp_speculation_replays": 4,
+            "fp_replayed_instructions": 18,
+            "fp_validation_failures": 2,
+            "fp_versions": 6,
+            "fp_version_misses": 9,
+            "fp_version_joins": 1,
+            "fp_opt_spills": 3,
+            "fp_opt_vector_spills": 2,
+            "fp_opt_spill_cells": 4,
+            "fp_fast_completions": 12,
+            "fp_vector_strips": 10,
+            "compilations": 3,
+        }
+        for key, value in expected.items():
+            self.assertEqual(got.get(key), value, key)
+
 
 class Work(unittest.TestCase):
     def test_resident_trips_falls_back_to_backedge_without_tier1_counts(self):
