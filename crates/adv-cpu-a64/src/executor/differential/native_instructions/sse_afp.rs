@@ -661,8 +661,7 @@ fn float_to_int_frintts_and_unmasked_packed_xm_priority() {
     for features in feature_modes() {
         for mxcsr in [0x1f80u32, 0x3f80, 0x5f80, 0x7f80, 0x1fc0, 0x9fc0] {
             // Scalar float-to-int + packed float-to-int (f32)
-            for chunk in f32_vals.chunks_exact(4) {
-                let lanes: [u32; 4] = chunk.try_into().unwrap();
+            for &lanes in f32_vals.as_chunks::<4>().0 {
                 for &scalar_in in &lanes {
                     let mut p = fixture(|asm| {
                         asm.cvttss2si(eax, xmm0).unwrap();
@@ -677,8 +676,7 @@ fn float_to_int_frintts_and_unmasked_packed_xm_priority() {
                 }
             }
             // Scalar float-to-int + packed float-to-int (f64)
-            for chunk in f64_vals.chunks_exact(2) {
-                let lanes: [u64; 2] = chunk.try_into().unwrap();
+            for &lanes in f64_vals.as_chunks::<2>().0 {
                 for &scalar_in in &lanes {
                     let mut p = fixture(|asm| {
                         asm.cvttsd2si(eax, xmm0).unwrap();
@@ -1029,7 +1027,7 @@ fn tier1_hot_path_instruction_counts_shrink_under_afp_rpres_frintts_flagm2() {
     // Measure marginal steady-state A64 words per guest instruction/pair using
     // (9 repetitions - 1 repetition) / 8 (plan.md §1.1).
     let marginal = |features: Features, build_one: fn(&mut CodeAssembler)| -> usize {
-        let w1 = tier1_words(features, 0x1f80, |a| build_one(a)).len();
+        let w1 = tier1_words(features, 0x1f80, build_one).len();
         let w9 = tier1_words(features, 0x1f80, |a| {
             for _ in 0..9 {
                 build_one(a);

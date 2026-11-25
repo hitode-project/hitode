@@ -851,7 +851,7 @@ mod tests {
         // atomic 3-bit TOP index.
         assert_eq!(joined.mask(), (mask & !TOP) & !0x0200);
         assert_eq!(joined.control(), None);
-        assert_eq!(joined.control_bits().1, 0xffff & !0x0200);
+        assert_eq!(joined.control_bits().1, !0x0200);
         assert!(original.proves(joined));
         assert!(observed.proves(joined));
     }
@@ -859,8 +859,10 @@ mod tests {
     // spec: A64F-FP-5 A64-OPT-4
     #[test]
     fn resident_key_trims_mxcsr_sticky_bits_with_afp_when_masked() {
-        let mut cpu = CpuState::default();
-        cpu.mxcsr = 0x1fa0; // all masked + PE set
+        let cpu = CpuState {
+            mxcsr: 0x1fa0, // all masked + PE set
+            ..Default::default()
+        };
         let assumed = Assumed {
             control: cpu.x87.control,
             status: cpu.x87.status & !0x3800,

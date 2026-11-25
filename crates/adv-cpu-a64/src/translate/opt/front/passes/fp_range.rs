@@ -1800,132 +1800,125 @@ fn prove_finite_domain(
     const MAX_DEPTH: usize = 8;
     const MAX_NODES: usize = 32;
 
-    let mut order: Vec<Value> = Vec::new();
-    let mut visited = BTreeSet::<Value>::new();
-    let mut leaves: Vec<(Value, i64, i64)> = Vec::new();
-
-    fn collect(
-        v: Value,
-        depth: usize,
-        func: &Func,
-        defs: &[Option<Op>],
-        int_facts: &[Option<IntRange>],
-        visited: &mut BTreeSet<Value>,
-        order: &mut Vec<Value>,
-        leaves: &mut Vec<(Value, i64, i64)>,
-    ) -> bool {
-        if visited.contains(&v) {
-            return true;
-        }
-        if depth > MAX_DEPTH || order.len() >= MAX_NODES {
-            return false;
-        }
-        let op = defs.get(v.0 as usize).copied().flatten();
-        // Bounded integer leaf?
-        if matches!(func.ty(v), Type::I32 | Type::I64) {
-            if let Some(Op::Constant(..)) = op {
-                visited.insert(v);
-                order.push(v);
-                return true;
-            }
-            if let Some(r) = int_facts.get(v.0 as usize).copied().flatten()
-                && r.lo <= r.hi
-                && r.hi.checked_sub(r.lo).is_some_and(|span| span <= 1 << 20)
-            {
-                let is_pure_inner = matches!(
-                    op,
-                    Some(
-                        Op::Int(
-                            IntOp::Add
-                                | IntOp::Sub
-                                | IntOp::Mul
-                                | IntOp::And
-                                | IntOp::Or
-                                | IntOp::Xor
-                                | IntOp::Shl
-                                | IntOp::Shr
-                                | IntOp::Sar,
-                            ..,
-                        ) | Op::IntUnary(IntUnary::Not | IntUnary::Neg, _)
-                    )
-                );
-                if !is_pure_inner {
-                    if leaves.len() >= 2 {
-                        return false;
-                    }
-                    visited.insert(v);
-                    leaves.push((v, r.lo, r.hi));
-                    return true;
-                }
-            }
-        }
-        let Some(op) = op else {
-            return false;
-        };
-        let ok = match op {
-            Op::Constant(Type::F64 | Type::I32 | Type::I64, _) => true,
-            Op::FromInt(a)
-            | Op::FpUnary(FpUnary::Neg | FpUnary::Abs, a)
-            | Op::X87Round { value: a, .. }
-            | Op::IntUnary(
-                IntUnary::Not
-                | IntUnary::Neg
-                | IntUnary::ZeroExtend8
-                | IntUnary::ZeroExtend16
-                | IntUnary::SignExtend8
-                | IntUnary::SignExtend16,
-                a,
-            ) => collect(a, depth + 1, func, defs, int_facts, visited, order, leaves),
-            Op::X87Sqrt {
-                value: a,
-                pc,
-                rounding: 0,
-                ..
-            } if matches!(pc, 0 | 2) => {
-                collect(a, depth + 1, func, defs, int_facts, visited, order, leaves)
-            }
-            Op::Fp(_, a, b, _)
-            | Op::X87Single(_, a, b, _)
-            | Op::SseFp64(_, a, b)
-            | Op::Int(
-                IntOp::Add
-                | IntOp::Sub
-                | IntOp::Mul
-                | IntOp::And
-                | IntOp::Or
-                | IntOp::Xor
-                | IntOp::Shl
-                | IntOp::Shr
-                | IntOp::Sar,
-                a,
-                b,
-            ) => {
-                collect(a, depth + 1, func, defs, int_facts, visited, order, leaves)
-                    && collect(b, depth + 1, func, defs, int_facts, visited, order, leaves)
-            }
-            _ => false,
-        };
-        if !ok {
-            return false;
-        }
-        visited.insert(v);
-        order.push(v);
-        true
+    struct Collector<'a> {
+        func: &'a Func,
+        defs: &'a [Option<Op>],
+        int_facts: &'a [Option<IntRange>],
+        visited: BTreeSet<Value>,
+        order: Vec<Value>,
+        leaves: Vec<(Value, i64, i64)>,
     }
 
-    if !collect(
-        root,
-        0,
+    impl Collector<'_> {
+        fn collect(&mut self, v: Value, depth: usize) -> bool {
+            if self.visited.contains(&v) {
+                return true;
+            }
+            if depth > MAX_DEPTH || self.order.len() >= MAX_NODES {
+                return false;
+            }
+            let op = self.defs.get(v.0 as usize).copied().flatten();
+            // Bounded integer leaf?
+            if matches!(self.func.ty(v), Type::I32 | Type::I64) {
+                if let Some(Op::Constant(..)) = op {
+                    self.visited.insert(v);
+                    self.order.push(v);
+                    return true;
+                }
+                if let Some(r) = self.int_facts.get(v.0 as usize).copied().flatten()
+                    && r.lo <= r.hi
+                    && r.hi.checked_sub(r.lo).is_some_and(|span| span <= 1 << 20)
+                {
+                    let is_pure_inner = matches!(
+                        op,
+                        Some(
+                            Op::Int(
+                                IntOp::Add
+                                    | IntOp::Sub
+                                    | IntOp::Mul
+                                    | IntOp::And
+                                    | IntOp::Or
+                                    | IntOp::Xor
+                                    | IntOp::Shl
+                                    | IntOp::Shr
+                                    | IntOp::Sar,
+                                ..,
+                            ) | Op::IntUnary(IntUnary::Not | IntUnary::Neg, _)
+                        )
+                    );
+                    if !is_pure_inner {
+                        if self.leaves.len() >= 2 {
+                            return false;
+                        }
+                        self.visited.insert(v);
+                        self.leaves.push((v, r.lo, r.hi));
+                        return true;
+                    }
+                }
+            }
+            let Some(op) = op else {
+                return false;
+            };
+            let ok = match op {
+                Op::Constant(Type::F64 | Type::I32 | Type::I64, _) => true,
+                Op::FromInt(a)
+                | Op::FpUnary(FpUnary::Neg | FpUnary::Abs, a)
+                | Op::X87Round { value: a, .. }
+                | Op::IntUnary(
+                    IntUnary::Not
+                    | IntUnary::Neg
+                    | IntUnary::ZeroExtend8
+                    | IntUnary::ZeroExtend16
+                    | IntUnary::SignExtend8
+                    | IntUnary::SignExtend16,
+                    a,
+                ) => self.collect(a, depth + 1),
+                Op::X87Sqrt {
+                    value: a,
+                    pc: 0 | 2,
+                    rounding: 0,
+                    ..
+                } => self.collect(a, depth + 1),
+                Op::Fp(_, a, b, _)
+                | Op::X87Single(_, a, b, _)
+                | Op::SseFp64(_, a, b)
+                | Op::Int(
+                    IntOp::Add
+                    | IntOp::Sub
+                    | IntOp::Mul
+                    | IntOp::And
+                    | IntOp::Or
+                    | IntOp::Xor
+                    | IntOp::Shl
+                    | IntOp::Shr
+                    | IntOp::Sar,
+                    a,
+                    b,
+                ) => self.collect(a, depth + 1) && self.collect(b, depth + 1),
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+            self.visited.insert(v);
+            self.order.push(v);
+            true
+        }
+    }
+
+    let mut collector = Collector {
         func,
         defs,
         int_facts,
-        &mut visited,
-        &mut order,
-        &mut leaves,
-    ) || leaves.is_empty()
-    {
+        visited: BTreeSet::new(),
+        order: Vec::new(),
+        leaves: Vec::new(),
+    };
+
+    if !collector.collect(root, 0) || collector.leaves.is_empty() {
         return None;
     }
+    let Collector { order, leaves, .. } = collector;
 
     let mut total: u128 = 1;
     for &(_, lo, hi) in &leaves {
@@ -2050,10 +2043,10 @@ fn prove_finite_domain(
                 }
                 Op::X87Sqrt {
                     value,
-                    pc,
+                    pc: pc @ (0 | 2),
                     rounding: 0,
                     ..
-                } if matches!(pc, 0 | 2) => {
+                } => {
                     let fa = f64::from_bits(val_map[&value]);
                     if !fa.is_finite() || fa < 0.0 {
                         return None;

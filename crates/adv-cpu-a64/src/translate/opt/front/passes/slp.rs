@@ -584,8 +584,16 @@ fn mem_lane_of(
     })
 }
 
+#[derive(Clone, Copy)]
+struct StridedSlot {
+    base: Value,
+    offset: i32,
+    channels: u8,
+    addr: Value,
+    pc: u32,
+}
+
 /// Checks whether `lanes` are strided memory loads with stride `k * elem` (`k in 1..=4`).
-/// Returns `Some((base, first_offset, stride_channels, first_addr, pc))`.
 fn detect_strided_slot(
     lanes: &[Value],
     is_single: bool,
@@ -593,7 +601,7 @@ fn detect_strided_slot(
     def_op: &[Option<Op>],
     def_pos_in_block: &BTreeMap<Value, usize>,
     last_store_before: &[Option<usize>],
-) -> Option<(Value, i32, u8, Value, u32)> {
+) -> Option<StridedSlot> {
     if lanes.len() < 2 {
         return None;
     }
@@ -624,7 +632,13 @@ fn detect_strided_slot(
             return None;
         }
     }
-    Some((base, first_off, channels as u8, mems[0].addr, mems[0].pc))
+    Some(StridedSlot {
+        base,
+        offset: first_off,
+        channels: channels as u8,
+        addr: mems[0].addr,
+        pc: mems[0].pc,
+    })
 }
 
 /// Pricing for one operand slot (2 or 4 lanes) of a packed group.
@@ -695,7 +709,7 @@ fn price_slot(
     } else if !invariant
         && ctx.func.resident
         && !crate::translate::opt::back::is_compact_window()
-        && let Some((_, _, channels, ..)) = detect_strided_slot(
+        && detect_strided_slot(
             lanes,
             is_single,
             insert_at,
@@ -703,9 +717,9 @@ fn price_slot(
             ctx.def_pos_in_block,
             ctx.last_store_before,
         )
+        .is_some()
     {
         // Contiguous `LDR Q` (channels == 1) or AoS `LD2/3/4` (channels in 2..=4).
-        let _ = channels;
         (1, 0, 0)
     } else if is_single {
         // 4× NarrowScalar (4) + 3× Insert32 (3..6, conservatively 4) = 8 words.
@@ -1321,7 +1335,7 @@ pub(in crate::translate::opt) fn run(func: &mut Func) -> bool {
             // 16-byte vector loads (`LDR Q`), and broadcast-from-memory (`LD1R`).
             if allow_wide_mem {
                 let elem = if is_single { 4i32 } else { 8i32 };
-                let strided: Vec<Option<(Value, i32, u8, Value, u32)>> = slot_lanes
+                let strided: Vec<Option<StridedSlot>> = slot_lanes
                     .iter()
                     .map(|lanes| {
                         let invariant =
@@ -1346,7 +1360,14 @@ pub(in crate::translate::opt) fn run(func: &mut Func) -> bool {
                     if vec_inputs[s].is_some() {
                         continue;
                     }
-                    let Some((base, off0, channels, addr0, pc)) = strided[s] else {
+                    let Some(StridedSlot {
+                        base,
+                        offset: off0,
+                        channels,
+                        addr: addr0,
+                        pc,
+                    }) = strided[s]
+                    else {
                         continue;
                     };
                     if channels == 1 {
@@ -1369,7 +1390,13 @@ pub(in crate::translate::opt) fn run(func: &mut Func) -> bool {
                         let mut members: Vec<(usize, i32, Value, u32)> = vec![(s, off0, addr0, pc)];
                         for other in s + 1..n_slots {
                             if vec_inputs[other].is_none()
-                                && let Some((ob, ooff, och, oaddr, opc)) = strided[other]
+                                && let Some(StridedSlot {
+                                    base: ob,
+                                    offset: ooff,
+                                    channels: och,
+                                    addr: oaddr,
+                                    pc: opc,
+                                }) = strided[other]
                                 && ob == base
                                 && och == channels
                                 && (ooff - off0).abs() < i32::from(channels) * elem

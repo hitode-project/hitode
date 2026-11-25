@@ -124,12 +124,14 @@ impl Loop {
     }
 
     fn groups(&self) -> Vec<Vec<(usize, Stream)>> {
+        type BucketKey = (Value, i32, u8, bool);
+        type IndexedStream = (usize, Stream);
         // Group adjacent columns of an AoS interleave regardless of IR load
         // order (e.g. loading RGB as B, G, R or XY as Y, X) while keeping
         // each stream's original index for alias ordering (`r < w`).
-        let mut buckets: std::collections::BTreeMap<(Value, i32, u8, bool), Vec<(usize, Stream)>> =
+        let mut buckets: std::collections::BTreeMap<BucketKey, Vec<IndexedStream>> =
             std::collections::BTreeMap::new();
-        let mut order: Vec<(Value, i32, u8, bool)> = Vec::new();
+        let mut order: Vec<BucketKey> = Vec::new();
         for (i, &s) in self.streams.iter().enumerate() {
             let key = (s.addr.base, s.stride, s.width, s.write());
             if !buckets.contains_key(&key) {
