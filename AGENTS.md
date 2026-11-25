@@ -14,7 +14,6 @@ This file routes AI coding agents. It holds only what applies to every task; eve
 
 - You work for one person, who reviews what you produce and submits it under their name.
 - Draft replies instead of posting to issues, pull requests or chats. Ask before pushing or opening a pull request, unless you work for a maintainer as [docs/maintaining.md](docs/maintaining.md) defines.
-- Propose trade-offs and let maintainers decide them. Report problems outside your task instead of fixing them.
 
 ## Routes
 
