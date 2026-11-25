@@ -471,6 +471,7 @@ impl VReg {
 /// Width of a SIMD and floating-point transfer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VSize {
+    S,
     D,
     Q,
 }
@@ -478,6 +479,7 @@ pub enum VSize {
 impl VSize {
     const fn bytes(self) -> u32 {
         match self {
+            Self::S => 4,
             Self::D => 8,
             Self::Q => 16,
         }
@@ -567,17 +569,19 @@ const fn unscaled(base: u32, size: Size, rt: Reg, rn: Reg, offset: i32) -> u32 {
     base | size | (offset as u32 & 0x1ff) << 12 | rn.number() << 5 | rt.number()
 }
 
-/// `ldr dt/qt, [rn, #offset]`.
+/// `ldr st/dt/qt, [rn, #offset]`.
 pub const fn ldr_v(size: VSize, rt: VReg, rn: Reg, offset: u32) -> u32 {
     match size {
+        VSize::S => unsigned_offset(0xBD40_0000, 4, rt.number(), rn, offset),
         VSize::D => unsigned_offset(0xFD40_0000, 8, rt.number(), rn, offset),
         VSize::Q => unsigned_offset(0x3DC0_0000, 16, rt.number(), rn, offset),
     }
 }
 
-/// `str dt/qt, [rn, #offset]`.
+/// `str st/dt/qt, [rn, #offset]`.
 pub const fn str_v(size: VSize, rt: VReg, rn: Reg, offset: u32) -> u32 {
     match size {
+        VSize::S => unsigned_offset(0xBD00_0000, 4, rt.number(), rn, offset),
         VSize::D => unsigned_offset(0xFD00_0000, 8, rt.number(), rn, offset),
         VSize::Q => unsigned_offset(0x3D80_0000, 16, rt.number(), rn, offset),
     }
@@ -643,9 +647,10 @@ pub const fn ldp(size: Size, index: Index, rt: Reg, rt2: Reg, rn: Reg, offset: i
     stp(size, index, rt, rt2, rn, offset) | 1 << 22
 }
 
-/// `stp dt/qt, dt2/qt2` with `index` addressing.
+/// `stp st/dt/qt, st2/dt2/qt2` with `index` addressing.
 pub const fn stp_v(size: VSize, index: Index, rt: VReg, rt2: VReg, rn: Reg, offset: i32) -> u32 {
     let base = match size {
+        VSize::S => 0x2C00_0000,
         VSize::D => 0x6C00_0000,
         VSize::Q => 0xAC00_0000,
     };
@@ -1111,6 +1116,11 @@ pub const fn fcmp_zero(rn: VReg) -> u32 {
     0x1E60_2008 | rn.number() << 5
 }
 
+/// `fcmpe dn, #0.0`: also raises invalid for a quiet NaN.
+pub const fn fcmpe_zero(rn: VReg) -> u32 {
+    fcmp_zero(rn) | 0x10
+}
+
 /// `fcmp sn, sm`.
 pub const fn fcmps(rn: VReg, rm: VReg) -> u32 {
     0x1E20_2000 | rm.number() << 16 | rn.number() << 5
@@ -1124,6 +1134,21 @@ pub const fn fcmpes(rn: VReg, rm: VReg) -> u32 {
 /// `fcmp sn, #0.0`.
 pub const fn fcmps_zero(rn: VReg) -> u32 {
     0x1E20_2008 | rn.number() << 5
+}
+
+/// `fcmpe sn, #0.0`: also raises invalid for a quiet NaN.
+pub const fn fcmpes_zero(rn: VReg) -> u32 {
+    fcmps_zero(rn) | 0x10
+}
+
+/// Vector `faddp vd.<4s/2d>, vn, vm`.
+pub const fn vfaddp(double: bool, rd: VReg, rn: VReg, rm: VReg) -> u32 {
+    0x6E20_D400 | (double as u32) << 22 | rm.number() << 16 | rn.number() << 5 | rd.number()
+}
+
+/// Scalar pairwise `faddp sd, vn.2s` or `faddp dd, vn.2d`.
+pub const fn sfaddp(double: bool, rd: VReg, rn: VReg) -> u32 {
+    0x7E30_D800 | (double as u32) << 22 | rn.number() << 5 | rd.number()
 }
 
 /// Scalar `fmin`/`fmax sd, sn, sm` or `dd, dn, dm`.
@@ -1322,6 +1347,16 @@ pub const fn vxtn_2s(rd: VReg, rn: VReg) -> u32 {
 /// `scvtf vd.4s, vn.4s`.
 pub const fn vfromint(rd: VReg, rn: VReg) -> u32 {
     0x4E21_D800 | rn.number() << 5 | rd.number()
+}
+
+/// `sxtl vd.2d, vn.2s` (`sshll vd.2d, vn.2s, #0`).
+pub const fn vsxtl_2d(rd: VReg, rn: VReg) -> u32 {
+    0x0F20_A400 | rn.number() << 5 | rd.number()
+}
+
+/// `scvtf vd.2d, vn.2d`.
+pub const fn vfromint_2d(rd: VReg, rn: VReg) -> u32 {
+    0x4E61_D800 | rn.number() << 5 | rd.number()
 }
 
 /// `fcvtl vd.2d, vn.2s`.
@@ -1561,6 +1596,11 @@ pub const fn vst_interleaved(channels: u32, rt: VReg, rn: Reg) -> u32 {
         _ => panic!("invalid channel count"),
     };
     0x4C00_0000 | op | rn.number() << 5 | rt.number()
+}
+
+/// `st2/st3/st4 {vt.<arr>, ...}, [rn]`: interleave 2, 3, or 4 structures.
+pub const fn vst_interleaved_arr(channels: u32, arr: Arr, rt: VReg, rn: Reg) -> u32 {
+    vld_interleaved(channels, arr, rt, rn) & !(1 << 22)
 }
 
 /// `ld2/ld3/ld4 {vt.<arr>, ...}, [rn]`: de-interleave 2, 3, or 4 structures.
@@ -2466,6 +2506,34 @@ mod tests {
             (fcvt_int_s_mode(X, 2, r(0), v(1)), "fcvtps x0, s1"),
             (scvtf_s(W, v(0), r(1)), "scvtf s0, w1"),
             (scvtf_s(X, v(0), r(1)), "scvtf s0, x1"),
+            (fcmpe_zero(v(1)), "fcmpe d1, #0.0"),
+            (fcmpes_zero(v(1)), "fcmpe s1, #0.0"),
+            (
+                stp_v(VSize::S, Index::Offset, v(0), v(1), r(16), 16),
+                "stp s0, s1, [x16, #0x10]",
+            ),
+            (
+                ldp_v(VSize::S, Index::Offset, v(2), v(3), r(17), -8),
+                "ldp s2, s3, [x17, #-0x8]",
+            ),
+            (vfaddp(false, v(0), v(1), v(2)), "faddp v0.4s, v1.4s, v2.4s"),
+            (vfaddp(true, v(0), v(1), v(2)), "faddp v0.2d, v1.2d, v2.2d"),
+            (sfaddp(false, v(0), v(1)), "faddp s0, v1.2s"),
+            (sfaddp(true, v(0), v(1)), "faddp d0, v1.2d"),
+            (
+                vst_interleaved_arr(2, Arr::S4, v(0), r(16)),
+                "st2 { v0.4s, v1.4s }, [x16]",
+            ),
+            (
+                vst_interleaved_arr(3, Arr::S4, v(2), r(17)),
+                "st3 { v2.4s, v3.4s, v4.4s }, [x17]",
+            ),
+            (
+                vst_interleaved_arr(4, Arr::D2, v(0), r(16)),
+                "st4 { v0.2d, v1.2d, v2.2d, v3.2d }, [x16]",
+            ),
+            (vsxtl_2d(v(0), v(1)), "sxtl v0.2d, v1.2s"),
+            (vfromint_2d(v(0), v(1)), "scvtf v0.2d, v1.2d"),
         ]
     }
 

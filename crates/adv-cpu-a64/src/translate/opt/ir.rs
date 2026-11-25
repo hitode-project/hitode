@@ -368,6 +368,27 @@ pub(crate) enum Op {
         a: Value,
         b: Value,
     },
+    /// Proved-safe by-element `.2d` or `.4s` FP multiply: `a * b[lane]`.
+    VecFpMulElem {
+        double: bool,
+        a: Value,
+        b: Value,
+        lane: u8,
+    },
+    /// Proved-safe de-interleaving AoS load (`LD2`/`LD3`/`LD4`), returning `channel` of `channels`.
+    VecDeintLoad {
+        addr: Value,
+        channels: u8,
+        channel: u8,
+        double: bool,
+        pc: u32,
+    },
+    /// Proved-safe broadcast-from-memory load (`LD1R`) into `.4s` or `.2d`.
+    VecLoadBcast {
+        addr: Value,
+        double: bool,
+        pc: u32,
+    },
     /// Proved-safe lane-wise `.2d` or `.4s` fused multiply-add/sub: `c + a * b` or `c - a * b`.
     VecFma {
         sub: bool,
@@ -599,6 +620,8 @@ impl Op {
             | Op::SseSqrt { a, .. }
             | Op::SseConvert { a, .. }
             | Op::Load { addr: a, .. }
+            | Op::VecDeintLoad { addr: a, .. }
+            | Op::VecLoadBcast { addr: a, .. }
             | Op::PlainPage { addr: a, .. }
             | Op::PageCross { addr: a, .. }
             | Op::Host(a)
@@ -621,6 +644,7 @@ impl Op {
             | Op::SseMinMax { a, b, .. }
             | Op::Vec(_, a, b)
             | Op::VecFp { a, b, .. }
+            | Op::VecFpMulElem { a, b, .. }
             | Op::X87StoreC1 {
                 value: a,
                 stored: b,
@@ -710,6 +734,8 @@ impl Op {
                     | Op::PageCross { .. }
                     | Op::FrameDisjoint { .. }
                     | Op::Load { .. }
+                    | Op::VecDeintLoad { .. }
+                    | Op::VecLoadBcast { .. }
                     | Op::Store { .. }
                     | Op::X87Load { proved: false, .. }
                     | Op::SseInput { .. }
@@ -963,6 +989,9 @@ impl Func {
             Op::Vec(..)
             | Op::VecUnary(..)
             | Op::VecFp { .. }
+            | Op::VecFpMulElem { .. }
+            | Op::VecDeintLoad { .. }
+            | Op::VecLoadBcast { .. }
             | Op::VecFma { .. }
             | Op::VecFpToInt { .. }
             | Op::Fp32(..)

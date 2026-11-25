@@ -133,6 +133,21 @@ impl BatchEmitter<'_, '_> {
         self.asm().emit(add_ext(X, T, view, T, Extend::Uxtw, 0));
         T
     }
+
+    /// Commits a reduced `F64` accumulator back into its allocated host location.
+    pub fn write_f64(&mut self, value: Value, src: VReg) {
+        let loc = self.emitter.locations[value.0 as usize];
+        self.emitter.copy(loc, Host::Vector(src), Type::F64);
+    }
+
+    /// Bails cleanly (before any strip executes) if planned strip count `X3`
+    /// exceeds `max_strips`.
+    pub fn bail_if_strips_exceed(&mut self, max_strips: u64) {
+        self.emitter.imm(T, max_strips);
+        self.asm().emit(cmp(X, X3, T, Lsl, 0));
+        let bail = self.bail();
+        self.asm().b_cond(Cond::Hi, bail);
+    }
 }
 
 impl Emitter<'_> {
@@ -221,18 +236,69 @@ impl Emitter<'_> {
 
         self.imm(T, charge);
         self.asm.emit_all(&[mul(X, X5, X3, T), mov(X, X4, X3)]);
-        self.asm.bind(inner);
-        self.count(batch.loop_.eip, Counter::Batch);
-        let inner_start = self.asm.offset();
-        let bail = {
+        let mut bail = {
             let mut emitter = BatchEmitter {
                 emitter: self,
                 head: batch.loop_.eip,
                 bail: None,
             };
-            batch.plan.body.lower(&mut emitter);
+            batch.plan.body.lower_preheader(&mut emitter);
             emitter.bail
         };
+        let preheader_end = self.asm.offset();
+        let strips_done = self.asm.label();
+        let mut unroll2_words = None;
+        if batch.plan.body.has_unroll2() {
+            let unroll2_loop = self.asm.label();
+            let single_tail = self.asm.label();
+            self.asm.emit(super::cmp_imm(X, X4, 2, false));
+            self.asm.b_cond(Cond::Lo, single_tail);
+            self.asm.bind(unroll2_loop);
+            let u2_start = self.asm.offset();
+            {
+                // On pre-store bail in a 2x pair, fall into the 1x `inner` loop
+                // so a valid first strip still commits before the second bails
+                // to the scalar tail.
+                let mut emitter = BatchEmitter {
+                    emitter: self,
+                    head: batch.loop_.eip,
+                    bail: Some(inner),
+                };
+                batch.plan.body.lower_unroll2(&mut emitter);
+            }
+            self.count(batch.loop_.eip, Counter::Batch);
+            self.count(batch.loop_.eip, Counter::Batch);
+            for iv in &batch.loop_.ivs {
+                let loc = self.locations[iv.base.0 as usize];
+                let src = self.gp_at(loc, T);
+                let dst = match loc {
+                    Host::Register(r) => r,
+                    _ => T,
+                };
+                self.batch_add(dst, src, (iv.stride as u32).wrapping_mul(lanes * 2), U);
+                self.copy(loc, Host::Register(dst), Type::I32);
+            }
+            self.asm.emit_all(&[
+                sub_imm(X, X4, X4, 2, false),
+                super::cmp_imm(X, X4, 2, false),
+            ]);
+            self.asm.b_cond(Cond::Hs, unroll2_loop);
+            unroll2_words = Some(self.words_since(u2_start).div_ceil(2));
+            self.asm.bind(single_tail);
+            self.asm.cbz(X, false, X4, strips_done);
+        }
+        self.asm.bind(inner);
+        self.count(batch.loop_.eip, Counter::Batch);
+        let inner_start = self.asm.offset();
+        {
+            let mut emitter = BatchEmitter {
+                emitter: self,
+                head: batch.loop_.eip,
+                bail,
+            };
+            batch.plan.body.lower(&mut emitter);
+            bail = emitter.bail;
+        }
         let body_end = self.asm.offset();
         for iv in &batch.loop_.ivs {
             let loc = self.locations[iv.base.0 as usize];
@@ -246,6 +312,16 @@ impl Emitter<'_> {
         }
         self.asm.emit(sub_imm(X, X4, X4, 1, false));
         self.asm.cbz(X, true, X4, inner);
+        self.asm.bind(strips_done);
+        {
+            let mut emitter = BatchEmitter {
+                emitter: self,
+                head: batch.loop_.eip,
+                bail,
+            };
+            batch.plan.body.lower_epilogue(&mut emitter);
+            bail = emitter.bail;
+        }
         let words = self.words_since(inner_start);
         let is_float = batch.plan.body.is_float();
         if is_float {
@@ -298,6 +374,14 @@ impl Emitter<'_> {
             // Completed strips = planned (`X3`) - remaining (`X4`).
             self.asm.emit(sub(X, X3, X3, X4, Lsl, 0));
             self.asm.cbz(X, false, X3, scalar);
+            {
+                let mut emitter = BatchEmitter {
+                    emitter: self,
+                    head: batch.loop_.eip,
+                    bail: None,
+                };
+                batch.plan.body.lower_epilogue(&mut emitter);
+            }
             if is_float {
                 crate::runtime::emit_add_fp_counter(
                     &mut self.asm,
@@ -338,8 +422,10 @@ impl Emitter<'_> {
         self.asm.emit(movz(W, X5, lanes as u16, 0));
         self.asm.bind(body);
         self.reciprocal_division = false;
-        // Include the bounded long-range search and the scalar tail transfer.
-        let prefix = ((inner_start - admission) / 4) as u32 + 3;
+        // Include the bounded long-range search and the scalar tail transfer,
+        // without charging the 2x unrolled body as preheader admission overhead.
+        let prefix = ((preheader_end - admission) / 4) as u32 + 3;
+        let words = unroll2_words.unwrap_or(words);
         let pages = pages.map_or(0, |_| {
             crate::policy::proved::SPAN_SEARCH_WORDS * batch.spans.len() as u32
         });

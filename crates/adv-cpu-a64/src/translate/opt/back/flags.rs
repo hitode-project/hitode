@@ -38,6 +38,13 @@ const CONDITIONS: [(u8, [Cond; 8]); 20] = {
 impl Emitter<'_> {
     fn compare_floats(&mut self, kind: FlagKind, width: u8, a: Host, b: Host) {
         let a = self.v_at(a, A);
+        let single = kind != FlagKind::X87CompareFold && width == 32;
+        if let Host::Constant(bits) = b
+            && super::is_fp_zero_const(bits, single)
+        {
+            self.asm.emit(super::compare_zero(kind, width, a));
+            return;
+        }
         let b = self.v_at(b, B);
         self.asm.emit(super::compare(kind, width, a, b));
     }

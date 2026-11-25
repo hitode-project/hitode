@@ -859,8 +859,9 @@ impl Engine for Cpu {
             stats.native_code_bytes,
             stats.verification.json(),
             json(&format!(
-                "{} owner_retired: {} retired: {} worker_retired: {} whole_worker_jobs: {}",
+                "{} fp_exhaustive_budget_exceeded: {} owner_retired: {} retired: {} worker_retired: {} whole_worker_jobs: {}",
                 self.inner.diagnostics(),
+                crate::translate::opt::front::passes::exhaustive_budget_exceeded(),
                 self.retired - self.inner.worker_retired(),
                 self.retired,
                 self.inner.worker_retired(),

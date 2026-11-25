@@ -4484,3 +4484,325 @@ fn track_d_admits_sse_compares_packed_fp_minmax_sqrt_and_cvt() {
     assert!(count(&built, |op| matches!(op, Op::SseConvert { .. })) >= 4);
     assert!(count(&built, |op| matches!(op, Op::SseScalarToInt { .. })) >= 2);
 }
+
+fn wave2c_compile_resident(
+    body: impl FnOnce(&mut CodeAssembler, CodeLabel),
+    at: &CpuState,
+) -> (Built, super::super::back::Lowered) {
+    let code = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        body(a, head);
+    });
+    let unit = resident_unit(&code);
+    let mut at = at.clone();
+    at.eip = CODE;
+    let built = build_with_domains(&unit, None, &at, &|_| false, &|_| false, &|_| false)
+        .expect("resident form builds");
+    assert_eq!(verify::verify(&built.func), Ok(()));
+    let lowered =
+        super::super::back::lower_resident(&built.func, &built.assumed, &built.func.entry, false);
+    (built, lowered)
+}
+
+fn wave2c_fp_state(control: u16) -> CpuState {
+    let mut at = initial();
+    at.regs = [
+        0,
+        32,
+        0,
+        DATA + 0x800,
+        FRAME,
+        DATA + 0x80,
+        DATA,
+        DATA + 0x400,
+    ];
+    at.x87.control = control;
+    at.x87.status = 0x20;
+    at
+}
+
+// spec: A64-MEM-1, A64-OPT-4, A64-OPT-5, A64-OPT-6
+#[test]
+fn wave2c_hoisted_fp_neg_abs_masks_unroll2_ldp_stp_ld1r_fmul_elem_and_fcmp_zero() {
+    use super::super::loops;
+
+    // 1) f32 strip with fabs + fchs + * st(1) (by-element FMUL) + [ebx] (stride==0 LD1R)
+    let mut at = wave2c_fp_state(0x003f);
+    at.x87
+        .push(adv_cpu_core::floating::fast::extended(f64::from(1.25f32)));
+    let (built, lowered) = wave2c_compile_resident(
+        |a, head| {
+            a.fld(dword_ptr(esi)).unwrap();
+            a.fabs().unwrap();
+            a.fchs().unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fadd(dword_ptr(ebx)).unwrap();
+            a.fstp(dword_ptr(edi)).unwrap();
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at,
+    );
+    let batches = loops::plan(&built.func, &[&loops::vector::Vector]);
+    assert_eq!(batches.len(), 1, "expected FP vector strip plan");
+    assert!(
+        batches[0].plan.body.has_unroll2(),
+        "expected 2x unrolled FP strip body"
+    );
+
+    let is_ldp_q = |w: u32| (w & 0xffc0_0000) == 0xad40_0000;
+    let is_stp_q = |w: u32| (w & 0xffc0_0000) == 0xad00_0000;
+    let is_vld1r = |w: u32| (w & 0xbfff_f000) == 0x0d40_c000;
+    let is_vfmul_elem = |w: u32| (w & 0xbf80_f400) == 0x0f80_9000;
+    let is_sign_mask_movz =
+        |w: u32| (w & 0xffe0_0000) == 0x52a0_0000 && matches!((w >> 5) & 0xffff, 0x8000 | 0x7fff);
+
+    let first_ldp_q = lowered
+        .words
+        .iter()
+        .position(|&w| is_ldp_q(w))
+        .expect("expected 2x unroll LDP Q load");
+    let last_stp_q = lowered
+        .words
+        .iter()
+        .rposition(|&w| is_stp_q(w))
+        .expect("expected 2x unroll STP Q store");
+    assert!(
+        lowered.words.iter().any(|&w| is_vld1r(w)),
+        "expected LD1R for stride==0 broadcast load"
+    );
+    assert!(
+        lowered.words.iter().any(|&w| is_vfmul_elem(w)),
+        "expected by-element FMUL for vector * loop-invariant scalar"
+    );
+    let mask_positions: Vec<usize> = lowered
+        .words
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &w)| is_sign_mask_movz(w).then_some(idx))
+        .collect();
+    assert!(
+        !mask_positions.is_empty(),
+        "expected sign-mask MOVZ materialization for fabs/fchs"
+    );
+    assert!(
+        mask_positions.iter().all(|&pos| pos < first_ldp_q),
+        "sign-mask MOVZ must be hoisted into preheader before the inner loop (masks={mask_positions:?}, first_ldp_q={first_ldp_q})"
+    );
+    assert!(
+        !lowered.words[first_ldp_q..=last_stp_q]
+            .iter()
+            .any(|&w| is_sign_mask_movz(w)),
+        "sign-mask MOVZ must not appear inside the unrolled strip loop"
+    );
+
+    // 2) AoS 2-, 3- (out-of-order channels), and 4-channel float strip loads emit LD2/LD3/LD4.
+    let at_aos = wave2c_fp_state(0x003f);
+    for (channels, offsets, expected_op) in [
+        (2u32, vec![0i32, 4], 0x8000u32),
+        (3u32, vec![8, 0, 4], 0x4000u32),
+        (4u32, vec![0, 4, 8, 12], 0x0000u32),
+    ] {
+        let stride = (channels * 4) as i32;
+        let (_, lowered_aos) = wave2c_compile_resident(
+            |a, head| {
+                a.fld(dword_ptr(esi + offsets[0])).unwrap();
+                for &off in &offsets[1..] {
+                    a.fadd(dword_ptr(esi + off)).unwrap();
+                }
+                a.fstp(dword_ptr(edi)).unwrap();
+                a.add(esi, stride).unwrap();
+                a.add(edi, 4).unwrap();
+                a.dec(ecx).unwrap();
+                a.jne(head).unwrap();
+            },
+            &at_aos,
+        );
+        assert!(
+            lowered_aos
+                .words
+                .iter()
+                .any(|&w| (w & 0xbfff_f000) == (0x0c40_0000 | expected_op)),
+            "expected LD{channels} interleaved load for {channels}-channel AoS offsets {offsets:?}"
+        );
+    }
+
+    // 3) Zero comparison (`ftst`) lowers via `FCMP #0.0` / `FCMPE #0.0`.
+    let at_cmp = wave2c_fp_state(0x023f);
+    let (_, lowered_cmp) = wave2c_compile_resident(
+        |a, head| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.ftst().unwrap();
+            a.fnstsw(ax).unwrap();
+            a.fstp(st0).unwrap();
+            a.mov(word_ptr(edi), ax).unwrap();
+            a.add(esi, 8).unwrap();
+            a.add(edi, 2).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at_cmp,
+    );
+    assert!(
+        lowered_cmp
+            .words
+            .iter()
+            .any(|&w| (w & 0xffbf_fc0f) == 0x1e20_2008),
+        "expected FCMP/FCMPE #0.0 for floating zero comparison"
+    );
+}
+
+// spec: A64-MEM-1, A64-OPT-4, A64-OPT-5, A64-OPT-6
+#[test]
+fn wave2c_pow2_div_to_mul_loop_reduction_and_a64_mem1_guard_band_vs_compact() {
+    use super::super::loops;
+
+    // 1) Proved power-of-2 division on bounded integer-converted f64 -> Mul by 2^-k,
+    // while unproved general f64 division stays Div.
+    let at = wave2c_fp_state(0x023f);
+    let (built_proved, _) = wave2c_compile_resident(
+        |a, head| {
+            a.movzx(eax, byte_ptr(esi)).unwrap();
+            a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+            a.fild(dword_ptr(esp + 0x10)).unwrap();
+            a.fld1().unwrap();
+            a.fadd_2(st0, st0).unwrap(); // 2.0
+            a.fadd_2(st0, st0).unwrap(); // 4.0
+            a.fdivp(st1, st0).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+            a.inc(esi).unwrap();
+            a.add(edi, 8).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at,
+    );
+    assert_eq!(
+        count(&built_proved, |op| matches!(
+            op,
+            Op::Fp(FpOp::Div, ..) | Op::X87Single(FpOp::Div, ..) | Op::SseFp64(FpOp::Div, ..)
+        )),
+        0,
+        "proved bounded u8 / 4.0 must eliminate Op::Fp(Div)"
+    );
+    assert!(
+        count(&built_proved, |op| matches!(op, Op::Fp(FpOp::Mul, ..))) >= 1,
+        "proved bounded u8 / 4.0 must rewrite to Op::Fp(Mul) by 0.25"
+    );
+
+    let (built_unproved, _) = wave2c_compile_resident(
+        |a, head| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fld1().unwrap();
+            a.fadd_2(st0, st0).unwrap(); // 2.0
+            a.fdivp(st1, st0).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+            a.add(esi, 8).unwrap();
+            a.add(edi, 8).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at,
+    );
+    assert!(
+        count(&built_unproved, |op| matches!(op, Op::Fp(FpOp::Div, ..))) >= 1,
+        "unproved general f64 / 2.0 must NOT rewrite to Mul"
+    );
+
+    // 2) Loop exact-integer reduction vectorizes (`sfaddp`), while general float loop
+    // reduction is strictly REJECTED.
+    let mut at_red = wave2c_fp_state(0x023f);
+    at_red.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+    let (built_int_red, lowered_int_red) = wave2c_compile_resident(
+        |a, head| {
+            a.fild(dword_ptr(esi)).unwrap();
+            a.faddp(st1, st0).unwrap();
+            a.add(esi, 4).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at_red,
+    );
+    assert_eq!(
+        loops::plan(&built_int_red.func, &[&loops::vector::Vector]).len(),
+        1,
+        "exact-integer i32->f64 loop reduction must vectorize"
+    );
+    let is_sfaddp = |w: u32| (w & 0xffbf_fc00) == 0x7e30_d800;
+    assert!(
+        lowered_int_red.words.iter().any(|&w| is_sfaddp(w)),
+        "expected scalar pairwise FADDP in exact-integer reduction epilogue"
+    );
+
+    let (built_float_red, _) = wave2c_compile_resident(
+        |a, head| {
+            a.fadd(qword_ptr(esi)).unwrap();
+            a.add(esi, 8).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at_red,
+    );
+    assert!(
+        loops::plan(&built_float_red.func, &[&loops::vector::Vector]).is_empty(),
+        "general float loop reduction MUST NOT be vectorized/reassociated"
+    );
+
+    // 3) A64-MEM-1 guard-band immediate folding & LDP/STP on non-compact vs compact layout.
+    let at_mem = wave2c_fp_state(0x023f);
+    let build_mem_loop = || {
+        wave2c_compile_resident(
+            |a, head| {
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.mov(edx, dword_ptr(esi + 4)).unwrap();
+                a.add(eax, dword_ptr(esi + 16)).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+                a.mov(dword_ptr(edi + 4), edx).unwrap();
+                a.mov(dword_ptr(edi + 8), eax).unwrap();
+                a.mov(dword_ptr(edi + 12), edx).unwrap();
+                a.add(esi, 20).unwrap();
+                a.add(edi, 16).unwrap();
+                a.dec(ecx).unwrap();
+                a.jne(head).unwrap();
+            },
+            &at_mem,
+        )
+    };
+
+    let is_guest_ldp_w = |w: u32| (w & 0xffc0_03e0) == (0x2940_0000 | (17 << 5));
+    let is_guest_stp_w = |w: u32| (w & 0xffc0_03e0) == (0x2900_0000 | (17 << 5));
+    let is_ldr_w_u_16 = |w: u32| (w & 0xffff_ffe0) == (0xb940_0000 | (4 << 10) | (17 << 5));
+
+    if !adv_cpu_core::virtual_memory::GuestWindow::compact() {
+        let (_, lowered_guard) = build_mem_loop();
+        assert!(
+            lowered_guard.words.iter().any(|&w| is_guest_ldp_w(w)),
+            "non-compact A64-MEM-1 must pair adjacent [esi]/[esi+4] loads into LDP W"
+        );
+        assert!(
+            lowered_guard.words.iter().any(|&w| is_guest_stp_w(w)),
+            "non-compact A64-MEM-1 must pair adjacent [edi+8]/[edi+12] stores into STP W"
+        );
+        assert!(
+            lowered_guard.words.iter().any(|&w| is_ldr_w_u_16(w)),
+            "non-compact A64-MEM-1 must fold [esi+16] into direct immediate LDR W [x17, #16]"
+        );
+    }
+
+    let (_, lowered_compact) = super::super::back::with_compact_window(true, build_mem_loop);
+    assert!(
+        !lowered_compact.words.iter().any(|&w| is_guest_ldp_w(w)),
+        "compact window MUST NOT emit unguarded guest LDP W"
+    );
+    assert!(
+        !lowered_compact.words.iter().any(|&w| is_guest_stp_w(w)),
+        "compact window MUST NOT emit unguarded guest STP W"
+    );
+    assert!(
+        !lowered_compact.words.iter().any(|&w| is_ldr_w_u_16(w)),
+        "compact window MUST NOT fold [esi+16] into immediate LDR W [x17, #16]"
+    );
+}

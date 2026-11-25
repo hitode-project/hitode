@@ -36,6 +36,155 @@ use crate::translate::lower::{Site, WINDOW, X0, X1, X2, X3};
 pub(super) use batch::BatchEmitter;
 use std::mem::offset_of;
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_COMPACT_WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_compact_window<R>(compact: bool, f: impl FnOnce() -> R) -> R {
+    TEST_COMPACT_WINDOW.with(|cell| {
+        let prev = cell.replace(compact);
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
+pub(crate) fn is_compact_window() -> bool {
+    #[cfg(test)]
+    if TEST_COMPACT_WINDOW.with(std::cell::Cell::get) {
+        return true;
+    }
+    adv_cpu_core::virtual_memory::GuestWindow::compact()
+}
+
+/// Decomposes a single-step affine guest address `Op::Int(Add|Sub, base, Const)`.
+fn affine_disp(defs: &[Option<Op>], addr: Value) -> Option<(Value, i32)> {
+    match defs.get(addr.0 as usize).copied().flatten()? {
+        Op::Int(op @ (IntOp::Add | IntOp::Sub), base, rhs) => {
+            let Op::Constant(Type::I32, n) = defs.get(rhs.0 as usize).copied().flatten()? else {
+                return None;
+            };
+            let d = n as u32 as i32;
+            let disp = if op == IntOp::Add {
+                d
+            } else {
+                d.wrapping_neg()
+            };
+            Some((base, disp))
+        }
+        _ => None,
+    }
+}
+
+/// Returns whether `(disp, width)` lies strictly inside the 128 KiB guard band
+/// and encodes directly in an AArch64 immediate load/store for `(ty, width)`.
+fn guard_band_imm_word(
+    load: bool,
+    ty: Type,
+    width: u8,
+    rt_gp: Reg,
+    rt_v: VReg,
+    rn: Reg,
+    disp: i32,
+) -> Option<u32> {
+    let guard = adv_cpu_core::virtual_memory::WINDOW_GUARD as u32;
+    if disp.unsigned_abs().checked_add(u32::from(width))? > guard {
+        return None;
+    }
+    let w = i32::from(width);
+    let scaled = disp >= 0 && disp % w == 0 && (disp / w) < 4096;
+    if matches!(ty, Type::I32 | Type::I64) {
+        if scaled {
+            let off = disp as u32;
+            return Some(match (load, width) {
+                (true, 1) => ldrb(rt_gp, rn, off),
+                (false, 1) => strb(rt_gp, rn, off),
+                (true, 2) => ldrh(rt_gp, rn, off),
+                (false, 2) => strh(rt_gp, rn, off),
+                (true, 4) => ldr(W, rt_gp, rn, off),
+                (false, 4) => str(W, rt_gp, rn, off),
+                (true, 8) => ldr(X, rt_gp, rn, off),
+                (false, 8) => str(X, rt_gp, rn, off),
+                _ => return None,
+            });
+        }
+        if (-256..256).contains(&disp) {
+            return Some(match (load, width) {
+                (true, 4) => ldur(W, rt_gp, rn, disp),
+                (false, 4) => stur(W, rt_gp, rn, disp),
+                (true, 8) => ldur(X, rt_gp, rn, disp),
+                (false, 8) => stur(X, rt_gp, rn, disp),
+                (false, 2) => sturh(rt_gp, rn, disp),
+                _ => return None,
+            });
+        }
+        None
+    } else {
+        let size = mem_size(width);
+        if scaled {
+            let off = disp as u32;
+            Some(if load {
+                vldr(size, rt_v, rn, off)
+            } else {
+                vstr(size, rt_v, rn, off)
+            })
+        } else if (-256..256).contains(&disp) {
+            Some(if load {
+                vldur(size, rt_v, rn, disp)
+            } else {
+                vstur(size, rt_v, rn, disp)
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Returns whether two addresses are contiguous `(addr2 == addr1 + width)` and
+/// picks either `(base, d1)` (when `d1` fits signed 7-bit pair offset) or `(addr1, 0)`.
+fn pair_address(
+    defs: &[Option<Op>],
+    locations: &[Host],
+    folded: &[bool],
+    addr1: Value,
+    addr2: Value,
+    width: u8,
+) -> Option<(Value, i32)> {
+    let w = i32::from(width);
+    if !matches!(width, 4 | 8 | 16) {
+        return None;
+    }
+    let guard = adv_cpu_core::virtual_memory::WINDOW_GUARD as u32;
+    // Direct `addr2 = addr1 + width`.
+    if !folded[addr1.0 as usize]
+        && let Some((b2, d2)) = affine_disp(defs, addr2)
+        && b2 == addr1
+        && d2 == w
+    {
+        return Some((addr1, 0));
+    }
+    // Same base `addr1 = base + d1`, `addr2 = base + d2` with `d2 == d1 + width`.
+    let (b1, d1) = affine_disp(defs, addr1)?;
+    let (b2, d2) = affine_disp(defs, addr2)?;
+    if b1 != b2 || d1.checked_add(w) != Some(d2) {
+        return None;
+    }
+    if matches!(locations[b1.0 as usize], Host::Register(_))
+        && !folded[b1.0 as usize]
+        && d1 % w == 0
+        && (-64..64).contains(&(d1 / w))
+        && d1.unsigned_abs().checked_add(2 * u32::from(width))? <= guard
+    {
+        Some((b1, d1))
+    } else if !folded[addr1.0 as usize] {
+        Some((addr1, 0))
+    } else {
+        None
+    }
+}
+
 const T: Reg = Reg::new(16);
 const U: Reg = Reg::new(17);
 const S2: Reg = Reg::new(2);
@@ -582,6 +731,144 @@ fn emit<'a>(
             )
         });
     let mmx_miss = (resident && count_entries).then(|| asm.label());
+    let guard_band = resident && !is_compact_window();
+    // Pre-identify single-use `Op::VecUnary(Dup32|Dup64, scalar)` values consumed
+    // solely by a same-block `Op::VecFp(Mul, ..)` so `opt/back.rs` can lower the
+    // multiply directly via by-element `FMUL` and skip the `DUP`.
+    let mut mul_elem_dup = vec![None; func.types.len()];
+    // Pre-identify single-use `Op::Int(Add|Sub, base, Const)` address temps whose
+    // sole consumer is a same-block unchecked guard-band load/store.
+    let mut folded_addr_inst = vec![false; func.types.len()];
+    {
+        let mut use_count = vec![0usize; func.types.len()];
+        for b in &func.blocks {
+            for &(_, op) in &b.insts {
+                for u in op.uses() {
+                    use_count[u.0 as usize] += 1;
+                }
+            }
+            if let End::Branch { cond, .. } = b.end {
+                use_count[cond.0 as usize] += 1;
+            }
+            for t in b.end.targets() {
+                for &u in &t.args {
+                    use_count[u.0 as usize] += 1;
+                }
+            }
+        }
+        for r in &func.records {
+            for u in r.uses() {
+                use_count[u.0 as usize] += 1;
+            }
+        }
+        for b in &func.blocks {
+            let mut pending_page_cross = false;
+            for (idx, &(res, op)) in b.insts.iter().enumerate() {
+                if matches!(op, Op::PageCross { .. }) {
+                    pending_page_cross = true;
+                } else if matches!(op, Op::Store { .. }) {
+                    pending_page_cross = false;
+                }
+                let Some(v) = res else { continue };
+                if use_count[v.0 as usize] != 1 {
+                    continue;
+                }
+                if let Op::VecUnary(uop @ (VecUnary::Dup32 | VecUnary::Dup64), scalar) = op {
+                    let double = uop == VecUnary::Dup64;
+                    let scalar_loc = allocation.locations[scalar.0 as usize];
+                    let mut ok = false;
+                    for &(later_res, later_op) in &b.insts[idx + 1..] {
+                        if let Op::VecFp {
+                            op: FpOp::Mul,
+                            double: d2,
+                            a,
+                            b: bv,
+                        } = later_op
+                            && d2 == double
+                            && (a == v || bv == v)
+                            && a != bv
+                        {
+                            ok = true;
+                            break;
+                        }
+                        if later_op.uses().any(|u| u == v) {
+                            break;
+                        }
+                        if let Some(r) = later_res
+                            && allocation.locations[r.0 as usize] == scalar_loc
+                        {
+                            break;
+                        }
+                    }
+                    if ok {
+                        mul_elem_dup[v.0 as usize] = Some(scalar);
+                    }
+                } else if guard_band
+                    && let Some((base, disp)) = affine_disp(&allocation.defs, v)
+                    && let Host::Register(base_reg) = allocation.locations[base.0 as usize]
+                {
+                    let mut ok = false;
+                    let mut inner_page_cross = pending_page_cross;
+                    for (j, &(later_res, later_op)) in b.insts[idx + 1..].iter().enumerate() {
+                        let abs_j = idx + 1 + j;
+                        let prev_guard = abs_j > 0 && b.insts[abs_j - 1].1.region_guard().is_some();
+                        match later_op {
+                            Op::Load {
+                                ty,
+                                width,
+                                addr,
+                                checked: false,
+                                scope: None,
+                                clock: false,
+                                ..
+                            } if addr == v => {
+                                if !inner_page_cross
+                                    && guard_band_imm_word(true, ty, width, T, A, U, disp).is_some()
+                                {
+                                    ok = true;
+                                }
+                                break;
+                            }
+                            Op::Store {
+                                width,
+                                addr,
+                                value,
+                                checked: false,
+                                scope: None,
+                                ..
+                            } if addr == v && value != v && !prev_guard && !inner_page_cross => {
+                                let ty = func.ty(value);
+                                if guard_band_imm_word(false, ty, width, T, A, U, disp).is_some() {
+                                    ok = true;
+                                }
+                                break;
+                            }
+                            _ => {
+                                if matches!(later_op, Op::PageCross { .. }) {
+                                    inner_page_cross = true;
+                                } else if matches!(later_op, Op::Store { .. }) {
+                                    inner_page_cross = false;
+                                }
+                                if later_op.uses().any(|u| u == v) {
+                                    break;
+                                }
+                                if let Some(r) = later_res
+                                    && allocation.locations[r.0 as usize]
+                                        == Host::Register(base_reg)
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if ok {
+                        folded_addr_inst[v.0 as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+
     let mut e = Emitter {
         func,
         asm,
@@ -595,6 +882,7 @@ fn emit<'a>(
             Vec::new()
         },
         resident,
+        guard_band,
         env_miss,
         domain_miss,
         domain_fallback,
@@ -635,6 +923,8 @@ fn emit<'a>(
         func_uses_afp_sse,
         all_sse_ops_afp,
         store_only_extract32,
+        mul_elem_dup,
+        folded_addr_inst,
         fpsr_deferred_ops,
         fp_validate_strategies,
         cur_block_idx: 0,
@@ -721,13 +1011,30 @@ fn emit<'a>(
             }
             start = e.asm.offset();
         }
-        for (i, &(result, op)) in data.insts.iter().enumerate() {
+        let mut region_has_load = data.head.is_none();
+        let mut i = 0usize;
+        while i < data.insts.len() {
+            let (result, op) = data.insts[i];
             if matches!(op, Op::Test { .. }) && result.is_some_and(|v| branch_only[v.0 as usize]) {
+                i += 1;
                 continue;
             }
             if matches!(op, Op::VecToInt(VecToInt::Extract32(_), _))
                 && result.is_some_and(|v| e.store_only_extract32[v.0 as usize])
             {
+                i += 1;
+                continue;
+            }
+            if matches!(op, Op::VecUnary(VecUnary::Dup32 | VecUnary::Dup64, _))
+                && result.is_some_and(|v| e.mul_elem_dup[v.0 as usize].is_some())
+            {
+                i += 1;
+                continue;
+            }
+            if matches!(op, Op::Int(IntOp::Add | IntOp::Sub, ..))
+                && result.is_some_and(|v| e.folded_addr_inst[v.0 as usize])
+            {
+                i += 1;
                 continue;
             }
             if fpsr_clear_before.contains(&(b, i)) {
@@ -753,13 +1060,108 @@ fn emit<'a>(
                     .and_then(|value| func.cold_pcs.get(&value).copied())
                     .unwrap_or(func.records[e.region.0 as usize].eip)
             };
+
+            // Fuse consecutive `Op::VecDeintLoad` for channels 0..channels into one `LD2`/`LD3`/`LD4`.
+            if let Op::VecDeintLoad {
+                addr,
+                channels,
+                channel: 0,
+                double,
+                pc,
+            } = op
+            {
+                let k = usize::from(channels);
+                if i + k <= data.insts.len()
+                    && (0..k).all(|ch| {
+                        matches!(
+                            data.insts[i + ch].1,
+                            Op::VecDeintLoad {
+                                addr: a2,
+                                channels: c2,
+                                channel: ch2,
+                                double: d2,
+                                ..
+                            } if a2 == addr
+                                && c2 == channels
+                                && usize::from(ch2) == ch
+                                && d2 == double
+                        )
+                    })
+                {
+                    let outs: Vec<Option<Value>> = (0..k).map(|ch| data.insts[i + ch].0).collect();
+                    e.emit_deint_load_group(addr, channels, double, pc, &outs);
+                    region_has_load = true;
+                    i += k;
+                    continue;
+                }
+            }
+
+            // Pair adjacent unchecked non-compact window loads/stores into `LDP`/`STP`
+            // (A64-MEM-1), looking past zero-emission constants and folded address temps.
+            if e.guard_band
+                && e.page_cross.is_none()
+                && matches!(op, Op::Load { .. } | Op::Store { .. })
+            {
+                let mut next = i + 1;
+                let mut blocked = false;
+                while next < data.insts.len() {
+                    if fpsr_clear_before.contains(&(b, next)) {
+                        blocked = true;
+                        break;
+                    }
+                    let (nr, nop) = data.insts[next];
+                    let zero_emit = (matches!(nop, Op::Constant(..))
+                        && nr.is_some_and(|v| {
+                            matches!(e.locations[v.0 as usize], Host::Constant(_))
+                        }))
+                        || (matches!(nop, Op::Int(IntOp::Add | IntOp::Sub, ..))
+                            && nr.is_some_and(|v| e.folded_addr_inst[v.0 as usize]));
+                    if zero_emit {
+                        next += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if !blocked && next < data.insts.len() {
+                    if e.try_emit_load_pair(data.insts[i], data.insts[next])
+                        .is_some()
+                    {
+                        region_has_load = true;
+                        i = next + 1;
+                        continue;
+                    }
+                    if !region_has_load
+                        && e.page_cross.is_none()
+                        && e.try_emit_store_pair(data.insts[i], data.insts[next])
+                            .is_some()
+                    {
+                        region_has_load = false;
+                        i = next + 1;
+                        continue;
+                    }
+                }
+            }
+
             e.op(result, op);
+            match op {
+                Op::Load { .. }
+                | Op::FrameLoad { .. }
+                | Op::VecDeintLoad { .. }
+                | Op::VecLoadBcast { .. } => {
+                    region_has_load = true;
+                }
+                Op::Store { .. } => {
+                    region_has_load = false;
+                }
+                _ => {}
+            }
             if b == 0 && last_fact == Some(i) {
                 e.entry_frames(&func.entry);
                 e.begin_body(first, count_entries);
                 e.asm.bind(e.blocks[b]);
                 start = e.asm.offset();
             }
+            i += 1;
         }
         match &data.end {
             End::Jump(t) => {
@@ -1053,6 +1455,7 @@ struct Emitter<'a> {
     failures: Vec<(Label, RecordId, ResidentCold, u32)>,
     normal: Vec<[Option<Label>; 2]>,
     resident: bool,
+    guard_band: bool,
     env_miss: Option<Label>,
     domain_miss: Option<Label>,
     domain_fallback: Option<Label>,
@@ -1093,6 +1496,8 @@ struct Emitter<'a> {
     func_uses_afp_sse: bool,
     all_sse_ops_afp: bool,
     store_only_extract32: Vec<bool>,
+    mul_elem_dup: Vec<Option<Value>>,
+    folded_addr_inst: Vec<bool>,
     fpsr_deferred_ops: std::collections::BTreeSet<Value>,
     fp_validate_strategies: std::collections::BTreeMap<(usize, usize), cost::ValidationStrategy>,
     cur_block_idx: usize,
@@ -1988,14 +2393,27 @@ impl<'a> Emitter<'a> {
                 kind, width, a, b, ..
             } if kind.floating() => {
                 let is_sse = kind != FlagKind::X87CompareFold && width != 10;
+                let single = is_sse && width == 32;
+                let b_is_zero = match self.locations[b.0 as usize] {
+                    Host::Constant(bits) => is_fp_zero_const(bits, single),
+                    _ => matches!(
+                        self.defs[b.0 as usize],
+                        Some(Op::Constant(_, bits)) if is_fp_zero_const(bits, single)
+                    ),
+                };
                 let a = self.vr(a, A);
-                let b = self.vr(b, B);
+                let cmp_word = if b_is_zero {
+                    compare_zero(kind, width, a)
+                } else {
+                    let b = self.vr(b, B);
+                    compare(kind, width, a, b)
+                };
                 if is_sse && self.can_use_afp_sse {
                     self.arm_afp_sse();
-                    self.asm.emit(compare(kind, width, a, b));
+                    self.asm.emit(cmp_word);
                 } else {
                     self.ensure_rn_fpcr();
-                    self.asm.emit(compare(kind, width, a, b));
+                    self.asm.emit(cmp_word);
                     let fail = self.fail();
                     let (target, resume) = if is_sse && self.live_mxcsr {
                         let (check, resume) = (self.asm.label(), self.asm.label());
@@ -2006,7 +2424,6 @@ impl<'a> Emitter<'a> {
                     };
                     let ordered = kind == FlagKind::OrderedCompare
                         || (kind == FlagKind::X87CompareFold && width & 2 != 0);
-                    let single = is_sse && width == 32;
                     if ordered {
                         self.asm.b_cond(Cond::Vs, target);
                         if let Some(resume) = resume {
@@ -2017,16 +2434,22 @@ impl<'a> Emitter<'a> {
                         self.asm.b_cond(Cond::Vc, ok);
                         if single {
                             fp_class::snan32(&mut self.asm, a, T, target);
-                            fp_class::snan32(&mut self.asm, b, T, target);
+                            if !b_is_zero {
+                                let b = self.vr(b, B);
+                                fp_class::snan32(&mut self.asm, b, T, target);
+                            }
                         } else {
                             fp_class::snan(&mut self.asm, a, T, target);
-                            fp_class::snan(&mut self.asm, b, T, target);
+                            if !b_is_zero {
+                                let b = self.vr(b, B);
+                                fp_class::snan(&mut self.asm, b, T, target);
+                            }
                         }
                         if let Some(resume) = resume {
                             self.asm.bind(resume);
                         }
                         // `snan` uses `fcmp`/`fcmps` internally; restore the unordered NZCV.
-                        self.asm.emit(compare(kind, width, a, b));
+                        self.asm.emit(cmp_word);
                         self.asm.bind(ok);
                     }
                 }
@@ -2725,19 +3148,75 @@ impl<'a> Emitter<'a> {
             }
             Op::VecFp { op, double, a, b } => {
                 self.ensure_rn_fpcr();
-                let a = self.vr(a, A);
-                let b = self.vr(b, B);
-                let float = match op {
-                    FpOp::Add => Float::Fadd,
-                    FpOp::Sub => Float::Fsub,
-                    FpOp::Mul => Float::Fmul,
-                    FpOp::Div => Float::Fdiv,
-                };
-                self.asm.emit(if double {
-                    vfloat_2d(float, q, a, b)
+                if op == FpOp::Mul {
+                    if let Some(scalar) = self.mul_elem_dup[b.0 as usize] {
+                        let va = self.vr(a, A);
+                        let vb = self.vr(scalar, B);
+                        self.asm.emit(vfmul_elem(true, double, q, va, vb, 0));
+                    } else if let Some(scalar) = self.mul_elem_dup[a.0 as usize] {
+                        let va = self.vr(b, A);
+                        let vb = self.vr(scalar, B);
+                        self.asm.emit(vfmul_elem(true, double, q, va, vb, 0));
+                    } else {
+                        let a = self.vr(a, A);
+                        let b = self.vr(b, B);
+                        self.asm.emit(if double {
+                            vfloat_2d(Float::Fmul, q, a, b)
+                        } else {
+                            vfloat(Float::Fmul, true, q, a, b)
+                        });
+                    }
                 } else {
-                    vfloat(float, true, q, a, b)
-                });
+                    let a = self.vr(a, A);
+                    let b = self.vr(b, B);
+                    let float = match op {
+                        FpOp::Add => Float::Fadd,
+                        FpOp::Sub => Float::Fsub,
+                        FpOp::Mul => Float::Fmul,
+                        FpOp::Div => Float::Fdiv,
+                    };
+                    self.asm.emit(if double {
+                        vfloat_2d(float, q, a, b)
+                    } else {
+                        vfloat(float, true, q, a, b)
+                    });
+                }
+            }
+            Op::VecFpMulElem { double, a, b, lane } => {
+                self.ensure_rn_fpcr();
+                let va = self.vr(a, A);
+                let vb = self.vr(b, B);
+                self.asm
+                    .emit(vfmul_elem(true, double, q, va, vb, u32::from(lane)));
+            }
+            Op::VecDeintLoad {
+                addr,
+                channels,
+                channel,
+                double,
+                pc,
+            } => {
+                self.guest_eip = pc;
+                let addr_r = self.gp(addr, U);
+                let base = self.data_view();
+                self.asm.emit(add_ext(X, T, base, addr_r, Extend::Uxtw, 0));
+                let arr = if double { Arr::D2 } else { Arr::S4 };
+                self.site(false);
+                self.asm
+                    .emit(vld_interleaved(u32::from(channels), arr, D, T));
+                let src = VReg::new(D.number() as u8 + channel);
+                if q != src {
+                    self.asm.emit(vmov(true, q, src));
+                }
+            }
+            Op::VecLoadBcast { addr, double, pc } => {
+                self.guest_eip = pc;
+                let addr_r = self.gp(addr, U);
+                let base = self.data_view();
+                self.asm.emit(add_ext(X, T, base, addr_r, Extend::Uxtw, 0));
+                let arr = if double { Arr::D2 } else { Arr::S4 };
+                self.site(false);
+                self.asm.emit(vld1r(arr, q, T));
             }
             Op::VecFma {
                 sub,
@@ -3054,27 +3533,41 @@ impl<'a> Emitter<'a> {
                     return;
                 }
                 self.guest_eip = pc;
-                let addr = self.gp(addr, U);
                 let base = self.data_view();
-                let (word, reg) = if matches!(ty, Type::I32 | Type::I64) {
-                    (
-                        match width {
-                            1 => ldr_narrow(Narrow::Byte, d, base, addr),
-                            2 => ldr_narrow(Narrow::Half, d, base, addr),
-                            _ => ldr_reg(if width == 8 { X } else { W }, d, base, addr, false),
-                        },
-                        AccessReg::Scalar(d),
-                    )
+                if self.guard_band
+                    && !checked
+                    && !clock
+                    && self.page_cross.is_none()
+                    && let Some((base_val, disp)) = affine_disp(&self.defs, addr)
+                    && let Host::Register(base_reg) = self.locations[base_val.0 as usize]
+                    && let Some(word) = guard_band_imm_word(true, ty, width, d, q, U, disp)
+                {
+                    self.asm
+                        .emit(add_ext(X, U, base, base_reg, Extend::Uxtw, 0));
+                    self.site(false);
+                    self.asm.emit(word);
                 } else {
-                    let size = mem_size(width);
-                    (vldr_reg(size, q, base, addr), AccessReg::Vector(size, q))
-                };
-                self.memory_access(addr, width, reg, word, false, checked);
-                if clock {
-                    self.asm.emit_all(&[
-                        ldr(X, U, RT, runtime::CPU_STATE),
-                        str(X, RT, U, runtime::CLOCK_READ),
-                    ]);
+                    let addr = self.gp(addr, U);
+                    let (word, reg) = if matches!(ty, Type::I32 | Type::I64) {
+                        (
+                            match width {
+                                1 => ldr_narrow(Narrow::Byte, d, base, addr),
+                                2 => ldr_narrow(Narrow::Half, d, base, addr),
+                                _ => ldr_reg(if width == 8 { X } else { W }, d, base, addr, false),
+                            },
+                            AccessReg::Scalar(d),
+                        )
+                    } else {
+                        let size = mem_size(width);
+                        (vldr_reg(size, q, base, addr), AccessReg::Vector(size, q))
+                    };
+                    self.memory_access(addr, width, reg, word, false, checked);
+                    if clock {
+                        self.asm.emit_all(&[
+                            ldr(X, U, RT, runtime::CPU_STATE),
+                            str(X, RT, U, runtime::CLOCK_READ),
+                        ]);
+                    }
                 }
             }
             Op::Host(addr) => {
@@ -3131,43 +3624,99 @@ impl<'a> Emitter<'a> {
                     return;
                 }
                 self.guest_eip = pc;
-                let addr = self.gp(addr, U);
                 let base = self.data_view();
-                let (word, reg) = if width == 4
-                    && self.store_only_extract32[value.0 as usize]
-                    && let Some(Op::VecToInt(VecToInt::Extract32(lane), vec)) =
-                        self.defs[value.0 as usize]
+                let mut emitted_folded = false;
+                if self.guard_band
+                    && !checked
+                    && self.page_cross.is_none()
+                    && let Some((base_val, disp)) = affine_disp(&self.defs, addr)
+                    && let Host::Register(base_reg) = self.locations[base_val.0 as usize]
                 {
-                    let vec_reg = self.vr(vec, A);
-                    let src = if lane == 0 {
-                        vec_reg
+                    if width == 4
+                        && self.store_only_extract32[value.0 as usize]
+                        && let Some(Op::VecToInt(VecToInt::Extract32(lane), vec)) =
+                            self.defs[value.0 as usize]
+                    {
+                        let vec_reg = self.vr(vec, A);
+                        let src = if lane == 0 {
+                            vec_reg
+                        } else {
+                            self.asm.emit(vins(2, C, 0, vec_reg, u32::from(lane)));
+                            C
+                        };
+                        if let Some(word) =
+                            guard_band_imm_word(false, Type::V128, 4, T, src, U, disp)
+                        {
+                            self.asm
+                                .emit(add_ext(X, U, base, base_reg, Extend::Uxtw, 0));
+                            self.site(false);
+                            self.asm.emit(word);
+                            emitted_folded = true;
+                        }
+                    } else if matches!(self.func.ty(value), Type::I32 | Type::I64) {
+                        let src = self.gp(value, T);
+                        if let Some(word) =
+                            guard_band_imm_word(false, self.func.ty(value), width, src, A, U, disp)
+                        {
+                            self.asm
+                                .emit(add_ext(X, U, base, base_reg, Extend::Uxtw, 0));
+                            self.site(false);
+                            self.asm.emit(word);
+                            emitted_folded = true;
+                        }
                     } else {
-                        self.asm.emit(vins(2, C, 0, vec_reg, u32::from(lane)));
-                        C
+                        let src = self.vr(value, A);
+                        if let Some(word) =
+                            guard_band_imm_word(false, self.func.ty(value), width, T, src, U, disp)
+                        {
+                            self.asm
+                                .emit(add_ext(X, U, base, base_reg, Extend::Uxtw, 0));
+                            self.site(false);
+                            self.asm.emit(word);
+                            emitted_folded = true;
+                        }
+                    }
+                }
+                if !emitted_folded {
+                    let addr = self.gp(addr, U);
+                    let (word, reg) = if width == 4
+                        && self.store_only_extract32[value.0 as usize]
+                        && let Some(Op::VecToInt(VecToInt::Extract32(lane), vec)) =
+                            self.defs[value.0 as usize]
+                    {
+                        let vec_reg = self.vr(vec, A);
+                        let src = if lane == 0 {
+                            vec_reg
+                        } else {
+                            self.asm.emit(vins(2, C, 0, vec_reg, u32::from(lane)));
+                            C
+                        };
+                        (
+                            vstr_reg(VMem::S, src, base, addr),
+                            AccessReg::Vector(VMem::S, src),
+                        )
+                    } else if matches!(self.func.ty(value), Type::I32 | Type::I64) {
+                        let src = self.gp(value, T);
+                        (
+                            match width {
+                                1 => str_narrow(Narrow::Byte, src, base, addr),
+                                2 => str_narrow(Narrow::Half, src, base, addr),
+                                _ => {
+                                    str_reg(if width == 8 { X } else { W }, src, base, addr, false)
+                                }
+                            },
+                            AccessReg::Scalar(src),
+                        )
+                    } else {
+                        let src = self.vr(value, A);
+                        let size = mem_size(width);
+                        (
+                            vstr_reg(size, src, base, addr),
+                            AccessReg::Vector(size, src),
+                        )
                     };
-                    (
-                        vstr_reg(VMem::S, src, base, addr),
-                        AccessReg::Vector(VMem::S, src),
-                    )
-                } else if matches!(self.func.ty(value), Type::I32 | Type::I64) {
-                    let src = self.gp(value, T);
-                    (
-                        match width {
-                            1 => str_narrow(Narrow::Byte, src, base, addr),
-                            2 => str_narrow(Narrow::Half, src, base, addr),
-                            _ => str_reg(if width == 8 { X } else { W }, src, base, addr, false),
-                        },
-                        AccessReg::Scalar(src),
-                    )
-                } else {
-                    let src = self.vr(value, A);
-                    let size = mem_size(width);
-                    (
-                        vstr_reg(size, src, base, addr),
-                        AccessReg::Vector(size, src),
-                    )
-                };
-                self.memory_access(addr, width, reg, word, true, checked);
+                    self.memory_access(addr, width, reg, word, true, checked);
+                }
                 self.region = after;
                 self.mark(Part::Body, self.func.records[after.0 as usize].eip);
             }
@@ -3455,14 +4004,240 @@ impl<'a> Emitter<'a> {
         self.asm.emit(unary(op, q, a));
     }
 
+    fn emit_deint_load_group(
+        &mut self,
+        addr: Value,
+        channels: u8,
+        double: bool,
+        pc: u32,
+        outs: &[Option<Value>],
+    ) {
+        self.guest_eip = pc;
+        let addr_r = self.gp(addr, U);
+        let base = self.data_view();
+        self.asm.emit(add_ext(X, T, base, addr_r, Extend::Uxtw, 0));
+        let arr = if double { Arr::D2 } else { Arr::S4 };
+        self.site(false);
+        self.asm
+            .emit(vld_interleaved(u32::from(channels), arr, D, T));
+        for (ch, out) in outs.iter().enumerate() {
+            if let Some(v) = *out {
+                let loc = self.locations[v.0 as usize];
+                let src = VReg::new(D.number() as u8 + ch as u8);
+                self.copy(loc, Host::Vector(src), Type::V128);
+            }
+        }
+    }
+
+    fn try_emit_load_pair(
+        &mut self,
+        first: (Option<Value>, Op),
+        second: (Option<Value>, Op),
+    ) -> Option<usize> {
+        let (
+            Some(v1),
+            Op::Load {
+                ty: ty1,
+                width: w1,
+                addr: a1,
+                checked: false,
+                pc: pc1,
+                scope: None,
+                clock: false,
+            },
+        ) = first
+        else {
+            return None;
+        };
+        let (
+            Some(v2),
+            Op::Load {
+                ty: ty2,
+                width: w2,
+                addr: a2,
+                checked: false,
+                scope: None,
+                clock: false,
+                ..
+            },
+        ) = second
+        else {
+            return None;
+        };
+        if ty1 != ty2 || w1 != w2 || a2 == v1 {
+            return None;
+        }
+        let (base_val, disp) = pair_address(
+            &self.defs,
+            &self.locations,
+            &self.folded_addr_inst,
+            a1,
+            a2,
+            w1,
+        )?;
+        if base_val == v1 {
+            return None;
+        }
+        let loc1 = self.locations[v1.0 as usize];
+        let loc2 = self.locations[v2.0 as usize];
+        let base = self.data_view();
+        if matches!(ty1, Type::I32 | Type::I64) {
+            let size = match w1 {
+                4 => W,
+                8 => X,
+                _ => return None,
+            };
+            let (Host::Register(r1), Host::Register(r2)) = (loc1, loc2) else {
+                return None;
+            };
+            if r1 == r2 {
+                return None;
+            }
+            self.guest_eip = pc1;
+            let br = self.gp(base_val, U);
+            self.asm.emit(add_ext(X, U, base, br, Extend::Uxtw, 0));
+            self.site(false);
+            self.asm.emit(ldp(size, Index::Offset, r1, r2, U, disp));
+            Some(2)
+        } else {
+            let vsize = match w1 {
+                4 => VSize::S,
+                8 => VSize::D,
+                16 => VSize::Q,
+                _ => return None,
+            };
+            let (Host::Vector(r1), Host::Vector(r2)) = (loc1, loc2) else {
+                return None;
+            };
+            if r1 == r2 {
+                return None;
+            }
+            self.guest_eip = pc1;
+            let br = self.gp(base_val, U);
+            self.asm.emit(add_ext(X, U, base, br, Extend::Uxtw, 0));
+            self.site(false);
+            self.asm.emit(ldp_v(vsize, Index::Offset, r1, r2, U, disp));
+            Some(2)
+        }
+    }
+
+    fn try_emit_store_pair(
+        &mut self,
+        first: (Option<Value>, Op),
+        second: (Option<Value>, Op),
+    ) -> Option<usize> {
+        let (
+            None,
+            Op::Store {
+                width: w1,
+                addr: a1,
+                value: val1,
+                checked: false,
+                pc: pc1,
+                scope: None,
+                ..
+            },
+        ) = first
+        else {
+            return None;
+        };
+        let (
+            None,
+            Op::Store {
+                width: w2,
+                addr: a2,
+                value: val2,
+                after: after2,
+                checked: false,
+                scope: None,
+                ..
+            },
+        ) = second
+        else {
+            return None;
+        };
+        if w1 != w2 {
+            return None;
+        }
+        if self.store_only_extract32[val1.0 as usize] || self.store_only_extract32[val2.0 as usize]
+        {
+            return None;
+        }
+        let is_int1 = matches!(self.func.ty(val1), Type::I32 | Type::I64);
+        let is_int2 = matches!(self.func.ty(val2), Type::I32 | Type::I64);
+        if is_int1 != is_int2 {
+            return None;
+        }
+        let (base_val, disp) = pair_address(
+            &self.defs,
+            &self.locations,
+            &self.folded_addr_inst,
+            a1,
+            a2,
+            w1,
+        )?;
+        let base = self.data_view();
+        if is_int1 {
+            let size = match w1 {
+                4 => W,
+                8 => X,
+                _ => return None,
+            };
+            let (Host::Register(r1), Host::Register(r2)) = (
+                self.locations[val1.0 as usize],
+                self.locations[val2.0 as usize],
+            ) else {
+                return None;
+            };
+            self.disarm_sse_fpsr();
+            self.guest_eip = pc1;
+            let br = self.gp(base_val, U);
+            self.asm.emit(add_ext(X, U, base, br, Extend::Uxtw, 0));
+            self.site(false);
+            self.asm.emit(stp(size, Index::Offset, r1, r2, U, disp));
+            self.region = after2;
+            self.mark(Part::Body, self.func.records[after2.0 as usize].eip);
+            Some(2)
+        } else {
+            let vsize = match w1 {
+                4 => VSize::S,
+                8 => VSize::D,
+                16 => VSize::Q,
+                _ => return None,
+            };
+            self.disarm_sse_fpsr();
+            self.guest_eip = pc1;
+            let r1 = self.vr(val1, A);
+            let r2 = self.vr(val2, B);
+            let br = self.gp(base_val, U);
+            self.asm.emit(add_ext(X, U, base, br, Extend::Uxtw, 0));
+            self.site(false);
+            self.asm.emit(stp_v(vsize, Index::Offset, r1, r2, U, disp));
+            self.region = after2;
+            self.mark(Part::Body, self.func.records[after2.0 as usize].eip);
+            Some(2)
+        }
+    }
+
     fn x87_compare(&mut self, d: Reg, a: Value, b: Value, ordered: bool) {
         self.ensure_rn_fpcr();
+        let b_is_zero = match self.locations[b.0 as usize] {
+            Host::Constant(bits) => is_fp_zero_const(bits, false),
+            _ => matches!(
+                self.defs[b.0 as usize],
+                Some(Op::Constant(_, bits)) if is_fp_zero_const(bits, false)
+            ),
+        };
         let a = self.vr(a, A);
-        let b = self.vr(b, B);
         let fail = self.fail();
         let unordered = self.asm.label();
         let done = self.asm.label();
-        self.asm.emit(fcmp(a, b));
+        if b_is_zero {
+            self.asm.emit(fcmp_zero(a));
+        } else {
+            let b = self.vr(b, B);
+            self.asm.emit(fcmp(a, b));
+        }
         self.asm.b_cond(Cond::Vs, unordered);
         self.asm.emit_all(&[
             movz(W, d, 0x4000, 0),
@@ -3476,7 +4251,10 @@ impl<'a> Emitter<'a> {
             self.asm.b(fail);
         } else {
             fp_class::snan(&mut self.asm, a, T, fail);
-            fp_class::snan(&mut self.asm, b, T, fail);
+            if !b_is_zero {
+                let b = self.vr(b, B);
+                fp_class::snan(&mut self.asm, b, T, fail);
+            }
             self.asm.emit(movz(W, d, 0x4500, 0));
         }
         self.asm.bind(done);
@@ -3958,6 +4736,27 @@ fn mem_size(width: u8) -> VMem {
 }
 fn mem_type(ty: Type) -> VMem {
     [VMem::S, VMem::D, VMem::D, VMem::Q, VMem::S][ty as usize]
+}
+
+pub(super) fn is_fp_zero_const(bits: u128, single: bool) -> bool {
+    if single {
+        ((bits as u32) & 0x7fff_ffff) == 0
+    } else {
+        ((bits as u64) & 0x7fff_ffff_ffff_ffff) == 0
+    }
+}
+
+/// The NZCV compare of a floating `Flags` kind against immediate `#0.0`.
+pub(super) fn compare_zero(kind: FlagKind, width: u8, a: VReg) -> u32 {
+    let ordered =
+        kind == FlagKind::OrderedCompare || (kind == FlagKind::X87CompareFold && width & 2 != 0);
+    let single = kind != FlagKind::X87CompareFold && width == 32;
+    match (single, ordered) {
+        (true, true) => fcmpes_zero(a),
+        (true, false) => fcmps_zero(a),
+        (false, true) => fcmpe_zero(a),
+        (false, false) => fcmp_zero(a),
+    }
 }
 
 /// The NZCV compare of a floating `Flags` kind; `comisd`/`comiss` and ordered

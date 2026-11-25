@@ -88,6 +88,7 @@ enum Unary {
     FpAbs(bool),
     FpToInt(bool, u8),
     IntToFp32,
+    Int32ToFp64,
     Widen2sTo2d,
 }
 
@@ -112,10 +113,14 @@ enum OpCode {
     Store(Memory),
     Broadcast(Value),
     BroadcastExactF32(Value),
+    ScalarInvariant(Value, bool),
+    ScalarConstant(u64),
     Constant(u128),
     Unary(Unary),
     Binary(Binary),
+    FpMulElem { double: bool },
     FpFma { sub: bool, double: bool },
+    ReduceAdd { double: bool },
     CheckNormal { double: bool, strict_min_exp: bool },
     CheckMulUnderflow { double: bool, div: bool },
     CheckIntRange { double: bool, rounding: u8 },
@@ -138,9 +143,22 @@ struct Inst {
 enum Step {
     Word(u32),
     Address(Stream, u32),
+    AddressShift(Stream, u32, u32),
     Gp(Value, VReg, Arr),
     Vector(Value, VReg),
     FpBroadcast(Value, VReg, bool, bool),
+    FpScalar(Value, VReg, bool, bool),
+    ReduceInit {
+        acc: Value,
+        dst: VReg,
+        double: bool,
+        max_strips: u64,
+    },
+    ReduceFinish {
+        acc: Value,
+        src: VReg,
+        double: bool,
+    },
     BailCond(Cond),
     BailNonZero(Reg),
     BailNonZeroX(Reg),
@@ -155,9 +173,188 @@ enum Step {
 const ADDRESS: Reg = Reg::new(16);
 const SCALAR: Reg = Reg::new(16);
 
+struct AllocatedCode {
+    preheader: Vec<Step>,
+    body: Vec<Step>,
+    unroll2: Option<Vec<Step>>,
+    epilogue: Vec<Step>,
+}
+
 struct Program {
     shape: Shape,
+    preheader: Vec<Step>,
     code: Vec<Step>,
+    unroll2: Option<Vec<Step>>,
+    epilogue: Vec<Step>,
+}
+
+impl Program {
+    fn lower_steps(&self, steps: &[Step], emitter: &mut BatchEmitter<'_, '_>, iteration: u32) {
+        for &step in steps {
+            match step {
+                Step::Word(word) => emitter.asm().emit(word),
+                Step::Address(stream, word) => {
+                    let extra = if self.shape.repeat() {
+                        iteration
+                    } else if stream.stride < 0 {
+                        u32::from(self.shape.lanes() - 1)
+                    } else {
+                        0
+                    };
+                    let addr = stream
+                        .addr
+                        .shifted(extra.wrapping_mul(stream.stride as u32));
+                    emitter.address(addr);
+                    emitter.asm().emit(word);
+                }
+                Step::AddressShift(stream, extra, word) => {
+                    let addr = stream
+                        .addr
+                        .shifted(extra.wrapping_mul(stream.stride as u32));
+                    emitter.address(addr);
+                    emitter.asm().emit(word);
+                }
+                Step::Gp(value, dst, arr) => {
+                    let source = emitter.invariant(value, SCALAR);
+                    emitter.asm().emit(vdup(arr, dst, source));
+                }
+                Step::Vector(value, dst) => {
+                    let src = emitter.vector_invariant(value, dst);
+                    if self.shape == Shape::Packed(8) {
+                        emitter.asm().emit(vdup_lane(Arr::D2, dst, src, 0));
+                    } else if src != dst {
+                        emitter.asm().emit(vmov(true, dst, src));
+                    }
+                }
+                Step::FpBroadcast(value, dst, double, check_exact) => {
+                    let src = emitter.vector_invariant(value, dst);
+                    if double {
+                        emitter.asm().emit(vdup_lane(Arr::D2, dst, src, 0));
+                    } else if check_exact {
+                        let tmp = VReg::new(28);
+                        let gp2 = Reg::new(17);
+                        emitter.asm().emit_all(&[
+                            unary(crate::encode::Unary::Narrow, tmp, src),
+                            unary(crate::encode::Unary::Widen, VReg::new(29), tmp),
+                            fmov_from_v(Size::X, SCALAR, src),
+                            fmov_from_v(Size::X, gp2, VReg::new(29)),
+                            cmp(Size::X, SCALAR, gp2, Shift::Lsl, 0),
+                        ]);
+                        let bail = emitter.bail();
+                        emitter.asm().b_cond(Cond::Ne, bail);
+                        emitter.asm().emit(vdup_lane(Arr::S4, dst, tmp, 0));
+                    } else {
+                        emitter.asm().emit_all(&[
+                            unary(crate::encode::Unary::Narrow, dst, src),
+                            vdup_lane(Arr::S4, dst, dst, 0),
+                        ]);
+                    }
+                }
+                Step::FpScalar(value, dst, double, check_exact) => {
+                    let src = emitter.vector_invariant(value, dst);
+                    if double {
+                        if src != dst {
+                            emitter.asm().emit(fmov_d(dst, src));
+                        }
+                    } else if check_exact {
+                        let tmp = VReg::new(28);
+                        let gp2 = Reg::new(17);
+                        emitter.asm().emit_all(&[
+                            unary(crate::encode::Unary::Narrow, tmp, src),
+                            unary(crate::encode::Unary::Widen, VReg::new(29), tmp),
+                            fmov_from_v(Size::X, SCALAR, src),
+                            fmov_from_v(Size::X, gp2, VReg::new(29)),
+                            cmp(Size::X, SCALAR, gp2, Shift::Lsl, 0),
+                        ]);
+                        let bail = emitter.bail();
+                        emitter.asm().b_cond(Cond::Ne, bail);
+                        emitter.asm().emit(vmov(false, dst, tmp));
+                    } else {
+                        emitter
+                            .asm()
+                            .emit(unary(crate::encode::Unary::Narrow, dst, src));
+                    }
+                }
+                Step::ReduceInit {
+                    acc,
+                    dst,
+                    double,
+                    max_strips,
+                } => {
+                    emitter.bail_if_strips_exceed(max_strips);
+                    let src = emitter.vector_invariant(acc, VReg::new(29));
+                    let tmp = VReg::new(28);
+                    let gp2 = Reg::new(17);
+                    let bail = emitter.bail();
+                    // Verify initial accumulator is a finite exact integer within half
+                    // the exact integer range (`2^52` for f64, `2^23` for f32).
+                    let half_limit = if double {
+                        ((1u64 << 52) as f64).to_bits()
+                    } else {
+                        ((1u64 << 23) as f64).to_bits()
+                    };
+                    emitter.asm().emit_all(&[
+                        unary(crate::encode::Unary::Frintz, tmp, src),
+                        fcmp(tmp, src),
+                    ]);
+                    emitter.asm().b_cond(Cond::Ne, bail);
+                    emitter.asm().emit_all(&[
+                        fmov_from_v(Size::X, SCALAR, src),
+                        and_imm(Size::X, SCALAR, SCALAR, i64::MAX as u64),
+                    ]);
+                    emitter.immediate(gp2, half_limit);
+                    emitter.asm().emit(cmp(Size::X, SCALAR, gp2, Shift::Lsl, 0));
+                    emitter.asm().b_cond(Cond::Hi, bail);
+                    // Put `init` in lane 0 and `+0.0` in upper lanes (`fmov_d` / `fcvt s, d`
+                    // both zero upper bits).
+                    if double {
+                        emitter.asm().emit(fmov_d(dst, src));
+                    } else {
+                        emitter
+                            .asm()
+                            .emit(unary(crate::encode::Unary::Narrow, dst, src));
+                    }
+                }
+                Step::ReduceFinish { acc, src, double } => {
+                    let tmp = VReg::new(28);
+                    if double {
+                        emitter.asm().emit(sfaddp(true, tmp, src));
+                    } else {
+                        emitter.asm().emit_all(&[
+                            vfaddp(false, tmp, src, src),
+                            sfaddp(false, tmp, tmp),
+                            unary(crate::encode::Unary::Widen, tmp, tmp),
+                        ]);
+                    }
+                    emitter.write_f64(acc, tmp);
+                }
+                Step::BailCond(cond) => {
+                    let bail = emitter.bail();
+                    emitter.asm().b_cond(cond, bail);
+                }
+                Step::BailNonZero(reg) => {
+                    let bail = emitter.bail();
+                    emitter.asm().cbz(Size::W, true, reg, bail);
+                }
+                Step::BailNonZeroX(reg) => {
+                    let bail = emitter.bail();
+                    emitter.asm().cbz(Size::X, true, reg, bail);
+                }
+                Step::Imm(bits) => emitter.immediate(SCALAR, bits),
+                Step::Charge(cost) => emitter.adjust_charge(SCALAR, cost),
+                Step::LaneStore(stream, lane, value) => {
+                    emitter.address(stream.addr.shifted(lane.wrapping_mul(stream.stride as u32)));
+                    let physical = lane ^ u32::from(stream.stride < 0);
+                    let data = Reg::new(17);
+                    emitter.asm().emit(vumov(3, data, value, physical));
+                    emitter.asm().emit(str(Size::X, data, ADDRESS, 0));
+                }
+                Step::Publish(value, lane, ty, from) => emitter.publish(value, lane, ty, from),
+                Step::Update(value, keep, set) => emitter.update(value, keep, set),
+                Step::Debit(cost) => emitter.debit(cost),
+            }
+        }
+    }
 }
 
 impl BatchBody for Program {
@@ -165,100 +362,41 @@ impl BatchBody for Program {
         self.shape.is_float()
     }
 
+    fn lower_preheader(&self, emitter: &mut BatchEmitter<'_, '_>) {
+        self.lower_steps(&self.preheader, emitter, 0);
+    }
+
     fn lower(&self, emitter: &mut BatchEmitter<'_, '_>) {
         for iteration in 0..=u32::from(self.shape.repeat()) {
-            for &step in &self.code {
-                match step {
-                    Step::Word(word) => emitter.asm().emit(word),
-                    Step::Address(stream, word) => {
-                        let extra = if self.shape.repeat() {
-                            iteration
-                        } else if stream.stride < 0 {
-                            u32::from(self.shape.lanes() - 1)
-                        } else {
-                            0
-                        };
-                        let addr = stream
-                            .addr
-                            .shifted(extra.wrapping_mul(stream.stride as u32));
-                        emitter.address(addr);
-                        emitter.asm().emit(word);
-                    }
-                    Step::Gp(value, dst, arr) => {
-                        let source = emitter.invariant(value, SCALAR);
-                        emitter.asm().emit(vdup(arr, dst, source));
-                    }
-                    Step::Vector(value, dst) => {
-                        let src = emitter.vector_invariant(value, dst);
-                        if self.shape == Shape::Packed(8) {
-                            emitter.asm().emit(vdup_lane(Arr::D2, dst, src, 0));
-                        } else if src != dst {
-                            emitter.asm().emit(vmov(true, dst, src));
-                        }
-                    }
-                    Step::FpBroadcast(value, dst, double, check_exact) => {
-                        let src = emitter.vector_invariant(value, dst);
-                        if double {
-                            emitter.asm().emit(vdup_lane(Arr::D2, dst, src, 0));
-                        } else if check_exact {
-                            let tmp = VReg::new(28);
-                            let gp2 = Reg::new(17);
-                            emitter.asm().emit_all(&[
-                                unary(crate::encode::Unary::Narrow, tmp, src),
-                                unary(crate::encode::Unary::Widen, VReg::new(29), tmp),
-                                fmov_from_v(Size::X, SCALAR, src),
-                                fmov_from_v(Size::X, gp2, VReg::new(29)),
-                                cmp(Size::X, SCALAR, gp2, Shift::Lsl, 0),
-                            ]);
-                            let bail = emitter.bail();
-                            emitter.asm().b_cond(Cond::Ne, bail);
-                            emitter.asm().emit(vdup_lane(Arr::S4, dst, tmp, 0));
-                        } else {
-                            emitter.asm().emit_all(&[
-                                unary(crate::encode::Unary::Narrow, dst, src),
-                                vdup_lane(Arr::S4, dst, dst, 0),
-                            ]);
-                        }
-                    }
-                    Step::BailCond(cond) => {
-                        let bail = emitter.bail();
-                        emitter.asm().b_cond(cond, bail);
-                    }
-                    Step::BailNonZero(reg) => {
-                        let bail = emitter.bail();
-                        emitter.asm().cbz(Size::W, true, reg, bail);
-                    }
-                    Step::BailNonZeroX(reg) => {
-                        let bail = emitter.bail();
-                        emitter.asm().cbz(Size::X, true, reg, bail);
-                    }
-                    Step::Imm(bits) => emitter.immediate(SCALAR, bits),
-                    Step::Charge(cost) => emitter.adjust_charge(SCALAR, cost),
-                    Step::LaneStore(stream, lane, value) => {
-                        emitter
-                            .address(stream.addr.shifted(lane.wrapping_mul(stream.stride as u32)));
-                        let physical = lane ^ u32::from(stream.stride < 0);
-                        let data = Reg::new(17);
-                        emitter.asm().emit(vumov(3, data, value, physical));
-                        emitter.asm().emit(str(Size::X, data, ADDRESS, 0));
-                    }
-                    Step::Publish(value, lane, ty, from) => emitter.publish(value, lane, ty, from),
-                    Step::Update(value, keep, set) => emitter.update(value, keep, set),
-                    Step::Debit(cost) => emitter.debit(cost),
-                }
-            }
+            self.lower_steps(&self.code, emitter, iteration);
         }
+    }
+
+    fn has_unroll2(&self) -> bool {
+        self.unroll2.is_some()
+    }
+
+    fn lower_unroll2(&self, emitter: &mut BatchEmitter<'_, '_>) {
+        if let Some(steps) = &self.unroll2 {
+            self.lower_steps(steps, emitter, 0);
+        }
+    }
+
+    fn lower_epilogue(&self, emitter: &mut BatchEmitter<'_, '_>) {
+        self.lower_steps(&self.epilogue, emitter, 0);
     }
 }
 
 impl LoopKernel for Vector {
     fn recognize(&self, func: &Func, loop_: &Loop) -> Option<Plan> {
         let defs = Defs::new(func);
-        if loop_.trip.again == Cc::e || !loop_.streams.iter().any(|s| s.write()) {
+        if loop_.trip.again == Cc::e {
             return None;
         }
         let groups = loop_.groups();
-        if func.resident
+        let has_write = loop_.streams.iter().any(|s| s.write());
+        if has_write
+            && func.resident
             && loop_.streams.iter().any(|s| s.write() && s.width == 8)
             && let Some(plan) = conditional::recognize(func, loop_, &defs, &groups)
         {
@@ -276,12 +414,16 @@ impl LoopKernel for Vector {
 
         let paths = Paths::new(func, loop_)?;
         let values = Values::new(func, loop_, &defs, &paths)?;
-        let has_fp = loop_.blocks.iter().any(|&b| {
-            func.blocks[b.0 as usize].insts.iter().any(|&(r, op)| {
-                r.is_some_and(|v| func.ty(v) == Type::F64)
-                    || matches!(op, Op::X87Store { .. } | Op::X87Load { .. })
-            })
-        });
+        if !has_write && values.reduction.is_none() {
+            return None;
+        }
+        let has_fp = values.reduction.is_some()
+            || loop_.blocks.iter().any(|&b| {
+                func.blocks[b.0 as usize].insts.iter().any(|&(r, op)| {
+                    r.is_some_and(|v| func.ty(v) == Type::F64)
+                        || matches!(op, Op::X87Store { .. } | Op::X87Load { .. })
+                })
+            });
         let width = loop_.streams.iter().map(|s| s.width).max()?;
         let shapes = if has_fp {
             if !paths.selects.is_empty()
@@ -292,7 +434,15 @@ impl LoopKernel for Vector {
             {
                 return None;
             }
-            vec![Shape::Float32, Shape::Float64]
+            if let Some(red) = values.reduction {
+                if red.single {
+                    vec![Shape::Float32]
+                } else {
+                    vec![Shape::Float64]
+                }
+            } else {
+                vec![Shape::Float32, Shape::Float64]
+            }
         } else if width >= 8 {
             if !paths.selects.is_empty()
                 || !matches!(width, 8 | 16)
@@ -319,26 +469,48 @@ impl LoopKernel for Vector {
                 next: 0,
                 bindings: BTreeMap::new(),
             };
-            if let Some(code) = builder.build(&groups) {
-                let inputs = builder
+            if let Some(allocated) = builder.build(&groups) {
+                let mut inputs: Vec<Value> = builder
                     .insts
                     .iter()
                     .filter_map(|i| match i.op {
-                        OpCode::Broadcast(v) | OpCode::BroadcastExactF32(v) => Some(v),
+                        OpCode::Broadcast(v)
+                        | OpCode::BroadcastExactF32(v)
+                        | OpCode::ScalarInvariant(v, _) => Some(v),
                         _ => None,
                     })
                     .collect();
+                if let Some(red) = values.reduction {
+                    inputs.push(red.param);
+                }
                 return Some(Plan {
                     name: "V",
                     lanes: shape.lanes(),
                     inputs,
                     conditional: false,
-                    body: Box::new(Program { shape, code }),
+                    body: Box::new(Program {
+                        shape,
+                        preheader: allocated.preheader,
+                        code: allocated.body,
+                        unroll2: allocated.unroll2,
+                        epilogue: allocated.epilogue,
+                    }),
                 });
             }
         }
         None
     }
+}
+
+/// Statically proved exact-integer floating-point reduction (`acc += term`)
+/// eligible for bit-exact vector reassociation.
+#[derive(Clone, Copy)]
+struct FpReduction {
+    param: Value,
+    next: Value,
+    term: Value,
+    single: bool,
+    max_term: f64,
 }
 
 /// The original scalar iteration can reconstitute an overwritten value if
@@ -349,6 +521,7 @@ struct Values<'a> {
     loop_: &'a Loop,
     paths: &'a Paths,
     stable: BTreeMap<Value, u32>,
+    reduction: Option<FpReduction>,
 }
 
 impl<'a> Values<'a> {
@@ -359,13 +532,64 @@ impl<'a> Values<'a> {
             loop_,
             paths,
             stable: BTreeMap::new(),
+            reduction: None,
         };
+        let mut exact_int_facts: Option<Vec<Option<(f64, bool)>>> = None;
         for &(p, a) in &loop_.carried {
             let mask = if p == a {
                 u32::MAX
             } else if func.ty(p) == Type::F64 {
-                // Loop-carried floating-point recurrence: not independent across lanes.
-                return None;
+                // Count loop-body uses of `p`. A loop-carried F64 with zero
+                // loop-body uses (e.g. a saved C1 operand for the exit record)
+                // has no loop-carried data dependence and is refreshed by the
+                // scalar tail iteration before loop exit.
+                let mut body_uses = 0usize;
+                for &b in &loop_.blocks {
+                    for &(_, op) in &func.blocks[b.0 as usize].insts {
+                        for u in op.uses() {
+                            if u == p {
+                                body_uses += 1;
+                            }
+                        }
+                    }
+                }
+                if body_uses == 0 {
+                    continue;
+                }
+                // Only admit a single loop-carried FP addition whose term is
+                // statically proved to be a non-negative-zero exact integer;
+                // general floating-point reductions are NEVER reassociated.
+                if values.reduction.is_some() || body_uses != 1 {
+                    return None;
+                }
+                let (term, single) = match defs.op(a)? {
+                    Op::Fp(FpOp::Add, lhs, rhs, _) if lhs == p && rhs != p => (rhs, false),
+                    Op::Fp(FpOp::Add, lhs, rhs, _) if rhs == p && lhs != p => (lhs, false),
+                    Op::X87Single(FpOp::Add, lhs, rhs, _) if lhs == p && rhs != p => (rhs, true),
+                    Op::X87Single(FpOp::Add, lhs, rhs, _) if rhs == p && lhs != p => (lhs, true),
+                    _ => return None,
+                };
+                let facts = exact_int_facts.get_or_insert_with(|| {
+                    crate::translate::opt::front::passes::exact_integer_facts(func)
+                });
+                let (max_term, f32_exact) = (*facts.get(term.0 as usize)?)?;
+                if max_term <= 0.0 || !max_term.is_finite() {
+                    return None;
+                }
+                if single && (!f32_exact || max_term > (1u64 << 20) as f64) {
+                    return None;
+                }
+                if !single && max_term > (1u64 << 48) as f64 {
+                    return None;
+                }
+                values.reduction = Some(FpReduction {
+                    param: p,
+                    next: a,
+                    term,
+                    single,
+                    max_term,
+                });
+                continue;
             } else if loop_.ivs.iter().any(|iv| iv.base == p) {
                 continue;
             } else {
@@ -414,6 +638,7 @@ impl<'a> Values<'a> {
                     | Op::PageCross { .. }
                     | Op::FrameDisjoint { .. }
                     | Op::Validate
+                    | Op::FpValidate { .. }
                     | Op::Constant(..)
                     | Op::Test { .. }
                     | Op::Select { .. }
@@ -473,6 +698,14 @@ impl<'a> Values<'a> {
             }
         }
         for v in observed {
+            if let Some(red) = values.reduction
+                && (v == red.next || v == red.param)
+            {
+                if !values.independent(red.term, u32::MAX) {
+                    return None;
+                }
+                continue;
+            }
             if !values.independent(v, u32::MAX) {
                 return None;
             }
@@ -694,7 +927,7 @@ impl Builder<'_> {
         Some(())
     }
 
-    fn build(&mut self, groups: &[Vec<(usize, Stream)>]) -> Option<Vec<Step>> {
+    fn build(&mut self, groups: &[Vec<(usize, Stream)>]) -> Option<AllocatedCode> {
         self.read_inputs(groups)?;
         // Emit the entire read set and all computations + pre-store lane
         // validations (`A64-OPT-10`) before any store commits.
@@ -725,11 +958,31 @@ impl Builder<'_> {
                 inputs,
             ));
         }
+        let mut reduction_term = None;
+        if let Some(red) = self.values.reduction {
+            let double = self.shape == Shape::Float64;
+            if red.single == double {
+                return None;
+            }
+            let term = self.float_val(red.term, false, !double)?;
+            self.mapped.insert((red.next, u32::MAX), term);
+            reduction_term = Some((term, double));
+        }
         if self.shape.is_float() {
             // Every potentially-failing FP op in the loop body must be covered
             // by our validated data path so no exception can be skipped.
             for &b in &self.values.loop_.blocks {
                 for &(res, op) in &self.values.func.blocks[b.0 as usize].insts {
+                    if let Op::FpValidate { values, .. } = op {
+                        if values
+                            .into_iter()
+                            .flatten()
+                            .any(|v| !self.mapped.contains_key(&(v, u32::MAX)))
+                        {
+                            return None;
+                        }
+                        continue;
+                    }
                     if op.can_fail()
                         && !matches!(
                             op,
@@ -751,6 +1004,13 @@ impl Builder<'_> {
             self.insts.push(Inst {
                 op: OpCode::Store(memory),
                 inputs,
+                outputs: vec![],
+            });
+        }
+        if let Some((term, double)) = reduction_term {
+            self.insts.push(Inst {
+                op: OpCode::ReduceAdd { double },
+                inputs: vec![term],
                 outputs: vec![],
             });
         }
@@ -784,7 +1044,7 @@ impl Builder<'_> {
         });
     }
 
-    fn live_code(&mut self) -> Option<Vec<Step>> {
+    fn live_code(&mut self) -> Option<AllocatedCode> {
         let mut live = vec![false; self.next];
         self.insts = std::mem::take(&mut self.insts)
             .into_iter()
@@ -808,7 +1068,7 @@ impl Builder<'_> {
             let elem_ok = match (self.shape, stream.write()) {
                 (Shape::Float32, false) => matches!(stream.width, 1 | 2 | 4),
                 (Shape::Float32, true) => stream.width == 4,
-                (Shape::Float64, false) => matches!(stream.width, 4 | 8),
+                (Shape::Float64, false) => matches!(stream.width, 1 | 2 | 4 | 8),
                 (Shape::Float64, true) => matches!(stream.width, 4 | 8),
                 _ => unreachable!(),
             };
@@ -830,7 +1090,11 @@ impl Builder<'_> {
             }
         };
         if count == 1 {
-            matches!(bytes, 4 | 8 | 16).then_some(())
+            if self.shape == Shape::Float64 && !stream.write() {
+                matches!(bytes, 2 | 4 | 8 | 16).then_some(())
+            } else {
+                matches!(bytes, 4 | 8 | 16).then_some(())
+            }
         } else {
             matches!(bytes, 8 | 16).then_some(())
         }
@@ -1330,86 +1594,173 @@ impl Builder<'_> {
                 }
             }
             Op::FromInt(a) => {
+                // Full 32-bit signed integer stream (`fild dword ptr [esi]`) is exact in binary64.
+                if double
+                    && matches!(defs.op(a), Some(Op::Load { width: 4, .. }))
+                    && let Some(&int_vec) = self.mapped.get(&(a, u32::MAX))
+                {
+                    let id = self.emit(OpCode::Unary(Unary::Int32ToFp64), vec![int_vec]);
+                    self.mapped.insert((v, u32::MAX), id);
+                    return Some(id);
+                }
+                // Small integer stream loads (u8/u16/i8/i16) are exact in both binary32 and binary64.
+                let (src_val, sign_ext_bits) = match defs.op(a) {
+                    Some(Op::Load { width: 1 | 2, .. }) => (a, 0u32),
+                    Some(Op::IntUnary(IntUnary::ZeroExtend8 | IntUnary::ZeroExtend16, inner))
+                        if self.mapped.contains_key(&(inner, u32::MAX)) =>
+                    {
+                        (inner, 0)
+                    }
+                    Some(Op::IntUnary(IntUnary::SignExtend8, inner))
+                        if self.mapped.contains_key(&(inner, u32::MAX)) =>
+                    {
+                        (inner, 24)
+                    }
+                    Some(Op::IntUnary(IntUnary::SignExtend16, inner))
+                        if self.mapped.contains_key(&(inner, u32::MAX)) =>
+                    {
+                        (inner, 16)
+                    }
+                    _ => return None,
+                };
+                let mut int_vec = *self.mapped.get(&(src_val, u32::MAX))?;
+                if sign_ext_bits != 0 {
+                    let shifted = self.emit(
+                        OpCode::Unary(Unary::Shift(ShiftImm::Shl, Arr::S4, sign_ext_bits)),
+                        vec![int_vec],
+                    );
+                    int_vec = self.emit(
+                        OpCode::Unary(Unary::Shift(ShiftImm::Sshr, Arr::S4, sign_ext_bits)),
+                        vec![shifted],
+                    );
+                }
                 if double {
-                    return None;
+                    let f32s = self.emit(OpCode::Unary(Unary::IntToFp32), vec![int_vec]);
+                    self.emit(OpCode::Unary(Unary::Widen2sTo2d), vec![f32s])
+                } else {
+                    self.emit(OpCode::Unary(Unary::IntToFp32), vec![int_vec])
                 }
-                // Zero-extended u8/u16 stream loads are exact in binary32.
-                let is_small_unsigned = match defs.op(a) {
-                    Some(Op::Load { width: 1 | 2, .. }) => true,
-                    Some(Op::IntUnary(IntUnary::ZeroExtend8 | IntUnary::ZeroExtend16, inner)) => {
-                        self.mapped.contains_key(&(inner, u32::MAX))
-                    }
-                    _ => false,
-                };
-                if !is_small_unsigned {
-                    return None;
-                }
-                let src_val = match defs.op(a) {
-                    Some(Op::IntUnary(IntUnary::ZeroExtend8 | IntUnary::ZeroExtend16, inner)) => {
-                        inner
-                    }
-                    _ => a,
-                };
-                let int_vec = *self.mapped.get(&(src_val, u32::MAX))?;
-                self.emit(OpCode::Unary(Unary::IntToFp32), vec![int_vec])
             }
             Op::X87Single(op, a, b, proved) if !double => {
                 let proved_all = single_proved(proved);
                 let a_exact = proved & (SINGLE_A | SINGLE_EXACT) != 0;
                 let b_exact = proved & (SINGLE_B | SINGLE_EXACT) != 0;
-                let av = self.float_val(a, !a_exact, a_exact)?;
-                let bv = self.float_val(b, !b_exact, b_exact)?;
-                let res = self.binary(Binary::Fp(op, false), av, bv);
-                if !proved_all {
-                    // Exclude min-normal exponent 1 (2^-126) just like scalar
-                    // `x87_single`, so tininess-before-rounding cannot round a
-                    // subnormal product/quotient up to 2^-126 and hide from checks.
-                    self.checked.insert(res);
-                    self.effect(
-                        OpCode::CheckNormal {
-                            double: false,
-                            strict_min_exp: true,
-                        },
-                        vec![res],
-                    );
-                    if matches!(op, FpOp::Mul | FpOp::Div) {
+                if op == FpOp::Mul
+                    && let Some((vec_val, scalar_val, scalar_exact)) =
+                        self.mul_by_scalar_pair(a, a_exact, b, b_exact)
+                {
+                    let vec_exact = if vec_val == a { a_exact } else { b_exact };
+                    let av = self.float_val(vec_val, !vec_exact, vec_exact)?;
+                    let sv = if proved_all {
+                        self.float_scalar(scalar_val, false, scalar_exact)?
+                    } else {
+                        self.float_val(scalar_val, !scalar_exact, scalar_exact)?
+                    };
+                    let res = self.emit(OpCode::FpMulElem { double: false }, vec![av, sv]);
+                    if !proved_all {
+                        self.checked.insert(res);
+                        self.effect(
+                            OpCode::CheckNormal {
+                                double: false,
+                                strict_min_exp: true,
+                            },
+                            vec![res],
+                        );
                         self.effect(
                             OpCode::CheckMulUnderflow {
                                 double: false,
-                                div: op == FpOp::Div,
+                                div: false,
                             },
-                            vec![res, av, bv],
+                            vec![res, av, sv],
                         );
                     }
+                    res
+                } else {
+                    let av = self.float_val(a, !a_exact, a_exact)?;
+                    let bv = self.float_val(b, !b_exact, b_exact)?;
+                    let res = self.binary(Binary::Fp(op, false), av, bv);
+                    if !proved_all {
+                        // Exclude min-normal exponent 1 (2^-126) just like scalar
+                        // `x87_single`, so tininess-before-rounding cannot round a
+                        // subnormal product/quotient up to 2^-126 and hide from checks.
+                        self.checked.insert(res);
+                        self.effect(
+                            OpCode::CheckNormal {
+                                double: false,
+                                strict_min_exp: true,
+                            },
+                            vec![res],
+                        );
+                        if matches!(op, FpOp::Mul | FpOp::Div) {
+                            self.effect(
+                                OpCode::CheckMulUnderflow {
+                                    double: false,
+                                    div: op == FpOp::Div,
+                                },
+                                vec![res, av, bv],
+                            );
+                        }
+                    }
+                    res
                 }
-                res
             }
             Op::Fp(op, a, b, proved) if double => {
-                let av = self.float_val(a, !proved, false)?;
-                let bv = self.float_val(b, !proved, false)?;
-                let res = self.binary(Binary::Fp(op, true), av, bv);
-                if !proved {
-                    // Exclude min-normal exponent 1 (2^-1022) so tininess-before-
-                    // rounding cannot round a subnormal result up to 2^-1022.
-                    self.checked.insert(res);
-                    self.effect(
-                        OpCode::CheckNormal {
-                            double: true,
-                            strict_min_exp: true,
-                        },
-                        vec![res],
-                    );
-                    if matches!(op, FpOp::Mul | FpOp::Div) {
+                if op == FpOp::Mul
+                    && let Some((vec_val, scalar_val, _)) =
+                        self.mul_by_scalar_pair(a, false, b, false)
+                {
+                    let av = self.float_val(vec_val, !proved, false)?;
+                    let sv = if proved {
+                        self.float_scalar(scalar_val, true, false)?
+                    } else {
+                        self.float_val(scalar_val, !proved, false)?
+                    };
+                    let res = self.emit(OpCode::FpMulElem { double: true }, vec![av, sv]);
+                    if !proved {
+                        self.checked.insert(res);
+                        self.effect(
+                            OpCode::CheckNormal {
+                                double: true,
+                                strict_min_exp: true,
+                            },
+                            vec![res],
+                        );
                         self.effect(
                             OpCode::CheckMulUnderflow {
                                 double: true,
-                                div: op == FpOp::Div,
+                                div: false,
                             },
-                            vec![res, av, bv],
+                            vec![res, av, sv],
                         );
                     }
+                    res
+                } else {
+                    let av = self.float_val(a, !proved, false)?;
+                    let bv = self.float_val(b, !proved, false)?;
+                    let res = self.binary(Binary::Fp(op, true), av, bv);
+                    if !proved {
+                        // Exclude min-normal exponent 1 (2^-1022) so tininess-before-
+                        // rounding cannot round a subnormal result up to 2^-1022.
+                        self.checked.insert(res);
+                        self.effect(
+                            OpCode::CheckNormal {
+                                double: true,
+                                strict_min_exp: true,
+                            },
+                            vec![res],
+                        );
+                        if matches!(op, FpOp::Mul | FpOp::Div) {
+                            self.effect(
+                                OpCode::CheckMulUnderflow {
+                                    double: true,
+                                    div: op == FpOp::Div,
+                                },
+                                vec![res, av, bv],
+                            );
+                        }
+                    }
+                    res
                 }
-                res
             }
             Op::Fma {
                 op: fma_op @ (FmaOp::Add | FmaOp::RevSub),
@@ -1453,105 +1804,176 @@ impl Builder<'_> {
         Some(id)
     }
 
-    fn allocate(&self) -> Option<Vec<Step>> {
-        let mut last = vec![0; self.next];
-        for (i, inst) in self.insts.iter().enumerate() {
-            for &v in inst.inputs.iter().chain(&inst.outputs) {
-                last[v] = i;
-            }
+    fn is_scalar_invariant(&self, v: Value) -> bool {
+        let v = self.resolve(v);
+        if self.mapped.contains_key(&(v, u32::MAX)) {
+            return false;
         }
-        let mut owners = [None; 12];
-        let mut locations = vec![VReg::new(0); self.next];
-        let mut code = Vec::new();
-        for (i, inst) in self.insts.iter().enumerate() {
-            for owner in &mut owners {
-                if owner.is_some_and(|v| last[v] <= i) {
-                    *owner = None;
-                }
+        let defs = self.values.defs;
+        defs.constant(v).is_some()
+            || defs.invariant(&self.values.loop_.blocks, v)
+            || self.values.stable.get(&v) == Some(&u32::MAX)
+    }
+
+    fn mul_by_scalar_pair(
+        &self,
+        a: Value,
+        a_exact: bool,
+        b: Value,
+        b_exact: bool,
+    ) -> Option<(Value, Value, bool)> {
+        let a_inv = self.is_scalar_invariant(a);
+        let b_inv = self.is_scalar_invariant(b);
+        if b_inv && !a_inv {
+            Some((a, b, b_exact))
+        } else if a_inv && !b_inv {
+            Some((b, a, a_exact))
+        } else {
+            None
+        }
+    }
+
+    fn float_scalar(&mut self, v: Value, double: bool, exact_f32: bool) -> Option<usize> {
+        let v = self.resolve(v);
+        let defs = self.values.defs;
+        if let Some(bits) = defs.constant(v) {
+            let f = f64::from_bits(bits as u64);
+            if !double && f64::from(f as f32).to_bits() != f.to_bits() {
+                return None;
             }
-            for &v in &inst.outputs {
-                let slot = owners.iter().position(Option::is_none)?;
-                owners[slot] = Some(v);
-                locations[v] = VReg::new(16 + slot as u8);
+            let packed = if double {
+                bits as u64
+            } else {
+                u64::from((f as f32).to_bits())
+            };
+            return Some(self.emit(OpCode::ScalarConstant(packed), vec![]));
+        }
+        let check_exact = !double && !(exact_f32 || self.known_exact_f32(v));
+        Some(self.emit(OpCode::ScalarInvariant(v, check_exact), vec![]))
+    }
+
+    fn is_hoistable(&self, op: &OpCode) -> bool {
+        matches!(
+            op,
+            OpCode::Constant(_)
+                | OpCode::Broadcast(_)
+                | OpCode::BroadcastExactF32(_)
+                | OpCode::ScalarInvariant(_, _)
+                | OpCode::ScalarConstant(_)
+        ) || matches!(op, OpCode::Load(mem) if mem.stream.stride == 0 && mem.count == 1)
+    }
+
+    fn emit_inst(
+        &self,
+        code: &mut Vec<Step>,
+        inst: &Inst,
+        locations: &[VReg],
+        sign_mask_reg: Option<VReg>,
+        acc_reg: Option<VReg>,
+        extra_shift: u32,
+    ) {
+        let target = || locations[inst.outputs[0]];
+        let read = |n: usize| locations[inst.inputs[n]];
+        match inst.op {
+            OpCode::Load(memory) => {
+                let regs = inst
+                    .outputs
+                    .iter()
+                    .map(|&v| locations[v])
+                    .collect::<Vec<_>>();
+                self.memory(code, memory, &regs, extra_shift);
             }
-            let target = || locations[inst.outputs[0]];
-            let read = |n: usize| locations[inst.inputs[n]];
-            match inst.op {
-                OpCode::Load(memory) => {
-                    let regs = inst
-                        .outputs
-                        .iter()
-                        .map(|&v| locations[v])
-                        .collect::<Vec<_>>();
-                    self.memory(&mut code, memory, &regs);
+            OpCode::Store(memory) => {
+                let regs = inst
+                    .inputs
+                    .iter()
+                    .map(|&v| locations[v])
+                    .collect::<Vec<_>>();
+                self.memory(code, memory, &regs, extra_shift);
+            }
+            OpCode::Broadcast(v) => match self.shape {
+                Shape::Scalar(_) => {
+                    code.push(Step::Gp(v, target(), self.shape.arr()));
                 }
-                OpCode::Store(memory) => {
-                    let regs = inst
-                        .inputs
-                        .iter()
-                        .map(|&v| locations[v])
-                        .collect::<Vec<_>>();
-                    self.memory(&mut code, memory, &regs);
+                Shape::Packed(_) if self.values.func.ty(v) == Type::I32 => {
+                    code.push(Step::Gp(v, target(), Arr::S4));
                 }
-                OpCode::Broadcast(v) => match self.shape {
-                    Shape::Scalar(_) => {
-                        code.push(Step::Gp(v, target(), self.shape.arr()));
-                    }
-                    Shape::Packed(_) if self.values.func.ty(v) == Type::I32 => {
-                        code.push(Step::Gp(v, target(), Arr::S4));
-                    }
-                    Shape::Packed(_) => code.push(Step::Vector(v, target())),
-                    Shape::Float32 => code.push(Step::FpBroadcast(v, target(), false, false)),
-                    Shape::Float64 => code.push(Step::FpBroadcast(v, target(), true, false)),
-                },
-                OpCode::BroadcastExactF32(v) => {
-                    code.push(Step::FpBroadcast(v, target(), false, true));
-                }
-                OpCode::Constant(bits) => {
-                    if bits == 0 {
-                        code.push(Step::Word(vzero(true, target())));
+                Shape::Packed(_) => code.push(Step::Vector(v, target())),
+                Shape::Float32 => code.push(Step::FpBroadcast(v, target(), false, false)),
+                Shape::Float64 => code.push(Step::FpBroadcast(v, target(), true, false)),
+            },
+            OpCode::BroadcastExactF32(v) => {
+                code.push(Step::FpBroadcast(v, target(), false, true));
+            }
+            OpCode::ScalarInvariant(v, check_exact) => {
+                code.push(Step::FpScalar(
+                    v,
+                    target(),
+                    self.shape == Shape::Float64,
+                    check_exact,
+                ));
+            }
+            OpCode::ScalarConstant(bits) => {
+                if bits == 0 {
+                    code.push(Step::Word(vzero(false, target())));
+                } else {
+                    code.push(Step::Imm(bits));
+                    let size = if self.shape == Shape::Float64 {
+                        Size::X
                     } else {
-                        code.push(Step::Imm(bits as u64));
-                        code.push(Step::Word(vdup(self.shape.arr(), target(), SCALAR)));
-                        if self.shape == Shape::Packed(16) {
-                            let high = (bits >> 64) as u64;
-                            if high != bits as u64 {
-                                code.push(Step::Imm(high));
-                                code.push(Step::Word(vins_general(3, target(), 1, SCALAR)));
-                            }
+                        Size::W
+                    };
+                    code.push(Step::Word(fmov_to_v(size, target(), SCALAR)));
+                }
+            }
+            OpCode::Constant(bits) => {
+                if bits == 0 {
+                    code.push(Step::Word(vzero(true, target())));
+                } else {
+                    code.push(Step::Imm(bits as u64));
+                    code.push(Step::Word(vdup(self.shape.arr(), target(), SCALAR)));
+                    if self.shape == Shape::Packed(16) {
+                        let high = (bits >> 64) as u64;
+                        if high != bits as u64 {
+                            code.push(Step::Imm(high));
+                            code.push(Step::Word(vins_general(3, target(), 1, SCALAR)));
                         }
                     }
                 }
-                OpCode::Unary(op) => match op {
-                    Unary::Not => code.push(Step::Word(vnot(true, target(), read(0)))),
-                    Unary::Shift(op, arr, n) => {
-                        code.push(Step::Word(vshift(op, arr, target(), read(0), n)));
+            }
+            OpCode::Unary(op) => match op {
+                Unary::Not => code.push(Step::Word(vnot(true, target(), read(0)))),
+                Unary::Shift(op, arr, n) => {
+                    code.push(Step::Word(vshift(op, arr, target(), read(0), n)));
+                }
+                Unary::ShuffleWords(imm) => {
+                    let mut index = 0u64;
+                    for word in 0..4 {
+                        let byte = u64::from(2 * (imm >> (2 * word) & 3));
+                        index |= (byte | ((byte + 1) << 8)) << (16 * word);
                     }
-                    Unary::ShuffleWords(imm) => {
-                        let mut index = 0u64;
-                        for word in 0..4 {
-                            let byte = u64::from(2 * (imm >> (2 * word) & 3));
-                            index |= (byte | ((byte + 1) << 8)) << (16 * word);
-                        }
-                        let table = VReg::new(28);
-                        code.push(Step::Imm(index));
-                        code.push(Step::Word(fmov_to_v(Size::X, table, SCALAR)));
-                        code.push(Step::Imm(index + 0x0808_0808_0808_0808));
-                        code.push(Step::Word(vins_general(3, table, 1, SCALAR)));
-                        code.push(Step::Word(
-                            0x4e00_0000
-                                | (table.number() << 16)
-                                | (read(0).number() << 5)
-                                | target().number(),
-                        ));
-                    }
-                    Unary::FpNeg(double) | Unary::FpAbs(double) => {
+                    let table = VReg::new(28);
+                    code.push(Step::Imm(index));
+                    code.push(Step::Word(fmov_to_v(Size::X, table, SCALAR)));
+                    code.push(Step::Imm(index + 0x0808_0808_0808_0808));
+                    code.push(Step::Word(vins_general(3, table, 1, SCALAR)));
+                    code.push(Step::Word(
+                        0x4e00_0000
+                            | (table.number() << 16)
+                            | (read(0).number() << 5)
+                            | target().number(),
+                    ));
+                }
+                Unary::FpNeg(double) | Unary::FpAbs(double) => {
+                    let logic = if matches!(op, Unary::FpNeg(_)) {
+                        Logic::Eor
+                    } else {
+                        Logic::Bic
+                    };
+                    if let Some(mask_reg) = sign_mask_reg {
+                        code.push(Step::Word(vlogic(logic, true, target(), read(0), mask_reg)));
+                    } else {
                         let tmp = VReg::new(28);
-                        let logic = if matches!(op, Unary::FpNeg(_)) {
-                            Logic::Eor
-                        } else {
-                            Logic::Bic
-                        };
                         if double {
                             code.push(Step::Word(movz(Size::X, SCALAR, 0x8000, 48)));
                             code.push(Step::Word(vdup(Arr::D2, tmp, SCALAR)));
@@ -1561,237 +1983,631 @@ impl Builder<'_> {
                         }
                         code.push(Step::Word(vlogic(logic, true, target(), read(0), tmp)));
                     }
-                    Unary::FpToInt(double, rounding) => {
-                        code.push(Step::Word(vfcvt_int_mode(
-                            double,
-                            rounding,
-                            target(),
-                            read(0),
-                        )));
-                    }
-                    Unary::IntToFp32 => {
-                        code.push(Step::Word(vfromint(target(), read(0))));
-                    }
-                    Unary::Widen2sTo2d => {
-                        code.push(Step::Word(vwiden(target(), read(0))));
-                    }
-                },
-                OpCode::Binary(op) => {
-                    let x = VReg::new(28);
-                    let y = VReg::new(29);
-                    let word = match op {
-                        Binary::Same(op, arr) => vsame(op, arr, target(), read(0), read(1)),
-                        Binary::Logic(op) => vlogic(op, true, target(), read(0), read(1)),
-                        Binary::UnsignedGt(arr) => {
-                            vsame(Same::Cmgt, arr, target(), read(0), read(1)) | 1 << 29
-                        }
-                        Binary::Unpack(op, log) => {
-                            let arr = Arr::new(u32::from(log), true);
-                            code.push(Step::Word(vpermute(
-                                Permute::Zip1,
-                                arr,
-                                x,
-                                read(0),
-                                read(1),
-                            )));
-                            code.push(Step::Word(vpermute(
-                                Permute::Zip2,
-                                arr,
-                                y,
-                                read(0),
-                                read(1),
-                            )));
-                            vpermute(op, Arr::D2, target(), x, y)
-                        }
-                        Binary::Pack(op, log) => {
-                            let narrow = Arr::new(u32::from(log), false);
-                            code.push(Step::Word(vnarrow(op, narrow, x, read(0))));
-                            code.push(Step::Word(vnarrow(op, narrow, y, read(1))));
-                            vpermute(Permute::Zip1, Arr::S4, target(), x, y)
-                        }
-                        Binary::Fp(fp, double) => {
-                            if double {
-                                vfloat_2d(float_op(fp), target(), read(0), read(1))
-                            } else {
-                                vfloat(float_op(fp), true, target(), read(0), read(1))
-                            }
-                        }
-                    };
-                    code.push(Step::Word(word));
                 }
-                OpCode::FpFma { sub, double } => {
-                    let t = target();
-                    let (ra, rb, rc) = (read(0), read(1), read(2));
-                    if t == ra || t == rb {
-                        let tmp = VReg::new(28);
-                        code.push(Step::Word(vmov(true, tmp, rc)));
-                        code.push(Step::Word(vfmla(double, sub, tmp, ra, rb)));
-                        code.push(Step::Word(vmov(true, t, tmp)));
-                    } else {
-                        if t != rc {
-                            code.push(Step::Word(vmov(true, t, rc)));
-                        }
-                        code.push(Step::Word(vfmla(double, sub, t, ra, rb)));
-                    }
-                }
-                OpCode::CheckNormal {
-                    double,
-                    strict_min_exp,
-                } => {
-                    let src = read(0);
-                    let gp2 = Reg::new(17);
-                    if !double {
-                        // Normal (`1..=254`, or `2..=254` when `strict_min_exp`
-                        // excludes min-normal 2^-126) or ±0.0 across all 4 f32 lanes.
-                        let (lo_imm, span_imm) = if strict_min_exp {
-                            (0x0200u16, 0xfd00u16)
-                        } else {
-                            (0x0100u16, 0xfe00u16)
-                        };
-                        let (t1, t2, t3) = (VReg::new(28), VReg::new(29), VReg::new(30));
-                        code.push(Step::Word(vshift(ShiftImm::Shl, Arr::S4, t1, src, 1)));
-                        code.push(Step::Word(vzero(true, t2)));
-                        code.push(Step::Word(vsame(Same::Cmeq, Arr::S4, t2, t1, t2)));
-                        code.push(Step::Word(movz(Size::W, SCALAR, lo_imm, 16)));
-                        code.push(Step::Word(vdup(Arr::S4, t3, SCALAR)));
-                        code.push(Step::Word(vsame(Same::Sub, Arr::S4, t1, t1, t3)));
-                        code.push(Step::Word(vlogic(Logic::Bic, true, t1, t1, t2)));
-                        code.push(Step::Word(umaxv(t1, t1)));
-                        code.push(Step::Word(fmov_from_v(Size::W, SCALAR, t1)));
-                        code.push(Step::Word(movz(Size::W, gp2, span_imm, 16)));
-                        code.push(Step::Word(cmp(Size::W, SCALAR, gp2, Shift::Lsl, 0)));
-                        code.push(Step::BailCond(Cond::Hs));
-                    } else {
-                        // Normal (`1..=2046`, or `2..=2046` when `strict_min_exp`
-                        // excludes min-normal 2^-1022) or ±0.0 across both f64 lanes.
-                        let (lo_exp, span_exp) = if strict_min_exp { (2, 2045) } else { (1, 2046) };
-                        for lane in 0..2u32 {
-                            code.push(Step::Word(vumov(3, SCALAR, src, lane)));
-                            code.push(Step::Word(lsl_imm(Size::X, SCALAR, SCALAR, 1)));
-                            code.push(Step::Word(lsr_imm(Size::X, gp2, SCALAR, 53)));
-                            code.push(Step::Word(sub_imm(Size::W, gp2, gp2, lo_exp, false)));
-                            code.push(Step::Word(cmp_imm(Size::X, SCALAR, 0, false)));
-                            code.push(Step::Word(csel(Size::W, gp2, Reg::ZR, gp2, Cond::Eq)));
-                            code.push(Step::Word(cmp_imm(Size::W, gp2, span_exp, false)));
-                            code.push(Step::BailCond(Cond::Hs));
-                        }
-                    }
-                }
-                OpCode::CheckMulUnderflow { double, div } => {
-                    // Bail if any lane underflowed to ±0.0 from nonzero input(s).
-                    let (res, a, b) = (read(0), read(1), read(2));
-                    let (t1, t2, t3) = (VReg::new(28), VReg::new(29), VReg::new(30));
-                    let arr = if double { Arr::D2 } else { Arr::S4 };
-                    code.push(Step::Word(vzero(true, t3)));
-                    code.push(Step::Word(vshift(ShiftImm::Shl, arr, t1, res, 1)));
-                    code.push(Step::Word(vsame(Same::Cmeq, arr, t1, t1, t3)));
-                    code.push(Step::Word(vshift(ShiftImm::Shl, arr, t2, a, 1)));
-                    code.push(Step::Word(vsame(Same::Cmeq, arr, t2, t2, t3)));
-                    code.push(Step::Word(vlogic(Logic::Bic, true, t1, t1, t2)));
-                    if !div {
-                        code.push(Step::Word(vshift(ShiftImm::Shl, arr, t2, b, 1)));
-                        code.push(Step::Word(vsame(Same::Cmeq, arr, t2, t2, t3)));
-                        code.push(Step::Word(vlogic(Logic::Bic, true, t1, t1, t2)));
-                    }
-                    if double {
-                        let gp2 = Reg::new(17);
-                        code.push(Step::Word(vumov(3, SCALAR, t1, 0)));
-                        code.push(Step::Word(vumov(3, gp2, t1, 1)));
-                        code.push(Step::Word(orr(Size::X, SCALAR, SCALAR, gp2, Shift::Lsl, 0)));
-                        code.push(Step::BailNonZeroX(SCALAR));
-                    } else {
-                        code.push(Step::Word(umaxv(t1, t1)));
-                        code.push(Step::Word(fmov_from_v(Size::W, SCALAR, t1)));
-                        code.push(Step::BailNonZero(SCALAR));
-                    }
-                }
-                OpCode::CheckIntRange { double, rounding } => {
-                    let src = read(0);
-                    let gp2 = Reg::new(17);
-                    if !double {
-                        let tmp = VReg::new(28);
-                        code.push(Step::Word(vshift(ShiftImm::Shl, Arr::S4, tmp, src, 1)));
-                        code.push(Step::Word(umaxv(tmp, tmp)));
-                        code.push(Step::Word(fmov_from_v(Size::W, SCALAR, tmp)));
-                        code.push(Step::Word(movz(Size::W, gp2, 0x9e00, 16)));
-                        code.push(Step::Word(cmp(Size::W, SCALAR, gp2, Shift::Lsl, 0)));
-                        code.push(Step::BailCond(Cond::Hs));
-                    } else {
-                        let hi_imm = if rounding == 3 { 0x41e0 } else { 0x41df };
-                        code.push(Step::Word(movz(Size::W, gp2, hi_imm, 16)));
-                        for lane in 0..2u32 {
-                            code.push(Step::Word(vumov(3, SCALAR, src, lane)));
-                            code.push(Step::Word(ubfx(Size::X, SCALAR, SCALAR, 32, 31)));
-                            code.push(Step::Word(cmp(Size::W, SCALAR, gp2, Shift::Lsl, 0)));
-                            code.push(Step::BailCond(Cond::Hs));
-                        }
-                    }
-                }
-                OpCode::ClassTest(test) => {
-                    let r = Reg::new(test);
-                    let tmp = VReg::new(28);
-                    code.push(Step::Word(vpermute(
-                        Permute::Uzp1,
-                        Arr::S4,
-                        tmp,
-                        read(0),
+                Unary::FpToInt(double, rounding) => {
+                    code.push(Step::Word(vfcvt_int_mode(
+                        double,
+                        rounding,
+                        target(),
                         read(0),
                     )));
-                    code.push(Step::Word(vumov(3, r, tmp, 0)));
                 }
-                OpCode::LaneStore(stream, lane) => {
-                    code.push(Step::LaneStore(stream, lane, read(0)))
+                Unary::IntToFp32 => {
+                    code.push(Step::Word(vfromint(target(), read(0))));
                 }
-                OpCode::Publish(v, lane, ty) => code.push(Step::Publish(v, lane, ty, read(0))),
-                OpCode::Update(v, keep, set) => code.push(Step::Update(v, keep, set)),
-                OpCode::Debit(cost) => code.push(Step::Debit(cost)),
-                OpCode::Charge(cost) => {
-                    if inst.inputs.is_empty() {
-                        let lanes = if self.shape.repeat() {
-                            1
-                        } else {
-                            self.shape.lanes()
-                        };
-                        code.push(Step::Imm(u64::from(lanes)));
-                    } else {
-                        let arr = self.shape.arr();
-                        let tmp = VReg::new(28);
-                        code.push(Step::Word(
-                            0x4E31_B800
-                                | (arr.log2() << 22)
-                                | (read(0).number() << 5)
-                                | tmp.number(),
-                        ));
-                        code.push(Step::Word(vumov(arr.log2(), SCALAR, tmp, 0)));
-                        code.push(Step::Word(sbfx(Size::X, SCALAR, SCALAR, 0, arr.bits())));
-                        code.push(Step::Word(sub(
-                            Size::X,
-                            SCALAR,
-                            Reg::new(31),
-                            SCALAR,
-                            Shift::Lsl,
-                            0,
-                        )));
+                Unary::Int32ToFp64 => {
+                    let t = target();
+                    code.push(Step::Word(vsxtl_2d(t, read(0))));
+                    code.push(Step::Word(vfromint_2d(t, t)));
+                }
+                Unary::Widen2sTo2d => {
+                    code.push(Step::Word(vwiden(target(), read(0))));
+                }
+            },
+            OpCode::Binary(op) => {
+                let x = VReg::new(28);
+                let y = VReg::new(29);
+                let word = match op {
+                    Binary::Same(op, arr) => vsame(op, arr, target(), read(0), read(1)),
+                    Binary::Logic(op) => vlogic(op, true, target(), read(0), read(1)),
+                    Binary::UnsignedGt(arr) => {
+                        vsame(Same::Cmgt, arr, target(), read(0), read(1)) | 1 << 29
                     }
-                    code.push(Step::Charge(cost));
-                }
-                OpCode::Blend => {
+                    Binary::Unpack(op, log) => {
+                        let arr = Arr::new(u32::from(log), true);
+                        code.push(Step::Word(vpermute(
+                            Permute::Zip1,
+                            arr,
+                            x,
+                            read(0),
+                            read(1),
+                        )));
+                        code.push(Step::Word(vpermute(
+                            Permute::Zip2,
+                            arr,
+                            y,
+                            read(0),
+                            read(1),
+                        )));
+                        vpermute(op, Arr::D2, target(), x, y)
+                    }
+                    Binary::Pack(op, log) => {
+                        let narrow = Arr::new(u32::from(log), false);
+                        code.push(Step::Word(vnarrow(op, narrow, x, read(0))));
+                        code.push(Step::Word(vnarrow(op, narrow, y, read(1))));
+                        vpermute(Permute::Zip1, Arr::S4, target(), x, y)
+                    }
+                    Binary::Fp(fp, double) => {
+                        if double {
+                            vfloat_2d(float_op(fp), target(), read(0), read(1))
+                        } else {
+                            vfloat(float_op(fp), true, target(), read(0), read(1))
+                        }
+                    }
+                };
+                code.push(Step::Word(word));
+            }
+            OpCode::FpMulElem { double } => {
+                code.push(Step::Word(vfmul_elem(
+                    true,
+                    double,
+                    target(),
+                    read(0),
+                    read(1),
+                    0,
+                )));
+            }
+            OpCode::FpFma { sub, double } => {
+                let t = target();
+                let (ra, rb, rc) = (read(0), read(1), read(2));
+                if t == ra || t == rb {
                     let tmp = VReg::new(28);
-                    code.push(Step::Word(vmov(true, tmp, read(0))));
-                    code.push(Step::Word(vlogic(Logic::Bsl, true, tmp, read(1), read(2))));
-                    code.push(Step::Word(vmov(true, target(), tmp)));
+                    code.push(Step::Word(vmov(true, tmp, rc)));
+                    code.push(Step::Word(vfmla(double, sub, tmp, ra, rb)));
+                    code.push(Step::Word(vmov(true, t, tmp)));
+                } else {
+                    if t != rc {
+                        code.push(Step::Word(vmov(true, t, rc)));
+                    }
+                    code.push(Step::Word(vfmla(double, sub, t, ra, rb)));
+                }
+            }
+            OpCode::ReduceAdd { double } => {
+                let acc = acc_reg.expect("reduction accumulator allocated");
+                let term = read(0);
+                let word = if double {
+                    vfloat_2d(Float::Fadd, acc, acc, term)
+                } else {
+                    vfloat(Float::Fadd, true, acc, acc, term)
+                };
+                code.push(Step::Word(word));
+            }
+            OpCode::CheckNormal {
+                double,
+                strict_min_exp,
+            } => {
+                let src = read(0);
+                let gp2 = Reg::new(17);
+                if !double {
+                    let (lo_imm, span_imm) = if strict_min_exp {
+                        (0x0200u16, 0xfd00u16)
+                    } else {
+                        (0x0100u16, 0xfe00u16)
+                    };
+                    let (t1, t2, t3) = (VReg::new(28), VReg::new(29), VReg::new(30));
+                    code.push(Step::Word(vshift(ShiftImm::Shl, Arr::S4, t1, src, 1)));
+                    code.push(Step::Word(vzero(true, t2)));
+                    code.push(Step::Word(vsame(Same::Cmeq, Arr::S4, t2, t1, t2)));
+                    code.push(Step::Word(movz(Size::W, SCALAR, lo_imm, 16)));
+                    code.push(Step::Word(vdup(Arr::S4, t3, SCALAR)));
+                    code.push(Step::Word(vsame(Same::Sub, Arr::S4, t1, t1, t3)));
+                    code.push(Step::Word(vlogic(Logic::Bic, true, t1, t1, t2)));
+                    code.push(Step::Word(umaxv(t1, t1)));
+                    code.push(Step::Word(fmov_from_v(Size::W, SCALAR, t1)));
+                    code.push(Step::Word(movz(Size::W, gp2, span_imm, 16)));
+                    code.push(Step::Word(cmp(Size::W, SCALAR, gp2, Shift::Lsl, 0)));
+                    code.push(Step::BailCond(Cond::Hs));
+                } else {
+                    let (lo_exp, span_exp) = if strict_min_exp { (2, 2045) } else { (1, 2046) };
+                    for lane in 0..2u32 {
+                        code.push(Step::Word(vumov(3, SCALAR, src, lane)));
+                        code.push(Step::Word(lsl_imm(Size::X, SCALAR, SCALAR, 1)));
+                        code.push(Step::Word(lsr_imm(Size::X, gp2, SCALAR, 53)));
+                        code.push(Step::Word(sub_imm(Size::W, gp2, gp2, lo_exp, false)));
+                        code.push(Step::Word(cmp_imm(Size::X, SCALAR, 0, false)));
+                        code.push(Step::Word(csel(Size::W, gp2, Reg::ZR, gp2, Cond::Eq)));
+                        code.push(Step::Word(cmp_imm(Size::W, gp2, span_exp, false)));
+                        code.push(Step::BailCond(Cond::Hs));
+                    }
+                }
+            }
+            OpCode::CheckMulUnderflow { double, div } => {
+                let (res, a, b) = (read(0), read(1), read(2));
+                let (t1, t2, t3) = (VReg::new(28), VReg::new(29), VReg::new(30));
+                let arr = if double { Arr::D2 } else { Arr::S4 };
+                code.push(Step::Word(vzero(true, t3)));
+                code.push(Step::Word(vshift(ShiftImm::Shl, arr, t1, res, 1)));
+                code.push(Step::Word(vsame(Same::Cmeq, arr, t1, t1, t3)));
+                code.push(Step::Word(vshift(ShiftImm::Shl, arr, t2, a, 1)));
+                code.push(Step::Word(vsame(Same::Cmeq, arr, t2, t2, t3)));
+                code.push(Step::Word(vlogic(Logic::Bic, true, t1, t1, t2)));
+                if !div {
+                    code.push(Step::Word(vshift(ShiftImm::Shl, arr, t2, b, 1)));
+                    code.push(Step::Word(vsame(Same::Cmeq, arr, t2, t2, t3)));
+                    code.push(Step::Word(vlogic(Logic::Bic, true, t1, t1, t2)));
+                }
+                if double {
+                    let gp2 = Reg::new(17);
+                    code.push(Step::Word(vumov(3, SCALAR, t1, 0)));
+                    code.push(Step::Word(vumov(3, gp2, t1, 1)));
+                    code.push(Step::Word(orr(Size::X, SCALAR, SCALAR, gp2, Shift::Lsl, 0)));
+                    code.push(Step::BailNonZeroX(SCALAR));
+                } else {
+                    code.push(Step::Word(umaxv(t1, t1)));
+                    code.push(Step::Word(fmov_from_v(Size::W, SCALAR, t1)));
+                    code.push(Step::BailNonZero(SCALAR));
+                }
+            }
+            OpCode::CheckIntRange { double, rounding } => {
+                let src = read(0);
+                let gp2 = Reg::new(17);
+                if !double {
+                    let tmp = VReg::new(28);
+                    code.push(Step::Word(vshift(ShiftImm::Shl, Arr::S4, tmp, src, 1)));
+                    code.push(Step::Word(umaxv(tmp, tmp)));
+                    code.push(Step::Word(fmov_from_v(Size::W, SCALAR, tmp)));
+                    code.push(Step::Word(movz(Size::W, gp2, 0x9e00, 16)));
+                    code.push(Step::Word(cmp(Size::W, SCALAR, gp2, Shift::Lsl, 0)));
+                    code.push(Step::BailCond(Cond::Hs));
+                } else {
+                    let hi_imm = if rounding == 3 { 0x41e0 } else { 0x41df };
+                    code.push(Step::Word(movz(Size::W, gp2, hi_imm, 16)));
+                    for lane in 0..2u32 {
+                        code.push(Step::Word(vumov(3, SCALAR, src, lane)));
+                        code.push(Step::Word(ubfx(Size::X, SCALAR, SCALAR, 32, 31)));
+                        code.push(Step::Word(cmp(Size::W, SCALAR, gp2, Shift::Lsl, 0)));
+                        code.push(Step::BailCond(Cond::Hs));
+                    }
+                }
+            }
+            OpCode::ClassTest(test) => {
+                let r = Reg::new(test);
+                let tmp = VReg::new(28);
+                code.push(Step::Word(vpermute(
+                    Permute::Uzp1,
+                    Arr::S4,
+                    tmp,
+                    read(0),
+                    read(0),
+                )));
+                code.push(Step::Word(vumov(3, r, tmp, 0)));
+            }
+            OpCode::LaneStore(stream, lane) => code.push(Step::LaneStore(stream, lane, read(0))),
+            OpCode::Publish(v, lane, ty) => code.push(Step::Publish(v, lane, ty, read(0))),
+            OpCode::Update(v, keep, set) => code.push(Step::Update(v, keep, set)),
+            OpCode::Debit(cost) => code.push(Step::Debit(cost)),
+            OpCode::Charge(cost) => {
+                if inst.inputs.is_empty() {
+                    let lanes = if self.shape.repeat() {
+                        1
+                    } else {
+                        self.shape.lanes()
+                    };
+                    code.push(Step::Imm(u64::from(lanes)));
+                } else {
+                    let arr = self.shape.arr();
+                    let tmp = VReg::new(28);
+                    code.push(Step::Word(
+                        0x4E31_B800 | (arr.log2() << 22) | (read(0).number() << 5) | tmp.number(),
+                    ));
+                    code.push(Step::Word(vumov(arr.log2(), SCALAR, tmp, 0)));
+                    code.push(Step::Word(sbfx(Size::X, SCALAR, SCALAR, 0, arr.bits())));
+                    code.push(Step::Word(sub(
+                        Size::X,
+                        SCALAR,
+                        Reg::new(31),
+                        SCALAR,
+                        Shift::Lsl,
+                        0,
+                    )));
+                }
+                code.push(Step::Charge(cost));
+            }
+            OpCode::Blend => {
+                let tmp = VReg::new(28);
+                code.push(Step::Word(vmov(true, tmp, read(0))));
+                code.push(Step::Word(vlogic(Logic::Bsl, true, tmp, read(1), read(2))));
+                code.push(Step::Word(vmov(true, target(), tmp)));
+            }
+        }
+    }
+
+    fn alloc_slots(owners: &mut [Option<usize>; 12], outputs: &[usize]) -> Option<Vec<usize>> {
+        if outputs.len() > 1 {
+            // Prefer consecutive slots so LD2/LD3/LD4 transfers need zero temporary moves.
+            let n = outputs.len();
+            if let Some(start) =
+                (0..=12 - n).find(|&s| owners[s..s + n].iter().all(Option::is_none))
+            {
+                let mut slots = Vec::with_capacity(n);
+                for (k, &v) in outputs.iter().enumerate() {
+                    owners[start + k] = Some(v);
+                    slots.push(start + k);
+                }
+                return Some(slots);
+            }
+        }
+        let mut slots = Vec::with_capacity(outputs.len());
+        for &v in outputs {
+            let slot = owners.iter().position(Option::is_none)?;
+            owners[slot] = Some(v);
+            slots.push(slot);
+        }
+        Some(slots)
+    }
+
+    fn try_allocate(&self, hoist_limit: usize) -> Option<AllocatedCode> {
+        let mut last = vec![0; self.next];
+        for (i, inst) in self.insts.iter().enumerate() {
+            for &v in inst.inputs.iter().chain(&inst.outputs) {
+                last[v] = i;
+            }
+        }
+
+        let mut owners = [None; 12];
+        let mut locations = vec![VReg::new(0); self.next];
+        let mut preheader = Vec::new();
+        let mut epilogue = Vec::new();
+        let mut pinned = vec![false; 12];
+
+        // Reserve dedicated register for exact-integer FP reduction accumulator.
+        let acc_reg = if let Some(red) = self.values.reduction {
+            let slot = owners.iter().position(Option::is_none)?;
+            owners[slot] = Some(usize::MAX);
+            pinned[slot] = true;
+            let reg = VReg::new(16 + slot as u8);
+            let double = self.shape == Shape::Float64;
+            let half_limit = if double {
+                (1u64 << 52) as f64
+            } else {
+                (1u64 << 23) as f64
+            };
+            let per_strip = f64::from(self.shape.lanes()) * red.max_term;
+            let max_strips = (half_limit / per_strip).floor() as u64;
+            if max_strips == 0 {
+                return None;
+            }
+            preheader.push(Step::ReduceInit {
+                acc: red.param,
+                dst: reg,
+                double,
+                max_strips,
+            });
+            epilogue.push(Step::ReduceFinish {
+                acc: red.param,
+                src: reg,
+                double,
+            });
+            Some(reg)
+        } else {
+            None
+        };
+
+        // Hoist FpNeg/FpAbs sign-bit mask out of the inner loop into preheader.
+        let sign_mask_double = self.insts.iter().find_map(|inst| match inst.op {
+            OpCode::Unary(Unary::FpNeg(d) | Unary::FpAbs(d)) => Some(d),
+            _ => None,
+        });
+        let has_count4 = self
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.op, OpCode::Load(m) | OpCode::Store(m) if m.count == 4));
+        let sign_mask_reg = if let Some(double) = sign_mask_double {
+            // `v31` is untouched unless temporary LD4/ST4 uses `v28..v31`.
+            let reg = if !has_count4 {
+                VReg::new(31)
+            } else if let Some(slot) = owners.iter().position(Option::is_none) {
+                owners[slot] = Some(usize::MAX);
+                pinned[slot] = true;
+                VReg::new(16 + slot as u8)
+            } else {
+                VReg::new(28)
+            };
+            if reg != VReg::new(28) {
+                if double {
+                    preheader.push(Step::Word(movz(Size::X, SCALAR, 0x8000, 48)));
+                    preheader.push(Step::Word(vdup(Arr::D2, reg, SCALAR)));
+                } else {
+                    preheader.push(Step::Word(movz(Size::W, SCALAR, 0x8000, 16)));
+                    preheader.push(Step::Word(vdup(Arr::S4, reg, SCALAR)));
+                }
+                Some(reg)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Hoist loop-invariant constants, broadcasts, scalar invariants, and
+        // `stride == 0` LD1R loads into preheader up to `hoist_limit`.
+        let mut hoisted = vec![false; self.insts.len()];
+        let mut hoisted_count = 0usize;
+        for (i, inst) in self.insts.iter().enumerate() {
+            if hoisted_count >= hoist_limit
+                || !self.is_hoistable(&inst.op)
+                || inst.outputs.len() != 1
+            {
+                continue;
+            }
+            if let Some(slot) = owners.iter().position(Option::is_none) {
+                let v = inst.outputs[0];
+                owners[slot] = Some(usize::MAX);
+                pinned[slot] = true;
+                locations[v] = VReg::new(16 + slot as u8);
+                hoisted[i] = true;
+                hoisted_count += 1;
+                self.emit_inst(&mut preheader, inst, &locations, sign_mask_reg, acc_reg, 0);
+            }
+        }
+
+        // Allocate the single-strip body.
+        let mut body_owners = owners;
+        let mut body = Vec::new();
+        for (i, inst) in self.insts.iter().enumerate() {
+            if hoisted[i] {
+                continue;
+            }
+            for (slot, owner) in body_owners.iter_mut().enumerate() {
+                if !pinned[slot] && owner.is_some_and(|v| last[v] <= i) {
+                    *owner = None;
+                }
+            }
+            let slots = Self::alloc_slots(&mut body_owners, &inst.outputs)?;
+            for (&v, slot) in inst.outputs.iter().zip(slots) {
+                locations[v] = VReg::new(16 + slot as u8);
+            }
+            self.emit_inst(&mut body, inst, &locations, sign_mask_reg, acc_reg, 0);
+        }
+
+        // Attempt 2× strip unrolling for eligible FP vector strips without
+        // increasing register pressure (must fit cleanly in remaining `v16..v27`).
+        let unroll2 = if self.shape.is_float() && !self.shape.repeat() {
+            self.try_allocate_unroll2(
+                &hoisted,
+                &owners,
+                &pinned,
+                &locations,
+                sign_mask_reg,
+                acc_reg,
+            )
+        } else {
+            None
+        };
+
+        Some(AllocatedCode {
+            preheader,
+            body,
+            unroll2,
+            epilogue,
+        })
+    }
+
+    fn can_pair_memory(&self, memory: Memory) -> Option<VSize> {
+        let s = memory.stream;
+        if memory.count != 1 || s.stride == 0 {
+            return None;
+        }
+        let log = s.width.trailing_zeros();
+        let (work, bytes) = match self.shape {
+            Shape::Float32 => (2, s.width * 4),
+            Shape::Float64 => (if s.write() { 3 } else { log }, s.width * 2),
+            _ => return None,
+        };
+        if work != log {
+            return None;
+        }
+        match bytes {
+            8 => Some(VSize::D),
+            16 => Some(VSize::Q),
+            _ => None,
+        }
+    }
+
+    fn try_allocate_unroll2(
+        &self,
+        hoisted: &[bool],
+        base_owners: &[Option<usize>; 12],
+        pinned: &[bool],
+        base_locations: &[VReg],
+        sign_mask_reg: Option<VReg>,
+        acc_reg: Option<VReg>,
+    ) -> Option<Vec<Step>> {
+        // Only unroll straight-line FP strips (no control-flow charge/publish ops).
+        let body_indices: Vec<usize> = (0..self.insts.len()).filter(|&i| !hoisted[i]).collect();
+        if body_indices.is_empty()
+            || body_indices.iter().any(|&i| {
+                matches!(
+                    self.insts[i].op,
+                    OpCode::Charge(_)
+                        | OpCode::ClassTest(_)
+                        | OpCode::LaneStore(..)
+                        | OpCode::Publish(..)
+                        | OpCode::Update(..)
+                        | OpCode::Debit(_)
+                )
+            })
+        {
+            return None;
+        }
+
+        // Build interleaved 2× schedule: each body instruction `i` runs for
+        // strip 0 (`step_idx = 2*k`) and strip 1 (`step_idx = 2*k + 1`).
+        // All loads, computations, and validations for BOTH strips execute
+        // BEFORE any store or reduction update commits.
+        let n_vals = self.next;
+        let total_vals = n_vals * 2;
+        let mut last = vec![0usize; total_vals];
+        for (k, &orig_i) in body_indices.iter().enumerate() {
+            let inst = &self.insts[orig_i];
+            for copy in 0..2usize {
+                let step_idx = k * 2 + copy;
+                let off = copy * n_vals;
+                for &v in &inst.inputs {
+                    let mapped = if self
+                        .insts
+                        .iter()
+                        .enumerate()
+                        .any(|(ii, x)| hoisted[ii] && x.outputs.contains(&v))
+                    {
+                        v
+                    } else {
+                        v + off
+                    };
+                    last[mapped] = step_idx;
+                }
+                for &v in &inst.outputs {
+                    last[v + off] = step_idx;
                 }
             }
         }
+
+        let mut owners = *base_owners;
+        let mut locs0 = base_locations.to_vec();
+        let mut locs1 = base_locations.to_vec();
+        let mut code = Vec::new();
+        let lanes = u32::from(self.shape.lanes());
+
+        for (k, &orig_i) in body_indices.iter().enumerate() {
+            let inst = &self.insts[orig_i];
+            let step0 = k * 2;
+            let step1 = k * 2 + 1;
+
+            // Free values dead at or before step0.
+            for (slot, owner) in owners.iter_mut().enumerate() {
+                if !pinned[slot] && owner.is_some_and(|v| last[v] <= step0) {
+                    *owner = None;
+                }
+            }
+
+            // Paired contiguous `Load` -> single `LDP`!
+            if let OpCode::Load(memory) = inst.op
+                && let Some(vsize) = self.can_pair_memory(memory)
+            {
+                let v0 = inst.outputs[0];
+                let v1 = v0 + n_vals;
+                let s0 = owners.iter().position(Option::is_none)?;
+                owners[s0] = Some(v0);
+                let s1 = owners.iter().position(Option::is_none)?;
+                owners[s1] = Some(v1);
+                let r0 = VReg::new(16 + s0 as u8);
+                let r1 = VReg::new(16 + s1 as u8);
+                locs0[v0] = r0;
+                locs1[v0] = r1;
+                let s = memory.stream;
+                if s.stride > 0 {
+                    code.push(Step::AddressShift(
+                        s,
+                        0,
+                        ldp_v(vsize, Index::Offset, r0, r1, ADDRESS, 0),
+                    ));
+                } else {
+                    code.push(Step::AddressShift(
+                        s,
+                        2 * lanes - 1,
+                        ldp_v(vsize, Index::Offset, r1, r0, ADDRESS, 0),
+                    ));
+                }
+                continue;
+            }
+
+            // Paired contiguous `Store` -> single `STP`!
+            if let OpCode::Store(memory) = inst.op
+                && let Some(vsize) = self.can_pair_memory(memory)
+            {
+                let r0 = locs0[inst.inputs[0]];
+                let r1 = locs1[inst.inputs[0]];
+                let s = memory.stream;
+                if s.stride > 0 {
+                    code.push(Step::AddressShift(
+                        s,
+                        0,
+                        stp_v(vsize, Index::Offset, r0, r1, ADDRESS, 0),
+                    ));
+                } else {
+                    code.push(Step::AddressShift(
+                        s,
+                        2 * lanes - 1,
+                        stp_v(vsize, Index::Offset, r1, r0, ADDRESS, 0),
+                    ));
+                }
+                continue;
+            }
+
+            // Allocate outputs for strip 0 and emit strip 0.
+            let outs0: Vec<usize> = inst.outputs.clone();
+            let slots0 = Self::alloc_slots(&mut owners, &outs0)?;
+            for (&v, slot) in outs0.iter().zip(slots0) {
+                locs0[v] = VReg::new(16 + slot as u8);
+            }
+            self.emit_inst(&mut code, inst, &locs0, sign_mask_reg, acc_reg, 0);
+
+            // Free values dead at or before step1.
+            for (slot, owner) in owners.iter_mut().enumerate() {
+                if !pinned[slot] && owner.is_some_and(|v| last[v] <= step1) {
+                    *owner = None;
+                }
+            }
+
+            // Allocate outputs for strip 1 and emit strip 1.
+            let outs1: Vec<usize> = inst.outputs.iter().map(|&v| v + n_vals).collect();
+            let slots1 = Self::alloc_slots(&mut owners, &outs1)?;
+            for (&v, slot) in inst.outputs.iter().zip(slots1) {
+                locs1[v] = VReg::new(16 + slot as u8);
+            }
+            self.emit_inst(&mut code, inst, &locs1, sign_mask_reg, acc_reg, lanes);
+        }
+
         Some(code)
     }
 
-    fn memory(&self, code: &mut Vec<Step>, memory: Memory, regs: &[VReg]) {
+    fn allocate(&self) -> Option<AllocatedCode> {
+        let max_hoist = self
+            .insts
+            .iter()
+            .filter(|i| self.is_hoistable(&i.op) && i.outputs.len() == 1)
+            .count();
+        for limit in (0..=max_hoist).rev() {
+            if let Some(allocated) = self.try_allocate(limit) {
+                return Some(allocated);
+            }
+        }
+        None
+    }
+
+    fn memory(&self, code: &mut Vec<Step>, memory: Memory, regs: &[VReg], extra_shift: u32) {
         let s = memory.stream;
         let write = s.write();
         let mut log = s.width.trailing_zeros();
+        let emit_addr = |code: &mut Vec<Step>, word: u32| {
+            if extra_shift == 0 {
+                code.push(Step::Address(s, word));
+            } else {
+                let extra = if s.stride < 0 {
+                    extra_shift + u32::from(self.shape.lanes() - 1)
+                } else {
+                    extra_shift
+                };
+                code.push(Step::AddressShift(s, extra, word));
+            }
+        };
         if s.stride == 0 {
             let dst = regs[0];
+            let arr = self.shape.arr();
+            if memory.count == 1 && u32::from(s.width) == (1u32 << arr.log2()) {
+                emit_addr(code, vld1r(arr, dst, ADDRESS));
+                return;
+            }
             let size = match s.width {
                 1 => VMem::B,
                 2 => VMem::H,
@@ -1800,9 +2616,9 @@ impl Builder<'_> {
                 16 => VMem::Q,
                 _ => unreachable!(),
             };
-            code.push(Step::Address(s, vldr(size, dst, ADDRESS, 0)));
+            emit_addr(code, vldr(size, dst, ADDRESS, 0));
             if s.width < 16 {
-                code.push(Step::Word(vdup_lane(self.shape.arr(), dst, dst, 0)));
+                code.push(Step::Word(vdup_lane(arr, dst, dst, 0)));
             }
             return;
         }
@@ -1810,7 +2626,7 @@ impl Builder<'_> {
             Shape::Scalar(w) => (w.trailing_zeros(), s.width * self.shape.lanes()),
             Shape::Packed(_) => (log, 16),
             Shape::Float32 => (2, s.width * 4),
-            Shape::Float64 => (if write { 3 } else { log }, s.width * 2),
+            Shape::Float64 => (if write { 3 } else { log.max(2) }, s.width * 2),
         };
         let consecutive = regs
             .iter()
@@ -1821,6 +2637,7 @@ impl Builder<'_> {
         let transfer = |first| {
             if memory.count == 1 {
                 let size = match bytes {
+                    2 => VMem::H,
                     4 => VMem::S,
                     8 => VMem::D,
                     16 => VMem::Q,
@@ -1832,24 +2649,17 @@ impl Builder<'_> {
                     vldr(size, first, ADDRESS, 0)
                 }
             } else {
-                let op = match memory.count {
-                    2 => 0x8000,
-                    3 => 0x4000,
-                    4 => 0,
-                    _ => unreachable!(),
-                };
-                0x0C00_0000
-                    | (u32::from(bytes == 16) << 30)
-                    | (u32::from(!write) << 22)
-                    | op
-                    | (log << 10)
-                    | (ADDRESS.number() << 5)
-                    | first.number()
+                let arr = Arr::new(log, bytes == 16);
+                if write {
+                    vst_interleaved_arr(memory.count as u32, arr, first, ADDRESS)
+                } else {
+                    vld_interleaved(memory.count as u32, arr, first, ADDRESS)
+                }
             }
         };
         let instruction = transfer(first);
         if !write {
-            code.push(Step::Address(s, instruction));
+            emit_addr(code, instruction);
         }
         let elem = log;
         for (i, &target) in regs.iter().enumerate() {
@@ -1885,7 +2695,7 @@ impl Builder<'_> {
             }
         }
         if write {
-            code.push(Step::Address(s, instruction));
+            emit_addr(code, instruction);
         }
     }
 }

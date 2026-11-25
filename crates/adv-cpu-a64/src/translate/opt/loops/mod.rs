@@ -124,22 +124,45 @@ impl Loop {
     }
 
     fn groups(&self) -> Vec<Vec<(usize, Stream)>> {
-        let mut groups: Vec<Vec<(usize, Stream)>> = Vec::new();
+        // Group adjacent columns of an AoS interleave regardless of IR load
+        // order (e.g. loading RGB as B, G, R or XY as Y, X) while keeping
+        // each stream's original index for alias ordering (`r < w`).
+        let mut buckets: std::collections::BTreeMap<(Value, i32, u8, bool), Vec<(usize, Stream)>> =
+            std::collections::BTreeMap::new();
+        let mut order: Vec<(Value, i32, u8, bool)> = Vec::new();
         for (i, &s) in self.streams.iter().enumerate() {
-            // Adjacent columns of an interleave share one page and alias span.
-            if let Some(group) = groups.iter_mut().find(|g| {
-                let &(_, previous) = g.last().unwrap();
-                let bytes = u32::from(s.width) * (g.len() as u32 + 1);
-                previous.width == s.width
-                    && previous.stride == s.stride
-                    && previous.write() == s.write()
-                    && previous.addr.offset.checked_add(u32::from(s.width)) == Some(s.addr.offset)
-                    && previous.addr.base == s.addr.base
-                    && bytes <= s.stride.unsigned_abs()
-            }) {
-                group.push((i, s));
-            } else {
-                groups.push(vec![(i, s)]);
+            let key = (s.addr.base, s.stride, s.width, s.write());
+            if !buckets.contains_key(&key) {
+                order.push(key);
+            }
+            buckets.entry(key).or_default().push((i, s));
+        }
+        let mut groups: Vec<Vec<(usize, Stream)>> = Vec::new();
+        for key in order {
+            let mut list = buckets.remove(&key).unwrap();
+            if key.1 == 0 || list.len() == 1 {
+                for item in list {
+                    groups.push(vec![item]);
+                }
+                continue;
+            }
+            list.sort_by_key(|&(_, s)| s.addr.offset);
+            for (i, s) in list {
+                if let Some(group) = groups.iter_mut().find(|g| {
+                    let &(_, previous) = g.last().unwrap();
+                    let bytes = u32::from(s.width) * (g.len() as u32 + 1);
+                    previous.width == s.width
+                        && previous.stride == s.stride
+                        && previous.write() == s.write()
+                        && previous.addr.offset.checked_add(u32::from(s.width))
+                            == Some(s.addr.offset)
+                        && previous.addr.base == s.addr.base
+                        && bytes <= s.stride.unsigned_abs()
+                }) {
+                    group.push((i, s));
+                } else {
+                    groups.push(vec![(i, s)]);
+                }
             }
         }
         groups
@@ -500,7 +523,13 @@ pub(super) trait LoopKernel {
 }
 
 pub(super) trait BatchBody {
+    fn lower_preheader(&self, _emitter: &mut BatchEmitter<'_, '_>) {}
     fn lower(&self, emitter: &mut BatchEmitter<'_, '_>);
+    fn has_unroll2(&self) -> bool {
+        false
+    }
+    fn lower_unroll2(&self, _emitter: &mut BatchEmitter<'_, '_>) {}
+    fn lower_epilogue(&self, _emitter: &mut BatchEmitter<'_, '_>) {}
     fn is_float(&self) -> bool {
         false
     }

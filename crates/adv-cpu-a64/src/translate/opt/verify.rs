@@ -264,7 +264,16 @@ fn typed(func: &Func, op: &Op) -> bool {
         | Op::X87Round { value: a, .. }
         | Op::X87Exam(a) => is(a, Type::F64),
         Op::X87StoreC1 { value, stored, .. } => is(value, Type::F64) && int(stored),
-        Op::Vec(_, a, b) | Op::VecFp { a, b, .. } => is(a, Type::V128) && is(b, Type::V128),
+        Op::Vec(_, a, b) | Op::VecFp { a, b, .. } | Op::VecFpMulElem { a, b, .. } => {
+            is(a, Type::V128) && is(b, Type::V128)
+        }
+        Op::VecDeintLoad {
+            addr,
+            channels,
+            channel,
+            ..
+        } => is(addr, Type::I32) && (2..=4).contains(&channels) && channel < channels,
+        Op::VecLoadBcast { addr, .. } => is(addr, Type::I32),
         Op::VecFma { a, b, c, .. } => is(a, Type::V128) && is(b, Type::V128) && is(c, Type::V128),
         Op::VecUnary(_, a)
         | Op::VecToInt(_, a)

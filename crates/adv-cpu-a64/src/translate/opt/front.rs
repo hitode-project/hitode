@@ -20,7 +20,7 @@ use integer::part;
 mod integer;
 mod live;
 mod model;
-mod passes;
+pub(crate) mod passes;
 mod simd;
 #[cfg(test)]
 mod tests;

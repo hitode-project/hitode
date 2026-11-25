@@ -226,8 +226,20 @@ impl<'a> Trial<'a> {
         extra_memory: &'a [(u32, usize)],
         setup: impl Fn(&mut Memory),
     ) -> Self {
+        Self::new_window(BASE, LEN, image, state, context, extra_memory, setup)
+    }
+
+    fn new_window(
+        base: u32,
+        len: usize,
+        image: &Image,
+        state: &CpuState,
+        context: impl Into<String>,
+        extra_memory: &'a [(u32, usize)],
+        setup: impl Fn(&mut Memory),
+    ) -> Self {
         let make = |translated| {
-            let mut memory = Memory::window_at_host_size(BASE, LEN, HOST_PAGE).unwrap();
+            let mut memory = Memory::window_at_host_size(base, len, HOST_PAGE).unwrap();
             memory.map(CODE, HOST_PAGE, READ | WRITE).unwrap();
             memory.write(CODE, &image.code).unwrap();
             memory.protect(CODE, HOST_PAGE, READ | EXEC).unwrap();
@@ -3699,4 +3711,527 @@ fn track_d_resident_edge_cases_two_diff_sqrtss_narrow_and_afp_coherence() {
     });
     assert!(trial.try_install_at(state.clone()));
     assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+}
+
+// spec: A64-OPT-4, A64-OPT-5, A64-OPT-6
+#[test]
+fn wave2c_strip_hoist_unroll2_all_tails_aos_ld1r_fmul_elem_and_fcmp_zero() {
+    // 1) Hoisted FpNeg/FpAbs + LD1R (stride==0 [ebx]) + by-element FMUL across
+    // ALL remainder lengths n = 1..=17 (plus 24, 31, 32, 33), plus mid-pair bailout.
+    let f32_hoist_unroll = Image::loop_body(|a, head, _| {
+        a.fld(dword_ptr(esi)).unwrap();
+        a.fabs().unwrap();
+        a.fchs().unwrap();
+        a.fmul_2(st0, st1).unwrap();
+        a.fadd(dword_ptr(ebx)).unwrap();
+        a.fstp(dword_ptr(edi)).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    let mut base_state = initial(16);
+    base_state.regs[3] = DATA + 0x400; // ebx = broadcast scalar address
+    base_state.x87.control = 0x003f; // PC=24, nearest
+    base_state.x87.status = 0x20;
+    base_state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(f64::from(1.75f32)));
+
+    let init_f32 = |m: &mut adv_cpu_core::Memory| {
+        m.write(DATA + 0x400, &2.5f32.to_le_bytes()).unwrap();
+        for i in 0..40u32 {
+            let v = match i {
+                0 => -0.0f32,
+                1 => 0.0f32,
+                _ => (i as f32 - 15.5) * 0.625,
+            };
+            m.write(DATA + i * 4, &v.to_le_bytes()).unwrap();
+        }
+    };
+    for n in (1u32..=17).chain([24, 31, 32, 33]) {
+        let mut st = base_state.clone();
+        st.regs[1] = n;
+        let mut trial = Trial::new(
+            &f32_hoist_unroll,
+            &st,
+            format!("f32 hoist+unroll2 n={n}"),
+            &[],
+            init_f32,
+        );
+        assert!(trial.try_install_at(base_state.clone()));
+        assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+        let native = trial.live.native.as_ref().unwrap();
+        assert_eq!(native.diagnostics.resident_cold_exits, 0);
+        if n >= 12 {
+            assert!(
+                native.vector_strips() >= 1,
+                "expected vector strips for n={n}"
+            );
+        }
+    }
+
+    // Mid-pair bailout: subnormal in strip 0 (even) AND NaN in strip 3 (odd) both recover cleanly.
+    for (bad_idx, bad_bits, label) in [
+        (2u32, 1u32, "strip 0 (even) subnormal bail"),
+        (13u32, 0x7fc0_0001u32, "strip 3 (odd) qNaN bail"),
+    ] {
+        let mut st = base_state.clone();
+        st.regs[1] = 24;
+        let mut trial = Trial::new(&f32_hoist_unroll, &st, label, &[], |m| {
+            init_f32(m);
+            m.write(DATA + bad_idx * 4, &bad_bits.to_le_bytes())
+                .unwrap();
+        });
+        assert!(trial.try_install_at(base_state.clone()));
+        assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+    }
+
+    // f64 2x unroll across all remainder lengths n = 1..=15.
+    let f64_unroll = Image::loop_body(|a, head, _| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fabs().unwrap();
+        a.fchs().unwrap();
+        a.fmul_2(st0, st1).unwrap();
+        a.fadd(qword_ptr(ebx)).unwrap();
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    let mut d_state = initial(15);
+    d_state.regs[3] = DATA + 0x400;
+    d_state.x87.control = 0x023f; // PC=53
+    d_state.x87.status = 0x20;
+    d_state
+        .x87
+        .push(adv_cpu_core::floating::fast::extended(1.375));
+    let init_f64 = |m: &mut adv_cpu_core::Memory| {
+        m.write(DATA + 0x400, &(-3.25f64).to_le_bytes()).unwrap();
+        for i in 0..20u32 {
+            let v = if i == 0 {
+                -0.0f64
+            } else {
+                (i as f64 - 7.5) * 1.125
+            };
+            m.write(DATA + i * 8, &v.to_le_bytes()).unwrap();
+        }
+    };
+    for n in 1u32..=15 {
+        let mut st = d_state.clone();
+        st.regs[1] = n;
+        let mut trial = Trial::new(
+            &f64_unroll,
+            &st,
+            format!("f64 hoist+unroll2 n={n}"),
+            &[],
+            init_f64,
+        );
+        assert!(trial.try_install_at(d_state.clone()));
+        assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+    }
+
+    // 2) AoS 2-channel (LD2), 3-channel out-of-order (LD3), and 4-channel (LD4) float strips.
+    for (channels, offsets) in [
+        (2u32, vec![0i32, 4]),
+        (3u32, vec![8, 0, 4]),
+        (4u32, vec![0, 4, 8, 12]),
+    ] {
+        let stride = (channels * 4) as i32;
+        let aos_loop = Image::loop_body(|a, head, _| {
+            a.fld(dword_ptr(esi + offsets[0])).unwrap();
+            for &off in &offsets[1..] {
+                a.fadd(dword_ptr(esi + off)).unwrap();
+            }
+            a.fstp(dword_ptr(edi)).unwrap();
+            a.add(esi, stride).unwrap();
+            a.add(edi, 4).unwrap();
+            latch(a, head);
+            a.fldz().unwrap();
+            a.fstp(st0).unwrap();
+        });
+        let mut st = initial(19);
+        st.x87.control = 0x003f;
+        st.x87.status = 0x20;
+        let mut trial = Trial::new(
+            &aos_loop,
+            &st,
+            format!("AoS LD{channels} f32 strip"),
+            &[],
+            |m| {
+                for i in 0..19u32 {
+                    for c in 0..channels {
+                        let v = (i as f32 + 1.0) * 0.5 + c as f32 * 0.25;
+                        m.write(DATA + (i * channels + c) * 4, &v.to_le_bytes())
+                            .unwrap();
+                    }
+                }
+            },
+        );
+        assert!(trial.try_install_at(st.clone()));
+        assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+        let native = trial.live.native.as_ref().unwrap();
+        assert!(
+            native.vector_strips() >= 3,
+            "AoS LD{channels} should execute vectorized strips"
+        );
+        assert_eq!(native.diagnostics.resident_cold_exits, 0);
+    }
+
+    // 3) FCMP #0.0 differential test: ftst + ucomisd against +0.0 across signs and qNaN.
+    let fcmp_zero_loop = Image::loop_body(|a, head, _| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.ftst().unwrap();
+        a.fnstsw(ax).unwrap();
+        a.fstp(st0).unwrap();
+        a.mov(word_ptr(edi), ax).unwrap();
+        a.xorpd(xmm1, xmm1).unwrap();
+        a.movsd_2(xmm0, qword_ptr(esi)).unwrap();
+        a.ucomisd(xmm0, xmm1).unwrap();
+        a.sete(byte_ptr(edi + 4)).unwrap();
+        a.setp(byte_ptr(edi + 5)).unwrap();
+        a.setb(byte_ptr(edi + 6)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+    });
+    let mut cmp_state = initial(5);
+    cmp_state.x87.control = 0x023f;
+    cmp_state.x87.status = 0x20;
+    cmp_state.mxcsr = 0x1fa0;
+    let cmp_vals = [
+        -2.5f64,
+        -0.0,
+        0.0,
+        3.25,
+        f64::from_bits(0x7ff8_0000_0000_0001),
+    ];
+    let mut trial = Trial::new(&fcmp_zero_loop, &cmp_state, "FCMP #0.0", &[], |m| {
+        for (i, v) in cmp_vals.iter().enumerate() {
+            m.write(DATA + i as u32 * 8, &v.to_le_bytes()).unwrap();
+        }
+    });
+    assert!(trial.try_install_at(cmp_state));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+}
+
+// spec: A64-OPT-4, A64-OPT-5, A64-OPT-6
+#[test]
+fn wave2c_pow2_div_to_mul_and_exact_int_reduction_vs_general_float() {
+    // 1) Proved pow2 div->mul on bounded u8 / 4.0 and unproved general f64 / 2.0 with
+    // subnormal/overflow boundary values.
+    let proved_div = Image::loop_body(|a, head, _| {
+        a.movzx(eax, byte_ptr(esi)).unwrap();
+        a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+        a.fild(dword_ptr(esp + 0x10)).unwrap();
+        a.fld1().unwrap();
+        a.fadd_2(st0, st0).unwrap();
+        a.fadd_2(st0, st0).unwrap();
+        a.fdivp(st1, st0).unwrap();
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.inc(esi).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+        a.fstp(st0).unwrap();
+    });
+    let mut st = initial(16);
+    st.x87.control = 0x023f;
+    st.x87.status = 0x20;
+    let mut trial = Trial::new(&proved_div, &st, "proved pow2 div->mul", &[], |m| {
+        for i in 0..16u32 {
+            let b = if i == 0 {
+                0u8
+            } else {
+                (i as u8).wrapping_mul(17)
+            };
+            m.write(DATA + i, &[b]).unwrap();
+        }
+    });
+    assert!(trial.try_install_at(st.clone()));
+    assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+
+    let unproved_div = Image::loop_body(|a, head, _| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fld1().unwrap();
+        a.fadd_2(st0, st0).unwrap(); // 2.0
+        a.fdivp(st1, st0).unwrap();
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+        a.fstp(st0).unwrap();
+    });
+    let mut edge_st = initial(4);
+    edge_st.x87.control = 0x023f;
+    edge_st.x87.status = 0x20;
+    let edge_vals = [
+        4.0f64,
+        f64::MIN_POSITIVE, // / 2.0 underflows to subnormal -> UE
+        f64::from_bits(1), // subnormal input -> DE + UE
+        -f64::MIN_POSITIVE,
+    ];
+    let mut trial = Trial::new(
+        &unproved_div,
+        &edge_st,
+        "unproved f64 / 2.0 edges",
+        &[],
+        |m| {
+            for (i, v) in edge_vals.iter().enumerate() {
+                m.write(DATA + i as u32 * 8, &v.to_le_bytes()).unwrap();
+            }
+        },
+    );
+    assert!(trial.try_install_at(edge_st));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+
+    // 2) Exact-integer reduction vectorization (`sum += (double)i32[i]`) across
+    // trip counts and initial accumulators (0.0, -0.0, non-integer 0.5 bail, large 1e16 bail).
+    let int_red = Image::loop_body(|a, head, _| {
+        a.fild(dword_ptr(esi)).unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.add(esi, 4).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    let init_i32 = |m: &mut adv_cpu_core::Memory| {
+        for i in 0..40u32 {
+            let v: i32 = if i % 5 == 0 {
+                0
+            } else {
+                (i as i32 - 17) * 1021
+            };
+            m.write(DATA + i * 4, &v.to_le_bytes()).unwrap();
+        }
+    };
+    for (n, init_val, expect_vec) in [
+        (1u32, 0.0f64, false),
+        (2, 0.0, false),
+        (3, 0.0, true),
+        (7, 0.0, true),
+        (16, -0.0, true),
+        (33, 42.0, true),
+        (16, 0.5, false),  // non-integer init -> runtime preheader bail
+        (16, 1e16, false), // out-of-range init -> runtime preheader bail
+    ] {
+        let mut r_st = initial(n);
+        r_st.x87.control = 0x023f;
+        r_st.x87.status = 0x20;
+        r_st.x87
+            .push(adv_cpu_core::floating::fast::extended(init_val));
+        let mut trial = Trial::new(
+            &int_red,
+            &r_st,
+            format!("exact-int reduction n={n} init={init_val:?}"),
+            &[],
+            init_i32,
+        );
+        assert!(trial.try_install_at(r_st.clone()));
+        assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+        let strips = trial.live.native.as_ref().unwrap().vector_strips();
+        if expect_vec {
+            assert!(
+                strips > 0,
+                "expected vectorized exact-int reduction for n={n} init={init_val:?}"
+            );
+        } else {
+            assert_eq!(
+                strips, 0,
+                "expected scalar fallback for n={n} init={init_val:?}"
+            );
+        }
+    }
+
+    // 3) General float reduction MUST NOT be reassociated: cancellation-sensitive input.
+    let float_red = Image::loop_body(|a, head, _| {
+        a.fadd(qword_ptr(esi)).unwrap();
+        a.add(esi, 8).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+    });
+    let mut f_st = initial(8);
+    f_st.x87.control = 0x023f;
+    f_st.x87.status = 0x20;
+    f_st.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+    let cancel_vals = [1e16f64, 1.0, -1e16, 1.0, 1e16, 1.0, -1e16, 1.0];
+    let mut trial = Trial::new(
+        &float_red,
+        &f_st,
+        "general float reduction order",
+        &[],
+        |m| {
+            for (i, v) in cancel_vals.iter().enumerate() {
+                m.write(DATA + i as u32 * 8, &v.to_le_bytes()).unwrap();
+            }
+        },
+    );
+    assert!(trial.try_install_at(f_st));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    assert_eq!(
+        trial.live.native.as_ref().unwrap().vector_strips(),
+        0,
+        "general float reduction must never vectorize/reassociate"
+    );
+}
+
+// spec: A64-MEM-1, A64-OPT-4, A64-OPT-5, A64-OPT-6
+#[test]
+fn wave2c_a64_mem1_guard_band_folding_ldp_stp_wraparound_and_compact() {
+    // 1) Contiguous LDP/STP + positive and negative immediate displacements.
+    let mem_pairs = Image::loop_body(|a, head, _| {
+        a.mov(eax, dword_ptr(esi)).unwrap();
+        a.mov(edx, dword_ptr(esi + 4)).unwrap();
+        a.add(eax, dword_ptr(esi - 4)).unwrap();
+        a.add(edx, dword_ptr(esi + 8)).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.mov(dword_ptr(edi + 4), edx).unwrap();
+        a.mov(dword_ptr(edi + 8), eax).unwrap();
+        a.mov(dword_ptr(edi + 12), edx).unwrap();
+        a.add(esi, 12).unwrap();
+        a.add(edi, 16).unwrap();
+        latch(a, head);
+    });
+    let mut st = initial(8);
+    st.regs[6] = DATA + 16; // esi starts at +16 so [esi - 4] is valid
+    let init_pairs = |m: &mut adv_cpu_core::Memory| {
+        for i in 0..64u32 {
+            m.write(DATA + i * 4, &(0x1000_0000u32 + i * 37).to_le_bytes())
+                .unwrap();
+        }
+    };
+    let mut trial = Trial::new(
+        &mem_pairs,
+        &st,
+        "A64-MEM-1 LDP/STP + imm fold",
+        &[],
+        init_pairs,
+    );
+    assert!(trial.try_install_at(st.clone()));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    assert_eq!(
+        trial
+            .live
+            .native
+            .as_ref()
+            .unwrap()
+            .diagnostics
+            .resident_cold_exits,
+        0
+    );
+
+    // 2) 32-bit guest address wraparound near `0xffff_fff0` (and negative wrap near `0x0000_0004`):
+    // Host `x27 + 0xffff_fff0 + 0x10 = x27 + 0x1_0000_0000` lands in the upper 128 KiB
+    // inaccessible guard band, faults cleanly, and replays in Tier-0 at wrapped `0x0000_0000`!
+    let wrap_load = Image::loop_body(|a, head, _| {
+        a.mov(eax, dword_ptr(esi + 0x10)).unwrap();
+        a.mov(edx, dword_ptr(esi + 0x14)).unwrap();
+        a.add(eax, edx).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 8).unwrap();
+        a.add(edi, 4).unwrap();
+        latch(a, head);
+    });
+    // Map page 0 (`0x0000_0000..0x4000`) and run with `esi = 0xffff_fff0` (iter 0 wraps
+    // `esi+0x10 -> 0x0`, `esi+0x14 -> 0x4`; iter 1 has `esi = 0xffff_fff8`, wraps to `0x8`, `0xc`;
+    // iter 2 has `esi = 0x0`, no wrap -> `0x10`, `0x14`!).
+    let mut wrap_st = initial(4);
+    wrap_st.regs[6] = 0xffff_fff0;
+    let init_page0 = |m: &mut adv_cpu_core::Memory| {
+        m.map(0, HOST_PAGE, READ | WRITE).unwrap();
+        for i in 0..16u32 {
+            m.write(i * 4, &(0x2200_0000u32 + i * 11).to_le_bytes())
+                .unwrap();
+        }
+    };
+    let mut trial = Trial::new_window(
+        0,
+        0x6_0000,
+        &wrap_load,
+        &wrap_st,
+        "A64-MEM-1 32-bit wraparound near 0xffff_fff0",
+        &[],
+        init_page0,
+    );
+    assert!(trial.try_install_at(initial(4)));
+    assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+
+    // Negative displacement wraparound near `0x0000_0004`: `[esi - 0x10]` wraps to `0xffff_fff4`
+    // (unmapped -> exact fault classification & state matching Tier-0!).
+    let neg_wrap = Image::loop_body(|a, head, _| {
+        a.mov(eax, dword_ptr(esi - 0x10)).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(esi, 4).unwrap();
+        a.add(edi, 4).unwrap();
+        latch(a, head);
+    });
+    let mut neg_st = initial(2);
+    neg_st.regs[6] = 0x0000_0004;
+    let mut trial = Trial::new_window(
+        0,
+        0x6_0000,
+        &neg_wrap,
+        &neg_st,
+        "A64-MEM-1 negative wraparound fault near 0x0000_0004",
+        &[],
+        init_page0,
+    );
+    assert!(trial.try_install_at(st.clone()));
+    let expected = trial.reference.run(trial.stop, 128).unwrap();
+    let got = trial.live.run(trial.stop, 128).unwrap();
+    assert_eq!(
+        got, expected,
+        "negative wraparound fault outcome must match Tier-0"
+    );
+    trial.same_state();
+
+    // 3) STP split-page fault: first half hits RW page, second half hits RO page -> exact replay!
+    let stp_split = Image::loop_body(|a, head, _| {
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.mov(dword_ptr(edi + 4), edx).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+    });
+    let mut split_st = initial(2);
+    split_st.regs[0] = 0x1122_3344;
+    split_st.regs[2] = 0x5566_7788;
+    split_st.regs[7] = DATA + HOST_PAGE as u32 - 4; // [edi] in RW page, [edi+4] in RO page
+    let mut trial = Trial::new(
+        &stp_split,
+        &split_st,
+        "A64-MEM-1 STP split-page RO fault",
+        &[],
+        |m| {
+            m.map(DATA + HOST_PAGE as u32, HOST_PAGE, READ).unwrap();
+        },
+    );
+    assert!(trial.try_install_at(initial(2)));
+    let expected = trial.reference.run(trial.stop, 128).unwrap();
+    let got = trial.live.run(trial.stop, 128).unwrap();
+    assert_eq!(got, expected, "STP split-page RO fault must match Tier-0");
+    trial.same_state();
+
+    // 4) Compact window safety (IOS-MEM-1): compiling under compact mode keeps identical semantics.
+    crate::translate::opt::back::with_compact_window(true, || {
+        let mut trial = Trial::new_window(
+            0,
+            0x6_0000,
+            &wrap_load,
+            &wrap_st,
+            "IOS-MEM-1 compact window wraparound",
+            &[],
+            init_page0,
+        );
+        assert!(trial.try_install_at(initial(4)));
+        assert_eq!(trial.compare(4096).0, RunOutcome::ReachedStop);
+    });
 }

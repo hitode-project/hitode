@@ -914,6 +914,71 @@ fn step(
                 out
             }
         }
+        Op::VecFpMulElem { double, a, b, lane } => {
+            let (av, bv) = (get(a), get(b));
+            if double {
+                let s = f64::from_bits((bv >> (usize::from(lane) * 64)) as u64);
+                let mut out = 0u128;
+                for shift in [0usize, 64] {
+                    let x = f64::from_bits((av >> shift) as u64);
+                    let r = x * s;
+                    if !r.is_finite() || r.is_subnormal() {
+                        return None;
+                    }
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+                out
+            } else {
+                let s = f32::from_bits((bv >> (usize::from(lane) * 32)) as u32);
+                let mut out = 0u128;
+                for l in 0..4usize {
+                    let shift = l * 32;
+                    let x = f32::from_bits((av >> shift) as u32);
+                    let r = x * s;
+                    if !r.is_finite() || r.is_subnormal() {
+                        return None;
+                    }
+                    out |= u128::from(r.to_bits()) << shift;
+                }
+                out
+            }
+        }
+        Op::VecDeintLoad {
+            addr,
+            channels,
+            channel,
+            double,
+            ..
+        } => {
+            let base = get(addr) as u32;
+            let elem = if double { 8u32 } else { 4u32 };
+            let stride = elem * u32::from(channels);
+            let lanes = if double { 2u32 } else { 4u32 };
+            let mut out = 0u128;
+            for l in 0..lanes {
+                let ea = base
+                    .wrapping_add(l.wrapping_mul(stride))
+                    .wrapping_add(u32::from(channel).wrapping_mul(elem));
+                let mut bytes = [0u8; 16];
+                memory.read_into(ea, &mut bytes[..elem as usize]).ok()?;
+                let raw = u128::from_le_bytes(bytes);
+                out |= raw << (l * elem * 8);
+            }
+            out
+        }
+        Op::VecLoadBcast { addr, double, .. } => {
+            let base = get(addr) as u32;
+            let mut bytes = [0u8; 16];
+            if double {
+                memory.read_into(base, &mut bytes[..8]).ok()?;
+                let raw = u128::from_le_bytes(bytes);
+                raw | (raw << 64)
+            } else {
+                memory.read_into(base, &mut bytes[..4]).ok()?;
+                let raw = u128::from_le_bytes(bytes);
+                raw | (raw << 32) | (raw << 64) | (raw << 96)
+            }
+        }
         Op::VecFma {
             sub,
             double,

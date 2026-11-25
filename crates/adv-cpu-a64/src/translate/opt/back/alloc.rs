@@ -57,7 +57,9 @@ pub(super) fn allocate(
                 Op::FpValidate { .. } | Op::X87Arith { .. } | Op::X87RoundC1 { .. } => {
                     vectors = vectors.min(E.number() as u8);
                 }
-                Op::Vec(VecOp::LessF64, ..) | Op::SsePackedToInt { .. } => {
+                Op::Vec(VecOp::LessF64, ..)
+                | Op::SsePackedToInt { .. }
+                | Op::VecDeintLoad { .. } => {
                     vectors = vectors.min(D.number() as u8);
                 }
                 _ => {}
@@ -165,11 +167,26 @@ pub(super) fn allocate(
                 for v in op.uses() {
                     // Scalar SSE cold checks still need the original inputs.
                     let position = position + usize::from(resident && matches!(op, Op::Fp32(..)));
+                    let is_fp_zero_imm = constants[v.0 as usize].is_some_and(|bits| match *op {
+                        Op::Flags { kind, width, b, .. } if kind.floating() && b == v => {
+                            let single = kind != super::FlagKind::X87CompareFold && width == 32;
+                            if single {
+                                ((bits as u32) & 0x7fff_ffff) == 0
+                            } else {
+                                ((bits as u64) & 0x7fff_ffff_ffff_ffff) == 0
+                            }
+                        }
+                        Op::X87Compare { b, .. } if b == v => {
+                            ((bits as u64) & 0x7fff_ffff_ffff_ffff) == 0
+                        }
+                        _ => false,
+                    });
                     read(
                         v,
                         position,
                         true,
-                        constants[v.0 as usize].is_some_and(|bits| matches!(*op, Op::Int(kind, _, b) if b == v && int_immediate(kind, if func.ty(v) == Type::I64 { X } else { W }, T, T, bits as u64).is_some())),
+                        is_fp_zero_imm
+                            || constants[v.0 as usize].is_some_and(|bits| matches!(*op, Op::Int(kind, _, b) if b == v && int_immediate(kind, if func.ty(v) == Type::I64 { X } else { W }, T, T, bits as u64).is_some())),
                     );
                 }
             }

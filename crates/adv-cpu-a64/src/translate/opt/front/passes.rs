@@ -1,8 +1,9 @@
 //! Propagation removes frame traffic and mode tests; liveness keeps only values
 //! read by execution or recovery. Floating operations remain until validation.
-mod fp_range;
+pub(in crate::translate::opt) mod fp_range;
 mod head_flags;
-mod slp;
+pub(in crate::translate::opt) mod slp;
+
 use super::{
     BTreeMap, Block, ESP, End, Facts, FlagKind, Func, Head, IntOp, IntUnary, IrRecord, Location, M,
     MAX_PLAIN_FACTS, Op, Recipe, RecordId, Source, Target, Type, Value, VecOp, VecUnary,
@@ -11,6 +12,7 @@ use super::{
 use crate::translate::front::flags::FlagSet;
 use adv_cpu_core::integer::{self, CF, OF};
 use adv_cpu_core::memory::PAGE_SIZE;
+pub(crate) use fp_range::{exact_integer_facts, exhaustive_budget_exceeded};
 
 pub(super) struct Resident<'a> {
     pub refused: &'a dyn Fn(u32) -> bool,
@@ -166,6 +168,8 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::SsePackedToInt { value: a, .. }
         | Op::X87Store { value: a, .. }
         | Op::Load { addr: a, .. }
+        | Op::VecDeintLoad { addr: a, .. }
+        | Op::VecLoadBcast { addr: a, .. }
         | Op::PlainPage { addr: a, .. }
         | Op::PageCross { addr: a, .. }
         | Op::Host(a)
@@ -188,6 +192,7 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::SseFp64(_, a, b)
         | Op::Vec(_, a, b)
         | Op::VecFp { a, b, .. }
+        | Op::VecFpMulElem { a, b, .. }
         | Op::X87StoreC1 {
             value: a,
             stored: b,
