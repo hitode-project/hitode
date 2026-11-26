@@ -74,10 +74,14 @@ pub(crate) enum UploadSource {
     Staged(super::Staged),
 }
 
+/// Color attachments of a `Target`: one inline (every legacy pass), more on the heap, so
+/// the multi-target case does not size every command.
+pub(crate) type Colors = smallvec::SmallVec<[Image; 1]>;
+
 pub(crate) enum Command {
     /// Following clears and draws render to these attachments.
     Target {
-        colors: smallvec::SmallVec<[Image; 8]>,
+        colors: Colors,
         depth: Option<super::Depth>,
     },
     Clear {
