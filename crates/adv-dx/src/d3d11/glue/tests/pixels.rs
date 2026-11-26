@@ -696,7 +696,10 @@ fn assert_rows(
 #[test]
 fn guest_swap_chain_presents_the_back_buffer_and_resizes_after_release() {
     use crate::dxgi::swap::Window;
-    use adv_abi::types::{DXGI_MODE_DESC, DXGI_SWAP_CHAIN_DESC};
+    use adv_abi::types::{
+        DXGI_FRAME_STATISTICS, DXGI_MODE_DESC, DXGI_PRESENT_PARAMETERS, DXGI_RATIONAL,
+        DXGI_SWAP_CHAIN_DESC,
+    };
     use adv_device::frame::test_support::CapturePresenter;
 
     let mut machine = machine();
@@ -772,6 +775,29 @@ fn guest_swap_chain_presents_the_back_buffer_and_resizes_after_release() {
     assert_eq!(method(&mut machine, chain, 32, &[OUT]), 0);
     assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 1);
     assert_ne!(method(&mut machine, chain, 33, &[]), 0);
+    assert_eq!(method(&mut machine, chain, 10, &[1, 0]), 0x887a0001);
+    write_value(
+        &mut machine,
+        DESCRIPTOR,
+        DXGI_MODE_DESC {
+            Width: 12,
+            Height: 10,
+            RefreshRate: DXGI_RATIONAL {
+                Numerator: 75,
+                Denominator: 1,
+            },
+            Format: 28,
+            ..Default::default()
+        },
+    );
+    assert_eq!(method(&mut machine, chain, 14, &[DESCRIPTOR]), 0);
+    assert_eq!(method(&mut machine, chain, 12, &[DESCRIPTOR]), 0);
+    let resized: DXGI_SWAP_CHAIN_DESC = GuestPtr::new(DESCRIPTOR).read(&machine.cpu).unwrap();
+    assert_eq!(resized.BufferDesc.RefreshRate.Numerator, 75);
+    assert_eq!(
+        (resized.BufferDesc.Width, resized.BufferDesc.Height),
+        (8, 6)
+    );
 
     machine.cpu.write(IID, &IID_ID3D11TEXTURE2D).unwrap();
     assert_eq!(method(&mut machine, chain, 9, &[1, IID, OUT]), 0x887a0001);
@@ -793,7 +819,8 @@ fn guest_swap_chain_presents_the_back_buffer_and_resizes_after_release() {
     assert_eq!(method(&mut machine, chain, 8, &[0, 1]), 0);
     assert_eq!(method(&mut machine, chain, 17, &[OUT]), 0);
     assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 0);
-    assert_eq!(method(&mut machine, chain, 8, &[0, 0]), 0);
+    write_value(&mut machine, DESCRIPTOR, DXGI_PRESENT_PARAMETERS::default());
+    assert_eq!(method(&mut machine, chain, 22, &[0, 0, DESCRIPTOR]), 0);
     let frame = frames
         .recv_timeout(std::time::Duration::from_secs(20))
         .unwrap();
@@ -807,6 +834,9 @@ fn guest_swap_chain_presents_the_back_buffer_and_resizes_after_release() {
             .iter()
             .all(|pixel| *pixel == [0, 0, 255, 255])
     );
+    assert_eq!(method(&mut machine, chain, 16, &[DESCRIPTOR]), 0);
+    let stats: DXGI_FRAME_STATISTICS = GuestPtr::new(DESCRIPTOR).read(&machine.cpu).unwrap();
+    assert_eq!(stats.PresentCount, 1);
     assert_eq!(method(&mut machine, chain, 13, &[0, 10, 9, 0, 64]), 0);
     assert_eq!(method(&mut machine, chain, 9, &[0, IID, OUT]), 0);
     let resource = machine.cpu.read_u32(OUT).unwrap();
@@ -818,6 +848,37 @@ fn guest_swap_chain_presents_the_back_buffer_and_resizes_after_release() {
     assert_eq!(method(&mut machine, chain, 2, &[]), 0);
     assert_eq!(method(&mut machine, context, 2, &[]), 0);
     assert_eq!(method(&mut machine, device, 2, &[]), 0);
+}
+
+// spec: GFX-RES-1
+#[test]
+fn guest_staging_write_uploads_before_the_recorded_copy() {
+    let mut machine = machine();
+    let gpu = Gpu::request(!cfg!(target_vendor = "apple")).unwrap();
+    machine.ext.get_mut::<State>().execution = Some(gpu::Execution::new(gpu));
+    let (device, context) = create(&mut machine, 1, 0, &[0xb000]);
+    let target = texture(&mut machine, device, 0, Bind::RENDER_TARGET, 0, 0, 2);
+    let upload = texture(&mut machine, device, 3, 0, 0x10000, 0, 2);
+    let readback = texture(&mut machine, device, 3, 0, 0x20000, 0, 2);
+    let mapped = map(&mut machine, context, upload, 2);
+    write_value(&mut machine, mapped.pData, [0xff12_3456u32, 0xffab_cdef]);
+    write_value(
+        &mut machine,
+        mapped.pData + mapped.RowPitch,
+        [0xffde_bc9au32, 0xff78_5634],
+    );
+    assert_eq!(method(&mut machine, context, 15, &[upload, 0]), 0);
+    assert_eq!(method(&mut machine, context, 47, &[target, upload]), 0);
+    assert_eq!(method(&mut machine, context, 47, &[readback, target]), 0);
+    let mapped = map(&mut machine, context, readback, 1);
+    let row = |y| {
+        GuestPtr::<[u32; 2]>::new(mapped.pData + y * mapped.RowPitch)
+            .read(&machine.cpu)
+            .unwrap()
+    };
+    assert_eq!(row(0), [0xff12_3456, 0xffab_cdef]);
+    assert_eq!(row(1), [0xffde_bc9a, 0xff78_5634]);
+    assert_eq!(method(&mut machine, context, 15, &[readback, 0]), 0);
 }
 
 // spec: GFX-RES-1 GFX-DXGI-5
