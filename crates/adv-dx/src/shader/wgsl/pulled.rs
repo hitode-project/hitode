@@ -1,5 +1,8 @@
 //! Shared IR writer entries called by expansion compute shaders.
 
+mod hull;
+pub(crate) use hull::hull;
+
 use super::interface::register_count;
 use super::*;
 use crate::shader::variant::Variant;

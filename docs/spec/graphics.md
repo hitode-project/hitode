@@ -452,9 +452,8 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 **Verification**: Test
 
 The shader-core fixture directory holds the token ledger, Windows shader-creation HRESULTs
-and measured readbacks. GS, HS and DS execution belongs to expansion and programmable stages
-(T8 and T15). Class linkage execution belongs to T15. Residency feedback and double precision
-have Windows bytecode oracles. The shader core does not report tiled resources or emit
+and measured readbacks. The guest tests execute captured geometry, hull, domain and class
+linkage programs. Residency feedback and double precision have Windows bytecode oracles. The shader core does not report tiled resources or emit
 64-bit floating-point operations.
 
 ### GFX-SHADER-6 Expansion order
@@ -474,6 +473,9 @@ have Windows bytecode oracles. The shader core does not report tiled resources o
 **Rule**: The tessellator MUST cull a patch if any edge factor is zero, negative or NaN. It MUST match the Direct3D 11 reference for domain-location bits, primitive counts, connectivity and winding. Primitive order and the first vertex of each triangle MAY vary.
 **Verification**: Test
 **Basis**: [Direct3D 11.3 functional specification §11.7](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#TessellationPattern)
+
+The GPU path counts and emits domain points and indices from the hull shader's output.
+The domain shader consumes those points in the same expansion chunk.
 
 ## Vertex and raster input
 
@@ -530,7 +532,7 @@ Pretransformed draws MUST retain index order.
 
 ### GFX-STAGE-1 Stream output
 
-**Rule**: Each stream output buffer MUST track its own byte cursor and emitted vertex count. Append bindings MUST preserve both values. `DrawAuto` MUST consume the vertex count from input assembler slot zero.
+**Rule**: Each stream output buffer MUST track its own filled byte size and preserve it on append bindings. Stream-output statistics MUST distinguish required storage from written primitives. `DrawAuto` MUST consume the filled byte size using the input assembler offset and stride from slot zero.
 **Verification**: Test
 
 ### GFX-STAGE-2 Indirect dispatch
@@ -541,6 +543,11 @@ Pretransformed draws MUST retain index order.
 ### GFX-STAGE-3 Class linkage
 
 **Rule**: Each bound class instance MUST select the interface function table supported by its class. Draws MUST use the class instances captured at shader binding.
+**Verification**: Test
+
+### GFX-STAGE-4 Output merger UAVs
+
+**Rule**: At feature level 11_0 a pixel shader MUST access its bound output-merger UAVs. Pixel UAV writes MUST execute when neither color nor depth attachments are bound.
 **Verification**: Test
 
 ## Samplers

@@ -9,6 +9,7 @@ pub enum Kind {
     Timestamp,
     Disjoint,
     PipelineStatistics,
+    StreamStatistics(u8),
     OcclusionPredicate,
 }
 
@@ -17,7 +18,7 @@ impl Kind {
         match self {
             Self::Event | Self::OcclusionPredicate => 4,
             Self::Occlusion | Self::Timestamp => 8,
-            Self::Disjoint => 16,
+            Self::Disjoint | Self::StreamStatistics(_) => 16,
             Self::PipelineStatistics => 88,
         }
     }
@@ -37,6 +38,7 @@ pub struct Query {
 #[derive(Default)]
 pub struct Active {
     pub slots: Vec<adv_device::gpu::QuerySlot>,
+    pub streams: Vec<adv_device::gpu::BufferRange>,
     pub counters: [u64; 11],
 }
 
@@ -57,6 +59,8 @@ impl Query {
             3 => Kind::Disjoint,
             4 => Kind::PipelineStatistics,
             5 => Kind::OcclusionPredicate,
+            6 => Kind::StreamStatistics(0),
+            n @ (8 | 10 | 12 | 14) => Kind::StreamStatistics((n as u8 - 8) / 2),
             _ => return Err(Error::InvalidArgument),
         };
         if desc.MiscFlags & !1 != 0

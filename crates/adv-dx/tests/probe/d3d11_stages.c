@@ -152,6 +152,50 @@ done:
     if (pcode) ID3D10Blob_Release(pcode);
 }
 
+static void class_data(ID3D11Device *device)
+{
+    ID3DBlob *code = compile(
+            "interface Color { float4 shade(); };"
+            "class Tint : Color { float4 tint; float4 shade() { return tint; } };"
+            "Color paint; Tint namedTint;"
+            "float4 main() : SV_Target { return paint.shade(); }", "ps_5_0");
+    if (!code) return;
+    ID3D11ClassLinkage *linkage = NULL;
+    ID3D11PixelShader *shader = NULL;
+    HRESULT hr = ID3D11Device_CreateClassLinkage(device, &linkage);
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device_CreatePixelShader(device, ID3D10Blob_GetBufferPointer(code),
+                ID3D10Blob_GetBufferSize(code), linkage, &shader);
+    printf("class-data-create\t%08lx\n", (unsigned long)hr);
+    if (SUCCEEDED(hr)) {
+        ID3D11ClassInstance *instances[2] = {NULL, NULL};
+        HRESULT status[2];
+        status[0] = ID3D11ClassLinkage_GetClassInstance(linkage, "namedTint", 0, &instances[0]);
+        status[1] = ID3D11ClassLinkage_CreateClassInstance(linkage, "Tint", 3, 4, 0, 0, &instances[1]);
+        for (unsigned i = 0; i < 2; ++i) {
+            printf("class-data-desc-%u\t%08lx", i, (unsigned long)status[i]);
+            if (instances[i]) {
+                D3D11_CLASS_INSTANCE_DESC desc;
+                ID3D11ClassInstance_GetDesc(instances[i], &desc);
+                printf("\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%d", desc.InstanceId, desc.InstanceIndex,
+                       desc.TypeId, desc.ConstantBuffer, desc.BaseConstantBufferOffset,
+                       desc.BaseTexture, desc.BaseSampler, (int)desc.Created);
+                ID3D11ClassInstance_Release(instances[i]);
+            }
+            printf("\n");
+        }
+        ID3DBlob *text = NULL;
+        if (SUCCEEDED(D3DDisassemble(ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code),
+                0, NULL, &text))) {
+            printf("class-data-disassembly\n%s\n", (const char *)ID3D10Blob_GetBufferPointer(text));
+            ID3D10Blob_Release(text);
+        }
+    }
+    if (shader) ID3D11PixelShader_Release(shader);
+    if (linkage) ID3D11ClassLinkage_Release(linkage);
+    ID3D10Blob_Release(code);
+}
+
 int main(int argc, char **argv)
 {
     D3D_DRIVER_TYPE driver = argc > 1 && !strcmp(argv[1], "warp")
@@ -165,6 +209,7 @@ int main(int argc, char **argv)
     if (FAILED(hr)) return 1;
     stream_output(device, ctx);
     pixel_uav(device, ctx);
+    class_data(device);
     ID3D11DeviceContext_Release(ctx);
     ID3D11Device_Release(device);
     return 0;

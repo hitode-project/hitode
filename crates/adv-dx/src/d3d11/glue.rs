@@ -67,6 +67,8 @@ const FACES: &[(&str, &[Slot])] = &[
     face!("ID3D11PixelShader"),
     face!("ID3D11ComputeShader"),
     face!("ID3D11GeometryShader"),
+    face!("ID3D11HullShader"),
+    face!("ID3D11DomainShader"),
     face!("ID3D11ClassLinkage", GetClassInstance => get_instance Implement, CreateClassInstance => create_instance Implement),
     face!("ID3D11ClassInstance", GetClassLinkage => get_linkage Implement, GetDesc => class_desc State, GetInstanceName => instance_name State, GetTypeName => type_name State),
     face!("ID3D11InputLayout"),

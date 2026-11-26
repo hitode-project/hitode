@@ -498,7 +498,7 @@ impl<'a> Writer<'a> {
             .ok_or(Error::Invalid("expected register"))?;
         let name = match register {
             Register::Temp => format!("r[{}]", self.index(&indices[0], 1)?),
-            Register::Input if self.stage == Stage::Geometry => {
+            Register::Input if matches!(self.stage, Stage::Geometry | Stage::Hull) => {
                 format!(
                     "v[{}][{}]",
                     self.index(&indices[0], 1)?,
@@ -513,6 +513,13 @@ impl<'a> Writer<'a> {
                     self.index(&indices[1], 1)?
                 )
             }
+            Register::OutputControlPoint => format!(
+                "o_cp[{}][{}]",
+                self.index(&indices[0], 1)?,
+                self.index(&indices[1], 1)?
+            ),
+            Register::OutputControlPointId => "v_control_id".into(),
+            Register::InputForkInstanceId | Register::InputJoinInstanceId => "v_phase_id".into(),
             Register::InputPatchConstant => format!("v_patch[{}]", self.index(&indices[0], 1)?),
             Register::InputDomainPoint => "v_domain".into(),
             Register::InputGsInstanceId => "v_gs_instance".into(),

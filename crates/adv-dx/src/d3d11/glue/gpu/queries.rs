@@ -85,15 +85,16 @@ pub(in crate::d3d11::glue) fn end_query(env: &mut Env<'_>) -> Result<(), Error> 
                 active.counters[0] = result.frequency;
                 active.counters[1] = u64::from(result.disjoint);
             }
-            Kind::PipelineStatistics => width = 16,
+            Kind::PipelineStatistics | Kind::StreamStatistics(_) => width = 16,
             Kind::Occlusion | Kind::OcclusionPredicate | Kind::Timestamp => (),
         }
         let last = (active.slots.len() == 1).then(|| active.slots[0].clone());
-        let buffer = if active.slots.is_empty() {
+        let count = active.slots.len() + active.streams.len();
+        let buffer = if count == 0 {
             None
         } else {
             let buffer = execution.gpu.device().create_buffer(&BufferDesc {
-                size: active.slots.len() as u64 * width,
+                size: count as u64 * width,
                 memory: Memory::Readback,
                 usage: BufferUsage::COPY_DST,
                 label: "D3D11 query readback",
@@ -102,6 +103,13 @@ pub(in crate::d3d11::glue) fn end_query(env: &mut Env<'_>) -> Result<(), Error> 
                 execution
                     .gpu
                     .read_query(slot, buffer.clone(), index as u64 * width)?;
+            }
+            for (index, source) in active.streams.into_iter().enumerate() {
+                execution.gpu.transfer(ModernTransfer::CopyBuffer {
+                    source,
+                    destination: buffer.clone(),
+                    offset: index as u64 * width,
+                })?;
             }
             Some(buffer)
         };
@@ -151,6 +159,11 @@ pub(in crate::d3d11::glue) fn get_data(env: &mut Env<'_>) -> Result<u32, Error> 
             for sample in bytes.as_chunks::<16>().0 {
                 result.words[6] += u64::from_ne_bytes(sample[..8].try_into().unwrap());
                 result.words[7] += u64::from_ne_bytes(sample[8..].try_into().unwrap());
+            }
+        } else if matches!(kind, Kind::StreamStatistics(_)) {
+            for sample in bytes.as_chunks::<16>().0 {
+                result.words[0] += u64::from_ne_bytes(sample[..8].try_into().unwrap());
+                result.words[1] += u64::from_ne_bytes(sample[8..].try_into().unwrap());
             }
         } else {
             result.words[0] = bytes
@@ -223,11 +236,49 @@ pub(super) fn draw_slots(
             Kind::Event
             | Kind::Timestamp
             | Kind::Disjoint
+            | Kind::StreamStatistics(_)
             | Kind::Occlusion
             | Kind::OcclusionPredicate => (),
         }
     }
     Ok((occlusion, statistics))
+}
+
+pub(super) fn stream_queries(env: &mut Env<'_>) -> Result<Option<BufferRange>, Error> {
+    let device = context_device(env)?;
+    let table = table(env);
+    let exec = execution(env.ext)?;
+    let objects = &mut env.sys.objects;
+    exec.active_queries
+        .retain(|&id, pointer| table.key(objects, *pointer) == Some(id));
+    let mut counters: Option<Buffer> = None;
+    for &pointer in exec.active_queries.values() {
+        let object = table.get_mut(objects, pointer).unwrap();
+        if object.device() != Some(device) {
+            continue;
+        }
+        let query = object.query_mut().unwrap();
+        let Kind::StreamStatistics(stream) = query.kind else {
+            continue;
+        };
+        if counters.is_none() {
+            counters = Some(resource::upload(
+                &exec.gpu,
+                &[],
+                BufferUsage::STORAGE | BufferUsage::COPY_SRC,
+                64,
+            )?);
+        }
+        let start = u64::from(stream) * 16;
+        query.active.as_mut().unwrap().streams.push(BufferRange {
+            buffer: counters.as_ref().unwrap().clone(),
+            range: start..start + 16,
+        });
+    }
+    Ok(counters.map(|buffer| BufferRange {
+        buffer,
+        range: 0..64,
+    }))
 }
 
 pub(super) fn predicate(env: &Env<'_>, pointer: u32, value: bool) -> Option<Predicate> {

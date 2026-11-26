@@ -2,7 +2,12 @@
 //! admitted registers and assembled primitives and has no guest state.
 
 mod primitive;
+mod schedule;
+mod strip;
+pub use schedule::Indirect;
 pub mod statistics;
+mod tessellation;
+pub use tessellation::Tessellation;
 #[cfg(test)]
 mod tests;
 
@@ -30,6 +35,7 @@ const STREAM_SLOT: u32 = 166;
 const SCAN_SLOT: u32 = 167;
 const FILLED_BASE: u32 = 176;
 const TARGET_BASE: u32 = 169;
+const STREAM_STATISTICS: u32 = 180;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Topology {
@@ -75,6 +81,14 @@ pub enum Source<'a> {
         fetches: &'a [pulled::VertexFetch],
         assembly: Assembly,
     },
+    Tessellated {
+        vertex: Shader<'a>,
+        hull: &'a Shader<'a>,
+        domain: &'a Shader<'a>,
+        fetches: &'a [pulled::VertexFetch],
+        assembly: Assembly,
+        layout: Tessellation,
+    },
     Domain {
         shader: Shader<'a>,
         control_points: u32,
@@ -93,6 +107,7 @@ pub struct Assembly {
     pub index: Option<IndexInput>,
     pub step: u32,
     pub flip_winding: bool,
+    pub indirect: Option<Indirect>,
 }
 
 #[derive(Clone, Copy)]
@@ -101,12 +116,57 @@ pub struct IndexInput {
     pub wide: bool,
 }
 
+impl IndexInput {
+    fn read(self, source: &mut String, at: &str) {
+        let Self { offset, wide } = self;
+        if wide {
+            writeln!(source, "let vertex_id = dx_indices[{offset}u / 4u + {at}];").unwrap();
+        } else {
+            writeln!(source, "let word = {offset}u / 2u + {at}; let vertex_id = (dx_indices[word / 2u] >> (16u * (word & 1u))) & 65535u;").unwrap();
+        }
+    }
+}
+
 impl Assembly {
     pub fn primitives(self, input_vertices: u32) -> u32 {
         if self.count < input_vertices {
             0
         } else {
             1 + (self.count - input_vertices) / self.step
+        }
+    }
+
+    fn strip(self, input_vertices: u32) -> bool {
+        self.index.is_some() && self.step < input_vertices
+    }
+
+    fn active(self, input_vertices: u32) -> &'static str {
+        if self.indirect.is_some() {
+            "dx_schedule[0]"
+        } else if self.strip(input_vertices) {
+            "dx_strip_active()"
+        } else {
+            "dx_params.y"
+        }
+    }
+
+    fn schedule(self, source: &mut String, input_vertices: u32) {
+        if self.indirect.is_some() {
+            storage(source, schedule::SLOT, "dx_schedule", "array<u32>", false);
+        }
+        if self.strip(input_vertices) {
+            strip::declare(source, false);
+            if self.indirect.is_none() {
+                let maximum = self.primitives(input_vertices);
+                writeln!(
+                    source,
+                    "fn dx_strip_active() -> u32 {{
+                    let total = dx_strip[0].x * (dx_params.z / {maximum}u);
+                    return min(dx_params.y, max(total, dx_params.x) - dx_params.x);
+                }}"
+                )
+                .unwrap();
+            }
         }
     }
 
@@ -124,52 +184,91 @@ impl Assembly {
         if index.is_some() {
             storage(source, INDEX_SLOT, "dx_indices", "array<u32>", false);
         }
+        self.schedule(source, input_vertices);
         entry(source, "source_main", WORKGROUP);
+        let active = self.active(input_vertices);
         writeln!(
             source,
-            "{PRIMITIVE_INDEX}
-            let item = dx_params.x + primitive;
-            let instance = item / {count}u + {first_instance}u;
-            let per_instance = item % {count}u;
+            "let primitive = id.x;
+            if primitive >= {active} {{ return; }}
+            let item = dx_params.x + primitive;"
+        )
+        .unwrap();
+        if self.indirect.is_some() {
+            source.push_str("let first = dx_schedule[2]; let base_vertex = dx_schedule[3]; let first_instance = dx_schedule[4]; let per_draw = dx_schedule[1];\n");
+        } else {
+            let per_draw = if self.strip(input_vertices) {
+                "dx_strip[0].x".into()
+            } else {
+                format!("{count}u")
+            };
+            writeln!(source, "let first = {first}u; let base_vertex = {}u; let first_instance = {first_instance}u; let per_draw = {per_draw};", base_vertex as u32).unwrap();
+        }
+        writeln!(
+            source,
+            "let instance = item / per_draw + first_instance;
+            let per_instance = item % per_draw;
             for (var j = 0u; j < {input_vertices}u; j += 1u) {{"
         )
         .unwrap();
-        if flip_winding {
-            let flipped = if input_vertices == 6 {
-                "(6u - j) % 6u"
-            } else {
-                "(3u - j) % 3u"
-            };
-            writeln!(
-                source,
-                "let corner = select(j, {flipped}, (per_instance & 1u) != 0u);"
-            )
-            .unwrap();
-        } else {
-            source.push_str("let corner = j;\n");
+        let strip = self.strip(input_vertices);
+        if strip {
+            source.push_str("let strip_item = dx_strip[1u + per_instance];\n");
         }
-        writeln!(
-            source,
-            "let at = {first}u + per_instance * {step}u + corner;"
-        )
-        .unwrap();
-        if let Some(IndexInput { offset, wide }) = index {
-            if wide {
-                writeln!(source, "let vertex_id = dx_indices[{offset}u / 4u + at];").unwrap();
+        if input_vertices == 6 && flip_winding {
+            if strip {
+                source.push_str(
+                    "let base = strip_item.x;
+                    let in_strip = strip_item.y;
+                    let has_next = per_instance + 1u < per_draw
+                        && dx_strip[2u + per_instance].y == in_strip + 1u;\n",
+                );
             } else {
-                writeln!(source, "let word = {offset}u / 2u + at; let vertex_id = (dx_indices[word / 2u] >> (16u * (word & 1u))) & 65535u;").unwrap();
+                source.push_str(
+                    "let base = first + 2u * per_instance;
+                    let in_strip = per_instance;
+                    let has_next = per_instance + 1u < per_draw;\n",
+                );
             }
+            // The previous and next triangles supply the two shared-edge neighbors.
+            source.push_str("let adjacent_before = select(base + 1u, base - 2u, in_strip != 0u);
+                let adjacent_after = select(base + 5u, base + 6u, has_next);
+                let corners = array<u32, 6>(base, adjacent_before, base + 2u, adjacent_after, base + 4u, base + 3u);
+                let at = corners[select(j, (6u - j) % 6u, (in_strip & 1u) != 0u)];\n");
         } else {
-            writeln!(source, "let vertex_id = at - {first}u;").unwrap();
+            if flip_winding {
+                writeln!(
+                    source,
+                    "let corner = select(j, (3u - j) % 3u, ({} & 1u) != 0u);",
+                    if strip {
+                        "strip_item.y"
+                    } else {
+                        "per_instance"
+                    }
+                )
+                .unwrap();
+            } else {
+                source.push_str("let corner = j;\n");
+            }
+            if strip {
+                source.push_str("let at = strip_item.x + corner;\n");
+            } else {
+                writeln!(source, "let at = first + per_instance * {step}u + corner;").unwrap();
+            }
+        }
+        if let Some(index) = index {
+            index.read(source, "at");
+        } else {
+            source.push_str("let vertex_id = at - first;\n");
         }
         let start = if index.is_some() {
-            base_vertex as u32
+            "base_vertex"
         } else {
-            first
+            "first"
         };
         writeln!(
             source,
-            "dx_source[primitive * {input_vertices}u + j] = dx_fetch(vertex_id + {start}u, instance, {start}u, {first_instance}u);
+            "dx_source[primitive * {input_vertices}u + j] = dx_fetch(vertex_id + {start}, instance, {start}, first_instance);
             }}"
         ).unwrap();
     }
@@ -233,6 +332,7 @@ pub struct Plan<'a> {
     pub raster: Option<Raster<'a>>,
     /// Each declaration here has a bound target.
     pub stream_output: &'a [StreamOutput],
+    pub stream_statistics: bool,
 }
 
 pub struct ComputeProgram {
@@ -243,6 +343,7 @@ pub struct ComputeProgram {
     pub counters: Vec<(u32, u32)>,
     expansion: Vec<ExpansionBinding>,
     workgroup_size: Option<u32>,
+    items_per_primitive: u32,
 }
 
 pub struct Programs {
@@ -262,6 +363,8 @@ pub struct Programs {
     raster_stream: u32,
     domain: Option<(u32, u32)>,
     assembled: bool,
+    tessellation: Option<tessellation::Programs>,
+    assembly: Option<(Assembly, u32)>,
 }
 
 pub struct Inputs {
@@ -272,6 +375,10 @@ pub struct Inputs {
     pub indices: Option<BufferRange>,
     pub vertex: SlotBindings,
     pub geometry: SlotBindings,
+    pub hull: SlotBindings,
+    pub domain: SlotBindings,
+    pub indirect: Option<BufferRange>,
+    pub stream_statistics: Option<BufferRange>,
     pub statistics: Option<BufferRange>,
     /// Targets and their filled byte sizes, in declaration order.
     pub stream_output: Vec<(BufferRange, BufferRange)>,
@@ -284,6 +391,12 @@ pub struct BinDraw {
 }
 
 impl Programs {
+    pub fn tessellation_stages(&self) -> Option<(&ComputeProgram, &ComputeProgram)> {
+        self.tessellation
+            .as_ref()
+            .map(|programs| (&programs.vertex, &programs.hull))
+    }
+
     pub fn vertex_shader(&self, bin: usize) -> Result<Arc<ModernShader>, adv_device::gpu::Error> {
         let source = &self.raster[bin];
         ModernShader::wgsl(
@@ -349,9 +462,14 @@ impl Programs {
             indices,
             mut vertex,
             mut geometry,
+            mut hull,
+            mut domain,
+            indirect,
+            stream_statistics,
             statistics,
             stream_output,
         } = inputs;
+        let mut strip_buffer = None;
         let prelude = if let Some((input_stride, output_stride)) = self.domain {
             let vertices = vertices.unwrap();
             let count =
@@ -371,10 +489,28 @@ impl Programs {
             if self.assembled {
                 bind_storage(&mut vertex, INPUT_SLOT, vertices.unwrap());
             }
+            let strip = self
+                .assembly
+                .filter(|(assembly, width)| assembly.strip(*width));
+            let prelude = if let Some((assembly, width)) = strip {
+                let (buffer, prelude) = strip::prepare(
+                    gpu,
+                    assembly,
+                    width,
+                    indices.as_ref().unwrap().clone(),
+                    indirect.as_ref(),
+                )?;
+                bind_storage(&mut vertex, strip::SLOT, buffer.clone());
+                bind_storage(&mut geometry, strip::SLOT, buffer.clone());
+                strip_buffer = Some(buffer);
+                Some(prelude)
+            } else {
+                None
+            };
             if let Some(indices) = indices {
                 bind_storage(&mut vertex, INDEX_SLOT, indices);
             }
-            None
+            prelude
         };
         if let Some(statistics) = &statistics {
             bind_storage(&mut geometry, STATISTICS_SLOT, statistics.clone());
@@ -383,7 +519,14 @@ impl Programs {
         if let Some(initialize) = &self.initialize {
             programs.push(initialize.dispatch(gpu, SlotBindings::default())?);
         }
-        if prelude.is_none() {
+        if let Some(tessellation) = &self.tessellation {
+            programs.push(tessellation.vertex.dispatch(gpu, vertex)?);
+            programs.push(tessellation.hull.dispatch(gpu, std::mem::take(&mut hull))?);
+            for pass in &tessellation.fixed {
+                programs.push(pass.dispatch(gpu, SlotBindings::default())?);
+            }
+            programs.push(self.source.dispatch(gpu, std::mem::take(&mut domain))?);
+        } else if self.domain.is_none() {
             programs.push(self.source.dispatch(gpu, vertex)?);
         }
         programs.push(self.primitive.dispatch(gpu, geometry)?);
@@ -391,6 +534,12 @@ impl Programs {
         for (slot, (target, filled)) in stream_output.into_iter().enumerate() {
             bind_storage(&mut stream, TARGET_BASE + slot as u32, target);
             bind_storage(&mut stream, FILLED_BASE + slot as u32, filled);
+        }
+        if let Some(buffer) = &strip_buffer {
+            bind_storage(&mut stream, strip::SLOT, buffer.clone());
+        }
+        if let Some(statistics) = stream_statistics {
+            bind_storage(&mut stream, STREAM_STATISTICS, statistics);
         }
         if let Some(scan) = &self.scan {
             programs.push(scan.dispatch(gpu, stream.clone())?);
@@ -430,10 +579,25 @@ impl Programs {
                 }
             })
             .collect();
+        let mut regions = self.regions.clone();
+        if let Some((assembly, input_vertices)) = self
+            .assembly
+            .filter(|(assembly, _)| assembly.indirect.is_some())
+        {
+            schedule::insert(
+                gpu,
+                assembly,
+                input_vertices,
+                (indirect.unwrap(), strip_buffer),
+                &mut regions,
+                &mut programs,
+                usize::from(self.initialize.is_some()),
+            )?;
+        }
         Ok(Expand {
             primitives,
             prelude,
-            regions: self.regions.clone(),
+            regions,
             programs,
             bins,
         })
@@ -451,12 +615,17 @@ impl ComputeProgram {
             slots,
             expansion: self.expansion.clone(),
             workgroup_size: self.workgroup_size,
+            items_per_primitive: self.items_per_primitive,
+            indirect: None,
         })
     }
 
     fn prepare(&self, gpu: &Gpu) -> Result<adv_device::gpu::Dispatch, adv_device::gpu::Error> {
+        let mut identity = xxhash_rust::xxh3::Xxh3::new();
+        identity.update(self.source.as_bytes());
+        identity.update(self.entry.as_bytes());
         let shader = ModernShader::wgsl(
-            xxhash_rust::xxh3::xxh3_64(self.source.as_bytes()),
+            identity.digest(),
             &self.source,
             self.entry,
             adv_device::gpu::ShaderStage::Compute,
@@ -469,14 +638,31 @@ impl ComputeProgram {
 pub fn draw_auto(
     gpu: &Gpu,
     cursor: BufferRange,
+    offset: u32,
+    stride: u32,
 ) -> Result<(adv_device::gpu::Dispatch, SlotBindings, BufferRange), adv_device::gpu::Error> {
     use adv_gpu::resource::{BufferDesc, BufferUsage, Memory};
+    let invalid = |error: adv_gpu::Error| adv_device::gpu::Error::Invalid(error.to_string());
+    let params = gpu
+        .device()
+        .create_buffer(&BufferDesc {
+            size: 16,
+            usage: BufferUsage::UNIFORM,
+            memory: Memory::Upload,
+            label: "stream-output input offset and stride",
+        })
+        .map_err(invalid)?;
+    // This parameter range belongs to the draw being prepared.
+    unsafe { &mut *params.mapped().unwrap().as_ptr() }
+        .copy_from_slice(bytemuck::bytes_of(&[offset, stride, 0, 0]));
     let shader = Arc::new(ModernShader::wgsl(
         0x757f_047b_d84e_069c,
-        "@group(3) @binding(0) var<storage, read> filled: array<u32>;
+        "@group(0) @binding(0) var<uniform> input: vec4<u32>;
+        @group(3) @binding(0) var<storage, read> filled: array<u32>;
         @group(3) @binding(1) var<storage, read_write> args: vec4<u32>;
         @compute @workgroup_size(1) fn main() {
-            args = vec4<u32>(filled[1], 1u, 0u, 0u);
+            let count = (max(filled[0], input.x) - input.x) / input.y;
+            args = vec4<u32>(count, 1u, 0u, 0u);
         }",
         "main",
         adv_device::gpu::ShaderStage::Compute,
@@ -490,10 +676,16 @@ pub fn draw_auto(
                 memory: Memory::Device,
                 label: "stream-output draw arguments",
             })
-            .map_err(|error| adv_device::gpu::Error::Invalid(error.to_string()))?,
+            .map_err(invalid)?,
         range: 0..16,
     };
-    let mut bindings = SlotBindings::default();
+    let mut bindings = SlotBindings {
+        uniforms: vec![Some(BufferRange {
+            buffer: params,
+            range: 0..16,
+        })],
+        ..Default::default()
+    };
     bind_storage(&mut bindings, 0, cursor);
     bind_storage(&mut bindings, 1, arguments.clone());
     Ok((gpu.prepare_dispatch(shader)?, bindings, arguments))
@@ -538,10 +730,38 @@ fn entry(source: &mut String, name: &str, group: u32) {
 const PRIMITIVE_INDEX: &str = "let primitive = id.x; if primitive >= dx_params.y { return; }";
 
 impl Plan<'_> {
+    fn assembly(&self) -> Option<(Assembly, u32)> {
+        match self.source {
+            Source::InputAssembler { assembly, .. } => Some((assembly, self.input_vertices)),
+            Source::Tessellated {
+                assembly, layout, ..
+            } => Some((assembly, layout.input_points)),
+            _ => None,
+        }
+    }
+
     pub fn emit(&self) -> Result<Programs, Error> {
-        let (source, input_ir, input_registers) = self.emit_source()?;
+        let mut regions = Vec::new();
+        let (source, input_ir, input_registers, tessellation) = match self.source {
+            Source::Tessellated {
+                vertex,
+                hull,
+                domain,
+                fetches,
+                assembly,
+                layout,
+            } => {
+                let (source, outputs, tessellation) =
+                    layout.emit(vertex, *hull, *domain, fetches, assembly, &mut regions)?;
+                (source, domain.ir, outputs, Some(tessellation))
+            }
+            _ => {
+                let (source, ir, outputs) = self.emit_source()?;
+                (source, ir, outputs, None)
+            }
+        };
         let domain = match self.source {
-            Source::Vertex(_) | Source::InputAssembler { .. } => None,
+            Source::Vertex(_) | Source::InputAssembler { .. } | Source::Tessellated { .. } => None,
             Source::Domain {
                 control_points,
                 control_registers,
@@ -552,21 +772,28 @@ impl Plan<'_> {
                 input_registers * 16,
             )),
         };
-        let mut regions = Vec::new();
-        if domain.is_none() {
+        if domain.is_none() && tessellation.is_none() {
             regions.push(ExpansionRegion {
                 bytes_per_primitive: self.input_vertices * input_registers * 16,
                 fixed_bytes: 0,
                 element_stride: input_registers * 16,
             });
         }
-        let program = primitive::Emitter::new(self, input_ir, input_registers)?;
+        let program = primitive::Emitter::new(
+            self,
+            input_ir,
+            input_registers,
+            tessellation.as_ref().map(|programs| programs.output),
+        )?;
         let topology = program.raster_topology();
         let (initialize, raster_region, argument_region, raster) = match &self.raster {
             Some(raster) if program.raster_slots() != 0 => {
                 let vertex_region = regions.len();
                 regions.push(ExpansionRegion {
-                    bytes_per_primitive: program.raster_slots() * (program.outputs + 1) * 16,
+                    bytes_per_primitive: program.raster_slots()
+                        * (program.outputs + 1)
+                        * 16
+                        * program.items(),
                     fixed_bytes: 0,
                     element_stride: (program.outputs + 1) * 16,
                 });
@@ -604,7 +831,10 @@ impl Plan<'_> {
             (!self.stream_output.is_empty() && program.list_slots() != 0).then(|| {
                 let region = regions.len();
                 regions.push(ExpansionRegion {
-                    bytes_per_primitive: program.list_slots() * (program.outputs + 1) * 16,
+                    bytes_per_primitive: program.list_slots()
+                        * (program.outputs + 1)
+                        * 16
+                        * program.items(),
                     fixed_bytes: 0,
                     element_stride: (program.outputs + 1) * 16,
                 });
@@ -613,7 +843,10 @@ impl Plan<'_> {
         let scan_region = stream_region.map(|_| {
             let region = regions.len();
             regions.push(ExpansionRegion {
-                bytes_per_primitive: 4 * self.stream_output.len() as u32 * program.list_slots(),
+                bytes_per_primitive: 4
+                    * self.stream_output.len() as u32
+                    * program.list_slots()
+                    * program.items(),
                 fixed_bytes: 0,
                 element_stride: 4,
             });
@@ -648,6 +881,8 @@ impl Plan<'_> {
             raster_stream: self.raster.as_ref().map_or(0, |raster| raster.stream),
             domain,
             assembled: matches!(self.source, Source::Vertex(_)),
+            assembly: self.assembly(),
+            tessellation,
         })
     }
 
@@ -679,13 +914,14 @@ impl Plan<'_> {
                     counters: pulled.counters,
                     expansion: vec![params(), scratch(SOURCE_SLOT, 0)],
                     workgroup_size: Some(WORKGROUP),
+                    items_per_primitive: 1,
                 },
                 shader.ir,
                 pulled.outputs,
             ));
         }
         let (shader, invocation) = match self.source {
-            Source::InputAssembler { .. } => unreachable!(),
+            Source::InputAssembler { .. } | Source::Tessellated { .. } => unreachable!(),
             Source::Vertex(shader) => (shader, Invocation::Vertex),
             Source::Domain {
                 shader,
@@ -805,6 +1041,7 @@ impl Plan<'_> {
                 counters: pulled.counters,
                 expansion,
                 workgroup_size: Some(WORKGROUP),
+                items_per_primitive: 1,
             },
             shader.ir,
             pulled.outputs,

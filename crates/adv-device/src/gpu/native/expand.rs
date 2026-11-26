@@ -47,6 +47,10 @@ pub struct ExpansionDispatch {
     pub expansion: Vec<ExpansionBinding>,
     /// One invocation per primitive or a single invocation for the chunk.
     pub workgroup_size: Option<u32>,
+    /// Upper bound on shader invocations per input primitive in the chunk.
+    pub items_per_primitive: u32,
+    /// Region and byte offset of the three dispatch groups for this program.
+    pub indirect: Option<(usize, u32)>,
 }
 
 #[derive(Clone)]
@@ -264,13 +268,18 @@ impl Ring {
                 for binding in &bindings {
                     pass.bind(binding.slot, binding.binding());
                 }
-                pass.dispatch(
-                    program
-                        .workgroup_size
-                        .map_or(1, |size| count.div_ceil(size)),
-                    1,
-                    1,
-                );
+                if let Some((region, offset)) = program.indirect {
+                    let at = regions[region].start + u64::from(offset);
+                    pass.dispatch_indirect(scratch.slice(at..at + 12));
+                } else {
+                    pass.dispatch(
+                        program.workgroup_size.map_or(1, |size| {
+                            (count * program.items_per_primitive).div_ceil(size)
+                        }),
+                        1,
+                        1,
+                    );
+                }
             }
 
             for (bin, pipeline) in plan.bins.iter_mut().zip(&pipelines) {

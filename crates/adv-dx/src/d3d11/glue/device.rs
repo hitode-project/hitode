@@ -34,8 +34,8 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     CreateGeometryShader => geometry_shader Implement,
     CreateGeometryShaderWithStreamOutput => stream_output_shader Implement,
     CreatePixelShader => pixel_shader Implement,
-    CreateHullShader => excluded_stage SafeFail,
-    CreateDomainShader => excluded_stage SafeFail,
+    CreateHullShader => hull_shader Implement,
+    CreateDomainShader => domain_shader Implement,
     CreateComputeShader => compute_shader Implement,
     CreateClassLinkage => create_linkage Implement,
     CreateBlendState => blend Implement,
@@ -479,7 +479,7 @@ fn stream_output_shader(env: &mut Env<'_>) -> Outcome {
         out,
     ] = std::array::from_fn(|index| env.arg(index as u32));
     status((|| {
-        if linkage != 0 || count > 128 || stride_count > 4 {
+        if linkage != 0 || count > 512 || stride_count > 4 {
             return Err(Error::InvalidArgument);
         }
         let entries = array::<D3D11_SO_DECLARATION_ENTRY>(env, entries, count)?
@@ -512,6 +512,12 @@ fn pixel_shader(env: &mut Env<'_>) -> Outcome {
 }
 fn geometry_shader(env: &mut Env<'_>) -> Outcome {
     shader(env, Stage::Geometry, "ID3D11GeometryShader")
+}
+fn hull_shader(env: &mut Env<'_>) -> Outcome {
+    shader(env, Stage::Hull, "ID3D11HullShader")
+}
+fn domain_shader(env: &mut Env<'_>) -> Outcome {
+    shader(env, Stage::Domain, "ID3D11DomainShader")
 }
 fn compute_shader(env: &mut Env<'_>) -> Outcome {
     shader(env, Stage::Compute, "ID3D11ComputeShader")
@@ -647,9 +653,6 @@ fn unsupported_output(env: &mut Env<'_>, slot: u32, error: u32) -> Outcome {
     Outcome::Return(error)
 }
 
-fn excluded_stage(env: &mut Env<'_>) -> Outcome {
-    unsupported_output(env, 4, 0x80070057)
-}
 fn excluded_deferred(env: &mut Env<'_>) -> Outcome {
     unsupported_output(env, 2, 0x80004001)
 }

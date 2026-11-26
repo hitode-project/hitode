@@ -39,9 +39,6 @@ impl Shader {
         has_linkage: bool,
         report: &Report,
     ) -> Result<Self, Error> {
-        if matches!(stage, Stage::Hull | Stage::Domain) {
-            return Err(Error::InvalidArgument);
-        }
         let module = dxbc::parse(bytecode).map_err(|_| Error::InvalidArgument)?;
         if module.stage != stage || !accepts(stage, module.model, report) {
             return Err(Error::InvalidArgument);
@@ -61,7 +58,8 @@ impl Shader {
         {
             return Err(Error::InvalidArgument);
         }
-        match if stage == Stage::Geometry || linkage.is_some() {
+        match if matches!(stage, Stage::Geometry | Stage::Hull | Stage::Domain) || linkage.is_some()
+        {
             Ok(())
         } else {
             wgsl::emit(&module, wgsl::Options::default()).map(|_| ())
@@ -129,7 +127,7 @@ impl Shader {
                 Stage::Geometry | Stage::Vertex | Stage::Domain
             )
             || !accepts(module.stage, module.model, report)
-            || entries.len() > 128
+            || entries.len() > 512
             || strides.len() > 4
         {
             return Err(Error::InvalidArgument);
@@ -258,7 +256,7 @@ fn accepts(stage: Stage, model: Model, report: &Report) -> bool {
             Model::Sm50 => report.level >= L11_0,
             Model::Level91 | Model::Level93 => false,
         },
-        Stage::Hull | Stage::Domain => false,
+        Stage::Hull | Stage::Domain => model == Model::Sm50 && report.level >= L11_0,
     }
 }
 
@@ -311,6 +309,8 @@ mod tests {
             (Stage::Geometry, shader!("gs_4_0"), L10_0),
             (Stage::Geometry, shader!("gs_4_1"), L10_1),
             (Stage::Geometry, shader!("gs_5_0"), L11_0),
+            (Stage::Hull, shader!("hs_5_0"), L11_0),
+            (Stage::Domain, shader!("ds_5_0"), L11_0),
             (Stage::Pixel, shader!("ps_4_1"), L10_1),
             (Stage::Compute, shader!("cs_4_0"), L10_0),
             (Stage::Compute, shader!("cs_4_1"), L10_1),

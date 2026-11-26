@@ -142,7 +142,8 @@ impl Kind {
                     Stage::Pixel => IID_ID3D11PIXELSHADER,
                     Stage::Compute => IID_ID3D11COMPUTESHADER,
                     Stage::Geometry => IID_ID3D11GEOMETRYSHADER,
-                    Stage::Hull | Stage::Domain => unreachable!(),
+                    Stage::Hull => IID_ID3D11HULLSHADER,
+                    Stage::Domain => IID_ID3D11DOMAINSHADER,
                 };
                 (iid, DEVICE_CHILD)
             }

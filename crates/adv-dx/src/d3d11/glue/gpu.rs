@@ -1000,13 +1000,13 @@ fn stream_cursor(env: &mut Env<'_>, pointer: u32) -> Result<BufferRange, Error> 
         buffer.clone()
     } else {
         let usage = BufferUsage::STORAGE | BufferUsage::COPY_DST;
-        let buffer = resource::upload(&execution(env.ext)?.gpu, &[], usage, 8)?;
+        let buffer = resource::upload(&execution(env.ext)?.gpu, &[], usage, 4)?;
         *cursor = Some(buffer.clone());
         buffer
     };
     Ok(BufferRange {
         buffer,
-        range: 0..8,
+        range: 0..4,
     })
 }
 
@@ -1023,23 +1023,16 @@ pub(super) fn reset_stream_cursors(
         }
         let cursor = stream_cursor(env, pointer)?;
         let key = key(env, pointer, 0);
-        let execution = execution(env.ext)?;
-        for (word, value) in [offset, 0].into_iter().enumerate() {
-            let at = word as u64 * 4;
-            let transfer = ModernTransfer::FillBuffer {
-                destination: BufferRange {
-                    buffer: cursor.buffer.clone(),
-                    range: at..at + 4,
-                },
-                value,
-            };
-            execution.append(
-                Command::Transfer(transfer),
-                extent_rect([4, 1, 1]),
-                None,
-                key,
-            )?;
-        }
+        let transfer = ModernTransfer::FillBuffer {
+            destination: cursor,
+            value: offset,
+        };
+        execution(env.ext)?.append(
+            Command::Transfer(transfer),
+            extent_rect([4, 1, 1]),
+            None,
+            key,
+        )?;
     }
     Ok(())
 }
