@@ -223,10 +223,7 @@ impl Prepared {
         }
     }
 
-    pub(super) fn damage(
-        &self,
-        target: Option<&Target>,
-    ) -> crate::record::damage::Input<'_, impl Fn(Content, u128) -> u128 + '_> {
+    pub(super) fn damage(&self, target: Option<&Target>) -> crate::record::damage::Input<'_> {
         let image = damage::image(&self.operation).unwrap();
         let depth = match &self.operation {
             Operation::Draw(d) => d.target.depth(),
@@ -256,7 +253,7 @@ impl Prepared {
             samples: &self.samples,
             writes: &self.writes,
             ignores_sampled_color: self.ignores_sampled_color(),
-            write_key: |key, command| self.write_key(key, command),
+            clear_keys: self.clear_keys(),
         }
     }
     // A fixed-function draw without an alpha test never uses sampled color
@@ -267,22 +264,7 @@ impl Prepared {
                     && d.state.alpha_test == adv_device::gpu::Compare::Always)
     }
 
-    pub(super) fn attachment_command(&self, command: u128, versions: &[Option<u128>]) -> u128 {
-        if !self.ignores_sampled_color()
-            || !self.writes.iter().any(|(k, _)| k.2 != 0)
-            || !self.reads.iter().any(|k| k.2 == 0)
-        {
-            return command;
-        }
-        let mut key = xxhash_rust::xxh3::Xxh3::new();
-        self.key.hash(&mut key);
-        for (&k, &version) in self.reads.iter().zip(versions).filter(|(k, _)| k.2 != 0) {
-            (k, version.unwrap_or(0)).hash(&mut key);
-        }
-        key.digest128()
-    }
-
-    pub(super) fn write_key(&self, content: Content, command: u128) -> u128 {
+    fn clear_keys(&self) -> [Option<u128>; 3] {
         let Operation::Clear {
             target,
             rectangle,
@@ -291,20 +273,24 @@ impl Prepared {
             stencil,
         } = &self.operation
         else {
-            return command;
+            return [None; 3];
         };
-        let component = match content.2 {
-            0 => hash((image(&target.image), color.map(|c| c.map(f64::to_bits)))),
-            1 => hash((
-                target.depth().map(|d| (d.width(), d.height(), d.format())),
-                depth.map(f32::to_bits),
-            )),
-            _ => hash((
-                target.depth().map(|d| (d.width(), d.height(), d.format())),
-                stencil,
-            )),
-        };
-        hash((content, rect(*rectangle), component))
+        let mut keys = [None; 3];
+        for &(content, _) in &self.writes {
+            let component = match content.2 {
+                0 => hash((image(&target.image), color.map(|c| c.map(f64::to_bits)))),
+                1 => hash((
+                    target.depth().map(|d| (d.width(), d.height(), d.format())),
+                    depth.map(f32::to_bits),
+                )),
+                _ => hash((
+                    target.depth().map(|d| (d.width(), d.height(), d.format())),
+                    stencil,
+                )),
+            };
+            keys[content.2 as usize] = Some(hash((content, rect(*rectangle), component)));
+        }
+        keys
     }
 }
 pub(super) fn prepare(env: &mut Env<'_>, owner: Id, operation: Operation) -> Result<Prepared, u32> {

@@ -100,21 +100,21 @@ impl<K: Copy + Eq + std::hash::Hash, E> Cache<K, E> {
             .get(&target)
             .is_some_and(|r| r.until > self.frame)
     }
-    pub fn find(
-        &self,
+    pub fn candidates<'a>(
+        &'a self,
         target: K,
-        same_state: impl Fn(&E) -> bool,
-        same_bytes: impl Fn(&E) -> bool,
+        same_state: impl Fn(&E) -> bool + 'a,
         key: impl FnOnce() -> u128,
         entry_key: impl Fn(&E) -> u128,
-    ) -> (u128, bool, Option<Arc<E>>) {
+    ) -> (u128, bool, impl Iterator<Item = &'a Arc<E>>) {
         let sequence = self.targets.get(&target);
         let expected = sequence
             .and_then(|s| s.previous.get(s.cursor))
             .filter(|e| same_state(e));
         let index_key = expected.map_or_else(key, |e| entry_key(e));
-        let cached = expected.filter(|e| same_bytes(e)).or_else(|| {
-            sequence.and_then(|s| {
+        let others = sequence
+            .into_iter()
+            .flat_map(move |s| {
                 s.index
                     .get(&index_key)
                     .into_iter()
@@ -127,10 +127,13 @@ impl<K: Copy + Eq + std::hash::Hash, E> Cache<K, E> {
                             .flatten()
                             .filter_map(|&n| s.next.get(n)),
                     )
-                    .find(|e| same_state(e) && same_bytes(e))
             })
-        });
-        (index_key, expected.is_some(), cached.cloned())
+            .filter(move |e| same_state(e));
+        (
+            index_key,
+            expected.is_some(),
+            expected.into_iter().chain(others),
+        )
     }
 
     pub fn remember(

@@ -1,12 +1,13 @@
 use super::*;
 
+/// An allocation token, subresource ordinal, and attachment aspect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ResourceKey(pub [u64; 2], pub u64, pub u8);
+pub(crate) struct ResourceKey(pub (u64, u64), pub u64, pub u8);
 #[derive(Default)]
 pub(crate) struct Contents {
     indices: HashMap<ResourceKey, usize>,
-    pub(crate) slots: Vec<(ResourceKey, Option<u128>, Option<u128>)>,
-    pub(crate) touched: Vec<usize>,
+    pub(super) slots: Vec<(ResourceKey, Option<u128>, Option<u128>)>,
+    pub(super) touched: Vec<usize>,
     vacant: Vec<usize>,
 }
 impl Contents {
@@ -67,6 +68,11 @@ impl Contents {
         });
         self.indices.len() != before
     }
+    #[cfg(test)]
+    pub(crate) fn versions(&self) -> impl Iterator<Item = Option<u128>> + '_ {
+        self.slots.iter().map(|slot| slot.1)
+    }
+
     #[cfg(test)]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &ResourceKey> {
         self.slots.iter().filter(|s| s.1.is_some()).map(|s| &s.0)

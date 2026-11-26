@@ -53,7 +53,7 @@ fn signature(
     if !hot.scene
         || d.needs_reset
         || d.frame.reuse.disabled
-        || d.frame.partial
+        || d.frame.core.partial
         || d.frame.active.is_some()
     {
         return Err(INVALID);
@@ -99,11 +99,16 @@ fn signature(
         .iter()
         .flatten()
         .chain(&bindings.samples)
-        .map(|c| (d.frame.contents.get(c).copied(), d.frame.damage.written(c)))
+        .map(|c| {
+            (
+                d.frame.core.contents.get(c).copied(),
+                d.frame.core.damage.written(c),
+            )
+        })
         .collect();
     let independent = bindings
         .output
-        .map(|c| c.is_some_and(|c| d.frame.damage.independent(&c)));
+        .map(|c| c.is_some_and(|c| d.frame.core.damage.independent(&c)));
     let mut state = hot.fingerprints;
     state[13] = hot.shaders.vertex.map_or(0, |id| {
         constant_key(env, Some(id), &hot.shaders.vertex_constants)
@@ -216,7 +221,9 @@ fn draw(
     let owner = com(env).identity::<Payload>(&env.sys.objects, pointer);
     let fast_input = owner
         .filter(|_| {
-            rests || device(env, pointer).is_some_and(|d| d.frame.reuse.disabled || d.frame.partial)
+            rests
+                || device(env, pointer)
+                    .is_some_and(|d| d.frame.reuse.disabled || d.frame.core.partial)
         })
         .and_then(|owner| fast::input(env, pointer, owner, request, up));
     if let (Some(owner), Some(input)) = (owner, &fast_input)
@@ -262,79 +269,79 @@ fn draw(
     };
     let d = device(env, pointer).unwrap();
     let target_id = d.render_target.or(d.back_buffer).unwrap();
-    let (index_key, expected, cached) = d.frame.reuse.find(
+    let (index_key, expected, mut candidates) = d.frame.reuse.candidates(
         target_id,
         |e| *e.signature == signature && *e.indices == *indices,
-        |e| unchanged(env, &e.spans, up),
         || hash((&signature, indices)),
         |e| e.index_key,
     );
+    let cached = candidates.find(|e| unchanged(env, &e.spans, up)).cloned();
+    drop(candidates);
     let origin = cached.clone();
-    let entry = if let Some(entry) = cached {
-        let same_destination = entry.saved.get().is_none_or(|saved| {
-            entry
-                .prepared
-                .writes
-                .iter()
-                .zip(&saved.destinations)
-                .all(|((content, _), old)| d.frame.contents.get(content).copied() == *old)
-        });
-        // Keep an occurrence's output versions alongside the shared geometry.
-        // The same command can occur twice with different destination inputs.
-        let mut prepared = entry.prepared.clone();
-        let rebase = matches!(&prepared.operation, Operation::Draw(draw)
+    let entry =
+        if let Some(entry) = cached {
+            let same_destination =
+                entry.saved.get().is_none_or(|saved| {
+                    entry.prepared.writes.iter().zip(&saved.destinations).all(
+                        |((content, _), old)| d.frame.core.contents.get(content).copied() == *old,
+                    )
+                });
+            // Keep an occurrence's output versions alongside the shared geometry.
+            // The same command can occur twice with different destination inputs.
+            let mut prepared = entry.prepared.clone();
+            let rebase = matches!(&prepared.operation, Operation::Draw(draw)
             if !draw.target.image.shares_storage(&target.image));
-        if rebase && let Operation::Draw(draw) = &mut Arc::make_mut(&mut prepared).operation {
-            draw.target = target.clone();
-        }
-        if rebase || !same_destination {
-            let saved = std::sync::OnceLock::new();
-            if same_destination && let Some(old) = entry.saved.get() {
-                let _ = saved.set(old.clone());
+            if rebase && let Operation::Draw(draw) = &mut Arc::make_mut(&mut prepared).operation {
+                draw.target = target.clone();
             }
-            Arc::new(Entry {
-                signature: entry.signature.clone(),
-                index_key: entry.index_key,
-                indices: entry.indices.clone(),
-                prepared,
-                spans: entry.spans.clone(),
-                saved,
-            })
+            if rebase || !same_destination {
+                let saved = std::sync::OnceLock::new();
+                if same_destination && let Some(old) = entry.saved.get() {
+                    let _ = saved.set(old.clone());
+                }
+                Arc::new(Entry {
+                    signature: entry.signature.clone(),
+                    index_key: entry.index_key,
+                    indices: entry.indices.clone(),
+                    prepared,
+                    spans: entry.spans.clone(),
+                    saved,
+                })
+            } else {
+                entry
+            }
         } else {
-            entry
-        }
-    } else {
-        *d.hot.borrow().fixed.captures.borrow_mut() = Some(Vec::new());
-        let draw = build(env);
-        let spans = device(env, pointer)
-            .unwrap()
-            .hot
-            .borrow()
-            .fixed
-            .captures
-            .borrow_mut()
-            .take()
-            .unwrap();
-        let draw = match draw {
-            Ok(draw) => draw,
-            Err(code) => return Outcome::Return(code),
+            *d.hot.borrow().fixed.captures.borrow_mut() = Some(Vec::new());
+            let draw = build(env);
+            let spans = device(env, pointer)
+                .unwrap()
+                .hot
+                .borrow()
+                .fixed
+                .captures
+                .borrow_mut()
+                .take()
+                .unwrap();
+            let draw = match draw {
+                Ok(draw) => draw,
+                Err(code) => return Outcome::Return(code),
+            };
+            let owner = com(env)
+                .identity::<Payload>(&env.sys.objects, pointer)
+                .unwrap();
+            let prepared = match key::prepare(env, owner, Operation::Draw(draw)) {
+                Ok(prepared) => prepared,
+                Err(code) => return Outcome::Return(code),
+            };
+            Arc::new(Entry {
+                signature: Arc::new(signature),
+                index_key,
+                indices: indices.into(),
+                prepared: Arc::new(prepared),
+                spans,
+                saved: Default::default(),
+            })
         };
-        let owner = com(env)
-            .identity::<Payload>(&env.sys.objects, pointer)
-            .unwrap();
-        let prepared = match key::prepare(env, owner, Operation::Draw(draw)) {
-            Ok(prepared) => prepared,
-            Err(code) => return Outcome::Return(code),
-        };
-        Arc::new(Entry {
-            signature: Arc::new(signature),
-            index_key,
-            indices: indices.into(),
-            prepared: Arc::new(prepared),
-            spans,
-            saved: Default::default(),
-        })
-    };
     let owner = com(env)
         .identity::<Payload>(&env.sys.objects, pointer)
         .unwrap();

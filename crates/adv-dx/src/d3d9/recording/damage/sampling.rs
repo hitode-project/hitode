@@ -15,7 +15,7 @@ pub(in crate::d3d9::recording) fn prepare(
     operation: &Operation,
     reads: &[Content],
 ) -> smallvec::SmallVec<[Read; 2]> {
-    if !reads.iter().any(|k| device.frame.damage.written(k)) {
+    if !reads.iter().any(|k| device.frame.core.damage.written(k)) {
         return smallvec::SmallVec::new();
     }
     let result = match operation {

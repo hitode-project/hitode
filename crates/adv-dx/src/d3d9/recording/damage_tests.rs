@@ -30,7 +30,7 @@ fn recorded_bounds(f: &mut Fixture) -> Rect {
     let pointer = f.device;
     let e = env(f);
     let d = device(&e, pointer).unwrap();
-    damage::bounds(&e, d, d.frame.commands.last().unwrap())
+    damage::bounds(&e, d, d.frame.commands().last().unwrap())
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn check_sparse_constants(verify: bool) {
             let e = env(&mut f);
             let device = device(&e, pointer).unwrap();
             let hot = device.hot.borrow();
-            let Operation::Draw(d) = device.frame.commands.last().unwrap() else {
+            let Operation::Draw(d) = device.frame.commands().last().unwrap() else {
                 unreachable!()
             };
             let p = d.programmable.as_ref().unwrap();
@@ -734,7 +734,12 @@ fn verification_checks_outside_changed_bounds_and_reads_presented_rotation_slot(
     assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 0);
     let owner = id(&mut f);
     // A pixel outside the changed quad's damage cell.
-    frame(&mut env(&mut f), owner).previous.as_mut().unwrap().2[(11 * 16 + 15) * 4] ^= 1;
+    frame(&mut env(&mut f), owner)
+        .core
+        .previous
+        .as_mut()
+        .unwrap()
+        .2[(11 * 16 + 15) * 4] ^= 1;
     colors[0][1] = 0.75;
     scene(&mut f, colors);
     present(&mut f);
@@ -925,7 +930,12 @@ fn sampled_target_changes_damage_the_consuming_draw_and_copy_clips_keep_offsets(
         d.image = Some(target.image.clone());
         d.state.texture_op = TextureOp::Texture;
         record_draw(&mut f, d);
-        keys.push(frame(&mut env(&mut f), owner).command_identities.clone());
+        keys.push(
+            frame(&mut env(&mut f), owner)
+                .core
+                .command_identities
+                .clone(),
+        );
         present(&mut f);
     }
     assert_ne!(keys[0], keys[1]);
@@ -1070,7 +1080,7 @@ fn programmable_clipped_replay_matches_full_shader_execution() {
             let pointer = f.device;
             let e = env(&mut f);
             let d = device(&e, pointer).unwrap();
-            let Operation::Draw(d) = d.frame.commands.last().unwrap() else {
+            let Operation::Draw(d) = d.frame.commands().last().unwrap() else {
                 panic!("recorded shader draw");
             };
             gpu.draw_programmable(&target, d.programmable.as_ref().unwrap(), &d.state)
@@ -2346,8 +2356,8 @@ fn coalesced_draws_match_logical_plan_and_pixels() {
         f.okay("IDirect3DDevice9::EndScene", &[d]);
         let mut e = env(&mut f);
         let recording = frame(&mut e, owner);
-        let keys = recording.command_identities.clone();
-        let versions: Vec<_> = recording.contents.slots.iter().map(|s| s.1).collect();
+        let keys = recording.core.command_identities.clone();
+        let versions: Vec<_> = recording.core.contents.versions().collect();
         present(&mut f);
         let pixels = f.pixels(&image);
         let after = f.m.ext.get::<State>().frames;
@@ -2443,13 +2453,13 @@ fn fixed_draw_runs_match_general_recording_across_frames() {
             f.okay("IDirect3DDevice9::SetTexture", &[d, 0, 0]);
             let mut e = env(&mut f);
             let recorded = frame(&mut e, owner);
-            let keys = recorded.command_identities.clone();
-            let records = recorded.damage.recorded();
-            let versions: Vec<_> = recorded.contents.slots.iter().map(|s| s.1).collect();
-            recorded.test_plan = Some(Vec::new());
+            let keys = recorded.core.command_identities.clone();
+            let records = recorded.core.damage.recorded();
+            let versions: Vec<_> = recorded.core.contents.versions().collect();
+            recorded.core.test_plan = Some(Vec::new());
             let published = f.m.ext.get::<Presents>().damage.len();
             present(&mut f);
-            let plan = frame(&mut env(&mut f), owner).test_plan.take();
+            let plan = frame(&mut env(&mut f), owner).core.test_plan.take();
             let damage = f.m.ext.get::<Presents>().damage.get(published).cloned();
             let pixels = latest(&mut f);
             let after = f.m.ext.get::<State>().frames;

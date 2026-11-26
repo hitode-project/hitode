@@ -434,7 +434,6 @@ enum Operation {
         token: u64,
         reason: recording::Reason,
     },
-    Consumed,
 }
 struct Pending {
     context: u32,
@@ -1687,7 +1686,6 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             ..
         } => stretch::copy(&mut gpu, source, *rectangle, destination, *region, *filter)
             .map(|()| Completion::Command),
-        Operation::Consumed => Ok(Completion::Command),
         Operation::Flush { .. } => unreachable!("flush is executed by the recording owner"),
     };
     env.ext.get_mut::<State>().gpu = Some(gpu);

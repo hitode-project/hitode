@@ -1,7 +1,8 @@
 //! D3D9 command details for the frame trace.
 use super::*;
+use crate::record::Contents;
+pub(super) use crate::record::trace::capturing;
 pub use crate::record::trace::take_or_arm;
-pub(super) use crate::record::trace::{capturing, frame_end, present, work};
 use crate::record::trace::{name, push, rect};
 use std::sync::Mutex;
 

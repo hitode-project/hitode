@@ -69,6 +69,16 @@ impl Plan {
         };
         std::mem::size_of::<Effects>() + spill + 1
     }
+    pub fn retains_aspects(&self, n: usize, selected: Option<&[Content]>) -> bool {
+        self.effects[n].clear
+            && selected.is_some_and(|keys| {
+                self.effects[n]
+                    .writes
+                    .iter()
+                    .any(|(key, _)| !keys.contains(key))
+            })
+    }
+
     pub fn truncate(&mut self, len: usize) {
         self.effects.truncate(len);
         self.skipped.clear();
@@ -170,9 +180,9 @@ mod tests {
     // spec: GFX-REC-9
     fn complete_overwrites_protect_reads_partial_writes_mips_and_aspects() {
         use crate::record::ResourceKey;
-        let a = ResourceKey([1, 0], 0, 0);
-        let b = ResourceKey([1, 0], 1, 0);
-        let depth = ResourceKey([1, 0], 0, 1);
+        let a = ResourceKey((1, 0), 0, 0);
+        let b = ResourceKey((1, 0), 1, 0);
+        let depth = ResourceKey((1, 0), 0, 1);
         let effect = |pass, reads, writes, barrier| Effects {
             pass,
             reads: SmallVec::from_vec(reads),

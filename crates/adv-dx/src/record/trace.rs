@@ -31,11 +31,12 @@ pub(crate) fn push(line: String) {
     LINES.lock().unwrap().push(line);
 }
 pub(crate) fn name(c: &Content) -> String {
+    let &crate::record::ResourceKey((_, serial), subresource, aspect) = c;
     let aspect = ["color", "depth", "stencil"]
-        .get(c.2 as usize)
+        .get(aspect as usize)
         .copied()
         .unwrap_or("?");
-    format!("{:x}.{}.{aspect}", c.0[1], c.1)
+    format!("{serial:x}.{subresource}.{aspect}")
 }
 pub(crate) fn rect(r: Rect) -> String {
     format!("{}x{}+{}+{}", r.w, r.h, r.x, r.y)

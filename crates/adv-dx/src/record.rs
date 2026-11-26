@@ -5,10 +5,27 @@ use std::sync::Arc;
 mod contents;
 pub(crate) mod damage;
 pub(crate) mod key;
-pub(crate) mod passes;
+mod passes;
+mod planner;
 pub(crate) mod reuse;
 pub(crate) mod trace;
 pub(crate) use contents::{Contents, ResourceKey};
+
+pub(crate) use planner::{Cursor, Op, Plan, Reason, Recording};
+
+/// The adapter supplies the executable payload and maps its flush boundaries.
+pub(crate) trait Front {
+    type Payload;
+    type Sink<'a>;
+    type Completion;
+    type Error;
+    type Boundary;
+    fn encode(
+        sink: &mut Self::Sink<'_>,
+        payload: &Self::Payload,
+    ) -> Result<Self::Completion, Self::Error>;
+    fn reason(boundary: Self::Boundary) -> Reason;
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {

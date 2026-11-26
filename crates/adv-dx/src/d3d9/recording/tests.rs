@@ -373,7 +373,7 @@ fn repeated_programmable_frame_keeps_captures_without_backend_packing() {
         let (bytes, constants) = {
             let mut e = env(&mut f);
             let recording = frame(&mut e, owner);
-            let Operation::Draw(draw) = recording.commands.last().unwrap() else {
+            let Operation::Draw(draw) = recording.commands().last().unwrap() else {
                 panic!()
             };
             let p = draw.programmable.as_ref().unwrap();
@@ -445,7 +445,12 @@ fn verification_executes_repeats_async_and_counts_real_pixel_mismatches() {
     // Corrupt the retained reference only: the diagnostic must detect it, rather
     // than merely asserting that two copies of its own hash agree.
     let owner = id(&mut f);
-    frame(&mut env(&mut f), owner).previous.as_mut().unwrap().2[0] ^= 1;
+    frame(&mut env(&mut f), owner)
+        .core
+        .previous
+        .as_mut()
+        .unwrap()
+        .2[0] ^= 1;
     clear(&mut f, 0xff123456);
     present(&mut f);
     assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 1);
@@ -505,15 +510,17 @@ fn command_and_byte_limits_flush_complete_ordered_work_and_disable_partial_frame
     assert_eq!(f.finish(outcome), 0);
     assert_eq!(f.m.ext.get::<State>().frames.submissions, 4096);
     let owner = id(&mut f);
-    assert!(frame(&mut env(&mut f), owner).commands.is_empty());
+    assert!(frame(&mut env(&mut f), owner).core.commands.is_empty());
     present(&mut f);
     assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 0);
     // Seed the accumulated byte count near its bound without allocating a huge
     // fixture; the next real vertex payload must trigger exactly one flush.
-    frame(&mut env(&mut f), owner).bytes = 64 * 1024 * 1024 - 1;
+    frame(&mut env(&mut f), owner)
+        .core
+        .set_bytes(64 * 1024 * 1024 - 1);
     let d = draw(&mut f);
     record_draw(&mut f, d);
-    assert!(frame(&mut env(&mut f), owner).commands.is_empty());
+    assert!(frame(&mut env(&mut f), owner).core.commands.is_empty());
     assert_eq!(
         f.m.ext.get::<State>().frames.flushes[Reason::Limit as usize],
         2
@@ -1079,7 +1086,7 @@ fn repeat_keeps_refresh_wait_and_reset_release_and_unsupported_capture_commit_co
     let outcome = f.call("IDirect3DDevice9::GetFrontBufferData", &[f.device, 0, 0]);
     assert!(matches!(outcome, Outcome::Return(INVALID)));
     let owner = id(&mut f);
-    assert!(frame(&mut env(&mut f), owner).commands.is_empty());
+    assert!(frame(&mut env(&mut f), owner).core.commands.is_empty());
     assert_eq!(
         f.m.ext.get::<State>().frames.flushes[Reason::Readback as usize],
         1
@@ -1191,7 +1198,12 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
         let mut d = draw(&mut f);
         d.image = Some(f.image(if resource == first { source } else { other }));
         record_draw(&mut f, d);
-        keys.push(frame(&mut env(&mut f), owner).command_identities.clone());
+        keys.push(
+            frame(&mut env(&mut f), owner)
+                .core
+                .command_identities
+                .clone(),
+        );
         present(&mut f);
     }
     assert_ne!(keys[0], keys[1]);
@@ -1208,6 +1220,7 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
     present(&mut f);
     assert!(
         frame(&mut env(&mut f), owner)
+            .core
             .contents
             .keys()
             .any(|k| k.0 == first.key())
@@ -1216,6 +1229,7 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
     assert_eq!(f.finish(outcome), 0);
     assert!(
         !frame(&mut env(&mut f), owner)
+            .core
             .contents
             .keys()
             .any(|k| k.0 == first.key())
@@ -1259,7 +1273,7 @@ fn execution_time_device_failure_is_deferred_to_cooperative_level_and_present() 
     let outcome = flush(&mut f, Reason::Readback);
     assert_eq!(f.finish(outcome), 0, "flush defers device loss");
     let owner = id(&mut f);
-    assert!(frame(&mut env(&mut f), owner).commands.is_empty());
+    assert!(frame(&mut env(&mut f), owner).core.commands.is_empty());
     let outcome = f.call("IDirect3DDevice9::TestCooperativeLevel", &[f.device]);
     assert_eq!(f.finish(outcome), DEVICE_LOST);
     let outcome = f.call("IDirect3DDevice9::Present", &[f.device, 0, 0, 0, 0]);
@@ -1323,7 +1337,7 @@ fn private_background_presentations_do_not_seed_foreground_elision() {
     }
     assert_eq!(f.m.ext.get::<Presents>().published, [1]);
     let owner = id(&mut f);
-    assert_eq!(frame(&mut env(&mut f), owner).last_serial, None);
+    assert_eq!(frame(&mut env(&mut f), owner).core.last_serial(), None);
     // Handoff can preserve the same maximum serial when the former foreground
     // advanced private frames; regaining the output must still publish once.
     f.m.ext.get_mut::<Presents>().detached = false;
@@ -1378,7 +1392,7 @@ fn transient_vertex_buffer_release_preserves_captured_vertices_and_frame_elision
         assert_eq!(f.finish(outcome), 0);
         let owner = id(&mut f);
         assert_eq!(
-            frame(&mut env(&mut f), owner).commands.len(),
+            frame(&mut env(&mut f), owner).core.commands.len(),
             2,
             "transient release must not execute the frame early"
         );
@@ -1737,7 +1751,7 @@ fn d3d9_package_b_swap_chain_present_preserves_pacing_damage_and_capture_boundar
         let result = f.call("IDirect3DSwapChain9::GetFrontBufferData", &[chain, 0]);
         assert!(matches!(result, Outcome::Return(INVALID)));
         let owner = id(&mut f);
-        assert!(frame(&mut env(&mut f), owner).commands.is_empty());
+        assert!(frame(&mut env(&mut f), owner).core.commands.is_empty());
     }
     assert_eq!(results[0], results[1]);
     assert_eq!(results[0].3, 1);
@@ -1883,7 +1897,7 @@ fn d3d9_package_b_event_tracks_issue_boundary_and_flushes_without_guest_waits() 
     f.okay("IDirect3DQuery9::GetData", &[q, output, 4, 0]);
     let owner = id(&mut f);
     assert_eq!(
-        frame(&mut env(&mut f), owner).commands.len(),
+        frame(&mut env(&mut f), owner).core.commands.len(),
         1,
         "later work remains recorded"
     );
@@ -2040,8 +2054,7 @@ fn large_texture_probe_gates_full_hashing_and_preserves_frame_elimination() {
     f.m.cpu.write(locked.pBits, &[0x55u8; 64]).unwrap();
     f.okay("IDirect3DTexture9::UnlockRect", &[small, 0]);
     let small_key = frame(&mut env(&mut f), owner)
-        .commands
-        .iter()
+        .commands()
         .find_map(|op| match op {
             Operation::Upload { pixels, .. } => Some(pixels.key()),
             _ => None,
@@ -2085,8 +2098,7 @@ fn large_texture_probe_gates_full_hashing_and_preserves_frame_elimination() {
         f.m.cpu.write(locked.pBits, bytes).unwrap();
         f.okay("IDirect3DTexture9::UnlockRect", &[large, 0]);
         let key = frame(&mut env(f), owner)
-            .commands
-            .iter()
+            .commands()
             .rev()
             .find_map(|op| match op {
                 Operation::Upload {

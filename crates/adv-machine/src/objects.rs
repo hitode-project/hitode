@@ -41,8 +41,8 @@ pub struct Identity<T: Any> {
 
 impl<T: Any> Identity<T> {
     /// The table and serial of this identity as an opaque value key.
-    pub fn key(self) -> [u64; 2] {
-        [self.table, self.id]
+    pub fn key(self) -> (u64, u64) {
+        (self.table, self.id)
     }
 }
 

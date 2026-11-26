@@ -13,7 +13,7 @@ mod forward;
 pub(crate) mod sampling;
 mod schedule;
 
-pub(crate) struct Input<'a, W> {
+pub(crate) struct Input<'a> {
     pub kind: Kind,
     pub view: Rect,
     pub attachment: Option<(Rect, u8)>,
@@ -25,7 +25,38 @@ pub(crate) struct Input<'a, W> {
     pub samples: &'a [sampling::Read],
     pub writes: &'a [(Content, bool)],
     pub ignores_sampled_color: bool,
-    pub write_key: W,
+    pub clear_keys: [Option<u128>; 3],
+}
+
+impl Input<'_> {
+    pub fn write_key(&self, key: Content, command: u128) -> u128 {
+        if self.kind == Kind::Clear {
+            self.clear_keys[key.2 as usize].unwrap()
+        } else {
+            command
+        }
+    }
+
+    pub fn attachment_command(&self, command: u128, versions: &[Option<u128>]) -> u128 {
+        if !self.ignores_sampled_color
+            || !self.writes.iter().any(|(key, _)| key.2 != 0)
+            || !self.reads.iter().any(|key| key.2 == 0)
+        {
+            return command;
+        }
+        use std::hash::Hash;
+        let mut key = xxhash_rust::xxh3::Xxh3::new();
+        self.key.hash(&mut key);
+        for (&source, &version) in self
+            .reads
+            .iter()
+            .zip(versions)
+            .filter(|(key, _)| key.2 != 0)
+        {
+            (source, version.unwrap_or(0)).hash(&mut key);
+        }
+        key.digest128()
+    }
 }
 
 fn take_region(pool: &mut Vec<Region>, extent: (u32, u32), whole: bool) -> Region {
@@ -315,9 +346,6 @@ pub(crate) struct Saved {
 /// Scissors per write. A draw spanning several distant changes is submitted
 /// once per scissor it meets; past this many, coarser cells merge them.
 const PARTS: usize = 8;
-pub(crate) fn area(region: &Region) -> u64 {
-    region.area()
-}
 #[derive(Default)]
 pub(crate) struct Work {
     pub changed: Region,
@@ -330,8 +358,8 @@ impl Work {
     pub fn areas(&self) -> [u64; 3] {
         let mut common = self.executed.clone();
         common.intersect(&self.changed);
-        let executed = area(&self.executed);
-        [area(&self.changed), executed, executed - area(&common)]
+        let executed = self.executed.area();
+        [self.changed.area(), executed, executed - common.area()]
     }
 }
 #[derive(Default)]
@@ -426,7 +454,7 @@ impl Analysis {
     }
     pub fn record(
         &mut self,
-        p: Input<'_, impl Fn(Content, u128) -> u128>,
+        p: &Input<'_>,
         [command, attachment]: [u128; 2],
         contents: &Contents,
         read_versions: &[Option<u128>],
@@ -468,7 +496,7 @@ impl Analysis {
             let retained = (p.kind == Kind::Draw && !independent)
                 .then(|| contents.get(&k).copied().unwrap_or(0));
             let key = hash((
-                (p.write_key)(k, if k.2 == 0 { command } else { attachment }),
+                p.write_key(k, if k.2 == 0 { command } else { attachment }),
                 retained,
             ));
             let ignores_color = k.2 != 0 && p.ignores_sampled_color;

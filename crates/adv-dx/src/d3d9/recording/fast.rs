@@ -270,7 +270,12 @@ pub(super) fn capture(
         .as_ref()
         .map_or(input.vertices as usize, |i| i.len());
     let sampling = cached.source.filter(|_| {
-        (3..=64).contains(&clip_count) && cached.prepared.reads.iter().any(|k| f.damage.written(k))
+        (3..=64).contains(&clip_count)
+            && cached
+                .prepared
+                .reads
+                .iter()
+                .any(|k| f.core.damage.written(k))
     });
     let mut fit = SmallVec::<[([f64; 2], [f64; 2]); 64]>::new();
     let mut bounds = (clip_count <= 64).then(damage::Bounds::default);
