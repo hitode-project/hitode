@@ -91,6 +91,90 @@ fn normalize_game(game: &mut LibraryGame) {
     }
 }
 
+fn valid_import_id(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+fn rewrite_prefix(path: &Path, old_a: &Path, old_b: &Path, new_base: &Path) -> Option<PathBuf> {
+    let rest = path
+        .strip_prefix(old_a)
+        .or_else(|_| path.strip_prefix(old_b))
+        .ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        new_base.to_path_buf()
+    } else {
+        new_base.join(rest)
+    })
+}
+
+/// Moves legacy disc-install folders from `<app_data_dir>/installed/` into
+/// `<app_data_dir>/imports/` so managed storage, Android Files, and game
+/// removal all recognize them (HOST-LIB-7). Returns whether any library entry
+/// was updated.
+fn migrate_installed_dir(data_dir: &Path, games: &mut [LibraryGame]) -> bool {
+    let installed = data_dir.join("installed");
+    let Ok(meta) = fs::symlink_metadata(&installed) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return false;
+    }
+    let imports = data_dir.join("imports");
+    if fs::create_dir_all(&imports).is_err() {
+        return false;
+    }
+    let installed_canon = fs::canonicalize(&installed).unwrap_or_else(|_| installed.clone());
+    let Ok(entries) = fs::read_dir(&installed) else {
+        return false;
+    };
+    let mut changed = false;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() || !kind.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let raw_name = file_name.to_string_lossy();
+        let base = if valid_import_id(&raw_name) {
+            raw_name.into_owned()
+        } else {
+            "installed".to_owned()
+        };
+        let mut dest_name = base.clone();
+        let mut suffix = 1u32;
+        while imports.join(&dest_name).exists() {
+            dest_name = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        let old_path = entry.path();
+        let old_canon = installed_canon.join(&file_name);
+        let new_path = imports.join(&dest_name);
+        if fs::rename(&old_path, &new_path).is_err() {
+            continue;
+        }
+        let new_canon = fs::canonicalize(&new_path).unwrap_or(new_path);
+        for game in games.iter_mut() {
+            if let Some(next) = rewrite_prefix(&game.folder, &old_path, &old_canon, &new_canon) {
+                game.folder = next;
+                changed = true;
+            }
+            if let Some(pf) = &game.program_files
+                && let Some(next) = rewrite_prefix(pf, &old_path, &old_canon, &new_canon)
+            {
+                game.program_files = Some(next);
+                changed = true;
+            }
+        }
+    }
+    let _ = fs::remove_dir(&installed);
+    changed
+}
+
 impl Library {
     pub fn load(dir: PathBuf) -> io::Result<Self> {
         let path = dir.join("library.json");
@@ -100,11 +184,11 @@ impl Library {
             games: vec![],
             path,
         };
+        let mut migrated = false;
         match fs::read(&lib.path) {
             Ok(bytes) => match serde_json::from_slice::<Self>(&bytes) {
                 Ok(mut saved) => {
                     let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
-                    let mut migrated = false;
                     for (game, fields) in
                         saved.games.iter_mut().zip(raw["games"].as_array().unwrap())
                     {
@@ -133,9 +217,6 @@ impl Library {
                     }
                     lib.track_play_time = saved.track_play_time;
                     lib.games = saved.games;
-                    if migrated {
-                        lib.save()?;
-                    }
                 }
                 Err(e) => {
                     let bad = dir.join(format!("library.json.bad-{}", now()));
@@ -145,6 +226,12 @@ impl Library {
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
+        }
+        if migrate_installed_dir(&dir, &mut lib.games) {
+            migrated = true;
+        }
+        if migrated {
+            lib.save()?;
         }
         Ok(lib)
     }
@@ -297,7 +384,7 @@ impl Library {
     }
     /// A game a disc's `setup` installs into `target`; its program is chosen
     /// once the setup has run.
-    /// Without a `target` it installs beside the library.
+    /// Without a `target` it installs into managed storage (`imports/<id>`).
     fn add_install(
         &mut self,
         target: Option<&Path>,
@@ -310,7 +397,7 @@ impl Library {
         let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let target = match target {
             Some(target) => target.to_owned(),
-            None => self.path.parent().unwrap().join("installed").join(&id),
+            None => self.path.parent().unwrap().join("imports").join(&id),
         };
         fs::create_dir_all(&target)?;
         let dir = fs::canonicalize(&target)?;
@@ -758,12 +845,40 @@ pub fn library_update(state: Store<'_>, id: String, patch: GamePatch) -> Reply<L
     let mut library = state.lock().unwrap();
     let folder = reply(patch.folder.map(fs::canonicalize).transpose())?;
     let i = library.game(&id).map_err(|e| e.to_string())?;
+    let old_folder = library.games[i].folder.clone();
     let game = &mut library.games[i];
     game.title = patch.title.unwrap_or_else(|| game.title.clone());
     game.codepage = patch.codepage.unwrap_or(game.codepage);
     game.favorite = patch.favorite.unwrap_or(game.favorite);
     game.nsfw = patch.nsfw.unwrap_or(game.nsfw);
-    game.folder = folder.unwrap_or_else(|| game.folder.clone());
+    if let Some(next_folder) = folder {
+        if next_folder != old_folder {
+            let imports_root = library.data_dir().join("imports");
+            let imports_canon =
+                fs::canonicalize(&imports_root).unwrap_or_else(|_| imports_root.clone());
+            let old_in_imports = old_folder.parent().is_some_and(|p| p == imports_canon);
+            let still_used = library.games.iter().enumerate().any(|(idx, other)| {
+                idx != i
+                    && (other.folder.starts_with(&old_folder)
+                        || other
+                            .program_files
+                            .as_ref()
+                            .is_some_and(|pf| pf.starts_with(&old_folder)))
+            });
+            if old_in_imports
+                && !still_used
+                && fs::read_dir(&old_folder)
+                    .ok()
+                    .is_some_and(|mut it| it.next().is_none())
+                && fs::remove_dir(&old_folder).is_ok()
+                && library.games[i].program_files.as_deref() == Some(old_folder.as_path())
+            {
+                library.games[i].program_files = None;
+            }
+        }
+        library.games[i].folder = next_folder;
+    }
+    let game = &mut library.games[i];
     if let Some(exe) = patch.exe {
         game.exe = exe.replace('\\', "/");
         // Choosing the installed program completes the install.
@@ -1064,8 +1179,51 @@ mod tests {
         assert!(
             beside
                 .folder
-                .starts_with(fs::canonicalize(dir.join("app")).unwrap())
+                .starts_with(fs::canonicalize(dir.join("app/imports")).unwrap())
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+    // spec: HOST-LIB-7
+    #[test]
+    fn load_migrates_legacy_installed_folders_into_managed_imports() {
+        let dir = std::env::temp_dir().join(format!(
+            "adv-library-{}-migrate-installed",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let app = dir.join("app");
+        let legacy_game = app.join("installed/a1b2c3d4e5f60708");
+        let legacy_orphan = app.join("installed/deadbeef00001111");
+        fs::create_dir_all(legacy_game.join("Brand")).unwrap();
+        fs::write(legacy_game.join("Brand/game.exe"), b"exe").unwrap();
+        fs::create_dir_all(&legacy_orphan).unwrap();
+        fs::write(legacy_orphan.join("leftover.dat"), b"data").unwrap();
+        let legacy_canon = fs::canonicalize(&legacy_game).unwrap();
+        let lib = Library {
+            version: 1,
+            track_play_time: true,
+            games: vec![LibraryGame {
+                id: "a1b2c3d4e5f60708".into(),
+                title: "Installed".into(),
+                folder: legacy_canon.clone(),
+                exe: "Brand/game.exe".into(),
+                codepage: 932,
+                program_files: Some(legacy_canon),
+                ..LibraryGame::default()
+            }],
+            path: app.join("library.json"),
+        };
+        lib.save().unwrap();
+
+        let loaded = Library::load(app.clone()).unwrap();
+        let expected = fs::canonicalize(app.join("imports/a1b2c3d4e5f60708")).unwrap();
+        assert_eq!(loaded.games[0].folder, expected);
+        assert_eq!(loaded.games[0].program_files, Some(expected));
+        assert!(app.join("imports/deadbeef00001111/leftover.dat").is_file());
+        assert!(!app.join("installed").exists());
+
+        let reloaded = Library::load(app).unwrap();
+        assert_eq!(reloaded.games[0].folder, loaded.games[0].folder);
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

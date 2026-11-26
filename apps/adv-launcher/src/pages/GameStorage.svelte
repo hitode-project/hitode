@@ -15,6 +15,7 @@
     type GameLocation,
     type ImportedFile,
   } from "../lib/game-storage.svelte";
+  import type { Game } from "../lib/types";
 
   let { gameId }: { gameId: string | undefined } = $props();
   let expanded = $state<string | null>(null);
@@ -41,6 +42,10 @@
   const linkedFiles = $derived(gameStorage.files.filter((file) => gameStorage.linkedFile(file).length > 0));
   const attachedFiles = $derived(game ? gameStorage.filesForGame(game.id) : []);
   const displayCopy = (folder: GameCopy) => preview ? folder.directory : "Hitode/imports/" + folder.id;
+  const folderLabel = (folder: GameCopy, linked: Game[]) =>
+    folder.name === folder.id && linked.length > 0
+      ? linked.map((item) => item.title).join("、")
+      : folder.name;
   const displayFile = (file: ImportedFile) => preview ? file.path : `Hitode/files/${file.id}/${file.name}`;
   const fileKindLabel = (file: ImportedFile) => file.kind === "disc" ? t("光盘镜像") : file.kind === "font" ? t("字体") : t("文件");
 
@@ -270,7 +275,7 @@
                   <span class="fan-card" style:transform={`translateX(${offset * 16}px) rotate(${offset * 26}deg)`} style:z-index={stack.length - i}><Cover game={item} /></span>
                 {/each}
               </span>
-              <span class="folder-name"><strong>{folder.name}</strong><span class="sub">{t("关联 {0} 个游戏", linked.length)}</span></span>
+              <span class="folder-name"><strong>{folderLabel(folder, linked)}</strong><span class="sub">{t("关联 {0} 个游戏", linked.length)}</span></span>
               <span class="size">{storageSize(folder.bytes)}</span>
               <Icon name={open ? "chevron-down" : "chevron-right"} size={15} />
             </button>
@@ -365,6 +370,7 @@
   .back { display: inline-flex; align-items: center; gap: 3px; margin: 0 0 10px -7px; }
   .game, .summary, .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
   .game { margin-bottom: 14px; }
+  .game > div { min-width: 0; overflow-wrap: anywhere; }
   .sub, .summary span { color: var(--fg3); font-size: 13px; }
   .summary { align-items: baseline; margin-bottom: 18px; }
   .summary strong { font-size: 24px; font-variant-numeric: tabular-nums; }
@@ -373,6 +379,7 @@
   .orphans-head p { margin: 4px 0 0; }
   .group { margin-top: 12px; }
   .file-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+  .file-row button { flex: 0 0 auto; white-space: nowrap; }
   .file-info { flex: 1; min-width: 0; display: grid; gap: 2px; overflow-wrap: anywhere; }
   .cache-row { margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
   .cache-title { flex: 1; font-size: 14px; }
