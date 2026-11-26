@@ -9,6 +9,8 @@ pub mod ddraw;
 pub mod dshow;
 pub mod dsound;
 pub(crate) mod pacing;
+#[cfg(feature = "gpu")]
+pub(crate) mod record;
 pub mod shader;
 pub mod wmvcore;
 pub mod xaudio2;

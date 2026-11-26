@@ -11,7 +11,6 @@
 //! readers need; the chain then also covers the cells they wrote in place.
 //! Writes that put several final chains in one command join them.
 use super::*;
-use adv_device::surface::{PartsScratch, for_each_part, for_each_rect};
 
 pub(super) struct Node {
     pub slot: u128,
@@ -61,7 +60,7 @@ struct PassScratch {
     region: Vec<Region>,
     parts: Vec<Option<ClipRects>>,
     dirty: Vec<bool>,
-    parts_scratch: PartsScratch,
+    parts_scratch: Vec<Rect>,
     through_scratch: Vec<Rect>,
     check_region: Region,
 }
@@ -258,7 +257,7 @@ impl<'a> Graph<'a> {
         }
         for (k, r) in stale {
             if let Some(&g) = of.get(k) {
-                for_each_rect(r, |rect| initial[g].add(rect.into()));
+                r.for_each_rect(|rect| initial[g].add(rect));
             }
         }
         let mut whole = std::mem::take(&mut scratch.whole);
@@ -382,8 +381,8 @@ impl<'a> Graph<'a> {
                     let mut outside = false;
                     for w in &node.record.writes {
                         if let Some(need) = p.scratch.need.get(&(i, w.0)) {
-                            for_each_rect(need, |rect| {
-                                let rect = rect.clipped(w.2);
+                            need.for_each_rect(|rect| {
+                                let rect = Rect::from(rect).clipped(w.2);
                                 outside |= rect.clipped(node.record.view) != rect;
                                 r.add(rect.into());
                             });
@@ -393,9 +392,8 @@ impl<'a> Graph<'a> {
                         None
                     } else {
                         let mut parts = ClipRects::new();
-                        for_each_part(&r, PARTS, &mut p.scratch.parts_scratch, |rect| {
-                            parts.push(rect);
-                        });
+                        r.parts_into_as(PARTS, &mut p.scratch.parts_scratch);
+                        parts.extend(p.scratch.parts_scratch.iter().copied());
                         Some(clipped(&parts, node.record.bounds))
                     };
                     recycle_region(p.pool, r);
@@ -425,12 +423,8 @@ impl Pass<'_, '_, '_> {
     fn grow(&mut self, g: usize, current: usize) -> Result<(), usize> {
         let size = self.scratch.region[g].size();
         let mut parts = ClipRects::new();
-        for_each_part(
-            &self.scratch.region[g],
-            PARTS,
-            &mut self.scratch.parts_scratch,
-            |r| parts.push(r),
-        );
+        self.scratch.region[g].parts_into_as(PARTS, &mut self.scratch.parts_scratch);
+        parts.extend(self.scratch.parts_scratch.iter().copied());
         self.scratch.region[g].reset(size, false);
         for &rect in &parts {
             self.scratch.region[g].add(rect.into());
@@ -495,7 +489,7 @@ impl Pass<'_, '_, '_> {
                 // Pixels the write leaves keep the earlier version.
                 through.clear();
                 if let Some(need) = self.scratch.need.get(&(c, w.0)) {
-                    for_each_rect(need, |r| through.push(r));
+                    need.for_each_rect(|r| through.push(r.into()));
                 }
                 for &r in &through {
                     if !r.empty() {

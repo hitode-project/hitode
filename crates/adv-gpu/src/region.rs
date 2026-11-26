@@ -271,8 +271,13 @@ impl Region {
     /// Reuses `out` to store at most `max` (at least one) disjoint rectangles
     /// covering every marked cell.
     pub fn parts_into(&self, max: usize, out: &mut Vec<Rect>) {
+        self.parts_into_as(max, out);
+    }
+
+    /// Writes the covering rectangles in the caller's rectangle type.
+    pub fn parts_into_as<R: From<Rect>>(&self, max: usize, out: &mut Vec<R>) {
         out.clear();
-        self.for_each_rect(|r| out.push(r));
+        self.for_each_rect(|r| out.push(r.into()));
         let (columns, rows) = cells(self.size);
         let mut k = 0;
         let mut coarse = Region::default();
@@ -299,12 +304,15 @@ impl Region {
             out.clear();
             coarse.for_each_rect(|r| {
                 let (x, y) = (r.x << k, r.y << k);
-                out.push(Rect {
-                    x,
-                    y,
-                    w: ((r.x + r.w) << k).min(self.size.0) - x,
-                    h: ((r.y + r.h) << k).min(self.size.1) - y,
-                });
+                out.push(
+                    Rect {
+                        x,
+                        y,
+                        w: ((r.x + r.w) << k).min(self.size.0) - x,
+                        h: ((r.y + r.h) << k).min(self.size.1) - y,
+                    }
+                    .into(),
+                );
             });
         }
     }

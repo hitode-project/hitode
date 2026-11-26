@@ -233,10 +233,10 @@ pub(super) fn changes(
                 continue;
             };
             let entry = change.len;
-            let before = diagnose.then(|| area(&change.region));
+            let before = diagnose.then(|| change.region.area());
             change.advance(proven.then_some(region));
             if let Some(before) = before {
-                let after = area(&change.region);
+                let after = change.region.area();
                 if entry == 0 && change.old.is_none() {
                     trace::forward(
                         w.0,
