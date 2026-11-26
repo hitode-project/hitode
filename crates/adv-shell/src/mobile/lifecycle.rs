@@ -25,6 +25,12 @@ impl Lifecycle {
     pub fn paused(&self) -> bool {
         !self.foreground() || !self.audio_focus || self.overlay_pause
     }
+    /// Scripts running behind the run page have not entered game mode or
+    /// requested audio focus yet, so only background/suspension and overlay
+    /// pauses stop them.
+    pub fn paused_without_audio_focus(&self) -> bool {
+        !self.foreground() || self.overlay_pause
+    }
     pub fn set_resumed(&mut self, resumed: bool) {
         let state = if resumed {
             State::Foreground
@@ -108,5 +114,25 @@ mod tests {
         assert!(lifecycle.paused());
         lifecycle.set_resumed(true);
         assert!(!lifecycle.paused());
+    }
+    // spec: AND-APP-3, AND-APP-15, WINE-SES-11
+    #[test]
+    fn hidden_scripts_run_without_audio_focus_but_pause_in_background() {
+        let mut lifecycle = Lifecycle::default();
+        assert!(lifecycle.paused_without_audio_focus());
+        lifecycle.set_resumed(true);
+        assert!(lifecycle.paused());
+        assert!(!lifecycle.paused_without_audio_focus());
+        lifecycle.set_overlay_pause(true);
+        assert!(lifecycle.paused_without_audio_focus());
+        lifecycle.set_overlay_pause(false);
+        assert!(!lifecycle.paused_without_audio_focus());
+        lifecycle.set_resumed(false);
+        assert!(lifecycle.paused_without_audio_focus());
+        lifecycle.set_resumed(true);
+        lifecycle.suspend();
+        assert!(lifecycle.paused_without_audio_focus());
+        lifecycle.resume();
+        assert!(!lifecycle.paused_without_audio_focus());
     }
 }

@@ -22,6 +22,9 @@ struct Host {
     session: Option<Session>,
     game_id: Option<String>,
     playback: Option<Playback>,
+    /// True while a `.bat`/`.cmd` script runs behind the run page before
+    /// showing a window or entering game mode (which owns audio focus).
+    script_hidden: bool,
     /// Shared lifecycle, audio focus and overlay pause gates.
     lifecycle: adv_shell::mobile::Lifecycle,
     touch_mode: adv_shell::mobile::TouchMode,
@@ -51,9 +54,15 @@ impl Drop for Surface {
 
 impl Host {
     /// AND-APP-3: the game runs only while resumed, with audio focus and no overlay pause.
+    /// Hidden scripts have not entered game mode or requested audio focus yet.
     fn apply_pause(&self) {
         if let Some(session) = &self.session {
-            session.set_paused(self.lifecycle.paused());
+            let paused = if self.script_hidden {
+                self.lifecycle.paused_without_audio_focus()
+            } else {
+                self.lifecycle.paused()
+            };
+            session.set_paused(paused);
         }
     }
 
@@ -238,6 +247,7 @@ pub async fn start_game(
                     let ended = HOST.with_borrow_mut(|host| {
                         host.playback.take();
                         host.game_id = None;
+                        host.script_hidden = false;
                         (host.session.take(), host.view.take())
                     });
                     drop(ended);
@@ -269,7 +279,16 @@ pub async fn start_game(
                     // Requesting audio focus calls back into HOST.
                     let app = shown_window.app_handle().clone();
                     let _ = shown_window.run_on_main_thread(move || {
-                        if let Err(error) = android::set_game_mode(&app, true) {
+                        if let Err(error) = android::enter_game_mode_if(&app, || {
+                            HOST.with_borrow_mut(|host| {
+                                if host.session.is_none() {
+                                    return false;
+                                }
+                                host.script_hidden = false;
+                                host.apply_pause();
+                                true
+                            })
+                        }) {
                             log::error!("entering game mode: {error}");
                         }
                     });
@@ -279,6 +298,7 @@ pub async fn start_game(
             host.session = Some(session);
             host.game_id = Some(game_id_for_host);
             host.playback = Some(playback);
+            host.script_hidden = script;
             host.lifecycle.set_overlay_pause(false);
             host.apply_pause();
             Ok(())
