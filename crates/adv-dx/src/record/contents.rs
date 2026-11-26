@@ -2,7 +2,7 @@ use super::*;
 
 /// An allocation token, subresource ordinal, and attachment aspect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ResourceKey(pub (u64, u64), pub u64, pub u8);
+pub struct ResourceKey(pub (u64, u64), pub u64, pub u8);
 #[derive(Default)]
 pub(crate) struct Contents {
     indices: HashMap<ResourceKey, usize>,

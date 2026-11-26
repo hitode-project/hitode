@@ -5,6 +5,8 @@ pub mod desc;
 mod glue;
 pub mod object;
 mod ops;
+#[cfg(feature = "gpu")]
+pub mod recording;
 pub mod state;
 
 pub use glue::{

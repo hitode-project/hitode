@@ -214,3 +214,37 @@ fn separate_mips_and_read_only_depth_can_coexist() {
     assert_eq!(bound(&other_context, ViewSlot::DSV), Some(5));
     assert_eq!(bound(&state, ps), Some(1));
 }
+
+// spec: GFX-REC-1 GFX-REC-2
+#[test]
+fn repeated_setters_keep_the_snapshot_and_changes_copy_one_group() {
+    let mut state = ContextState::default();
+    let buffer = VertexBuffer {
+        buffer: 1,
+        stride: 32,
+        offset: 16,
+    };
+    state.set_vertices(0, &[buffer]);
+    let retained = state.snapshot();
+    state.set_vertices(0, &[buffer]);
+    assert!(Arc::ptr_eq(&retained.ia, &state.groups().ia));
+
+    state.set_vertices(
+        0,
+        &[VertexBuffer {
+            offset: 32,
+            ..buffer
+        }],
+    );
+    assert_eq!(retained.ia.vertices[0].offset, 16);
+    assert_eq!(state.groups().ia.vertices[0].offset, 32);
+    assert!(Arc::ptr_eq(&retained.rs, &state.groups().rs));
+    assert!(Arc::ptr_eq(&retained.om, &state.groups().om));
+    assert!(
+        retained
+            .stages
+            .iter()
+            .zip(&state.groups().stages)
+            .all(|(before, after)| Arc::ptr_eq(before, after))
+    );
+}

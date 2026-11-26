@@ -324,6 +324,7 @@ impl BoundSlot {
     }
 }
 
+#[derive(Clone)]
 pub struct ModernColor {
     pub view: ImageView,
     pub blend: Option<(p::BlendComponent, p::BlendComponent)>,
@@ -332,6 +333,7 @@ pub struct ModernColor {
     pub store: Store,
 }
 
+#[derive(Clone)]
 pub struct ModernDepth {
     pub view: ImageView,
     pub state: p::DepthStencil,
@@ -340,6 +342,7 @@ pub struct ModernDepth {
     pub read_only: bool,
 }
 
+#[derive(Clone)]
 pub enum DrawArguments {
     Direct {
         vertices: Range<u32>,
@@ -349,11 +352,13 @@ pub enum DrawArguments {
     Indirect(BufferRange),
 }
 
+#[derive(Clone)]
 pub enum DispatchArguments {
     Direct([u32; 3]),
     Indirect(BufferRange),
 }
 
+#[derive(Clone)]
 pub struct ModernDraw {
     /// Immutable input assembly, rasterizer, blend and depth/stencil state IDs.
     pub state_ids: [u64; 4],
@@ -383,6 +388,7 @@ pub struct QuerySlot {
 }
 
 /// Execute the draw if the occlusion result is nonzero (or zero when inverted).
+#[derive(Clone)]
 pub struct Predicate {
     pub query: QuerySlot,
     pub inverted: bool,

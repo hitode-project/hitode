@@ -303,3 +303,110 @@ impl ContextState {
 
 #[cfg(test)]
 mod tests;
+
+impl ContextState {
+    pub fn set_input_layout(&mut self, layout: u32) {
+        if self.groups.ia.layout != layout {
+            Arc::make_mut(&mut self.groups.ia).layout = layout;
+        }
+    }
+
+    pub fn set_topology(&mut self, topology: u32) {
+        if self.groups.ia.topology != topology {
+            Arc::make_mut(&mut self.groups.ia).topology = topology;
+        }
+    }
+
+    pub fn set_vertices(&mut self, first: usize, vertices: &[VertexBuffer]) {
+        let range = first..first + vertices.len();
+        if self.groups.ia.vertices[range.clone()] != *vertices {
+            Arc::make_mut(&mut self.groups.ia).vertices[range].copy_from_slice(vertices);
+        }
+    }
+
+    pub fn set_indices(&mut self, indices: IndexBuffer) {
+        if self.groups.ia.indices != indices {
+            Arc::make_mut(&mut self.groups.ia).indices = indices;
+        }
+    }
+
+    pub fn set_shader(&mut self, stage: Stage, shader: u32) {
+        let state = &mut self.groups.stages[stage as usize];
+        if state.shader != shader {
+            Arc::make_mut(state).shader = shader;
+        }
+    }
+
+    pub fn set_constants(&mut self, stage: Stage, first: usize, constants: &[ConstantBuffer]) {
+        let state = &mut self.groups.stages[stage as usize];
+        let range = first..first + constants.len();
+        if state.constants[range.clone()] != *constants {
+            Arc::make_mut(state).constants[range].copy_from_slice(constants);
+        }
+    }
+
+    pub fn set_samplers(&mut self, stage: Stage, first: usize, samplers: &[u32]) {
+        let state = &mut self.groups.stages[stage as usize];
+        let range = first..first + samplers.len();
+        if state.samplers[range.clone()] != *samplers {
+            Arc::make_mut(state).samplers[range].copy_from_slice(samplers);
+        }
+    }
+
+    pub fn set_rasterizer(&mut self, rasterizer: u32) {
+        if self.groups.rs.state != rasterizer {
+            Arc::make_mut(&mut self.groups.rs).state = rasterizer;
+        }
+    }
+
+    pub fn set_viewports(&mut self, viewports: &[D3D11_VIEWPORT]) {
+        let state = &mut self.groups.rs;
+        if bytemuck::cast_slice::<_, u32>(&state.viewports[..state.viewport_count])
+            != bytemuck::cast_slice::<_, u32>(viewports)
+        {
+            let state = Arc::make_mut(state);
+            state.viewport_count = viewports.len();
+            state.viewports[..viewports.len()].copy_from_slice(viewports);
+        }
+    }
+
+    pub fn set_scissors(&mut self, scissors: &[RECT]) {
+        let state = &mut self.groups.rs;
+        if bytemuck::cast_slice::<_, u32>(&state.scissors[..state.scissor_count])
+            != bytemuck::cast_slice::<_, u32>(scissors)
+        {
+            let state = Arc::make_mut(state);
+            state.scissor_count = scissors.len();
+            state.scissors[..scissors.len()].copy_from_slice(scissors);
+        }
+    }
+
+    pub fn set_blend(&mut self, blend: u32, factor: [f32; 4], mask: u32) {
+        let state = &mut self.groups.om;
+        if state.blend != blend
+            || state.sample_mask != mask
+            || state.blend_factor.map(f32::to_bits) != factor.map(f32::to_bits)
+        {
+            let state = Arc::make_mut(state);
+            state.blend = blend;
+            state.blend_factor = factor;
+            state.sample_mask = mask;
+        }
+    }
+
+    pub fn set_depth_stencil(&mut self, depth_stencil: u32, reference: u32) {
+        let state = &mut self.groups.om;
+        if state.depth_stencil != depth_stencil || state.stencil_reference != reference {
+            let state = Arc::make_mut(state);
+            state.depth_stencil = depth_stencil;
+            state.stencil_reference = reference;
+        }
+    }
+
+    pub fn set_predication(&mut self, predicate: u32, value: bool) {
+        if self.groups.predication.predicate != predicate || self.groups.predication.value != value
+        {
+            *Arc::make_mut(&mut self.groups.predication) = Predication { predicate, value };
+        }
+    }
+}
