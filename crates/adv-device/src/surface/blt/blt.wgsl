@@ -66,12 +66,15 @@ fn convert(raw: u32, mode: u32) -> u32 {
     let rule = draw_parameters.values[3];
     let xy = vec2<u32>(position.xy) - origins.zw;
     let coord = origins.xy + vec2(sample_axis(xy.x, draw_parameters.values[1], rule.x), sample_axis(xy.y, draw_parameters.values[2], rule.y));
-    let p = vec4<u32>(round(textureLoad(source, vec2<i32>(coord), 0).bgra * 255.));
-    let raw = p.x | (p.y << 8u) | (p.z << 16u) | (p.w << 24u);
+    let texel = textureLoad(source, vec2<i32>(coord), 0);
+    let src = draw_parameters.values[5];
+    let raw = select(packed_raw(texel), packed_encode(texel, packed_storage_masks(src)), src.x != 0u);
     let key = draw_parameters.values[4];
     if key.x != 0u && (raw & rule.z) == key.y {
         discard;
     }
     let value = convert(raw, rule.w);
+    let dst = draw_parameters.values[6];
+    if dst.x != 0u { return packed_decode(value, packed_storage_masks(dst)); }
     return vec4<f32>((vec4<u32>(value) >> vec4(16u, 8u, 0u, 24u)) & vec4(255u)) / 255.;
 }

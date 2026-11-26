@@ -1,12 +1,12 @@
 //! Assemble shader state into a neutral GPU command. Guest memory is validated
 //! once; raw stream bytes are retained by the command across deferred submits.
 use super::*;
-use crate::fixed::{self as fixed_core, Input, STAGE_ARGUMENTS, Setting, VertexProgram};
+use crate::fixed::program as source;
+use crate::fixed::{self as fixed_core, Input, Setting, VertexProgram};
 use crate::shader::{SamplerDimension, Shader, Translation};
 use adv_device::gpu::{
     Attribute, AttributeFormat, IndexBytes, Program, ProgramTexture, ProgrammableDraw, VertexStream,
 };
-mod source;
 mod streams;
 pub(super) mod warmup;
 pub(super) use warmup::warm;
@@ -650,10 +650,11 @@ fn prepare_checked(
             program
         } else {
             let source = source::build_with_fixed(
-                vs.as_ref().map(|s| s.parsed.as_ref()),
-                ps.as_ref().map(|s| s.parsed.as_ref()),
-                vt,
-                pt,
+                [
+                    vs.as_ref().map(|s| s.parsed.as_ref()),
+                    ps.as_ref().map(|s| s.parsed.as_ref()),
+                ],
+                [vt, pt],
                 &input_spec,
                 &slots,
                 (second.is_some(), key.features.0, key.features.1, key.fixed),

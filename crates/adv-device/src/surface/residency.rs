@@ -131,6 +131,8 @@ pub(super) struct Entry {
     pub(super) layout: Surface,
     pub(super) residency: Residency<LegacyImage>,
     #[cfg(feature = "gpu")]
+    pub(super) packed_color: [u32; 4],
+    #[cfg(feature = "gpu")]
     depth: Option<Depth>,
 }
 
@@ -139,6 +141,8 @@ impl Entry {
         Self {
             layout,
             residency: Residency::cpu(),
+            #[cfg(feature = "gpu")]
+            packed_color: [0; 4],
             #[cfg(feature = "gpu")]
             depth: None,
         }
@@ -150,6 +154,7 @@ impl Entry {
         Self {
             layout,
             residency: Residency::native(target.image),
+            packed_color: [0; 4],
             depth,
         }
     }
@@ -226,7 +231,12 @@ impl<P: Presenter> Surfaces<P> {
                     for y in part.y..part.y + part.h {
                         row.clear();
                         for pixel in rows.by_ref().take(part.w as usize) {
-                            row.extend_from_slice(&pixel[..bytes]);
+                            if entry.packed_color[0] != 0 {
+                                let raw = super::render::pack_color(*pixel, entry.packed_color);
+                                row.extend_from_slice(&raw.to_le_bytes());
+                            } else {
+                                row.extend_from_slice(&pixel[..bytes]);
+                            }
                         }
                         layout.write_pixels(memory, part.x, y, &row)?;
                     }
@@ -240,7 +250,7 @@ impl<P: Presenter> Surfaces<P> {
     }
 
     /// Obtain the current GPU copy, uploading only the requested stale cells.
-    /// Packed CPU texels use the low bytes of a BGRA8 texel to retain their bits.
+    /// Packed render targets use BGRA color. Other packed layouts retain their raw bits.
     #[cfg(feature = "gpu")]
     pub fn gpu_access(
         &mut self,
@@ -269,8 +279,16 @@ impl<P: Presenter> Surfaces<P> {
                 for y in part.y..part.y + part.h {
                     let row = layout.read_pixels(memory, part.x, y, part.w)?;
                     for pixel in row.chunks_exact(bytes) {
-                        pixels.extend_from_slice(pixel);
-                        pixels.resize(pixels.len() + 4 - bytes, 0);
+                        if entry.packed_color[0] != 0 {
+                            let raw = u16::from_le_bytes(pixel.try_into().unwrap());
+                            pixels.extend_from_slice(&super::render::unpack_color(
+                                raw,
+                                entry.packed_color,
+                            ));
+                        } else {
+                            pixels.extend_from_slice(pixel);
+                            pixels.resize(pixels.len() + 4 - bytes, 0);
+                        }
                     }
                 }
                 self.gpu

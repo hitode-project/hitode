@@ -7,9 +7,45 @@ use super::*;
 const MAX_INCLUSIVE_LIST_SEGMENTS: usize = 4096;
 const INTEGER_TOLERANCE: f32 = 1. / 4096.;
 
-pub(super) enum Inclusive {
+pub enum Inclusive {
     List,
     Strip { terminal: bool },
+}
+
+impl Inclusive {
+    /// Native line ranges interleaved with their terminal points. A range of
+    /// length one uses point topology and the original vertex input.
+    pub fn ranges(
+        topology: Topology,
+        count: u32,
+        same_pixel: impl Fn(u32, u32) -> bool,
+    ) -> Vec<std::ops::Range<u32>> {
+        let inclusive = match topology {
+            Topology::Lines => Self::List,
+            Topology::LineStrip => Self::Strip {
+                terminal: !same_pixel(count - 2, count - 1),
+            },
+            _ => return Vec::new(),
+        };
+        let mut ranges = Vec::new();
+        match inclusive {
+            Self::List => {
+                for end in (1..count).step_by(2) {
+                    ranges.push(end - 1..end + 1);
+                    if !same_pixel(end - 1, end) {
+                        ranges.push(end..end + 1);
+                    }
+                }
+            }
+            Self::Strip { terminal } => {
+                ranges.push(0..count);
+                if terminal {
+                    ranges.push(count - 1..count);
+                }
+            }
+        }
+        ranges
+    }
 }
 
 pub(super) fn prepare(

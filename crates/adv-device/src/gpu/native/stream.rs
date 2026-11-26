@@ -337,41 +337,64 @@ impl Producer {
         bindings: impl IntoIterator<Item = (u32, Binding)>,
         areas: &[(adv_gpu::Rect, Option<adv_gpu::Rect>)],
     ) {
+        self.draw_ranges(base, bindings, areas, &[], None);
+    }
+
+    pub fn draw_ranges(
+        &mut self,
+        base: Draw,
+        bindings: impl IntoIterator<Item = (u32, Binding)>,
+        areas: &[(adv_gpu::Rect, Option<adv_gpu::Rect>)],
+        ranges: &[std::ops::Range<u32>],
+        endpoint: Option<&adv_gpu::RenderPipeline>,
+    ) {
         if areas.is_empty() {
             return;
         }
         let start = self.chunk.bindings.len() as u32;
         self.chunk.bindings.extend(bindings);
         let binding_range = start..self.chunk.bindings.len() as u32;
+        let ranges = if ranges.is_empty() {
+            std::slice::from_ref(&base.vertices)
+        } else {
+            ranges
+        };
         for &(area, opaque) in areas {
-            let index_binding = match &base.index {
-                Some((Binding::Storage(bytes), fmt)) => Some((Binding::Storage(*bytes), *fmt)),
-                Some((Binding::Uniform(bytes), fmt)) => Some((Binding::Uniform(*bytes), *fmt)),
-                Some((Binding::Buffer(buf, range), fmt)) => {
-                    Some((Binding::Buffer(buf.clone(), range.clone()), *fmt))
-                }
-                _ => None,
-            };
-            let draw = Draw {
-                pipeline: base.pipeline.clone(),
-                bindings: binding_range.clone(),
-                index: index_binding,
-                vertices: base.vertices.clone(),
-                instances: base.instances.clone(),
-                base_vertex: base.base_vertex,
-                viewport: base.viewport,
-                scissor: area,
-                stencil_reference: base.stencil_reference,
-                blend_constant: base.blend_constant,
-                area,
-                writes_color: base.writes_color,
-                uses_depth: base.uses_depth,
-                writes_depth: base.writes_depth,
-                opaque,
-            };
-            self.chunk.draws.push(draw);
-            let index = self.chunk.draws.len() as u32 - 1;
-            self.chunk.commands.push(Command::Draw(index));
+            for vertices in ranges {
+                let pipeline = if vertices.len() == 1 {
+                    endpoint.unwrap_or(&base.pipeline)
+                } else {
+                    &base.pipeline
+                };
+                let index_binding = match &base.index {
+                    Some((Binding::Storage(bytes), fmt)) => Some((Binding::Storage(*bytes), *fmt)),
+                    Some((Binding::Uniform(bytes), fmt)) => Some((Binding::Uniform(*bytes), *fmt)),
+                    Some((Binding::Buffer(buf, range), fmt)) => {
+                        Some((Binding::Buffer(buf.clone(), range.clone()), *fmt))
+                    }
+                    _ => None,
+                };
+                let draw = Draw {
+                    pipeline: pipeline.clone(),
+                    bindings: binding_range.clone(),
+                    index: index_binding,
+                    vertices: vertices.clone(),
+                    instances: base.instances.clone(),
+                    base_vertex: base.base_vertex,
+                    viewport: base.viewport,
+                    scissor: area,
+                    stencil_reference: base.stencil_reference,
+                    blend_constant: base.blend_constant,
+                    area,
+                    writes_color: base.writes_color,
+                    uses_depth: base.uses_depth,
+                    writes_depth: base.writes_depth,
+                    opaque,
+                };
+                self.chunk.draws.push(draw);
+                let index = self.chunk.draws.len() as u32 - 1;
+                self.chunk.commands.push(Command::Draw(index));
+            }
         }
         if self.chunk.commands.len() >= CHUNK {
             self.hand_off();

@@ -17,7 +17,7 @@ pub(crate) struct Rules {
 }
 
 impl Rules {
-    fn texture_op(self, op: u32) -> u32 {
+    pub(crate) fn texture_op(self, op: u32) -> u32 {
         match self.uncapped_op {
             Some((from, to)) if op == from => to,
             _ => op,
@@ -230,8 +230,11 @@ pub(crate) fn features(f: &State, transformed: Option<bool>, rules: Rules) -> u3
                 || f.render[&Render::PointSprite] != 0
                 || f.render[&Render::PointSize] != 1f32.to_bits(),
         ) << 6)
-        | (u32::from(f.render[&Render::SlopeDepthBias] != 0 || f.render[&Render::DepthBias] != 0)
-            << 7)
+        | (u32::from(
+            f.render[&Render::SlopeDepthBias] != 0
+                || f.render[&Render::DepthBias] != 0
+                || rules.integer_zbias && f.render[&Render::ZBias] != 0,
+        ) << 7)
         | (u32::from(transformed == Some(false) && f.render[&Render::PointScale] != 0) << 8)
 }
 impl State {
@@ -424,7 +427,11 @@ pub(crate) fn lower(f: &State, layout: &Layout, rules: Rules) -> Result<Lowered,
             f.stage[&Stage::AlphaArg1] | f.stage[&Stage::AlphaArg2] << 8,
         ],
         raster_parameters: [
-            f.render[&Render::DepthBias],
+            if rules.integer_zbias {
+                (-(f.render[&Render::ZBias] as i32 as f32) / 65535.).to_bits()
+            } else {
+                f.render[&Render::DepthBias]
+            },
             f.render[&Render::SlopeDepthBias],
             rules.color_key_mask.unwrap_or(0),
             u32::from(rules.integer_zbias) | (u32::from(rules.round_points) << 1),
