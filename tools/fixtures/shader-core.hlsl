@@ -393,3 +393,44 @@ Blue blue;
 float4 linkage(float4 position : SV_Position) : SV_Target {
     return paint.shade(position);
 }
+
+[numthreads(1, 1, 1)]
+void swap_values(uint3 id : SV_DispatchThreadID) {
+    uint a = input_words[id.x], b = input_words[id.x + 1];
+    bool swap = (id.x & 1) != 0;
+    output_words[id.x * 2] = swap ? a : b;
+    output_words[id.x * 2 + 1] = swap ? b : a;
+}
+
+float4 diagnostic_pixel(float4 position : SV_Position) : SV_Target {
+    if (position.x < 1) abort();
+    return position;
+}
+
+[numthreads(1, 1, 1)]
+void min_precision(uint3 id : SV_DispatchThreadID) {
+    min16float a = (min16float)(float(id.x) * 0.25);
+    min16int b = (min16int)(int(id.x) - 4);
+    min16uint c = (min16uint)id.x;
+    output_words[id.x * 3] = asuint(float(abs(a) * a));
+    output_words[id.x * 3 + 1] = uint(b * b);
+    output_words[id.x * 3 + 2] = uint(c * c);
+}
+
+struct StreamVertex {
+    float4 position : SV_Position;
+    uint primitive : SV_PrimitiveID;
+};
+
+[maxvertexcount(2)]
+[instance(2)]
+void instanced_geometry(point float4 input[1] : SV_Position, uint id : SV_GSInstanceID,
+                        inout LineStream<StreamVertex> stream) {
+    StreamVertex result;
+    result.position = input[0];
+    result.primitive = id;
+    stream.Append(result);
+    result.position.x += 0.5;
+    stream.Append(result);
+    stream.RestartStrip();
+}

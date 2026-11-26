@@ -38,6 +38,11 @@ impl Writer<'_> {
             self.line("let dx_local_index = vec4<u32>(local_index);");
         } else {
             let mut inputs = fields(module, &module.signatures.input, true, variant)?;
+            if self.stage == Stage::Pixel && self.options.raster_samples == 1 {
+                // A single-sample target supplies index zero. The input register
+                // already starts at zero, so this variant needs no sample-rate builtin.
+                inputs.retain(|field| field.attribute != "@builtin(sample_index)");
+            }
             if reflection
                 .reads
                 .contains_key(&(Register::InputCoverageMask, Some(0)))

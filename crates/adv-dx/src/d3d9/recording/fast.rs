@@ -299,7 +299,7 @@ pub(super) fn capture(
             }
         });
         let Some((clip, _)) =
-            damage::fixed_clip(position, fixed.transforms.as_ref(), draw.state.viewport)
+            crate::fixed::tnl::clip(position, fixed.transforms.as_ref(), draw.state.viewport)
         else {
             bounds = None;
             samples_valid = false;

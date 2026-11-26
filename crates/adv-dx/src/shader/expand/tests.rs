@@ -412,7 +412,7 @@ fn check_stats(name: &str, stats: statistics::PipelineStatistics) {
     }
 }
 
-// spec: GFX-SHADER-5 GFX-SHADER-6
+// spec: GFX-SHADER-6 GFX-SHADER-7
 #[test]
 fn native_vertex_and_expansion_render_identical_pixels() {
     let mut gpu = gpu();
@@ -522,7 +522,7 @@ fn native_vertex_and_expansion_render_identical_pixels() {
     }
 }
 
-// spec: GFX-SHADER-5 GFX-SHADER-6
+// spec: GFX-SHADER-6 GFX-SHADER-7
 #[test]
 fn geometry_cuts_instances_and_stream_output_keep_primitive_order() {
     let mut gpu = gpu();

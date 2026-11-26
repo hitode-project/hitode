@@ -33,6 +33,11 @@ pub trait Resources {
     fn read(&mut self, access: ResourceAccess, arguments: &[Vector]) -> Result<Vector, Error>;
     fn atomic(&mut self, access: ResourceAccess, arguments: &[Vector]) -> Result<Vector, Error>;
     /// Evaluate an input using the rasterizer state of this invocation.
+    /// Supplies the derivative of a source across the caller's pixel quad.
+    fn derivative(&mut self, instruction: &Instruction, _: Vector) -> Result<Vector, Error> {
+        Err(Error::UnsupportedOpcode(instruction.opcode))
+    }
+
     fn interpolate(
         &mut self,
         instruction: Opcode,
@@ -220,7 +225,12 @@ impl<'a, R: Resources> Machine<'a, R> {
             .filter(|&(_, ty)| *ty != ValueType::Binding)
             .map(|(source, ty)| self.read(source, *ty, op.flush_inputs))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut values = if op.opcode.is_interpolation() {
+        let mut values = if matches!(
+            op.opcode,
+            DerivRtx | DerivRty | DerivRtxCoarse | DerivRtyCoarse | DerivRtxFine | DerivRtyFine
+        ) {
+            [self.resources.derivative(op, args[0])?, [0; 4]]
+        } else if op.opcode.is_interpolation() {
             let value = self.resources.interpolate(
                 op.opcode,
                 self.location(&op.sources[0])?.1,
