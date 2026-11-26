@@ -737,6 +737,81 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
 }
 
 #[test]
+fn metal_validator_capabilities_compile_to_libraries() {
+    let (device, _) = gpu!();
+    let raw = &device.inner.0.raw;
+    let mac = raw.supportsFamily(MTLGPUFamily::Mac2);
+    let apple6 = raw.supportsFamily(MTLGPUFamily::Apple6);
+    let apple7 = raw.supportsFamily(MTLGPUFamily::Apple7);
+    for (label, supported, source) in [
+        (
+            "clip distances",
+            true,
+            "enable clip_distances;
+            struct Output {
+                @builtin(position) position: vec4<f32>,
+                @builtin(clip_distances) clip: array<f32, 1>,
+            }
+            @vertex fn main() -> Output { return Output(vec4(1.0), array(1.0)); }",
+        ),
+        (
+            "multisampled shading and dual source blending",
+            true,
+            "enable dual_source_blending;
+            struct Output {
+                @location(0) @blend_src(0) color: vec4<f32>,
+                @location(0) @blend_src(1) blend: vec4<f32>,
+            }
+            @fragment fn main(@builtin(sample_index) sample: u32) -> Output {
+                return Output(vec4(f32(sample)), vec4(1.0));
+            }",
+        ),
+        (
+            "cube arrays and 16-bit normalized storage textures",
+            true,
+            "@group(1) @binding(0) var cube: texture_cube_array<f32>;
+            @group(2) @binding(0) var filtering: sampler;
+            @group(3) @binding(0) var image: texture_storage_2d<r16unorm, write>;
+            @compute @workgroup_size(1) fn main() {
+                textureStore(image, vec2(0), textureSampleLevel(cube, filtering, vec3(1.0), 0, 0.0));
+            }",
+        ),
+        (
+            "primitive index",
+            (mac || apple7) && objc2::available!(macos = 11.0, ios = 14.0),
+            "enable primitive_index;
+            @fragment fn main(@builtin(primitive_index) id: u32) -> @location(0) vec4<f32> {
+                return vec4(f32(id));
+            }",
+        ),
+        (
+            "texture atomics",
+            (mac || apple6) && objc2::available!(macos = 14.0, ios = 17.0),
+            "@group(3) @binding(0) var image: texture_storage_2d<r32uint, atomic>;
+            @compute @workgroup_size(1) fn main() { textureAtomicAdd(image, vec2(0), 1u); }",
+        ),
+        (
+            "coherent storage",
+            (mac || apple6) && objc2::available!(macos = 15.0, ios = 18.0),
+            "@coherent @group(3) @binding(0) var<storage, read_write> value: u32;
+            @compute @workgroup_size(1) fn main() { value = 1u; }",
+        ),
+    ] {
+        let result = device.create_shader(ShaderDesc {
+            source: Source::Wgsl(source),
+            identity: 0,
+            label,
+        });
+        if supported {
+            result.unwrap_or_else(|error| panic!("{label}: {error}"));
+        } else {
+            assert!(matches!(result, Err(Error::Compile(ref message))
+                if message.starts_with("shader validation:")), "{label}");
+        }
+    }
+}
+
+#[test]
 fn precompiled_msl_and_shader_validation() {
     let (device, mut queue) = gpu!();
     let shader = device.create_shader(ShaderDesc { source: Source::Precompiled { spirv: &[u32::MAX], metal: b"#include <metal_stdlib>\nusing namespace metal;\nkernel void main0(device uint* out [[buffer(29)]], uint i [[thread_position_in_grid]]) { out[i] = i + 5; }", entries: &[crate::shader::PrecompiledEntry { name: "main", function: "main0", workgroup: [1, 1, 1], threadgroup: &[] }] }, identity: 102, label: "precompiled" }).unwrap();

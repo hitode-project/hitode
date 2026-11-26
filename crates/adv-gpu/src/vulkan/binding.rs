@@ -71,7 +71,7 @@ impl PushLayout {
         heap: &Heap,
         bytes: u32,
         strides: &HashMap<u32, (u32, bool)>,
-    ) -> Result<Self> {
+    ) -> Option<Self> {
         let mut layout = Self::default();
         let mut half = None;
         for binding in bindings {
@@ -119,12 +119,7 @@ impl PushLayout {
                 layout.words += 1;
             }
         }
-        if layout.words * 4 > bytes as usize {
-            return Err(Error::Invalid(
-                "pipeline bindings exceed push-constant capacity".into(),
-            ));
-        }
-        Ok(layout)
+        (layout.words * 4 <= bytes as usize).then_some(layout)
     }
     pub(super) fn field(&self, group: u32, slot: u32) -> Option<&Field> {
         self.fields[group as usize].get(slot as usize)?.as_ref()
