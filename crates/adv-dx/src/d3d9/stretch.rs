@@ -121,11 +121,11 @@ fn stretch(
     // it must not expose the physical unused X byte as stored alpha.
     if !matches!(
         (src.desc.Format, dst.desc.Format),
-        (21, 21) | (22, 22) | (21, 22) | (22, 21)
+        (21, 21) | (22, 22) | (21, 22) | (22, 21) | (23, 23)
     ) {
         return unavailable(
             env,
-            "color blits support 21/22; other format conversions are unavailable",
+            "color blits support 21/22 and same-format 23; other format conversions are unavailable",
         );
     }
     if dst.desc.Usage == 0 && src.desc.Usage != 0 {

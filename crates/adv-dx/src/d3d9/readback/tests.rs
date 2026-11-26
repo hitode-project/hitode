@@ -1,6 +1,6 @@
 //! Guest-only lock publication and shared COM rollback, with no host GPU.
 use super::*;
-use adv_cpu::JitCpu;
+use adv_cpu::{JitCpu, backend::Guest};
 use adv_machine::{ObjectLimits, Objects};
 
 fn fixture(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
@@ -566,4 +566,141 @@ fn front_buffer_data_captures_presented_pixels_and_validates_inputs() {
         f.call("IDirect3DDevice9::GetNPatchMode", &[f.device]),
         Outcome::ReturnF32(v) if v == 0.0
     ));
+}
+
+// spec: GFX-CAP-1, GFX-COPY-1, GFX-COPY-2
+#[test]
+fn r5g6b5_render_targets_sample_opaque_and_read_back_packed() {
+    let mut f = super::super::stretch::tests::Fixture::new();
+    f.m.ext
+        .get_mut::<State>()
+        .tables
+        .insert("IDirect3DTexture9", 0);
+    let output = f.packet(0u32);
+    f.okay(
+        "IDirect3DDevice9::CreateTexture",
+        &[f.device, 4, 3, 1, 1, 23, 0, output, 0],
+    );
+    let texture = f.m.cpu.read_u32(output).unwrap();
+    f.okay("IDirect3DTexture9::GetSurfaceLevel", &[texture, 0, output]);
+    let rt_surface = f.m.cpu.read_u32(output).unwrap();
+    assert_eq!(
+        f.image(rt_surface).alpha_mode(),
+        adv_device::gpu::AlphaMode::Opaque
+    );
+
+    // Clear with zero alpha; sampling an R5G6B5 target must still produce alpha 1.0.
+    f.okay(
+        "IDirect3DDevice9::SetRenderTarget",
+        &[f.device, 0, rt_surface],
+    );
+    f.okay(
+        "IDirect3DDevice9::Clear",
+        &[f.device, 0, 0, 1, 0x00123456, 1f32.to_bits(), 0],
+    );
+
+    let argb_target = f.render_target(4, 3, 21);
+    f.okay(
+        "IDirect3DDevice9::SetRenderTarget",
+        &[f.device, 0, argb_target],
+    );
+    f.okay(
+        "IDirect3DDevice9::Clear",
+        &[f.device, 0, 0, 1, 0x00000000, 1f32.to_bits(), 0],
+    );
+    f.okay("IDirect3DDevice9::SetTexture", &[f.device, 0, texture]);
+    f.okay("IDirect3DDevice9::SetFVF", &[f.device, 0x144]);
+    f.okay("IDirect3DDevice9::SetRenderState", &[f.device, 27, 0]);
+    f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct QuadVertex {
+        x: f32,
+        y: f32,
+        z: f32,
+        rhw: f32,
+        color: u32,
+        u: f32,
+        v: f32,
+    }
+    let vertices = f.packet([
+        QuadVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.0,
+            rhw: 1.0,
+            color: 0xffff_ffff,
+            u: 0.0,
+            v: 0.0,
+        },
+        QuadVertex {
+            x: 3.5,
+            y: -0.5,
+            z: 0.0,
+            rhw: 1.0,
+            color: 0xffff_ffff,
+            u: 1.0,
+            v: 0.0,
+        },
+        QuadVertex {
+            x: -0.5,
+            y: 2.5,
+            z: 0.0,
+            rhw: 1.0,
+            color: 0xffff_ffff,
+            u: 0.0,
+            v: 1.0,
+        },
+        QuadVertex {
+            x: 3.5,
+            y: 2.5,
+            z: 0.0,
+            rhw: 1.0,
+            color: 0xffff_ffff,
+            u: 1.0,
+            v: 1.0,
+        },
+    ]);
+    f.okay(
+        "IDirect3DDevice9::DrawPrimitiveUP",
+        &[f.device, 5, 2, vertices, 28],
+    );
+    f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+    f.okay("IDirect3DDevice9::SetTexture", &[f.device, 0, 0]);
+    let sampled = f.image(argb_target);
+    assert_eq!(&f.pixels(&sampled)[..4], &[0x56, 0x34, 0x12, 0xff]);
+
+    // Standalone lockable R5G6B5 render target + StretchRect + GetRenderTargetData.
+    f.okay(
+        "IDirect3DDevice9::CreateRenderTarget",
+        &[f.device, 4, 3, 23, 0, 0, 1, output, 0],
+    );
+    let standalone = f.m.cpu.read_u32(output).unwrap();
+    f.okay(
+        "IDirect3DDevice9::StretchRect",
+        &[f.device, rt_surface, 0, standalone, 0, 0],
+    );
+    let sysmem = f.surface(4, 3, 23, 2);
+    f.okay(
+        "IDirect3DDevice9::GetRenderTargetData",
+        &[f.device, standalone, sysmem],
+    );
+    let expected = u16::from_le_bytes(format::pack(23, 0x00123456).unwrap().try_into().unwrap());
+    let locked = f.lock(sysmem, 0, 0x10);
+    assert_eq!(locked.Pitch, 8);
+    assert_eq!(f.m.cpu.read_u16(locked.pBits).unwrap(), expected);
+    f.okay("IDirect3DSurface9::UnlockRect", &[sysmem]);
+
+    let locked = f.lock(standalone, 0, 0);
+    assert_eq!(locked.Pitch, 8);
+    assert_eq!(f.m.cpu.read_u16(locked.pBits).unwrap(), expected);
+    f.m.cpu
+        .write(locked.pBits + 2, &0xf81fu16.to_le_bytes())
+        .unwrap();
+    f.okay("IDirect3DSurface9::UnlockRect", &[standalone]);
+
+    let locked = f.lock(standalone, 0, 0x10);
+    assert_eq!(f.m.cpu.read_u16(locked.pBits).unwrap(), expected);
+    assert_eq!(f.m.cpu.read_u16(locked.pBits + 2).unwrap(), 0xf81f);
+    f.okay("IDirect3DSurface9::UnlockRect", &[standalone]);
 }
