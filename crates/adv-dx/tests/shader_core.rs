@@ -25,6 +25,7 @@ const CORPUS: &[&str] = &[
     "discard_pixel",
     "typed_uav",
     "doubles",
+    "encoded_dmov",
     "atomics",
     "raw",
     "texture_ops",
@@ -71,8 +72,22 @@ fn module(name: &str) -> ir::Module {
 #[test]
 fn windows_containers_round_trip_and_disassemble() {
     let mut mismatches = Vec::new();
-    for &name in CORPUS {
+    for entry in std::fs::read_dir(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/shader-core"
+    ))
+    .unwrap()
+    {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "asm") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap();
         let bytes = fixture(name, "dxbc");
+        if name == "diagnostic_pixel" {
+            assert_eq!(dxbc::parse(&bytes), Err(dxbc::ParseError::Checksum));
+            continue;
+        }
         let container =
             dxbc::Container::decode(&bytes).unwrap_or_else(|error| panic!("{name}: {error:?}"));
         assert_eq!(container.encode().unwrap(), bytes, "{name}");
@@ -133,7 +148,7 @@ fn profile_metadata_and_semantic_passes_verify() {
 fn programmable_corpus_emits_valid_wgsl() {
     for &name in CORPUS {
         let module = module(name);
-        if name == "doubles" {
+        if matches!(name, "doubles" | "encoded_dmov") {
             assert!(analyze(&module).doubles);
             assert!(matches!(
                 wgsl::emit(&module, wgsl::Options::default()),

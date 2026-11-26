@@ -90,7 +90,7 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
             for n in 0..p.vertex_count {
                 let input = vertex_input(p, n)?;
                 positions[n as usize] =
-                    programmable::transformed::position(input.v[0], d.state.viewport)?;
+                    crate::fixed::tnl::pretransformed(input.v[0], d.state.viewport)?;
             }
         } else {
             let shader = shaders::bound(env, device.hot.borrow().shaders.vertex?)?;
@@ -195,24 +195,7 @@ fn fixed_position(d: &fixed::Draw, ordinal: usize) -> Option<([f32; 4], [f32; 3]
         &mut bytes[..attribute.format.size() as usize],
     )?;
     let raw = std::array::from_fn(|n| f32::from_le_bytes(bytes[n * 4..][..4].try_into().unwrap()));
-    fixed_clip(raw, fixed.transforms.as_ref(), d.state.viewport)
-}
-
-pub(super) fn fixed_clip(
-    mut raw: [f32; 4],
-    transforms: Option<&[[f32; 16]; 3]>,
-    viewport: adv_device::gpu::Viewport,
-) -> Option<([f32; 4], [f32; 3])> {
-    if let Some([world, view, projection]) = transforms {
-        raw[3] = 1.;
-        let eye = fixed::row(fixed::row(raw, world), view);
-        let mut clip = fixed::row(eye, projection);
-        clip[0] += clip[3] / viewport.width;
-        clip[1] -= clip[3] / viewport.height;
-        Some((clip, [eye[0], eye[1], eye[2]]))
-    } else {
-        programmable::transformed::position(raw, viewport).map(|clip| (clip, [0.; 3]))
-    }
+    crate::fixed::tnl::clip(raw, fixed.transforms.as_ref(), d.state.viewport)
 }
 
 pub(in crate::d3d9) fn vertex_input(

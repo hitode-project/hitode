@@ -15,7 +15,6 @@ mod fast;
 mod key;
 mod reuse;
 pub mod trace;
-pub(super) use key::fixed as fixed_key;
 pub(super) use key::hash;
 pub(super) use key::rect;
 pub(super) use reuse::{bound, indexed, up};

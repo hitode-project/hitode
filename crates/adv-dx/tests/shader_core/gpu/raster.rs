@@ -26,6 +26,7 @@ struct Vertex {
 struct Pixel {
     uv: [f32; 4],
     samples: u32,
+    fixture: &'static str,
 }
 
 impl Pixel {
@@ -42,29 +43,86 @@ impl Pixel {
 impl Resources for Pixel {
     fn read(&mut self, access: ResourceAccess, args: &[Vector]) -> Result<Vector, ir::Error> {
         let result = match access.instruction {
+            Opcode::Resinfo => {
+                let (width, height, levels) = if self.fixture == "multisample_queries" {
+                    (WIDTH, HEIGHT, 1)
+                } else {
+                    let size = 8 >> args[0][0];
+                    (size, size, 3)
+                };
+                return Ok([width, height, 0, levels]);
+            }
+            Opcode::Ld => {
+                let [x, y, _, _] = args[0];
+                if x >= 4 || y >= 4 {
+                    [0.0; 4]
+                } else {
+                    [0.0, (x + 4 * y) as f32 / 64.0, 0.0, 1.0]
+                }
+            }
+            Opcode::LdMs => [0.25, 0.5, 0.75, 1.0],
+            Opcode::Sample | Opcode::SampleB | Opcode::SampleD | Opcode::SampleL => {
+                let [u, v, ..] = args[0].map(f32::from_bits);
+                let x = (u * 8.0).floor() as u32 % 8;
+                let y = (v * 8.0).floor() as u32 % 8;
+                [0.0, (x + 8 * y) as f32 / 64.0, 0.0, 1.0]
+            }
+            Opcode::SampleC | Opcode::SampleCLz => {
+                [f32::from(f32::from_bits(args[1][0]) <= 0.5); 4]
+            }
             Opcode::SamplePos => {
                 let [x, y] = self.sample_offset(args[0][0]);
                 [x, y, 0.0, 0.0]
             }
             Opcode::SampleInfo => [self.samples as f32, 0.0, 0.0, 0.0],
             Opcode::Lod => [0.75, 1.25, 0.0, 0.0],
-            Opcode::Gather4Po | Opcode::Gather4PoC => {
+            Opcode::Gather4 | Opcode::Gather4C | Opcode::Gather4Po | Opcode::Gather4PoC => {
                 let uv = args[0].map(f32::from_bits);
-                let offset = |word: u32| ((word << 26) as i32) >> 26;
-                let x = (uv[0] * 8.0 - 0.5).floor() as i32 + offset(args[1][0]);
-                let y = (uv[1] * 8.0 - 0.5).floor() as i32 + offset(args[1][1]);
+                let dynamic = matches!(access.instruction, Opcode::Gather4Po | Opcode::Gather4PoC);
+                let offset = if dynamic {
+                    args[1].map(|word| (word << 26) as i32 >> 26)
+                } else {
+                    let [x, y, z] = access.operands.offset.unwrap_or_default();
+                    [x, y, z, 0]
+                };
+                let x = (uv[0] * 8.0 - 0.5).floor() as i32 + offset[0];
+                let y = (uv[1] * 8.0 - 0.5).floor() as i32 + offset[1];
                 [(0, 1), (1, 1), (1, 0), (0, 0)].map(|(dx, dy)| {
                     let value = ((x + dx).rem_euclid(8) + 8 * (y + dy).rem_euclid(8)) as f32 / 64.0;
-                    if access.instruction == Opcode::Gather4PoC {
-                        f32::from(value >= f32::from_bits(args[2][0]))
-                    } else {
-                        value
+                    match access.instruction {
+                        Opcode::Gather4C => f32::from(f32::from_bits(args[1][0]) <= 0.5),
+                        Opcode::Gather4PoC => f32::from(value >= f32::from_bits(args[2][0])),
+                        _ => value,
                     }
                 })
             }
             op => return Err(ir::Error::UnsupportedOpcode(op)),
         };
         Ok(result.map(f32::to_bits))
+    }
+
+    fn derivative(
+        &mut self,
+        instruction: &ir::Instruction,
+        _: Vector,
+    ) -> Result<Vector, ir::Error> {
+        let source = &instruction.sources[0];
+        assert!(matches!(
+            source.register(),
+            Some((Register::Input, [ir::Index::Direct(0)]))
+        ));
+        let step = if matches!(
+            instruction.opcode,
+            Opcode::DerivRtx | Opcode::DerivRtxCoarse | Opcode::DerivRtxFine
+        ) {
+            [1.0 / WIDTH as f32, 0.0, 1.0 / WIDTH as f32, 0.0]
+        } else {
+            [0.0, 1.0 / HEIGHT as f32, 0.0, 1.0 / HEIGHT as f32]
+        };
+        Ok(source
+            .components
+            .swizzle()
+            .map(|lane| step[lane as usize].to_bits()))
     }
 
     fn interpolate(
@@ -109,6 +167,11 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
         "level_query",
         "dynamic_gather",
         "dynamic_gather_compare",
+        "derivative_queries",
+        "derivatives_4_0",
+        "multisample_queries",
+        "sample_modes",
+        "texture_ops",
     ]
     .into_iter()
     .enumerate()
@@ -136,12 +199,15 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
             },
         )
         .unwrap();
+        let supplemental = identity >= 5;
+        // Keep point samples and integer texel addresses away from rounding boundaries.
+        let vertex_source = supplemental.then(|| VERTEX.replace("0.0625", "0.09375"));
         let vertex = gpu
             .device
             .create_shader(ShaderDesc {
-                source: Source::Wgsl(VERTEX),
+                source: Source::Wgsl(vertex_source.as_deref().unwrap_or(VERTEX)),
                 label: "shader oracle vertex",
-                identity: 1,
+                identity: u64::from(supplemental),
             })
             .unwrap();
         let pixel = gpu
@@ -153,110 +219,154 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
             })
             .unwrap_or_else(|err| panic!("{name}: {err}\n{}", translation.source));
 
-        let depth = name == "dynamic_gather_compare";
-        let depth_format = if depth {
-            Format::Depth32Float
-        } else {
-            Format::Rgba32Float
-        };
+        let multisampled = name == "multisample_queries";
         let mut bindings = Vec::new();
         let mut encoder = gpu.queue.encoder(name);
-        let texture = if translation
-            .locations
-            .iter()
-            .any(|location| location.register == Register::Resource)
-        {
-            let image = gpu
-                .device
-                .create_image(&ImageDesc {
-                    dimension: Dimension::D2,
-                    size: extent(8, 8),
-                    format: depth_format,
-                    mips: if name == "level_query" { 3 } else { 1 },
-                    samples: 1,
-                    usage: Usage::SAMPLED
-                        | Usage::COPY_DST
-                        | if depth {
-                            Usage::DEPTH_STENCIL
-                        } else {
-                            Usage::empty()
-                        },
-                    view_formats: &[],
-                    label: name,
-                })
-                .unwrap();
-            if name != "level_query" {
-                let values = (0..64)
-                    .flat_map(|i| {
-                        let value = i as f32 / 64.0;
-                        if depth {
-                            [value, 0.0, 0.0, 0.0]
-                        } else {
-                            [0.0, value, 0.0, 1.0]
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let compact = if depth {
-                    values
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|pixel| pixel[0])
-                        .collect::<Vec<_>>()
-                } else {
-                    values
-                };
-                let upload = gpu.buffer(
-                    (compact.len() * 4) as u64,
-                    BufferUsage::COPY_SRC,
-                    Memory::Upload,
-                );
-                // No pending copy references the upload.
-                unsafe { &mut *upload.mapped().unwrap().as_ptr() }
-                    .copy_from_slice(bytemuck::cast_slice(&compact));
-                encoder.copy_buffer_to_image(
-                    BufferCopy {
-                        buffer: &upload,
-                        offset: 0,
-                        row_pitch: 0,
-                        rows: 0,
-                    },
-                    image_copy(&image),
-                    extent(8, 8),
-                );
-            }
-            Some(image)
-        } else {
-            None
-        };
-        let sampler = texture.as_ref().map(|_| {
-            gpu.device
-                .sampler(&SamplerDesc {
-                    min: Filter::Nearest,
-                    mag: Filter::Nearest,
-                    mip: Filter::Linear,
-                    address: [Address::Repeat; 3],
-                    border: BorderColor::TransparentBlack,
-                    lod_bias: 0,
-                    lod_min: 0,
-                    lod_max: u16::MAX,
-                    anisotropy: 1,
-                    compare: depth.then_some(Compare::LessEqual),
-                })
-                .unwrap()
-        });
+        let mut images = [None, None];
+        let mut samplers = [None, None];
         for location in &translation.locations {
-            bindings.push(Binding {
-                slot: location.binding,
-                kind: match location.register {
-                    Register::Resource => GpuBinding::SampledImage {
+            let slot = location.slot as usize;
+            let depth = slot == 1;
+            let kind = match location.register {
+                Register::Resource => {
+                    let format = if depth {
+                        Format::Depth32Float
+                    } else {
+                        Format::Rgba32Float
+                    };
+                    let mips = if !depth && matches!(name, "level_query" | "texture_ops") {
+                        3
+                    } else {
+                        1
+                    };
+                    let size = if multisampled {
+                        extent(WIDTH, HEIGHT)
+                    } else {
+                        extent(8, 8)
+                    };
+                    let image = gpu
+                        .device
+                        .create_image(&ImageDesc {
+                            dimension: Dimension::D2,
+                            size,
+                            format,
+                            mips,
+                            samples: if multisampled { 4 } else { 1 },
+                            usage: Usage::SAMPLED
+                                | if multisampled {
+                                    Usage::COLOR
+                                } else {
+                                    Usage::COPY_DST
+                                }
+                                | if depth {
+                                    Usage::DEPTH_STENCIL
+                                } else {
+                                    Usage::empty()
+                                },
+                            view_formats: &[],
+                            label: name,
+                        })
+                        .unwrap();
+                    if multisampled {
+                        let _clear = encoder.render_pass(&RenderPassDesc {
+                            colors: [ColorAttachment {
+                                view: image.view(),
+                                load: Load::Clear([0.25, 0.5, 0.75, 1.0]),
+                                store: Store::Store,
+                                resolve: None,
+                            }]
+                            .into_iter()
+                            .collect(),
+                            depth_stencil: None,
+                            area: Rect {
+                                x: 0,
+                                y: 0,
+                                w: WIDTH,
+                                h: HEIGHT,
+                            },
+                            timestamps: None,
+                            label: name,
+                        });
+                    } else if name != "level_query" {
+                        for mip in 0..mips {
+                            let width = 8 >> mip;
+                            let values: Vec<_> = (0..width * width)
+                                .flat_map(|i| {
+                                    let value = i as f32 / 64.0;
+                                    if depth {
+                                        if name == "dynamic_gather_compare" {
+                                            [value, 0.0, 0.0, 0.0]
+                                        } else {
+                                            [0.5, 0.0, 0.0, 0.0]
+                                        }
+                                    } else {
+                                        [0.0, value, 0.0, 1.0]
+                                    }
+                                })
+                                .collect();
+                            let compact: Vec<_> = if depth {
+                                values.into_iter().step_by(4).collect()
+                            } else {
+                                values
+                            };
+                            let upload = gpu.buffer(
+                                (compact.len() * 4) as u64,
+                                BufferUsage::COPY_SRC,
+                                Memory::Upload,
+                            );
+                            // The upload is mapped before the encoder references it.
+                            unsafe { &mut *upload.mapped().unwrap().as_ptr() }
+                                .copy_from_slice(bytemuck::cast_slice(&compact));
+                            encoder.copy_buffer_to_image(
+                                BufferCopy {
+                                    buffer: &upload,
+                                    offset: 0,
+                                    row_pitch: 0,
+                                    rows: 0,
+                                },
+                                ImageCopy {
+                                    mip,
+                                    ..image_copy(&image)
+                                },
+                                extent(width, width),
+                            );
+                        }
+                    }
+                    images[slot] = Some(image);
+                    GpuBinding::SampledImage {
                         dimension: Dimension::D2,
                         depth,
-                        multisampled: false,
-                    },
-                    Register::Sampler => GpuBinding::Sampler { comparison: depth },
-                    register => panic!("unexpected register {register:?}"),
-                },
+                        multisampled,
+                    }
+                }
+                Register::Sampler => {
+                    samplers[slot] = Some(
+                        gpu.device
+                            .sampler(&SamplerDesc {
+                                min: Filter::Nearest,
+                                mag: Filter::Nearest,
+                                mip: if name == "sample_modes" {
+                                    Filter::Nearest
+                                } else {
+                                    Filter::Linear
+                                },
+                                address: [Address::Repeat; 3],
+                                border: BorderColor::TransparentBlack,
+                                lod_bias: 0,
+                                lod_min: 0,
+                                lod_max: u16::MAX,
+                                anisotropy: 1,
+                                compare: depth.then_some(Compare::LessEqual),
+                            })
+                            .unwrap(),
+                    );
+                    GpuBinding::Sampler { comparison: depth }
+                }
+                register => panic!("unexpected register {register:?}"),
+            };
+            bindings.push(Binding {
+                slot: location.binding,
+                kind,
                 stages: Stages::FRAGMENT,
             });
         }
@@ -347,10 +457,13 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                 if location.register == Register::Resource {
                     pass.bind(
                         location.binding,
-                        Bind::Sampled(texture.as_ref().unwrap().view()),
+                        Bind::Sampled(images[location.slot as usize].as_ref().unwrap().view()),
                     );
                 } else {
-                    pass.bind(location.binding, Bind::Sampler(sampler.as_ref().unwrap()));
+                    pass.bind(
+                        location.binding,
+                        Bind::Sampler(samplers[location.slot as usize].as_ref().unwrap()),
+                    );
                 }
             }
             pass.draw(0..3, 0..1);
@@ -386,23 +499,27 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                     .collect()
             })
             .collect();
-        assert_eq!(oracle.len(), HEIGHT as usize, "{name}");
+        if !supplemental || !oracle.is_empty() {
+            assert_eq!(oracle.len(), HEIGHT as usize, "{name}");
+        }
         for (i, actual) in values.iter().enumerate() {
             let x = (i as u32 % WIDTH) as f32 + 0.5;
             let y = (i as u32 / WIDTH) as f32 + 0.5;
             let u = x / WIDTH as f32;
             let v = y / HEIGHT as f32;
-            let uv = [u + 0.0625, v + 0.03125, u, v];
+            let u_offset = if supplemental { 0.09375 } else { 0.0625 };
+            let uv = [u + u_offset, v + 0.03125, u, v];
             let mut inputs = Inputs::default();
             for element in &module.signatures.input {
                 let value = match element.system_value {
-                    ir::SystemValue::Position => [x, y, 0.0, 1.0],
-                    ir::SystemValue::None => uv,
+                    ir::SystemValue::Position => [x, y, 0.0, 1.0].map(f32::to_bits),
+                    ir::SystemValue::None => uv.map(f32::to_bits),
+                    ir::SystemValue::SampleIndex => [0; 4],
                     value => panic!("unexpected system value {value:?}"),
                 };
                 inputs
                     .registers
-                    .insert((Register::Input, element.register), value.map(f32::to_bits));
+                    .insert((Register::Input, element.register), value);
             }
             if name == "raster_samples" {
                 inputs
@@ -413,24 +530,29 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                 &module,
                 &inputs,
                 &Constants::new(),
-                &mut Pixel { uv, samples },
+                &mut Pixel {
+                    uv,
+                    samples: if multisampled { 4 } else { samples },
+                    fixture: name,
+                },
             )
             .unwrap();
             if name == "raster_samples" {
                 assert_eq!(result.registers[&(Register::OutputCoverageMask, 0)][0], 15);
             }
             let expected = result.registers[&(Register::Output, 0)].map(f32::from_bits);
-            let row = &oracle[i / WIDTH as usize];
-            let column = i % WIDTH as usize * 4;
-            let hardware = &row[column..][..4];
-            let warp = &row[(WIDTH as usize * 4 + column)..][..4];
-            assert!(
-                [hardware, warp].into_iter().any(|windows| expected
-                    .iter()
-                    .zip(windows)
-                    .all(|(a, b)| (a - b).abs() < 1e-5)),
-                "{name} ({x}, {y}): scalar {expected:?}, Windows {hardware:?} / {warp:?}"
-            );
+            if let Some(row) = oracle.get(i / WIDTH as usize) {
+                let column = i % WIDTH as usize * 4;
+                let hardware = &row[column..][..4];
+                let warp = &row[(WIDTH as usize * 4 + column)..][..4];
+                assert!(
+                    [hardware, warp].into_iter().any(|windows| expected
+                        .iter()
+                        .zip(windows)
+                        .all(|(a, b)| (a - b).abs() < 1e-5)),
+                    "{name} ({x}, {y}): scalar {expected:?}, Windows {hardware:?} / {warp:?}"
+                );
+            }
             assert!(
                 actual
                     .iter()

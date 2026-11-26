@@ -69,9 +69,9 @@ assembly can call guest Windows interfaces. DirectDraw keeps its private surface
 transitional dependency on `adv-os` for heaps, activation, Automation, files and
 input state.
 
-The shared `adv-dx` modules, including frame recording, shader translation and
-pacing, depend on no API front. `tools/layering/check_modules.py` also applies
-this rule to shared fixed-function code.
+The shared `adv-dx` modules for fixed-function state and lowering, frame recording,
+shader translation and pacing depend on no API front. `tools/layering/check_modules.py`
+checks these module boundaries.
 
 The Direct3D 11 core validates creation requests against the derived feature
 level and format table. Resources and immutable state use the shared COM

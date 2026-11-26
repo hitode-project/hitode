@@ -514,7 +514,7 @@ fn vertices(
             let position = if draw.fixed_vertex.is_some() {
                 super::fixed_position(draw, n)?.0
             } else {
-                programmable::transformed::position(input.v[0], draw.state.viewport)?
+                crate::fixed::tnl::pretransformed(input.v[0], draw.state.viewport)?
             };
             let mut output = Outputs {
                 position,

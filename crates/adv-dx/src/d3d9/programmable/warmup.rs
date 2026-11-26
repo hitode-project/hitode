@@ -51,7 +51,7 @@ fn schedule(
         inputs: inputs.iter().map(|i| (i.register, i.format)).collect(),
         second: false,
         features: (hot.fixed.render[&152], hot.fixed.render[&28] != 0),
-        fixed: fixed_features(&hot.fixed, None),
+        fixed: fixed_core::features(&hot.fixed, None, fixed::state_map::RULES),
         fixed_vertex: None,
     };
     let streams_meta = hot.buffers.streams;
@@ -65,9 +65,11 @@ fn schedule(
         .programs
         .last_draw
         .unwrap_or((4, None));
-    let prediction = fixed::prepare_state(env, pointer, kind, key.fixed & STAGE_ARGUMENTS != 0)
+    let prediction = fixed::topology(kind)
         .ok()
-        .map(|(target, _, state)| {
+        .and_then(|topology| fixed::prepare_state(env, pointer, topology, None).ok())
+        .map(|(target, _, lowered)| {
+            let state = lowered.state;
             let textures = std::array::from_fn(|slot| texture(env, pointer, slot, &state).ok());
             (target, state, textures)
         });

@@ -11,6 +11,8 @@ pub mod dmsynth;
 pub mod dshow;
 pub mod dsound;
 pub mod dxgi;
+#[cfg(feature = "gpu")]
+pub(crate) mod fixed;
 pub(crate) mod pacing;
 #[cfg(feature = "gpu")]
 pub(crate) mod record;

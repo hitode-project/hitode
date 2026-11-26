@@ -1,0 +1,249 @@
+category	token	name	fixture	value_scope
+opcode	0	add	arithmetic	shader core
+opcode	1	and	branches	shader core
+opcode	2	break	branches	shader core
+opcode	3	breakc	branches	shader core
+opcode	4	call	encoded_call	shader core
+opcode	5	callc	encoded_callc	shader core
+opcode	6	case	control	shader core
+opcode	7	continue	branches	shader core
+opcode	8	continuec	encoded_flow	shader core
+opcode	9	cut	gs_4_0	T8/T15 programmable stages
+opcode	10	default	control	shader core
+opcode	11	deriv_rtx	derivatives_4_0	Windows value readback pending
+opcode	12	deriv_rty	derivatives_4_0	Windows value readback pending
+opcode	13	discard	discard_pixel	shader core
+opcode	14	div	float_ops	shader core
+opcode	15	dp2	float_ops	shader core
+opcode	16	dp3	integer_ops	shader core
+opcode	17	dp4	integer_ops	shader core
+opcode	18	else	branches	shader core
+opcode	19	emit	encoded_emit_cut	T8/T15 programmable stages
+opcode	20	emitthencut	encoded_emit_cut	T8/T15 programmable stages
+opcode	21	endif	branches	shader core
+opcode	22	endloop	branches	shader core
+opcode	23	endswitch	control	shader core
+opcode	24	eq	float_ops	shader core
+opcode	25	exp	float_ops	shader core
+opcode	26	frc	float_ops	shader core
+opcode	27	ftoi	dynamic_gather	shader core
+opcode	28	ftou	float_ops	shader core
+opcode	29	ge	float_ops	shader core
+opcode	30	iadd	arithmetic	shader core
+opcode	31	if	branches	shader core
+opcode	32	ieq	bit_ops	shader core
+opcode	33	ige	integer_ops	shader core
+opcode	34	ilt	bit_ops	shader core
+opcode	35	imad	arithmetic	shader core
+opcode	36	imax	integer_ops	shader core
+opcode	37	imin	bit_ops	shader core
+opcode	38	imul	bit_ops	shader core
+opcode	39	ine	integer_ops	shader core
+opcode	40	ineg	bit_ops	shader core
+opcode	41	ishl	arithmetic	shader core
+opcode	42	ishr	bit_ops	shader core
+opcode	43	itof	bit_ops	shader core
+opcode	44	label	encoded_call	shader core
+opcode	45	ld	buffer_views	shader core
+opcode	46	ldms	multisample_queries	Windows value readback pending
+opcode	47	log	float_ops	shader core
+opcode	48	loop	branches	shader core
+opcode	49	lt	discard_pixel	shader core
+opcode	50	mad	ds_5_0	T8/T15 programmable stages
+opcode	51	min	float_ops	shader core
+opcode	52	max	float_ops	shader core
+opcode	53	customdata	ps_4_0	shader core
+opcode	54	mov	atomic_modes	shader core
+opcode	55	movc	bit_ops	shader core
+opcode	56	mul	color	shader core
+opcode	57	ne	float_ops	shader core
+opcode	58	nop	encoded_nop	shader core
+opcode	59	not	bit_ops	shader core
+opcode	60	or	integer_ops	shader core
+opcode	61	resinfo	multisample_queries	Windows value readback pending
+opcode	62	ret	arithmetic	shader core
+opcode	63	retc	encoded_flow	shader core
+opcode	64	round_ne	arithmetic	shader core
+opcode	65	round_ni	float_ops	shader core
+opcode	66	round_pi	float_ops	shader core
+opcode	67	round_z	float_ops	shader core
+opcode	68	rsq	float_ops	shader core
+opcode	69	sample	ps_4_0	shader core
+opcode	70	sample_c	sample_modes	Windows value readback pending
+opcode	71	sample_c_lz	sample_modes	Windows value readback pending
+opcode	72	sample_l	sample_modes	Windows value readback pending
+opcode	73	sample_d	sample_modes	Windows value readback pending
+opcode	74	sample_b	sample_modes	Windows value readback pending
+opcode	75	sqrt	float_ops	shader core
+opcode	76	switch	control	shader core
+opcode	77	sincos	float_ops	shader core
+opcode	78	udiv	arithmetic	shader core
+opcode	79	ult	bit_ops	shader core
+opcode	80	uge	branches	shader core
+opcode	81	umul	encoded_alu	shader core
+opcode	82	umad	encoded_alu	shader core
+opcode	83	umax	bit_ops	shader core
+opcode	84	umin	integer_ops	shader core
+opcode	85	ushr	bit_ops	shader core
+opcode	86	utof	bit_ops	shader core
+opcode	87	xor	arithmetic	shader core
+declaration	88	dcl_resource	buffer_views	shader core
+declaration	89	dcl_constant_buffer	encoded_hull_join	T8/T15 programmable stages
+declaration	90	dcl_sampler	dynamic_gather	shader core
+declaration	91	dcl_index_range	encoded_hull_join	T8/T15 programmable stages
+declaration	92	dcl_gs_output_primitive_topology	encoded_emit_cut	T8/T15 programmable stages
+declaration	93	dcl_gs_input_primitive	encoded_emit_cut	T8/T15 programmable stages
+declaration	94	dcl_max_output_vertex_count	encoded_emit_cut	T8/T15 programmable stages
+declaration	95	dcl_input	arithmetic	shader core
+declaration	96	dcl_input_sgv	vertex_sample	shader core
+declaration	97	dcl_input_siv	encoded_emit_cut	T8/T15 programmable stages
+declaration	98	dcl_input_ps	derivative_queries	Windows value readback pending
+declaration	99	dcl_input_ps_sgv	coverage	shader core
+declaration	100	dcl_input_ps_siv	color	shader core
+declaration	101	dcl_output	color	shader core
+declaration	102	dcl_output_sgv	instanced_geometry	T8/T15 programmable stages
+declaration	103	dcl_output_siv	ds_5_0	T8/T15 programmable stages
+declaration	104	dcl_temps	arithmetic	shader core
+declaration	105	dcl_indexable_temp	indexed_inputs	shader core
+declaration	106	dcl_global_flags	arithmetic	shader core
+opcode	108	lod	level_query	shader core
+opcode	109	gather4	texture_ops	Windows value readback pending
+opcode	110	samplepos	multisample_queries	Windows value readback pending
+opcode	111	sampleinfo	coverage	shader core
+opcode	113	hs_decls	encoded_hull_join	T8/T15 programmable stages
+opcode	114	hs_control_point_phase	encoded_hull_join	T8/T15 programmable stages
+opcode	115	hs_fork_phase	encoded_hull_join	T8/T15 programmable stages
+opcode	116	hs_join_phase	encoded_hull_join	T8/T15 programmable stages
+opcode	117	emit_stream	encoded_emit_cut_stream	T8/T15 programmable stages
+opcode	118	cut_stream	gs_5_0	T8/T15 programmable stages
+opcode	119	emitthencut_stream	encoded_emit_cut_stream	T8/T15 programmable stages
+opcode	120	fcall	linkage	T15 class linkage
+opcode	121	bufinfo	buffer_views	shader core
+opcode	122	deriv_rtx_coarse	derivative_queries	Windows value readback pending
+opcode	123	deriv_rtx_fine	derivative_queries	Windows value readback pending
+opcode	124	deriv_rty_coarse	derivative_queries	Windows value readback pending
+opcode	125	deriv_rty_fine	derivative_queries	Windows value readback pending
+opcode	126	gather4_c	texture_ops	Windows value readback pending
+opcode	127	gather4_po	dynamic_gather	shader core
+opcode	128	gather4_po_c	dynamic_gather_compare	shader core
+opcode	129	rcp	float_ops	shader core
+opcode	130	f32tof16	arithmetic	shader core
+opcode	131	f16tof32	float_ops	shader core
+opcode	132	uaddc	encoded_alu	shader core
+opcode	133	usubb	encoded_alu	shader core
+opcode	134	countbits	bit_ops	shader core
+opcode	135	firstbit_hi	bit_ops	shader core
+opcode	136	firstbit_lo	bit_ops	shader core
+opcode	137	firstbit_shi	bit_ops	shader core
+opcode	138	ubfe	bit_ops	shader core
+opcode	139	ibfe	bit_ops	shader core
+opcode	140	bfi	bit_ops	shader core
+opcode	141	bfrev	arithmetic	shader core
+opcode	142	swapc	swap_values	shader core
+declaration	143	dcl_stream	encoded_emit_cut_stream	T8/T15 programmable stages
+declaration	144	dcl_function_body	linkage	T15 class linkage
+declaration	145	dcl_function_table	linkage	T15 class linkage
+declaration	146	dcl_interface	linkage	T15 class linkage
+declaration	147	dcl_input_control_point_count	ds_5_0	T8/T15 programmable stages
+declaration	148	dcl_output_control_point_count	encoded_hull_join	T8/T15 programmable stages
+declaration	149	dcl_tess_domain	ds_5_0	T8/T15 programmable stages
+declaration	150	dcl_tess_partitioning	encoded_hull_join	T8/T15 programmable stages
+declaration	151	dcl_tess_output_primitive	encoded_hull_join	T8/T15 programmable stages
+declaration	152	dcl_hs_max_tessfactor	limited_hull	T8/T15 programmable stages
+declaration	153	dcl_hs_fork_phase_instance_count	encoded_hull_join	T8/T15 programmable stages
+declaration	154	dcl_hs_join_phase_instance_count	encoded_hull_join	T8/T15 programmable stages
+declaration	155	dcl_thread_group	arithmetic	shader core
+declaration	156	dcl_unordered_access_view_typed	buffer_views	shader core
+declaration	157	dcl_unordered_access_view_raw	raw	shader core
+declaration	158	dcl_unordered_access_view_structured	arithmetic	shader core
+declaration	159	dcl_thread_group_shared_memory_raw	encoded_shared_raw	shader core
+declaration	160	dcl_thread_group_shared_memory_structured	cs_4_0	shader core
+declaration	161	dcl_resource_raw	raw	shader core
+declaration	162	dcl_resource_structured	arithmetic	shader core
+opcode	163	ld_uav_typed	buffer_views	shader core
+opcode	164	store_uav_typed	buffer_views	shader core
+opcode	165	ld_raw	encoded_shared_raw	shader core
+opcode	166	store_raw	encoded_shared_raw	shader core
+opcode	167	ld_structured	arithmetic	shader core
+opcode	168	store_structured	arithmetic	shader core
+opcode	169	atomic_and	atomic_modes	shader core
+opcode	170	atomic_or	atomic_modes	shader core
+opcode	171	atomic_xor	atomic_modes	shader core
+opcode	172	atomic_cmp_store	atomic_modes	shader core
+opcode	173	atomic_iadd	texture_atomic	shader core
+opcode	174	atomic_imax	atomic_modes	shader core
+opcode	175	atomic_imin	atomic_modes	shader core
+opcode	176	atomic_umax	atomic_modes	shader core
+opcode	177	atomic_umin	atomic_modes	shader core
+opcode	178	imm_atomic_alloc	counters	shader core
+opcode	179	imm_atomic_consume	counters	shader core
+opcode	180	imm_atomic_iadd	atomics	shader core
+opcode	181	imm_atomic_and	atomic_modes	shader core
+opcode	182	imm_atomic_or	atomic_modes	shader core
+opcode	183	imm_atomic_xor	atomic_modes	shader core
+opcode	184	imm_atomic_exch	atomic_modes	shader core
+opcode	185	imm_atomic_cmp_exch	atomics	shader core
+opcode	186	imm_atomic_imax	atomic_modes	shader core
+opcode	187	imm_atomic_imin	atomic_modes	shader core
+opcode	188	imm_atomic_umax	atomic_modes	shader core
+opcode	189	imm_atomic_umin	atomic_modes	shader core
+opcode	190	sync	cs_4_0	shader core
+opcode	191	dadd	doubles	double precision excluded
+opcode	192	dmax	doubles	double precision excluded
+opcode	193	dmin	doubles	double precision excluded
+opcode	194	dmul	doubles	double precision excluded
+opcode	195	deq	doubles	double precision excluded
+opcode	196	dge	doubles	double precision excluded
+opcode	197	dlt	doubles	double precision excluded
+opcode	198	dne	doubles	double precision excluded
+opcode	199	dmov	encoded_dmov	double precision excluded
+opcode	200	dmovc	doubles	double precision excluded
+opcode	201	dtof	doubles	double precision excluded
+opcode	202	ftod	doubles	double precision excluded
+opcode	203	eval_snapped	raster_queries	shader core
+opcode	204	eval_sample_index	raster_queries	shader core
+opcode	205	eval_centroid	raster_queries	shader core
+declaration	206	dcl_gs_instance_count	instanced_geometry	T8/T15 programmable stages
+opcode	207	abort	encoded_abort	diagnostic instruction
+opcode	208	debug_break	encoded_debug_break	diagnostic instruction
+opcode	210	ddiv	doubles	double precision excluded
+opcode	211	dfma	doubles	double precision excluded
+opcode	212	drcp	doubles	double precision excluded
+opcode	213	msad	integer_ops	shader core
+opcode	214	dtoi	doubles	double precision excluded
+opcode	215	dtou	doubles	double precision excluded
+opcode	216	itod	doubles	double precision excluded
+opcode	217	utod	doubles	double precision excluded
+opcode	219	gather4_s	residency	tiled resources excluded
+opcode	220	gather4_c_s	residency	tiled resources excluded
+opcode	221	gather4_po_s	residency	tiled resources excluded
+opcode	222	gather4_po_c_s	residency	tiled resources excluded
+opcode	223	ld_s	residency	tiled resources excluded
+opcode	224	ldms_s	residency	tiled resources excluded
+opcode	225	ld_uav_typed_s	residency	tiled resources excluded
+opcode	226	ld_raw_s	residency	tiled resources excluded
+opcode	227	ld_structured_s	residency	tiled resources excluded
+opcode	228	sample_l_s	residency	tiled resources excluded
+opcode	229	sample_c_lz_s	residency	tiled resources excluded
+opcode	230	sample_cl_s	residency	tiled resources excluded
+opcode	231	sample_b_cl_s	residency	tiled resources excluded
+opcode	232	sample_d_cl_s	residency	tiled resources excluded
+opcode	233	sample_c_cl_s	residency	tiled resources excluded
+opcode	234	check_access_fully_mapped	residency	tiled resources excluded
+custom declaration	3	dcl_immediateConstantBuffer	ps_4_0	shader core
+opcode extension	0	empty	encoded_empty_opcode	shader core
+opcode extension	1	sample controls	ps_4_0	shader core
+opcode extension	2	resource dimension	arithmetic	shader core
+opcode extension	3	resource return type	arithmetic	shader core
+operand extension	0	empty	encoded_empty_operand	shader core
+operand extension	1	modifier	arithmetic	shader core
+modifier	0	none	arithmetic	shader core
+modifier	1	negate	bit_ops	shader core
+modifier	2	absolute	integer_ops	shader core
+modifier	3	absolute negate	arithmetic	shader core
+precision	0	default	arithmetic	shader core
+precision	1	float16	min_precision	shader core
+precision	2	float2.8	encoded_min10	shader core
+precision	4	int16	min_precision	shader core
+precision	5	uint16	min_precision	shader core
+operand non-uniform	1	non-uniform	encoded_non_uniform	shader core
