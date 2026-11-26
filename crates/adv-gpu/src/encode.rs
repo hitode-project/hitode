@@ -1,10 +1,10 @@
 //! Command encoding, on the GPU owner thread only.
 //!
-//! One encoder is open per queue at a time and submits in creation order, so
-//! encoding order is execution order. The Vulkan backend derives every image
-//! layout transition and barrier from that order and each image's last use;
-//! callers never write barriers. The Metal backend needs none for a single
-//! queue with tracked resources.
+//! One encoder is open per queue at a time and submits in creation order.
+//! Vulkan derives layout transitions and barriers from the encoding order
+//! and each image's last use. Metal orders conflicting accesses to tracked
+//! resources on a single queue. Standalone timestamp markers also order passes
+//! that have no resource dependencies.
 
 use crate::pipeline::{ComputePipeline, MAX_COLOR_TARGETS, RenderPipeline};
 use crate::queue::QuerySet;
@@ -159,6 +159,26 @@ impl Encoder {
     pub fn compute_pass<'e>(&'e mut self, desc: &ComputePassDesc<'_>) -> ComputePass<'e> {
         self.inner.compute_pass(desc)
     }
+    /// Sample the GPU clock between preceding and subsequent work. The marker
+    /// uses a binding-free compute pipeline and writes its result at `first + 1`,
+    /// using `first` for the pass-start sample.
+    pub fn write_timestamp(
+        &mut self,
+        set: &QuerySet,
+        first: u32,
+        pipeline: &ComputePipeline,
+    ) -> crate::Result<()> {
+        self.inner.timestamp_barrier()?;
+        {
+            let mut pass = self.compute_pass(&ComputePassDesc {
+                timestamps: Some((set, first)),
+                label: "timestamp marker",
+            });
+            pass.set_pipeline(pipeline);
+            pass.dispatch(1, 1, 1);
+        }
+        self.inner.timestamp_barrier()
+    }
     pub fn copy_buffer_to_image(&mut self, src: BufferCopy<'_>, dst: ImageCopy<'_>, size: Extent) {
         self.inner.copy_buffer_to_image(src, dst, size)
     }
@@ -182,6 +202,37 @@ impl Encoder {
     pub fn retain(&mut self, span: Span) {
         self.inner.retain(span)
     }
+    /// Resolve matching color subresources. The source contents are preserved.
+    pub fn resolve(&mut self, source: &ImageView, destination: &ImageView) {
+        let size = source.size();
+        let desc = RenderPassDesc {
+            colors: [ColorAttachment {
+                view: source,
+                load: Load::Load,
+                store: Store::Store,
+                resolve: Some(destination),
+            }]
+            .into_iter()
+            .collect(),
+            depth_stencil: None,
+            area: Rect {
+                x: 0,
+                y: 0,
+                w: size.width,
+                h: size.height,
+            },
+            timestamps: None,
+            label: "resolve",
+        };
+        drop(self.render_pass(&desc));
+    }
+
+    /// Fill the remaining levels of a filterable view from its first level.
+    /// The image needs COPY_SRC and COPY_DST usage.
+    pub fn generate_mips(&mut self, view: &ImageView) {
+        self.inner.generate_mips(view);
+    }
+
     /// Copy query results into `dst` as 64-bit values. They are there when
     /// this submission's token completes; read them on the host, not from
     /// later commands of this encoder (Metal resolves timestamps after the
@@ -209,6 +260,11 @@ impl RenderPass<'_> {
     pub fn bind(&mut self, slot: u32, resource: Bind<'_>) {
         self.inner.bind(slot, resource)
     }
+    /// Bind a compacted vertex register in the vertex-only bank.
+    pub fn bind_vertex(&mut self, slot: u32, resource: Bind<'_>) {
+        self.inner.bind_vertex(slot, resource)
+    }
+
     /// Bind this buffer's prebuilt converted-video set. Set its pool's video
     /// pipeline first. No descriptor is written on the encoding path.
     pub fn bind_video(&mut self, image: &crate::PresentImage) {
@@ -259,6 +315,15 @@ impl RenderPass<'_> {
     }
     pub fn end_occlusion(&mut self) {
         self.inner.end_occlusion()
+    }
+    /// Bracket raster work with a native pipeline statistics query.
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn begin_statistics(&mut self, set: &QuerySet, index: u32) {
+        self.inner.begin_statistics(set, index)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn end_statistics(&mut self) {
+        self.inner.end_statistics()
     }
 }
 

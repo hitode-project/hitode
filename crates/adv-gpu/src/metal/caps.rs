@@ -17,7 +17,9 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
         | Features::PRESENTABLE_BUFFERS
         | Features::STANDARD_SAMPLE_LOCATIONS
         | Features::DUAL_SOURCE_BLEND
-        | Features::DEPTH_CLAMP;
+        | Features::DEPTH_CLAMP
+        | Features::CLIP_DISTANCES
+        | Features::WIREFRAME;
     if apple || mac {
         features |= Features::MULTIPLE_VIEWPORTS;
     }

@@ -260,6 +260,9 @@ impl Device {
     ) -> Result<crate::queue::QuerySet> {
         self.check()?;
         let data = match kind {
+            QueryKind::PipelineStatistics => {
+                return Err(Error::Unavailable("pipeline statistics queries".into()));
+            }
             QueryKind::Occlusion => QueryData::Occlusion(
                 self.0
                     .raw

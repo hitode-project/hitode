@@ -16,6 +16,7 @@ impl Writer<'_> {
         entry: &str,
         module: &Module,
         reflection: &Reflection,
+        variant: Option<&passes::variant::Interface>,
     ) -> Result<(), Error> {
         let input_count = register_count(&module.signatures.input);
         let output_count = register_count(&module.signatures.output);
@@ -36,7 +37,7 @@ impl Writer<'_> {
             self.line("let dx_local_id = vec4<u32>(local_id, 0u);");
             self.line("let dx_local_index = vec4<u32>(local_index);");
         } else {
-            let mut inputs = fields(module, &module.signatures.input, true)?;
+            let mut inputs = fields(module, &module.signatures.input, true, variant)?;
             if self.stage == Stage::Pixel && self.options.raster_samples == 1 {
                 // A single-sample target supplies index zero. The input register
                 // already starts at zero, so this variant needs no sample-rate builtin.
@@ -64,10 +65,12 @@ impl Writer<'_> {
                 if self.options.raster_samples > 1 {
                     eval_coverage =
                         builtin_input(&mut inputs, "sample_mask", "dx_eval_coverage", "u32");
-                    if inputs
-                        .iter()
-                        .any(|field| field.attribute.ends_with(", sample)"))
-                    {
+                    if reflection.interpolation.values().any(|mode| {
+                        matches!(
+                            mode,
+                            Interpolation::PerspectiveSample | Interpolation::LinearSample
+                        )
+                    }) {
                         eval_sample =
                             builtin_input(&mut inputs, "sample_index", "dx_eval_sample", "u32");
                     }
@@ -81,7 +84,16 @@ impl Writer<'_> {
                     }
                 }
             }
-            let outputs = fields(module, &module.signatures.output, false)?;
+            let outputs = fields(module, &module.signatures.output, false, variant)?;
+            let vertex = self.stage == Stage::Vertex;
+            let variant_inputs = variant.filter(|_| !vertex);
+            let variant_outputs = variant.filter(|_| vertex);
+            if let Some(storage) = variant_inputs.and_then(|i| i.storage.as_ref()) {
+                self.storage_varying_binding(storage);
+            }
+            if variant_inputs.is_some_and(|i| i.count_fragments) {
+                self.line(&format!("@group(3) @binding({}) var<storage, read_write> dx_statistics: array<atomic<u32>>;", super::STATISTICS_SLOT));
+            }
             let input_name = if self.stage == Stage::Vertex {
                 "DxVertexInput"
             } else {
@@ -92,9 +104,9 @@ impl Writer<'_> {
             } else {
                 "DxPixelOutput"
             };
-            self.interface(input_name, &inputs);
-            self.interface(output_name, &outputs);
-            let args = if inputs.is_empty() {
+            let has_inputs = self.interface(input_name, &inputs, variant_inputs, false);
+            let has_outputs = self.interface(output_name, &outputs, variant_outputs, true);
+            let args = if !has_inputs {
                 String::new()
             } else {
                 format!("input: {input_name}")
@@ -121,14 +133,17 @@ impl Writer<'_> {
             } else {
                 "@fragment"
             };
-            let returns = if outputs.is_empty() {
+            let returns = if !has_outputs {
                 String::new()
             } else {
                 format!(" -> {output_name}")
             };
             self.open(&format!("{attrib} fn {entry}({args}){returns}"));
-            let result: Vec<_> = outputs.iter().map(Field::output).collect();
-            self.result = if outputs.is_empty() {
+            let mut result: Vec<_> = outputs.iter().map(Field::output).collect();
+            if let Some(variant) = variant_outputs {
+                result.extend(super::variant_interface::variant_outputs(variant, "o"));
+            }
+            self.result = if !has_outputs {
                 String::new()
             } else {
                 format!("{output_name}({})", result.join(", "))
@@ -140,10 +155,12 @@ impl Writer<'_> {
                     self.line(&field.input());
                 }
             }
+            if let Some(variant) = variant_inputs {
+                self.variant_inputs(variant);
+            }
             if reflection.interpolation_queries {
                 self.interpolation_planes(
                     module,
-                    &inputs,
                     input_count,
                     &eval_position,
                     &eval_coverage,
@@ -157,6 +174,14 @@ impl Writer<'_> {
                 self.line("var o_coverage: vec4<u32>;");
             }
         }
+        self.temporaries(module, reflection)
+    }
+
+    pub(super) fn temporaries(
+        &mut self,
+        module: &Module,
+        reflection: &Reflection,
+    ) -> Result<(), Error> {
         self.line(&format!(
             "var r: array<vec4<u32>, {}>;",
             reflection.temporary_count.max(1)
@@ -177,7 +202,6 @@ impl Writer<'_> {
     fn interpolation_planes(
         &mut self,
         module: &Module,
-        inputs: &[Field],
         count: u32,
         position: &str,
         coverage: &str,
@@ -196,13 +220,15 @@ impl Writer<'_> {
             let mask = ((1u64 << samples) - 1) as u32;
             self.line(&format!("let dx_centroid_offset = select(dx_sample_position({samples}u, firstTrailingBit({coverage})), vec2<f32>(0.0), {coverage} == {mask}u);"));
         }
-        for field in inputs {
-            if !field.attribute.starts_with("@location(") {
+        let mut seen = HashSet::new();
+        for element in &module.signatures.input {
+            if element.system_value != SystemValue::None || !seen.insert(element.register) {
                 continue;
             }
-            let index = &field.name[1..];
-            let mode = interpolation_mode(module, index.parse().unwrap());
-            let perspective = field.ty == "vec4<f32>"
+            let index = element.register.to_string();
+            let mode = interpolation_mode(module, element.register);
+            let float = element.value_type == ValueType::Float;
+            let perspective = float
                 && !matches!(
                     mode,
                     Some(
@@ -224,7 +250,7 @@ impl Writer<'_> {
                 "let dx_plane_{index} = {value} * dx_eval_w[{index}].x;"
             ));
             self.line(&format!("dx_eval_base[{index}] = dx_plane_{index};"));
-            if !matches!(mode, Some(Interpolation::Flat)) && field.ty == "vec4<f32>" {
+            if float && !matches!(mode, Some(Interpolation::Flat)) {
                 self.line(&format!(
                     "dx_eval_dx[{index}] = dpdxFine(dx_plane_{index});"
                 ));
@@ -244,7 +270,7 @@ impl Writer<'_> {
                 _ => None,
             };
             if let Some(offset) = offset {
-                let expression = Self::interpolate_at(index, &offset);
+                let expression = Self::interpolate_at(&index, &offset);
                 self.line(&format!("v[{index}] = bitcast<vec4<u32>>({expression});"));
             }
         }
@@ -289,9 +315,19 @@ impl Writer<'_> {
         )
     }
 
-    fn interface(&mut self, name: &str, fields: &[Field]) {
-        if fields.is_empty() {
-            return;
+    fn interface(
+        &mut self,
+        name: &str,
+        fields: &[Field],
+        variant: Option<&passes::variant::Interface>,
+        output: bool,
+    ) -> bool {
+        if fields.is_empty()
+            && !variant.is_some_and(|i| {
+                !i.varyings.is_empty() || i.storage.is_some() || output && i.native_clip
+            })
+        {
+            return false;
         }
         self.open(&format!("struct {name}"));
         for field in fields {
@@ -300,7 +336,14 @@ impl Writer<'_> {
                 field.attribute, field.name, field.ty
             ));
         }
+        if let Some(variant) = variant {
+            self.varying_fields(variant);
+            if output {
+                self.clip_field(variant);
+            }
+        }
         self.close();
+        true
     }
 }
 
@@ -355,7 +398,7 @@ impl Field {
     }
 }
 
-fn register_count(elements: &[SignatureElement]) -> u32 {
+pub(super) fn register_count(elements: &[SignatureElement]) -> u32 {
     elements
         .iter()
         .filter_map(|element| element.register.checked_add(1))
@@ -367,10 +410,20 @@ fn fields(
     module: &Module,
     elements: &[SignatureElement],
     input: bool,
+    variant: Option<&passes::variant::Interface>,
 ) -> Result<Vec<Field>, Error> {
     let register = if input { "v" } else { "o" };
     let mut fields: Vec<Field> = Vec::new();
     for element in elements {
+        if variant.is_some()
+            && input == (module.stage == Stage::Pixel)
+            && matches!(
+                element.system_value,
+                SystemValue::None | SystemValue::ClipDistance
+            )
+        {
+            continue;
+        }
         let first = LANES
             .as_bytes()
             .get(element.mask.trailing_zeros() as usize)

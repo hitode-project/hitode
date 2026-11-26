@@ -241,6 +241,12 @@ impl Encoder {
             vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
         );
     }
+    pub(crate) fn timestamp_barrier(&mut self) -> Result<()> {
+        // Timestamp markers also order commands tracked by image transitions.
+        self.synced = false;
+        self.memory_barrier();
+        Ok(())
+    }
     /// Orders compute shader writes before subsequent compute or indirect dispatches.
     fn compute_barrier(&mut self) {
         if !self.ready() || self.synced {
@@ -560,9 +566,13 @@ impl Encoder {
                 );
                 let clear = match color.load {
                     Load::Clear(value) => vk::ClearValue {
-                        color: if view.0.format == Format::R32Uint {
+                        color: if view.0.format.is_uint() {
                             vk::ClearColorValue {
                                 uint32: value.map(|v| v as u32),
+                            }
+                        } else if view.0.format.is_sint() {
+                            vk::ClearColorValue {
+                                int32: value.map(|v| v as i32),
                             }
                         } else {
                             vk::ClearColorValue {
@@ -591,7 +601,7 @@ impl Encoder {
                         vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                     );
                     info = info
-                        .resolve_mode(if matches!(view.0.format, Format::R32Uint) {
+                        .resolve_mode(if view.0.format.is_uint() || view.0.format.is_sint() {
                             vk::ResolveModeFlags::SAMPLE_ZERO
                         } else {
                             vk::ResolveModeFlags::AVERAGE
@@ -707,9 +717,13 @@ impl Encoder {
                 );
                 let clear = match color.load {
                     Load::Clear(value) => vk::ClearValue {
-                        color: if view.0.format == Format::R32Uint {
+                        color: if view.0.format.is_uint() {
                             vk::ClearColorValue {
                                 uint32: value.map(|v| v as u32),
+                            }
+                        } else if view.0.format.is_sint() {
+                            vk::ClearColorValue {
+                                int32: value.map(|v| v as i32),
                             }
                         } else {
                             vk::ClearColorValue {
@@ -865,6 +879,7 @@ impl Encoder {
                 begun: false,
                 timestamp,
                 occlusion: None,
+                statistics: None,
                 preamble: None,
                 preamble_index,
                 resets: Vec::new(),
@@ -1034,6 +1049,140 @@ impl Encoder {
             vk::PipelineStageFlags2::TRANSFER,
         );
     }
+    pub(crate) fn generate_mips(&mut self, view: &crate::ImageView) {
+        let image = view.image();
+        let desc = &view.inner.0.desc;
+        if desc.mips.len() == 1 {
+            return;
+        }
+        if formats::vk(view.format()) != formats::vk(image.desc().format) {
+            self.generate_view_mips(view);
+            return;
+        }
+        let core = &image.inner.core;
+        let is_3d = core.desc.dimension == crate::resource::Dimension::D3;
+        let offsets = |level: u32| {
+            let axis = |n: u32| (n >> level).max(1) as i32;
+            [
+                vk::Offset3D::default(),
+                vk::Offset3D {
+                    x: axis(core.desc.size.width),
+                    y: axis(core.desc.size.height),
+                    z: if is_3d {
+                        axis(core.desc.size.depth_or_layers)
+                    } else {
+                        1
+                    },
+                },
+            ]
+        };
+        let layers = |level| {
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(level)
+                .base_array_layer(desc.layers.start)
+                .layer_count(desc.layers.len() as u32)
+        };
+        for dst in desc.mips.start + 1..desc.mips.end {
+            let src = dst - 1;
+            let mut barriers = Vec::new();
+            self.push_transition(
+                &mut barriers,
+                core,
+                src..src + 1,
+                desc.layers.clone(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags2::TRANSFER_READ,
+                vk::PipelineStageFlags2::TRANSFER,
+            );
+            self.push_transition(
+                &mut barriers,
+                core,
+                dst..dst + 1,
+                desc.layers.clone(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::TRANSFER,
+            );
+            self.flush_image_barriers(&barriers);
+            if self.ready() {
+                let region = vk::ImageBlit::default()
+                    .src_subresource(layers(src))
+                    .src_offsets(offsets(src))
+                    .dst_subresource(layers(dst))
+                    .dst_offsets(offsets(dst));
+                unsafe {
+                    self.shared.context.device.cmd_blit_image(
+                        self.command,
+                        core.handle,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        core.handle,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                        vk::Filter::LINEAR,
+                    );
+                }
+            }
+        }
+    }
+
+    fn generate_view_mips(&mut self, view: &crate::ImageView) {
+        use crate::resource::{Dimension, ImageDesc, Usage};
+        let src = view.image();
+        let desc = &view.inner.0.desc;
+        let dimension = match src.desc().dimension {
+            Dimension::Cube => Dimension::D2,
+            dimension => dimension,
+        };
+        let is_3d = dimension == Dimension::D3;
+        // Vulkan blits use the allocation's format. Copy the view's bits to
+        // a matching image first so e.g. sRGB mip generation filters in linear space.
+        let size = view.size();
+        let scratch = match Device(self.shared.context.clone()).create_image(&ImageDesc {
+            dimension,
+            size,
+            format: view.format(),
+            mips: desc.mips.len() as u32,
+            samples: 1,
+            usage: Usage::COPY_SRC | Usage::COPY_DST,
+            view_formats: &[],
+            label: "mip view",
+        }) {
+            Ok(image) => image,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
+        let copy = |image, mip, layer| ImageCopy {
+            image,
+            mip,
+            layer,
+            origin: (0, 0, 0),
+        };
+        self.copy_image(
+            copy(src, desc.mips.start, desc.layers.start),
+            copy(&scratch, 0, 0),
+            size,
+        );
+        self.generate_mips(scratch.view());
+        for mip in 1..desc.mips.len() as u32 {
+            self.copy_image(
+                copy(&scratch, mip, 0),
+                copy(src, desc.mips.start + mip, desc.layers.start),
+                Extent {
+                    width: (size.width >> mip).max(1),
+                    height: (size.height >> mip).max(1),
+                    depth_or_layers: if is_3d {
+                        (size.depth_or_layers >> mip).max(1)
+                    } else {
+                        size.depth_or_layers
+                    },
+                },
+            );
+        }
+    }
+
     pub(crate) fn copy_image(&mut self, src: ImageCopy<'_>, dst: ImageCopy<'_>, size: Extent) {
         self.copy_image_regions(
             src.image,
@@ -1231,7 +1380,11 @@ impl Encoder {
                 range.end - range.start,
                 dst.inner.0.handle,
                 offset,
-                8,
+                if set.inner.0.kind == crate::queue::QueryKind::PipelineStatistics {
+                    16
+                } else {
+                    8
+                },
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             );
         }
@@ -1440,6 +1593,7 @@ pub(crate) struct RenderPass<'e> {
     begun: bool,
     timestamp: Option<(vk::QueryPool, u32)>,
     occlusion: Option<(vk::QueryPool, u32)>,
+    statistics: Option<(vk::QueryPool, u32)>,
     preamble: Option<vk::CommandBuffer>,
     preamble_index: usize,
     resets: Vec<(vk::QueryPool, u32)>,
@@ -1696,6 +1850,9 @@ impl RenderPass<'_> {
             },
         );
         self.encoder.bindings = Some(bindings);
+    }
+    pub(crate) fn bind_vertex(&mut self, slot: u32, resource: Bind<'_>) {
+        self.bind(slot, resource);
     }
     #[cfg(target_os = "android")]
     pub(crate) fn bind_video(&mut self, image: &crate::PresentImage) {
@@ -1967,8 +2124,19 @@ impl RenderPass<'_> {
         }
     }
     pub(crate) fn begin_occlusion(&mut self, set: &crate::queue::QuerySet, index: u32) {
+        self.occlusion = self.begin_query(set, index, vk::QueryControlFlags::PRECISE);
+    }
+    pub(crate) fn begin_statistics(&mut self, set: &crate::queue::QuerySet, index: u32) {
+        self.statistics = self.begin_query(set, index, vk::QueryControlFlags::empty());
+    }
+    fn begin_query(
+        &mut self,
+        set: &crate::queue::QuerySet,
+        index: u32,
+        flags: vk::QueryControlFlags,
+    ) -> Option<(vk::QueryPool, u32)> {
         if !self.encoder.ready() {
-            return;
+            return None;
         }
         if !self.begun {
             unsafe {
@@ -1980,14 +2148,10 @@ impl RenderPass<'_> {
                 );
             }
             if !self.ensure_begun() {
-                return;
+                return None;
             }
         } else {
-            if Self::ensure_preamble(self.encoder, &mut self.preamble, self.preamble_index)
-                .is_none()
-            {
-                return;
-            }
+            Self::ensure_preamble(self.encoder, &mut self.preamble, self.preamble_index)?;
             self.resets.push((set.inner.0.handle, index));
         }
         self.encoder.has_query_ops = true;
@@ -1996,14 +2160,22 @@ impl RenderPass<'_> {
                 self.encoder.command,
                 set.inner.0.handle,
                 index,
-                vk::QueryControlFlags::PRECISE,
+                flags,
             );
         }
-        self.occlusion = Some((set.inner.0.handle, index));
+        Some((set.inner.0.handle, index))
     }
     pub(crate) fn end_occlusion(&mut self) {
+        let query = self.occlusion.take();
+        self.end_query(query);
+    }
+    pub(crate) fn end_statistics(&mut self) {
+        let query = self.statistics.take();
+        self.end_query(query);
+    }
+    fn end_query(&mut self, query: Option<(vk::QueryPool, u32)>) {
         if self.encoder.ready()
-            && let Some((pool, index)) = self.occlusion.take()
+            && let Some((pool, index)) = query
         {
             unsafe {
                 self.encoder

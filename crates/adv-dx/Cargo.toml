@@ -34,6 +34,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 [dev-dependencies]
 adv-gpu = { path = "../adv-gpu", default-features = false }
 adv-device = { path = "../adv-device", features = ["test-support"] }
+half = { version = "2", default-features = false }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
 
 [lints]

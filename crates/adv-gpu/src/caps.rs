@@ -63,6 +63,10 @@ bitflags::bitflags! {
         const STANDARD_SAMPLE_LOCATIONS = 1 << 19;
         /// R32 integer image atomics.
         const IMAGE_ATOMICS = 1 << 20;
+        /// Native clipping primitive and fragment invocation queries.
+        const PIPELINE_STATISTICS_QUERY = 1 << 21;
+        const CLIP_DISTANCES = 1 << 22;
+        const WIREFRAME = 1 << 23;
         // Reserved for D3D10/11 front ends. No backend sets these yet; Metal has
         // no geometry stage, so a front end emulates it with compute plus
         // indirect draws instead of waiting for this bit.

@@ -15,6 +15,7 @@ pub(crate) struct Encoder {
     visibility_offset: usize,
     /// Timestamp resolves, encoded after this submission completes.
     pub(super) resolves: Vec<Resolve>,
+    timestamp_event: Option<(Object<dyn MTLEvent>, u64)>,
 }
 
 impl Drop for Encoder {
@@ -42,6 +43,7 @@ pub(crate) struct RenderPass<'e> {
     /// Draws reached the GPU, so stage-boundary samples are written.
     pub(super) work: bool,
     occlusion: Vec<(Object<dyn MTLBuffer>, usize, usize)>,
+    vertex_bindings: Option<Box<Bindings>>,
     resolves: Vec<(Object<dyn MTLTexture>, Object<dyn MTLTexture>)>,
     pipeline: Option<Arc<RenderData>>,
     raster: Raster,
@@ -74,6 +76,7 @@ impl Encoder {
             visibility_needs_zero: true,
             visibility_offset: 0,
             resolves: Vec::new(),
+            timestamp_event: None,
         }
     }
     fn blit(&mut self) -> &ProtocolObject<dyn MTLBlitCommandEncoder> {
@@ -87,6 +90,19 @@ impl Encoder {
         if let Some(blit) = self.blit.take() {
             blit.endEncoding();
         }
+    }
+    pub(crate) fn timestamp_barrier(&mut self) -> Result<()> {
+        self.finish_blit();
+        let (event, value) = match &mut self.timestamp_event {
+            Some(barrier) => barrier,
+            slot => slot.insert((self.device.0.raw.newEvent().ok_or(Error::OutOfMemory)?, 0)),
+        };
+        *value += 1;
+        // Stage-boundary samples can overlap across independent passes. A
+        // signal waits for all prior commands and the wait holds later passes.
+        self.command.encodeSignalEvent_value(event, *value);
+        self.command.encodeWaitForEvent_value(event, *value);
+        Ok(())
     }
     pub(crate) fn render_pass<'e>(
         &'e mut self,
@@ -265,6 +281,7 @@ impl Encoder {
                     .map(|(set, first)| (set.inner.0.clone(), first)),
                 work,
                 occlusion: Vec::new(),
+                vertex_bindings: None,
                 resolves,
                 pipeline: None,
                 raster: Raster::DEFAULT,
@@ -469,6 +486,9 @@ impl Encoder {
     pub(crate) fn retain(&mut self, span: crate::Span) {
         self.spans.push(span);
     }
+    pub(crate) fn generate_mips(&mut self, view: &crate::ImageView) {
+        self.blit().generateMipmapsForTexture(&view.inner.raw);
+    }
     pub(crate) fn resolve_queries(
         &mut self,
         set: &crate::queue::QuerySet,
@@ -657,6 +677,18 @@ impl RenderPass<'_> {
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
         self.encoder.bindings.as_mut().unwrap().bind(slot, resource);
     }
+    pub(crate) fn bind_vertex(&mut self, slot: u32, resource: Bind<'_>) {
+        let group = match resource {
+            Bind::Uniform(_) => 0,
+            Bind::Sampled(_) => 1,
+            Bind::Sampler(_) => 2,
+            Bind::StorageImage(_) | Bind::StorageBuffer(_) => 3,
+        };
+        let slot = crate::shader::compile::stage_slot(crate::pipeline::Stages::VERTEX, group, slot);
+        self.vertex_bindings
+            .get_or_insert_with(Bindings::new)
+            .bind(slot, resource);
+    }
     /// Gives each stage the bindings it reads that changed since its last draw.
     fn flush(&mut self) -> MTLPrimitiveType {
         let p = self
@@ -667,7 +699,11 @@ impl RenderPass<'_> {
         let sizes = std::mem::take(&mut bindings.sizes_dirty);
         let raw = &*self.raw;
         let table = |stage: usize| p.sizes[stage].as_deref().filter(|_| sizes);
-        bindings.flush(0, p.used[0], table(0), &Vertex(raw));
+        if let Some(vertex) = &mut self.vertex_bindings {
+            vertex.flush(0, p.used[0], p.sizes[0].as_deref(), &Vertex(raw));
+        } else {
+            bindings.flush(0, p.used[0], table(0), &Vertex(raw));
+        }
         bindings.flush(1, p.used[1], table(1), &Fragment(raw));
         p.topology
     }

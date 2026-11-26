@@ -165,7 +165,7 @@ Packed 16-bit targets MUST blend in resident BGRA and round to the nearest packe
 
 **Rule**: Full-target color clears MUST become load-action clears in the next compatible draw pass. Partial and padded-target clears MUST preserve bounded drawing semantics.
 Full-target clips MUST preserve full-clear load actions for equal-sized attachments.
-Pending clears MUST resolve before target changes, copies, readbacks, uploads, presentation, frame completion, or external queue submissions.
+Pending clears MUST resolve before target changes, copies, readbacks, uploads, dispatches, presentation, frame completion, or external queue submissions.
 Retained resources MUST keep pending clears valid after callers release their target handles.
 **Verification**: Test
 
@@ -452,6 +452,16 @@ and measured readbacks. GS, HS and DS execution belongs to expansion and program
 (T8 and T15). Class linkage execution belongs to T15. Residency feedback and double precision
 have Windows bytecode oracles. The shader core does not report tiled resources or emit
 64-bit floating-point operations.
+
+### GFX-SHADER-6 Expansion order
+
+**Rule**: Expansion MUST preserve primitive order, the leading vertex and winding. It MUST append complete stream-output primitives in order and derive filled sizes from the append scan.
+**Verification**: Test
+
+### GFX-SHADER-7 Pipeline statistics
+
+**Rule**: Pipeline statistics MUST combine recorded work with raster and expansion counts. Rasterization-disabled draws MUST contribute zero clipping and fragment counts.
+**Verification**: Test
 
 ## Tessellation
 

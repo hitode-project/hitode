@@ -711,6 +711,7 @@ impl Device {
                 sampler_anisotropy: base.sampler_anisotropy,
                 texture_compression_bc: base.texture_compression_bc,
                 occlusion_query_precise: base.occlusion_query_precise,
+                pipeline_statistics_query: base.pipeline_statistics_query,
                 vertex_pipeline_stores_and_atomics: base.vertex_pipeline_stores_and_atomics,
                 fragment_stores_and_atomics: base.fragment_stores_and_atomics,
                 shader_storage_image_extended_formats: base.shader_storage_image_extended_formats,
@@ -900,6 +901,15 @@ impl Device {
             {
                 feature_bits |= Features::TIMESTAMPS;
             }
+            if base.pipeline_statistics_query != 0 {
+                feature_bits |= Features::PIPELINE_STATISTICS_QUERY;
+            }
+            if base.shader_clip_distance != 0 {
+                feature_bits |= Features::CLIP_DISTANCES;
+            }
+            if base.fill_mode_non_solid != 0 {
+                feature_bits |= Features::WIREFRAME;
+            }
             if base.occlusion_query_precise != 0 {
                 feature_bits |= Features::OCCLUSION_QUERIES;
             }
@@ -1075,13 +1085,7 @@ impl Device {
                         1
                     },
                     max_buffer_size,
-                    max_uniform_buffers: if use_indexing {
-                        (l.max_bound_descriptor_sets - 1)
-                            .min(l.max_descriptor_set_uniform_buffers_dynamic)
-                            .min(l.max_per_stage_descriptor_uniform_buffers)
-                    } else {
-                        l.max_per_stage_descriptor_uniform_buffers
-                    },
+                    max_uniform_buffers: l.max_per_stage_descriptor_uniform_buffers,
                     max_sampled_images: l.max_per_stage_descriptor_sampled_images,
                     max_samplers: l.max_per_stage_descriptor_samplers,
                     max_storage_bindings: l
@@ -1188,6 +1192,8 @@ impl Device {
                 api: adapter.api,
                 anisotropy: base.sampler_anisotropy != 0,
                 max_anisotropy: l.max_sampler_anisotropy,
+                max_heap_uniform_slots: (l.max_bound_descriptor_sets - 1)
+                    .min(l.max_descriptor_set_uniform_buffers_dynamic),
                 mirror_clamp: plan.use_mirror_clamp,
             });
             let device = crate::Device {

@@ -417,11 +417,8 @@ pub(crate) fn select_device_plan(
         push_ext(&mut extensions, c"VK_EXT_4444_formats");
     }
 
-    let use_mirror_clamp = mark_opt(
-        Optional::MIRROR_CLAMP,
-        api >= VK_1_2 || support.ext_mirror_clamp,
-    );
-    if use_mirror_clamp && api < VK_1_2 {
+    let use_mirror_clamp = mark_opt(Optional::MIRROR_CLAMP, support.ext_mirror_clamp);
+    if use_mirror_clamp {
         push_ext(&mut extensions, c"VK_KHR_sampler_mirror_clamp_to_edge");
     }
 

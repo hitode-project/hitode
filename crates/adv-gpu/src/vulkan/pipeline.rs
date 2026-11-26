@@ -493,6 +493,15 @@ impl Device {
             .heap
             .as_ref()
             .filter(|_| !entries.iter().any(|e| e.shader.inner.storage_atomics()))
+            .filter(|_| {
+                let slots = self
+                    .0
+                    .max_heap_uniform_slots
+                    .saturating_sub(u32::from(video.is_some()));
+                bindings
+                    .iter()
+                    .all(|b| b.kind != BindingKind::UniformBuffer || b.slot < slots)
+            })
             .and_then(|heap| {
                 let mut strides = HashMap::new();
                 for entry in entries {
@@ -722,6 +731,10 @@ fn factor(f: Factor) -> vk::BlendFactor {
         Factor::SrcAlphaSaturated => vk::BlendFactor::SRC_ALPHA_SATURATE,
         Factor::Constant => vk::BlendFactor::CONSTANT_COLOR,
         Factor::OneMinusConstant => vk::BlendFactor::ONE_MINUS_CONSTANT_COLOR,
+        Factor::Src1 => vk::BlendFactor::SRC1_COLOR,
+        Factor::OneMinusSrc1 => vk::BlendFactor::ONE_MINUS_SRC1_COLOR,
+        Factor::Src1Alpha => vk::BlendFactor::SRC1_ALPHA,
+        Factor::OneMinusSrc1Alpha => vk::BlendFactor::ONE_MINUS_SRC1_ALPHA,
     }
 }
 fn blend_op(op: BlendOp) -> vk::BlendOp {

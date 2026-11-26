@@ -451,6 +451,18 @@ impl Gpu {
             .ok_or_else(|| Error::Invalid("staged upload size".into()))?;
         Ok((self.staging.take(&self.device, u64::from(size))?, size))
     }
+    pub(super) fn stage_image_bytes(
+        &mut self,
+        pitch: u32,
+        rows: u32,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<Staged, Error> {
+        let (buffer, len) = self.take_stage(pitch, rows)?;
+        // SAFETY: the staging allocation has no GPU users or other writers.
+        fill(unsafe { &mut buffer.mapped().unwrap().as_mut()[..len as usize] });
+        Ok(Staged { buffer, pitch, len })
+    }
+
     /// Copy a tightly packed pixel slice into a mapped staging buffer.
     pub fn stage_bytes(&mut self, row_bytes: u32, rows: u32, src: &[u8]) -> Result<Staged, Error> {
         self.stage_bytes_with(row_bytes, rows, src, |_| {})
