@@ -756,15 +756,8 @@ impl State {
             )?);
         }
         let pipeline = self.timestamp_pipeline.as_ref().unwrap().clone();
-        let mut pass = self
-            .encoder()
-            .compute_pass(&adv_gpu::encode::ComputePassDesc {
-                timestamps: Some((&slot.set, slot.index)),
-                label: "guest timestamp",
-            });
-        pass.set_pipeline(&pipeline);
-        pass.dispatch(1, 1, 1);
-        Ok(())
+        self.encoder()
+            .write_timestamp(&slot.set, slot.index, &pipeline)
     }
 
     fn end_frame(&mut self) {

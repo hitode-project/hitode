@@ -1,10 +1,10 @@
 //! Command encoding, on the GPU owner thread only.
 //!
-//! One encoder is open per queue at a time and submits in creation order, so
-//! encoding order is execution order. The Vulkan backend derives every image
-//! layout transition and barrier from that order and each image's last use;
-//! callers never write barriers. The Metal backend needs none for a single
-//! queue with tracked resources.
+//! One encoder is open per queue at a time and submits in creation order.
+//! Vulkan derives layout transitions and barriers from the encoding order
+//! and each image's last use. Metal orders conflicting accesses to tracked
+//! resources on a single queue. Standalone timestamp markers also order passes
+//! that have no resource dependencies.
 
 use crate::pipeline::{ComputePipeline, MAX_COLOR_TARGETS, RenderPipeline};
 use crate::queue::QuerySet;
@@ -158,6 +158,26 @@ impl Encoder {
     }
     pub fn compute_pass<'e>(&'e mut self, desc: &ComputePassDesc<'_>) -> ComputePass<'e> {
         self.inner.compute_pass(desc)
+    }
+    /// Sample the GPU clock between preceding and subsequent work. The marker
+    /// uses a binding-free compute pipeline and writes its result at `first + 1`,
+    /// using `first` for the pass-start sample.
+    pub fn write_timestamp(
+        &mut self,
+        set: &QuerySet,
+        first: u32,
+        pipeline: &ComputePipeline,
+    ) -> crate::Result<()> {
+        self.inner.timestamp_barrier()?;
+        {
+            let mut pass = self.compute_pass(&ComputePassDesc {
+                timestamps: Some((set, first)),
+                label: "timestamp marker",
+            });
+            pass.set_pipeline(pipeline);
+            pass.dispatch(1, 1, 1);
+        }
+        self.inner.timestamp_barrier()
     }
     pub fn copy_buffer_to_image(&mut self, src: BufferCopy<'_>, dst: ImageCopy<'_>, size: Extent) {
         self.inner.copy_buffer_to_image(src, dst, size)

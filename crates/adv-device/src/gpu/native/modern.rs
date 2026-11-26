@@ -527,8 +527,9 @@ impl Gpu {
         }
     }
 
-    /// Timestamp sets allocate two consecutive indices per marker. The
-    /// marker's result is its second (pass end) timestamp.
+    /// Record a GPU timestamp after preceding work and before subsequent work.
+    /// A marker uses two consecutive indices in the set, with the result in
+    /// the second index.
     pub fn timestamp(&mut self, slot: QuerySlot) -> Result<(), Error> {
         self.enqueue_modern(super::record::WorkerItem::Timestamp {
             facade: self.facade_id,
