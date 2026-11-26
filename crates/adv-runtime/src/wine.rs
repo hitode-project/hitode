@@ -70,6 +70,8 @@ const CREATED_BITMAP: u32 = 32;
 
 pub fn register(registry: &mut Registry) {
     adv_dx::ddraw::register(registry);
+    #[cfg(feature = "gpu")]
+    adv_dx::ddraw::d3d::register(registry);
     class::register(registry);
     dmsynth::register(registry);
     sound::register(registry);
@@ -120,6 +122,17 @@ pub fn install<B: Backend>(
             },
         },
     )?;
+    #[cfg(feature = "gpu")]
+    {
+        adv_dx::ddraw::d3d::install(machine)?;
+        machine
+            .ext
+            .get_mut::<adv_dx::ddraw::front::State>()
+            .set_activation_provider(|ext, hwnd| {
+                (adv_drv::user::input::presented_window(ext) == Some(hwnd))
+                    .then(|| !adv_drv::user::project::minimized(ext))
+            });
+    }
     class::install(machine)?;
     let ddraw: Vec<_> = DDRAW_EXPORTS.into_iter().chain(class::EXPORTS).collect();
     install_image(machine, drive, DDRAW, &ddraw)?;

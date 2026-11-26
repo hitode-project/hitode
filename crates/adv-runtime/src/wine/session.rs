@@ -1489,6 +1489,14 @@ impl Session {
 
     /// The host application gained or lost activation.
     pub fn activate(&mut self, active: bool) -> bool {
+        #[cfg(feature = "gpu")]
+        if let Some(draw) = self
+            .machine
+            .ext
+            .try_get_mut::<adv_dx::ddraw::front::State>()
+        {
+            draw.set_application_active(active);
+        }
         let queued = project::activate(&mut self.machine.ext, active);
         self.queued(queued)
     }
