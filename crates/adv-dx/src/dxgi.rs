@@ -1,5 +1,47 @@
-//! Data shared by DXGI format consumers.
+//! DXGI factory, adapter and output. Assembly supplies display facts at query
+//! time. The front is installed explicitly and is independent of DLL serving.
+#![deny(clippy::todo, clippy::unimplemented, clippy::wildcard_enum_match_arm)]
+
+mod abi;
+pub mod caps;
+mod desc;
 pub mod formats;
+mod glue;
+mod object;
+mod ops;
+mod state;
+
+pub use glue::{create_device_factory, install, register};
+pub use state::{DeviceCall, DeviceOperation, Devices, Provider, shared_display};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Error {
+    InvalidArgument,
+    InvalidCall,
+    NoInterface,
+    NotFound,
+    MoreData,
+    Unsupported,
+    Unavailable,
+    OutOfMemory,
+    FrameStatisticsDisjoint,
+}
+
+impl Error {
+    pub fn hresult(self) -> u32 {
+        match self {
+            Self::InvalidArgument => 0x80070057,
+            Self::InvalidCall => 0x887a0001,
+            Self::NoInterface => 0x80004002,
+            Self::NotFound => 0x887a0002,
+            Self::MoreData => 0x887a0003,
+            Self::Unsupported => 0x887a0004,
+            Self::Unavailable => 0x887a0022,
+            Self::OutOfMemory => 0x8007000e,
+            Self::FrameStatisticsDisjoint => 0x887a000b,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

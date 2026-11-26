@@ -74,6 +74,8 @@ Its scoped supplement preserves two GUID pointers and a BOOL result.
 ## Graphics declarations and capability data
 
 `com.tsv` includes the Direct3D 1–7, DXGI, Direct3D 10.1 and Direct3D 11.1 slots.
+DXGI includes factory slots through Factory7, adapter slots through Adapter4
+and output slots through Output6.
 `gfx-iids.rs`, `structs.rs` and `constants.tsv` project interface IDs, x86 record
 layouts, enums and numeric D3D11 limits. The legacy COM declarations and legacy
 enum spellings come from the pinned SDK headers. To check them, run
@@ -96,6 +98,8 @@ fixtures exercise lossless SHDR and SHEX token encoding. Regenerate them with
 published FL 11.0 format columns against their pinned Microsoft Learn source.
 `python3 tools/gfx/check_caps.py [probe-directory]` compares those columns, the
 feature levels and reported record sizes with the external Windows probe outputs.
+It also checks the downlevel format eligibility table. Regenerate that table
+with the same probe directory and `--write-downlevel`.
 
 ## Selected legacy exports and DLL aliases
 

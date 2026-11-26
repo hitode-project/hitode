@@ -123,10 +123,39 @@ def check_feature_sizes(caps):
             assert sizes[name] == len(values) * 4, (name, values)
 
 
+def downlevel_formats(caps):
+    levels = ("9100", "9200", "9300", "a000", "a100")
+    measured = {}
+    for row in caps:
+        if row[0] != "format":
+            continue
+        _, device, number, _, mask1, _, mask2, *samples = row
+        driver, level = device.split("/")
+        if driver not in ("hardware", "warp") or level not in levels:
+            continue
+        sample_mask = 0
+        for sample in samples:
+            count, hr, quality = sample.split(":")
+            if int(count) in (2, 4, 8) and hr == "00000000" and int(quality):
+                sample_mask |= int(count)
+        old = measured.get((int(number), level), (0, 0, 0))
+        measured[int(number), level] = (old[0] | int(mask1, 16), old[1] | int(mask2, 16), old[2] | sample_mask)
+    lines = [
+        "# D3D11 caps.tsv Win11 x86 hardware/WARP union. Each cell: FORMAT_SUPPORT, FORMAT_SUPPORT2, sample mask (hex).",
+        "format\t" + "\t".join(levels),
+    ]
+    for number in sorted({number for number, _ in measured}):
+        cells = [measured[number, level] for level in levels]
+        if any(any(cell) for cell in cells):
+            lines.append(f"{number}\t" + "\t".join(",".join(f"{mask:x}" for mask in cell) for cell in cells))
+    return "\n".join(lines) + "\n"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("probes", nargs="?", type=Path,
                         default=Path.home() / "adv-wine-assets/probes/gfx")
+    parser.add_argument("--write-downlevel", action="store_true")
     args = parser.parse_args()
     if not (args.probes / "caps.tsv").is_file():
         print("Skipped Windows capability checks (caps.tsv is unavailable).")
@@ -140,6 +169,10 @@ def main():
     check_formats(caps)
     check_levels(caps, lowlevel, io_regs)
     check_feature_sizes(caps)
+    downlevel = DATA / "format-support-downlevel.tsv"
+    if args.write_downlevel:
+        downlevel.write_text(downlevel_formats(caps))
+    assert downlevel.read_text() == downlevel_formats(caps), "downlevel format mask mismatch"
     print("Windows capability checks passed for hardware and WARP.")
 
 

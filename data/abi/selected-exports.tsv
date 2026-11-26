@@ -2,6 +2,9 @@
 # destination DLL<TAB>export<TAB>source DLL<TAB>export<TAB>expected x86 stdcall stack words
 # The legacy x86 Kernel32 export shares the ANSI implementation and address.
 kernel32.dll	lstrcpy	kernel32.dll	lstrcpyA	2
+dxgi.dll	CreateDXGIFactory	dxgi.dll	CreateDXGIFactory	2
+dxgi.dll	CreateDXGIFactory1	dxgi.dll	CreateDXGIFactory1	2
+dxgi.dll	CreateDXGIFactory2	dxgi.dll	CreateDXGIFactory2	3
 mpr.dll	WNetGetUniversalNameA	mpr.dll	WNetGetUniversalNameA	4
 mpr.dll	WNetGetUniversalNameW	mpr.dll	WNetGetUniversalNameW	4
 ntdll.dll	RtlFreeUnicodeString	ntdll.dll	RtlFreeUnicodeString	1
