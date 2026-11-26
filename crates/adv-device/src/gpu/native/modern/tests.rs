@@ -1271,97 +1271,106 @@ fn sampling_probe_comparison_depth_and_stencil() {
         compare_samples(&format!("depth-{name}-clear-1/3"), &actual, epsilon);
     }
 
-    let depth = image(
-        &gpu,
-        1,
-        1,
-        Format::Depth32FloatStencil8,
-        1,
-        1,
-        Usage::DEPTH_STENCIL | Usage::SAMPLED,
-    );
-    let stencil_view = sample_aspect(&depth, 1);
-    let fragment = shader("@fragment fn main() {}", Stage::Fragment);
-    for (id, (name, op, from, reference, mask, instances)) in [
-        (
-            "incrsat-from-fe-x2",
-            StencilOp::IncrementClamp,
-            0xfe,
-            0,
-            0xff,
-            2,
-        ),
-        (
-            "incr-from-fe-x2",
-            StencilOp::IncrementWrap,
-            0xfe,
-            0,
-            0xff,
-            2,
-        ),
-        (
-            "decrsat-from-1-x2",
-            StencilOp::DecrementClamp,
+    for (format_name, format) in [
+        ("d32fs8", Format::Depth32FloatStencil8),
+        ("d24s8", Format::Depth24UnormStencil8),
+    ] {
+        let depth = image(
+            &gpu,
             1,
-            0,
-            0xff,
-            2,
-        ),
-        ("decr-from-1-x2", StencilOp::DecrementWrap, 1, 0, 0xff, 2),
-        ("invert-from-5a", StencilOp::Invert, 0x5a, 0, 0xff, 1),
-        (
-            "replace-ff-writemask-0f-from-0",
-            StencilOp::Replace,
-            0,
-            0xff,
-            0x0f,
             1,
-        ),
-        (
-            "incr-writemask-f0-from-0f",
-            StencilOp::IncrementWrap,
-            0x0f,
-            0,
-            0xf0,
+            format,
             1,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut draw = draw(1, 1, vertex.clone(), fragment.clone(), []);
-        draw.state_ids[3] = 1 + id as u64;
-        draw.stencil_reference = reference;
-        draw.arguments = DrawArguments::Direct {
-            vertices: 0..3,
-            instances: 0..instances,
-            base_vertex: 0,
-        };
-        let mut state = depth_state(&depth, Load::Clear(1.), Load::Clear(from));
-        let face = StencilFace {
-            compare: Compare::Always,
-            fail: StencilOp::Keep,
-            depth_fail: StencilOp::Keep,
-            pass: op,
-        };
-        state.state.depth_write = false;
-        state.state.stencil = Some((face, face));
-        state.state.stencil_write_mask = mask;
-        draw.depth = Some(state);
-        simple(&mut gpu, draw);
-        let actual = sample(
-            &mut gpu,
-            stencil_view.clone(),
-            None,
-            "
+            1,
+            Usage::DEPTH_STENCIL | Usage::SAMPLED,
+        );
+        let stencil_view = sample_aspect(&depth, 1);
+        let fragment = shader("@fragment fn main() {}", Stage::Fragment);
+        for (id, (name, op, from, reference, mask, instances)) in [
+            (
+                "incrsat-from-fe-x2",
+                StencilOp::IncrementClamp,
+                0xfe,
+                0,
+                0xff,
+                2,
+            ),
+            (
+                "incr-from-fe-x2",
+                StencilOp::IncrementWrap,
+                0xfe,
+                0,
+                0xff,
+                2,
+            ),
+            (
+                "decrsat-from-1-x2",
+                StencilOp::DecrementClamp,
+                1,
+                0,
+                0xff,
+                2,
+            ),
+            ("decr-from-1-x2", StencilOp::DecrementWrap, 1, 0, 0xff, 2),
+            ("invert-from-5a", StencilOp::Invert, 0x5a, 0, 0xff, 1),
+            (
+                "replace-ff-writemask-0f-from-0",
+                StencilOp::Replace,
+                0,
+                0xff,
+                0x0f,
+                1,
+            ),
+            (
+                "incr-writemask-f0-from-0f",
+                StencilOp::IncrementWrap,
+                0x0f,
+                0,
+                0xf0,
+                1,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut draw = draw(1, 1, vertex.clone(), fragment.clone(), []);
+            draw.state_ids[3] = 1 + id as u64;
+            draw.stencil_reference = reference;
+            draw.arguments = DrawArguments::Direct {
+                vertices: 0..3,
+                instances: 0..instances,
+                base_vertex: 0,
+            };
+            let mut state = depth_state(&depth, Load::Clear(1.), Load::Clear(from));
+            let face = StencilFace {
+                compare: Compare::Always,
+                fail: StencilOp::Keep,
+                depth_fail: StencilOp::Keep,
+                pass: op,
+            };
+            state.state.depth_write = false;
+            state.state.stencil = Some((face, face));
+            state.state.stencil_write_mask = mask;
+            draw.depth = Some(state);
+            simple(&mut gpu, draw);
+            let actual = sample(
+                &mut gpu,
+                stencil_view.clone(),
+                None,
+                "
 @group(1) @binding(0) var stencil: texture_2d<u32>;
 @fragment fn main() -> @location(0) vec4<f32> {
     return vec4(f32(textureLoad(stencil, vec2(0), 0).g));
 }",
-            1,
-        );
-        let expected = bits(oracle(&format!("stencil-d32fs8-{name}"), 0).next().unwrap());
-        assert_eq!(actual[0] as u32, expected, "{name}");
+                1,
+            );
+            let expected = bits(
+                oracle(&format!("stencil-{format_name}-{name}"), 0)
+                    .next()
+                    .unwrap(),
+            );
+            assert_eq!(actual[0] as u32, expected, "{name}");
+        }
     }
 }
 
@@ -1768,6 +1777,199 @@ fn pixel_probe_output_merger() {
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn pixel_probe_line_and_point_coverage() {
+    let Some(mut gpu) = executor() else { return };
+    let target = target(&gpu, 32, 32, Format::Rgba8Unorm);
+    let fragment = shader(WHITE, Stage::Fragment);
+    for (name, topology, points, edge) in [
+        (
+            "lines-1,1-6,4-and-1.5,6.5-6.5,1.5",
+            Topology::Lines,
+            &[[1., 1.], [6., 4.], [1.5, 6.5], [6.5, 1.5]][..],
+            8,
+        ),
+        (
+            "points-1.5,1.5-3,3-5.25,5.75",
+            Topology::Points,
+            &[[1.5, 1.5], [3., 3.], [5.25, 5.75]][..],
+            7,
+        ),
+    ] {
+        let positions = points
+            .iter()
+            .map(|[x, y]| format!("vec2({x:?}, {y:?})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let vertex = shader(
+            &format!(
+                "
+@vertex fn main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
+    let xy = array({positions});
+    return vec4(xy[i] * vec2(0.0625, -0.0625) + vec2(-1., 1.), 0.5, 1.);
+}}"
+            ),
+            Stage::Vertex,
+        );
+        let mut draw = draw(
+            32,
+            32,
+            vertex,
+            fragment.clone(),
+            [color(&target, Load::Clear([0.; 4]))],
+        );
+        draw.primitive.topology = topology;
+        draw.state_ids[0] = if topology == Topology::Lines { 1 } else { 2 };
+        draw.arguments = DrawArguments::Direct {
+            vertices: 0..points.len() as u32,
+            instances: 0..1,
+            base_vertex: 0,
+        };
+        simple(&mut gpu, draw);
+        compare_coverage(&mut gpu, &target, name, edge, edge);
+    }
+}
+
+#[test]
+fn sampling_probe_custom_border() {
+    let Some(mut gpu) = executor() else { return };
+    let texels = image(
+        &gpu,
+        4,
+        1,
+        Format::Rgba8Unorm,
+        1,
+        1,
+        Usage::SAMPLED | Usage::COPY_DST,
+    );
+    upload(
+        &mut gpu,
+        &texels,
+        0,
+        16,
+        1,
+        &[16, 80, 144, 208]
+            .into_iter()
+            .flat_map(|v| [v, 0, 0, 255])
+            .collect::<Vec<_>>(),
+    );
+    let source = "
+@group(1) @binding(0) var tex: texture_2d<f32>;
+fn tap(x: i32) -> vec4<f32> {
+    if x < 0 || x >= 4 { return round(vec4(1., 0.25, 0., 1.) * 255.) / 255.; }
+    return textureLoad(tex, vec2(x, 0), 0);
+}
+@fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return tap(i32(floor((floor(p.x) - 31.5) / 4.)));
+}";
+    let actual = sample(&mut gpu, texels.view().clone(), None, source, 64);
+    compare_samples("address-border-1,0.25,0,1", &actual, f32::EPSILON);
+    let source = "
+@group(1) @binding(0) var tex: texture_2d<f32>;
+fn tap(x: i32) -> vec4<f32> {
+    if x < 0 || x >= 4 { return round(vec4(1., 0.25, 0., 1.) * 255.) / 255.; }
+    return textureLoad(tex, vec2(x, 0), 0);
+}
+@fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let u = (floor(p.x) - 8.) / 16. - 0.5;
+    return mix(tap(i32(floor(u))), tap(i32(floor(u))+1), fract(u));
+}";
+    let actual = sample(&mut gpu, texels.view().clone(), None, source, 24);
+    compare_samples("address-border-linear-edge-u=(i-8)/64", &actual, 0.6 / 255.);
+}
+
+#[test]
+fn sampling_probe_depth_bias_clip_and_viewport_depth() {
+    let Some(mut gpu) = executor() else { return };
+    let fragment = shader("@fragment fn main() {}", Stage::Fragment);
+    let load = "
+@group(1) @binding(0) var dep: texture_depth_2d;
+@fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return vec4(textureLoad(dep, vec2(i32(p.x), 0), 0));
+}";
+    for (name, format, tolerance) in [
+        ("d16", Format::Depth16Unorm, 1. / 65535.),
+        ("d32f", Format::Depth32Float, 0.),
+        ("d32fs8", Format::Depth32FloatStencil8, 0.),
+    ] {
+        let depth = image(
+            &gpu,
+            64,
+            1,
+            format,
+            1,
+            1,
+            Usage::DEPTH_STENCIL | Usage::SAMPLED,
+        );
+        let view = if format.has_stencil() {
+            sample_aspect(&depth, 2)
+        } else {
+            depth.view().clone()
+        };
+        for (i, (test, [constant, slope, clamp], [z0, z1, z2], unclipped, [min, max])) in [
+            ("bias1-at-0.5", [1., 0., 0.], [0.5; 3], false, [0., 1.]),
+            ("bias100-at-0.5", [100., 0., 0.], [0.5; 3], false, [0., 1.]),
+            ("bias-1-at-0.5", [-1., 0., 0.], [0.5; 3], false, [0., 1.]),
+            (
+                "slope2-sloped-at-0.5",
+                [0., 2., 0.],
+                [0.25, 1.25, 0.25],
+                false,
+                [0., 1.],
+            ),
+            (
+                "bias100-clamp1e-5-at-0.5",
+                [100., 0., 1e-5],
+                [0.5; 3],
+                false,
+                [0., 1.],
+            ),
+            (
+                "none-sloped-at-0.5",
+                [0., 0., 0.],
+                [0.25, 1.25, 0.25],
+                false,
+                [0., 1.],
+            ),
+            ("noclip-z1.5", [0., 0., 0.], [1.5; 3], true, [0., 1.]),
+            (
+                "viewport-0.25-0.75-z0",
+                [0., 0., 0.],
+                [0.; 3],
+                false,
+                [0.25, 0.75],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let vertex = shader(
+                &format!(
+                    "
+@vertex fn main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
+    let p = array(vec3(-1., -1., {z0:?}), vec3(3., -1., {z1:?}), vec3(-1., 3., {z2:?}));
+    return vec4(p[i], 1.);
+}}"
+                ),
+                Stage::Vertex,
+            );
+            let mut draw = draw(64, 1, vertex, fragment.clone(), []);
+            draw.state_ids[1] = i as u64;
+            draw.state_ids[3] = i as u64;
+            draw.primitive.unclipped_depth = unclipped;
+            draw.viewport[4] = min;
+            draw.viewport[5] = max;
+            let mut depth_state = depth_state(&depth, Load::Clear(1.), Load::None);
+            depth_state.state.depth_bias = constant != 0. || slope != 0.;
+            draw.depth = Some(depth_state);
+            draw.depth_bias = [constant, slope, clamp];
+            simple(&mut gpu, draw);
+            let actual = sample(&mut gpu, view.clone(), None, load, 64);
+            compare_samples(&format!("depth-{name}-{test}"), &actual, tolerance);
         }
     }
 }

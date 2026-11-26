@@ -30,7 +30,7 @@ def main():
         if driver != "warp":
             continue
         hw = pixels[(name, row, "hw")]
-        if name.startswith(("quad-", "viewport-")):
+        if name.startswith(("quad-", "viewport-", "lines-", "points-")):
             if hw != warp or any(v not in {"00000000", "ffffffff"} for v in warp):
                 raise ValueError(f"inconsistent coverage oracle {name} {row}")
             mask = sum(1 << i for i, value in enumerate(warp) if value == "ffffffff")
@@ -48,14 +48,16 @@ def main():
     for (name, row, driver), warp in sampling.items():
         if driver != "warp":
             continue
-        depth = name.startswith(("depth-d16-", "depth-d32f-", "depth-d32fs8-")) and (
-            "-svdepth-" in name or "-clear-" in name
-        )
+        depth = name.startswith(("depth-d16-", "depth-d32f-", "depth-d32fs8-"))
         if depth or name.startswith(("srgb-", "bc", "address-wrap", "address-mirror",
-                                     "address-clamp", "cmp-", "stencil-d32fs8-", "lod-")):
+                                     "address-clamp", "address-border", "cmp-", "stencil-", "lod-")):
             hw = sampling[(name, row, "hw")]
             exact_lod = name.startswith("lod-mip-point")
-            if (exact_lod or name.startswith(("bc7-", "address-", "cmp-", "stencil-"))) and hw != warp:
+            exact_address = name.startswith("address-") and not name.startswith("address-border-linear")
+            exact = exact_lod or exact_address or name.startswith((
+                "bc1-3color", "bc7-", "cmp-", "stencil-", "depth-d32f-", "depth-d32fs8-",
+            ))
+            if exact and hw != warp:
                 raise ValueError(f"inconsistent exact sampling oracle {name}")
             output.append(f"{name}\t0\t" + "\t".join(warp))
     OUTPUT.write_text("\n".join(output) + "\n")
