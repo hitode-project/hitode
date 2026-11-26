@@ -86,6 +86,11 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
             max_image_3d: 2048,
             max_image_layers: 2048,
             max_color_attachments: 8,
+            max_color_bytes_per_sample: if apple7 || mac { 128 } else { 64 },
+            max_fragment_input_components: if apple { 124 } else { 128 },
+            max_framebuffer_layers: 2048,
+            // The backend binds real MTLBuffers, not inlined constant data.
+            max_uniform_buffer_bytes: raw.maxBufferLength().min(u32::MAX as usize) as u32,
             max_viewports: if features.contains(Features::MULTIPLE_VIEWPORTS) {
                 16
             } else {
@@ -233,7 +238,7 @@ fn format_caps(
             caps
         }
         present::FORMAT => color | C::STORAGE | C::PRESENTABLE,
-        Format::A8Unorm => C::SAMPLED | C::FILTERED,
+
         Format::Rgb9e5Float if !apple => C::SAMPLED | C::FILTERED,
         Format::R32Uint | Format::R32Sint => C::SAMPLED | C::COLOR | C::STORAGE | C::STORAGE_READ,
         f if f.is_uint() || f.is_sint() => C::SAMPLED | C::COLOR | C::STORAGE,

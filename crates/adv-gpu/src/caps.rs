@@ -114,6 +114,10 @@ pub struct Limits {
     pub max_image_3d: u32,
     pub max_image_layers: u32,
     pub max_color_attachments: u32,
+    pub max_color_bytes_per_sample: u32,
+    pub max_fragment_input_components: u32,
+    pub max_framebuffer_layers: u32,
+    pub max_uniform_buffer_bytes: u32,
     pub max_viewports: u32,
     pub max_buffer_size: u64,
     /// Per stage, per binding kind. D3D11 needs 14 uniform buffers, 128 sampled
@@ -157,6 +161,24 @@ bitflags::bitflags! {
 }
 
 impl Caps {
+    /// Capability snapshot from device limits and format reports, suitable
+    /// for deriving front-end limits without opening a GPU device.
+    pub fn from_reported_formats(
+        limits: Limits,
+        features: Features,
+        formats: Vec<(Format, FormatCaps, u32)>,
+    ) -> Self {
+        Self {
+            features,
+            ieee_f32: false,
+            modern: Modern::empty(),
+            limits,
+            adapter: String::new(),
+            driver: String::new(),
+            formats,
+        }
+    }
+
     pub fn format(&self, format: Format) -> FormatCaps {
         self.formats
             .iter()

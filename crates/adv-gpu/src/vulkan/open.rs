@@ -706,6 +706,7 @@ impl Device {
                 depth_clamp: base.depth_clamp,
                 multi_viewport: base.multi_viewport,
                 depth_bias_clamp: base.depth_bias_clamp,
+                sample_rate_shading: base.sample_rate_shading,
                 fill_mode_non_solid: base.fill_mode_non_solid,
                 sampler_anisotropy: base.sampler_anisotropy,
                 texture_compression_bc: base.texture_compression_bc,
@@ -1003,9 +1004,6 @@ impl Device {
                     if f.is_bc() && base.texture_compression_bc == 0 {
                         caps = FormatCaps::empty();
                     }
-                    if f == Format::A8Unorm {
-                        caps &= FormatCaps::SAMPLED | FormatCaps::FILTERED;
-                    }
                     if f == Format::Bgra4Unorm && !plan.use_4444 {
                         caps = FormatCaps::empty();
                     }
@@ -1066,6 +1064,11 @@ impl Device {
                     max_image_3d: l.max_image_dimension3_d,
                     max_image_layers: l.max_image_array_layers,
                     max_color_attachments: l.max_color_attachments,
+                    // Vulkan has no separate limit on aggregate color bytes.
+                    max_color_bytes_per_sample: l.max_color_attachments * 16,
+                    max_fragment_input_components: l.max_fragment_input_components,
+                    max_framebuffer_layers: l.max_framebuffer_layers,
+                    max_uniform_buffer_bytes: l.max_uniform_buffer_range,
                     max_viewports: if base.multi_viewport != 0 {
                         l.max_viewports
                     } else {
