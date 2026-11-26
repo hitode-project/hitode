@@ -528,6 +528,13 @@ Every presenter's frames carry only that content, while the host shows caption, 
 **Rule**: Each input thread MUST register its event pipe as Wine's queue fd. Queuing host input MUST run the server and deliver wake-ups even when every guest context waits. Input waits MUST NOT use periodic polling.
 **Verification**: Test
 
+### WINE-IN-4 DirectInput action map device filtering
+
+**Rule**: `IDirectInputDevice8::SetActionMap` MUST assign each device object's application data only from actions mapped to that device without `DIA_APPNOMAP`. Actions mapped to another device or left unmapped MUST NOT overwrite matching object IDs on the target device.
+**Verification**: Test
+
+The pinned Wine source carries this through `tools/wine/patches`.
+
 ## Native UI and control
 
 ### WINE-UI-1 Native popup presentation

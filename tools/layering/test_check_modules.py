@@ -1,6 +1,6 @@
 import unittest
 
-from check_modules import violations
+from check_modules import dx_violations, violations
 
 
 class ModuleDependenciesTest(unittest.TestCase):
@@ -151,3 +151,18 @@ fn floating() {
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DirectXModuleDependenciesTest(unittest.TestCase):
+    def test_shared_modules_cannot_reference_fronts(self):
+        self.assertEqual(dx_violations({
+            "record.rs": "use crate::{d3d9::Device, shader::Program};",
+            "record/damage.rs": "type Key = super::super::ddraw::Key;",
+            "shader.rs": "type State = adv_dx::d3d11::State;",
+            "fixed.rs": "use crate::pacing::Clock;",
+            "d3d9/recording.rs": "use crate::record::Recording;",
+        }), [
+            "record.rs:1: record -> d3d9: disallowed",
+            "record/damage.rs:1: record -> ddraw: disallowed",
+            "shader.rs:1: shader -> d3d11: disallowed",
+        ])

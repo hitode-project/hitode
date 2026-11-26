@@ -4,27 +4,8 @@ use super::*;
 use adv_device::gpu::ImageId;
 use smallvec::SmallVec;
 
-#[derive(Default)]
-pub(super) struct Cache {
-    targets: HashMap<Id, Sequence>,
-    /// Targets whose retained entries were dropped unused. Their draws record
-    /// directly until `until`; then one frame retains entries for the next.
-    resting: HashMap<Id, Rest>,
-    /// Frames finished, which rests count.
-    frame: u64,
-    disabled: bool,
-}
-
-/// The first frame after a rest and its span, which doubles while retained
-/// entries keep going unused. The first waste rests for no frame, so one
-/// unavailable history alone keeps reuse.
-#[derive(Clone, Copy)]
-struct Rest {
-    until: u64,
-    span: u64,
-}
-
-const MAX_REST: u64 = 64;
+pub(super) use crate::record::reuse::Saved;
+pub(super) type Cache = crate::record::reuse::Cache<Id, Entry>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Mode {
@@ -44,15 +25,6 @@ struct Signature {
     reads: SmallVec<[(Option<u128>, bool); 4]>,
     independent: [bool; 3],
 }
-#[derive(Default)]
-struct Sequence {
-    previous: Vec<Arc<Entry>>,
-    next: Vec<Arc<Entry>>,
-    index: HashMap<u128, Vec<usize>>,
-    next_index: HashMap<u128, Vec<usize>>,
-    cursor: usize,
-    hits: u32,
-}
 pub(super) struct Entry {
     signature: Arc<Signature>,
     index_key: u128,
@@ -61,79 +33,10 @@ pub(super) struct Entry {
     spans: fixed::CapturedSpans,
     pub saved: std::sync::OnceLock<Saved>,
 }
-#[derive(Clone)]
-pub(super) struct Saved {
-    pub command: u128,
-    pub attachment: u128,
-    pub damage: Arc<damage::Saved>,
-    pub pass: passes::Effects,
-    pub destinations: Vec<Option<u128>>,
-    pub outputs: Vec<u128>,
-}
-impl Cache {
-    /// Drops all entries; this frame's draws record directly.
-    pub(super) fn invalidate(&mut self) {
-        for (target, s) in std::mem::take(&mut self.targets) {
-            if s.hits == 0 {
-                self.waste(target);
-            }
-        }
-        self.disabled = true;
-    }
-
-    fn waste(&mut self, target: Id) {
-        let frame = self.frame;
-        let rest = self.resting.entry(target).or_insert(Rest {
-            until: 0,
-            span: u64::MAX,
-        });
-        rest.span = match rest.span {
-            u64::MAX => 0,
-            0 => 1,
-            span => (span * 2).min(MAX_REST),
-        };
-        rest.until = frame + 1 + rest.span;
-    }
-    /// Whether a retained entry still draws into `image`'s allocation.
-    #[cfg(test)]
-    pub(super) fn retains(&self, image: &adv_device::gpu::Image) -> bool {
-        self.targets.values().any(|s| {
-            s.previous.iter().chain(&s.next).any(|e| {
-                matches!(&e.prepared.operation,
-                    Operation::Draw(d) if d.target.image.shares_storage(image))
-            })
-        })
-    }
-    pub(super) fn finish(&mut self) {
-        let wasted: Vec<_> = self
-            .targets
-            .iter()
-            .filter(|(_, s)| !s.previous.is_empty())
-            .map(|(&target, s)| (target, s.hits == 0))
-            .collect();
-        for (target, unused) in wasted {
-            if unused {
-                self.waste(target);
-            } else {
-                self.resting.remove(&target);
-            }
-        }
-        self.frame += 1;
-        let (frame, resting) = (self.frame, &self.resting);
-        self.targets.retain(|target, s| {
-            s.previous = std::mem::take(&mut s.next);
-            s.index = std::mem::take(&mut s.next_index);
-            s.cursor = 0;
-            s.hits = 0;
-            !s.previous.is_empty() && resting.get(target).is_none_or(|r| r.until <= frame)
-        });
-        self.disabled = false;
-    }
-
-    fn rests(&self, target: Id) -> bool {
-        self.resting
-            .get(&target)
-            .is_some_and(|r| r.until > self.frame)
+#[cfg(test)]
+impl Entry {
+    pub(super) fn draws_into(&self, image: &adv_device::gpu::Image) -> bool {
+        matches!(&self.prepared.operation, Operation::Draw(d) if d.target.image.shares_storage(image))
     }
 }
 fn signature(
@@ -150,7 +53,7 @@ fn signature(
     if !hot.scene
         || d.needs_reset
         || d.frame.reuse.disabled
-        || d.frame.partial
+        || d.frame.core.partial
         || d.frame.active.is_some()
     {
         return Err(INVALID);
@@ -196,11 +99,16 @@ fn signature(
         .iter()
         .flatten()
         .chain(&bindings.samples)
-        .map(|c| (d.frame.contents.get(c).copied(), d.frame.damage.written(c)))
+        .map(|c| {
+            (
+                d.frame.core.contents.get(c).copied(),
+                d.frame.core.damage.written(c),
+            )
+        })
         .collect();
     let independent = bindings
         .output
-        .map(|c| c.is_some_and(|c| d.frame.damage.independent(&c)));
+        .map(|c| c.is_some_and(|c| d.frame.core.damage.independent(&c)));
     let mut state = hot.fingerprints;
     state[13] = hot.shaders.vertex.map_or(0, |id| {
         constant_key(env, Some(id), &hot.shaders.vertex_constants)
@@ -313,7 +221,9 @@ fn draw(
     let owner = com(env).identity::<Payload>(&env.sys.objects, pointer);
     let fast_input = owner
         .filter(|_| {
-            rests || device(env, pointer).is_some_and(|d| d.frame.reuse.disabled || d.frame.partial)
+            rests
+                || device(env, pointer)
+                    .is_some_and(|d| d.frame.reuse.disabled || d.frame.core.partial)
         })
         .and_then(|owner| fast::input(env, pointer, owner, request, up));
     if let (Some(owner), Some(input)) = (owner, &fast_input)
@@ -359,100 +269,79 @@ fn draw(
     };
     let d = device(env, pointer).unwrap();
     let target_id = d.render_target.or(d.back_buffer).unwrap();
-    let sequence = d.frame.reuse.targets.get(&target_id);
-    let same_state = |e: &&Arc<Entry>| *e.signature == signature && *e.indices == *indices;
-    let same_bytes = |e: &&Arc<Entry>| unchanged(env, &e.spans, up);
-    let expected = sequence
-        .and_then(|s| s.previous.get(s.cursor))
-        .filter(same_state);
-    let index_key = expected.map_or_else(|| hash((&signature, indices)), |e| e.index_key);
-    let cached = expected
-        .filter(same_bytes)
-        .or_else(|| {
-            sequence.and_then(|s| {
-                s.index
-                    .get(&index_key)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|&n| s.previous.get(n))
-                    .chain(
-                        s.next_index
-                            .get(&index_key)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|&n| s.next.get(n)),
-                    )
-                    .find(|e| same_state(e) && same_bytes(e))
-            })
-        })
-        .cloned();
-    let expected = expected.is_some();
+    let (index_key, expected, mut candidates) = d.frame.reuse.candidates(
+        target_id,
+        |e| *e.signature == signature && *e.indices == *indices,
+        || hash((&signature, indices)),
+        |e| e.index_key,
+    );
+    let cached = candidates.find(|e| unchanged(env, &e.spans, up)).cloned();
+    drop(candidates);
     let origin = cached.clone();
-    let entry = if let Some(entry) = cached {
-        let same_destination = entry.saved.get().is_none_or(|saved| {
-            entry
-                .prepared
-                .writes
-                .iter()
-                .zip(&saved.destinations)
-                .all(|((content, _), old)| d.frame.contents.get(content).copied() == *old)
-        });
-        // Keep an occurrence's output versions alongside the shared geometry.
-        // The same command can occur twice with different destination inputs.
-        let mut prepared = entry.prepared.clone();
-        let rebase = matches!(&prepared.operation, Operation::Draw(draw)
+    let entry =
+        if let Some(entry) = cached {
+            let same_destination =
+                entry.saved.get().is_none_or(|saved| {
+                    entry.prepared.writes.iter().zip(&saved.destinations).all(
+                        |((content, _), old)| d.frame.core.contents.get(content).copied() == *old,
+                    )
+                });
+            // Keep an occurrence's output versions alongside the shared geometry.
+            // The same command can occur twice with different destination inputs.
+            let mut prepared = entry.prepared.clone();
+            let rebase = matches!(&prepared.operation, Operation::Draw(draw)
             if !draw.target.image.shares_storage(&target.image));
-        if rebase && let Operation::Draw(draw) = &mut Arc::make_mut(&mut prepared).operation {
-            draw.target = target.clone();
-        }
-        if rebase || !same_destination {
-            let saved = std::sync::OnceLock::new();
-            if same_destination && let Some(old) = entry.saved.get() {
-                let _ = saved.set(old.clone());
+            if rebase && let Operation::Draw(draw) = &mut Arc::make_mut(&mut prepared).operation {
+                draw.target = target.clone();
             }
-            Arc::new(Entry {
-                signature: entry.signature.clone(),
-                index_key: entry.index_key,
-                indices: entry.indices.clone(),
-                prepared,
-                spans: entry.spans.clone(),
-                saved,
-            })
+            if rebase || !same_destination {
+                let saved = std::sync::OnceLock::new();
+                if same_destination && let Some(old) = entry.saved.get() {
+                    let _ = saved.set(old.clone());
+                }
+                Arc::new(Entry {
+                    signature: entry.signature.clone(),
+                    index_key: entry.index_key,
+                    indices: entry.indices.clone(),
+                    prepared,
+                    spans: entry.spans.clone(),
+                    saved,
+                })
+            } else {
+                entry
+            }
         } else {
-            entry
-        }
-    } else {
-        *d.hot.borrow().fixed.captures.borrow_mut() = Some(Vec::new());
-        let draw = build(env);
-        let spans = device(env, pointer)
-            .unwrap()
-            .hot
-            .borrow()
-            .fixed
-            .captures
-            .borrow_mut()
-            .take()
-            .unwrap();
-        let draw = match draw {
-            Ok(draw) => draw,
-            Err(code) => return Outcome::Return(code),
+            *d.hot.borrow().fixed.captures.borrow_mut() = Some(Vec::new());
+            let draw = build(env);
+            let spans = device(env, pointer)
+                .unwrap()
+                .hot
+                .borrow()
+                .fixed
+                .captures
+                .borrow_mut()
+                .take()
+                .unwrap();
+            let draw = match draw {
+                Ok(draw) => draw,
+                Err(code) => return Outcome::Return(code),
+            };
+            let owner = com(env)
+                .identity::<Payload>(&env.sys.objects, pointer)
+                .unwrap();
+            let prepared = match key::prepare(env, owner, Operation::Draw(draw)) {
+                Ok(prepared) => prepared,
+                Err(code) => return Outcome::Return(code),
+            };
+            Arc::new(Entry {
+                signature: Arc::new(signature),
+                index_key,
+                indices: indices.into(),
+                prepared: Arc::new(prepared),
+                spans,
+                saved: Default::default(),
+            })
         };
-        let owner = com(env)
-            .identity::<Payload>(&env.sys.objects, pointer)
-            .unwrap();
-        let prepared = match key::prepare(env, owner, Operation::Draw(draw)) {
-            Ok(prepared) => prepared,
-            Err(code) => return Outcome::Return(code),
-        };
-        Arc::new(Entry {
-            signature: Arc::new(signature),
-            index_key,
-            indices: indices.into(),
-            prepared: Arc::new(prepared),
-            spans,
-            saved: Default::default(),
-        })
-    };
     let owner = com(env)
         .identity::<Payload>(&env.sys.objects, pointer)
         .unwrap();
@@ -462,30 +351,13 @@ fn draw(
     if up.is_some() {
         buffers::clear_up_bindings(env, pointer, false);
     }
-    let sequence = frame(env, owner)
-        .reuse
-        .targets
-        .entry(target_id)
-        .or_default();
-    sequence.hits += u32::from(origin.is_some());
-    if let Some(positions) = sequence.index.get(&index_key)
-        && let Some(&n) = positions.iter().find(|&&n| {
-            n >= sequence.cursor
-                && origin
-                    .as_ref()
-                    .is_some_and(|o| Arc::ptr_eq(&sequence.previous[n], o))
-        })
-    {
-        sequence.cursor = n + 1;
-    } else if expected {
-        sequence.cursor += 1;
-    }
-    sequence
-        .next_index
-        .entry(index_key)
-        .or_default()
-        .push(sequence.next.len());
-    sequence.next.push(entry.clone());
+    frame(env, owner).reuse.remember(
+        target_id,
+        index_key,
+        expected,
+        origin.as_ref(),
+        entry.clone(),
+    );
     if env.ext.get::<State>().gpu.is_none() {
         return Outcome::Return(UNAVAILABLE);
     }
