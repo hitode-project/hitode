@@ -4,7 +4,7 @@ pub(super) mod query;
 
 use super::{
     abi::limit,
-    caps::Report,
+    caps::{FeatureLevel, Report},
     desc::{PipelineState, Resource, Shader, TextureKind, View, ViewKind},
     state::ContextState,
 };
@@ -40,6 +40,7 @@ pub struct Object {
     device: u32,
     kind: Kind,
     private: BTreeMap<Iid, PrivateData>,
+    pub(super) d3d10_face: u32,
 }
 
 #[cfg(feature = "gpu")]
@@ -49,11 +50,25 @@ pub(super) struct Shared {
     pub resource: Resource,
     pub adapter: crate::dxgi::caps::Adapter,
     pub backing: super::resource::Backing,
+    pub keyed: std::sync::Mutex<Keyed>,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Default)]
+pub(super) struct Keyed {
+    pub owner: Option<u32>,
+    pub key: u64,
+    pub event: u32,
+    pub waiters: u32,
+    pub nt_created: bool,
+    pub abandoned: bool,
 }
 
 enum Kind {
     Device(Device),
-    ImmediateContext(Box<ContextState>),
+    Context(Box<Context>),
+    ContextState(ContextStateObject),
+    CommandList(Box<CommandList>),
     Shader(Box<Shader>),
     InputLayout(Box<super::desc::InputLayout>),
     Query(Box<query::Query>),
@@ -81,8 +96,30 @@ enum Kind {
     Pipeline(Box<PipelineState>),
 }
 
+#[derive(Default)]
+pub(super) struct Context {
+    pub state: Box<ContextState>,
+    pub deferred: Option<CommandList>,
+    pub active_state: u32,
+    pub level: Option<FeatureLevel>,
+    pub d3d10: bool,
+}
+
+pub(super) struct ContextStateObject {
+    pub state: Option<Box<ContextState>>,
+    pub level: FeatureLevel,
+    pub d3d10: bool,
+}
+
+#[derive(Default)]
+pub(super) struct CommandList {
+    pub flags: u32,
+    #[cfg(feature = "gpu")]
+    pub recording: super::glue::context::deferred::Recording,
+}
+
 pub(super) struct Device {
-    report: Arc<Report>,
+    pub(super) report: Arc<Report>,
     pub(crate) flags: u32,
     pub(crate) exception_mode: u32,
     pub(crate) immediate: u32,
@@ -92,6 +129,7 @@ pub(super) struct Device {
     pub(crate) latency: u32,
     pub(crate) thread_lock: u32,
     pub(crate) multithreaded: bool,
+    pub(super) text_filter: [u32; 2],
     states: [BTreeMap<Vec<u8>, u32>; 4],
 }
 
@@ -102,10 +140,12 @@ impl Kind {
         const VIEW: &[Iid] = &[IID_ID3D11DEVICECHILD, IID_ID3D11VIEW];
         match self {
             Self::Device(_) => (IID_ID3D11DEVICE1, &[IID_ID3D11DEVICE]),
-            Self::ImmediateContext(_) => (
+            Self::Context(_) => (
                 IID_ID3D11DEVICECONTEXT1,
                 &[IID_ID3D11DEVICECONTEXT, IID_ID3D11DEVICECHILD],
             ),
+            Self::ContextState(_) => (IID_ID3DDEVICECONTEXTSTATE, DEVICE_CHILD),
+            Self::CommandList(_) => (IID_ID3D11COMMANDLIST, DEVICE_CHILD),
             Self::Query(query) if query.predicate => (
                 IID_ID3D11PREDICATE,
                 &[
@@ -334,15 +374,45 @@ impl Object {
     }
 
     pub fn context(&self) -> Option<&ContextState> {
+        self.context_data().map(|context| context.state.as_ref())
+    }
+
+    pub(super) fn context_data(&self) -> Option<&Context> {
         match &self.kind {
-            Kind::ImmediateContext(state) => Some(state),
+            Kind::Context(context) => Some(context),
             _ => None,
         }
     }
 
     pub fn context_mut(&mut self) -> Option<&mut ContextState> {
+        self.context_data_mut()
+            .map(|context| context.state.as_mut())
+    }
+
+    pub(super) fn context_data_mut(&mut self) -> Option<&mut Context> {
         match &mut self.kind {
-            Kind::ImmediateContext(state) => Some(state),
+            Kind::Context(context) => Some(context),
+            _ => None,
+        }
+    }
+
+    pub(super) fn context_state(&mut self) -> Option<&mut ContextStateObject> {
+        match &mut self.kind {
+            Kind::ContextState(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    pub(super) fn command_list_mut(&mut self) -> Option<&mut CommandList> {
+        match &mut self.kind {
+            Kind::CommandList(list) => Some(list),
+            _ => None,
+        }
+    }
+
+    pub(super) fn command_list(&self) -> Option<&CommandList> {
+        match &self.kind {
+            Kind::CommandList(list) => Some(list),
             _ => None,
         }
     }
@@ -386,6 +456,8 @@ pub struct Release {
     pub private_interfaces: Vec<u32>,
     #[cfg(feature = "gpu")]
     pub(super) shared: Vec<u32>,
+    #[cfg(feature = "gpu")]
+    pub(super) keyed_wakes: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -429,6 +501,7 @@ impl Table {
                 latency: 3,
                 thread_lock: 0,
                 multithreaded: false,
+                text_filter: [0; 2],
                 states: Default::default(),
             }),
         )
@@ -444,8 +517,60 @@ impl Table {
             objects,
             pointer,
             device,
-            Kind::ImmediateContext(Box::default()),
+            Kind::Context(Box::new(Context {
+                level: Some(self.device(objects, device)?.report.level),
+                d3d10: self.get(objects, device).unwrap().d3d10_face != 0,
+                ..Default::default()
+            })),
         )
+    }
+
+    pub(super) fn attach_deferred(
+        self,
+        objects: &mut Objects,
+        pointer: u32,
+        device: u32,
+        flags: u32,
+    ) -> Result<(), Error> {
+        let context = Context {
+            deferred: Some(CommandList {
+                flags,
+                ..Default::default()
+            }),
+            level: Some(self.device(objects, device)?.report.level),
+            ..Default::default()
+        };
+        self.attach(objects, pointer, device, Kind::Context(Box::new(context)))
+    }
+
+    pub(super) fn attach_context_state(
+        self,
+        objects: &mut Objects,
+        pointer: u32,
+        device: u32,
+        level: FeatureLevel,
+        d3d10: bool,
+    ) -> Result<(), Error> {
+        self.attach(
+            objects,
+            pointer,
+            device,
+            Kind::ContextState(ContextStateObject {
+                state: Some(Box::default()),
+                level,
+                d3d10,
+            }),
+        )
+    }
+
+    pub(super) fn attach_command_list(
+        self,
+        objects: &mut Objects,
+        pointer: u32,
+        device: u32,
+        list: CommandList,
+    ) -> Result<(), Error> {
+        self.attach(objects, pointer, device, Kind::CommandList(Box::new(list)))
     }
 
     pub(super) fn attach_query(
@@ -484,6 +609,21 @@ impl Table {
         for &iid in interfaces {
             assert!(self.com.register_interface(objects, identity, iid, face));
         }
+    }
+
+    pub(super) fn register_separate_face(
+        self,
+        objects: &mut Objects,
+        pointer: u32,
+        face: u32,
+        interfaces: &[Iid],
+    ) {
+        let identity = self.com.identity::<Object>(objects, pointer).unwrap();
+        assert!(
+            self.com
+                .register_separate(objects, identity, interfaces[0], face)
+        );
+        self.register_faces(objects, pointer, face, &interfaces[1..]);
     }
 
     pub fn attach_shader(
@@ -623,6 +763,7 @@ impl Table {
             device,
             kind,
             private: BTreeMap::new(),
+            d3d10_face: 0,
         };
         let Some(identity) = self.com.create(objects, pointer, iid, object) else {
             if device != 0 {
@@ -729,13 +870,14 @@ impl Table {
             return 0;
         };
         let device = object.device;
+        let last = device != 0 && self.references(objects, pointer) == Some(1);
         let Some(released) = self.com.release::<Object>(objects, pointer) else {
             return 0;
         };
         if let Some(destroyed) = released.destroyed {
             self.destroy(objects, destroyed, result);
         }
-        if released.references == 0 && device != 0 {
+        if last {
             self.release_public(objects, device, result);
         }
         released.references
@@ -750,15 +892,27 @@ impl Table {
 
     fn destroy(self, objects: &mut Objects, destroyed: Destroyed<Object>, result: &mut Release) {
         #[cfg(feature = "gpu")]
-        if let Some(shared) = destroyed.value.shared()
-            && Arc::strong_count(shared) == 1
-        {
-            result.shared.push(shared.handle);
+        if let Some(shared) = destroyed.value.shared() {
+            if Arc::strong_count(shared) == 1 {
+                result.shared.push(shared.handle);
+            }
+            let mut keyed = shared.keyed.lock().unwrap();
+            if keyed
+                .owner
+                .is_some_and(|owner| destroyed.interfaces.contains(&owner))
+            {
+                keyed.owner = None;
+                keyed.abandoned = true;
+                if keyed.event != 0 {
+                    result.keyed_wakes.push(keyed.event);
+                }
+            }
         }
         let Object {
             device,
             kind,
             private,
+            ..
         } = destroyed.value;
         result.allocations.extend(destroyed.interfaces);
         result
@@ -794,16 +948,46 @@ impl Table {
                     self.release_internal(objects, owner.immediate, result);
                 }
             }
-            Kind::ImmediateContext(state) => {
-                state
+            Kind::Context(context) => {
+                context
+                    .state
                     .groups()
                     .for_each_binding(|pointer| self.release_internal(objects, pointer, result));
+                self.drop_binding(objects, context.active_state, result);
+                if let Some(list) = context.deferred {
+                    self.destroy_list(objects, list, result);
+                }
             }
+            Kind::ContextState(state) => {
+                if let Some(state) = state.state {
+                    state.groups().for_each_binding(|pointer| {
+                        self.release_internal(objects, pointer, result)
+                    });
+                }
+            }
+            Kind::CommandList(list) => self.destroy_list(objects, *list, result),
             Kind::Shader(_)
             | Kind::InputLayout(_)
             | Kind::Query(_)
             | Kind::Resource { mapping: None, .. } => (),
         }
+    }
+    pub(super) fn destroy_list(
+        self,
+        objects: &mut Objects,
+        list: CommandList,
+        result: &mut Release,
+    ) {
+        #[cfg(feature = "gpu")]
+        {
+            let mut recording = list.recording;
+            result.allocations.extend(recording.release_mappings());
+            for pointer in recording.references {
+                self.release_internal(objects, pointer, result);
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        let _ = (objects, list, result);
     }
 }
 

@@ -1,4 +1,4 @@
-//! Immediate-context state and guest array marshaling.
+//! Context state and guest array marshaling.
 use super::*;
 use crate::d3d11::{
     desc::Bind,
@@ -8,6 +8,9 @@ use crate::d3d11::{
     },
 };
 use std::ops::Range;
+
+pub(in crate::d3d11) mod deferred;
+use deferred::{execute_list, finish_list, get_context_flags, get_type, swap_state};
 
 macro_rules! methods {
     ($($method:ident => $handler:ident $level:ident),+ $(,)?) => {
@@ -76,7 +79,7 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     SetResourceMinLOD => set_min_lod State,
     GetResourceMinLOD => min_lod State,
     ResolveSubresource => resolve Implement,
-    ExecuteCommandList => excluded_command_list SafeFail,
+    ExecuteCommandList => execute_list Implement,
     HSSetShaderResources => hs_set_srvs State,
     HSSetShader => hs_set_shader State,
     HSSetSamplers => hs_set_samplers State,
@@ -132,7 +135,7 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     Flush => flush Implement,
     GetType => get_type State,
     GetContextFlags => get_context_flags State,
-    FinishCommandList => excluded_finish_list SafeFail,
+    FinishCommandList => finish_list Implement,
     CopySubresourceRegion1 => copy_region Implement,
     UpdateSubresource1 => update_resource Implement,
     DiscardResource => discard State,
@@ -149,7 +152,7 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     GSGetConstantBuffers1 => gs_get_constants1 State,
     PSGetConstantBuffers1 => ps_get_constants1 State,
     CSGetConstantBuffers1 => cs_get_constants1 State,
-    SwapDeviceContextState => excluded_context_state SafeFail,
+    SwapDeviceContextState => swap_state Implement,
     ClearView => clear_view Implement,
     DiscardView1 => discard State,
 );
@@ -237,30 +240,7 @@ fn draw_auto(_: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 
-fn excluded_command_list(env: &mut Env<'_>) -> Outcome {
-    adv_abi::stub::warn_unavailable(env, "ExecuteCommandList", "deferred contexts");
-    Outcome::Return(0)
-}
-
-fn excluded_context_state(env: &mut Env<'_>) -> Outcome {
-    adv_abi::stub::warn_unavailable(env, "SwapDeviceContextState", "device context state");
-    let output = env.arg(2);
-    call(optional(env, output, 0u32))
-}
-
-fn excluded_finish_list(env: &mut Env<'_>) -> Outcome {
-    adv_abi::stub::warn_unavailable(env, "FinishCommandList", "immediate context");
-    let output = env.arg(2);
-    call(optional(env, output, 0u32).and(Err(Error::InvalidArgument)))
-}
-
-fn get_type(_: &mut Env<'_>) -> Outcome {
-    Outcome::Return(0)
-}
-
-fn get_context_flags(_: &mut Env<'_>) -> Outcome {
-    Outcome::Return(0)
-}
+pub(super) use deferred::list_flags;
 
 fn state<'a>(env: &'a Env<'_>) -> Result<&'a ContextState, Error> {
     ops::object(env, table(env), env.arg(0))?
@@ -285,6 +265,17 @@ pub(super) fn owner(env: &Env<'_>) -> Result<u32, Error> {
         .ok_or(Error::InvalidArgument)
 }
 
+pub(super) fn report<'a>(env: &'a Env<'_>) -> Result<&'a crate::d3d11::caps::Report, Error> {
+    let level = ops::object(env, table(env), env.arg(0))?
+        .context_data()
+        .and_then(|context| context.level)
+        .ok_or(Error::InvalidArgument)?;
+    let reports = &env.ext.get::<State>().devices.reports;
+    reports[level.column()]
+        .as_deref()
+        .map_or_else(|| device::report(env, owner(env)?), Ok)
+}
+
 pub(super) fn owned<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a Object> {
     let object = table(env).get(&env.sys.objects, pointer)?;
     (object.device() == Some(owner(env).ok()?)).then_some(object)
@@ -293,7 +284,8 @@ pub(super) fn owned<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a Object> {
 fn object_pointer(env: &Env<'_>, pointer: u32, valid: impl FnOnce(&Object) -> bool) -> u32 {
     owned(env, pointer)
         .filter(|object| valid(object))
-        .map_or(0, |_| pointer)
+        .and_then(|_| table(env).canonical(&env.sys.objects, pointer))
+        .unwrap_or(0)
 }
 
 fn buffer_pointer(env: &Env<'_>, pointer: u32, bind: u32) -> u32 {
@@ -311,7 +303,11 @@ fn range(first: u32, count: u32, limit: usize) -> Result<Range<usize>, Error> {
     Ok(first as usize..end as usize)
 }
 
-fn output_array<T: Pod>(env: &mut Env<'_>, address: u32, values: &[T]) -> Result<(), Error> {
+pub(super) fn output_array<T: Pod>(
+    env: &mut Env<'_>,
+    address: u32,
+    values: &[T],
+) -> Result<(), Error> {
     if address != 0 {
         env.cpu
             .write(address, bytemuck::cast_slice(values))
@@ -320,7 +316,7 @@ fn output_array<T: Pod>(env: &mut Env<'_>, address: u32, values: &[T]) -> Result
     Ok(())
 }
 
-fn optional<T: Pod>(env: &mut Env<'_>, address: u32, value: T) -> Result<(), Error> {
+pub(super) fn optional<T: Pod>(env: &mut Env<'_>, address: u32, value: T) -> Result<(), Error> {
     if address != 0 {
         write(env, address, value)?;
     }
@@ -353,6 +349,10 @@ fn replace(
             if old != new {
                 if new != 0 {
                     table.retain_bound(&mut env.sys.objects, new)?;
+                    #[cfg(feature = "gpu")]
+                    if deferred::current(env).is_some() {
+                        deferred::retain_binding(env, new)?;
+                    }
                 }
                 table.drop_binding(&mut env.sys.objects, old, &mut released);
             }
@@ -365,19 +365,16 @@ fn replace(
 }
 
 fn clear(env: &mut Env<'_>) -> Outcome {
+    let mut released = Release::default();
+    released.references = clear_bindings(env, &mut released).map_or_else(Error::hresult, |()| 0);
+    retire(env, released)
+}
+
+fn clear_bindings(env: &mut Env<'_>, released: &mut Release) -> Result<(), Error> {
     let table = table(env);
-    let result = (|| {
-        let old = state_mut(env)?.clear();
-        let mut released = Release::default();
-        old.for_each_binding(|pointer| {
-            table.drop_binding(&mut env.sys.objects, pointer, &mut released)
-        });
-        Ok(released)
-    })();
-    match result {
-        Ok(released) => retire(env, released),
-        Err(error) => Outcome::Return(Error::hresult(error)),
-    }
+    let old = state_mut(env)?.clear();
+    old.for_each_binding(|pointer| table.drop_binding(&mut env.sys.objects, pointer, released));
+    Ok(())
 }
 
 fn ia_set_layout(env: &mut Env<'_>) -> Outcome {
@@ -629,6 +626,7 @@ fn get_samplers(env: &mut Env<'_>, stage: Stage) -> Outcome {
 
 fn as_view(env: &Env<'_>, pointer: u32) -> Option<BoundView> {
     let (resource, desc) = owned(env, pointer)?.view()?;
+    let pointer = table(env).canonical(&env.sys.objects, pointer)?;
     Some(BoundView {
         pointer,
         resource,
@@ -706,7 +704,7 @@ fn get_srvs(env: &mut Env<'_>, stage: Stage) -> Outcome {
 fn cs_set_uavs(env: &mut Env<'_>) -> Outcome {
     let (first, count, input) = (env.arg(1), env.arg(2), env.arg(3));
     let result = (|| {
-        let length = device::report(env, owner(env)?)?
+        let length = report(env)?
             .level
             .limit(crate::d3d11::caps::Requirement::ComputeUavSlots) as usize;
         let slots = range(first, count, UAVS)?;
@@ -986,7 +984,16 @@ fn map_resource(env: &mut Env<'_>) -> Outcome {
         if owned(env, pointer).is_none() {
             return Err(Error::InvalidArgument);
         }
-        let mapped = map_subresource(env, pointer, subresource, mode, flags)?;
+        let mapped = if deferred::current(env).is_some() {
+            #[cfg(feature = "gpu")]
+            {
+                deferred::map_resource(env, pointer, subresource, mode, flags)?
+            }
+            #[cfg(not(feature = "gpu"))]
+            return Err(Error::InvalidArgument);
+        } else {
+            map_subresource(env, pointer, subresource, mode, flags)?
+        };
         write(env, out, mapped)
     })())
 }
@@ -1039,9 +1046,15 @@ pub(super) fn map_subresource(
     Ok(mapped)
 }
 
-fn unmap_resource(_: &mut Env<'_>) -> Outcome {
-    // Map granted CPU ownership of the shadow. A draw captures dynamic
-    // ranges, and staging uploads happen when a GPU operation reads them.
+fn unmap_resource(env: &mut Env<'_>) -> Outcome {
+    #[cfg(feature = "gpu")]
+    if deferred::current(env).is_some() {
+        let (resource, subresource) = (env.arg(1), env.arg(2));
+        return call(deferred::unmap_resource(env, resource, subresource));
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = env;
+    // Immediate draws capture dynamic ranges as they admit each draw.
     Outcome::Return(0)
 }
 
@@ -1049,7 +1062,11 @@ macro_rules! gpu_methods {
     ($($name:ident),+ $(,)?) => {$(
         fn $name(env: &mut Env<'_>) -> Outcome {
             #[cfg(feature = "gpu")]
-            return call(gpu::$name(env));
+            return call(if deferred::current(env).is_some() {
+                deferred::record(env, stringify!($name))
+            } else {
+                gpu::$name(env)
+            });
             #[cfg(not(feature = "gpu"))]
             let _ = env;
             #[cfg(not(feature = "gpu"))]
@@ -1085,6 +1102,9 @@ gpu_methods!(
 gpu_methods!(begin_query, end_query);
 
 fn get_data(env: &mut Env<'_>) -> Outcome {
+    if deferred::current(env).is_some() {
+        return Outcome::Return(Error::InvalidArgument.hresult());
+    }
     #[cfg(feature = "gpu")]
     return status(gpu::get_data(env));
     #[cfg(not(feature = "gpu"))]
@@ -1095,6 +1115,10 @@ fn get_data(env: &mut Env<'_>) -> Outcome {
 }
 
 fn set_min_lod(env: &mut Env<'_>) -> Outcome {
+    #[cfg(feature = "gpu")]
+    if deferred::current(env).is_some() {
+        return call(deferred::record(env, "set_min_lod"));
+    }
     let (resource, lod) = (env.arg(1), f32::from_bits(env.arg(2)));
     call((|| {
         use crate::d3d11::desc::Misc;
@@ -1130,6 +1154,9 @@ fn reset_counters(
     #[cfg(feature = "gpu")]
     {
         let pointers: smallvec::SmallVec<[_; UAVS]> = pointers.collect();
+        if initial != 0 && deferred::current(env).is_some() {
+            return deferred::record_counters(env, &pointers, initial);
+        }
         gpu::reset_counters(env, &pointers, initial)
     }
     #[cfg(not(feature = "gpu"))]

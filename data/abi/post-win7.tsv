@@ -36,6 +36,15 @@ crypt32.dll	CryptGetAsyncParam	Windows 10 Build 20348	https://learn.microsoft.co
 crypt32.dll	CryptSetAsyncParam	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-cryptsetasyncparam
 dbghelp.dll	SymAddSourceStreamA	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/dbghelp/nf-dbghelp-symaddsourcestreama
 dbghelp.dll	SymMatchStringA	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/dbghelp/nf-dbghelp-symmatchstringa
+d3d11.dll	CreateDirect3D11DeviceFromDXGIDevice	Windows 10	https://learn.microsoft.com/en-us/windows/win32/api/windows.graphics.directx.direct3d11.interop/nf-windows-graphics-directx-direct3d11-interop-createdirect3d11devicefromdxgidevice
+d3d11.dll	CreateDirect3D11SurfaceFromDXGISurface	Windows 10	https://learn.microsoft.com/en-us/windows/win32/api/windows.graphics.directx.direct3d11.interop/nf-windows-graphics-directx-direct3d11-interop-createdirect3d11surfacefromdxgisurface
+d3d11.dll	D3D11CreateDeviceForD3D12	Windows 10	https://winexports.info/dlls/d3d11_dll/
+d3d11.dll	D3D11On12CreateDevice	Windows 10	https://learn.microsoft.com/en-us/windows/win32/api/d3d11on12/nf-d3d11on12-d3d11on12createdevice
+d3d11.dll	D3DPerformance_BeginEvent	After Windows 7	https://winexports.info/dlls/d3d11_dll/
+d3d11.dll	D3DPerformance_EndEvent	After Windows 7	https://winexports.info/dlls/d3d11_dll/
+d3d11.dll	D3DPerformance_GetStatus	After Windows 7	https://winexports.info/dlls/d3d11_dll/
+d3d11.dll	D3DPerformance_SetMarker	After Windows 7	https://winexports.info/dlls/d3d11_dll/
+d3d11.dll	EnableFeatureLevelUpgrade	After Windows 7	https://winexports.info/dlls/d3d11_dll/
 dxgi.dll	CreateDXGIFactory2	Windows 8.1	https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-createdxgifactory2
 imm32.dll	ImmDisableLegacyIME	Windows 8.0	windows8.0
 iphlpapi.dll	CaptureInterfaceHardwareCrossTimestamp	Windows 11 (Build 10.0.22000.194)	https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-captureinterfacehardwarecrosstimestamp

@@ -22,6 +22,7 @@ macro_rules! vtable {
     };
 }
 
+mod exports;
 mod swap_chain;
 
 const FACTORY: &[Slot] = vtable!("IDXGIFactory7",
@@ -114,6 +115,7 @@ const OUTPUT: &[Slot] = vtable!("IDXGIOutput6",
 );
 
 pub fn register(registry: &mut Registry) {
+    exports::register(registry);
     registry.register(create_factory_ABI);
     registry.register(create_factory1_ABI);
     for slots in [FACTORY, ADAPTER, OUTPUT, swap_chain::SLOTS] {
@@ -778,15 +780,27 @@ device_glue!(
         structure::<DXGI_SWAP_CHAIN_DESC1>(env, 2)
     }
 );
-device_glue!(
-    shared_resource_luid,
-    GetSharedResourceAdapterLuid,
-    2,
-    |env: &mut Env<'_>| {
-        device_required(env, 1)?;
-        result_pointer::<LUID>(env, 2)
+fn shared_resource_luid(env: &mut Env<'_>) -> Outcome {
+    let (this, handle, out) = (env.arg(0), env.arg(1), env.arg(2));
+    if let Err(error) = device_required(env, 1).and_then(|()| result_pointer::<LUID>(env, 2)) {
+        return Outcome::Return(error.hresult());
     }
-);
+    let Some(services) = env.ext.try_get::<super::swap::Services>() else {
+        return ops::device(
+            env,
+            DeviceCall {
+                operation: DeviceOperation::GetSharedResourceAdapterLuid,
+                this,
+                arguments: [handle, out, 0, 0, 0, 0],
+            },
+        );
+    };
+    call(|| {
+        let adapter = services.buffers.shared_adapter(env, handle)?;
+        let info = &env.ext.get::<State>().provider.adapter;
+        write(env, out, adapter.description(info).AdapterLuid)
+    })
+}
 device_glue!(take_ownership, TakeOwnership, 2, |env: &mut Env<'_>| {
     device_required(env, 1)
 });

@@ -399,11 +399,8 @@ fn capture_texture(
         unreachable!()
     };
     let destination = resource::region(image, texture, 0);
-    let source = resource::texture_transfer(&execution.gpu, texture, &destination, &bytes)?;
-    execution.gpu.transfer(ModernTransfer::Upload {
-        source,
-        destination,
-    })?;
+    let upload = resource::texture_transfer(&execution.gpu, texture, destination, &bytes)?;
+    execution.gpu.transfer(upload)?;
     Ok(backing)
 }
 

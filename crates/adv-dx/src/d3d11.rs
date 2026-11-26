@@ -2,6 +2,7 @@
 mod abi;
 pub mod caps;
 pub mod desc;
+mod exports;
 mod glue;
 pub mod object;
 mod ops;
