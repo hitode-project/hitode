@@ -12,6 +12,7 @@
 mod cache;
 pub mod interpreter;
 mod parser;
+pub mod tessellator;
 #[cfg(test)]
 mod tests;
 mod translate;
