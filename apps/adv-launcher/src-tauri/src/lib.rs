@@ -129,6 +129,8 @@ pub fn run() {
         #[cfg(target_os = "android")]
         android::setup(app.handle().clone());
         let data_dir = app.path().app_data_dir()?;
+        #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
+        drive::apply_pending_reset(app.handle());
         gamepad::init(app.handle().clone(), &data_dir);
         app.manage(std::sync::Mutex::new(library::Library::load(data_dir)?));
         #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
@@ -210,6 +212,10 @@ pub fn run() {
                 drive::reveal_drive,
                 drive::import_registry,
                 drive::library_installed,
+                drive::wine_environment_status,
+                drive::clean_wine_environment,
+                drive::cancel_wine_reset,
+                drive::restart_launcher,
                 redist::install_runtime_component,
                 redist::import_runtime_component,
                 library::reveal_path,
@@ -317,6 +323,9 @@ pub fn run() {
         drive::reveal_drive,
         drive::import_registry,
         drive::library_installed,
+        drive::wine_environment_status,
+        drive::clean_wine_environment,
+        drive::cancel_wine_reset,
         redist::install_runtime_component,
         redist::import_runtime_component,
         library::reveal_path,
@@ -387,6 +396,9 @@ pub fn run() {
         drive::reveal_drive,
         drive::import_registry,
         drive::library_installed,
+        drive::wine_environment_status,
+        drive::clean_wine_environment,
+        drive::cancel_wine_reset,
         redist::install_runtime_component,
         redist::import_runtime_component,
         library::reveal_path,
