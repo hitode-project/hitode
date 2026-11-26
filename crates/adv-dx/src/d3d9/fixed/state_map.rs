@@ -1,9 +1,6 @@
 //! D3D9 selectors, defaults and refusals for shared fixed-function state.
 use super::*;
-use crate::fixed::StateMap;
-use crate::fixed::{
-    LightKind, LightValue, Material, Registers, Render, Sampler, Stage, State, Transform, Viewport,
-};
+use crate::fixed::{LightKind, LightValue, Material, Render, Sampler, Stage, Transform, Viewport};
 use adv_device::surface::Rect;
 
 pub(in crate::d3d9) const RULES: core_fixed::Rules = core_fixed::Rules {
@@ -15,150 +12,7 @@ pub(in crate::d3d9) const RULES: core_fixed::Rules = core_fixed::Rules {
 };
 
 pub(in crate::d3d9) fn defaults(width: u32, height: u32) -> Fixed {
-    let sampler = BTreeMap::from([
-        (1, 1),
-        (2, 1),
-        (3, 1),
-        (4, 0),
-        (5, 1),
-        (6, 1),
-        (7, 0),
-        (8, 0),
-        (9, 0),
-        (10, 1),
-        (11, 0),
-        (12, 0),
-        (13, 0),
-    ]);
-    State::new(
-        Registers {
-            render: StateMap::from(BTreeMap::from([
-                (7, 0),
-                (8, 3), // FILLMODE: only solid rasterization is implemented.
-                (9, 2), // SHADEMODE: GOURAUD.
-                (14, 1),
-                (15, 0),
-                (16, 1), // LASTPIXEL: consumed by the shared line rasterizer.
-                (19, 2),
-                (20, 1),
-                (22, 3),
-                (23, 4),
-                (24, 0),
-                (25, 8),
-                (27, 0),
-                (28, 0),
-                (34, 0),
-                (35, 0),
-                (36, 0f32.to_bits()),
-                (37, 1f32.to_bits()),
-                (38, 1f32.to_bits()),
-                (140, 0),
-                (48, 0),        // RANGEFOGENABLE.
-                (60, u32::MAX), // TEXTUREFACTOR.
-                (142, 1),       // LOCALVIEWER.
-                (143, 0),       // NORMALIZENORMALS.
-                (157, 0),
-                (158, 1f32.to_bits()),
-                (159, 0),
-                (160, 0),
-                (162, u32::MAX),
-                (165, 0),
-                (170, 0),
-                (172, 3),
-                (173, 1),
-                (175, 0),
-                (176, 0),
-                (193, u32::MAX),
-                (194, 0),
-                (195, 0),
-                (154, 1f32.to_bits()),
-                (155, 1f32.to_bits()),
-                (156, 0),
-                (166, 64f32.to_bits()),
-                (29, 0), // SPECULARENABLE.
-                (26, 0), // DITHERENABLE: the renderer does not dither.
-                (52, 0),
-                (53, 1),
-                (54, 1),
-                (55, 1),
-                (56, 8),
-                (57, 0),
-                (58, u32::MAX),
-                (59, u32::MAX),
-                (128, 0), // WRAP0–WRAP7: texture coordinate wrapping is disabled.
-                (129, 0),
-                (130, 0),
-                (131, 0),
-                (132, 0),
-                (133, 0),
-                (134, 0),
-                (135, 0),
-                (136, 1), // CLIPPING: GPU primitive clipping remains enabled.
-                (137, 1),
-                (139, 0), // AMBIENT.
-                (141, 1), // COLORVERTEX: only relevant when lighting is enabled.
-                (145, 1), // Material sources: COLOR1, COLOR2, MATERIAL, MATERIAL.
-                (146, 2),
-                (147, 0),
-                (148, 0),
-                (151, 0), // VERTEXBLEND: one world matrix without blending.
-                (152, 0), // CLIPPLANEENABLE: no user clipping planes.
-                (161, 1), // Inert on the supported single-sample render targets.
-                (167, 0), // INDEXEDVERTEXBLENDENABLE: no matrix indices.
-                (168, 15),
-                (190, 15),
-                (191, 15),
-                (192, 15),
-                (198, 0),
-                (199, 0),
-                (200, 0),
-                (201, 0),
-                (202, 0),
-                (203, 0),
-                (204, 0),
-                (205, 0),
-                (171, 1),
-                (174, 0),
-                (185, 0),
-                (186, 1),
-                (187, 1),
-                (188, 1),
-                (189, 8),
-                (206, 0),
-                (207, 2),
-                (208, 1),
-                (209, 1),
-            ])),
-            stage_slots: std::array::from_fn(|stage| {
-                let mut states =
-                    BTreeMap::from([(7, 0), (8, 0), (9, 0), (10, 0), (22, 0), (23, 0)]);
-                if stage != 0 {
-                    states.extend([(1, 1), (2, 2), (3, 1), (4, 1), (5, 2), (6, 1)]);
-                    // TEXCOORDINDEX defaults to the stage's own coordinate set.
-                    states.insert(11, stage as u32);
-                }
-                states.into()
-            }),
-            stage: StateMap::from(BTreeMap::from([
-                (1, 4),
-                (2, 2),
-                (3, 1),
-                (4, 2),
-                (5, 2),
-                (6, 1),
-                (11, 0), // TEXCOORDINDEX: pass through the first FVF coordinate set.
-                (24, 0), // TEXTURETRANSFORMFLAGS: no texture coordinate transform.
-            ])),
-            sampler: sampler.clone().into(),
-            sampler_slots: std::array::from_fn(|_| sampler.clone().into()),
-        },
-        width,
-        height,
-        material([
-            1., 1., 1., 1., 1., 1., 1., 1., 0., 0., 0., 0., 0., 0., 0., 0., 0.,
-        ]),
-        default_light(),
-    )
+    core_fixed::defaults(width, height)
 }
 
 pub(super) fn render(state: i32, value: u32) -> Result<Setting, u32> {
@@ -220,7 +74,7 @@ pub(super) fn render(state: i32, value: u32) -> Result<Setting, u32> {
     if !valid {
         return Err(INVALID);
     }
-    Ok(Setting::Render(render_slot(state), value))
+    Ok(Setting::Render(Render::from_raw(state).unwrap(), value))
 }
 
 pub(super) fn stage(stage: u32, kind: i32, value: u32) -> Result<Setting, u32> {
@@ -230,7 +84,7 @@ pub(super) fn stage(stage: u32, kind: i32, value: u32) -> Result<Setting, u32> {
     if matches!(kind, 7..=10 | 22 | 23) {
         return Ok(Setting::StageRegister(
             stage as usize,
-            stage_slot(kind),
+            Stage::from_raw(kind).unwrap(),
             value,
         ));
     }
@@ -257,7 +111,7 @@ pub(super) fn stage(stage: u32, kind: i32, value: u32) -> Result<Setting, u32> {
         }
         return Ok(Setting::StageRegister(
             stage as usize,
-            stage_slot(kind),
+            Stage::from_raw(kind).unwrap(),
             value,
         ));
     }
@@ -295,7 +149,7 @@ pub(super) fn stage(stage: u32, kind: i32, value: u32) -> Result<Setting, u32> {
     if !valid {
         return Err(INVALID);
     }
-    Ok(Setting::Stage(stage_slot(kind), value))
+    Ok(Setting::Stage(Stage::from_raw(kind).unwrap(), value))
 }
 
 pub(super) fn sampler(sampler: u32, kind: i32, value: u32) -> Result<Setting, u32> {
@@ -317,7 +171,7 @@ pub(super) fn sampler(sampler: u32, kind: i32, value: u32) -> Result<Setting, u3
     if !valid {
         return Err(INVALID);
     }
-    let kind = sampler_kind(kind);
+    let kind = Sampler::from_raw(kind).unwrap();
     Ok(if slot == 0 {
         Setting::Sampler(kind, value)
     } else {
@@ -460,27 +314,14 @@ pub(in crate::d3d9) fn transform_slot(kind: i32) -> Option<Transform> {
     })
 }
 
-pub(super) fn material(words: [f32; 17]) -> Material {
-    Material {
-        colors: std::array::from_fn(|i| words[i * 4..][..4].try_into().unwrap()),
-        power: words[16],
-    }
-}
+#[cfg(test)]
+pub(super) use core_fixed::defaults::default_light;
+pub(super) use core_fixed::material;
 
 pub(super) fn material_words(material: Material) -> [f32; 17] {
     let mut words = [material.power; 17];
     words[..16].copy_from_slice(material.colors.as_flattened());
     words
-}
-
-pub(super) fn default_light() -> LightValue {
-    let mut components = [0; 25];
-    components[..3].fill(1f32.to_bits());
-    components[17] = 1f32.to_bits();
-    LightValue {
-        kind: LightKind::Directional,
-        components,
-    }
 }
 
 pub(super) fn light(words: [u32; 26]) -> Result<LightValue, u32> {
@@ -551,144 +392,4 @@ fn valid_fvf(fvf: u32) -> bool {
         && !(fvf & 0x0e == 4 && fvf & 0x10 != 0)
         && count <= 8
         && (count == 8 || sizes >> (count * 2) == 0)
-}
-
-fn render_slot(kind: i32) -> Render {
-    match kind {
-        7 => Render::DepthEnable,
-        8 => Render::FillMode,
-        9 => Render::ShadeMode,
-        14 => Render::DepthWrite,
-        15 => Render::AlphaTest,
-        16 => Render::LastPixel,
-        19 => Render::SourceBlend,
-        20 => Render::DestinationBlend,
-        22 => Render::CullMode,
-        23 => Render::DepthCompare,
-        24 => Render::AlphaReference,
-        25 => Render::AlphaCompare,
-        26 => Render::DitherEnable,
-        27 => Render::BlendEnable,
-        28 => Render::FogEnable,
-        29 => Render::SpecularEnable,
-        34 => Render::FogColor,
-        35 => Render::TableFog,
-        36 => Render::FogStart,
-        37 => Render::FogEnd,
-        38 => Render::FogDensity,
-        48 => Render::RangeFog,
-        52 => Render::StencilEnable,
-        53 => Render::StencilFail,
-        54 => Render::StencilDepthFail,
-        55 => Render::StencilPass,
-        56 => Render::StencilCompare,
-        57 => Render::StencilReference,
-        58 => Render::StencilReadMask,
-        59 => Render::StencilWriteMask,
-        60 => Render::TextureFactor,
-        128 => Render::Wrap0,
-        129 => Render::Wrap1,
-        130 => Render::Wrap2,
-        131 => Render::Wrap3,
-        132 => Render::Wrap4,
-        133 => Render::Wrap5,
-        134 => Render::Wrap6,
-        135 => Render::Wrap7,
-        136 => Render::Clipping,
-        137 => Render::Lighting,
-        139 => Render::Ambient,
-        140 => Render::VertexFog,
-        141 => Render::ColorVertex,
-        142 => Render::LocalViewer,
-        143 => Render::NormalizeNormals,
-        145 => Render::DiffuseSource,
-        146 => Render::SpecularSource,
-        147 => Render::AmbientSource,
-        148 => Render::EmissiveSource,
-        151 => Render::VertexBlend,
-        152 => Render::ClipPlaneEnable,
-        154 => Render::PointSize,
-        155 => Render::PointSizeMin,
-        156 => Render::PointSprite,
-        157 => Render::PointScale,
-        158 => Render::PointScaleA,
-        159 => Render::PointScaleB,
-        160 => Render::PointScaleC,
-        161 => Render::MultisampleAntialias,
-        162 => Render::MultisampleMask,
-        165 => Render::DebugMonitorToken,
-        166 => Render::PointSizeMax,
-        167 => Render::IndexedVertexBlend,
-        168 => Render::ColorWrite,
-        170 => Render::TweenFactor,
-        171 => Render::BlendOperation,
-        172 => Render::PositionDegree,
-        173 => Render::NormalDegree,
-        174 => Render::ScissorEnable,
-        175 => Render::SlopeDepthBias,
-        176 => Render::AntialiasedLine,
-        185 => Render::TwoSidedStencil,
-        186 => Render::BackStencilFail,
-        187 => Render::BackStencilDepthFail,
-        188 => Render::BackStencilPass,
-        189 => Render::BackStencilCompare,
-        190 => Render::ColorWrite1,
-        191 => Render::ColorWrite2,
-        192 => Render::ColorWrite3,
-        193 => Render::BlendFactor,
-        194 => Render::SrgbWrite,
-        195 => Render::DepthBias,
-        198 => Render::Wrap8,
-        199 => Render::Wrap9,
-        200 => Render::Wrap10,
-        201 => Render::Wrap11,
-        202 => Render::Wrap12,
-        203 => Render::Wrap13,
-        204 => Render::Wrap14,
-        205 => Render::Wrap15,
-        206 => Render::SeparateAlphaBlend,
-        207 => Render::SourceBlendAlpha,
-        208 => Render::DestinationBlendAlpha,
-        209 => Render::BlendOperationAlpha,
-        _ => unreachable!(),
-    }
-}
-
-fn stage_slot(kind: i32) -> Stage {
-    match kind {
-        1 => Stage::ColorOp,
-        2 => Stage::ColorArg1,
-        3 => Stage::ColorArg2,
-        4 => Stage::AlphaOp,
-        5 => Stage::AlphaArg1,
-        6 => Stage::AlphaArg2,
-        7 => Stage::Bump00,
-        8 => Stage::Bump01,
-        9 => Stage::Bump10,
-        10 => Stage::Bump11,
-        11 => Stage::CoordinateIndex,
-        22 => Stage::BumpScale,
-        23 => Stage::BumpOffset,
-        24 => Stage::TransformFlags,
-        _ => unreachable!(),
-    }
-}
-
-fn sampler_kind(kind: i32) -> Sampler {
-    match kind {
-        1 => Sampler::AddressU,
-        2 => Sampler::AddressV,
-        3 => Sampler::AddressW,
-        4 => Sampler::BorderColor,
-        5 => Sampler::MagFilter,
-        6 => Sampler::MinFilter,
-        7 => Sampler::MipFilter,
-        8 => Sampler::MipLodBias,
-        9 => Sampler::MaxMipLevel,
-        10 => Sampler::MaxAnisotropy,
-        11 => Sampler::SrgbTexture,
-        12 => Sampler::ElementIndex,
-        13 => Sampler::DisplacementOffset,
-        _ => unreachable!(),
-    }
 }

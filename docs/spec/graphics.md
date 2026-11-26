@@ -109,6 +109,19 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 **Verification**: Test
 **Basis**: Wine ddraw `ddraw1`–`ddraw7` tests, which pass on Windows.
 
+## DirectDraw 3D
+
+### GFX-D3D7-1 Interface identity and reachability
+
+**Rule**: DirectDrawCreate MUST supply three distinct Direct3D 1–3 faces and DirectDrawCreateEx MUST supply Direct3D7, sharing the owning DirectDraw count. Surface-owned textures and Device1 faces MUST share the surface count, and created devices and child objects MUST follow their measured face and attachment ownership rules. The production DirectDraw registry MUST refuse the Direct3D IIDs until the complete front is installed.
+**Verification**: Test
+**Basis**: Windows Direct3D legacy and Direct3D7 semantics probes
+
+### GFX-D3D7-3 Fixed-function state
+
+**Rule**: Device7 MUST translate its API state into the shared fixed-function registers and return its API values from getters. A state block MUST capture and apply only its member slots, including recorded changes to stage samplers and texture matrices.
+**Verification**: Test
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws

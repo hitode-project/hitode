@@ -4,6 +4,7 @@ use adv_device::surface::Rect;
 use std::{cell::Cell, collections::BTreeMap};
 
 mod block;
+pub(crate) mod defaults;
 mod lower;
 mod registers;
 pub(crate) mod slots;
@@ -11,6 +12,7 @@ pub(crate) mod tnl;
 mod vertex;
 
 pub(crate) use block::{Block, Members};
+pub(crate) use defaults::{defaults, material};
 pub(crate) use lower::{
     Layout, LowerError, Lowered, Rules, STAGE_ARGUMENTS, compact_stage_ops, features, lower,
     second_stage,
@@ -107,6 +109,17 @@ pub(crate) enum Transform {
     World,
     View,
     Projection,
+    World1,
+    World2,
+    World3,
+    Texture0,
+    Texture1,
+    Texture2,
+    Texture3,
+    Texture4,
+    Texture5,
+    Texture6,
+    Texture7,
 }
 
 #[derive(Clone)]
@@ -121,6 +134,7 @@ pub(crate) struct State {
     pub(crate) viewport: Viewport,
     pub(crate) scissor: Rect,
     pub(crate) transforms: [[f32; 16]; 3],
+    extra_transforms: Option<Box<[[f32; 16]; 11]>>,
     pub(crate) clip_planes: [[f32; 4]; 6],
     pub(crate) material: Material,
     default_light: LightValue,
@@ -196,9 +210,6 @@ impl State {
         material: Material,
         default_light: LightValue,
     ) -> Self {
-        let identity = [
-            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-        ];
         let Registers {
             render,
             stage,
@@ -226,7 +237,8 @@ impl State {
                 max_depth: 1.,
             },
             scissor: rect,
-            transforms: [identity; 3],
+            transforms: [IDENTITY; 3],
+            extra_transforms: None,
             clip_planes: [[0.; 4]; 6],
             material,
             default_light,
@@ -264,6 +276,7 @@ impl State {
             viewport,
             scissor,
             transforms,
+            extra_transforms: _,
             clip_planes,
             material,
             default_light: _,
@@ -294,7 +307,7 @@ impl State {
             clip_planes.map(|m| m.map(f32::to_bits)),
             material.key(),
             lights,
-        ))
+        )) ^ self.extra_transform_key()
     }
 
     pub(crate) fn class_key(&self, class: usize) -> u128 {
@@ -309,7 +322,7 @@ impl State {
                 (self.scissor.x + self.scissor.w) as i32,
                 (self.scissor.y + self.scissor.h) as i32,
             )),
-            5 => hash(self.transforms.map(|v| v.map(f32::to_bits))),
+            5 => hash(self.transforms.map(|v| v.map(f32::to_bits))) ^ self.extra_transform_key(),
             6 => hash(self.clip_planes.map(|v| v.map(f32::to_bits))),
             _ => unreachable!(),
         }
@@ -345,18 +358,18 @@ impl State {
             Setting::Scissor(value) => (Slot::Scissor, replace(&mut self.scissor, value)),
             Setting::Transform(n, value) => (
                 Slot::Transform(n),
-                replace_floats(&mut self.transforms[n as usize], value),
+                replace_floats(self.transform_mut(n as usize), value),
             ),
             Setting::MultiplyTransform(n, matrix) => {
                 let value = std::array::from_fn(|i| {
                     tnl::row(
                         matrix[i / 4 * 4..i / 4 * 4 + 4].try_into().unwrap(),
-                        &self.transforms[n as usize],
+                        self.transform(n as usize),
                     )[i % 4]
                 });
                 (
                     Slot::Transform(n),
-                    replace_floats(&mut self.transforms[n as usize], value),
+                    replace_floats(self.transform_mut(n as usize), value),
                 )
             }
             Setting::ClipPlane(n, value) => (
@@ -389,6 +402,31 @@ impl State {
             value: self.default_light,
             enabled: false,
         })
+    }
+
+    pub(crate) fn transform(&self, slot: usize) -> &[f32; 16] {
+        match slot {
+            0..=2 => &self.transforms[slot],
+            _ => self
+                .extra_transforms
+                .as_ref()
+                .map_or(&IDENTITY, |m| &m[slot - 3]),
+        }
+    }
+
+    fn transform_mut(&mut self, slot: usize) -> &mut [f32; 16] {
+        match slot {
+            0..=2 => &mut self.transforms[slot],
+            _ => &mut self
+                .extra_transforms
+                .get_or_insert_with(|| Box::new([IDENTITY; 11]))[slot - 3],
+        }
+    }
+
+    fn extra_transform_key(&self) -> u128 {
+        self.extra_transforms
+            .as_ref()
+            .map_or(0, |m| hash(m.map(|v| v.map(f32::to_bits))))
     }
 
     pub(crate) fn viewport_rect(&self) -> Rect {
@@ -447,3 +485,7 @@ fn replace_bits<T: Copy, B: PartialEq>(old: &mut T, value: T, bits: impl Fn(T) -
 fn replace_floats<const N: usize>(old: &mut [f32; N], value: [f32; N]) -> bool {
     replace_bits(old, value, |v| v.map(f32::to_bits))
 }
+
+const IDENTITY: [f32; 16] = [
+    1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+];

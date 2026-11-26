@@ -217,6 +217,10 @@ pub struct DirectDraw {
     submitted: Option<u32>,
     com: Option<CommonCom>,
     pending_guest: Vec<ComIdentity<ComState>>,
+    #[cfg(feature = "gpu")]
+    d3d: Option<d3d::State>,
+    #[cfg(feature = "gpu")]
+    d3d_surface_devices: BTreeMap<u32, d3d::object::Device>,
     /// Non-owning index; all payload and reference ownership lives in Objects.
     surface_objects: BTreeMap<u32, ComIdentity<ComState>>,
     /// Non-owning index from device_id to live device identity for GetDDInterface.
@@ -276,6 +280,10 @@ impl DirectDraw {
             submitted: None,
             com: None,
             pending_guest: Vec::new(),
+            #[cfg(feature = "gpu")]
+            d3d: None,
+            #[cfg(feature = "gpu")]
+            d3d_surface_devices: BTreeMap::new(),
             surface_objects: BTreeMap::new(),
             device_objects: BTreeMap::new(),
             surface_dcs: BTreeMap::new(),
@@ -391,12 +399,13 @@ impl DirectDraw {
         let mut parent = root;
         for (w, h, member) in levels {
             let sid = surfaces.create(w, h, false, format, m)?;
+            self.described.insert(sid, member);
             let Some(p) = self.com_version(objects, surfaces, Kind::Surface(sid), version, m)?
             else {
+                self.described.remove(&sid);
                 surfaces.delete(sid);
                 return Ok(false);
             };
-            self.described.insert(sid, member);
             self.surface_owners.insert(sid, owner);
             self.members.insert(sid, (root, p));
             self.complex.entry(parent).or_default().push(sid);
@@ -527,6 +536,8 @@ struct ComState {
     cooperative: bool,
     old: u32,
     modern: u32,
+    #[cfg(feature = "gpu")]
+    d3d_device_faces: [u32; 2],
     /// Each interface version's pointer, oldest first.
     versions: Vec<(u8, u32)>,
 }
@@ -781,6 +792,8 @@ impl DirectDraw {
             cooperative: false,
             old,
             modern,
+            #[cfg(feature = "gpu")]
+            d3d_device_faces: [0; 2],
             versions: layouts.iter().map(|&(v, _, p)| (v, p)).collect(),
         };
         let Some(identity) = com.create(objects, canonical, initial_iid, value) else {
@@ -799,6 +812,24 @@ impl DirectDraw {
                 surfaces.release(p, 16);
             }
             return Ok(None);
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(state) = &self.d3d {
+            let caps = match kind {
+                Kind::Surface(sid) => self.caps(sid)[0],
+                Kind::Device | Kind::Clipper => 0,
+            };
+            match d3d::attach_faces(state, com, objects, identity, surfaces, m, caps) {
+                Ok(true) => (),
+                result => {
+                    com.release_identity(objects, identity);
+                    for pointer in pointers {
+                        surfaces.release(pointer, 16);
+                    }
+                    result?;
+                    return Ok(None);
+                }
+            }
         }
         match kind {
             Kind::Device => {
@@ -894,6 +925,16 @@ impl DirectDraw {
             return 0;
         };
         if let Some(destroyed) = released.destroyed {
+            #[cfg(feature = "gpu")]
+            if self.d3d.is_some() && matches!(destroyed.value.kind, Kind::Surface(_)) {
+                d3d::release_surface(
+                    self,
+                    objects,
+                    surfaces,
+                    destroyed.value.d3d_device_faces,
+                    &destroyed.interfaces,
+                );
+            }
             for pointer in destroyed.interfaces {
                 surfaces.release(pointer, 16);
                 self.clipper_windows.remove(&pointer);
@@ -1175,6 +1216,16 @@ impl DirectDraw {
             api::QUERY => {
                 m.arg_put_u32(a[2], 0)?;
                 let iid: [u8; 16] = m.arg_read(a[1], 16)?.as_ref().try_into().unwrap();
+                #[cfg(feature = "gpu")]
+                if self.d3d.is_some() {
+                    return match d3d::query(self, objects, a[0], iid) {
+                        Ok(pointer) => {
+                            m.arg_put_u32(a[2], pointer)?;
+                            Ok(0)
+                        }
+                        Err(hr) => Ok(hr),
+                    };
+                }
                 match com.query::<ComState>(objects, a[0], iid) {
                     Ok(pointer) => {
                         m.arg_put_u32(a[2], pointer)?;
@@ -1535,9 +1586,11 @@ impl DirectDraw {
                 };
                 // Like Windows, the kept descriptor has no client address.
                 d.flags &= !DDSD_LPSURFACE;
+                self.described.insert(sid, d);
                 let Some(p) =
                     self.com_version(objects, surfaces, Kind::Surface(sid), surface_version, m)?
                 else {
+                    self.described.remove(&sid);
                     if surfaces.primary_id() != Some(sid) {
                         surfaces.delete(sid);
                     }
@@ -1548,7 +1601,6 @@ impl DirectDraw {
                         self.color_keys.insert((sid, key), d.keys[i]);
                     }
                 }
-                self.described.insert(sid, d);
                 self.surface_owners.insert(sid, owner_device_id);
                 // Surfaces from DirectDraw4 and 7 keep their creator alive.
                 if version >= 4 {
