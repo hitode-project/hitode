@@ -426,13 +426,13 @@ fn windows_fill_and_sampling_rows_through_guest_vtables() {
         .cpu
         .write(DESCRIPTOR, bytemuck::cast_slice(&elements))
         .unwrap();
-    let layout = create_object(
+    let instance_layout = create_object(
         &mut machine,
         device,
         11,
         &[DESCRIPTOR, 2, CODE_BYTES, vs_bytes.len() as u32],
     );
-    assert_eq!(method(&mut machine, context, 17, &[layout]), 0);
+    assert_eq!(method(&mut machine, context, 17, &[instance_layout]), 0);
     let uv = buffer(&mut machine, device, Bind::VERTEX, 32);
     update_dynamic(
         &mut machine,
@@ -508,6 +508,124 @@ fn windows_fill_and_sampling_rows_through_guest_vtables() {
         );
         assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
     }
+
+    assert_eq!(method(&mut machine, context, 17, &[layout]), 0);
+    let srv = create_object(&mut machine, device, 7, &[white, 0]);
+    write_value(&mut machine, ARRAY + 24, srv);
+    assert_eq!(method(&mut machine, context, 8, &[0, 1, ARRAY + 24]), 0);
+    update_dynamic(
+        &mut machine,
+        context,
+        ps_constant,
+        &[0.0f32, 0., 0., 0., 1., 1., 1., 1.],
+    );
+    write_value(
+        &mut machine,
+        DESCRIPTOR,
+        D3D11_RASTERIZER_DESC {
+            FillMode: 3,
+            CullMode: 1,
+            DepthClipEnable: 1,
+            ScissorEnable: 1,
+            ..Default::default()
+        },
+    );
+    let raster_scissor = create_object(&mut machine, device, 22, &[DESCRIPTOR]);
+
+    for (name, [x, y, w, h], scissor) in [
+        ("viewport-0.5-0.5-8x8", [0.5, 0.5, 8., 8.], false),
+        ("viewport-2.25-2.75-4x4", [2.25, 2.75, 4., 4.], false),
+        ("viewport-1-1-4.5x4.5", [1., 1., 4.5, 4.5], false),
+        ("viewport-full-scissor-1-2-5-4", [0., 0., 32., 32.], true),
+    ] {
+        write_value(
+            &mut machine,
+            DESCRIPTOR,
+            D3D11_VIEWPORT {
+                TopLeftX: x,
+                TopLeftY: y,
+                Width: w,
+                Height: h,
+                MaxDepth: 1.,
+                ..Default::default()
+            },
+        );
+        assert_eq!(method(&mut machine, context, 44, &[1, DESCRIPTOR]), 0);
+        write_value(&mut machine, DESCRIPTOR, [1i32, 2, 5, 4]);
+        assert_eq!(method(&mut machine, context, 45, &[1, DESCRIPTOR]), 0);
+        assert_eq!(
+            method(
+                &mut machine,
+                context,
+                43,
+                &[if scissor { raster_scissor } else { raster }]
+            ),
+            0
+        );
+        update_dynamic(
+            &mut machine,
+            context,
+            vs_constant,
+            &[2.0 / w, -2.0 / h, 1., 1., -1., 1., 0., 0.],
+        );
+        update_dynamic(
+            &mut machine,
+            context,
+            vb,
+            &[p(0., 0.), p(w, 0.), p(0., h), p(0., h), p(w, 0.), p(w, h)],
+        );
+        write_value(&mut machine, DESCRIPTOR, [0.0f32; 4]);
+        assert_eq!(method(&mut machine, context, 50, &[rtv, DESCRIPTOR]), 0);
+        assert_eq!(method(&mut machine, context, 13, &[6, 0]), 0);
+        assert_eq!(method(&mut machine, context, 47, &[staging, target]), 0);
+        assert_rows(&mut machine, context, staging, name, 0);
+    }
+
+    assert_eq!(method(&mut machine, context, 43, &[raster]), 0);
+    let mut blend = D3D11_BLEND_DESC::default();
+    blend.RenderTarget[0] = adv_abi::types::D3D11_RENDER_TARGET_BLEND_DESC {
+        BlendEnable: 1,
+        SrcBlend: 2,
+        DestBlend: 2,
+        BlendOp: 1,
+        SrcBlendAlpha: 2,
+        DestBlendAlpha: 2,
+        BlendOpAlpha: 1,
+        RenderTargetWriteMask: 0xf,
+        ..Default::default()
+    };
+    write_value(&mut machine, DESCRIPTOR, blend);
+    let additive = create_object(&mut machine, device, 20, &[DESCRIPTOR]);
+    assert_eq!(
+        method(&mut machine, context, 35, &[additive, 0, u32::MAX]),
+        0
+    );
+    assert_eq!(method(&mut machine, context, 24, &[4]), 0);
+    update_dynamic(
+        &mut machine,
+        context,
+        ps_constant,
+        &[0.0f32, 0., 0., 0., 0.25, 0.25, 0.25, 0.25],
+    );
+    write_value(&mut machine, DESCRIPTOR, [0.0f32; 4]);
+    assert_eq!(method(&mut machine, context, 50, &[rtv, DESCRIPTOR]), 0);
+    for [l, t, r, b] in [[0., 0., 8., 8.], [2.3, 1.7, 6.1, 6.6]] {
+        update_dynamic(
+            &mut machine,
+            context,
+            vb,
+            &[p(l, t), p(r, t), p(l, b), p(l, b), p(r, t), p(r, b)],
+        );
+        assert_eq!(method(&mut machine, context, 13, &[6, 0]), 0);
+    }
+    assert_eq!(method(&mut machine, context, 47, &[staging, target]), 0);
+    assert_rows(
+        &mut machine,
+        context,
+        staging,
+        "shared-edges-additive-quarter",
+        0,
+    );
 }
 
 fn assert_rows(

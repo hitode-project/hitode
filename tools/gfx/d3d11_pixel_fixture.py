@@ -13,7 +13,9 @@ def fixture(capture: str) -> str:
     rows = []
     for line in capture.splitlines():
         match line.split("\t"):
-            case ["px", "hw", name, y, *pixels] if name.startswith(("quad-", "tex-")):
+            case ["px", "hw", name, y, *pixels] if name.startswith(
+                ("quad-", "tex-", "viewport-", "shared-edges-")
+            ):
                 rows.append("\t".join((name, y, *pixels)) + "\n")
     return "".join(rows)
 
