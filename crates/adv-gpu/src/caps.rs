@@ -17,7 +17,7 @@ pub struct Caps {
     pub adapter: String,
     pub driver: String,
     /// Filled by the backend at open; read through [`Caps::format`].
-    pub(crate) formats: Vec<(Format, FormatCaps)>,
+    pub(crate) formats: Vec<(Format, FormatCaps, u32)>,
 }
 
 bitflags::bitflags! {
@@ -42,7 +42,7 @@ bitflags::bitflags! {
         const OCCLUSION_QUERIES = 1 << 7;
         /// Pipeline caches that persist across launches.
         const PIPELINE_CACHE = 1 << 8;
-        /// BC1–BC3 sampling in hardware. Without it, front ends decode on upload.
+        /// BC1–BC7 sampling in hardware. Without it, front ends decode on upload.
         const BC_TEXTURES = 1 << 9;
         /// Indirect draws and dispatches.
         const INDIRECT = 1 << 10;
@@ -57,6 +57,12 @@ bitflags::bitflags! {
         const TILE_SHADERS = 1 << 14;
         /// Sampling decoder output with an external YCbCr format.
         const YCBCR_SAMPLING = 1 << 15;
+        const DUAL_SOURCE_BLEND = 1 << 16;
+        const MULTIPLE_VIEWPORTS = 1 << 17;
+        const DEPTH_CLAMP = 1 << 18;
+        const STANDARD_SAMPLE_LOCATIONS = 1 << 19;
+        /// R32 integer image atomics.
+        const IMAGE_ATOMICS = 1 << 20;
         // Reserved for D3D10/11 front ends. No backend sets these yet; Metal has
         // no geometry stage, so a front end emulates it with compute plus
         // indirect draws instead of waiting for this bit.
@@ -108,6 +114,8 @@ pub struct Limits {
     pub max_image_3d: u32,
     pub max_image_layers: u32,
     pub max_color_attachments: u32,
+    pub max_viewports: u32,
+    pub max_buffer_size: u64,
     /// Per stage, per binding kind. D3D11 needs 14 uniform buffers, 128 sampled
     /// images, 16 samplers and 8 (11.1: 64) storage bindings.
     pub max_uniform_buffers: u32,
@@ -137,6 +145,8 @@ bitflags::bitflags! {
         const BLEND = 1 << 3;
         const DEPTH_STENCIL = 1 << 4;
         const STORAGE = 1 << 5;
+        /// Typed loads from a storage image.
+        const STORAGE_READ = 1 << 9;
         const PRESENTABLE = 1 << 6;
         /// Presentable buffers of this format are losslessly compressed, so
         /// rendering into them costs what a private image costs.
@@ -150,7 +160,15 @@ impl Caps {
     pub fn format(&self, format: Format) -> FormatCaps {
         self.formats
             .iter()
-            .find(|(f, _)| *f == format)
-            .map_or(FormatCaps::empty(), |&(_, caps)| caps)
+            .find(|(f, ..)| *f == format)
+            .map_or(FormatCaps::empty(), |&(_, caps, _)| caps)
+    }
+
+    /// Attachment sample counts as a bitmask. Zero when the format is not renderable.
+    pub fn format_sample_counts(&self, format: Format) -> u32 {
+        self.formats
+            .iter()
+            .find(|(f, ..)| *f == format)
+            .map_or(0, |&(_, _, samples)| samples)
     }
 }
