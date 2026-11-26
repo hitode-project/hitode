@@ -584,11 +584,19 @@ impl<'a> Emitter<'a> {
                     |(register, lane)| format!("list[0][{register}][{lane}]"),
                 )
             };
+            let viewport = read_index(SystemValue::ViewportArrayIndex);
+            let layer = read_index(SystemValue::RenderTargetArrayIndex);
+            let layers = raster
+                .bins
+                .iter()
+                .map(|variant| u32::from(variant.bin().first_layer) + 1)
+                .max()
+                .unwrap_or(1);
             writeln!(
                 source,
-                "let viewport = {}; let layer = {};",
-                read_index(SystemValue::ViewportArrayIndex),
-                read_index(SystemValue::RenderTargetArrayIndex)
+                "let raw_viewport = {viewport}; let raw_layer = {layer};
+                 let viewport = select(0u, raw_viewport, raw_viewport < 16u);
+                 let layer = select(0u, raw_layer, raw_layer < {layers}u);"
             )
             .unwrap();
             for (index, variant) in raster.bins.iter().enumerate() {

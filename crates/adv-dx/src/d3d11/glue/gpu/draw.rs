@@ -3,13 +3,13 @@ use super::*;
 use crate::{
     d3d11::{
         desc::{Aspects, Bind, InputRate, Misc},
-        state::{STREAMS, Snapshot, Stage, ViewSlot},
+        state::{RENDER_TARGETS, STREAMS, Snapshot, Stage, VIEWPORTS, ViewSlot},
     },
     shader::{
         analysis::Reflection,
         expand,
         ir::{BindingKind, Register, ResourceDimension, SamplerMode, SystemValue},
-        variant::{DrawFacts, Variant},
+        variant::{Bin, DrawFacts, Variant},
         wgsl::{
             self, BindingLocation, BorderChannel, BorderSampler, BorderTexture, LodSampler,
             Options, TextureLod, Translation,
@@ -1254,7 +1254,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     let mut colors = Vec::new();
     let mut color_slots = 0;
     let mut writes = Vec::new();
-    for slot in 0..super::super::super::state::RENDER_TARGETS {
+    for slot in 0..RENDER_TARGETS {
         let Some(bound) = snapshot.view(ViewSlot::rtv(slot).unwrap()) else {
             continue;
         };
@@ -1277,13 +1277,31 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             ))
         })
         .transpose()?;
-    let vp = snapshot.rs.viewports[0];
-    let raster_stream = raster_stream.filter(|_| {
-        snapshot.rs.viewport_count != 0
-            && vp.Width > 0.
-            && vp.Height > 0.
-            && (pixel != 0 || depth.is_some())
-    });
+    let (viewport_index, layer_index) = raster_stream
+        .and_then(|stream| {
+            let shader = bound_shader(env, &snapshot, Stage::Geometry)?;
+            (shader.module().stage == crate::shader::ir::Stage::Geometry).then(|| {
+                let writes_index =
+                    |system_value| {
+                        shader.reflection().signatures.output.iter().any(|entry| {
+                            entry.stream == stream && entry.system_value == system_value
+                        })
+                    };
+                (
+                    writes_index(SystemValue::ViewportArrayIndex),
+                    writes_index(SystemValue::RenderTargetArrayIndex),
+                )
+            })
+        })
+        .unwrap_or_default();
+    let raster_stream = raster_stream
+        .filter(|_| snapshot.rs.viewport_count != 0 && (pixel != 0 || depth.is_some()));
+    let viewport_count = if viewport_index {
+        snapshot.rs.viewport_count
+    } else {
+        snapshot.rs.viewport_count.min(1)
+    };
+    let viewports = &snapshot.rs.viewports[..viewport_count];
     let (extent, samples) = if raster_stream.is_none() {
         (extent_rect([1, 1, 1]), 1)
     } else {
@@ -1293,41 +1311,77 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             .or_else(|| depth.as_ref().map(|depth| &depth.view))
         {
             Some(attachment) => (view_rect(attachment), attachment.image().desc().samples),
-            None => (
-                extent_rect([
-                    (vp.TopLeftX + vp.Width).ceil() as u32,
-                    (vp.TopLeftY + vp.Height).ceil() as u32,
-                    1,
-                ]),
-                1,
-            ),
+            None => {
+                let extent = viewports.iter().fold(Rect::default(), |area, vp| {
+                    area.union(extent_rect([
+                        (vp.TopLeftX + vp.Width).ceil() as u32,
+                        (vp.TopLeftY + vp.Height).ceil() as u32,
+                        1,
+                    ]))
+                });
+                (extent, 1)
+            }
         }
     };
-    let mut scissor = extent;
-    if raster_stream.is_some() && raster.ScissorEnable != 0 {
-        let raw = snapshot.rs.scissors[0];
-        scissor = Rect {
-            x: raw.left.max(0) as u32,
-            y: raw.top.max(0) as u32,
-            w: raw.right.saturating_sub(raw.left.max(0)).max(0) as u32,
-            h: raw.bottom.saturating_sub(raw.top.max(0)).max(0) as u32,
-        }
-        .clipped(extent);
+    let mut layer_count = 1;
+    if layer_index {
+        layer_count = (0..RENDER_TARGETS)
+            .filter_map(|slot| snapshot.view(ViewSlot::rtv(slot).unwrap()))
+            .chain(snapshot.view(ViewSlot::DSV))
+            .map(|bound| bound.desc.subresources().layers.len())
+            .min()
+            .unwrap_or(1);
     }
-    let raster_stream = raster_stream.filter(|_| !scissor.empty());
+    let mut raster_bins = Vec::new();
+    let mut scissor = Rect::default();
+    if raster_stream.is_some() {
+        for (index, vp) in viewports.iter().enumerate() {
+            let bounds = if raster.ScissorEnable == 0 {
+                extent
+            } else if index < snapshot.rs.scissor_count {
+                let raw = snapshot.rs.scissors[index];
+                Rect {
+                    x: raw.left.max(0) as u32,
+                    y: raw.top.max(0) as u32,
+                    w: raw.right.saturating_sub(raw.left.max(0)).max(0) as u32,
+                    h: raw.bottom.saturating_sub(raw.top.max(0)).max(0) as u32,
+                }
+                .clipped(extent)
+            } else {
+                Rect::default()
+            };
+            if vp.Width <= 0. || vp.Height <= 0. || bounds.empty() {
+                continue;
+            }
+            scissor = scissor.union(bounds);
+            let viewport = [
+                vp.TopLeftX,
+                vp.TopLeftY,
+                vp.Width,
+                vp.Height,
+                vp.MinDepth,
+                vp.MaxDepth,
+            ];
+            for layer in 0..layer_count {
+                raster_bins.push((
+                    Bin {
+                        viewport: index as u16,
+                        first_layer: layer as u16,
+                        layers: 1,
+                    },
+                    viewport,
+                    bounds,
+                ));
+            }
+        }
+    }
+    let raster_stream = raster_stream.filter(|_| !raster_bins.is_empty());
     if raster_stream.is_none() {
         if so_declarations.is_empty() && counted_streams == 0 {
             return Ok(());
         }
         writes.clear();
         scissor = extent;
-    }
-    if !indexed
-        && (geometry != 0 || tessellation.is_some())
-        && snapshot.ia.vertices.iter().all(|vertex| vertex.buffer == 0)
-        && let DrawRange::Indirect(arguments, _, None) = &args
-    {
-        args = read_indirect_draw(env, arguments)?;
     }
     let mut stream_targets = Vec::new();
     let mut stream_output = Vec::new();
@@ -1469,6 +1523,8 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             tessellated: tessellation.is_some(),
             stream_output: !stream_output.is_empty() || counted_streams != 0,
             rasterization_disabled: raster_stream.is_none(),
+            viewport_count: if viewport_index { VIEWPORTS as u32 } else { 1 },
+            layer_count: layer_count as u32,
             ..Default::default()
         };
         let variant = Variant::select(reflection, &facts, caps);
@@ -1501,7 +1557,12 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                             let stride = if *format == IndexFormat::U32 { 4 } else { 2 };
                             (buffer.range.end - buffer.range.start) as u32 / stride
                         });
-                        indirect_bounds(env, &snapshot, &fetches, index_extent)?
+                        let Some(limits) = indirect_bounds(env, &snapshot, &fetches, index_extent)?
+                        else {
+                            let direct = read_indirect_draw(env, arguments, indexed)?;
+                            return render(env, indexed, direct);
+                        };
+                        limits
                     };
                     (
                         0,
@@ -1602,10 +1663,13 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                     assembly,
                 }
             };
-            let bins = [geometry_options
-                .as_ref()
-                .or(domain_options.as_ref())
-                .map_or(&variant, |(variant, _, _)| variant)];
+            let variants: Vec<_> = raster_bins
+                .iter()
+                .map(|(bin, _, _)| {
+                    Variant::select(producer, &DrawFacts { bin: *bin, ..facts }, caps)
+                })
+                .collect();
+            let bins: Vec<_> = variants.iter().collect();
             let programs = expand::Plan {
                 source,
                 topology: input_topology,
@@ -1688,9 +1752,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 &programs.source
             };
             (
-                raster_stream
-                    .map(|_| programs.vertex_shader(0))
-                    .transpose()?,
+                None,
                 (
                     &vertex_reflection,
                     vertex_source.bindings.as_slice(),
@@ -1820,7 +1882,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         buffer: index.buffer.clone(),
         range: 0..index.buffer.desc().size,
     });
-    let draw = vertex_shader.map(|vertex| ModernDraw {
+    let make_draw = |vertex, viewport, bounds: Rect, occlusion| ModernDraw {
         state_ids: [
             layout,
             snapshot.rs.state,
@@ -1829,10 +1891,10 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         ]
         .map(u64::from),
         vertex,
-        fragment: pixel_shader,
-        colors: colors.into_iter().collect(),
+        fragment: pixel_shader.clone(),
+        colors: colors.iter().cloned().collect(),
         color_slots: Some(color_slots),
-        depth,
+        depth: depth.clone(),
         samples,
         alpha_to_coverage,
         primitive: p::Primitive {
@@ -1848,15 +1910,8 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             unclipped_depth: raster.DepthClipEnable == 0,
         },
         area: extent.into(),
-        viewport: [
-            vp.TopLeftX,
-            vp.TopLeftY,
-            vp.Width,
-            vp.Height,
-            vp.MinDepth,
-            vp.MaxDepth,
-        ],
-        scissor: scissor.into(),
+        viewport,
+        scissor: bounds.into(),
         stencil_reference: snapshot.om.stencil_reference,
         blend_constant: snapshot.om.blend_factor,
         depth_bias: [
@@ -1865,51 +1920,76 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             raster.DepthBiasClamp,
         ],
         arguments: args.arguments(),
-        index,
+        index: index.clone(),
         occlusion,
-        predicate,
-    });
-    let execution = execution(env.ext)?;
+        predicate: predicate.clone(),
+    };
     let command = if let Some((programs, primitives)) = expansion {
-        Command::Expand(Box::new(
-            programs.command(
-                &execution.gpu,
-                expand::Inputs {
-                    primitives,
-                    vertices: None,
-                    indices,
-                    vertex: vertex_bindings,
-                    geometry: geometry_bindings,
-                    hull: hull_bindings,
-                    domain: domain_bindings,
-                    indirect: match args {
-                        DrawRange::Indirect(arguments, ..) => Some(BufferRange {
-                            range: 0..arguments.buffer.desc().size,
-                            buffer: arguments.buffer,
-                        }),
-                        _ => None,
-                    },
-                    statistics: None,
-                    stream_output: stream_targets,
-                    stream_statistics,
+        let mut bins = Vec::new();
+        for (i, (bin, viewport, bounds)) in raster_bins.into_iter().enumerate() {
+            let (occlusion, statistics) = if i == 0 {
+                (occlusion.clone(), statistics.clone())
+            } else {
+                queries::draw_slots(env, 0, 0)?
+            };
+            let mut draw = make_draw(programs.vertex_shader(i)?, viewport, bounds, occlusion);
+            if layer_count > 1 {
+                let layer = u32::from(bin.first_layer);
+                for (slot, color) in (0..RENDER_TARGETS)
+                    .filter_map(|slot| snapshot.view(ViewSlot::rtv(slot).unwrap()))
+                    .zip(&mut draw.colors)
+                {
+                    color.view = attachment_layer(&color.view, &slot.desc, layer)?;
+                }
+                if let Some(depth) = &mut draw.depth {
+                    let slot = snapshot.view(ViewSlot::DSV).unwrap();
+                    depth.view = attachment_layer(&depth.view, &slot.desc, layer)?;
+                }
+            }
+            bins.push(expand::BinDraw {
+                draw,
+                fragment: fragment_bindings.clone(),
+                statistics,
+            });
+        }
+        let execution = execution(env.ext)?;
+        Command::Expand(Box::new(programs.command(
+            &execution.gpu,
+            expand::Inputs {
+                primitives,
+                vertices: None,
+                indices,
+                vertex: vertex_bindings,
+                geometry: geometry_bindings,
+                hull: hull_bindings,
+                domain: domain_bindings,
+                indirect: match args {
+                    DrawRange::Indirect(arguments, ..) => Some(BufferRange {
+                        range: 0..arguments.buffer.desc().size,
+                        buffer: arguments.buffer,
+                    }),
+                    _ => None,
                 },
-                draw.map(|draw| expand::BinDraw {
-                    draw,
-                    fragment: fragment_bindings.clone(),
-                    statistics: statistics.clone(),
-                })
-                .into_iter()
-                .collect(),
-            )?,
-        ))
+                statistics: None,
+                stream_output: stream_targets,
+                stream_statistics,
+            },
+            bins,
+        )?))
     } else {
         Command::Draw {
-            draw: Box::new(draw.unwrap()),
+            draw: Box::new(make_draw(
+                vertex_shader.unwrap(),
+                raster_bins[0].1,
+                raster_bins[0].2,
+                occlusion,
+            )),
             vertex: vertex_bindings,
             fragment: fragment_bindings,
             statistics,
         }
     };
+    let execution = execution(env.ext)?;
     execution.recording.append(
         &mut execution.gpu,
         command,
@@ -1925,11 +2005,28 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     Ok(())
 }
 
-fn read_indirect_draw(env: &mut Env<'_>, arguments: &BufferRange) -> Result<DrawRange, Error> {
+fn attachment_layer(view: &ImageView, desc: &View, layer: u32) -> Result<ImageView, Error> {
+    let image = view.image();
+    let range = desc.subresources();
+    let layer = range.layers.start + layer;
+    Ok(image.create_view(&r::ViewDesc {
+        format: (view.format() != image.desc().format).then_some(view.format()),
+        dimension: (image.desc().dimension == r::Dimension::Cube).then_some(r::Dimension::D2),
+        mips: range.mips.clone(),
+        layers: layer..layer + 1,
+        plane: 0,
+    })?)
+}
+
+fn read_indirect_draw(
+    env: &mut Env<'_>,
+    arguments: &BufferRange,
+    indexed: bool,
+) -> Result<DrawRange, Error> {
     let exec = execution(env.ext)?;
     exec.barrier(Boundary::Map)?;
     let buffer = exec.gpu.device().create_buffer(&BufferDesc {
-        size: 16,
+        size: arguments.range.end - arguments.range.start,
         memory: Memory::Readback,
         usage: BufferUsage::COPY_DST,
         label: "indirect draw argument readback",
@@ -1940,9 +2037,17 @@ fn read_indirect_draw(env: &mut Env<'_>, arguments: &BufferRange) -> Result<Draw
         offset: 0,
     })?;
     exec.gpu.completion()?.recv().map_err(|_| Error::Device)?;
+    #[cfg(feature = "d3d9-counters")]
+    exec.recording
+        .count_indirect_readback(arguments.range.end - arguments.range.start);
     // The completion marker follows the argument transfer.
     let words: &[u32] = bytemuck::cast_slice(unsafe { buffer.mapped().unwrap().as_ref() });
-    DrawRange::direct(words[0], words[2], words[1], words[3], 0)
+    let (base_vertex, first_instance) = if indexed {
+        (words[3] as i32, words[4])
+    } else {
+        (0, words[3])
+    };
+    DrawRange::direct(words[0], words[2], words[1], first_instance, base_vertex)
 }
 
 fn indirect_bounds(
@@ -1950,7 +2055,7 @@ fn indirect_bounds(
     snapshot: &Snapshot,
     fetches: &[VertexFetch],
     index_extent: Option<u32>,
-) -> Result<(u32, u32), Error> {
+) -> Result<Option<(u32, u32)>, Error> {
     let mut vertex_extent = None::<u32>;
     let mut instance_extent = None::<u32>;
     for fetch in fetches {
@@ -1979,11 +2084,7 @@ fn indirect_bounds(
             InputStep::Instance(_) => (),
         }
     }
-    let vertices = index_extent
-        .or(vertex_extent)
-        .ok_or(Error::InvalidArgument)?;
-    let instances = instance_extent.ok_or(Error::InvalidArgument)?;
-    Ok((vertices, instances))
+    Ok(index_extent.or(vertex_extent).zip(instance_extent))
 }
 
 fn shader_error(error: crate::shader::ir::Error) -> Error {

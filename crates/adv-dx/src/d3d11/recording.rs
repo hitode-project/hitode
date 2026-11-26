@@ -102,9 +102,22 @@ pub struct Effects<'a> {
 #[derive(Default)]
 pub struct Recording {
     inner: record::Recording<Command>,
+    #[cfg(feature = "d3d9-counters")]
+    counters: record::Counters,
 }
 
 impl Recording {
+    #[cfg(feature = "d3d9-counters")]
+    pub fn count_indirect_readback(&mut self, bytes: u64) {
+        self.counters.readback_bytes += bytes;
+        self.counters.flushes[1] += 1;
+        log::debug!(
+            "D3D11 indirect argument readbacks: {}; readback bytes: {}",
+            self.counters.flushes[1],
+            self.counters.readback_bytes
+        );
+    }
+
     pub fn append(
         &mut self,
         gpu: &mut Gpu,

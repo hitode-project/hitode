@@ -435,6 +435,77 @@ fn container(chunks: &[([u8; 4], &[u8])]) -> Vec<u8> {
 }
 
 #[cfg(feature = "gpu")]
+pub(crate) fn geometry_routing_fixture() -> Vec<u8> {
+    let bytes = fixture("gs_5_0");
+    let original = Container::decode(&bytes).unwrap();
+    let tokens = words(original.chunks().find(|(tag, _)| tag == b"SHEX").unwrap().1);
+    let mut program = Program::decode(&tokens).unwrap();
+    let output = |slot| {
+        register(
+            D3D10_SB_OPERAND_TYPE_OUTPUT,
+            D3D10_SB_OPERAND_4_COMPONENT,
+            encode_operand_4_component_mask(1 << D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT),
+            Some(slot),
+        )
+    };
+    let first_move = program
+        .instructions
+        .iter()
+        .position(|instruction| opcode(instruction) == D3D10_SB_OPCODE_MOV)
+        .unwrap();
+    program.instructions.splice(
+        first_move..first_move,
+        [
+            declaration(D3D10_SB_OPCODE_DCL_OUTPUT_SIV, Some(output(2)), &[5]),
+            declaration(D3D10_SB_OPCODE_DCL_OUTPUT_SIV, Some(output(3)), &[4]),
+        ],
+    );
+    for index in (0..program.instructions.len()).rev() {
+        if opcode(&program.instructions[index]) == D3D11_SB_OPCODE_EMIT_STREAM {
+            program.instructions.splice(
+                index..index,
+                [
+                    op(D3D10_SB_OPCODE_MOV, vec![output(2), immediate(&[1])]),
+                    op(D3D10_SB_OPCODE_MOV, vec![output(3), immediate(&[1])]),
+                ],
+            );
+        }
+    }
+    let code: Vec<_> = program
+        .encode()
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let mut strings = Vec::new();
+    let mut signature = vec![4, 8];
+    for (slot, (name, system, ty, mask)) in [
+        ("SV_Position", 1, 3, 15),
+        ("TEXCOORD", 0, 3, 3),
+        ("SV_ViewportArrayIndex", 5, 1, 1),
+        ("SV_RenderTargetArrayIndex", 4, 1, 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        signature.extend([
+            0,
+            120 + strings.len() as u32,
+            0,
+            system,
+            ty,
+            slot as u32,
+            mask,
+        ]);
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+    }
+    let mut signature: Vec<_> = signature.into_iter().flat_map(u32::to_le_bytes).collect();
+    signature.extend(strings);
+    let input = original.chunks().find(|(tag, _)| tag == b"ISGN").unwrap().1;
+    container(&[(*b"ISGN", input), (*b"OSG5", &signature), (*b"SHEX", &code)])
+}
+
+#[cfg(feature = "gpu")]
 pub(crate) fn pixel_uav_fixture() -> Vec<u8> {
     let program = Program {
         version: Version {

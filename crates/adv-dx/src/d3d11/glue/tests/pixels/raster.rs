@@ -891,6 +891,14 @@ fn geometry_stream_output_appends_and_drives_draw_auto_through_guest_vtables() {
         r.call(method, &[arguments, 0]);
         assert_eq!(r.read(target, staging, 4, 4), [0xff0000ff; 4]);
     }
+    write_value(&mut r.machine, ARRAY, [0u32; 3]);
+    r.call(18, &[1, 1, ARRAY, ARRAY + 4, ARRAY + 8]);
+    update_dynamic(&mut r.machine, r.context, indices, &[4u16, 1, 2, 3]);
+    write_value(&mut r.machine, ARRAY, [3u32, 2, 1, u32::MAX, 5]);
+    r.call(48, &[arguments, 0, 0, ARRAY, 0, 0]);
+    r.clear(view, [0., 0., 0., 1.]);
+    r.call(39, &[arguments, 0]);
+    assert_eq!(r.read(target, staging, 4, 4), [0xff0000ff; 4]);
 }
 
 // spec: GFX-STAGE-2
@@ -1074,6 +1082,73 @@ fn hull_phases_and_domain_shader_stream_tessellated_patches_through_guest_vtable
         r.call(29, &[query, DESCRIPTOR, 16, 0]);
         let statistics: [u64; 2] = GuestPtr::new(DESCRIPTOR).read(&r.machine.cpu).unwrap();
         assert_eq!(statistics, [2 * (mesh.indices.len() / 3) as u64; 2]);
+    }
+}
+
+// spec: GFX-STAGE-5
+#[test]
+fn geometry_shader_selects_viewport_scissor_and_attachment_slice() {
+    let mut r = Raster::new();
+    r.shader(13, 23, &crate::shader::dxbc::geometry_routing_fixture());
+    r.shader(
+        15,
+        9,
+        include_bytes!("../../../../../tests/fixtures/d3d11/guest_color.dxbc"),
+    );
+    write_value(&mut r.machine, ARRAY + 32, [0u32; 4]);
+    write_value(
+        &mut r.machine,
+        ARRAY,
+        [adv_abi::types::D3D11_SUBRESOURCE_DATA {
+            pSysMem: ARRAY + 32,
+            SysMemPitch: 16,
+            SysMemSlicePitch: 16,
+        }; 2],
+    );
+    let target = r.image(
+        D3D11_TEXTURE2D_DESC {
+            Width: 4,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 2,
+            Format: 28,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BindFlags: Bind::RENDER_TARGET,
+            ..Default::default()
+        },
+        ARRAY,
+    );
+    let view = create_object(&mut r.machine, r.device, 9, &[target, 0]);
+    r.targets(4, &[view]);
+    let mut vp = D3D11_VIEWPORT {
+        Width: 2.,
+        Height: 1.,
+        MaxDepth: 1.,
+        ..Default::default()
+    };
+    let first = vp;
+    vp.TopLeftX = 2.;
+    write_value(&mut r.machine, DESCRIPTOR, [first, vp]);
+    r.call(44, &[2, DESCRIPTOR]);
+    write_value(&mut r.machine, DESCRIPTOR, [[0i32, 0, 2, 1], [3, 0, 4, 1]]);
+    r.call(45, &[2, DESCRIPTOR]);
+    update_dynamic(
+        &mut r.machine,
+        r.context,
+        r.constants,
+        &[1.0f32, 0., 0., 1.],
+    );
+    r.call(13, &[3, 0]);
+    let staging = r.texture(4, 1, 28, 0, 0);
+    for (slice, expected) in [(0, [0; 4]), (1, [0, 0, 0, 0xff0000ff])] {
+        r.call(46, &[staging, 0, 0, 0, 0, target, slice, 0]);
+        let mapped = map(&mut r.machine, r.context, staging, 1);
+        let pixels: [u32; 4] = GuestPtr::new(mapped.pData).read(&r.machine.cpu).unwrap();
+        r.call(15, &[staging, 0]);
+        assert_eq!(pixels, expected, "array slice {slice}");
     }
 }
 

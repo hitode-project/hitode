@@ -256,7 +256,7 @@ Hot state setters, getters, scene boundaries, and unchanged bindings or state bl
 
 Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices and indices use 128-bit content keys. Whole-image upload snapshots hash their texels during capture unless a large texture's sampled probe changed from its previous upload. Partial uploads, changed probes, and fills use admission identities. Insufficient storage wraps before the complete binding window exceeds the buffer. Immutable snapshots retain only used registers, reuse unchanged captures across writes to unused registers and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
 
-Direct3D 11 captures the dynamic index window and the vertex and instance windows determined at draw admission. GPU-resident index and indirect-argument buffers keep their data on the GPU.
+Direct3D 11 captures the dynamic index window and the vertex and instance windows determined at draw admission. GPU-resident index buffers and indirect arguments with resource bounds stay on the GPU. Expanded indirect draws read arguments at an ordered boundary when one or both dimensions lack a resource bound and report the readback in diagnostic builds.
 
 ### GFX-REC-8 Frontend work counters
 
@@ -532,7 +532,7 @@ Pretransformed draws MUST retain index order.
 
 ### GFX-STAGE-1 Stream output
 
-**Rule**: Each stream output buffer MUST track its own filled byte size and preserve it on append bindings. Stream-output statistics MUST distinguish required storage from written primitives. `DrawAuto` MUST consume the filled byte size using the input assembler offset and stride from slot zero.
+**Rule**: Each stream output buffer MUST track its own filled byte size and preserve it on append bindings. Stream-output statistics MUST count storage needed for all declared output, treating an unbound target as full when determining which primitives were written. `DrawAuto` MUST consume the filled byte size using the input assembler offset and stride from slot zero.
 **Verification**: Test
 
 ### GFX-STAGE-2 Indirect dispatch
@@ -548,6 +548,11 @@ Pretransformed draws MUST retain index order.
 ### GFX-STAGE-4 Output merger UAVs
 
 **Rule**: At feature level 11_0 a pixel shader MUST access its bound output-merger UAVs. Pixel UAV writes MUST execute when neither color nor depth attachments are bound.
+**Verification**: Test
+
+### GFX-STAGE-5 Geometry shader raster routing
+
+**Rule**: The rasterizer MUST take viewport and render-target array indices from the leading vertex emitted by the geometry shader. A primitive MUST use the selected viewport, scissor, and attachment slice.
 **Verification**: Test
 
 ## Samplers

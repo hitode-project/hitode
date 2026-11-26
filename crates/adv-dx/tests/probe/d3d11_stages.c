@@ -166,13 +166,99 @@ done:
     if (pcode) ID3D10Blob_Release(pcode);
 }
 
-static void class_data(ID3D11Device *device)
+static void geometry_routing(ID3D11Device *device, ID3D11DeviceContext *ctx)
 {
-    ID3DBlob *code = compile(
+    ID3DBlob *vcode = compile(
+            "float4 main(uint id:SV_VertexID):SV_Position {"
+            "return float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0.5, 1); }", "vs_5_0");
+    ID3DBlob *gcode = compile(
+            "struct Out { float4 pos:SV_Position; uint viewport:SV_ViewportArrayIndex;"
+            " uint layer:SV_RenderTargetArrayIndex; };"
+            "[maxvertexcount(3)] void main(triangle float4 pos[3]:SV_Position,"
+            " inout TriangleStream<Out> stream) {"
+            " for (int i = 0; i < 3; ++i) { Out o; o.pos = pos[i]; o.viewport = 1;"
+            " o.layer = 1; stream.Append(o); } }", "gs_5_0");
+    ID3DBlob *pcode = compile("float4 main():SV_Target {return float4(1,0,0,1);}", "ps_5_0");
+    ID3D11VertexShader *vs = NULL;
+    ID3D11GeometryShader *gs = NULL;
+    ID3D11PixelShader *ps = NULL;
+    ID3D11Texture2D *target = NULL, *staging = NULL;
+    ID3D11RenderTargetView *view = NULL;
+    ID3D11RasterizerState *raster = NULL;
+    if (!vcode || !gcode || !pcode) goto done;
+    HRESULT hr = ID3D11Device_CreateVertexShader(device, ID3D10Blob_GetBufferPointer(vcode),
+            ID3D10Blob_GetBufferSize(vcode), NULL, &vs);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateGeometryShader(device, ID3D10Blob_GetBufferPointer(gcode),
+            ID3D10Blob_GetBufferSize(gcode), NULL, &gs);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreatePixelShader(device, ID3D10Blob_GetBufferPointer(pcode),
+            ID3D10Blob_GetBufferSize(pcode), NULL, &ps);
+    D3D11_RASTERIZER_DESC raster_desc = {D3D11_FILL_SOLID, D3D11_CULL_NONE, FALSE,
+        0, 0, 0, TRUE, TRUE, FALSE, FALSE};
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateRasterizerState(device, &raster_desc, &raster);
+    D3D11_TEXTURE2D_DESC desc = {4, 1, 1, 2, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
+        D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0};
+    UINT zero[4] = {0};
+    D3D11_SUBRESOURCE_DATA initial[2] = {{zero, sizeof(zero), 0}, {zero, sizeof(zero), 0}};
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateTexture2D(device, &desc, initial, &target);
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateRenderTargetView(device, (ID3D11Resource *)target, NULL, &view);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (SUCCEEDED(hr)) hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &staging);
+    printf("geometry-routing\t%08lx", (unsigned long)hr);
+    if (SUCCEEDED(hr)) {
+        D3D11_VIEWPORT viewports[2] = {{0, 0, 2, 1, 0, 1}, {2, 0, 2, 1, 0, 1}};
+        D3D11_RECT scissors[2] = {{0, 0, 2, 1}, {3, 0, 4, 1}};
+        ID3D11DeviceContext_RSSetState(ctx, raster);
+        ID3D11DeviceContext_RSSetViewports(ctx, 2, viewports);
+        ID3D11DeviceContext_RSSetScissorRects(ctx, 2, scissors);
+        ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
+        ID3D11DeviceContext_GSSetShader(ctx, gs, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &view, NULL);
+        ID3D11DeviceContext_Draw(ctx, 3, 0);
+        ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)target);
+        for (UINT slice = 0; slice < 2; ++slice) {
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, slice, D3D11_MAP_READ, 0, &mapped);
+            printf("\t%08lx", (unsigned long)hr);
+            if (SUCCEEDED(hr)) {
+                for (UINT pixel = 0; pixel < 4; ++pixel) printf("\t%08x", ((UINT *)mapped.pData)[pixel]);
+                ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, slice);
+            }
+        }
+    }
+    printf("\n");
+    ID3D11DeviceContext_ClearState(ctx);
+done:
+    if (raster) ID3D11RasterizerState_Release(raster);
+    if (view) ID3D11RenderTargetView_Release(view);
+    if (target) ID3D11Texture2D_Release(target);
+    if (staging) ID3D11Texture2D_Release(staging);
+    if (vs) ID3D11VertexShader_Release(vs);
+    if (gs) ID3D11GeometryShader_Release(gs);
+    if (ps) ID3D11PixelShader_Release(ps);
+    if (vcode) ID3D10Blob_Release(vcode);
+    if (gcode) ID3D10Blob_Release(gcode);
+    if (pcode) ID3D10Blob_Release(pcode);
+}
+
+static void class_data(ID3D11Device *device, int resources)
+{
+    static const char constant_source[] =
             "interface Color { float4 shade(); };"
             "class Tint : Color { float4 tint; float4 shade() { return tint; } };"
             "Color paint; Tint namedTint;"
-            "float4 main() : SV_Target { return paint.shade(); }", "ps_5_0");
+            "float4 main() : SV_Target { return paint.shade(); }";
+    static const char resource_source[] =
+            "interface Color { float4 shade(); };"
+            "class Tint : Color { float4 tint; Texture2D<float4> tex; SamplerState samp;"
+            " float4 shade() { return tint * tex.Sample(samp, float2(0.5, 0.5)); } };"
+            "Color paint; Tint namedTint;"
+            "float4 main() : SV_Target { return paint.shade(); }";
+    const char *label = resources ? "class-resources" : "class-data";
+    ID3DBlob *code = compile(resources ? resource_source : constant_source, "ps_5_0");
     if (!code) return;
     ID3D11ClassLinkage *linkage = NULL;
     ID3D11PixelShader *shader = NULL;
@@ -180,14 +266,15 @@ static void class_data(ID3D11Device *device)
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreatePixelShader(device, ID3D10Blob_GetBufferPointer(code),
                 ID3D10Blob_GetBufferSize(code), linkage, &shader);
-    printf("class-data-create\t%08lx\n", (unsigned long)hr);
+    printf("%s-create\t%08lx\n", label, (unsigned long)hr);
     if (SUCCEEDED(hr)) {
         ID3D11ClassInstance *instances[2] = {NULL, NULL};
         HRESULT status[2];
         status[0] = ID3D11ClassLinkage_GetClassInstance(linkage, "namedTint", 0, &instances[0]);
-        status[1] = ID3D11ClassLinkage_CreateClassInstance(linkage, "Tint", 3, 4, 0, 0, &instances[1]);
+        status[1] = ID3D11ClassLinkage_CreateClassInstance(linkage, "Tint", 3, 4,
+                resources ? 5 : 0, resources ? 2 : 0, &instances[1]);
         for (unsigned i = 0; i < 2; ++i) {
-            printf("class-data-desc-%u\t%08lx", i, (unsigned long)status[i]);
+            printf("%s-desc-%u\t%08lx", label, i, (unsigned long)status[i]);
             if (instances[i]) {
                 D3D11_CLASS_INSTANCE_DESC desc;
                 ID3D11ClassInstance_GetDesc(instances[i], &desc);
@@ -201,9 +288,13 @@ static void class_data(ID3D11Device *device)
         ID3DBlob *text = NULL;
         if (SUCCEEDED(D3DDisassemble(ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code),
                 0, NULL, &text))) {
-            printf("class-data-disassembly\n%s\n", (const char *)ID3D10Blob_GetBufferPointer(text));
+            printf("%s-disassembly\n%s\n", label, (const char *)ID3D10Blob_GetBufferPointer(text));
             ID3D10Blob_Release(text);
         }
+        const unsigned char *bytes = ID3D10Blob_GetBufferPointer(code);
+        printf("%s-dxbc\t", label);
+        for (SIZE_T i = 0; i < ID3D10Blob_GetBufferSize(code); ++i) printf("%02x", bytes[i]);
+        printf("\n");
     }
     if (shader) ID3D11PixelShader_Release(shader);
     if (linkage) ID3D11ClassLinkage_Release(linkage);
@@ -223,7 +314,9 @@ int main(int argc, char **argv)
     if (FAILED(hr)) return 1;
     stream_output(device, ctx);
     pixel_uav(device, ctx);
-    class_data(device);
+    geometry_routing(device, ctx);
+    class_data(device, 0);
+    class_data(device, 1);
     ID3D11DeviceContext_Release(ctx);
     ID3D11Device_Release(device);
     return 0;
