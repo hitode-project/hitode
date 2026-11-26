@@ -13,6 +13,7 @@ mod cache;
 pub mod dxbc;
 pub mod interpreter;
 mod parser;
+pub mod tessellator;
 #[cfg(test)]
 mod tests;
 mod translate;
