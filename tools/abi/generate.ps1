@@ -1,7 +1,8 @@
 param(
     [string]$Winmd,
     [switch]$Download,
-    [switch]$Check
+    [switch]$Check,
+    [string]$LayoutProbe
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
@@ -25,9 +26,9 @@ if ((Get-FileHash -LiteralPath $Winmd -Algorithm SHA256).Hash -ne $winmdHash) { 
 Add-Type -Path (Join-Path $PSScriptRoot 'Metadata.cs')
 $destination = Join-Path $repoRoot 'data/abi'
 if ($Check) { $destination = Join-Path $cache 'check' }
-[AbiMetadata]::Generate($Winmd, $destination, (Join-Path $repoRoot 'data/abi/modules.txt'), (Join-Path $repoRoot 'data/abi/crt-input.tsv'), (Join-Path $repoRoot 'data/abi/selected-exports.tsv'), (Join-Path $repoRoot 'data/abi/sdk-input.tsv'))
+[AbiMetadata]::Generate($Winmd, $destination, (Join-Path $repoRoot 'data/abi/modules.txt'), (Join-Path $repoRoot 'data/abi/crt-input.tsv'), (Join-Path $repoRoot 'data/abi/selected-exports.tsv'), (Join-Path $repoRoot 'data/abi/sdk-input.tsv'), $(if ($LayoutProbe) { [IO.Path]::GetFullPath($LayoutProbe) } else { $null }))
 if ($Check) {
-    foreach ($name in @('signatures.tsv', 'structs.rs', 'com.tsv', 'constants.tsv')) {
+    foreach ($name in @('signatures.tsv', 'structs.rs', 'com.tsv', 'constants.tsv', 'gfx-iids.rs')) {
         $expected = [IO.File]::ReadAllBytes((Join-Path $repoRoot "data/abi/$name"))
         $actual = [IO.File]::ReadAllBytes((Join-Path $destination $name))
         if (![Linq.Enumerable]::SequenceEqual[byte]($expected, $actual)) { throw "Generated file differs: $name" }

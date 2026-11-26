@@ -152,6 +152,7 @@ dependencies = [
  "adv-abi",
  "adv-cpu",
  "adv-device",
+ "adv-gpu",
  "adv-machine",
  "adv-os",
  "adv-sync",
