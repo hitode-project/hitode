@@ -62,3 +62,11 @@ query_pipeline_statistics	0	0	0	1	1	1
 query_stream_output_statistics	0	0	0	1	1	1
 query_event	1	1	1	1	1	1
 query_timestamp_and_disjoint	1	1	1	1	1	1
+color_bytes_per_sample	16	16	64	128	128	128
+framebuffer_layers	1	1	1	512	512	2048
+wireframe	0	0	0	1	1	1
+clip_distances	0	0	0	8	8	8
+cull_distances	0	0	0	1	1	1
+multisample_render_targets	0	0	0	4	4	4
+immediate_context	1	1	1	1	1	1
+deferred_context	1	1	1	1	1	1

@@ -28,7 +28,7 @@ fn matches(filter: &Descriptor, mode: &Descriptor) -> bool {
     flags & PIXEL_FORMAT == 0 || word(filter, 84) == word(mode, 84)
 }
 
-fn catalog(current: (u32, u32), legacy: bool) -> Vec<Descriptor> {
+pub(crate) fn sizes(current: (u32, u32)) -> Vec<(u32, u32)> {
     // A bounded virtual display profile. All entries use formats accepted by
     // SetDisplayMode; this catalog neither allocates nor changes the primary.
     let mut sizes = vec![
@@ -42,11 +42,13 @@ fn catalog(current: (u32, u32), legacy: bool) -> Vec<Descriptor> {
     ];
     sizes.sort_unstable();
     sizes.dedup();
+    sizes.retain(|&(width, height)| surface::size(width, height).is_ok());
+    sizes
+}
+
+fn catalog(current: (u32, u32), legacy: bool) -> Vec<Descriptor> {
     let mut modes = Vec::new();
-    for (width, height) in sizes {
-        if surface::size(width, height).is_err() {
-            continue;
-        }
+    for (width, height) in sizes(current) {
         for format in [PixelFormat::Rgb565, PixelFormat::Bgra32] {
             let mut d = [0; 124];
             let (red, green, blue) = format.masks();
