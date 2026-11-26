@@ -427,7 +427,7 @@ struct Output {
             .as_mut()
             .copy_from_slice(bytemuck::cast_slice(&[2u32, 2, 1]));
     }
-    indirect.flush([0..12]);
+    indirect.flush(std::iter::once(0..12));
     gpu.dispatch(
         &dispatch,
         &slots,
@@ -615,8 +615,10 @@ fn sample(
     )
     .unwrap();
     read_image(gpu, &out, 0, 16)
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect()
 }
 

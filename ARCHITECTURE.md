@@ -225,7 +225,7 @@ The machine owns the virtual clock. Holding Ctrl to skip may advance time to the
 
 ## Personality and compatibility
 
-Wine provides the Windows personality. Hitode serves the device fronts DirectDraw, Direct3D 9, DirectSound, DirectShow, Windows Media and XAudio2 natively, as host-module images whose exports follow the native contracts; every other module is Wine's own code. The rules are in [docs/spec/wine.md](docs/spec/wine.md), [docs/spec/graphics.md](docs/spec/graphics.md) and [docs/spec/media.md](docs/spec/media.md).
+Wine provides the Windows personality. Hitode serves the device fronts DirectDraw, Direct3D 9, DirectSound, DirectMusic synthesis, DirectShow, Windows Media and XAudio2 natively, as host-module images whose exports follow the native contracts; every other module is Wine's own code. The rules are in [docs/spec/wine.md](docs/spec/wine.md), [docs/spec/graphics.md](docs/spec/graphics.md) and [docs/spec/media.md](docs/spec/media.md).
 
 Games share one Wine prefix, whose registry keeps their settings, and run in place from their own folders. Read-only ISO 9660 and Joliet images can be attached as CD drives through `adv-nt`'s read-only volume interface.
 Sparse identity files retain wineserver handle and section ownership; data and lazy

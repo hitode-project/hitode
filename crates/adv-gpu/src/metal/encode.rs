@@ -15,6 +15,7 @@ pub(crate) struct Encoder {
     visibility_offset: usize,
     /// Timestamp resolves, encoded after this submission completes.
     pub(super) resolves: Vec<Resolve>,
+    timestamp_event: Option<(Object<dyn MTLEvent>, u64)>,
 }
 
 impl Drop for Encoder {
@@ -75,6 +76,7 @@ impl Encoder {
             visibility_needs_zero: true,
             visibility_offset: 0,
             resolves: Vec::new(),
+            timestamp_event: None,
         }
     }
     fn blit(&mut self) -> &ProtocolObject<dyn MTLBlitCommandEncoder> {
@@ -88,6 +90,19 @@ impl Encoder {
         if let Some(blit) = self.blit.take() {
             blit.endEncoding();
         }
+    }
+    pub(crate) fn timestamp_barrier(&mut self) -> Result<()> {
+        self.finish_blit();
+        let (event, value) = match &mut self.timestamp_event {
+            Some(barrier) => barrier,
+            slot => slot.insert((self.device.0.raw.newEvent().ok_or(Error::OutOfMemory)?, 0)),
+        };
+        *value += 1;
+        // Stage-boundary samples can overlap across independent passes. A
+        // signal waits for all prior commands and the wait holds later passes.
+        self.command.encodeSignalEvent_value(event, *value);
+        self.command.encodeWaitForEvent_value(event, *value);
+        Ok(())
     }
     pub(crate) fn render_pass<'e>(
         &'e mut self,
