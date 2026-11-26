@@ -70,9 +70,11 @@ SHA-256 `cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2`.
 Its notices are in `vendor/fluidr3mono/LICENSE`. The bank is embedded and needs no
 runtime downloads or host MIDI setup. Synthesis runs on the execution owner;
 the session pump feeds the shared PCM mixer with 30 ms of lead. Native WinMM
-consumes wave headers and sequences MIDI streams independently of guest threads.
-The authored `tests/probe/midi.c` in `adv-runtime` checks WinMM, MIDI streams and
-MCI. Run `cargo test --release -p adv-runtime --test wine_midi` with
+consumes wave headers and sequences MIDI streams independently of guest threads,
+and native `dmsynth.dll` serves DirectMusic software synthesis through the same
+bank and mixer. The authored `tests/probe/midi.c` and `tests/probe/dmusic.c` in
+`adv-runtime` check WinMM, MIDI streams, MCI and DirectMusic. Run
+`cargo test --release -p adv-runtime --test wine_midi --test wine_dmusic` with
 `ADV_WINE_DIST` set.
 
 ## Tests

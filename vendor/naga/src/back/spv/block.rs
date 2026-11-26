@@ -257,7 +257,12 @@ impl Writer {
                 }
             };
 
-            self.store_io_with_f16_polyfill(body, res_member.id, member_value_id);
+            let target = if res_member.built_in == Some(crate::BuiltIn::SampleMask) {
+                self.sample_mask_element(body, res_member.id, spirv::StorageClass::Output)
+            } else {
+                res_member.id
+            };
+            self.store_io_with_f16_polyfill(body, target, member_value_id);
 
             match res_member.built_in {
                 Some(crate::BuiltIn::Position { .. })
@@ -2685,6 +2690,32 @@ impl BlockContext<'_> {
         };
 
         self.fun_info[index].uniformity.non_uniform_result.is_some()
+    }
+
+    pub(super) fn image_atomic_pointer(
+        &mut self,
+        image: Handle<crate::Expression>,
+        block: &mut Block,
+    ) -> Result<Word, Error> {
+        match self.ir_function.expressions[image] {
+            crate::Expression::GlobalVariable(handle) => {
+                Ok(self.writer.global_variables[handle].var_id)
+            }
+            crate::Expression::Access { .. } | crate::Expression::AccessIndex { .. } => {
+                // OpImageTexelPointer takes the descriptor element pointer.
+                match self.write_access_chain(
+                    image,
+                    block,
+                    AccessTypeAdjustment::IntroducePointer(spirv::StorageClass::UniformConstant),
+                )? {
+                    ExpressionPointer::Ready { pointer_id } => Ok(pointer_id),
+                    ExpressionPointer::Conditional { .. } => Err(Error::FeatureNotImplemented(
+                        "Texture array out-of-bounds handling",
+                    )),
+                }
+            }
+            _ => Err(Error::Validation("Unexpected image type")),
+        }
     }
 
     /// Compute a single index operand to an `OpAccessChain` instruction.

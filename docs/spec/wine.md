@@ -528,6 +528,13 @@ Every presenter's frames carry only that content, while the host shows caption, 
 **Rule**: Each input thread MUST register its event pipe as Wine's queue fd. Queuing host input MUST run the server and deliver wake-ups even when every guest context waits. Input waits MUST NOT use periodic polling.
 **Verification**: Test
 
+### WINE-IN-4 DirectInput action map device filtering
+
+**Rule**: `IDirectInputDevice8::SetActionMap` MUST assign each device object's application data only from actions mapped to that device without `DIA_APPNOMAP`. Actions mapped to another device or left unmapped MUST NOT overwrite matching object IDs on the target device.
+**Verification**: Test
+
+The pinned Wine source carries this through `tools/wine/patches`.
+
 ## Native UI and control
 
 ### WINE-UI-1 Native popup presentation
@@ -845,6 +852,12 @@ Windowless VMR-7 (`CLSID_VideoMixingRenderer`) converts pushed uncompressed RGB 
 **Rule**: MIDI streams MUST sequence short, long, tempo and callback events on host time through the Wine stack's synthesizer. Pause, restart, stop and properties MUST retain Wine 11's results, and position MUST report SMPTE time under an SMPTE division. Session idle deadlines MUST include native audio work.
 **Verification**: Test
 **Basis**: Wine 11 `dlls/winmm/winmm.c`; Wine winmm `midi` test, which passes on Windows.
+
+### WINE-AUD-13 Native DirectMusic synthesizer
+
+**Rule**: DirectMusic software synthesis MUST run through `adv-device::midi::Synth` and the session mixer on host time. Prefixes MUST install a default General MIDI collection when absent without replacing an existing file. Structured MIDI messages, SysEx messages and volume properties MUST control synthesized PCM output.
+**Verification**: Test
+**Basis**: Wine 11.0 `dmsynth.dll`, `dmusic.dll` and `dmloader.dll`.
 
 ## Native XAudio2
 

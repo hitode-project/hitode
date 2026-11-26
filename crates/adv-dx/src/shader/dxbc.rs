@@ -1,4 +1,10 @@
 //! Lossless token streams of SHDR and SHEX chunks in DXBC containers.
+mod checksum;
+mod container;
+mod disassemble;
+pub use disassemble::disassemble;
+mod lower;
+pub use container::{Container, ParseError, parse};
 pub mod fields;
 pub mod operand;
 
@@ -266,3 +272,6 @@ fn take_words<'a>(words: &mut &'a [u32], count: usize) -> Result<&'a [u32], Erro
 fn take_word(words: &mut &[u32]) -> Result<u32, Error> {
     Ok(take_words(words, 1)?[0])
 }
+
+#[cfg(test)]
+mod coverage;
