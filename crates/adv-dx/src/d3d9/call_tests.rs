@@ -1025,6 +1025,11 @@ fn d3d9_direct_body_loop_keeps_host_calls_flat_on_real_vtable() {
             s.targets.insert(s.next, target);
             Ok(s.next)
         },
+        cpu_access: |ext, id, rect| {
+            let target = (ext.get::<State>().provider.target)(ext, id)?;
+            Some(CpuReadback::new(target.image, rect))
+        },
+        gpu_access: |env, id, _, _| (env.ext.get::<State>().provider.target)(env.ext, id),
         target: |ext, surface| ext.get::<Surfaces>().targets.get(&surface).cloned(),
         remove: |ext, _, surface| {
             ext.get_mut::<Surfaces>().targets.remove(&surface);

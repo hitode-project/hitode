@@ -231,6 +231,10 @@ pub struct Target {
 }
 
 impl Target {
+    pub(crate) fn from_parts(image: Image, depth: Option<Depth>) -> Self {
+        Self { image, depth }
+    }
+
     pub fn same_attachments(&self, other: &Self) -> bool {
         self.image.id() == other.image.id()
             && self.image.alpha_mode() == other.image.alpha_mode()

@@ -1,10 +1,11 @@
-//! Software surfaces in guest memory and their presentation. Graphics fronts (GDI,
-//! DirectDraw) name surfaces by id and translate their calls into these operations; the
-//! presenter or the frame mailbox receives every completed frame.
+//! Shared CPU stores, GPU images and presentation. Graphics fronts name surfaces
+//! by id and translate drawing and mapping calls into neutral operations.
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+mod blt;
+pub use blt::{Blt, BltError, BltFailure, BltKey, BltRules, BltSurface, MemoryClass};
 mod composite;
 pub(crate) mod convert;
 use convert::{BLACK_PALETTE, decode_pixel};
@@ -12,7 +13,12 @@ mod sprite;
 pub use sprite::{Sprite, SpriteAlpha, SpriteMode};
 mod packed;
 mod planes;
+mod residency;
 pub use planes::Plane;
+pub use residency::Access;
+#[cfg(feature = "gpu")]
+pub use residency::CpuReadback;
+use residency::Entry;
 #[cfg(feature = "gpu")]
 pub(crate) mod slots;
 pub use composite::{Composite, CompositeError, GradientVertex};
@@ -1370,13 +1376,11 @@ pub struct Surfaces<P: Presenter> {
     arena: Arena,
     /// Next id; surfaces and device contexts share the numbering.
     next: u32,
-    surfaces: BTreeMap<u32, Surface>,
+    surfaces: BTreeMap<u32, Entry>,
     damage_history: DamageHistory,
     software_source: Option<u32>,
     /// Damaged and total pixels of the last software publication.
     software_pending: Option<SoftwareFrame>,
-    #[cfg(feature = "gpu")]
-    native_surfaces: BTreeMap<u32, NativeSurface>,
 
     primary: Option<u32>,
     deferred_presentation: bool,
@@ -1414,11 +1418,6 @@ pub enum FlushReason {
     Message,
     Timeout,
     Immediate,
-}
-
-#[cfg(feature = "gpu")]
-struct NativeSurface {
-    target: crate::gpu::Target,
 }
 
 impl<P: Presenter> Surfaces<P> {
@@ -1463,8 +1462,6 @@ impl<P: Presenter> Surfaces<P> {
             damage_history: DamageHistory::default(),
             software_source: None,
             software_pending: None,
-            #[cfg(feature = "gpu")]
-            native_surfaces: BTreeMap::new(),
 
             primary: None,
             deferred_presentation: false,
@@ -1493,11 +1490,11 @@ impl<P: Presenter> Surfaces<P> {
     }
 
     pub fn get(&self, id: u32) -> Option<&Surface> {
-        self.surfaces.get(&id)
+        self.surfaces.get(&id).map(|entry| &entry.layout)
     }
 
     pub fn get_mut(&mut self, id: u32) -> Option<&mut Surface> {
-        self.surfaces.get_mut(&id)
+        self.surfaces.get_mut(&id).map(|entry| &mut entry.layout)
     }
 
     /// Cold allocation diagnostics. Released pixels remain reusable in the
@@ -1623,15 +1620,12 @@ impl<P: Presenter> Surfaces<P> {
             self.software_pending = None;
         }
         #[cfg(feature = "gpu")]
-        if self.native_surfaces.remove(&id).is_some() {
-            if self.native_source == Some(id) {
-                self.native_source = None;
-            }
-            return true;
+        if self.native_source == Some(id) {
+            self.native_source = None;
         }
         // Imported guest storage is retired by its frontend owner, not returned
         // to the surface allocator's free list.
-        if self.arena.contains(s.pixels, s.pitch * s.height) {
+        if s.residency.has_cpu() && self.arena.contains(s.pixels, s.pitch * s.height) {
             self.arena.release(s.pixels, s.pitch * s.height);
         }
         true
@@ -2029,7 +2023,7 @@ impl<P: Presenter> Surfaces<P> {
         let Some(primary) = self.primary else {
             return Ok(());
         };
-        let old = self.surfaces[&primary].clone();
+        let old = self.surfaces[&primary].layout.clone();
         if old.width == width && old.height == height {
             return Ok(());
         }
@@ -2086,6 +2080,7 @@ impl<P: Presenter> Surfaces<P> {
         let old = (s.pixels, s.pitch * s.height);
         (s.pixels, s.width, s.height, s.pitch, s.format) = (pixels, width, height, pitch, format);
         s.version += 1;
+        s.residency = residency::Residency::cpu();
         if self.arena.contains(old.0, old.1) {
             self.arena.release(old.0, old.1);
         }
@@ -2121,7 +2116,7 @@ impl<P: Presenter> Surfaces<P> {
         }
         m.writable(surface.pixels, bytes as usize)?;
         let id = self.new_id();
-        self.surfaces.insert(id, surface);
+        self.surfaces.insert(id, Entry::software(surface));
         Ok(id)
     }
     /// A zeroed surface; returns its id.
@@ -2151,7 +2146,7 @@ impl<P: Presenter> Surfaces<P> {
         let id = self.new_id();
         self.surfaces.insert(
             id,
-            Surface {
+            Entry::software(Surface {
                 pixels: p,
                 width: w,
                 height: h,
@@ -2161,7 +2156,7 @@ impl<P: Presenter> Surfaces<P> {
                 version: 0,
                 format,
                 palette: format.indexed().then(|| Arc::new(BLACK_PALETTE)),
-            },
+            }),
         );
         Ok(id)
     }
@@ -2186,7 +2181,7 @@ impl<P: Presenter> Surfaces<P> {
         damage: Rect,
     ) -> Result<(), String> {
         #[cfg(feature = "gpu")]
-        if self.native_surfaces.contains_key(&id) {
+        if self.is_native(id) {
             return Err("native surface requires GPU presentation".into());
         }
         let full = self.surfaces[&id].rect();
@@ -2451,25 +2446,27 @@ impl<P: Presenter> Surfaces<P> {
         let id = self.new_id();
         self.surfaces.insert(
             id,
-            Surface {
-                pixels: 0,
-                width,
-                height,
-                pitch: width * 4,
-                bottom_up: false,
-                locked: None,
-                version: 0,
-                format: PixelFormat::Bgra32,
-                palette: None,
-            },
+            Entry::native(
+                Surface {
+                    pixels: 0,
+                    width,
+                    height,
+                    pitch: width * 4,
+                    bottom_up: false,
+                    locked: None,
+                    version: 0,
+                    format: PixelFormat::Bgra32,
+                    palette: None,
+                },
+                target,
+            ),
         );
-        self.native_surfaces.insert(id, NativeSurface { target });
         Ok(id)
     }
 
     #[cfg(feature = "gpu")]
-    pub fn native_target(&self, id: u32) -> Option<&crate::gpu::Target> {
-        self.native_surfaces.get(&id).map(|surface| &surface.target)
+    pub fn native_target(&self, id: u32) -> Option<crate::gpu::Target> {
+        self.surfaces.get(&id)?.target()
     }
 
     /// Reset/replace storage while preserving the logical surface id. All old
@@ -2480,14 +2477,20 @@ impl<P: Presenter> Surfaces<P> {
         id: u32,
         target: crate::gpu::Target,
     ) -> Result<crate::gpu::Target, String> {
-        let native = self
-            .native_surfaces
-            .get_mut(&id)
-            .ok_or("unknown native surface")?;
+        let old = self.native_target(id).ok_or("unknown native surface")?;
         let surface = self.surfaces.get_mut(&id).unwrap();
         if surface.locked.is_some() {
             return Err("native surface is locked during replacement".into());
         }
+        if surface.residency.has_cpu()
+            && self
+                .arena
+                .contains(surface.pixels, surface.pitch * surface.height)
+        {
+            self.arena
+                .release(surface.pixels, surface.pitch * surface.height);
+        }
+        surface.pixels = 0;
         surface.width = target.image.width();
         surface.height = target.image.height();
         surface.pitch = surface.width * 4;
@@ -2496,7 +2499,8 @@ impl<P: Presenter> Surfaces<P> {
         if self.native_source == Some(id) {
             self.native_source = None;
         }
-        Ok(std::mem::replace(&mut native.target, target))
+        surface.replace_target(target);
+        Ok(old)
     }
 
     /// Damage is relative to the preceding publication of this surface.
@@ -2507,11 +2511,9 @@ impl<P: Presenter> Surfaces<P> {
         damage: Option<Region>,
         gpu: &mut crate::gpu::Gpu,
     ) -> Result<(), String> {
-        let image = &self
-            .native_surfaces
-            .get(&id)
+        let image = self
+            .native_target(id)
             .ok_or("unknown native surface")?
-            .target
             .image;
         let extent = (image.width(), image.height());
         let serial = self
@@ -2524,14 +2526,8 @@ impl<P: Presenter> Surfaces<P> {
             .unwrap_or_else(|| Region::whole(extent));
         let video = self.native_video(extent);
         let windows = self.window_layers(extent);
-        gpu.present(
-            &self.native_surfaces[&id].target.image,
-            damage,
-            serial,
-            video,
-            windows,
-        )
-        .map_err(|error| error.to_string())?;
+        gpu.present(&image, damage, serial, video, windows)
+            .map_err(|error| error.to_string())?;
         // A later native Present supersedes software work still waiting to publish.
         self.software_pending = None;
         self.software_source = None;
@@ -2615,7 +2611,7 @@ impl<P: Presenter> Surfaces<P> {
     #[cfg(feature = "gpu")]
     fn base_extent(&self) -> Option<(u32, u32)> {
         if let Some(id) = self.native_source {
-            let image = &self.native_surfaces[&id].target.image;
+            let image = self.surfaces[&id].residency.gpu.as_ref().unwrap();
             Some((image.width(), image.height()))
         } else {
             let s = &self.surfaces[&self.software_source?];
@@ -2645,7 +2641,7 @@ impl<P: Presenter> Surfaces<P> {
         if let Some(id) = self.native_source {
             self.gpu
                 .present(
-                    &self.native_surfaces[&id].target.image,
+                    self.surfaces[&id].residency.gpu.as_ref().unwrap(),
                     damage,
                     serial,
                     video,
@@ -2676,11 +2672,7 @@ impl<P: Presenter> Surfaces<P> {
         id: u32,
         gpu: &mut crate::gpu::Gpu,
     ) -> Result<crate::gpu::Readback, String> {
-        let target = &self
-            .native_surfaces
-            .get(&id)
-            .ok_or("unknown native surface")?
-            .target;
+        let target = self.native_target(id).ok_or("unknown native surface")?;
         gpu.readback(&target.image, None)
             .map_err(|error| error.to_string())
     }
@@ -2696,7 +2688,7 @@ impl<P: Presenter> Surfaces<P> {
     /// Advance guest presentation accounting while retaining the visible frame.
     #[cfg(feature = "gpu")]
     pub fn repeat_native_frame(&mut self, id: u32) -> Result<u64, crate::gpu::Error> {
-        if !self.native_surfaces.contains_key(&id) {
+        if !self.is_native(id) {
             return Err(crate::gpu::Error::Invalid(
                 "unknown repeated surface".into(),
             ));
@@ -2722,14 +2714,10 @@ impl<P: Presenter> Surfaces<P> {
     ) -> Result<bool, String> {
         use crate::text::{Horizontal, Pixels, Vertical};
         #[cfg(feature = "gpu")]
-        if self.native_surfaces.contains_key(&id) {
+        if self.is_native(id) {
             return Err("native text target requires an explicit GPU text command".into());
         }
-        let surface = self
-            .surfaces
-            .get(&id)
-            .ok_or("unknown text surface")?
-            .clone();
+        let surface = self.get(id).ok_or("unknown text surface")?.clone();
         if surface.locked.is_some() {
             return Err("text surface is locked".into());
         }
@@ -2887,14 +2875,20 @@ impl<P: Presenter> Surfaces<P> {
         m: &mut dyn SurfaceMemory,
     ) -> Result<(), String> {
         #[cfg(feature = "gpu")]
-        if self.native_surfaces.contains_key(&dst) {
+        if self.is_native(dst) {
             return Err("native fill requires a GPU drawing command".into());
         }
-        let d = self
-            .surfaces
-            .get(&dst)
-            .ok_or("unknown destination surface")?
-            .clone();
+        self.fill_cpu(dst, rect, value, m)
+    }
+
+    fn fill_cpu(
+        &mut self,
+        dst: u32,
+        rect: Rect,
+        value: u32,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<(), String> {
+        let d = self.get(dst).ok_or("unknown destination surface")?.clone();
         if rect.x.checked_add(rect.w).is_none_or(|x| x > d.width)
             || rect.y.checked_add(rect.h).is_none_or(|y| y > d.height)
         {
@@ -2964,14 +2958,10 @@ impl<P: Presenter> Surfaces<P> {
         m: &mut dyn SurfaceMemory,
     ) -> Result<Rect, String> {
         #[cfg(feature = "gpu")]
-        if self.native_surfaces.contains_key(&src) || self.native_surfaces.contains_key(&dst) {
+        if self.is_native(src) || self.is_native(dst) {
             return Err("native blit requires GPU copy or explicit asynchronous readback".into());
         }
-        let s = self
-            .surfaces
-            .get(&src)
-            .ok_or("unknown source surface")?
-            .clone();
+        let s = self.get(src).ok_or("unknown source surface")?.clone();
         self.blit_surface(&s, sr, dst, dr, options, m)
     }
 
@@ -3014,7 +3004,7 @@ impl<P: Presenter> Surfaces<P> {
             return Err("source rectangle outside surface".into());
         }
         #[cfg(feature = "gpu")]
-        if self.native_surfaces.contains_key(&dst) {
+        if self.is_native(dst) {
             return Err("native blit requires GPU copy or explicit asynchronous readback".into());
         }
         let d = self
@@ -3057,11 +3047,7 @@ impl<P: Presenter> Surfaces<P> {
         options: BlitOptions,
         m: &mut dyn SurfaceMemory,
     ) -> Result<Rect, String> {
-        let d = self
-            .surfaces
-            .get(&dst)
-            .ok_or("unknown destination surface")?
-            .clone();
+        let d = self.get(dst).ok_or("unknown destination surface")?.clone();
         if sr.x.checked_add(sr.w).is_none_or(|right| right > s.width)
             || sr
                 .y
