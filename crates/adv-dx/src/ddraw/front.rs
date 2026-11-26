@@ -11,7 +11,7 @@ use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine};
 mod enumeration;
 mod extras;
-mod modes;
+pub(crate) mod modes;
 #[derive(Clone, Copy)]
 pub struct WindowGeometry {
     pub hwnd: u32,

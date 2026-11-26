@@ -4932,6 +4932,42 @@ impl crate::GuestArg for DXGI_ADAPTER_DESC2 {
     const WORDS: u8 = 76;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DXGI_ADAPTER_DESC3 {
+    pub Description: [u16; 128],
+    pub VendorId: u32,
+    pub DeviceId: u32,
+    pub SubSysId: u32,
+    pub Revision: u32,
+    pub DedicatedVideoMemory: u32,
+    pub DedicatedSystemMemory: u32,
+    pub SharedSystemMemory: u32,
+    pub AdapterLuid: LUID,
+    pub Flags: i32,
+    pub GraphicsPreemptionGranularity: i32,
+    pub ComputePreemptionGranularity: i32,
+}
+const _: () = assert!(core::mem::size_of::<DXGI_ADAPTER_DESC3>() == 304);
+const _: () = assert!(core::mem::align_of::<DXGI_ADAPTER_DESC3>() == 4);
+impl Default for DXGI_ADAPTER_DESC3 { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, Description) == 0);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, VendorId) == 256);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, DeviceId) == 260);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, SubSysId) == 264);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, Revision) == 268);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, DedicatedVideoMemory) == 272);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, DedicatedSystemMemory) == 276);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, SharedSystemMemory) == 280);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, AdapterLuid) == 284);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, Flags) == 292);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, GraphicsPreemptionGranularity) == 296);
+const _: () = assert!(core::mem::offset_of!(DXGI_ADAPTER_DESC3, ComputePreemptionGranularity) == 300);
+impl crate::GuestArg for DXGI_ADAPTER_DESC3 {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 76;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
 #[repr(C, align(8))]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DXGI_FRAME_STATISTICS {
@@ -5175,6 +5211,46 @@ impl crate::GuestArg for DXGI_OUTPUT_DESC {
 }
 #[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DXGI_OUTPUT_DESC1 {
+    pub DeviceName: [u16; 32],
+    pub DesktopCoordinates: RECT,
+    pub AttachedToDesktop: i32,
+    pub Rotation: i32,
+    pub Monitor: u32,
+    pub BitsPerColor: u32,
+    pub ColorSpace: i32,
+    pub RedPrimary: [f32; 2],
+    pub GreenPrimary: [f32; 2],
+    pub BluePrimary: [f32; 2],
+    pub WhitePoint: [f32; 2],
+    pub MinLuminance: f32,
+    pub MaxLuminance: f32,
+    pub MaxFullFrameLuminance: f32,
+}
+const _: () = assert!(core::mem::size_of::<DXGI_OUTPUT_DESC1>() == 144);
+const _: () = assert!(core::mem::align_of::<DXGI_OUTPUT_DESC1>() == 4);
+impl Default for DXGI_OUTPUT_DESC1 { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, DeviceName) == 0);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, DesktopCoordinates) == 64);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, AttachedToDesktop) == 80);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, Rotation) == 84);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, Monitor) == 88);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, BitsPerColor) == 92);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, ColorSpace) == 96);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, RedPrimary) == 100);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, GreenPrimary) == 108);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, BluePrimary) == 116);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, WhitePoint) == 124);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, MinLuminance) == 132);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, MaxLuminance) == 136);
+const _: () = assert!(core::mem::offset_of!(DXGI_OUTPUT_DESC1, MaxFullFrameLuminance) == 140);
+impl crate::GuestArg for DXGI_OUTPUT_DESC1 {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 36;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DXGI_PRESENT_PARAMETERS {
     pub DirtyRectsCount: u32,
     pub pDirtyRects: u32,
@@ -5191,6 +5267,26 @@ const _: () = assert!(core::mem::offset_of!(DXGI_PRESENT_PARAMETERS, pScrollOffs
 impl crate::GuestArg for DXGI_PRESENT_PARAMETERS {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 4;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DXGI_QUERY_VIDEO_MEMORY_INFO {
+    pub Budget: u64,
+    pub CurrentUsage: u64,
+    pub AvailableForReservation: u64,
+    pub CurrentReservation: u64,
+}
+const _: () = assert!(core::mem::size_of::<DXGI_QUERY_VIDEO_MEMORY_INFO>() == 32);
+const _: () = assert!(core::mem::align_of::<DXGI_QUERY_VIDEO_MEMORY_INFO>() == 8);
+impl Default for DXGI_QUERY_VIDEO_MEMORY_INFO { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(DXGI_QUERY_VIDEO_MEMORY_INFO, Budget) == 0);
+const _: () = assert!(core::mem::offset_of!(DXGI_QUERY_VIDEO_MEMORY_INFO, CurrentUsage) == 8);
+const _: () = assert!(core::mem::offset_of!(DXGI_QUERY_VIDEO_MEMORY_INFO, AvailableForReservation) == 16);
+const _: () = assert!(core::mem::offset_of!(DXGI_QUERY_VIDEO_MEMORY_INFO, CurrentReservation) == 24);
+impl crate::GuestArg for DXGI_QUERY_VIDEO_MEMORY_INFO {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 8;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
 #[repr(C, align(4))]

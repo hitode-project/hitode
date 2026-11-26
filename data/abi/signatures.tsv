@@ -1562,6 +1562,9 @@ dsound.dll	DirectSoundFullDuplexCreate	stdcall	i32	Windows.Win32.Foundation.HRES
 dsound.dll	GetDeviceID	stdcall	i32	Windows.Win32.Foundation.HRESULT	pGuidSrc:System.Guid*:ptr:1|pGuidDest:System.Guid*:ptr:1
 dwmapi.dll	DwmSetWindowAttribute	stdcall	i32	Windows.Win32.Foundation.HRESULT	hwnd:Windows.Win32.Foundation.HWND:handle:1|dwAttribute:u32:u32:1|pvAttribute:void*:ptr:1|cbAttribute:u32:u32:1
 dwrite.dll	DWriteCreateFactory	stdcall	i32	Windows.Win32.Foundation.HRESULT	factoryType:Windows.Win32.Graphics.DirectWrite.DWRITE_FACTORY_TYPE:i32:1|iid:System.Guid*:ptr:1|factory:void**:ptr:1
+dxgi.dll	CreateDXGIFactory	stdcall	i32	Windows.Win32.Foundation.HRESULT	riid:System.Guid*:ptr:1|ppFactory:void**:ptr:1
+dxgi.dll	CreateDXGIFactory1	stdcall	i32	Windows.Win32.Foundation.HRESULT	riid:System.Guid*:ptr:1|ppFactory:void**:ptr:1
+dxgi.dll	CreateDXGIFactory2	stdcall	i32	Windows.Win32.Foundation.HRESULT	Flags:Windows.Win32.Graphics.Dxgi.DXGI_CREATE_FACTORY_FLAGS:u32:1|riid:System.Guid*:ptr:1|ppFactory:void**:ptr:1
 gdi32.dll	AbortDoc	stdcall	i32	i32	hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1
 gdi32.dll	AbortPath	stdcall	i32	Windows.Win32.Foundation.BOOL	hdc:Windows.Win32.Graphics.Gdi.HDC:handle:1
 gdi32.dll	AddFontMemResourceEx	stdcall	handle	Windows.Win32.Foundation.HANDLE	pFileView:void*:ptr:1|cjSize:u32:u32:1|pvResrved:void*:ptr:1|pNumFonts:u32*:ptr:1
