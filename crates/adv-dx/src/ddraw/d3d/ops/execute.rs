@@ -350,6 +350,15 @@ impl Calls<'_> {
                     3 => 4,
                     _ => unreachable!(),
                 };
+                let edges = (instruction.opcode == 3).then(|| {
+                    instruction
+                        .records
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|record| u16::from_le_bytes([record[6], record[7]]))
+                        .collect::<Vec<_>>()
+                });
                 let hr = self.emit_primitive(
                     this,
                     PrimitiveBatch {
@@ -359,6 +368,7 @@ impl Calls<'_> {
                         vertices: vertices.clone(),
                         indices: Some(indices),
                     },
+                    edges.as_deref(),
                 )?;
                 if hr != 0 {
                     return Ok(hr);

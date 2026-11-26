@@ -2705,7 +2705,19 @@ fn legacy_execute_buffer_copies_vertices_and_draws_the_captured_triangle() {
     f.write(desc, &20u32.to_le_bytes());
     assert_eq!(f.call("IDirect3DExecuteBuffer::Lock", &[buffer, desc]), 0);
     assert_eq!(f.word(desc + 16), data);
+    f.write(data + 96 + 6 * 4, bytemuck::cast_slice(&[8u32, 2]));
+    f.write(data + 96 + 10 * 4, &0x0100_0002u32.to_le_bytes());
     assert_eq!(f.call("IDirect3DExecuteBuffer::Unlock", &[buffer]), 0);
+    assert_eq!(f.call("IDirect3DDevice::BeginScene", &[device]), 0);
+    assert_eq!(f.call("IDirect3DViewport3::Clear", &[viewport, 0, 0, 1]), 0);
+    assert_eq!(
+        f.call("IDirect3DDevice::Execute", &[device, buffer, viewport, 1]),
+        0
+    );
+    assert_eq!(f.call("IDirect3DDevice::EndScene", &[device]), 0);
+    let pixels = f.pixels(target, 32, 32);
+    assert_eq!(pixels[6 + 2 * 32], 0x00ff00);
+    assert_eq!(pixels[2 + 6 * 32], 0);
     assert_eq!(f.call("IDirect3DExecuteBuffer::Release", &[buffer]), 0);
 }
 

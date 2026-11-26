@@ -578,6 +578,7 @@ impl Calls<'_> {
                 primitive: args[1],
                 fvf,
             },
+            None,
         )
     }
 
@@ -585,6 +586,7 @@ impl Calls<'_> {
         &mut self,
         this: u32,
         batch: super::object::PrimitiveBatch,
+        triangle_edges: Option<&[u16]>,
     ) -> Result<u32, CallError> {
         let super::object::PrimitiveBatch {
             mut vertices,
@@ -701,8 +703,15 @@ impl Calls<'_> {
                         }
                     }
                     if fill == 2 {
-                        for vertex in [0, 1, 1, 2, 2, 0] {
-                            append_vertex(&mut expanded, &triangle_bytes, vertex, layout.size);
+                        for (edge, pair) in [[0, 1], [1, 2], [2, 0]].into_iter().enumerate() {
+                            if triangle_edges
+                                .is_some_and(|flags| flags[i as usize] & (0x100 << edge) == 0)
+                            {
+                                continue;
+                            }
+                            for vertex in pair {
+                                append_vertex(&mut expanded, &triangle_bytes, vertex, layout.size);
+                            }
                         }
                     } else {
                         expanded.extend_from_slice(&triangle_bytes);

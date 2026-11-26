@@ -642,7 +642,7 @@ impl Calls<'_> {
                 let Some(batch) = dev.legacy.batch.take() else {
                     return Ok(INVALID);
                 };
-                return self.emit_primitive(args[0], batch);
+                return self.emit_primitive(args[0], batch, None);
             }
             _ => unreachable!(),
         }
