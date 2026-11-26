@@ -29,8 +29,9 @@ pub use native::test_support;
 pub use native::{
     BlockTexture, BufferRange, Depth, Dispatch, DispatchArguments, DrawArguments, Expand,
     ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude, ExpansionRegion, Gpu,
-    Image, ImageId, ModernColor, ModernDepth, ModernDraw, ModernShader, Predicate, QuerySlot,
-    Readback, SlotBindings, Staged, StorageBinding, Target, TimestampDisjoint,
+    Image, ImageId, ImageRegion, ModernColor, ModernDepth, ModernDraw, ModernShader,
+    ModernTransfer, Predicate, QuerySlot, Readback, SlotBindings, Staged, StorageBinding, Target,
+    TimestampDisjoint, TransferBuffer,
 };
 pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,

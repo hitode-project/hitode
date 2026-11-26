@@ -324,6 +324,7 @@ impl BoundSlot {
     }
 }
 
+#[derive(Clone)]
 pub struct ModernColor {
     pub view: ImageView,
     pub blend: Option<(p::BlendComponent, p::BlendComponent)>,
@@ -332,6 +333,7 @@ pub struct ModernColor {
     pub store: Store,
 }
 
+#[derive(Clone)]
 pub struct ModernDepth {
     pub view: ImageView,
     pub state: p::DepthStencil,
@@ -340,6 +342,7 @@ pub struct ModernDepth {
     pub read_only: bool,
 }
 
+#[derive(Clone)]
 pub enum DrawArguments {
     Direct {
         vertices: Range<u32>,
@@ -349,17 +352,21 @@ pub enum DrawArguments {
     Indirect(BufferRange),
 }
 
+#[derive(Clone)]
 pub enum DispatchArguments {
     Direct([u32; 3]),
     Indirect(BufferRange),
 }
 
+#[derive(Clone)]
 pub struct ModernDraw {
     /// Immutable input assembly, rasterizer, blend and depth/stencil state IDs.
     pub state_ids: [u64; 4],
     pub vertex: Arc<ModernShader>,
     pub fragment: Option<Arc<ModernShader>>,
     pub colors: ArrayVec<ModernColor, { p::MAX_COLOR_TARGETS }>,
+    /// Color locations in increasing slot order. None uses consecutive slots.
+    pub color_slots: Option<u8>,
     pub depth: Option<ModernDepth>,
     pub samples: u32,
     pub alpha_to_coverage: bool,
@@ -383,6 +390,7 @@ pub struct QuerySlot {
 }
 
 /// Execute the draw if the occlusion result is nonzero (or zero when inverted).
+#[derive(Clone)]
 pub struct Predicate {
     pub query: QuerySlot,
     pub inverted: bool,
@@ -555,3 +563,100 @@ impl Gpu {
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone)]
+pub struct ImageRegion {
+    pub image: adv_gpu::Image,
+    pub mip: u32,
+    pub layer: u32,
+    pub origin: (u32, u32, u32),
+    pub extent: adv_gpu::Extent,
+}
+
+impl ImageRegion {
+    pub(super) fn copy(&self) -> adv_gpu::encode::ImageCopy<'_> {
+        adv_gpu::encode::ImageCopy {
+            image: &self.image,
+            mip: self.mip,
+            layer: self.layer,
+            origin: self.origin,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TransferBuffer {
+    pub buffer: Buffer,
+    pub offset: u64,
+    pub row_pitch: u32,
+    pub rows: u32,
+}
+
+impl TransferBuffer {
+    pub(super) fn copy(&self) -> adv_gpu::encode::BufferCopy<'_> {
+        adv_gpu::encode::BufferCopy {
+            buffer: &self.buffer,
+            offset: self.offset,
+            row_pitch: self.row_pitch,
+            rows: self.rows,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum ModernTransfer {
+    CopyImage {
+        source: ImageRegion,
+        destination: ImageRegion,
+    },
+    Upload {
+        source: TransferBuffer,
+        destination: ImageRegion,
+    },
+    Download {
+        source: ImageRegion,
+        destination: TransferBuffer,
+    },
+    CopyBuffer {
+        source: BufferRange,
+        destination: Buffer,
+        offset: u64,
+    },
+    FillBuffer {
+        destination: BufferRange,
+        value: u32,
+    },
+    ClearColor {
+        view: ImageView,
+        value: [f64; 4],
+        area: Option<Rect>,
+    },
+    ClearDepth {
+        view: ImageView,
+        depth: Option<f32>,
+        stencil: Option<u32>,
+    },
+}
+
+impl Gpu {
+    pub fn transfer(&self, transfer: ModernTransfer) -> Result<(), Error> {
+        self.enqueue_modern(super::record::WorkerItem::TransferImage {
+            facade: self.facade_id,
+            command: Box::new(super::stream::Command::ModernTransfer(Box::new(transfer))),
+        })
+    }
+
+    pub fn completion(&self) -> Result<std::sync::mpsc::Receiver<()>, Error> {
+        let (send, receive) = std::sync::mpsc::channel();
+        self.check()?;
+        self.execution.worker.admit_cmd(0, self.wake.get())?;
+        self.execution.worker.push_boundary(
+            super::record::WorkerItem::TransferImage {
+                facade: self.facade_id,
+                command: Box::new(super::stream::Command::Complete(send)),
+            },
+            0,
+        );
+        Ok(receive)
+    }
+}

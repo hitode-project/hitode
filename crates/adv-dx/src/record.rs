@@ -9,7 +9,8 @@ mod passes;
 mod planner;
 pub(crate) mod reuse;
 pub(crate) mod trace;
-pub(crate) use contents::{Contents, ResourceKey};
+pub(crate) use contents::Contents;
+pub use contents::ResourceKey;
 
 pub(crate) use planner::{Cursor, Op, Plan, Reason, Recording};
 

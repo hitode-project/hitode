@@ -108,6 +108,18 @@ pub(super) enum Storage {
 }
 
 impl Image {
+    pub fn from_native(image: adv_gpu::Image) -> Self {
+        let view = image.view().clone();
+        Self {
+            storage: Storage::Fixed {
+                image,
+                view,
+                level: None,
+            },
+            alpha: AlphaMode::Stored,
+        }
+    }
+
     pub fn width(&self) -> u32 {
         self.size().0
     }

@@ -3,6 +3,7 @@ use super::caps::{AdapterInfo, Display, PhysicalMode};
 use adv_abi::{Env, Outcome, com::Com};
 use adv_device::surface::SurfaceStore;
 use adv_machine::{Ext, Objects};
+use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -40,6 +41,7 @@ pub enum DeviceOperation {
     DuplicateOutput1,
 }
 
+#[derive(Clone, Copy)]
 pub struct DeviceCall {
     pub operation: DeviceOperation,
     pub this: u32,
@@ -76,11 +78,13 @@ pub(super) struct State {
     pub factory_vtable: u32,
     pub adapter_vtable: u32,
     pub output_vtable: u32,
+    pub swap_chain_vtable: u32,
     pub provider: Provider,
+    pub chains: BTreeMap<u32, Vec<u32>>,
 }
 
 #[derive(Default)]
 pub(super) struct Factory {
-    pub window: u32,
+    pub window: Option<u32>,
     pub window_flags: u32,
 }

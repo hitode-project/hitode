@@ -1,4 +1,8 @@
+mod border;
 mod typed_buffer;
+
+#[cfg(feature = "gpu")]
+pub(crate) use typed_buffer::clear_pattern;
 
 use super::*;
 use crate::shader::dxbc::fields::{
@@ -7,6 +11,19 @@ use crate::shader::dxbc::fields::{
     D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GROUP,
 };
 use naga::common::wgsl::ToWgsl;
+
+pub(super) const EXACT_UNORM: &str = r#"
+fn dx_unorm_exact(value: f32, bits: u32) -> f32 {
+    let maximum = (1u << bits) - 1u;
+    let code = u32(round(value * f32(maximum)));
+    if code == 0u { return 0.0; }
+    if code == maximum { return 1.0; }
+    let top = 31u - countLeadingZeros(code);
+    let significand = code << (23u - top);
+    let rounded = significand + (significand + maximum / 2u) / maximum;
+    return bitcast<f32>(((126u + top - bits) << 23u) + rounded);
+}
+"#;
 
 impl Writer<'_> {
     pub(super) fn declarations(
@@ -97,7 +114,9 @@ impl Writer<'_> {
                         }
                     };
                     let ty = scalar(returns[0])?;
-                    let texture = if comparison_sample(&module.body, slot) {
+                    let texture = if self.options.depth_textures.contains(&slot)
+                        || comparison_sample(&module.body, slot)
+                    {
                         format!("texture_depth_{dimension}")
                     } else {
                         format!("texture_{dimension}<{ty}>")
@@ -141,6 +160,7 @@ impl Writer<'_> {
                             slot,
                             group: 3,
                             binding: slot,
+                            sampler_min_lod_bits: None,
                         });
                         continue;
                     }
@@ -175,6 +195,7 @@ impl Writer<'_> {
                 slot,
                 group,
                 binding: physical_slot,
+                sampler_min_lod_bits: None,
             });
         }
         for binding in &reflection.bindings {
@@ -356,7 +377,7 @@ impl Writer<'_> {
                     } else if register == Register::UnorderedAccessView {
                         self.storage_instruction(op, args, &name, dimension, slot)?
                     } else {
-                        Some(self.texture_instruction(op, args, &name, sampler, dimension)?)
+                        Some(self.texture_instruction(op, args, &name, sampler, dimension, slot)?)
                     }
                 }
                 BindingKind::Sampler(_) | BindingKind::ConstantBuffer { .. } => {
@@ -629,8 +650,15 @@ impl Writer<'_> {
         texture: &str,
         sampler: Option<(u32, u8)>,
         dimension: ResourceDimension,
+        slot: u32,
     ) -> Result<String, Error> {
         use Opcode::*;
+        let lod = self
+            .options
+            .texture_lods
+            .iter()
+            .find(|lod| lod.slot == slot)
+            .copied();
         let (width, lanes, array) = match dimension {
             ResourceDimension::Texture1D => (1, "x", ""),
             ResourceDimension::Texture2D | ResourceDimension::Texture2DMs => (2, "xy", ""),
@@ -675,6 +703,11 @@ impl Writer<'_> {
         {
             return self.sample_query(op, &format!("textureNumSamples({texture})"), args);
         }
+        let empty = lod.is_some_and(|lod| lod.minimum > lod.last as f32);
+        let default = lod.map_or(0, |lod| lod.default_alpha);
+        if empty && op.opcode != Lod {
+            return Ok(format!("vec4<u32>(0u, 0u, 0u, {default}u)"));
+        }
         if matches!(op.opcode, Ld | LdMs) {
             let xy = if offset.is_empty() {
                 cast(&args[0], "i32")
@@ -687,7 +720,9 @@ impl Writer<'_> {
                 format!("{}.w", args[0])
             };
             let result = format!("texture_result_{}", self.serial);
-            self.line(&format!("var {result}: vec4<u32>;"));
+            self.line(&format!(
+                "var {result} = vec4<u32>(0u, 0u, 0u, {default}u);"
+            ));
             let (count, dimensions) = if op.opcode == LdMs {
                 (
                     format!("textureNumSamples({texture})"),
@@ -699,7 +734,13 @@ impl Writer<'_> {
                     format!("textureDimensions({texture}, {level})"),
                 )
             };
-            self.open(&format!("if {level} < {count}"));
+            let minimum = lod.map_or(0, |lod| lod.minimum.floor() as u32);
+            let first = if minimum == 0 {
+                String::new()
+            } else {
+                format!(" && {level} >= {minimum}u")
+            };
+            self.open(&format!("if {level} < {count}{first}"));
             let index_u32 = if width == 1 {
                 format!("bitcast<u32>({xy})")
             } else {
@@ -719,9 +760,16 @@ impl Writer<'_> {
                 )
             };
             self.open(&format!("if {in_bounds}"));
-            self.line(&format!(
-                "{result} = bitcast<vec4<u32>>(textureLoad({texture}, {xy}{load_layer}, {level}));"
-            ));
+            let load = format!("textureLoad({texture}, {xy}{load_layer}, {level})");
+            let load = if self.options.depth24_textures.contains(&slot) {
+                format!("vec4<f32>(dx_unorm_exact({load}, 24u), 0.0, 0.0, 1.0)")
+            } else if self.options.depth_textures.contains(&slot) {
+                format!("vec4<f32>({load}, 0.0, 0.0, 1.0)")
+            } else {
+                load
+            };
+            let load = self.exact_unorm(slot, &load);
+            self.line(&format!("{result} = bitcast<vec4<u32>>({load});"));
             self.close();
             self.close();
             return Ok(result);
@@ -737,9 +785,15 @@ impl Writer<'_> {
             )
         };
         if op.opcode == Lod {
-            return Ok(self.lod_query(texture, sampler, dimension, width, &coord));
+            return Ok(self.lod_query(texture, sampler, dimension, width, &coord, lod));
         }
         if matches!(op.opcode, Gather4 | Gather4C | Gather4Po | Gather4PoC) {
+            if lod.is_some_and(|lod| lod.minimum >= 1.) {
+                return Ok(format!(
+                    "vec4<u32>({}u)",
+                    if component == 3 { default } else { 0 }
+                ));
+            }
             if matches!(op.opcode, Gather4Po | Gather4PoC) {
                 let dynamic = &args[1];
                 coord = format!(
@@ -758,27 +812,215 @@ impl Writer<'_> {
             };
             return Ok(format!("bitcast<vec4<u32>>({call})"));
         }
+        let border = self
+            .options
+            .border_samplers
+            .iter()
+            .find(|border| border.slot == sampler)
+            .copied();
+        let sampling = self
+            .options
+            .lod_samplers
+            .iter()
+            .find_map(|(slot, mode)| (*slot == sampler).then_some(*mode));
+        let mip = sampling.filter(|mode| mode.round_mip);
+        let sampler = if let Some(lod) = lod {
+            self.clamped_sampler(sampler, lod.minimum)
+        } else {
+            format!("s{sampler}")
+        };
         let extra = |idx: usize| format!("bitcast<f32>({}.x)", args[idx]);
         let (function, arguments, scalar) = match op.opcode {
+            Sample if mip.is_some_and(|mip| mip.bias != 0.) => (
+                "textureSampleBias",
+                format!(", bitcast<f32>({}u)", mip.unwrap().bias.to_bits()),
+                false,
+            ),
             Sample => ("textureSample", String::new(), false),
-            SampleB => ("textureSampleBias", format!(", {}", extra(1)), false),
+            SampleB => (
+                "textureSampleBias",
+                match mip {
+                    Some(mip) => format!(", {} + bitcast<f32>({}u)", extra(1), mip.bias.to_bits()),
+                    None => format!(", {}", extra(1)),
+                },
+                false,
+            ),
             SampleL => ("textureSampleLevel", format!(", {}", extra(1)), false),
+            SampleD
+                if mip.is_some()
+                    && !matches!(
+                        dimension,
+                        ResourceDimension::TextureCube | ResourceDimension::TextureCubeArray
+                    ) =>
+            {
+                let ty = if width == 1 {
+                    "f32".into()
+                } else {
+                    format!("vec{width}<f32>")
+                };
+                let size = format!("{ty}(textureDimensions({texture}, 0u))");
+                let x = format!("({} * {size})", cast(&args[1], "f32"));
+                let y = format!("({} * {size})", cast(&args[2], "f32"));
+                let magnitude = if width == 1 {
+                    format!("max(abs({x}), abs({y}))")
+                } else {
+                    format!("max(length({x}), length({y}))")
+                };
+                let bias = mip.unwrap().bias.to_bits();
+                let lambda = format!("(log2({magnitude}) + bitcast<f32>({bias}u))");
+                // D3D converts LOD to at least 8.8 fixed precision before the
+                // half-up mip selection. Do that before the host samples.
+                (
+                    "textureSampleLevel",
+                    format!(", floor(round({lambda} * 256.0) / 256.0 + 0.5)"),
+                    false,
+                )
+            }
             SampleD => (
                 "textureSampleGrad",
-                format!(", {}, {}", cast(&args[1], "f32"), cast(&args[2], "f32")),
+                if let Some(mip) = mip {
+                    let scale = format!("exp2(bitcast<f32>({}u))", mip.bias.to_bits());
+                    format!(
+                        ", {} * {scale}, {} * {scale}",
+                        cast(&args[1], "f32"),
+                        cast(&args[2], "f32")
+                    )
+                } else {
+                    format!(", {}, {}", cast(&args[1], "f32"), cast(&args[2], "f32"))
+                },
                 false,
             ),
             SampleC => ("textureSampleCompare", format!(", {}", extra(1)), true),
             SampleCLz => ("textureSampleCompareLevel", format!(", {}", extra(1)), true),
             other => return Err(Error::UnsupportedOpcode(other)),
         };
-        let sample =
-            format!("{function}({texture}, s{sampler}, {coord}{suffix}{arguments}{offset})");
+        let mut sample =
+            format!("{function}({texture}, {sampler}, {coord}{suffix}{arguments}{offset})");
+        if op.opcode == SampleCLz
+            && sampling.is_some_and(|mode| mode.linear_comparison)
+            && matches!(
+                dimension,
+                ResourceDimension::Texture2D | ResourceDimension::Texture2DArray
+            )
+            && lod.is_none_or(|lod| lod.minimum < 1.)
+        {
+            let name = format!("cmp_taps_{}", self.serial);
+            let weight = format!("cmp_weight_{}", self.serial);
+            self.line(&format!("let {name} = textureGatherCompare({texture}, {sampler}, {coord}{suffix}{arguments}{offset});"));
+            self.line(&format!(
+                "let {weight} = fract({coord} * vec2<f32>(textureDimensions({texture}, 0u)) - 0.5);"
+            ));
+            sample = format!(
+                "mix(mix({name}.w, {name}.z, {weight}.x), mix({name}.x, {name}.y, {weight}.x), {weight}.y)"
+            );
+        }
+        if let Some(border) = border
+            && !matches!(
+                dimension,
+                ResourceDimension::TextureCube | ResourceDimension::TextureCubeArray
+            )
+            && let Some(format) = self
+                .options
+                .border_textures
+                .iter()
+                .find(|format| format.slot == slot)
+        {
+            sample = self.border_sample(border::BorderSample {
+                sampler: border,
+                format: *format,
+                depth: self.options.depth_textures.contains(&slot),
+                width,
+                texture,
+                coordinate: &coord,
+                arguments: args,
+                offset: op.resource.offset,
+                opcode: op.opcode,
+                lod,
+                native: &sample,
+            });
+        }
+        if !scalar && sampling.is_some_and(|mode| mode.point) {
+            sample = self.exact_unorm(slot, &sample);
+        }
         Ok(if scalar {
             format!("vec4<u32>(bitcast<u32>({sample}))")
+        } else if self.options.depth_textures.contains(&slot) {
+            format!("bitcast<vec4<u32>>(vec4<f32>({sample}, 0.0, 0.0, 1.0))")
         } else {
             format!("bitcast<vec4<u32>>({sample})")
         })
+    }
+
+    fn exact_unorm(&mut self, slot: u32, value: &str) -> String {
+        let Some((_, widths)) = self
+            .options
+            .exact_unorm
+            .iter()
+            .find(|(bound, _)| *bound == slot)
+        else {
+            return value.into();
+        };
+        let local = format!("decoded_unorm_{}", self.serial);
+        self.line(&format!("let {local} = {value};"));
+        let channels = widths
+            .iter()
+            .enumerate()
+            .map(|(lane, &bits)| {
+                let source = format!("{local}.{}", LANES.as_bytes()[lane] as char);
+                if bits == 0 {
+                    source
+                } else {
+                    format!("dx_unorm_exact({source}, {bits}u)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("vec4<f32>({channels})")
+    }
+
+    fn clamped_sampler(&mut self, slot: u32, minimum: f32) -> String {
+        let bits = Some(minimum.to_bits());
+        if let Some(location) = self.locations.iter().find(|location| {
+            location.register == Register::Sampler
+                && location.slot == slot
+                && location.sampler_min_lod_bits == bits
+        }) {
+            return format!("dx_s{}", location.binding);
+        }
+        let binding = 16
+            + self
+                .locations
+                .iter()
+                .filter(|location| location.sampler_min_lod_bits.is_some())
+                .count() as u32;
+        self.locations.push(BindingLocation {
+            register: Register::Sampler,
+            slot,
+            group: 2,
+            binding,
+            sampler_min_lod_bits: bits,
+        });
+        format!("dx_s{binding}")
+    }
+
+    pub(super) fn clamped_sampler_declarations(&mut self) {
+        for location in &self.locations {
+            if location.sampler_min_lod_bits.is_some() {
+                let binding = location.binding;
+                let ty = if self.bindings[&(Register::Sampler, location.slot)]
+                    == BindingKind::Sampler(SamplerMode::Comparison)
+                {
+                    "sampler_comparison"
+                } else {
+                    "sampler"
+                };
+                writeln!(
+                    self.source,
+                    "@group(2) @binding({binding}) var dx_s{binding}: {ty};"
+                )
+                .unwrap();
+            }
+        }
     }
     fn sample_query(
         &self,
@@ -812,6 +1054,7 @@ impl Writer<'_> {
         dimension: ResourceDimension,
         width: usize,
         coordinate: &str,
+        resource: Option<TextureLod>,
     ) -> String {
         let sampler = self
             .options
@@ -823,6 +1066,9 @@ impl Writer<'_> {
                 min: 0.0,
                 max: f32::MAX,
                 max_anisotropy: 1,
+                round_mip: false,
+                point: false,
+                linear_comparison: false,
             });
         let c = format!("lod_coord_{}", self.serial);
         self.line(&format!("let {c} = {coordinate};"));
@@ -873,7 +1119,13 @@ impl Writer<'_> {
             "clamp(bitcast<f32>({}u), 0.0, f32(textureNumLevels({texture}) - 1u))",
             sampler.max.to_bits()
         );
-        format!("bitcast<vec4<u32>>(vec4<f32>(clamp({raw}, {lower}, {upper}), {raw}, 0.0, 0.0))")
+        let clamped = format!("clamp({raw}, {lower}, {upper})");
+        let clamped = match resource {
+            Some(lod) if lod.minimum > lod.last as f32 => "0.0".into(),
+            Some(lod) => format!("max({clamped}, bitcast<f32>({}u))", lod.minimum.to_bits()),
+            None => clamped,
+        };
+        format!("bitcast<vec4<u32>>(vec4<f32>({clamped}, {raw}, 0.0, 0.0))")
     }
 
     fn resource_info(

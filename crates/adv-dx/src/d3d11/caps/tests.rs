@@ -303,7 +303,10 @@ fn feature_layouts_masks_and_creation_status() {
         has_software_module: false,
         levels: None,
         flags: 0,
+        sdk_version: 7,
+        level_count: 0,
         wants_device: false,
+        wants_context: false,
     };
     assert_eq!(
         request.choose(Some(high.level)),
@@ -408,4 +411,79 @@ fn swap_models_use_present_paths_and_renderable_formats() {
     assert!(!discard.sequential_buffers && discard.occluded_status);
     let sequential = SwapEffect::FlipSequential.model();
     assert!(sequential.sequential_buffers && !sequential.occluded_status);
+}
+
+pub(in crate::d3d11) fn fixture_report(maximum: FeatureLevel) -> Report {
+    fixture_report_samples(maximum, Fixture::m1().rgba_samples)
+}
+
+pub(in crate::d3d11) fn fixture_report_samples(maximum: FeatureLevel, rgba_samples: u32) -> Report {
+    let paths = Coverage {
+        requirements: &requirements(),
+        emulated: EMULATED,
+        formats: &format::fixture_rows(),
+        features: FEATURES,
+    };
+    let fixture = Fixture {
+        rgba_samples,
+        ..Fixture::m1()
+    };
+    let report = Report::derive_at_most(&fixture.caps(), paths, maximum).unwrap();
+    assert_eq!(report.level, maximum);
+    report
+}
+
+// spec: GFX-CAP-4
+#[test]
+fn public_creation_request_matches_windows() {
+    let report = fixture_report(FeatureLevel::L11_0);
+    for line in include_str!("creation.tsv").lines() {
+        let mut fields = line.split('\t');
+        let name = fields.next().unwrap();
+        let status = u32::from_str_radix(fields.next().unwrap(), 16).unwrap();
+        let sdk_version = fields.next().unwrap().parse().unwrap();
+        let level = u32::from_str_radix(fields.next().unwrap(), 16).unwrap();
+        let wants_device = fields.next().unwrap() != "unchanged";
+        let wants_context = fields.next().unwrap() != "unchanged";
+        let levels: Option<&[u32]> = match name {
+            "array-order" => Some(&[0x9100, 0xb000]),
+            "invalid-after-valid" => Some(&[0xb000, 0xb080]),
+            "invalid-before-valid" => Some(&[0xb080, 0xc000]),
+            "empty-levels" => Some(&[]),
+            "sdk-zero"
+            | "sdk-minus"
+            | "sdk-plus"
+            | "null-levels-with-count"
+            | "none-out"
+            | "context-out"
+            | "debug" => None,
+            _ => panic!("device creation case {name}"),
+        };
+        let level_count = levels.map_or_else(
+            || {
+                if name == "null-levels-with-count" {
+                    4
+                } else {
+                    0
+                }
+            },
+            |list| list.len() as u32,
+        );
+        let request = DeviceRequest {
+            driver: Driver::Hardware,
+            has_adapter: false,
+            has_software_module: false,
+            levels,
+            flags: u32::from(name == "debug") * 2,
+            sdk_version,
+            level_count,
+            wants_device,
+            wants_context,
+        };
+        let actual = request
+            .choose(Some(report.level))
+            .map(|choice| (choice.status, choice.level as u32))
+            .unwrap_or_else(|error| (error.hresult(), 0));
+        assert_eq!(actual, (status, level), "{name}");
+    }
 }

@@ -367,6 +367,7 @@ impl State {
                 Command::Present { .. }
                     | Command::PresentSwap { .. }
                     | Command::Readback { .. }
+                    | Command::Complete(_)
                     | Command::Submit
             ) {
                 debug_assert_eq!(at + 1, self.chunks[chunk].commands.len());
@@ -377,6 +378,84 @@ impl State {
         }
         self.poll(consumer)
     }
+    fn transfer(&mut self, transfer: modern::ModernTransfer) {
+        use adv_gpu::encode::{ColorAttachment, DepthAttachment, Load, RenderPassDesc, Store};
+        use modern::ModernTransfer::*;
+        let encoder = self.encoder();
+        match transfer {
+            CopyImage {
+                source,
+                destination,
+            } => encoder.copy_image(source.copy(), destination.copy(), source.extent),
+            Upload {
+                source,
+                destination,
+            } => {
+                encoder.copy_buffer_to_image(source.copy(), destination.copy(), destination.extent)
+            }
+            Download {
+                source,
+                destination,
+            } => encoder.copy_image_to_buffer(source.copy(), destination.copy(), source.extent),
+            CopyBuffer {
+                source,
+                destination,
+                offset,
+            } => encoder.copy_buffer(source.buffer.slice(source.range), &destination, offset),
+            FillBuffer { destination, value } => {
+                encoder.fill_buffer(destination.buffer.slice(destination.range), value)
+            }
+            ClearColor { view, value, area } => {
+                let size = view.size();
+                drop(
+                    encoder.render_pass(&RenderPassDesc {
+                        colors: [ColorAttachment {
+                            view: &view,
+                            load: Load::Clear(value),
+                            store: Store::Store,
+                            resolve: None,
+                        }]
+                        .into_iter()
+                        .collect(),
+                        depth_stencil: None,
+                        area: area.unwrap_or(adv_gpu::Rect {
+                            x: 0,
+                            y: 0,
+                            w: size.width,
+                            h: size.height,
+                        }),
+                        timestamps: None,
+                        label: "clear modern color",
+                    }),
+                );
+            }
+            ClearDepth {
+                view,
+                depth,
+                stencil,
+            } => {
+                let size = view.size();
+                drop(encoder.render_pass(&RenderPassDesc {
+                    colors: Default::default(),
+                    depth_stencil: Some(DepthAttachment {
+                        view: &view,
+                        depth: (depth.map_or(Load::Load, Load::Clear), Store::Store),
+                        stencil: (stencil.map_or(Load::Load, Load::Clear), Store::Store),
+                        read_only: false,
+                    }),
+                    area: adv_gpu::Rect {
+                        x: 0,
+                        y: 0,
+                        w: size.width,
+                        h: size.height,
+                    },
+                    timestamps: None,
+                    label: "clear modern depth and stencil",
+                }));
+            }
+        }
+    }
+
     fn command(&mut self, command: Command, chunk: usize) -> adv_gpu::Result<()> {
         match command {
             Command::Target { colors, depth } => {
@@ -463,6 +542,16 @@ impl State {
                 );
             }
 
+            Command::ModernTransfer(transfer) => self.transfer(*transfer),
+            Command::Complete(send) => {
+                let token = self.submit(None)?;
+                self.queue.on_complete(
+                    token,
+                    Box::new(move || {
+                        let _ = send.send(());
+                    }),
+                );
+            }
             Command::Timestamp(slot) => self.timestamp(slot)?,
             Command::ReadQuery {
                 slot,
@@ -974,7 +1063,11 @@ pub(super) fn draw_modern_pass(
 ) {
     #[cfg(target_vendor = "apple")]
     let _ = statistics;
-    let mut pass = encoder.render_pass(&pass::modern_attachments(draw, chunk));
+    let desc = pass::modern_attachments(draw, chunk);
+    let mut pass = match draw.color_slots {
+        Some(slots) => encoder.render_pass_slots(&desc, slots),
+        None => encoder.render_pass(&desc),
+    };
     pass.set_pipeline(pipeline);
     let [x, y, w, h, min, max] = draw.viewport;
     pass.set_viewport(x, y, w, h, min, max);

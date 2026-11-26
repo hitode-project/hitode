@@ -25,7 +25,7 @@ impl FeatureLevel {
     ];
     pub const DEFAULT: [u32; 6] = [0xb000, 0xa100, 0xa000, 0x9300, 0x9200, 0x9100];
 
-    pub(super) fn column(self) -> usize {
+    pub(in crate::d3d11) fn column(self) -> usize {
         match self {
             Self::L9_1 => 0,
             Self::L9_2 => 1,

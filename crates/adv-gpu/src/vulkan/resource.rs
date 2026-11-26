@@ -214,7 +214,10 @@ impl ViewCore {
             Some(
                 vk::DescriptorImageInfo::default()
                     .image_view(self.handle)
-                    .image_layout(binding::sampled_layout(self.format)),
+                    .image_layout(binding::sampled_layout(
+                        self.format,
+                        self.image.inner.core.desc.usage,
+                    )),
             ),
         )?;
         if self.sampled.set(index).is_err() {

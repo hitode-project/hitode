@@ -107,6 +107,7 @@ impl Encoder {
     pub(crate) fn render_pass<'e>(
         &'e mut self,
         desc: &RenderPassDesc<'_>,
+        slots: u8,
     ) -> crate::RenderPass<'e> {
         let d = MTLRenderPassDescriptor::new();
         let mut size = desc
@@ -120,7 +121,7 @@ impl Encoder {
                 depth_or_layers: 1,
             });
         let mut resolves = Vec::new();
-        for (i, color) in desc.colors.iter().enumerate() {
+        for (i, color) in crate::pipeline::color_slots(slots).zip(&desc.colors) {
             let attachment = unsafe { d.colorAttachments().objectAtIndexedSubscript(i) };
             size.width = size.width.min(color.view.size().width);
             size.height = size.height.min(color.view.size().height);

@@ -234,11 +234,16 @@ fn every_queried_interface_uses_covered_guest_thunks() {
     let count = registry.coverage();
     assert_eq!(
         count.implement + count.state + count.safe_fail,
-        FACTORY.len() + ADAPTER.len() + OUTPUT.len() + 2
+        FACTORY.len() + ADAPTER.len() + OUTPUT.len() + swap_chain::SLOTS.len() + 2
     );
     assert_eq!(count.safe_fail, 1);
     assert_eq!(count.legacy, 0);
-    for &(name, _, _) in FACTORY.iter().chain(ADAPTER).chain(OUTPUT) {
+    for &(name, _, _) in FACTORY
+        .iter()
+        .chain(ADAPTER)
+        .chain(OUTPUT)
+        .chain(swap_chain::SLOTS)
+    {
         let level = registry.level(DLL, name);
         assert!(
             matches!(

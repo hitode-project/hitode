@@ -83,7 +83,20 @@ impl Device {
         desc: &RenderPipelineDesc,
         cache: Option<&PipelineCache>,
     ) -> Result<RenderPipeline> {
-        self.inner.create_render_pipeline(desc, cache)
+        self.create_render_pipeline_slots(
+            desc,
+            crate::pipeline::dense_color_slots(desc.colors.len()),
+            cache,
+        )
+    }
+    /// Color targets in ascending order of the set bits in `slots`.
+    pub fn create_render_pipeline_slots(
+        &self,
+        desc: &RenderPipelineDesc,
+        slots: u8,
+        cache: Option<&PipelineCache>,
+    ) -> Result<RenderPipeline> {
+        self.inner.create_render_pipeline(desc, slots, cache)
     }
     /// Compile once for a pool's immutable video sampler, off the frame path.
     pub fn create_video_pipeline(
@@ -104,7 +117,10 @@ impl Device {
     /// Identity of the driver object `desc` needs on this backend (see
     /// [`crate::pipeline`]). Equal identities share one compilation.
     pub fn pipeline_identity(&self, desc: &RenderPipelineDesc) -> u64 {
-        self.inner.pipeline_identity(desc)
+        self.pipeline_identity_slots(desc, crate::pipeline::dense_color_slots(desc.colors.len()))
+    }
+    pub fn pipeline_identity_slots(&self, desc: &RenderPipelineDesc, slots: u8) -> u64 {
+        self.inner.pipeline_identity(desc, slots)
     }
     pub fn create_compute_pipeline(
         &self,

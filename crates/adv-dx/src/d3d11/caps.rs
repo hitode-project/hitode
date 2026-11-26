@@ -151,6 +151,12 @@ impl Report {
         }
     }
 
+    pub(super) fn supports(&self, format: u32, operation: FormatOperation) -> bool {
+        self.formats
+            .get(&format)
+            .is_some_and(|row| row.contains(operation))
+    }
+
     /// E_FAIL leaves a zero format-support mask.
     pub fn check_format(&self, format: u32) -> Result<u32, Error> {
         format::checked_mask(self.formats.get(&format).map_or(0, |row| row.support))
@@ -218,7 +224,10 @@ pub struct DeviceRequest<'a> {
     pub has_software_module: bool,
     pub levels: Option<&'a [u32]>,
     pub flags: u32,
+    pub sdk_version: u32,
+    pub level_count: u32,
     pub wants_device: bool,
+    pub wants_context: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,7 +249,9 @@ impl DeviceRequest<'_> {
     /// GFX-CAP-4: the first supported requested level and the Windows argument
     /// and debug-layer errors. The maximum comes from capability derivation.
     pub fn choose(&self, maximum: Option<FeatureLevel>) -> Result<DeviceChoice, Error> {
-        if self.has_adapter != (self.driver == Driver::Unknown)
+        if self.sdk_version != super::abi::limit("D3D11_SDK_VERSION")
+            || (self.levels.is_none() && self.level_count != 0)
+            || self.has_adapter != (self.driver == Driver::Unknown)
             || (self.driver == Driver::Software && !self.has_software_module)
         {
             return Err(Error::InvalidArgument);
@@ -267,11 +278,11 @@ impl DeviceRequest<'_> {
             .ok_or(Error::Unsupported)?;
         Ok(DeviceChoice {
             level,
-            status: u32::from(!self.wants_device),
+            status: u32::from(!self.wants_device && !self.wants_context),
             adapter,
         })
     }
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

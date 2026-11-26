@@ -22,6 +22,17 @@ use crate::resource::*;
 use crate::shader::*;
 use crate::{Error, Extent, Format, Rect, Result};
 
+fn slot_count(slots: u8) -> usize {
+    (u8::BITS - slots.leading_zeros()) as usize
+}
+
+fn unused_attachment() -> vk::AttachmentReference {
+    vk::AttachmentReference {
+        attachment: vk::ATTACHMENT_UNUSED,
+        layout: vk::ImageLayout::UNDEFINED,
+    }
+}
+
 mod binding;
 mod encode;
 mod formats;

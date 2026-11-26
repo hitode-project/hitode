@@ -214,6 +214,9 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                         min: 0.0,
                         max: 0.75,
                         max_anisotropy: 1,
+                        round_mip: false,
+                        point: false,
+                        linear_comparison: false,
                     },
                 )],
                 ..Default::default()

@@ -85,6 +85,7 @@ fn draw(
     colors: impl IntoIterator<Item = ModernColor>,
 ) -> ModernDraw {
     ModernDraw {
+        color_slots: None,
         state_ids: [0; 4],
         vertex,
         fragment: Some(fragment),

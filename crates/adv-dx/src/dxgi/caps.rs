@@ -32,6 +32,7 @@ impl AdapterInfo {
 pub enum Adapter {
     Hardware,
     Software,
+    Null,
 }
 
 pub const ADAPTERS: [Adapter; 2] = [Adapter::Hardware, Adapter::Software];
@@ -52,6 +53,7 @@ impl Adapter {
                     0,
                     1,
                 ),
+                Self::Null => ("", 0, 0, 0, 0, 0, 0, 0, 0, 0),
                 Self::Software => (
                     "Microsoft Basic Render Driver",
                     0x1414,

@@ -529,6 +529,7 @@ impl Encoder {
     pub(crate) fn render_pass<'e>(
         &'e mut self,
         desc: &RenderPassDesc<'_>,
+        slots: u8,
     ) -> crate::RenderPass<'e> {
         self.memory_barrier();
         let timestamp = self.timestamp_start(desc.timestamps);
@@ -544,10 +545,12 @@ impl Encoder {
         };
         let mut needs_empty_pass = false;
         let begin_info = if dynamic {
-            let mut dynamic_colors = ArrayVec::<vk::RenderingAttachmentInfo<'static>, 8>::new();
+            let mut dynamic_colors: ArrayVec<_, 8> = (0..slot_count(slots))
+                .map(|_| vk::RenderingAttachmentInfo::default())
+                .collect();
             let mut depth_info = None;
             let mut stencil_info = None;
-            for color in &desc.colors {
+            for (slot, color) in color_slots(slots).zip(&desc.colors) {
                 let view = &color.view.inner;
                 dimensions = view.size();
                 if matches!(color.load, Load::Clear(_)) || color.resolve.is_some() {
@@ -609,7 +612,7 @@ impl Encoder {
                         .resolve_image_view(view.0.handle)
                         .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
                 }
-                dynamic_colors.push(info);
+                dynamic_colors[slot] = info;
             }
             if let Some(depth) = &desc.depth_stencil {
                 let view = &depth.view.inner;
@@ -695,10 +698,12 @@ impl Encoder {
             let mut attachments = ArrayVec::<_, 17>::new();
             let mut views = ArrayVec::<_, 17>::new();
             let mut clears = ArrayVec::<_, 17>::new();
-            let mut colors = ArrayVec::<_, 8>::new();
-            let mut resolves = ArrayVec::<_, 8>::new();
+            let mut colors: ArrayVec<_, 8> = (0..slot_count(slots))
+                .map(|_| unused_attachment())
+                .collect();
+            let mut resolves = colors.clone();
             let mut depth_ref = None;
-            for color in &desc.colors {
+            for (slot, color) in color_slots(slots).zip(&desc.colors) {
                 let view = &color.view.inner;
                 dimensions = view.size();
                 if matches!(color.load, Load::Clear(_)) || color.resolve.is_some() {
@@ -744,10 +749,10 @@ impl Encoder {
                 ));
                 views.push(view.0.handle);
                 clears.push(clear);
-                colors.push(vk::AttachmentReference {
+                colors[slot] = vk::AttachmentReference {
                     attachment: index,
                     layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                });
+                };
                 if let Some(resolve) = color.resolve {
                     let view = &resolve.inner;
                     attachment_handles.push(view.0.image.inner.core.handle);
@@ -760,10 +765,10 @@ impl Encoder {
                         vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                         vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                     );
-                    resolves.push(vk::AttachmentReference {
+                    resolves[slot] = vk::AttachmentReference {
                         attachment: attachments.len() as u32,
                         layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    });
+                    };
                     attachments.push(attachment(
                         view,
                         vk::AttachmentLoadOp::DONT_CARE,
@@ -774,11 +779,6 @@ impl Encoder {
                     ));
                     views.push(view.0.handle);
                     clears.push(vk::ClearValue::default());
-                } else {
-                    resolves.push(vk::AttachmentReference {
-                        attachment: vk::ATTACHMENT_UNUSED,
-                        layout: vk::ImageLayout::UNDEFINED,
-                    });
                 }
             }
             if let Some(depth) = &desc.depth_stencil {
@@ -1512,7 +1512,7 @@ fn buffer_image_copies(
             vk::BufferImageCopy::default()
                 .buffer_offset(buffer.offset)
                 .buffer_row_length(buffer.row_pitch / bytes * block)
-                .buffer_image_height(buffer.rows)
+                .buffer_image_height(buffer.rows * block)
                 .image_subresource(subresource(image, size))
                 .image_offset(offset(image.origin))
                 .image_extent(copy_extent(image, size)),

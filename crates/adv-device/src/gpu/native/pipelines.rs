@@ -141,9 +141,11 @@ struct Key {
 #[derive(PartialEq, Eq, Hash)]
 struct ModernKey {
     state: [u64; 4],
+    topology: p::Topology,
     vertex: u64,
     fragment: Option<u64>,
     colors: arrayvec::ArrayVec<Format, { p::MAX_COLOR_TARGETS }>,
+    color_slots: Option<u8>,
     depth: Option<Format>,
     samples: u32,
 }
@@ -261,6 +263,7 @@ impl Pipelines {
     ) -> Result<RenderPipeline, Error> {
         let key = ModernKey {
             state: draw.state_ids,
+            topology: draw.primitive.topology,
             vertex: draw.vertex.identity(),
             fragment: draw.fragment.as_ref().map(|f| f.identity()),
             colors: draw
@@ -268,6 +271,7 @@ impl Pipelines {
                 .iter()
                 .map(|color| color.view.format())
                 .collect(),
+            color_slots: draw.color_slots,
             depth: draw.depth.as_ref().map(|d| d.view.format()),
             samples: draw.samples,
         };
@@ -300,6 +304,7 @@ impl Pipelines {
                 });
                 let samples = draw.samples;
                 let alpha_to_coverage = draw.alpha_to_coverage;
+                let color_slots = draw.color_slots;
                 let task = Compile::spawn(0, self.counters.clone(), move || {
                     let built = device.guard_guest_pipeline(|| {
                         let desc = p::RenderPipelineDesc {
@@ -316,8 +321,20 @@ impl Pipelines {
                             alpha_to_coverage,
                             label: "modern render pipeline",
                         };
-                        let identity = device.pipeline_identity(&desc);
-                        let pipeline = device.create_render_pipeline(&desc, cache.as_deref())?;
+                        let (identity, pipeline) = match color_slots {
+                            Some(slots) => (
+                                device.pipeline_identity_slots(&desc, slots),
+                                device.create_render_pipeline_slots(
+                                    &desc,
+                                    slots,
+                                    cache.as_deref(),
+                                )?,
+                            ),
+                            None => (
+                                device.pipeline_identity(&desc),
+                                device.create_render_pipeline(&desc, cache.as_deref())?,
+                            ),
+                        };
                         Ok(Built { identity, pipeline })
                     });
                     Ok(built.map_err(gpu_error))
@@ -698,7 +715,7 @@ pub(super) fn program_sampling_flags(texture: &gpu::ProgramTexture) -> u8 {
 pub(super) fn fixed_sampling_flags(image: Option<&super::Image>) -> u8 {
     image.map_or(0, |image| {
         u8::from(image.alpha_mode() == gpu::AlphaMode::Opaque)
-            | (u8::from(image.texel_format() == gpu::TexelFormat::A8) << 1)
+            | (u8::from(super::record::color_format(image) == Format::R8Unorm) << 1)
     })
 }
 fn sampling_expression(flags: u8) -> &'static str {

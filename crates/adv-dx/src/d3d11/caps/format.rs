@@ -43,7 +43,7 @@ impl FormatSupport {
         self.support2 |= two;
     }
 
-    fn contains(self, bit: FormatOperation) -> bool {
+    pub(super) fn contains(self, bit: FormatOperation) -> bool {
         let (one, two) = bit.flags();
         if bit.sample_count() != 0 {
             self.sample_counts & bit.sample_count() != 0

@@ -5039,6 +5039,30 @@ impl crate::GuestArg for DXGI_MAPPED_RECT {
 }
 #[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DXGI_MATRIX_3X2_F {
+    pub _11: f32,
+    pub _12: f32,
+    pub _21: f32,
+    pub _22: f32,
+    pub _31: f32,
+    pub _32: f32,
+}
+const _: () = assert!(core::mem::size_of::<DXGI_MATRIX_3X2_F>() == 24);
+const _: () = assert!(core::mem::align_of::<DXGI_MATRIX_3X2_F>() == 4);
+impl Default for DXGI_MATRIX_3X2_F { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(DXGI_MATRIX_3X2_F, _11) == 0);
+const _: () = assert!(core::mem::offset_of!(DXGI_MATRIX_3X2_F, _12) == 4);
+const _: () = assert!(core::mem::offset_of!(DXGI_MATRIX_3X2_F, _21) == 8);
+const _: () = assert!(core::mem::offset_of!(DXGI_MATRIX_3X2_F, _22) == 12);
+const _: () = assert!(core::mem::offset_of!(DXGI_MATRIX_3X2_F, _31) == 16);
+const _: () = assert!(core::mem::offset_of!(DXGI_MATRIX_3X2_F, _32) == 20);
+impl crate::GuestArg for DXGI_MATRIX_3X2_F {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 6;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DXGI_MODE_DESC {
     pub Width: u32,
     pub Height: u32,

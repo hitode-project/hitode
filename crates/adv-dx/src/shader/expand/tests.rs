@@ -326,6 +326,7 @@ fn draw(image: &Image, vertex: Arc<ModernShader>, fragment: Arc<ModernShader>) -
         h: 64,
     };
     ModernDraw {
+        color_slots: None,
         state_ids: [0; 4],
         vertex,
         fragment: Some(fragment),

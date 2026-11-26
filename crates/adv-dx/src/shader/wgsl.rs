@@ -7,6 +7,8 @@ mod memory;
 pub(crate) mod pulled;
 mod variant_interface;
 
+#[cfg(feature = "gpu")]
+pub(crate) use memory::clear_pattern;
 pub use variant_interface::STATISTICS_SLOT;
 
 use super::{analysis::Reflection, ir::*};
@@ -21,6 +23,7 @@ pub struct BindingLocation {
     pub slot: u32,
     pub group: u32,
     pub binding: u32,
+    pub sampler_min_lod_bits: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +48,12 @@ pub struct Options<'a> {
     pub storage_extents: &'a [(u32, [u32; 3])],
     pub image_atomics: bool,
     pub lod_samplers: &'a [(u32, LodSampler)],
+    pub texture_lods: &'a [TextureLod],
+    pub border_samplers: &'a [BorderSampler],
+    pub border_textures: &'a [BorderTexture],
+    pub depth_textures: &'a [u32],
+    pub depth24_textures: &'a [u32],
+    pub exact_unorm: &'a [(u32, [u8; 4])],
     pub raster_samples: u32,
 }
 
@@ -57,6 +66,12 @@ impl Default for Options<'_> {
             storage_extents: &[],
             image_atomics: false,
             lod_samplers: &[],
+            texture_lods: &[],
+            border_samplers: &[],
+            border_textures: &[],
+            depth_textures: &[],
+            depth24_textures: &[],
+            exact_unorm: &[],
             raster_samples: 1,
         }
     }
@@ -68,6 +83,41 @@ pub struct LodSampler {
     pub min: f32,
     pub max: f32,
     pub max_anisotropy: u16,
+    pub round_mip: bool,
+    pub point: bool,
+    pub linear_comparison: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TextureLod {
+    pub slot: u32,
+    pub minimum: f32,
+    pub last: u32,
+    pub default_alpha: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BorderSampler {
+    pub slot: u32,
+    pub axes: [bool; 3],
+    pub color: [f32; 4],
+    pub linear: [bool; 3],
+    pub lod: LodSampler,
+    pub comparison: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BorderChannel {
+    Missing,
+    Float,
+    Unorm(u8),
+    Snorm(u8),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BorderTexture {
+    pub slot: u32,
+    pub channels: [BorderChannel; 4],
 }
 
 pub fn emit(module: &Module, options: Options<'_>) -> Result<Translation, Error> {
@@ -169,6 +219,7 @@ fn emit_entry(
         writer.line(&format!("return {};", writer.result));
     }
     writer.source.push_str("}\n");
+    writer.clamped_sampler_declarations();
     let Writer {
         source,
         locations,
@@ -215,6 +266,9 @@ impl<'a> Writer<'a> {
 
     fn helpers(&mut self, reflection: &Reflection) {
         self.source.push_str(alu::HELPERS);
+        if !self.options.exact_unorm.is_empty() || !self.options.depth24_textures.is_empty() {
+            self.source.push_str(memory::EXACT_UNORM);
+        }
         if reflection.lod_queries {
             self.source.push_str(memory::LOD_HELPERS);
         }

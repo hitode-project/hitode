@@ -181,3 +181,29 @@ pub(super) fn enum_modes(
 
 #[cfg(test)]
 mod tests;
+
+/// DXGI and DirectDraw share the exclusive-mode owner. COM headers and
+/// DirectDraw's monotonic device IDs use disjoint ranges.
+pub(crate) fn set_modern_exclusive(
+    ext: &mut adv_machine::Ext,
+    pointer: u32,
+    enabled: bool,
+) -> bool {
+    let Some(state) = ext.try_get_mut::<super::State>() else {
+        return !enabled;
+    };
+    let owner = 1u64 << 63 | u64::from(pointer);
+    if enabled {
+        if state
+            .draw
+            .exclusive_owner
+            .is_some_and(|current| current != owner)
+        {
+            return false;
+        }
+        state.draw.exclusive_owner = Some(owner);
+    } else if state.draw.exclusive_owner == Some(owner) {
+        state.draw.exclusive_owner = None;
+    }
+    true
+}

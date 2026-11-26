@@ -223,6 +223,21 @@ pub struct ColorTarget {
 }
 
 #[cfg(feature = "backend")]
+pub(crate) fn dense_color_slots(count: usize) -> u8 {
+    ((1u16 << count) - 1) as u8
+}
+
+#[cfg(feature = "backend")]
+pub(crate) fn color_slots(mut mask: u8) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        let next = mask.checked_sub(1)?;
+        let slot = mask.trailing_zeros() as usize;
+        mask &= next;
+        Some(slot)
+    })
+}
+
+#[cfg(feature = "backend")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RenderPipelineDesc {
     pub vertex: Entry,
