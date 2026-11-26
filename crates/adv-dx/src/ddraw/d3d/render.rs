@@ -281,7 +281,9 @@ impl Calls<'_> {
         } else {
             let bytes = self.memory.arg_read(args[2], args[1] as usize * 16)?;
             bytes
-                .chunks_exact(16)
+                .as_chunks::<16>()
+                .0
+                .iter()
                 .filter_map(|bytes| {
                     let [x, y, right, bottom]: [i32; 4] = bytemuck::pod_read_unaligned(bytes);
                     let x = x.max(view.x as i32);
@@ -482,8 +484,10 @@ impl Calls<'_> {
         let mut indices = if indexed {
             let bytes = self.memory.arg_read(args[5], args[6] as usize * 2)?;
             let values = bytes
-                .chunks_exact(2)
-                .map(|word| u32::from(u16::from_le_bytes(word.try_into().unwrap())))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|word| u32::from(u16::from_le_bytes(*word)))
                 .collect::<Vec<_>>();
             if values.iter().any(|&i| i >= count) {
                 return Ok(INVALID);

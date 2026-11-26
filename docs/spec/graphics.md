@@ -139,6 +139,12 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 **Rule**: Device7 MUST admit immutable draw inputs and use shared surface residency for the textures it reads and render targets it writes. DirectDraw locks MUST see the results of the recorded GPU writes.
 **Verification**: Test
 
+### GFX-D3D7-6 Device scene on a lost target
+
+**Rule**: Device7 MUST reject scene entry on a lost render target. Clear, DrawPrimitive and SetTexture on the lost device MUST succeed without submitting work, and EndScene MUST return D3DERR_SCENE_NOT_IN_SCENE after a failed BeginScene. The same device MUST accept draws again after DirectDraw restores the target.
+**Verification**: Test
+**Basis**: Windows DirectDraw lost-surface probe
+
 ### GFX-D3D7-7 Device limits
 
 **Rule**: HAL and T&L HAL creation MUST reject render targets with any dimension over 2048. The texture extent MUST be capped by the device class limit of 1024 for RGB and 16384 for HAL and T&L HAL.

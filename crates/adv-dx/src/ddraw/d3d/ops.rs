@@ -458,15 +458,23 @@ impl Calls<'_> {
                     return Ok(INVALID);
                 };
                 let parent = device.parent;
-                let iid = if face == Face::Device7 {
-                    IID_IDIRECT3D7
-                } else {
-                    match face {
-                        Face::Device1 => IID_IDIRECT3D,
-                        Face::Device2 => IID_IDIRECT3D2,
-                        Face::Device3 => IID_IDIRECT3D3,
-                        _ => unreachable!(),
-                    }
+                let iid = match face {
+                    Face::Device1 => IID_IDIRECT3D,
+                    Face::Device2 => IID_IDIRECT3D2,
+                    Face::Device3 => IID_IDIRECT3D3,
+                    Face::Device7 => IID_IDIRECT3D7,
+                    Face::Direct3D
+                    | Face::Direct3D2
+                    | Face::Direct3D3
+                    | Face::Direct3D7
+                    | Face::Material1
+                    | Face::Material2
+                    | Face::Material3
+                    | Face::Viewport3
+                    | Face::Light
+                    | Face::Texture1
+                    | Face::Texture2
+                    | Face::VertexBuffer7 => return Ok(INVALID),
                 };
                 match super::query(self.draw, self.objects, parent, iid) {
                     Ok(pointer) => {
@@ -502,8 +510,8 @@ impl Calls<'_> {
                 }
                 if method.starts_with("Set") {
                     let bytes = self.memory.arg_read(args[1], words.len() * 4)?;
-                    for (out, word) in words.iter_mut().zip(bytes.chunks_exact(4)) {
-                        *out = u32::from_le_bytes(word.try_into().unwrap());
+                    for (out, word) in words.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                        *out = u32::from_le_bytes(*word);
                     }
                 } else {
                     words[0] = words.len() as u32 * 4;
@@ -553,7 +561,19 @@ impl Calls<'_> {
             Face::Direct3D2 => &[Face::Device2, Face::Device1],
             Face::Direct3D3 => &[Face::Device3, Face::Device2, Face::Device1],
             Face::Direct3D7 => &[Face::Device7],
-            _ => return Ok(NO_INTERFACE),
+            Face::Direct3D
+            | Face::Device1
+            | Face::Device2
+            | Face::Device3
+            | Face::Device7
+            | Face::Material1
+            | Face::Material2
+            | Face::Material3
+            | Face::Viewport3
+            | Face::Light
+            | Face::Texture1
+            | Face::Texture2
+            | Face::VertexBuffer7 => return Ok(NO_INTERFACE),
         };
         let mut device = object::Device::new(kind, parent, target);
         if face == Face::Direct3D7 {
@@ -767,7 +787,20 @@ impl Calls<'_> {
                 let faces = match face {
                     Face::Direct3D => [Face::Material1, Face::Material2, Face::Material3],
                     Face::Direct3D2 => [Face::Material2, Face::Material1, Face::Material3],
-                    _ => [Face::Material3, Face::Material1, Face::Material2],
+                    Face::Direct3D3 => [Face::Material3, Face::Material1, Face::Material2],
+                    Face::Direct3D7
+                    | Face::Device1
+                    | Face::Device2
+                    | Face::Device3
+                    | Face::Device7
+                    | Face::Material1
+                    | Face::Material2
+                    | Face::Material3
+                    | Face::Viewport3
+                    | Face::Light
+                    | Face::Texture1
+                    | Face::Texture2
+                    | Face::VertexBuffer7 => return Ok(INVALID),
                 };
                 self.make(&faces, &[], Object::Material([0; 20]))
             }

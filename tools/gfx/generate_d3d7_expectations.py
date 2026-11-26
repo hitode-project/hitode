@@ -29,8 +29,14 @@ def expectations(source):
     for row in rows(source, "d3d7_tnl"):
         if row[0] == "vx" and row[2] == "directional-diffuse-6deg-steps":
             yield [*row[:3], "".join(row[3:])]
+        elif row[0] == "vx" and row[2].startswith("vertex-blend-1weight-"):
+            yield row
+        elif row[0] == "vx" and row[1] == "hal" and row[2] == "texgen-cameraspaceposition-u=x/32":
+            yield ["stage", *row[1:3], "0", "".join(row[3:])]
         if row[0] == "px" and row[2] in {
-            "z-coplanar-less", "z-coplanar-less-zbias1", "z-coplanar-less-zbias16"
+            "z-coplanar-less", "z-coplanar-less-zbias1", "z-coplanar-less-zbias16",
+            "texture-565-0x8410-expanded", "texture-1555-0x4210-expanded",
+            "texture-4444-0x8fff-srcalpha-over-404040",
         } and row[1] == "hal":
             yield ["stage", *row[1:3], "0", row[3]]
     for row in rows(source, "d3d7_colorkey"):

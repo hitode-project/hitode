@@ -109,11 +109,21 @@ px	rgb	line-1,1-6,4-points-1.5,6.5-3,6	6	000000000000000000ffffff000000000000000
 px	rgb	line-1,1-6,4-points-1.5,6.5-3,6	7	000000000000ffffff000000000000000000000000000000
 px	rgb	subtract-half-0x40	0	c0c0c0
 vx	hal	directional-diffuse-6deg-steps	fffffffefefef9f9f9f3f3f3e9e9e9ddddddcececebebebeababab9696967f7f7f6868684f4f4f3535351b1b1b000000
+stage	hal	texgen-cameraspaceposition-u=x/32	0	080040180040280040380040480040580040680040780040880040980040a80040b80040c80040d80040e80040f80040
+vx	hal	vertex-blend-1weight-draw	80004005
+vx	hal	vertex-blend-1weight-row-of-point-c=0..4	-1	-1	-1	-1	-1
 stage	hal	z-coplanar-less	0	00ff00
 stage	hal	z-coplanar-less-zbias1	0	ff0000
 stage	hal	z-coplanar-less-zbias16	0	ff0000
+stage	hal	texture-565-0x8410-expanded	0	848284
+stage	hal	texture-4444-0x8fff-srcalpha-over-404040	0	a6a6a6
+stage	hal	texture-1555-0x4210-expanded	0	848484
 vx	tnlhal	directional-diffuse-6deg-steps	fffffffefefef9f9f9f2f2f2e9e9e9ddddddcececebdbdbdababab9696967f7f7f6868684f4f4f3535351b1b1b000000
+vx	tnlhal	vertex-blend-1weight-draw	00000000
+vx	tnlhal	vertex-blend-1weight-row-of-point-c=0..4	22	21	20	19	18
 vx	rgb	directional-diffuse-6deg-steps	fffffffefefef9f9f9f3f3f3e9e9e9ddddddcececebebebeababab9696967f7f7f6868684f4f4f3535351b1b1b000000
+vx	rgb	vertex-blend-1weight-draw	80004005
+vx	rgb	vertex-blend-1weight-row-of-point-c=0..4	-1	-1	-1	-1	-1
 setkey	hal	xrgb32-nomip	top	00000000
 ck	hal	xrgb32-nomip	level0-left-key	ggggWWWW
 setkey	hal	argb32-nomip	top	00000000

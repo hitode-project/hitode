@@ -93,7 +93,18 @@ pub(in crate::ddraw::d3d) fn stage(
             Sampler::MinFilter if !(1..=3).contains(&value) => return Err(INVALID),
             Sampler::MipFilter => value.checked_sub(1).filter(|v| *v <= 2).ok_or(INVALID)?,
             Sampler::MagFilter if value == 5 => 3,
-            _ => value,
+            Sampler::AddressU
+            | Sampler::AddressV
+            | Sampler::AddressW
+            | Sampler::BorderColor
+            | Sampler::MagFilter
+            | Sampler::MinFilter
+            | Sampler::MipLodBias
+            | Sampler::MaxMipLevel
+            | Sampler::MaxAnisotropy
+            | Sampler::SrgbTexture
+            | Sampler::ElementIndex
+            | Sampler::DisplacementOffset => value,
         };
         let set = |sampler| {
             if stage == 0 {
@@ -157,7 +168,18 @@ pub(in crate::ddraw::d3d) fn stage_value(
         return Ok(match sampler {
             Sampler::MipFilter => value + 1,
             Sampler::MagFilter if value == 3 => 5,
-            _ => value,
+            Sampler::AddressU
+            | Sampler::AddressV
+            | Sampler::AddressW
+            | Sampler::BorderColor
+            | Sampler::MagFilter
+            | Sampler::MinFilter
+            | Sampler::MipLodBias
+            | Sampler::MaxMipLevel
+            | Sampler::MaxAnisotropy
+            | Sampler::SrgbTexture
+            | Sampler::ElementIndex
+            | Sampler::DisplacementOffset => value,
         });
     }
     let slot = Stage::from_raw(slot as i32).ok_or(INVALID)?;
