@@ -1,14 +1,19 @@
 use super::*;
 use adv_gpu::{
     Extent, Format, Rect,
+    caps::FormatCaps,
     encode::{BufferCopy, ColorAttachment, ImageCopy, Load, RenderPassDesc, Store},
     pipeline::{ColorTarget, Compare, Cull, Primitive, RenderPipelineDesc, Topology},
     resource::{Address, BorderColor, Dimension, Filter, ImageDesc, SamplerDesc, Usage},
 };
+use half::f16;
 
 const WIDTH: u32 = 8;
 const HEIGHT: u32 = 4;
+const MSAA_SAMPLES: u32 = 4;
 
+// The triangle spans 16 by 8 pixels in the test viewport, so its interpolated
+// values are exact before conversion to the multisample target format.
 const VERTEX: &str = "
 struct Vertex {
     @builtin(position) position: vec4<f32>,
@@ -16,7 +21,7 @@ struct Vertex {
 }
 @vertex fn vertex_main(@builtin(vertex_index) i: u32) -> Vertex {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
-    let q = p * 0.6875 - 0.375;
+    let q = p * 0.5 - 0.25;
     let uv = 0.5 + 2.0 * q;
     return Vertex(vec4<f32>(q * vec2(1.0, -1.0), 0.0, 1.0),
                   vec4<f32>(uv + vec2(0.0625, 0.03125), uv));
@@ -31,7 +36,7 @@ struct Pixel {
 
 impl Pixel {
     fn sample_offset(&self, index: u32) -> [f32; 2] {
-        assert_eq!(self.samples, 4);
+        assert_eq!(self.samples, MSAA_SAMPLES);
         let [x, y] = [[-2, -6], [6, -2], [-6, 2], [2, 6]]
             .get(index as usize)
             .copied()
@@ -161,6 +166,17 @@ impl Resources for Pixel {
 // spec: GFX-NUM-1
 fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
     let mut gpu = Compute::open();
+    let caps = gpu.device.caps();
+    // The multisample fixtures' values are exact in RGBA16Float, which
+    // supports 4x rendering and resolve on Apple5 and Apple6.
+    let msaa_format = [Format::Rgba16Float, Format::Rgba32Float]
+        .into_iter()
+        .find(|&format| {
+            caps.format(format)
+                .contains(FormatCaps::COLOR | FormatCaps::SAMPLED)
+                && caps.format_sample_counts(format) & MSAA_SAMPLES != 0
+        })
+        .expect("4x multisampled float color format");
     for (identity, name) in [
         "raster_queries",
         "raster_samples",
@@ -178,9 +194,14 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
     {
         let module = module(name);
         let samples = if matches!(name, "raster_queries" | "raster_samples") {
-            4
+            MSAA_SAMPLES
         } else {
             1
+        };
+        let target_format = if samples > 1 {
+            msaa_format
+        } else {
+            Format::Rgba32Float
         };
         let translation = wgsl::emit(
             &module,
@@ -231,6 +252,8 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                 Register::Resource => {
                     let format = if depth {
                         Format::Depth32Float
+                    } else if multisampled {
+                        msaa_format
                     } else {
                         Format::Rgba32Float
                     };
@@ -251,7 +274,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                             size,
                             format,
                             mips,
-                            samples: if multisampled { 4 } else { 1 },
+                            samples: if multisampled { MSAA_SAMPLES } else { 1 },
                             usage: Usage::SAMPLED
                                 | if multisampled {
                                     Usage::COLOR
@@ -389,7 +412,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                         unclipped_depth: false,
                     },
                     colors: [ColorTarget {
-                        format: Format::Rgba32Float,
+                        format: target_format,
                         blend: None,
                         write_mask: 15,
                     }]
@@ -408,7 +431,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
             .create_image(&ImageDesc {
                 dimension: Dimension::D2,
                 size: extent(WIDTH, HEIGHT),
-                format: Format::Rgba32Float,
+                format: target_format,
                 mips: 1,
                 samples: 1,
                 usage: Usage::COLOR | Usage::COPY_SRC,
@@ -421,7 +444,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                 .create_image(&ImageDesc {
                     dimension: Dimension::D2,
                     size: extent(WIDTH, HEIGHT),
-                    format: Format::Rgba32Float,
+                    format: target_format,
                     mips: 1,
                     samples,
                     usage: Usage::COLOR,
@@ -468,8 +491,10 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
             }
             pass.draw(0..3, 0..1);
         }
+        let half_target = target_format == Format::Rgba16Float;
+        let pixel_bytes = if half_target { 8 } else { 16 };
         let output = gpu.buffer(
-            (WIDTH * HEIGHT * 16) as u64,
+            WIDTH as u64 * HEIGHT as u64 * pixel_bytes as u64,
             BufferUsage::COPY_DST,
             Memory::Readback,
         );
@@ -486,8 +511,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
         let token = gpu.queue.submit(encoder).unwrap();
         assert!(gpu.queue.wait(token, Duration::from_secs(20)).unwrap());
         // The render and readback copy have completed.
-        let values: &[[f32; 4]] =
-            bytemuck::cast_slice(unsafe { &*output.mapped().unwrap().as_ptr() });
+        let values = unsafe { &*output.mapped().unwrap().as_ptr() };
         let oracle: Vec<Vec<f32>> = include_str!("../../fixtures/shader-core/raster.tsv")
             .lines()
             .map(|line| line.split_once('\t').unwrap())
@@ -502,7 +526,13 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
         if !supplemental || !oracle.is_empty() {
             assert_eq!(oracle.len(), HEIGHT as usize, "{name}");
         }
-        for (i, actual) in values.iter().enumerate() {
+        for (i, pixel) in values.chunks_exact(pixel_bytes).enumerate() {
+            let actual = if half_target {
+                bytemuck::pod_read_unaligned::<[u16; 4]>(pixel)
+                    .map(|bits| f16::from_bits(bits).to_f32())
+            } else {
+                bytemuck::pod_read_unaligned::<[f32; 4]>(pixel)
+            };
             let x = (i as u32 % WIDTH) as f32 + 0.5;
             let y = (i as u32 / WIDTH) as f32 + 0.5;
             let u = x / WIDTH as f32;
@@ -532,7 +562,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                 &Constants::new(),
                 &mut Pixel {
                     uv,
-                    samples: if multisampled { 4 } else { samples },
+                    samples: if multisampled { MSAA_SAMPLES } else { samples },
                     fixture: name,
                 },
             )

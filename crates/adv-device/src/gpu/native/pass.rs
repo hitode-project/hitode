@@ -9,7 +9,7 @@
 //! attachments; by then it knows how the pass starts and how the depth buffer
 //! is used next, which a pass encoded as soon as it opens cannot know.
 //!
-//! Pure functions over [`Op`] summaries: no GPU types, tested directly.
+//! Plans are computed from [`Op`] summaries, independently of GPU encoding.
 
 use adv_gpu::Rect;
 use adv_gpu::encode::{Load, Store};
@@ -38,6 +38,43 @@ pub(crate) enum OpKind {
         /// reading it (no blending, no discard, full write mask), if known.
         opaque: Option<Rect>,
     },
+}
+
+/// Commands without a render operation close the active run. In particular,
+/// a dispatch sees the stored output of every preceding clear and draw.
+pub(super) fn render_op(
+    command: &super::stream::Command,
+    draws: &[super::stream::Draw],
+) -> Option<Op> {
+    use super::stream::Command;
+    match command {
+        Command::Clear {
+            area,
+            color,
+            depth,
+            stencil,
+        } => Some(Op {
+            area: *area,
+            kind: OpKind::Clear {
+                color: *color,
+                depth: *depth,
+                stencil: *stencil,
+            },
+        }),
+        Command::Draw(n) => {
+            let draw = &draws[*n as usize];
+            Some(Op {
+                area: draw.area,
+                kind: OpKind::Draw {
+                    writes_color: draw.writes_color,
+                    uses_depth: draw.uses_depth,
+                    writes_depth: draw.writes_depth,
+                    opaque: draw.opaque,
+                },
+            })
+        }
+        _ => None,
+    }
 }
 
 /// The next use of the depth attachment after a run of passes, if the owner
@@ -203,6 +240,73 @@ fn settle_depth(ops: &[Op], passes: &mut [Pass], next: NextDepth, has_stencil: b
             _ if pass.depth.0 == Load::None => needed,
             _ => None,
         };
+    }
+}
+
+pub(super) fn modern_attachments(
+    draw: &super::modern::ModernDraw,
+    chunk: (bool, bool),
+) -> adv_gpu::encode::RenderPassDesc<'_> {
+    use adv_gpu::encode::{ColorAttachment, DepthAttachment, RenderPassDesc};
+    fn chunk_access<T: PartialEq>(
+        load: Load<T>,
+        store: Store,
+        (first, last): (bool, bool),
+    ) -> (Load<T>, Store) {
+        if load == Load::None {
+            (load, store)
+        } else {
+            (
+                if first { load } else { Load::Load },
+                if last { store } else { Store::Store },
+            )
+        }
+    }
+    RenderPassDesc {
+        colors: draw
+            .colors
+            .iter()
+            .map(|color| {
+                let (load, store) = chunk_access(color.load, color.store, chunk);
+                ColorAttachment {
+                    view: &color.view,
+                    load,
+                    store,
+                    resolve: None,
+                }
+            })
+            .collect(),
+        depth_stencil: draw.depth.as_ref().map(|depth| DepthAttachment {
+            view: &depth.view,
+            depth: chunk_access(depth.depth.0, depth.depth.1, chunk),
+            stencil: chunk_access(depth.stencil.0, depth.stencil.1, chunk),
+            read_only: depth.read_only,
+        }),
+        area: draw.area,
+        timestamps: None,
+        label: "guest modern pass",
+    }
+}
+
+/// D3D10+ intersects the fractional viewport transform with integer
+/// viewport bounds. The user scissor clips against those bounds as well.
+pub(super) fn modern_scissor(viewport: [f32; 6], scissor: Rect) -> Rect {
+    let [left, top, width, height, _, _] = viewport;
+    let x = scissor.x.max((left - 0.5).ceil() as u32);
+    let y = scissor.y.max((top - 0.5).ceil() as u32);
+    let right = scissor
+        .x
+        .saturating_add(scissor.w)
+        .min((left + width) as u32);
+    let bottom = scissor
+        .y
+        .saturating_add(scissor.h)
+        .min((top + height) as u32);
+    Rect {
+        x,
+        y,
+        w: right.saturating_sub(x),
+        h: bottom.saturating_sub(y),
     }
 }
 

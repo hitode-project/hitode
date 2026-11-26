@@ -113,6 +113,16 @@ pub(crate) fn index(group: u32, slot: u32, buffer: bool) -> (usize, u32) {
         _ => panic!("invalid Metal binding group"),
     }
 }
+pub(crate) fn stage_slot(stage: Stages, group: u32, slot: u32) -> u32 {
+    if stage == Stages::VERTEX && group < 4 {
+        let base = crate::pipeline::VERTEX_BINDING_BASES[group as usize];
+        if slot >= base {
+            return slot - base;
+        }
+    }
+    slot
+}
+
 pub(crate) fn native(group: u32, slot: u32, buffer: bool, textures: u32) -> Result<(usize, u32)> {
     let limit = match (group, buffer) {
         (0 | 3, true) => SIZES as u32,
@@ -310,7 +320,12 @@ pub(crate) fn metal(
                     format!("undeclared binding {}:{}", binding.group, binding.binding),
                 ));
             }
-            let index = used.add(portable.group, portable.binding, buffer, options.textures)? as u8;
+            let index = used.add(
+                portable.group,
+                stage_slot(stage, portable.group, portable.binding),
+                buffer,
+                options.textures,
+            )? as u8;
             let mut target = msl::BindTarget::default();
             match (buffer, portable.group) {
                 (true, _) => target.buffer = Some(index),
@@ -335,7 +350,7 @@ pub(crate) fn metal(
             sizes: reads_sizes.then(|| {
                 sizes
                     .iter()
-                    .map(|slot| slot.map(|slot| index(3, slot, true).1 as u8))
+                    .map(|slot| slot.map(|slot| index(3, stage_slot(stage, 3, slot), true).1 as u8))
                     .collect()
             }),
         });

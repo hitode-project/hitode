@@ -20,6 +20,18 @@ fn main() {
         .opt_level(3)
         .compile("adv_xaudio_reverb");
     println!("cargo:rerun-if-changed=src/xaudio2/reverb.c");
+    if std::env::var_os("CARGO_FEATURE_GPU").is_some() {
+        let bcdec = "../adv-nt/src/native";
+        let upload = "src/gpu/native/bc_upload.c";
+        cc::Build::new()
+            .file(upload)
+            .include(bcdec)
+            .flag_if_supported("-fno-strict-aliasing")
+            .opt_level(3)
+            .compile("adv_bc_upload");
+        println!("cargo:rerun-if-changed={upload}");
+        println!("cargo:rerun-if-changed={bcdec}/bcdec.h");
+    }
     let root = "../../vendor/libtheora";
     let mut build = cc::Build::new();
     build

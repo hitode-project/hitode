@@ -12,6 +12,8 @@
 pub mod analysis;
 mod cache;
 pub mod dxbc;
+#[cfg(feature = "gpu")]
+pub mod expand;
 pub mod interpreter;
 pub mod ir;
 mod parser;
@@ -19,6 +21,8 @@ pub mod tessellator;
 #[cfg(test)]
 mod tests;
 mod translate;
+#[cfg(feature = "gpu")]
+pub mod variant;
 pub mod wgsl;
 
 pub const MAX_SHADER_TOKENS: usize = 65_536;

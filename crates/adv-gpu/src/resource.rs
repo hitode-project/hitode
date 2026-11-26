@@ -73,7 +73,8 @@ impl Image {
         self.inner.view()
     }
     /// A view of a mip or layer range, optionally in one of the formats the
-    /// image declared in [`ImageDesc::view_formats`].
+    /// image declared in [`ImageDesc::view_formats`]. A8 images also provide
+    /// the identity R8 view for attachment and storage writes.
     pub fn create_view(&self, desc: &ViewDesc) -> Result<ImageView> {
         self.inner.create_view(desc)
     }
@@ -91,6 +92,8 @@ pub struct ViewDesc {
     pub layers: std::ops::Range<u32>,
     /// For NV12 presentable buffers, 0 samples Y as `R8Unorm` and 1
     /// samples UV as `Rg8Unorm`, with ceil-divided width and height.
+    /// For depth/stencil images, 0 selects the attachment, 1 a stencil
+    /// sample view (stencil in green), and 2 a depth sample view.
     pub plane: u32,
 }
 
@@ -102,6 +105,9 @@ pub struct ImageView {
 
 #[cfg(feature = "backend")]
 impl ImageView {
+    pub fn format(&self) -> Format {
+        self.inner.format()
+    }
     pub fn image(&self) -> &Image {
         self.inner.image()
     }

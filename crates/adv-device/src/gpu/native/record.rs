@@ -214,6 +214,45 @@ pub(super) enum WorkerItem {
         state: DrawState,
         clips: Clips,
     },
+    DrawModern {
+        facade: u64,
+        draw: Box<super::modern::ModernDraw>,
+        statistics: Option<super::modern::QuerySlot>,
+        vertex: Vec<super::modern::BoundSlot>,
+        fragment: Vec<super::modern::BoundSlot>,
+    },
+    Expand {
+        facade: u64,
+        plan: Box<super::expand::Expand>,
+        per_chunk: u32,
+    },
+    Dispatch {
+        facade: u64,
+        work: super::modern::Compute,
+    },
+    Resolve {
+        facade: u64,
+        source: adv_gpu::ImageView,
+        destination: adv_gpu::ImageView,
+    },
+    TransferImage {
+        facade: u64,
+        command: Box<Command>,
+    },
+    GenerateMips {
+        facade: u64,
+        view: adv_gpu::ImageView,
+    },
+    Timestamp {
+        facade: u64,
+        slot: super::modern::QuerySlot,
+    },
+    ReadQuery {
+        facade: u64,
+        slot: super::modern::QuerySlot,
+        destination: adv_gpu::Buffer,
+        offset: u64,
+    },
     Blit {
         facade: u64,
         source: Image,
@@ -860,6 +899,98 @@ impl WorkerState {
                 self.execute_draw_programmable(facade, &target, &draw, &state, &clips)
                     .map_err(|error| (facade, error))?;
             }
+            WorkerItem::DrawModern {
+                facade,
+                draw,
+                statistics,
+                vertex,
+                fragment,
+            } => {
+                if self.facade_failure(facade).is_none() {
+                    let state = self.facades.get_mut(&facade).unwrap();
+                    let pipeline = state
+                        .pipelines
+                        .modern(&self.device, &draw)
+                        .map_err(|error| (facade, error))?;
+                    self.stream
+                        .push(Command::DrawModern(Box::new(super::modern::Render {
+                            draw: *draw,
+                            statistics,
+                            pipeline,
+                            vertex,
+                            fragment,
+                        })));
+                    state.stats.draws += 1;
+                }
+            }
+            WorkerItem::Expand {
+                facade,
+                plan,
+                per_chunk,
+            } => {
+                if self.facade_failure(facade).is_none() {
+                    let state = self.facades.get_mut(&facade).unwrap();
+                    let pipelines = plan
+                        .bins
+                        .iter()
+                        .map(|bin| state.pipelines.modern(&self.device, &bin.draw))
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| (facade, error))?;
+                    self.stream
+                        .push(Command::Expand(Box::new(super::expand::Work {
+                            plan: *plan,
+                            per_chunk,
+                            pipelines,
+                        })));
+                    state.stats.draws += 1;
+                }
+            }
+            WorkerItem::Dispatch { facade, work } => {
+                if self.facade_failure(facade).is_none() {
+                    self.stream.push(Command::Dispatch(Box::new(work)));
+                }
+            }
+            WorkerItem::Resolve {
+                facade,
+                source,
+                destination,
+            } => {
+                if self.facade_failure(facade).is_none() {
+                    self.stream.push(Command::Resolve {
+                        source,
+                        destination,
+                    });
+                }
+            }
+            WorkerItem::TransferImage { facade, command } => {
+                if self.facade_failure(facade).is_none() {
+                    self.stream.push(*command);
+                }
+            }
+            WorkerItem::GenerateMips { facade, view } => {
+                if self.facade_failure(facade).is_none() {
+                    self.stream.push(Command::GenerateMips(view));
+                }
+            }
+            WorkerItem::Timestamp { facade, slot } => {
+                if self.facade_failure(facade).is_none() {
+                    self.stream.push(Command::Timestamp(slot));
+                }
+            }
+            WorkerItem::ReadQuery {
+                facade,
+                slot,
+                destination,
+                offset,
+            } => {
+                if self.facade_failure(facade).is_none() {
+                    self.stream.push(Command::ReadQuery {
+                        slot,
+                        destination,
+                        offset,
+                    });
+                }
+            }
             WorkerItem::Blit {
                 facade,
                 source,
@@ -1111,7 +1242,7 @@ impl WorkerState {
         });
         if !same {
             self.stream.push(Command::Target {
-                color: target.image.clone(),
+                colors: smallvec::smallvec![target.image.clone()],
                 depth: target.depth.clone(),
             });
             self.target = Some((target.image.id(), target.depth.clone()));

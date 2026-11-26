@@ -4,7 +4,7 @@
 
 use super::resources::Storage;
 use super::stream::{Binding, Bytes, Chunk, Command, Consumer, Draw, UploadSource, Waker};
-use super::{Depth, Image, Target, backing, pass};
+use super::{Depth, Image, backing, modern, pass};
 use crate::frame::{Base, Frame, Presenter, SwapImage};
 use adv_gpu::encode::{Bind, BufferCopy, ColorAttachment, DepthAttachment, ImageCopy};
 use adv_gpu::resource::BufferSlice;
@@ -111,12 +111,20 @@ struct Run {
     locations: Vec<(usize, usize)>,
     passes: Vec<pass::Pass>,
 }
+struct Attachments {
+    colors: super::stream::Colors,
+    depth: Option<Depth>,
+}
+
 struct State {
     wake: super::stream::Waker,
     queue: Queue,
     encoder: Option<Encoder>,
     presenter: Box<dyn Presenter>,
-    target: Option<Target>,
+    target: Option<Attachments>,
+    predicate_pipeline: Option<adv_gpu::ComputePipeline>,
+    expansion: super::expand::Ring,
+    timestamp_pipeline: Option<adv_gpu::ComputePipeline>,
     depths: Vec<Depth>,
     run: Run,
     chunks: VecDeque<Chunk>,
@@ -206,6 +214,9 @@ impl State {
             encoder: None,
             presenter,
             target: None,
+            predicate_pipeline: None,
+            expansion: super::expand::Ring::default(),
+            timestamp_pipeline: None,
             depths: Vec::new(),
             run: Run::default(),
             chunks: VecDeque::new(),
@@ -322,34 +333,7 @@ impl State {
                 continue;
             }
             let current = &self.chunks[chunk];
-            let op = match &current.commands[at] {
-                Command::Clear {
-                    area,
-                    color,
-                    depth,
-                    stencil,
-                } => Some(pass::Op {
-                    area: *area,
-                    kind: pass::OpKind::Clear {
-                        color: *color,
-                        depth: *depth,
-                        stencil: *stencil,
-                    },
-                }),
-                Command::Draw(n) => {
-                    let d = &current.draws[*n as usize];
-                    Some(pass::Op {
-                        area: d.area,
-                        kind: pass::OpKind::Draw {
-                            writes_color: d.writes_color,
-                            uses_depth: d.uses_depth,
-                            writes_depth: d.writes_depth,
-                            opaque: d.opaque,
-                        },
-                    })
-                }
-                _ => None,
-            };
+            let op = pass::render_op(&current.commands[at], &current.draws);
             if let Some(op) = op {
                 self.run.ops.push(op);
                 self.run.locations.push(self.cursor);
@@ -395,11 +379,102 @@ impl State {
     }
     fn command(&mut self, command: Command, chunk: usize) -> adv_gpu::Result<()> {
         match command {
-            Command::Target { color, depth } => {
-                self.target = Some(Target {
-                    image: color,
-                    depth,
-                })
+            Command::Target { colors, depth } => {
+                self.target = Some(Attachments { colors, depth });
+            }
+            Command::DrawModern(draw) => self.draw_modern(*draw)?,
+            Command::Expand(work) => {
+                let device = self.queue.device().clone();
+                let mut expansion = std::mem::take(&mut self.expansion);
+                expansion.encode(&device, self.encoder(), *work)?;
+                self.expansion = expansion;
+            }
+            Command::Dispatch(work) => {
+                let work = *work;
+                let mut pass = self
+                    .encoder()
+                    .compute_pass(&adv_gpu::encode::ComputePassDesc {
+                        timestamps: None,
+                        label: "guest dispatch",
+                    });
+                pass.set_pipeline(&work.pipeline);
+                for binding in &work.bindings {
+                    pass.bind(binding.slot, binding.binding());
+                }
+                match work.arguments {
+                    modern::DispatchArguments::Direct([x, y, z]) => pass.dispatch(x, y, z),
+                    modern::DispatchArguments::Indirect(buffer) => {
+                        pass.dispatch_indirect(buffer.buffer.slice(buffer.range));
+                    }
+                }
+            }
+            Command::Resolve {
+                source,
+                destination,
+            } => self.encoder().resolve(&source, &destination),
+            Command::GenerateMips(view) => self.encoder().generate_mips(&view),
+            Command::UploadImage {
+                image,
+                mip,
+                layer,
+                staged,
+                extent,
+            } => {
+                self.encoder().copy_buffer_to_image(
+                    BufferCopy {
+                        buffer: staged.buffer(),
+                        offset: 0,
+                        row_pitch: staged.pitch(),
+                        rows: 0,
+                    },
+                    ImageCopy {
+                        image: &image,
+                        mip,
+                        layer,
+                        origin: (0, 0, 0),
+                    },
+                    extent,
+                );
+                self.uploads.push_back((Token(u64::MAX), staged));
+                self.pending_uploads += 1;
+            }
+            Command::ReadImage {
+                image,
+                mip,
+                layer,
+                buffer,
+                row_pitch,
+                extent,
+            } => {
+                self.encoder().copy_image_to_buffer(
+                    ImageCopy {
+                        image: &image,
+                        mip,
+                        layer,
+                        origin: (0, 0, 0),
+                    },
+                    BufferCopy {
+                        buffer: &buffer,
+                        offset: 0,
+                        row_pitch,
+                        rows: 0,
+                    },
+                    extent,
+                );
+            }
+
+            Command::Timestamp(slot) => self.timestamp(slot)?,
+            Command::ReadQuery {
+                slot,
+                destination,
+                offset,
+            } => {
+                self.encoder().resolve_queries(
+                    &slot.set,
+                    slot.index..slot.index + 1,
+                    &destination,
+                    offset,
+                );
             }
             Command::Upload {
                 source,
@@ -502,6 +577,7 @@ impl State {
                 video,
                 windows,
             } => {
+                self.expansion.begin_frame();
                 let (raw, _, _) = self.image(&image)?;
                 let mut swap = match &image.storage {
                     Storage::Fixed { .. } => SwapImage::Private(raw),
@@ -541,6 +617,7 @@ impl State {
                 windows,
                 serial,
             } => {
+                self.expansion.begin_frame();
                 if self.encoder.is_some() {
                     self.submit(None)?;
                 }
@@ -560,6 +637,129 @@ impl State {
         }
         Ok(())
     }
+    fn draw_modern(&mut self, render: modern::Render) -> adv_gpu::Result<()> {
+        let draw = render.draw;
+        let predicated = draw
+            .predicate
+            .as_ref()
+            .map(|predicate| {
+                self.predicated_arguments(&draw.arguments, draw.index.is_some(), predicate)
+            })
+            .transpose()?;
+        let arguments = predicated.as_ref().unwrap_or(&draw.arguments);
+        draw_modern_pass(
+            self.encoder(),
+            (&draw, &render.pipeline),
+            (&render.vertex, &render.fragment),
+            arguments,
+            render.statistics.as_ref(),
+            (true, true),
+        );
+        Ok(())
+    }
+
+    fn predicated_arguments(
+        &mut self,
+        arguments: &modern::DrawArguments,
+        indexed: bool,
+        predicate: &modern::Predicate,
+    ) -> adv_gpu::Result<modern::DrawArguments> {
+        use adv_gpu::resource::{BufferDesc, BufferUsage, Memory};
+        let device = self.queue.device();
+        if self.predicate_pipeline.is_none() {
+            let pipeline = utility_compute(
+                device,
+                "@group(3) @binding(0) var<storage, read_write> data: array<u32>;
+                @compute @workgroup_size(1) fn main() {
+                    let visible = (data[0] | data[1]) != 0u;
+                    if visible == (data[2] != 0u) { data[4] = 0u; }
+                }",
+                0x15e1_552c_7626_1d91,
+                vec![adv_gpu::pipeline::Binding {
+                    slot: 0,
+                    kind: adv_gpu::pipeline::BindingKind::StorageBuffer { writable: true },
+                    stages: adv_gpu::pipeline::Stages::COMPUTE,
+                }],
+            )?;
+            self.predicate_pipeline = Some(pipeline);
+        }
+        let pipeline = self.predicate_pipeline.as_ref().unwrap().clone();
+        let size = if indexed { 20 } else { 16 };
+        let buffer = device.create_buffer(&BufferDesc {
+            size: 16 + size,
+            usage: BufferUsage::INDIRECT | BufferUsage::STORAGE | BufferUsage::COPY_DST,
+            memory: Memory::Device,
+            label: "predicated draw arguments",
+        })?;
+        let encoder = self.encoder();
+        let query = &predicate.query;
+        encoder.resolve_queries(&query.set, query.index..query.index + 1, &buffer, 0);
+        encoder.fill_buffer(buffer.slice(8..12), u32::from(predicate.inverted));
+        match arguments {
+            modern::DrawArguments::Direct {
+                vertices,
+                instances,
+                base_vertex,
+            } => {
+                let last = if indexed {
+                    *base_vertex as u32
+                } else {
+                    instances.start
+                };
+                for (i, word) in [
+                    vertices.len() as u32,
+                    instances.len() as u32,
+                    vertices.start,
+                    last,
+                    instances.start,
+                ][..(size / 4) as usize]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                {
+                    let start = 16 + i as u64 * 4;
+                    encoder.fill_buffer(buffer.slice(start..start + 4), word);
+                }
+            }
+            modern::DrawArguments::Indirect(source) => {
+                encoder.copy_buffer(
+                    source
+                        .buffer
+                        .slice(source.range.start..source.range.start + size),
+                    &buffer,
+                    16,
+                );
+            }
+        }
+        {
+            let mut pass = encoder.compute_pass(&adv_gpu::encode::ComputePassDesc {
+                timestamps: None,
+                label: "draw predicate",
+            });
+            pass.set_pipeline(&pipeline);
+            pass.bind(0, Bind::StorageBuffer(buffer.slice(0..16 + size)));
+            pass.dispatch(1, 1, 1);
+        }
+        Ok(modern::DrawArguments::Indirect(modern::BufferRange {
+            buffer,
+            range: 16..16 + size,
+        }))
+    }
+
+    fn timestamp(&mut self, slot: modern::QuerySlot) -> adv_gpu::Result<()> {
+        if self.timestamp_pipeline.is_none() {
+            self.timestamp_pipeline = Some(utility_compute(
+                self.queue.device(),
+                "@compute @workgroup_size(1) fn main() {}",
+                0x0e3c_82a1_c6a0_8ade,
+                Vec::new(),
+            )?);
+        }
+        let pipeline = self.timestamp_pipeline.as_ref().unwrap().clone();
+        self.encoder()
+            .write_timestamp(&slot.set, slot.index, &pipeline)
+    }
+
     fn end_frame(&mut self) {
         for depth in self.depths.drain(..) {
             depth.0.owner.lock().unwrap().end_frame();
@@ -582,10 +782,14 @@ impl State {
         Ok(token)
     }
     fn render(&mut self, run: &Run) -> adv_gpu::Result<()> {
-        let target = self.target.as_ref().unwrap().clone();
-        let (_, color, _) = self.image(&target.image)?;
-        let depth_image = target
-            .depth
+        let Attachments { colors, depth } = self.target.as_ref().unwrap();
+        let targets = colors.clone();
+        let depth = depth.clone();
+        let colors = targets
+            .iter()
+            .map(|image| self.image(image).map(|(_, view, _)| view))
+            .collect::<adv_gpu::Result<arrayvec::ArrayVec<_, 8>>>()?;
+        let depth_image = depth
             .as_ref()
             .map(|depth| {
                 if !self
@@ -621,14 +825,15 @@ impl State {
         self.encoder();
         for plan in &run.passes {
             let desc = RenderPassDesc {
-                colors: [ColorAttachment {
-                    view: &color,
-                    load: plan.color.0,
-                    store: plan.color.1,
-                    resolve: None,
-                }]
-                .into_iter()
-                .collect(),
+                colors: colors
+                    .iter()
+                    .map(|view| ColorAttachment {
+                        view,
+                        load: plan.color.0,
+                        store: plan.color.1,
+                        resolve: None,
+                    })
+                    .collect(),
                 depth_stencil: depth_image.as_ref().map(|image| DepthAttachment {
                     view: image.view(),
                     depth: plan.depth,
@@ -725,6 +930,28 @@ impl State {
         Ok(())
     }
 }
+fn utility_compute(
+    device: &adv_gpu::Device,
+    source: &str,
+    identity: u64,
+    bindings: Vec<adv_gpu::pipeline::Binding>,
+) -> adv_gpu::Result<adv_gpu::ComputePipeline> {
+    use adv_gpu::shader::{ShaderDesc, Source, Stage};
+    let shader = device.create_shader(ShaderDesc {
+        source: Source::Wgsl(source),
+        identity,
+        label: "guest utility",
+    })?;
+    device.create_compute_pipeline(
+        &adv_gpu::pipeline::ComputePipelineDesc {
+            entry: shader.entry("main", Stage::Compute)?,
+            bindings,
+            label: "guest utility",
+        },
+        None,
+    )
+}
+
 fn slice(bytes: Bytes, spans: &[Span]) -> BufferSlice<'_> {
     let span = &spans[bytes.span as usize];
     let offset = span.offset() + u64::from(bytes.offset);
@@ -737,6 +964,69 @@ fn extent(rect: Rect) -> Extent {
         depth_or_layers: 1,
     }
 }
+pub(super) fn draw_modern_pass(
+    encoder: &mut Encoder,
+    (draw, pipeline): (&modern::ModernDraw, &adv_gpu::RenderPipeline),
+    (vertex, fragment): (&[modern::BoundSlot], &[modern::BoundSlot]),
+    arguments: &modern::DrawArguments,
+    statistics: Option<&modern::QuerySlot>,
+    chunk: (bool, bool),
+) {
+    #[cfg(target_vendor = "apple")]
+    let _ = statistics;
+    let mut pass = encoder.render_pass(&pass::modern_attachments(draw, chunk));
+    pass.set_pipeline(pipeline);
+    let [x, y, w, h, min, max] = draw.viewport;
+    pass.set_viewport(x, y, w, h, min, max);
+    pass.set_scissor(pass::modern_scissor(draw.viewport, draw.scissor));
+    pass.set_stencil_reference(draw.stencil_reference);
+    pass.set_blend_constant(draw.blend_constant);
+    let [constant, slope, clamp] = draw.depth_bias;
+    pass.set_depth_bias(constant, slope, clamp);
+    for binding in vertex {
+        pass.bind_vertex(binding.slot, binding.binding());
+    }
+    for binding in fragment {
+        pass.bind(binding.slot, binding.binding());
+    }
+    if let Some((index, format)) = &draw.index {
+        pass.set_index_buffer(index.buffer.slice(index.range.clone()), *format);
+    }
+    if let Some(query) = &draw.occlusion {
+        pass.begin_occlusion(&query.set, query.index);
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    if let Some(query) = statistics {
+        pass.begin_statistics(&query.set, query.index);
+    }
+    match arguments {
+        modern::DrawArguments::Direct {
+            vertices,
+            instances,
+            base_vertex,
+        } => {
+            if draw.index.is_some() {
+                pass.draw_indexed(vertices.clone(), *base_vertex, instances.clone());
+            } else {
+                pass.draw(vertices.clone(), instances.clone());
+            }
+        }
+        modern::DrawArguments::Indirect(buffer) => {
+            pass.draw_indirect(
+                buffer.buffer.slice(buffer.range.clone()),
+                draw.index.is_some(),
+            );
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    if statistics.is_some() {
+        pass.end_statistics();
+    }
+    if draw.occlusion.is_some() {
+        pass.end_occlusion();
+    }
+}
+
 fn next_depth<'a>(
     depth: Option<&Depth>,
     commands: impl Iterator<Item = (&'a Command, &'a [Draw])>,
@@ -886,7 +1176,7 @@ mod tests {
     }
     fn color(image: &Image) -> Command {
         Command::Target {
-            color: image.clone(),
+            colors: smallvec::smallvec![image.clone()],
             depth: None,
         }
     }
@@ -1536,7 +1826,7 @@ struct Color {rgba:vec4<f32>}
             DepthFormat::Depth24Stencil8,
         )));
         h.producer.push(Command::Target {
-            color: image.clone(),
+            colors: smallvec::smallvec![image.clone()],
             depth: Some(depth.clone()),
         });
         let clear_depth = || Command::Clear {
@@ -1680,7 +1970,7 @@ struct Output {@builtin(position) position:vec4<f32>,@location(0) color:vec4<f32
             stencil: Some(0),
         };
         h.producer.push(Command::Target {
-            color: image.clone(),
+            colors: smallvec::smallvec![image.clone()],
             depth: Some(depth.clone()),
         });
         h.producer.push(clear_depth());
