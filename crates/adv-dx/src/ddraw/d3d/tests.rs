@@ -410,7 +410,8 @@ fn children_hold_one_reference_and_device_handles_are_local() {
 // spec: GFX-D3D7-1
 #[test]
 fn production_directdraw_keeps_refusing_direct3d() {
-    let mut f = Fixture::new(false);
+    let forced = std::env::var_os("ADV_DDRAW_LEGACY").is_some_and(|value| value == "1");
+    let mut f = Fixture::new(forced);
     let old = f.dd(1);
     let ex = f.dd(7);
     for dd in [old, ex] {
@@ -2577,4 +2578,389 @@ fn device7_validates_and_draws_the_captured_texture_cascades() {
             );
         }
     }
+}
+
+// spec: GFX-D3D7-1, GFX-D3D7-3, GFX-D3D7-5
+#[test]
+fn legacy_execute_buffer_copies_vertices_and_draws_the_captured_triangle() {
+    use adv_abi::types::D3DEXECUTEDATA;
+    let mut f = Fixture::new(true);
+    let dd = f.dd(1);
+    let d3d = f.face(dd, IID_IDIRECT3D);
+    let target = f.surface(
+        dd,
+        false,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let device = f.face(target, IID_IDIRECT3DHALDEVICE);
+    let viewport = f.output("IDirect3D::CreateViewport", &[d3d, OUT, 0]);
+    assert_eq!(
+        f.call("IDirect3DDevice::AddViewport", &[device, viewport]),
+        0
+    );
+    let desc = DATA + 0x80;
+    f.write(
+        desc,
+        bytemuck::cast_slice(&[
+            44u32,
+            0,
+            0,
+            32,
+            32,
+            16f32.to_bits(),
+            16f32.to_bits(),
+            1f32.to_bits(),
+            1f32.to_bits(),
+            0,
+            1f32.to_bits(),
+        ]),
+    );
+    assert_eq!(
+        f.call("IDirect3DViewport3::SetViewport", &[viewport, desc]),
+        0
+    );
+
+    f.write(desc, bytemuck::cast_slice(&[20u32, 1, 0, 1024, 0]));
+    let buffer = f.output(
+        "IDirect3DDevice::CreateExecuteBuffer",
+        &[device, desc, OUT, 0],
+    );
+    assert_eq!(f.call("IDirect3DExecuteBuffer::Lock", &[buffer, desc]), 0);
+    let data = f.word(desc + 16);
+    assert_eq!(f.word(desc + 12), 1024);
+    assert_eq!(f.word(desc + 8), 0);
+    assert_eq!(
+        f.call("IDirect3DExecuteBuffer::Lock", &[buffer, desc]),
+        0x887602ca
+    );
+    let vertices = [
+        tl(2., 2., 0., 0xff00ff00),
+        tl(30., 2., 0., 0xff00ff00),
+        tl(2., 30., 0., 0xff00ff00),
+    ];
+    f.write(data, bytemuck::cast_slice(&vertices));
+    let instructions = [
+        0x0001_1009u32,
+        2,
+        0,
+        3,
+        0, // COPY three TL vertices
+        0x0001_0808,
+        7,
+        0, // disable Z
+        0x0001_0803,
+        1 << 16,
+        0x0700_0002, // triangle
+        11,
+    ];
+    f.write(data + 96, bytemuck::cast_slice(&instructions));
+    let mut execute = D3DEXECUTEDATA {
+        dwSize: 48,
+        dwVertexCount: 3,
+        dwInstructionOffset: 96,
+        dwInstructionLength: size_of_val(&instructions) as u32,
+        ..Default::default()
+    };
+    f.write(desc, bytemuck::bytes_of(&execute));
+    assert_eq!(
+        f.call("IDirect3DExecuteBuffer::SetExecuteData", &[buffer, desc]),
+        0
+    );
+    assert_eq!(f.call("IDirect3DDevice::BeginScene", &[device]), 0);
+    assert_eq!(
+        f.call("IDirect3DDevice::Execute", &[device, buffer, viewport, 1]),
+        0x887602ca
+    );
+    assert_eq!(f.call("IDirect3DExecuteBuffer::Unlock", &[buffer]), 0);
+    assert_eq!(f.call("IDirect3DViewport3::Clear", &[viewport, 0, 0, 1]), 0);
+    assert_eq!(
+        f.call("IDirect3DDevice::Execute", &[device, buffer, viewport, 1]),
+        0
+    );
+    assert_eq!(
+        f.call("IDirect3DExecuteBuffer::GetExecuteData", &[buffer, desc]),
+        0
+    );
+    f.machine
+        .cpu
+        .read(desc, bytemuck::bytes_of_mut(&mut execute))
+        .unwrap();
+    let extent = execute.dsStatus.drExtent;
+    assert_eq!(
+        (
+            execute.dsStatus.dwFlags,
+            extent.x1,
+            extent.y1,
+            extent.x2,
+            extent.y2
+        ),
+        (0, 1, 1, 31, 31)
+    );
+    assert_eq!(f.call("IDirect3DDevice::EndScene", &[device]), 0);
+    let pixels = f.pixels(target, 32, 32);
+    assert_eq!(pixels[6 + 6 * 32], 0x00ff00);
+    assert_eq!(pixels[28 + 28 * 32], 0);
+    f.write(desc, &20u32.to_le_bytes());
+    assert_eq!(f.call("IDirect3DExecuteBuffer::Lock", &[buffer, desc]), 0);
+    assert_eq!(f.word(desc + 16), data);
+    f.write(data + 96 + 6 * 4, bytemuck::cast_slice(&[8u32, 2]));
+    f.write(data + 96 + 10 * 4, &0x0100_0002u32.to_le_bytes());
+    assert_eq!(f.call("IDirect3DExecuteBuffer::Unlock", &[buffer]), 0);
+    assert_eq!(f.call("IDirect3DDevice::BeginScene", &[device]), 0);
+    assert_eq!(f.call("IDirect3DViewport3::Clear", &[viewport, 0, 0, 1]), 0);
+    assert_eq!(
+        f.call("IDirect3DDevice::Execute", &[device, buffer, viewport, 1]),
+        0
+    );
+    assert_eq!(f.call("IDirect3DDevice::EndScene", &[device]), 0);
+    let pixels = f.pixels(target, 32, 32);
+    assert_eq!(pixels[6 + 2 * 32], 0x00ff00);
+    assert_eq!(pixels[2 + 6 * 32], 0);
+    assert_eq!(f.call("IDirect3DExecuteBuffer::Release", &[buffer]), 0);
+}
+
+// spec: GFX-D3D7-3
+#[test]
+fn vertex_buffers_process_positions_and_preserve_diffuse_and_texcoords() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let device = f.device(d3d, Face::Direct3D7, rt);
+    let desc = DATA + 0xc0;
+    let lock =
+        |f: &mut Fixture, buffer| f.output("IDirect3DVertexBuffer7::Lock", &[buffer, 0, OUT, 0]);
+    let src = {
+        f.write(desc, bytemuck::cast_slice(&[16u32, 0x800, 0x1e2, 1]));
+        f.output("IDirect3D7::CreateVertexBuffer", &[d3d, desc, OUT, 0])
+    };
+    let dst = {
+        f.write(desc, bytemuck::cast_slice(&[16u32, 0x800, 0x1c4, 1]));
+        f.output("IDirect3D7::CreateVertexBuffer", &[d3d, desc, OUT, 0])
+    };
+    let ptr = lock(&mut f, src);
+    f.write(
+        ptr,
+        bytemuck::cast_slice(&[
+            0f32.to_bits(),
+            0.5f32.to_bits(),
+            0.25f32.to_bits(),
+            0,
+            0xff123456,
+            0xff000001,
+            0.75f32.to_bits(),
+            0.5f32.to_bits(),
+        ]),
+    );
+    assert_eq!(f.call("IDirect3DVertexBuffer7::Unlock", &[src]), 0);
+    assert_eq!(
+        f.call(
+            "IDirect3DVertexBuffer7::ProcessVertices",
+            &[dst, 1, 0, 1, src, 0, device, 0]
+        ),
+        0
+    );
+    let ptr = lock(&mut f, dst);
+    assert_eq!(
+        std::array::from_fn::<_, 8, _>(|i| f.word(ptr + i as u32 * 4)),
+        [
+            16f32.to_bits(),
+            8f32.to_bits(),
+            0.25f32.to_bits(),
+            1f32.to_bits(),
+            0xff123456,
+            0xff000001,
+            0.75f32.to_bits(),
+            0.5f32.to_bits(),
+        ]
+    );
+    assert_eq!(f.call("IDirect3DVertexBuffer7::Unlock", &[dst]), 0);
+}
+
+// spec: GFX-D3D7-6
+#[test]
+fn exclusive_mode_changes_and_window_activation_lose_video_surfaces() {
+    #[derive(Clone, Copy)]
+    struct Active(bool);
+    let mut f = Fixture::new(true);
+    f.machine.ext.insert(Active(true));
+    f.machine
+        .ext
+        .get_mut::<front::State>()
+        .set_activation_provider(|ext, _| Some(ext.get::<Active>().0));
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    assert_eq!(
+        f.call("IDirectDraw7::SetCooperativeLevel", &[dd, 1, 0x11]),
+        0
+    );
+    let primary = f.surface(
+        dd,
+        true,
+        creation::PRIMARY | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let video = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::VIDEO_MEMORY,
+        16,
+        16,
+    );
+    let system = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::SYSTEM_MEMORY,
+        16,
+        16,
+    );
+    let device = f.device(d3d, Face::Direct3D7, primary);
+    let set = |f: &mut Fixture, w, h, bits| {
+        f.call("IDirectDraw7::SetDisplayMode", &[dd, w, h, bits, 0, 0])
+    };
+    let lost = |f: &mut Fixture, p| f.call("IDirectDrawSurface7::IsLost", &[p]);
+    let desc = DATA + 0x100;
+
+    assert_eq!(set(&mut f, 640, 480, 16), 0);
+    assert_eq!(lost(&mut f, primary), 0x887601c2);
+    assert_eq!(lost(&mut f, video), 0x887601c2);
+    assert_eq!(lost(&mut f, system), 0);
+    f.lock(primary, 0x10);
+    f.unlock(primary);
+    f.write(desc, &124u32.to_le_bytes());
+    assert_eq!(
+        f.call("IDirectDrawSurface7::Lock", &[video, 0, desc, 0x10, 0]),
+        0x887601c2
+    );
+    assert_eq!(
+        f.call("IDirectDrawSurface7::Blt", &[primary, 0, system, 0, 0, 0]),
+        0x887601c2
+    );
+    assert_eq!(
+        f.call("IDirectDraw7::RestoreAllSurfaces", &[dd]),
+        0x8876024b
+    );
+    assert_eq!(f.device_call(device, "BeginScene", &[]), 0x887602fa);
+    assert_eq!(f.call("IDirectDraw7::RestoreDisplayMode", &[dd]), 0);
+    assert_eq!(f.call("IDirectDraw7::RestoreAllSurfaces", &[dd]), 0);
+    assert_eq!(lost(&mut f, primary), 0);
+
+    f.machine.ext.get_mut::<Active>().0 = false;
+    assert_eq!(
+        f.call("IDirectDraw7::TestCooperativeLevel", &[dd]),
+        0x887600e1
+    );
+    assert_eq!(f.device_call(device, "BeginScene", &[]), 0x887601c2);
+    f.machine.ext.get_mut::<Active>().0 = true;
+    assert_eq!(f.call("IDirectDraw7::TestCooperativeLevel", &[dd]), 0);
+    assert_eq!(f.device_call(device, "BeginScene", &[]), 0x887601c2);
+    assert_eq!(f.call("IDirectDraw7::RestoreAllSurfaces", &[dd]), 0);
+    assert_eq!(f.device_call(device, "BeginScene", &[]), 0);
+    assert_eq!(f.device_call(device, "EndScene", &[]), 0);
+
+    assert_eq!(set(&mut f, 640, 480, 8), 0);
+    f.write(desc, &124u32.to_le_bytes());
+    assert_eq!(f.call("IDirectDraw7::GetDisplayMode", &[dd, desc]), 0);
+    assert_eq!((f.word(desc + 76), f.word(desc + 84)), (0x60, 8));
+    assert_eq!(f.call("IDirectDrawSurface7::Release", &[primary]), 1);
+    assert_eq!(f.call("IDirect3DDevice7::Release", &[device]), 0);
+    let indexed = f.surface(dd, true, creation::PRIMARY, 640, 480);
+    let entries = DATA + 0x400;
+    let colors = [[32u8, 64, 128, 0]; 256];
+    f.write(entries, bytemuck::cast_slice(&colors));
+    let palette = f.output("IDirectDraw7::CreatePalette", &[dd, 0x44, entries, OUT, 0]);
+    assert_eq!(
+        f.call("IDirectDrawSurface7::SetPalette", &[indexed, palette]),
+        0
+    );
+    assert_eq!(
+        f.output("IDirectDrawSurface7::GetPalette", &[indexed, OUT]),
+        palette
+    );
+    assert_eq!(f.call("IDirectDrawPalette::Release", &[palette]), 2);
+    assert_eq!(f.call("IDirectDrawPalette::Release", &[palette]), 1);
+    assert_eq!(f.call("IDirectDrawSurface7::Release", &[indexed]), 0);
+    assert_eq!(f.call("IDirectDraw7::GetDisplayMode", &[dd, desc]), 0);
+    assert_eq!(set(&mut f, 640, 480, 24), 0);
+    assert_eq!(f.call("IDirectDraw7::GetDisplayMode", &[dd, desc]), 0);
+    assert_eq!((f.word(desc + 76), f.word(desc + 84)), (0x40, 32));
+    assert_eq!(set(&mut f, 700, 500, 32), 0x80004001);
+    assert_eq!(f.call("IDirectDraw7::SetCooperativeLevel", &[dd, 1, 8]), 0);
+    assert_eq!(
+        f.call("IDirectDraw7::TestCooperativeLevel", &[dd]),
+        0x8876024b
+    );
+}
+
+// spec: GFX-D3D7-2, GFX-CAP-6
+#[test]
+fn legacy_caps_and_texture_callbacks_use_the_interface_layout() {
+    use adv_abi::types::{D3DDEVICEDESC, DDPIXELFORMAT};
+    let mut f = Fixture::new(true);
+    let callback = DATA + 0xf00;
+    f.machine.cpu.protect(DATA, 4096, Prot::RWX).unwrap();
+    let dd = f.dd(1);
+    let target = f.surface(
+        dd,
+        false,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let device1 = f.face(target, IID_IDIRECT3DHALDEVICE);
+    let d3d2 = f.face(dd, IID_IDIRECT3D2);
+    let d3d3 = f.face(dd, IID_IDIRECT3D3);
+    let device2 = f.device(d3d2, Face::Direct3D2, target);
+    let target4 = f.face(target, IID_SURFACE4);
+    let device3 = f.device(d3d3, Face::Direct3D3, target4);
+    let mut formats = Vec::new();
+    for (interface, pointer, desc) in [
+        ("IDirect3DDevice", device1, true),
+        ("IDirect3DDevice2", device2, true),
+        ("IDirect3DDevice3", device3, false),
+    ] {
+        assert_eq!(
+            f.invoke(
+                &format!("{interface}::EnumTextureFormats"),
+                &[pointer, callback, DATA],
+                |cpu, args| {
+                    assert_eq!(args[1], DATA);
+                    let pixelformat = if desc {
+                        assert_eq!(cpu.read_u32(args[0]).unwrap(), 108);
+                        args[0] + 72
+                    } else {
+                        args[0]
+                    };
+                    let format: DDPIXELFORMAT =
+                        adv_abi::GuestPtr::new(pixelformat).read(cpu).unwrap();
+                    assert_eq!(format.dwSize, 32);
+                    formats.push((format.dwFlags, format.dwRGBBitCount));
+                    0
+                }
+            ),
+            0
+        );
+        let address = DATA + 0x300;
+        let size = size_of::<D3DDEVICEDESC>() as u32;
+        f.write(address, &size.to_le_bytes());
+        assert_eq!(
+            f.call(&format!("{interface}::GetCaps"), &[pointer, address, 0]),
+            0
+        );
+        let report: D3DDEVICEDESC = adv_abi::GuestPtr::new(address)
+            .read(&f.machine.cpu)
+            .unwrap();
+        assert_eq!(report.dwMaxTextureWidth, 16384);
+        assert_eq!(report.dwDevCaps & 0x30, 0x10);
+    }
+    assert_eq!(formats, vec![formats[0]; 3]);
 }

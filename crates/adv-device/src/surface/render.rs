@@ -7,6 +7,21 @@ impl<P: Presenter> Surfaces<P> {
         self.gpu.fork()
     }
 
+    /// Discard a GPU cache of guest-backed pixels after synchronizing its CPU copy.
+    pub fn evict_surface_image(
+        &mut self,
+        id: u32,
+        memory: &mut dyn SurfaceMemory,
+    ) -> Result<(), String> {
+        let entry = &self.surfaces[&id];
+        if !entry.residency.has_cpu() || entry.residency.gpu.is_none() {
+            return Ok(());
+        }
+        self.cpu_access(id, entry.layout.rect(), Access::Read, memory)?;
+        self.surfaces.get_mut(&id).unwrap().residency = super::residency::Residency::cpu();
+        Ok(())
+    }
+
     pub fn set_packed_color(&mut self, id: u32, masks: [u32; 4]) {
         self.surfaces.get_mut(&id).unwrap().packed_color = masks;
     }

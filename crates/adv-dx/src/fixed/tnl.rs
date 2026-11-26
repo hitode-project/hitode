@@ -81,7 +81,6 @@ pub(crate) fn normal_matrix(f: &State) -> [[f32; 3]; 3] {
     cofactor.map(|r| r.map(|v| v / det))
 }
 
-#[cfg(test)]
 fn normalize(v: [f32; 3]) -> [f32; 3] {
     let length = dot(v, v).sqrt();
     if length == 0. {
@@ -90,7 +89,6 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
         v.map(|x| x / length)
     }
 }
-#[cfg(test)]
 pub(crate) fn illuminate(
     f: &State,
     lights: &[Option<[f32; 26]>; 8],
@@ -178,7 +176,6 @@ pub(crate) fn illuminate(
         highlight.map(|v| v.clamp(0., 1.)),
     )
 }
-#[cfg(test)]
 pub(crate) fn fog(f: &State, transformed: bool, z: f32, eye: [f32; 4], supplied: f32) -> f32 {
     let table = f.render[&Render::TableFog];
     let mode = if table != 0 {
