@@ -97,7 +97,8 @@ for target in ['aarch64-apple-darwin', 'aarch64-linux-android', 'aarch64-apple-i
         sources.append({'name': p['name'], 'versionInfo': p['version'], 'license': p['license'],
                         'downloadLocation': f"https://crates.io/api/v1/crates/{p['name']}/{p['version']}/download"})
 
-for name, path in [('cpal', 'vendor/cpal'), ('symphonia-codec-adpcm', 'vendor/symphonia-codec-adpcm'),
+for name, path in [('cpal', 'vendor/cpal'), ('naga', 'vendor/naga'),
+                   ('symphonia-codec-adpcm', 'vendor/symphonia-codec-adpcm'),
                    ('softfloat', 'crates/adv-cpu-core/softfloat'), ('libtheora', 'vendor/libtheora'),
                    ('upscaling', 'vendor/upscaling'), ('fluidr3mono', 'vendor/fluidr3mono')]:
     package.copy_licenses(ROOT / path, out / 'vendor' / name)

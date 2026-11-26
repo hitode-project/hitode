@@ -153,7 +153,8 @@ def notices(resources: Path, build: dict) -> tuple[int, int]:
                         'downloadLocation': f'https://crates.io/api/v1/crates/{name}/{version}/download'})
         rust_count += 1
     # Local patched dependencies and statically linked SoftFloat need notices too.
-    for name, path in [('cpal', 'vendor/cpal'), ('symphonia-codec-adpcm', 'vendor/symphonia-codec-adpcm'),
+    for name, path in [('cpal', 'vendor/cpal'), ('naga', 'vendor/naga'),
+                       ('symphonia-codec-adpcm', 'vendor/symphonia-codec-adpcm'),
                        ('softfloat', 'crates/adv-cpu-core/softfloat'), ('libtheora', 'vendor/libtheora'),
                        ('fluidr3mono', 'vendor/fluidr3mono')]:
         count += copy_licenses(ROOT / path, licenses / name)

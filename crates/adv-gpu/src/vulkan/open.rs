@@ -1043,18 +1043,11 @@ impl Device {
                 None
             };
             if let Some(heap) = &heap {
-                let indices = caps.limits.push_constant_bytes / 2;
-                caps.limits.max_sampled_images = caps
-                    .limits
-                    .max_sampled_images
-                    .min(indices)
-                    .min(heap.counts[0]);
-                caps.limits.max_samplers =
-                    caps.limits.max_samplers.min(indices).min(heap.counts[1]);
+                caps.limits.max_sampled_images = caps.limits.max_sampled_images.min(heap.counts[0]);
+                caps.limits.max_samplers = caps.limits.max_samplers.min(heap.counts[1]);
                 caps.limits.max_storage_bindings = caps
                     .limits
                     .max_storage_bindings
-                    .min(caps.limits.push_constant_bytes / 6)
                     .min(heap.counts[2])
                     .min(heap.counts[3]);
             }
