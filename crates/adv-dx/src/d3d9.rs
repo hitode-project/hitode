@@ -10,6 +10,7 @@ use adv_abi::types::{D3DPRESENT_PARAMETERS, RECT};
 use adv_abi::{GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_device::gpu::{Error, Gpu, Target};
+use adv_device::surface::{Access, CpuReadback, Rect};
 use adv_machine::{Env, Ext, Machine, Object, Objects, Outcome, Wait};
 // Only handlers that can destroy a resource need to drain guest COM releases.
 macro_rules! with_private_releases {
@@ -76,6 +77,8 @@ pub struct SurfaceProvider {
     pub dc: crate::interop::MemoryDc,
     pub insert: fn(&mut Ext, Target) -> Result<u32, String>,
     pub target: fn(&Ext, u32) -> Option<Target>,
+    pub cpu_access: fn(&Ext, u32, Rect) -> Option<CpuReadback>,
+    pub gpu_access: fn(&mut Env<'_>, u32, Option<Rect>, Access) -> Option<Target>,
     pub remove: fn(&mut Ext, &mut dyn adv_cpu::backend::Guest, u32) -> Result<(), String>,
     pub replace: fn(&mut Ext, u32, Target) -> Result<(), String>,
     /// Rotates the surface's front; the region is what changed since its previous present.

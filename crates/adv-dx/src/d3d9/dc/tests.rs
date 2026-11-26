@@ -55,7 +55,9 @@ impl Fixture {
         state.tables.insert("IDirect3DTexture9", 0);
         state.provider.dc = super::super::tests::test_dc();
         state.provider.insert = |ext, target| ext.get_mut::<SurfaceStore>().insert_native(target);
-        state.provider.target = |ext, id| ext.get::<SurfaceStore>().native_target(id).cloned();
+        state.provider.target = |ext, id| ext.get::<SurfaceStore>().native_target(id);
+        state.provider.cpu_access =
+            |ext, id, rect| ext.get::<SurfaceStore>().cpu_readback(id, rect);
         state.provider.remove = |ext, _, id| {
             if id != 0 {
                 assert!(ext.get_mut::<SurfaceStore>().delete(id));
