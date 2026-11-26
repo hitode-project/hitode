@@ -28,6 +28,8 @@ pub mod code_signature;
 pub mod com;
 pub mod constants;
 pub mod dll;
+#[path = "../../../data/abi/gfx-iids.rs"]
+pub mod gfx_iids;
 pub mod guest;
 pub mod native;
 pub mod ordinals;

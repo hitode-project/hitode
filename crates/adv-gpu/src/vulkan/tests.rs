@@ -1172,7 +1172,7 @@ fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
             label: "sixteen textures",
         })
         .unwrap();
-    let mut desc = RenderPipelineDesc {
+    let desc = RenderPipelineDesc {
         vertex: shader.entry("vs", Stage::Vertex).unwrap(),
         fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
         bindings,
@@ -1196,6 +1196,7 @@ fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
         label: "sixteen textures",
     };
     let pipeline = device.create_render_pipeline(&desc, None).unwrap();
+    assert!(!pipeline.inner.compiled.classic);
     assert_eq!(pipeline.inner.compiled.push.words, 16);
     // Sparse register numbers use the same dense budget as contiguous slots.
     let mut sparse = desc.bindings.clone();
@@ -1213,35 +1214,6 @@ fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
         .words,
         16
     );
-    for slot in 16..66 {
-        desc.bindings.push(Binding {
-            slot,
-            kind: BindingKind::Sampler { comparison: false },
-            stages: Stages::FRAGMENT,
-        });
-    }
-    assert!(matches!(
-        device.create_render_pipeline(&desc, None),
-        Err(Error::Invalid(_))
-    ));
-    let compute = device
-        .create_shader(ShaderDesc {
-            source: Source::Wgsl("@compute @workgroup_size(1) fn main() {}"),
-            identity: 112,
-            label: "capacity",
-        })
-        .unwrap();
-    assert!(matches!(
-        device.create_compute_pipeline(
-            &ComputePipelineDesc {
-                entry: compute.entry("main", Stage::Compute).unwrap(),
-                bindings: desc.bindings.clone(),
-                label: "capacity"
-            },
-            None
-        ),
-        Err(Error::Invalid(_))
-    ));
     let size = Extent {
         width: 4,
         height: 4,
@@ -1350,6 +1322,135 @@ fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
                 "{pixel:?} != {expected:?}"
             );
         }
+    }
+}
+
+#[test]
+fn bindless_128_sampled_images_use_cached_sets_with_128_push_constant_bytes() {
+    let (device, mut queue) = Device::open_with_push_limit(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            ..Default::default()
+        },
+        128,
+    )
+    .unwrap();
+    let context = &device.inner.0;
+    let Some(heap) = &context.heap else {
+        return;
+    };
+    let limits = unsafe {
+        context
+            .instance
+            .get_physical_device_properties(context.physical)
+            .limits
+    };
+    if limits
+        .max_per_stage_descriptor_sampled_images
+        .min(heap.counts[0])
+        < 128
+    {
+        return;
+    }
+    assert_eq!(device.caps().limits.push_constant_bytes, 128);
+    assert!(device.caps().limits.max_sampled_images >= 128);
+
+    let mut source =
+        String::from("@group(3) @binding(0) var<storage, read_write> out: array<u32, 128>;\n");
+    let mut bindings = vec![Binding {
+        slot: 0,
+        kind: BindingKind::StorageBuffer { writable: true },
+        stages: Stages::COMPUTE,
+    }];
+    for slot in 0..128 {
+        source.push_str(&format!(
+            "@group(1) @binding({slot}) var image{slot}: texture_2d<f32>;\n"
+        ));
+        bindings.push(Binding {
+            slot,
+            kind: BindingKind::SampledImage {
+                dimension: Dimension::D2,
+                depth: false,
+                multisampled: false,
+            },
+            stages: Stages::COMPUTE,
+        });
+    }
+    source.push_str("@compute @workgroup_size(1) fn main() {\n");
+    for slot in 0..128 {
+        source.push_str(&format!(
+            "out[{slot}] = u32(round(textureLoad(image{slot}, vec2<i32>(0), 0).r * 255.0));\n"
+        ));
+    }
+    source.push('}');
+    let shader = device
+        .create_shader(ShaderDesc {
+            source: Source::Wgsl(&source),
+            identity: 112,
+            label: "128 sampled images",
+        })
+        .unwrap();
+    let pipeline = device
+        .create_compute_pipeline(
+            &ComputePipelineDesc {
+                entry: shader.entry("main", Stage::Compute).unwrap(),
+                bindings,
+                label: "128 sampled images",
+            },
+            None,
+        )
+        .unwrap();
+    assert!(pipeline.inner.compiled.classic);
+
+    let size = Extent {
+        width: 1,
+        height: 1,
+        depth_or_layers: 1,
+    };
+    let textures: Vec<_> = (0..128)
+        .map(|_| create_image(&device, Format::Rgba8Unorm, size, 1, 1))
+        .collect();
+    let output = device
+        .create_buffer(&BufferDesc {
+            size: 128 * 4,
+            usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC,
+            memory: Memory::Device,
+            label: "texture load results",
+        })
+        .unwrap();
+    let result = readback(&device, 128 * 4);
+    let mut encoder = queue.encoder("128 sampled images");
+    for (i, texture) in textures.iter().enumerate() {
+        drop(encoder.render_pass(&pass(
+            texture.view(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            Load::Clear([i as f64 / 255.0, 0.0, 0.0, 1.0]),
+            Store::Store,
+            None,
+        )));
+    }
+    {
+        let mut compute = encoder.compute_pass(&ComputePassDesc {
+            timestamps: None,
+            label: "128 sampled images",
+        });
+        compute.set_pipeline(&pipeline);
+        for (slot, texture) in textures.iter().enumerate() {
+            compute.bind(slot as u32, Bind::Sampled(texture.view()));
+        }
+        compute.bind(0, Bind::StorageBuffer(output.slice(0..128 * 4)));
+        compute.dispatch(1, 1, 1);
+    }
+    encoder.copy_buffer(output.slice(0..128 * 4), &result, 0);
+    finish(&mut queue, encoder);
+    for (i, word) in bytes(&result).as_chunks::<4>().0.iter().enumerate() {
+        assert_eq!(u32::from_le_bytes(*word), i as u32, "texture slot {i}");
     }
 }
 
