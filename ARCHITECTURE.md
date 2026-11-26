@@ -69,9 +69,9 @@ assembly can call guest Windows interfaces. DirectDraw keeps its private surface
 transitional dependency on `adv-os` for heaps, activation, Automation, files and
 input state.
 
-The shared `adv-dx` modules, including frame recording, shader translation and
-pacing, depend on no API front. `tools/layering/check_modules.py` also applies
-this rule to shared fixed-function code.
+The shared `adv-dx` modules for fixed-function state and lowering, frame recording,
+shader translation and pacing depend on no API front. `tools/layering/check_modules.py`
+checks these module boundaries.
 
 For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe` and calls their imports through the machine. `adv-unix::builtin` installs those images in the prefix before process startup. `adv-runtime::wine` assembles the graphics fronts on that stack: our DirectDraw as such an image, with memory DCs from Wine's GDI. `adv-drv` holds the driver modules win32u loads, such as the user driver whose window reports give the fronts their geometry.
 

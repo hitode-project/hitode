@@ -1,13 +1,14 @@
 //! The fixed vertex stage uses the same raw input layout and uniform blocks as
 //! translated shaders. Numeric state stays in uniforms so changing a matrix,
 //! material or light value does not require a new pipeline.
-use super::*;
+use super::{LowerError, Render, State, VertexLayout, tnl};
+use adv_device::gpu::{AttributeFormat, Topology};
 use adv_device::{constants::ConstantUsage, gpu::ConstantSnapshot};
 use std::fmt::Write;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub(super) struct Variant {
-    layout: fixed::Layout,
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct VertexProgram {
+    layout: VertexLayout,
     lights: [u8; 8],
     lit: bool,
     sources: [u32; 4],
@@ -19,7 +20,7 @@ pub(super) struct Variant {
     pub scaled: bool,
 }
 
-pub(super) const HELPERS: &str = r#"
+pub(crate) const HELPERS: &str = r#"
 fn fixed_row(p:vec4<f32>, first:u32)->vec4<f32> {
     return ((p.x*vs_constants.f[first]+p.y*vs_constants.f[first+1u])+p.z*vs_constants.f[first+2u])+p.w*vs_constants.f[first+3u];
 }
@@ -30,8 +31,8 @@ fn fixed_normalize(v:vec3<f32>)->vec3<f32> {
 }
 "#;
 
-pub(super) fn inputs(layout: fixed::Layout) -> Vec<Input> {
-    let mut inputs = transformed::inputs(layout);
+pub(crate) fn inputs(layout: VertexLayout) -> Vec<Input> {
+    let mut inputs = position_inputs(layout);
     if let Some((stream, offset)) = layout.specular {
         inputs.push(Input {
             stream: stream as usize,
@@ -51,20 +52,22 @@ pub(super) fn inputs(layout: fixed::Layout) -> Vec<Input> {
     inputs
 }
 
-impl Variant {
-    pub fn new(
-        layout: fixed::Layout,
-        f: &fixed::Fixed,
-        kind: i32,
-    ) -> Result<Self, fixed::Rejected> {
-        let lit = !layout.transformed && f.render[&137] != 0;
+impl VertexProgram {
+    pub fn new(layout: VertexLayout, f: &State, topology: Topology) -> Result<Self, LowerError> {
+        let lit = !layout.transformed && f.render[&Render::Lighting] != 0;
         let lights = if lit {
-            fixed::lighting::active(f)?.map(|light| light.map_or(0, |v| v[0] as u8))
+            tnl::active(f)?.map(|light| light.map_or(0, |v| v[0] as u8))
         } else {
             [0; 8]
         };
-        let sources = [145, 146, 147, 148].map(|state| {
-            if lit && f.render[&141] != 0 {
+        let sources = [
+            Render::DiffuseSource,
+            Render::SpecularSource,
+            Render::AmbientSource,
+            Render::EmissiveSource,
+        ]
+        .map(|state| {
+            if lit && f.render[&Render::ColorVertex] != 0 {
                 match f.render[&state] {
                     1 if layout.color.is_some() => 1,
                     2 if layout.specular.is_some() => 2,
@@ -74,45 +77,37 @@ impl Variant {
                 0
             }
         });
-        let table = f.render[&35];
-        let fog = if f.render[&28] == 0 {
+        let table = f.render[&Render::TableFog];
+        let fog = if f.render[&Render::FogEnable] == 0 {
             0
         } else if table != 0 {
             table
         } else if layout.transformed {
             0
         } else {
-            f.render[&140]
+            f.render[&Render::VertexFog]
         };
         Ok(Self {
             layout,
             lights,
             lit,
             sources,
-            normalize: lit && f.render[&143] != 0,
-            local_viewer: lit && f.render[&142] != 0,
-            specular: lit && f.render[&29] != 0,
+            normalize: lit && f.render[&Render::NormalizeNormals] != 0,
+            local_viewer: lit && f.render[&Render::LocalViewer] != 0,
+            specular: lit && f.render[&Render::SpecularEnable] != 0,
             fog,
-            range_fog: fog != 0 && table == 0 && f.render[&48] != 0,
-            scaled: kind == 1 && !layout.transformed && f.render[&157] != 0,
+            range_fog: fog != 0 && table == 0 && f.render[&Render::RangeFog] != 0,
+            scaled: topology == Topology::Points
+                && !layout.transformed
+                && f.render[&Render::PointScale] != 0,
         })
     }
 
-    pub fn bounds(&self, f: &fixed::Fixed, count: u32, fixed_pixel: bool) -> fixed::VertexBounds {
-        fixed::VertexBounds {
-            transforms: (!self.layout.transformed).then_some(f.transforms),
-            point_scale: self
-                .scaled
-                .then(|| [158, 159, 160].map(|k| f32::from_bits(f.render[&k]))),
-            count,
-            fixed_pixel,
-        }
+    pub fn transformed(&self) -> bool {
+        self.layout.transformed
     }
 
-    pub fn constants(
-        &self,
-        f: &fixed::Fixed,
-    ) -> Result<(ConstantSnapshot, ConstantUsage), fixed::Rejected> {
+    pub fn constants(&self, f: &State) -> Result<(ConstantSnapshot, ConstantUsage), LowerError> {
         let mut usage = ConstantUsage::default();
         if self.layout.transformed {
             return Ok((ConstantSnapshot::default(), usage));
@@ -127,23 +122,29 @@ impl Variant {
         }
         let mut count = 12;
         if self.scaled {
-            values[12] = [158, 159, 160, 154].map(|k| f32::from_bits(f.render[&k]));
+            values[12] = [
+                Render::PointScaleA,
+                Render::PointScaleB,
+                Render::PointScaleC,
+                Render::PointSize,
+            ]
+            .map(|k| f32::from_bits(f.render[&k]));
             count = 13;
         }
         if self.lit {
-            let normal = fixed::lighting::normal_matrix(f);
+            let normal = tnl::normal_matrix(f);
             for (out, row) in values[13..16].iter_mut().zip(normal) {
                 out[..3].copy_from_slice(&row);
             }
-            for (out, row) in values[16..20].iter_mut().zip(f.material.as_chunks::<4>().0) {
+            for (out, row) in values[16..20].iter_mut().zip(&f.material.colors) {
                 *out = *row;
             }
-            values[20] = fixed::lighting::color(f.render[&139]);
-            values[21][0] = f.material[16];
+            values[20] = tnl::color(f.render[&Render::Ambient]);
+            values[21][0] = f.material.power;
             count = 22;
-            for light in fixed::lighting::active(f)?.into_iter().flatten() {
-                let position = fixed::row([light[13], light[14], light[15], 1.], &f.transforms[1]);
-                let direction = fixed::row([light[16], light[17], light[18], 0.], &f.transforms[1]);
+            for light in tnl::active(f)?.into_iter().flatten() {
+                let position = tnl::row([light[13], light[14], light[15], 1.], &f.transforms[1]);
+                let direction = tnl::row([light[16], light[17], light[18], 0.], &f.transforms[1]);
                 values[count..count + 6].copy_from_slice(&[
                     light[1..5].try_into().unwrap(),
                     light[5..9].try_into().unwrap(),
@@ -271,4 +272,49 @@ impl Variant {
         }
         s.push_str("out.c0=clamp(vec4<f32>(lit,diffuse.a),vec4<f32>(0.0),vec4<f32>(1.0));out.c1=vec4<f32>(clamp(highlight,vec3<f32>(0.0),vec3<f32>(1.0)),0.0);\n");
     }
+}
+
+fn position_inputs(layout: VertexLayout) -> Vec<Input> {
+    let mut inputs = vec![Input {
+        stream: layout.streams[0] as usize,
+        offset: layout.position,
+        format: if layout.transformed {
+            AttributeFormat::Float4
+        } else {
+            AttributeFormat::Float3
+        },
+        register: 0,
+    }];
+    if let Some(offset) = layout.color {
+        inputs.push(Input {
+            stream: layout.streams[1] as usize,
+            offset,
+            format: AttributeFormat::Bgra8Unorm,
+            register: 1,
+        });
+    }
+    for (n, coordinate) in layout.texcoords.iter().enumerate() {
+        if let Some((stream, offset, dimensions)) = *coordinate {
+            inputs.push(Input {
+                stream: stream as usize,
+                offset,
+                format: match dimensions {
+                    1 => AttributeFormat::Float1,
+                    2 => AttributeFormat::Float2,
+                    3 => AttributeFormat::Float3,
+                    _ => AttributeFormat::Float4,
+                },
+                register: 2 + n as u32,
+            });
+        }
+    }
+    inputs
+}
+
+#[derive(Clone)]
+pub(crate) struct Input {
+    pub stream: usize,
+    pub offset: u32,
+    pub format: AttributeFormat,
+    pub register: u32,
 }

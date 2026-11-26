@@ -1,7 +1,7 @@
 //! Allocation-free membership for validated SDK slots and state selectors.
 use std::marker::PhantomData;
 
-pub(super) trait Key: Copy {
+pub(crate) trait Key: Copy {
     fn index(self) -> usize;
     fn from_index(index: usize) -> Self;
 }
@@ -30,7 +30,7 @@ impl Key for (usize, i32) {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Slots<T, const N: usize> {
+pub(crate) struct Slots<T, const N: usize> {
     words: [u64; N],
     marker: PhantomData<T>,
 }
@@ -75,7 +75,7 @@ impl<T: Key, const N: usize> Slots<T, N> {
         }
     }
 }
-pub(super) struct Iter<T, const N: usize> {
+pub(crate) struct Iter<T, const N: usize> {
     words: [u64; N],
     at: usize,
     remaining: usize,

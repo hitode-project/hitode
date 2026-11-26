@@ -8,6 +8,8 @@ pub mod d3d9;
 pub mod ddraw;
 pub mod dshow;
 pub mod dsound;
+#[cfg(feature = "gpu")]
+pub(crate) mod fixed;
 pub(crate) mod pacing;
 #[cfg(feature = "gpu")]
 pub(crate) mod record;
