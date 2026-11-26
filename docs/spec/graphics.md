@@ -111,7 +111,7 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 
 **Rule**: Full-target color clears MUST become load-action clears in the next compatible draw pass. Partial and padded-target clears MUST preserve bounded drawing semantics.
 Full-target clips MUST preserve full-clear load actions for equal-sized attachments.
-Pending clears MUST resolve before target changes, copies, readbacks, uploads, presentation, frame completion, or external queue submissions.
+Pending clears MUST resolve before target changes, copies, readbacks, uploads, dispatches, presentation, frame completion, or external queue submissions.
 Retained resources MUST keep pending clears valid after callers release their target handles.
 **Verification**: Test
 

@@ -77,7 +77,7 @@ pub(crate) enum UploadSource {
 pub(crate) enum Command {
     /// Following clears and draws render to these attachments.
     Target {
-        color: Image,
+        colors: smallvec::SmallVec<[Image; 8]>,
         depth: Option<super::Depth>,
     },
     Clear {
@@ -88,6 +88,34 @@ pub(crate) enum Command {
     },
     /// `Chunk::draws[index]`.
     Draw(u32),
+    DrawModern(Box<super::modern::Render>),
+    Dispatch(Box<super::modern::Compute>),
+    Resolve {
+        source: adv_gpu::ImageView,
+        destination: adv_gpu::ImageView,
+    },
+    GenerateMips(adv_gpu::ImageView),
+    UploadImage {
+        image: adv_gpu::Image,
+        mip: u32,
+        layer: u32,
+        staged: super::Staged,
+        extent: adv_gpu::Extent,
+    },
+    ReadImage {
+        image: adv_gpu::Image,
+        mip: u32,
+        layer: u32,
+        buffer: Buffer,
+        row_pitch: u32,
+        extent: adv_gpu::Extent,
+    },
+    Timestamp(super::modern::QuerySlot),
+    ReadQuery {
+        slot: super::modern::QuerySlot,
+        destination: Buffer,
+        offset: u64,
+    },
     /// Rows of `pitch` bytes into `image`'s `mip` at `rect`, in the image's
     /// own format: converting formats is the GPU's job.
     Upload {

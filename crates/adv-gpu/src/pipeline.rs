@@ -40,6 +40,10 @@ use arrayvec::ArrayVec;
 
 pub const MAX_COLOR_TARGETS: usize = 8;
 
+/// First vertex-only slot in each group. The modern facade compacts shader
+/// registers into separate vertex and fragment banks.
+pub const VERTEX_BINDING_BASES: [u32; 4] = [32, 128, 32, 32];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BindingKind {
@@ -187,6 +191,10 @@ pub enum Factor {
     SrcAlphaSaturated,
     Constant,
     OneMinusConstant,
+    Src1,
+    OneMinusSrc1,
+    Src1Alpha,
+    OneMinusSrc1Alpha,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

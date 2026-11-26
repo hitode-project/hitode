@@ -113,6 +113,16 @@ pub(crate) fn index(group: u32, slot: u32, buffer: bool) -> (usize, u32) {
         _ => panic!("invalid Metal binding group"),
     }
 }
+pub(crate) fn stage_slot(stage: Stages, group: u32, slot: u32) -> u32 {
+    if stage == Stages::VERTEX && group < 4 {
+        let base = crate::pipeline::VERTEX_BINDING_BASES[group as usize];
+        if slot >= base {
+            return slot - base;
+        }
+    }
+    slot
+}
+
 pub(crate) fn native(group: u32, slot: u32, buffer: bool, textures: u32) -> Result<(usize, u32)> {
     let limit = match (group, buffer) {
         (0 | 3, true) => SIZES as u32,
@@ -310,7 +320,12 @@ pub(crate) fn metal(
                     format!("undeclared binding {}:{}", binding.group, binding.binding),
                 ));
             }
-            let index = used.add(portable.group, portable.binding, buffer, options.textures)? as u8;
+            let index = used.add(
+                portable.group,
+                stage_slot(stage, portable.group, portable.binding),
+                buffer,
+                options.textures,
+            )? as u8;
             let mut target = msl::BindTarget::default();
             match (buffer, portable.group) {
                 (true, _) => target.buffer = Some(index),
@@ -335,7 +350,7 @@ pub(crate) fn metal(
             sizes: reads_sizes.then(|| {
                 sizes
                     .iter()
-                    .map(|slot| slot.map(|slot| index(3, slot, true).1 as u8))
+                    .map(|slot| slot.map(|slot| index(3, stage_slot(stage, 3, slot), true).1 as u8))
                     .collect()
             }),
         });
@@ -612,6 +627,74 @@ pub(crate) fn combine_video_sampler(words: &mut Vec<u32>, set: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metal_depth_test_modes() {
+        let source = "
+            struct FragmentOut {
+                @location(0) color: vec4<f32>,
+                @builtin(frag_depth) depth: f32,
+            }
+            @fragment @early_depth_test(force)
+            fn forced() -> @location(0) vec4<f32> { return vec4(1.0); }
+            @fragment @early_depth_test(greater_equal)
+            fn greater() -> @builtin(frag_depth) f32 { return 1.0; }
+            @fragment @early_depth_test(less_equal)
+            fn less() -> FragmentOut { return FragmentOut(vec4(1.0), 0.0); }
+            @fragment @early_depth_test(unchanged)
+            fn unchanged(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
+                return pos.z;
+            }
+            @fragment
+            fn any_depth() -> @builtin(frag_depth) f32 { return 0.5; }
+        ";
+        let compiled = precompile(source, &[]).unwrap();
+        assert_eq!(
+            compiled.metal.matches("[[early_fragment_tests]]").count(),
+            1
+        );
+        assert!(compiled.metal.contains("[[early_fragment_tests]] fragment"));
+        assert_eq!(compiled.metal.matches("[[depth(greater)]]").count(), 1);
+        assert_eq!(compiled.metal.matches("[[depth(less)]]").count(), 1);
+        assert_eq!(compiled.metal.matches("[[depth(any)]]").count(), 2);
+
+        #[cfg(all(feature = "backend", target_vendor = "apple"))]
+        {
+            use crate::shader::{PrecompiledEntry, ShaderDesc, Source, Stage};
+            let (device, _) = test_device!(crate::queue::DeviceOptions::default());
+            let entries: Vec<_> = compiled
+                .entries
+                .iter()
+                .map(
+                    |(name, function, workgroup, threadgroup)| PrecompiledEntry {
+                        name,
+                        function,
+                        workgroup: *workgroup,
+                        threadgroup,
+                    },
+                )
+                .collect();
+            for source in [
+                Source::Precompiled {
+                    spirv: &compiled.spirv,
+                    metal: compiled.metal.as_bytes(),
+                    entries: &entries,
+                },
+                Source::Wgsl(source),
+            ] {
+                let shader = device
+                    .create_shader(ShaderDesc {
+                        source,
+                        identity: compiled.identity,
+                        label: "depth test modes",
+                    })
+                    .unwrap();
+                for entry in &entries {
+                    shader.entry(entry.name, Stage::Fragment).unwrap();
+                }
+            }
+        }
+    }
+
     #[test]
     fn slots_hold_fixed_indices_and_kinds_meeting_in_a_table_are_rejected() {
         let mut used = Used::default();

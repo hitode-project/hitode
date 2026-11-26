@@ -4,6 +4,8 @@ use super::*;
 pub(super) struct Key {
     colors: [MTLPixelFormat; MAX_COLOR_TARGETS],
     write: u8,
+    uint: u8,
+    sint: u8,
     depth: MTLPixelFormat,
     stencil: MTLPixelFormat,
     clear_depth: bool,
@@ -25,6 +27,8 @@ impl Device {
         let mut key = Key {
             colors: [MTLPixelFormat::Invalid; MAX_COLOR_TARGETS],
             write: 0,
+            uint: 0,
+            sint: 0,
             depth: MTLPixelFormat::Invalid,
             stencil: MTLPixelFormat::Invalid,
             clear_depth: false,
@@ -41,8 +45,12 @@ impl Device {
             if encode::partial(desc.area, color.view.size())
                 && let Load::Clear(c) = color.load
             {
-                values[i] = if key.colors[i] == MTLPixelFormat::R32Uint {
+                values[i] = if color.view.format().is_uint() {
+                    key.uint |= 1 << i;
                     c.map(|v| v as u32)
+                } else if color.view.format().is_sint() {
+                    key.sint |= 1 << i;
+                    c.map(|v| v as i32 as u32)
                 } else {
                     c.map(|v| (v as f32).to_bits())
                 };
@@ -117,8 +125,10 @@ impl Device {
             if key.write & (1 << i) == 0 {
                 continue;
             }
-            let ty = if key.colors[i] == MTLPixelFormat::R32Uint {
+            let ty = if key.uint & (1 << i) != 0 {
                 "uint4"
+            } else if key.sint & (1 << i) != 0 {
+                "int4"
             } else {
                 "float4"
             };
@@ -133,8 +143,10 @@ impl Device {
                 if key.write & (1 << i) == 0 {
                     continue;
                 }
-                let value = if key.colors[i] == MTLPixelFormat::R32Uint {
+                let value = if key.uint & (1 << i) != 0 {
                     format!("values[{i}]")
+                } else if key.sint & (1 << i) != 0 {
+                    format!("as_type<int4>(values[{i}])")
                 } else {
                     format!("as_type<float4>(values[{i}])")
                 };

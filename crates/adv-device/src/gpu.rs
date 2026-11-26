@@ -21,7 +21,11 @@ pub use depth::{DepthFormat, Stencil, StencilFace, StencilOp};
 #[cfg(feature = "test-support")]
 pub use native::test_support;
 
-pub use native::{Depth, Gpu, Image, ImageId, Readback, Staged, Target};
+pub use native::{
+    BlockTexture, BufferRange, Depth, Dispatch, DispatchArguments, DrawArguments, Gpu, Image,
+    ImageId, ModernColor, ModernDepth, ModernDraw, ModernShader, Predicate, QuerySlot, Readback,
+    SlotBindings, Staged, StorageBinding, Target, TimestampDisjoint,
+};
 pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,
     VertexStream,

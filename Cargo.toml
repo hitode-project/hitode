@@ -27,7 +27,7 @@ members = [
     "apps/adv-jit-helper",
     "apps/adv-launcher/src-tauri",
 ]
-exclude = ["vendor/cpal", "vendor/symphonia-codec-adpcm"]
+exclude = ["vendor/cpal", "vendor/naga", "vendor/symphonia-codec-adpcm"]
 
 [workspace.package]
 version = "0.2.9"
@@ -101,4 +101,5 @@ opt-level = "s"
 
 [patch.crates-io]
 cpal = { path = "vendor/cpal" }
+naga = { path = "vendor/naga" }
 symphonia-codec-adpcm = { path = "vendor/symphonia-codec-adpcm" }

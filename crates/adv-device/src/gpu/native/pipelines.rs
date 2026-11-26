@@ -36,6 +36,7 @@ use gpu::compile::{self, Compile, CompileCounters};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -137,10 +138,32 @@ struct Key {
     textures: arrayvec::ArrayVec<(bool, u8), 20>,
 }
 
+#[derive(PartialEq, Eq, Hash)]
+struct ModernKey {
+    state: [u64; 4],
+    vertex: u64,
+    fragment: Option<u64>,
+    colors: arrayvec::ArrayVec<Format, { p::MAX_COLOR_TARGETS }>,
+    depth: Option<Format>,
+    samples: u32,
+}
+
+struct JobDigest(Sha256);
+impl Hasher for JobDigest {
+    fn finish(&self) -> u64 {
+        u64::from_le_bytes(self.0.clone().finalize()[..8].try_into().unwrap())
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Pipelines {
     entries: HashMap<Key, (RenderPipeline, [u8; 32], bool)>,
     order: VecDeque<Key>,
+    modern_order: VecDeque<[u8; 32]>,
     jobs: Arc<Mutex<HashMap<[u8; 32], PipelineJob>>>,
     anticipated: u64,
     cache_hits: u64,
@@ -231,6 +254,85 @@ impl Compiler {
 }
 
 impl Pipelines {
+    pub fn modern(
+        &mut self,
+        device: &Device,
+        draw: &super::modern::ModernDraw,
+    ) -> Result<RenderPipeline, Error> {
+        let key = ModernKey {
+            state: draw.state_ids,
+            vertex: draw.vertex.identity(),
+            fragment: draw.fragment.as_ref().map(|f| f.identity()),
+            colors: draw
+                .colors
+                .iter()
+                .map(|color| color.view.format())
+                .collect(),
+            depth: draw.depth.as_ref().map(|d| d.view.format()),
+            samples: draw.samples,
+        };
+        let mut digest = JobDigest(Sha256::new_with_prefix(b"modern pipeline"));
+        key.hash(&mut digest);
+        let hash = digest.0.finalize().into();
+        let task = {
+            let mut jobs = self.jobs.lock().unwrap();
+            if let Some((task, _, _)) = jobs.get(&hash) {
+                self.cache_hits += 1;
+                task.clone()
+            } else {
+                let vertex = draw.vertex.clone();
+                let fragment = draw.fragment.clone();
+                let device = device.clone();
+                let cache = self.cache.clone();
+                let primitive = draw.primitive;
+                let colors = draw
+                    .colors
+                    .iter()
+                    .map(|c| p::ColorTarget {
+                        format: c.view.format(),
+                        blend: c.blend,
+                        write_mask: c.write_mask,
+                    })
+                    .collect();
+                let depth_stencil = draw.depth.as_ref().map(|d| p::DepthStencil {
+                    format: d.view.format(),
+                    ..d.state
+                });
+                let samples = draw.samples;
+                let alpha_to_coverage = draw.alpha_to_coverage;
+                let task = Compile::spawn(0, self.counters.clone(), move || {
+                    let built = device.guard_guest_pipeline(|| {
+                        let desc = p::RenderPipelineDesc {
+                            vertex: vertex.entry(&device)?,
+                            fragment: fragment.as_ref().map(|f| f.entry(&device)).transpose()?,
+                            bindings: vertex
+                                .layout()
+                                .chain(fragment.iter().flat_map(|f| f.layout()))
+                                .collect(),
+                            primitive,
+                            colors,
+                            depth_stencil,
+                            samples,
+                            alpha_to_coverage,
+                            label: "modern render pipeline",
+                        };
+                        let identity = device.pipeline_identity(&desc);
+                        let pipeline = device.create_render_pipeline(&desc, cache.as_deref())?;
+                        Ok(Built { identity, pipeline })
+                    });
+                    Ok(built.map_err(gpu_error))
+                });
+                if self.modern_order.len() == MAX_PIPELINES {
+                    jobs.remove(&self.modern_order.pop_front().unwrap());
+                }
+                self.modern_order.push_back(hash);
+                jobs.insert(hash, (task.clone(), None, false));
+                self.misses += 1;
+                task
+            }
+        };
+        Ok(task.wait().clone().map_err(Error::Device)??.pipeline)
+    }
     pub fn fixed(
         &mut self,
         device: &Device,
@@ -433,6 +535,7 @@ impl Pipelines {
         // The archive is a best-effort cache; a failed write only costs compiles.
         let _ = self.flush();
         self.jobs = Default::default();
+        self.modern_order.clear();
         self.batch = None;
         self.cache = None;
         self.store = None;

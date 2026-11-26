@@ -28,6 +28,7 @@ pub(crate) struct ImageView {
     pub(super) raw: Object<dyn MTLTexture>,
     image: crate::Image,
     size: Extent,
+    format: Format,
 }
 
 pub(crate) struct Buffer(pub(super) Arc<BufferData>, OnceLock<Box<crate::Buffer>>);
@@ -72,6 +73,14 @@ impl Device {
                 "unsupported format {:?}",
                 desc.format
             )));
+        }
+        if desc.samples > 1
+            && (!desc.samples.is_power_of_two()
+                || self.caps().format_sample_counts(desc.format) & desc.samples == 0)
+        {
+            return Err(Error::Invalid(
+                "unsupported multisample image format or count".into(),
+            ));
         }
         for (usage, caps) in [
             (Usage::SAMPLED, FormatCaps::SAMPLED),
@@ -125,7 +134,9 @@ impl Device {
         d.setHazardTrackingMode(MTLHazardTrackingMode::Tracked);
         // Reinterpreting views cost lossless compression; only images that
         // declare other view formats allow them.
-        let mut usage = if desc.view_formats.is_empty() {
+        let sampled_view = (desc.format.has_stencil() || desc.format == Format::A8Unorm)
+            && desc.usage.contains(Usage::SAMPLED);
+        let mut usage = if desc.view_formats.is_empty() && !sampled_view {
             MTLTextureUsage::empty()
         } else {
             MTLTextureUsage::PixelFormatView
@@ -303,6 +314,23 @@ impl Image {
     }
     pub(crate) fn view(&self) -> &crate::ImageView {
         self.view.get_or_init(|| {
+            let desc = self.desc();
+            if desc.format == Format::A8Unorm && desc.usage.contains(Usage::SAMPLED) {
+                return Box::new(
+                    self.create_view(&ViewDesc {
+                        format: None,
+                        dimension: None,
+                        mips: 0..desc.mips,
+                        layers: 0..if desc.dimension == Dimension::D3 {
+                            1
+                        } else {
+                            desc.size.depth_or_layers
+                        },
+                        plane: 0,
+                    })
+                    .expect("alpha sample view"),
+                );
+            }
             Box::new(crate::ImageView {
                 inner: ImageView {
                     raw: self.data.raw.clone(),
@@ -310,6 +338,7 @@ impl Image {
                         inner: self.clone(),
                     },
                     size: self.desc().size,
+                    format: self.desc().format,
                 },
             })
         })
@@ -334,6 +363,7 @@ impl Image {
             return Ok(crate::ImageView {
                 inner: ImageView {
                     raw: planes[plane].clone(),
+                    format: [Format::R8Unorm, Format::Rg8Unorm][plane],
                     image: crate::Image {
                         inner: self.clone(),
                     },
@@ -345,7 +375,7 @@ impl Image {
                 },
             });
         }
-        if desc.plane != 0
+        if (desc.plane != 0 && (!image.format.has_stencil() || desc.plane > 2))
             || desc.mips.is_empty()
             || desc.layers.is_empty()
             || desc.mips.end > image.mips
@@ -354,30 +384,57 @@ impl Image {
             return Err(Error::Invalid("image view range".into()));
         }
         let view_format = desc.format.unwrap_or(image.format);
-        if view_format != image.format && !image.view_formats.contains(&view_format) {
+        if view_format != image.format
+            && !image.view_formats.contains(&view_format)
+            && (image.format, view_format) != (Format::A8Unorm, Format::R8Unorm)
+        {
             return Err(Error::Invalid(
                 "image view format not declared in view_formats".into(),
             ));
         }
-        let format = caps::pixel_format(view_format)
-            .ok_or_else(|| Error::Invalid("image view format".into()))?;
+        let format = if desc.plane == 1 {
+            MTLPixelFormat::X32_Stencil8
+        } else {
+            caps::pixel_format(view_format)
+                .ok_or_else(|| Error::Invalid("image view format".into()))?
+        };
         let dimension = desc.dimension.unwrap_or(image.dimension);
+        let ty = texture_type(dimension, desc.layers.len() as u32, image.samples);
+        let mips = NSRange::new(desc.mips.start as usize, desc.mips.len());
+        let layers = NSRange::new(
+            desc.layers.start as usize,
+            if dimension == Dimension::D3 {
+                1
+            } else {
+                desc.layers.len()
+            },
+        );
         let raw = unsafe {
-            self.data
-                .raw
-                .newTextureViewWithPixelFormat_textureType_levels_slices(
-                    format,
-                    texture_type(dimension, desc.layers.len() as u32, image.samples),
-                    NSRange::new(desc.mips.start as usize, desc.mips.len()),
-                    NSRange::new(
-                        desc.layers.start as usize,
-                        if dimension == Dimension::D3 {
-                            1
-                        } else {
-                            desc.layers.len()
-                        },
-                    ),
-                )
+            let swizzle = if view_format == Format::A8Unorm {
+                Some(alpha_swizzle())
+            } else if desc.plane == 1 {
+                Some(MTLTextureSwizzleChannels {
+                    red: MTLTextureSwizzle::Zero,
+                    green: MTLTextureSwizzle::Red,
+                    blue: MTLTextureSwizzle::Zero,
+                    alpha: MTLTextureSwizzle::One,
+                })
+            } else {
+                None
+            };
+            if let Some(swizzle) = swizzle {
+                self.data
+                    .raw
+                    .newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+                        format, ty, mips, layers, swizzle,
+                    )
+            } else {
+                self.data
+                    .raw
+                    .newTextureViewWithPixelFormat_textureType_levels_slices(
+                        format, ty, mips, layers,
+                    )
+            }
         }
         .ok_or_else(|| Error::Invalid("incompatible Metal texture view".into()))?;
         let size = Extent {
@@ -396,6 +453,7 @@ impl Image {
                     inner: self.clone(),
                 },
                 size,
+                format: view_format,
             },
         })
     }
@@ -403,7 +461,18 @@ impl Image {
         Arc::as_ptr(&self.data) as u64
     }
 }
+fn alpha_swizzle() -> MTLTextureSwizzleChannels {
+    MTLTextureSwizzleChannels {
+        red: MTLTextureSwizzle::Zero,
+        green: MTLTextureSwizzle::Zero,
+        blue: MTLTextureSwizzle::Zero,
+        alpha: MTLTextureSwizzle::Red,
+    }
+}
 impl ImageView {
+    pub(crate) fn format(&self) -> Format {
+        self.format
+    }
     pub(crate) fn image(&self) -> &crate::Image {
         &self.image
     }

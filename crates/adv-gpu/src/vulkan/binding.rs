@@ -71,7 +71,7 @@ impl PushLayout {
         heap: &Heap,
         bytes: u32,
         strides: &HashMap<u32, (u32, bool)>,
-    ) -> Result<Self> {
+    ) -> Option<Self> {
         let mut layout = Self::default();
         let mut half = None;
         for binding in bindings {
@@ -119,12 +119,7 @@ impl PushLayout {
                 layout.words += 1;
             }
         }
-        if layout.words * 4 > bytes as usize {
-            return Err(Error::Invalid(
-                "pipeline bindings exceed push-constant capacity".into(),
-            ));
-        }
-        Ok(layout)
+        (layout.words * 4 <= bytes as usize).then_some(layout)
     }
     pub(super) fn field(&self, group: u32, slot: u32) -> Option<&Field> {
         self.fields[group as usize].get(slot as usize)?.as_ref()
@@ -420,7 +415,7 @@ pub(super) struct Bindings {
     uniform_sets: Vec<vk::DescriptorSet>,
     uniform_dirty: u64,
     // Push-descriptor and cached-set tiers.
-    dirty: [u128; 4],
+    dirty: [[u128; 2]; 4],
     changed: bool,
     pushed_layout: vk::PipelineLayout,
     values: Vec<Bound>,
@@ -437,7 +432,7 @@ impl Bindings {
         self.push_dirty = (0, 0);
         self.uniform_sets.clear();
         self.uniform_dirty = 0;
-        self.dirty = [0; 4];
+        self.dirty = [[0; 2]; 4];
         self.changed = false;
         self.pushed_layout = vk::PipelineLayout::null();
         self.values.clear();
@@ -567,7 +562,7 @@ impl Bindings {
                 },
             ),
         };
-        debug_assert!(slot < 128, "slot {slot}");
+        debug_assert!(slot < 256, "slot {slot}");
         let slots = &mut self.slots[group as usize];
         if slots.len() <= slot as usize {
             slots.resize(slot as usize + 1, Bound::default());
@@ -587,16 +582,29 @@ impl Bindings {
                     .any(|mip| states[(layer * core.desc.mips + mip) as usize].layout != layout)
             });
             drop(states);
-            if stale {
+            let writable = group == 3
+                && compiled.is_none_or(|pipeline| {
+                    pipeline
+                        .bindings
+                        .binary_search_by_key(&(group, slot), |b| (self::group(b.kind), b.slot))
+                        .ok()
+                        .is_none_or(|index| {
+                            matches!(
+                                pipeline.bindings[index].kind,
+                                BindingKind::StorageImage { writable: true, .. }
+                            )
+                        })
+                });
+            if stale || writable {
                 // Inside an active render pass the barrier goes to the pass preamble.
                 let command = encoder.command;
                 if let Some(cb) = preamble(encoder) {
                     encoder.command = cb;
                 }
-                let write = if group == 1 {
-                    vk::AccessFlags2::empty()
-                } else {
+                let write = if writable {
                     vk::AccessFlags2::SHADER_WRITE
+                } else {
+                    vk::AccessFlags2::empty()
                 };
                 encoder.view_transition(
                     &view.inner,
@@ -609,7 +617,7 @@ impl Bindings {
         }
         let context = &encoder.shared.context;
         if context.heap.is_none() || compiled.is_none_or(|p| p.classic) {
-            self.dirty[group as usize] |= 1 << slot;
+            self.dirty[group as usize][(slot / 128) as usize] |= 1 << (slot % 128);
             self.changed = true;
         }
         let Some(heap) = &context.heap else {
@@ -771,10 +779,11 @@ impl Bindings {
             set
         };
         let context = &encoder.shared.context;
-        let written = compiled
-            .bindings
-            .iter()
-            .filter(|b| all || self.dirty[group(b.kind) as usize] & (1 << b.slot) != 0);
+        let written = compiled.bindings.iter().filter(|b| {
+            all || self.dirty[group(b.kind) as usize][(b.slot / 128) as usize]
+                & (1 << (b.slot % 128))
+                != 0
+        });
         // Fixed-size batches keep the descriptor infos on the stack.
         let mut buffers = ArrayVec::<vk::DescriptorBufferInfo, 32>::new();
         let mut images = ArrayVec::<vk::DescriptorImageInfo, 32>::new();
@@ -841,7 +850,7 @@ impl Bindings {
             }
         }
         self.changed = false;
-        self.dirty = [0; 4];
+        self.dirty = [[0; 2]; 4];
         self.pushed_layout = compiled.layout;
         Ok(())
     }

@@ -350,7 +350,12 @@ impl Device {
         let mut declared = shader::Used::default();
         for b in bindings.iter().filter(|b| b.stages.contains(stage)) {
             let (group, buffer) = shader::binding_group(b.kind);
-            declared.add(group, b.slot, buffer, self.caps().limits.max_sampled_images)?;
+            declared.add(
+                group,
+                crate::shader::compile::stage_slot(stage, group, b.slot),
+                buffer,
+                self.caps().limits.max_sampled_images,
+            )?;
         }
         let used = function.used.unwrap_or(declared);
         used.check_samplers()?;
@@ -390,6 +395,10 @@ fn factor(value: Factor) -> MTLBlendFactor {
         Factor::SrcAlphaSaturated => MTLBlendFactor::SourceAlphaSaturated,
         Factor::Constant => MTLBlendFactor::BlendColor,
         Factor::OneMinusConstant => MTLBlendFactor::OneMinusBlendColor,
+        Factor::Src1 => MTLBlendFactor::Source1Color,
+        Factor::OneMinusSrc1 => MTLBlendFactor::OneMinusSource1Color,
+        Factor::Src1Alpha => MTLBlendFactor::Source1Alpha,
+        Factor::OneMinusSrc1Alpha => MTLBlendFactor::OneMinusSource1Alpha,
     }
 }
 fn operation(value: BlendOp) -> MTLBlendOperation {
