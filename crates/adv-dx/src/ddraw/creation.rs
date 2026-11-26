@@ -212,6 +212,21 @@ pub(super) fn d3d_storage(format: &[u8; 32]) -> Option<PixelFormat> {
     }
 }
 
+#[cfg(feature = "gpu")]
+impl Described {
+    pub(super) fn packed_render_masks(&self) -> [u32; 4] {
+        if self.caps[0] & THREE_D_DEVICE != 0
+            && self.caps[0] & ZBUFFER == 0
+            && word(&self.format, 12) == 16
+            && word(&self.format, 4) & DDPF_RGB != 0
+        {
+            std::array::from_fn(|i| word(&self.format, 16 + i * 4))
+        } else {
+            [0; 4]
+        }
+    }
+}
+
 /// Check `d` as Windows does for a DirectDraw `version` object, completing
 /// what the caller left out from the display mode.
 pub(super) fn validate(
@@ -335,7 +350,7 @@ pub(super) fn validate(
     {
         return Err(NO_COLOR_KEY_HW);
     }
-    if (if has(TEXTURE) {
+    if (if has(TEXTURE | THREE_D_DEVICE) {
         texture_storage
     } else {
         storage

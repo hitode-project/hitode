@@ -59,7 +59,8 @@ pub(super) fn derive(store: &SurfaceStore, device: Device) -> Report {
             max_vertices: 65535,
             clip_planes: 6,
             vertex_blend_matrices: u16::from(device == Device::TnlHal) * 4,
-            render_formats: &[adv_gpu::Format::Bgra8Unorm, adv_gpu::Format::B5g6r5Unorm],
+            converted_packed_render_targets: true,
+            render_formats: &[adv_gpu::Format::Bgra8Unorm],
             converted_textures: &[
                 TextureFormat::Xrgb1555,
                 TextureFormat::Argb1555,

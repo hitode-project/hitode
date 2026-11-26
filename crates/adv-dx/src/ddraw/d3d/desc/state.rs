@@ -18,7 +18,8 @@ pub(in crate::ddraw::d3d) fn defaults(width: u32, height: u32, depth: bool) -> S
         (Render::LinePattern, 0),
         (Render::StippledAlpha, 0),
         (Render::EdgeAntialias, 0),
-        (Render::StippleEnable, 0),
+        (Render::Extents, 0),
+        (Render::ColorKeyBlendEnable, 0),
         (Render::ColorKeyEnable, 0),
         (Render::ZBias, 0),
     ] {
@@ -31,21 +32,25 @@ pub(in crate::ddraw::d3d) fn defaults(width: u32, height: u32, depth: bool) -> S
 }
 
 pub(in crate::ddraw::d3d) fn render(slot: u32, value: u32) -> Result<Setting, u32> {
+    // Device7 rejects the retired selectors that remain in the SDK enum for
+    // the older interfaces. Optional raster modes require a corresponding cap.
     let valid = match slot {
-        2 => value <= 2,
-        7 => value <= 2,
-        8 | 9 | 22 => (1..=3).contains(&value),
-        4 | 14..=16 | 26..=29 | 33 | 39..=41 | 48 | 52 | 136 | 137 | 141..=143 => true,
-        10 | 24 | 34 | 36..=38 | 47 | 57..=60 => true,
+        2 | 10 | 40 => value == 0,
+        7 => value <= 1,
+        9 => matches!(value, 1 | 2),
+        8 | 22 => (1..=3).contains(&value),
+        4 | 14..=16 | 26..=29 | 33 | 41 | 48 | 52 | 136..=138 | 141..=144 => true,
         19 | 20 => (1..=13).contains(&value),
         23 | 25 | 53..=56 => (1..=8).contains(&value),
+        24 => value <= 255,
+        34 | 36..=38 | 57..=60 | 139 => true,
         35 | 140 => value <= 3,
-        128..=135 => value <= 7,
-        139 => true,
+        47 => value <= 16,
+        128..=135 => value <= 15,
         145..=148 => value <= 2,
         151 => value <= 3,
         152 => value <= 63,
-        _ => return Err(UNSUPPORTED),
+        _ => return Err(INVALID),
     };
     if !valid {
         return Err(INVALID);

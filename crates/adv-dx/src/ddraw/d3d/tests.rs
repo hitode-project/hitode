@@ -872,14 +872,6 @@ fn packed_render_targets_use_hal_shading_and_dithering_rules() {
                 f.unlock(rt);
             }
         }
-        assert_eq!(f.device_call(dev, "SetRenderState", &[27, 1]), 0);
-        assert_eq!(f.device_call(dev, "ValidateDevice", &[OUT]), 0x80004001);
-        assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
-        assert_eq!(
-            f.device_call(dev, "DrawPrimitive", &[5, 0x1c4, DATA + 0x200, 4, 0]),
-            0x80004001
-        );
-        assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
     }
 }
 
@@ -1174,6 +1166,7 @@ fn registry_enumerates_device_classes_and_depth_formats_in_measured_order() {
         16,
     );
     let mut devices = Vec::new();
+    let mut descriptors = Vec::new();
     assert_eq!(
         f.invoke(
             "IDirect3D7::EnumDevices",
@@ -1182,6 +1175,7 @@ fn registry_enumerates_device_classes_and_depth_formats_in_measured_order() {
                 assert_eq!(args[3], DATA);
                 let name = cpu.read_cstr(args[1], 40).unwrap();
                 let desc: D3DDEVICEDESC7 = adv_abi::GuestPtr::new(args[2]).read(cpu).unwrap();
+                descriptors.push(desc);
                 devices.push((
                     String::from_utf8(name).unwrap(),
                     bytemuck::cast::<_, [u8; 16]>(desc.deviceGUID),
@@ -1196,11 +1190,100 @@ fn registry_enumerates_device_classes_and_depth_formats_in_measured_order() {
         devices,
         expected.map(|device| (device.name().0.to_owned(), device.guid()))
     );
-    for (device, label) in [
+    for (index, (device, label)) in [
         (caps::Device::Rgb, "rgb"),
         (caps::Device::Hal, "hal"),
         (caps::Device::TnlHal, "tnlhal"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let desc = &descriptors[index];
+        let capture = EXPECTATIONS
+            .lines()
+            .filter(|line| line.starts_with("device7\t"))
+            .nth(index)
+            .unwrap()
+            .split('\t')
+            .collect::<Vec<_>>();
+        let measured = |field: &str| {
+            let i = capture.iter().position(|&name| name == field).unwrap();
+            u32::from_str_radix(capture[i + 1], 16).unwrap()
+        };
+        let rgb = device == caps::Device::Rgb;
+        let triangle = &desc.dpcTriCaps;
+        for (field, value, omitted) in [
+            ("devcaps", desc.dwDevCaps, if rgb { 0x10 } else { 0x30 }),
+            (
+                "texcaps",
+                triangle.dwTextureCaps,
+                if rgb { 0x82 } else { 0x880 },
+            ),
+            (
+                "filter",
+                triangle.dwTextureFilterCaps,
+                if rgb { 0 } else { 0x400 },
+            ),
+            ("blendsrc", triangle.dwSrcBlendCaps, 0),
+            ("blenddst", triangle.dwDestBlendCaps, 0),
+            (
+                "raster",
+                triangle.dwRasterCaps,
+                if rgb { 6 } else { 0x21800 },
+            ),
+            ("zcmp", triangle.dwZCmpCaps, 0),
+            ("alphacmp", triangle.dwAlphaCmpCaps, 0),
+            ("shade", triangle.dwShadeCaps, 0),
+            ("texblend", triangle.dwTextureBlendCaps, 0),
+            ("fvfcaps", desc.dwFVFCaps, 0),
+            (
+                "texop",
+                desc.dwTextureOpCaps,
+                if rgb { 0 } else { 0x600000 },
+            ),
+            ("vpcaps", desc.dwVertexProcessingCaps, 0),
+        ] {
+            assert_eq!(value, measured(field) & !omitted, "{label} {field}");
+        }
+        assert_eq!(desc.dwDeviceRenderBitDepth & 0x400, 0x400);
+        assert_eq!(desc.dwMaxActiveLights, 8);
+        let target = f.surface(
+            dd,
+            true,
+            creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+            16,
+            16,
+        );
+        let dev = f.device_kind(d3d, Face::Direct3D7, target, device);
+        assert_eq!(f.device_call(dev, "GetCaps", &[DATA + 0x600]), 0);
+        let returned: D3DDEVICEDESC7 = adv_abi::GuestPtr::new(DATA + 0x600)
+            .read(&f.machine.cpu)
+            .unwrap();
+        assert_eq!(bytemuck::bytes_of(&returned), bytemuck::bytes_of(desc));
+        if device == caps::Device::Hal {
+            let mut texture_formats = Vec::new();
+            assert_eq!(
+                f.invoke("IDirect3DDevice7::EnumTextureFormats", &[dev, callback, DATA], |cpu, args| {
+                    let pf: DDPIXELFORMAT = adv_abi::GuestPtr::new(args[0]).read(cpu).unwrap();
+                    let [_, flags, fourcc, bits, r, g, b, a]: [u32; 8] = bytemuck::cast(pf);
+                    texture_formats.push(format!(
+                        "texformat\tflags\t{flags:08x}\tfourcc\t{fourcc:08x}\tbits\t{bits}\tmasks\t{r:08x}\t{g:08x}\t{b:08x}\t{a:08x}",
+                    ));
+                    1
+                }),
+                0
+            );
+            let expected = EXPECTATIONS
+                .lines()
+                .filter(|line| line.starts_with("texformat\t"))
+                .filter(|line| {
+                    !line.starts_with("texformat\tflags\t00000004")
+                        && !line.contains("flags\t00080000")
+                        && !line.contains("flags\t000c0000")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(texture_formats, expected);
+        }
         f.write(DATA, &device.guid());
         let mut formats = Vec::new();
         assert_eq!(
@@ -1772,5 +1855,616 @@ fn packed_colors_expand_before_combining_and_blending() {
         }
         draw_tl(&mut f, dev, 5, &quad(0., 0., 8., 8., u32::MAX));
         assert_eq!(f.pixels(rt, 1, 1), pixel_row("stage", "hal", name, "0"));
+    }
+}
+
+// spec: GFX-D3D7-5
+#[test]
+fn packed_targets_blend_color_and_return_nearest_packed_channels() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let caps = creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE | creation::VIDEO_MEMORY;
+    for (masks, packed) in [
+        ([0xf800, 0x7e0, 0x1f, 0], 0xa514u16),
+        ([0x7c00, 0x3e0, 0x1f, 0], 0x5294),
+        ([0x7c00, 0x3e0, 0x1f, 0x8000], 0xd294),
+        ([0xf00, 0xf0, 0xf, 0xf000], 0xbaaa),
+    ] {
+        let rt = f.described_surface(
+            dd,
+            creation::Described {
+                flags: 0x1007,
+                width: 8,
+                height: 8,
+                caps: [caps, 0, 0, 0],
+                format: pixel_format(0x40 | u32::from(masks[3] != 0), 16, masks),
+                ..Default::default()
+            },
+        );
+        let dev = f.device(d3d, Face::Direct3D7, rt);
+        for (slot, value) in [(22, 1), (19, 5), (20, 6), (27, 1)] {
+            assert_eq!(f.device_call(dev, "SetRenderState", &[slot, value]), 0);
+        }
+        assert_eq!(f.device_call(dev, "ValidateDevice", &[OUT]), 0);
+        assert_eq!(f.word(OUT), 1);
+        for dither in [0, 1] {
+            assert_eq!(f.device_call(dev, "SetRenderState", &[26, dither]), 0);
+            assert_eq!(
+                f.device_call(dev, "Clear", &[0, 0, 1, 0xff404040, 1f32.to_bits(), 0]),
+                0
+            );
+            draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., 0x80ffffff));
+            let (address, _) = f.lock(rt, 0x10);
+            assert_eq!(f.word(address) as u16, packed, "{masks:x?}");
+            f.unlock(rt);
+        }
+    }
+}
+
+// spec: GFX-D3D7-2
+#[test]
+fn textured_rgb_lines_emit_programmable_terminal_pixels_in_draw_order() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        8,
+        8,
+    );
+    let tex = f.surface(dd, true, creation::TEXTURE, 1, 1);
+    let (at, _) = f.lock(tex, 0);
+    f.write(at, &0xff404040u32.to_le_bytes());
+    f.unlock(tex);
+    let dev = f.device_kind(d3d, Face::Direct3D7, rt, caps::Device::Rgb);
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, tex]), 0);
+    for (slot, value) in [(19, 2), (20, 2), (27, 1)] {
+        assert_eq!(f.device_call(dev, "SetRenderState", &[slot, value]), 0);
+    }
+    let vertices = [
+        tl(1., 1., 0.5, u32::MAX),
+        tl(5., 1., 0.5, u32::MAX),
+        tl(5., 5., 0.5, u32::MAX),
+    ];
+    f.write(DATA + 0x200, bytemuck::cast_slice(&vertices));
+    f.write(DATA + 0x300, bytemuck::cast_slice(&[0u16, 1, 2]));
+    assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+    assert_eq!(
+        f.device_call(
+            dev,
+            "DrawIndexedPrimitive",
+            &[3, 0x1c4, DATA + 0x200, 3, DATA + 0x300, 3, 0]
+        ),
+        0
+    );
+    assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+    let pixels = f.pixels(rt, 8, 8);
+    for y in 0..8 {
+        for x in 0..8 {
+            let touched = y == 1 && (1..=5).contains(&x) || x == 5 && (2..=5).contains(&y);
+            assert_eq!(
+                pixels[y * 8 + x],
+                if touched { 0x404040 } else { 0 },
+                "{x},{y}"
+            );
+        }
+    }
+}
+
+// spec: GFX-D3D7-3
+#[test]
+fn device7_applies_the_captured_hal_combiner_blend_and_alpha_test_rules() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        8,
+        8,
+    );
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    let white = f.surface(dd, true, creation::TEXTURE, 1, 1);
+    let half = f.surface(dd, true, creation::TEXTURE, 1, 1);
+    for (tex, value) in [(white, u32::MAX), (half, 0x80808080)] {
+        let (at, _) = f.lock(tex, 0);
+        f.write(at, &value.to_le_bytes());
+        f.unlock(tex);
+    }
+    assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+    for (case, op, texture, diffuse) in [
+        ("modulate-white-tex-white-diffuse", 4, white, u32::MAX),
+        ("modulate-half-half", 4, half, 0x80808080),
+        ("modulate2x-half-half", 5, half, 0x80808080),
+        ("modulate4x-half-half", 6, half, 0x80808080),
+        ("add-half-half", 7, half, 0x80808080),
+        ("addsigned-half-half", 8, half, 0x80808080),
+        ("subtract-half-0x40", 10, half, 0x40404040),
+        ("blenddiffusealpha-a40", 12, white, 0x40000000),
+        ("selectarg2-diffuse-0x7f", 3, half, 0x7f7f7f7f),
+    ] {
+        assert_eq!(f.device_call(dev, "SetTexture", &[0, texture]), 0);
+        assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 1, op]), 0);
+        draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., diffuse));
+        assert_eq!(
+            f.pixels(rt, 1, 1),
+            pixel_row("px", "hal", case, "0"),
+            "{case}"
+        );
+    }
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, 0]), 0);
+    assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 1, 1]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[27, 1]), 0);
+    for (case, src, dst, color) in [
+        ("blend-srcalpha-a80-white-over-0x404040", 5, 6, 0x80ffffff),
+        ("blend-srcalpha-a7f-white-over-0x404040", 5, 6, 0x7fffffff),
+        ("blend-srcalpha-a01-white-over-0x404040", 5, 6, 0x01ffffff),
+        ("blend-one-one-0xc0-over-0x404040", 2, 2, 0xffc0c0c0),
+        ("blend-destcolor-zero-0x80-over-0x404040", 9, 1, 0xff808080),
+        (
+            "blend-bothsrcalpha-a40-white-over-0x404040",
+            12,
+            1,
+            0x40ffffff,
+        ),
+    ] {
+        assert_eq!(
+            f.device_call(dev, "Clear", &[0, 0, 1, 0xff404040, 1f32.to_bits(), 0]),
+            0
+        );
+        assert_eq!(f.device_call(dev, "SetRenderState", &[19, src]), 0);
+        assert_eq!(f.device_call(dev, "SetRenderState", &[20, dst]), 0);
+        draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., color));
+        assert_eq!(
+            f.pixels(rt, 1, 1),
+            pixel_row("px", "hal", case, "0"),
+            "{case}"
+        );
+    }
+    for (slot, value) in [(27, 0), (15, 1), (25, 7)] {
+        assert_eq!(f.device_call(dev, "SetRenderState", &[slot, value]), 0);
+    }
+    for reference in [0x7f, 0x80, 0x81] {
+        assert_eq!(
+            f.device_call(dev, "Clear", &[0, 0, 1, 0, 1f32.to_bits(), 0]),
+            0
+        );
+        assert_eq!(f.device_call(dev, "SetRenderState", &[24, reference]), 0);
+        draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., 0x80ffffff));
+        let case = format!("alphatest-a80-gequal-ref{reference:02x}");
+        assert_eq!(f.pixels(rt, 1, 1), pixel_row("px", "hal", &case, "0"));
+    }
+}
+
+// spec: GFX-D3D7-3
+#[test]
+fn device7_admits_documented_raster_states_and_rejects_retired_selectors() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        8,
+        8,
+    );
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    for slot in [
+        1, 3, 5, 6, 11, 12, 13, 17, 18, 21, 30, 31, 32, 39, 43, 44, 45, 46, 49, 50, 51,
+    ]
+    .into_iter()
+    .chain(64..=95)
+    {
+        f.write(OUT, &0xdead_beefu32.to_le_bytes());
+        assert_eq!(
+            f.device_call(dev, "GetRenderState", &[slot, OUT]),
+            INVALID,
+            "{slot}"
+        );
+        assert_eq!(f.word(OUT), 0xdead_beef);
+        assert_eq!(
+            f.device_call(dev, "SetRenderState", &[slot, 1]),
+            INVALID,
+            "{slot}"
+        );
+    }
+    for (slot, value) in [
+        (2, 2),
+        (7, 2),
+        (9, 3),
+        (10, 0x55550001),
+        (40, 1),
+        (47, 17),
+        (128, 16),
+    ] {
+        assert_eq!(
+            f.device_call(dev, "SetRenderState", &[slot, value]),
+            INVALID
+        );
+    }
+    for (slot, value) in [(22, 1), (8, 1), (138, 1), (135, 15)] {
+        assert_eq!(f.device_call(dev, "SetRenderState", &[slot, value]), 0);
+        assert_eq!(f.device_call(dev, "GetRenderState", &[slot, OUT]), 0);
+        assert_eq!(f.word(OUT), value);
+    }
+    let triangle = [
+        tl(1., 1., 0.5, u32::MAX),
+        tl(5., 1., 0.5, u32::MAX),
+        tl(1., 5., 0.5, u32::MAX),
+    ];
+    draw_tl(&mut f, dev, 4, &triangle);
+    let points = f.pixels(rt, 8, 8);
+    assert_eq!(points.iter().filter(|&&value| value == 0xffffff).count(), 3);
+    assert_eq!([points[9], points[13], points[41]], [0xffffff; 3]);
+    assert_eq!(f.device_call(dev, "GetClipStatus", &[DATA + 0x700]), 0);
+    assert_eq!(
+        std::array::from_fn(|i| f.word(DATA + 0x708 + i as u32 * 4)),
+        [1f32, 5., 1., 5., 0.5, 0.5].map(f32::to_bits)
+    );
+    assert_eq!(f.device_call(dev, "SetRenderState", &[8, 2]), 0);
+    assert_eq!(
+        f.device_call(dev, "Clear", &[0, 0, 1, 0, 1f32.to_bits(), 0]),
+        0
+    );
+    draw_tl(&mut f, dev, 4, &triangle);
+    let lines = f.pixels(rt, 8, 8);
+    assert_eq!([lines[11], lines[25], lines[27]], [0xffffff; 3]);
+    assert_eq!(lines[18], 0);
+
+    let texture = f.surface(dd, true, creation::TEXTURE, 4, 1);
+    let (address, _) = f.lock(texture, 0);
+    f.write(
+        address,
+        bytemuck::cast_slice(&[0xffff0000u32, 0xff00ff00, 0xff0000ff, 0xffffffff]),
+    );
+    f.unlock(texture);
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, texture]), 0);
+    assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 1, 2]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[8, 3]), 0);
+    let mut seam = quad(0., 0., 8., 8., u32::MAX);
+    for (vertex, u) in seam.iter_mut().zip([0.875f32, 0.125, 0.875, 0.125]) {
+        vertex[6] = u.to_bits();
+    }
+    for (wrap, expected) in [(0, 0x0000ff), (1, 0xff0000)] {
+        assert_eq!(f.device_call(dev, "SetRenderState", &[128, wrap]), 0);
+        draw_tl(&mut f, dev, 5, &seam);
+        assert_eq!(f.pixels(rt, 8, 1)[4], expected);
+    }
+}
+
+// spec: GFX-D3D7-5, GFX-BLT-1
+#[test]
+fn packed_target_blt_crosses_raw_and_color_residency_in_both_directions() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let packed = creation::Described {
+        flags: 0x1007,
+        caps: [creation::TEXTURE | creation::VIDEO_MEMORY, 0, 0, 0],
+        width: 8,
+        height: 8,
+        format: pixel_format(0x40, 16, [0xf800, 0x7e0, 0x1f, 0]),
+        ..Default::default()
+    };
+    let mut renderable = packed;
+    renderable.caps[0] |= creation::THREE_D_DEVICE;
+    let rt = f.described_surface(dd, renderable);
+    let texture = f.described_surface(dd, packed);
+    let output = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        8,
+        8,
+    );
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    let (address, pitch) = f.lock(texture, 0);
+    for y in 0..8 {
+        f.write(address + y * pitch, bytemuck::cast_slice(&[0x8410u16; 8]));
+    }
+    f.unlock(texture);
+    assert_eq!(f.device_call(dev, "PreLoad", &[texture]), 0);
+    assert_eq!(
+        f.device_call(dev, "Clear", &[0, 0, 1, 0, 1f32.to_bits(), 0]),
+        0
+    );
+    assert_eq!(
+        f.call("IDirectDrawSurface7::Blt", &[rt, 0, texture, 0, 0, 0]),
+        0
+    );
+    assert_eq!(f.device_call(dev, "SetRenderTarget", &[output, 0]), 0);
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, rt]), 0);
+    assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 1, 2]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+    draw_tl(&mut f, dev, 5, &quad(0., 0., 8., 8., u32::MAX));
+    assert_eq!(f.pixels(output, 1, 1), [0x848284]);
+    let (at, _) = f.lock(rt, 0);
+    f.write(at, &0xf800u16.to_le_bytes());
+    f.unlock(rt);
+    assert_eq!(f.device_call(dev, "PreLoad", &[rt]), 0);
+    assert_eq!(
+        f.call("IDirectDrawSurface7::Blt", &[texture, 0, rt, 0, 0, 0]),
+        0
+    );
+    let (at, _) = f.lock(texture, 0x10);
+    assert_eq!(f.word(at), 0x8410f800);
+    f.unlock(texture);
+}
+
+// spec: GFX-D3D7-3
+#[test]
+fn device7_vertex_material_light_and_fog_rows_match_the_capture() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    let projection: [f32; 16] = [
+        1. / 16.,
+        0.,
+        0.,
+        0.,
+        0.,
+        -1. / 16.,
+        0.,
+        0.,
+        0.,
+        0.,
+        1.,
+        0.,
+        -1.,
+        1.,
+        0.,
+        1.,
+    ];
+    f.write(DATA + 0x200, bytemuck::bytes_of(&projection));
+    assert_eq!(f.device_call(dev, "SetTransform", &[3, DATA + 0x200]), 0);
+    let vertices = |y: u32| {
+        std::array::from_fn::<_, 16, _>(|i| {
+            [
+                2. * i as f32 + 0.25,
+                y as f32 + 0.25,
+                0.5,
+                0.,
+                0.,
+                -1.,
+                f32::from_bits(u32::MAX),
+                0.,
+                0.,
+            ]
+        })
+    };
+    let compare = |f: &mut Fixture, case: &str, input: [[f32; 9]; 16], tolerance: u8| {
+        f.write(DATA + 0x200, bytemuck::cast_slice(&input));
+        assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+        assert_eq!(
+            f.device_call(dev, "DrawPrimitive", &[1, 0x152, DATA + 0x200, 16, 0]),
+            0
+        );
+        assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+        // The runtime saturates one near-normal highlight that the T&L driver
+        // and the scalar exponent evaluate to 0xfc.
+        let device = if case == "specular-power10-nonlocal" {
+            "tnlhal"
+        } else {
+            "hal"
+        };
+        let prefix = format!("vx\t{device}\t{case}\t");
+        let expected = EXPECTATIONS
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap();
+        let y = input[0][1].floor() as usize;
+        let pixels = f.pixels(rt, 32, y as u32 + 1);
+        for (i, word) in expected.as_bytes().as_chunks::<6>().0.iter().enumerate() {
+            let expected = u32::from_str_radix(std::str::from_utf8(word).unwrap(), 16).unwrap();
+            let actual = pixels[32 * y + i * 2];
+            for channel in 0..3 {
+                assert!(
+                    actual.to_le_bytes()[channel].abs_diff(expected.to_le_bytes()[channel])
+                        <= tolerance,
+                    "{case} vertex {i}, got {actual:06x}, expected {expected:06x}"
+                );
+            }
+        }
+    };
+    for (case, row, kind, position, material, ambient, specular, local, normalize, normal_length) in [
+        (
+            "directional-normal-length-0.5",
+            1,
+            3,
+            [0., 0., 0.],
+            [1., 0., 0., 0., 0.],
+            0.,
+            false,
+            true,
+            false,
+            0.5,
+        ),
+        (
+            "directional-normal-length-0.5-normalized",
+            1,
+            3,
+            [0., 0., 0.],
+            [1., 0., 0., 0., 0.],
+            0.,
+            false,
+            true,
+            true,
+            0.5,
+        ),
+        (
+            "ambient-global40-mat0.5-light0.25-diffuse0.5",
+            2,
+            3,
+            [0., 0., 0.],
+            [0.5, 0.5, 0., 0., 0.],
+            0.25,
+            false,
+            true,
+            false,
+            1.,
+        ),
+        (
+            "specular-power10-localviewer",
+            3,
+            3,
+            [0., 0., 0.],
+            [0., 0., 1., 0., 10.],
+            0.,
+            true,
+            true,
+            false,
+            1.,
+        ),
+        (
+            "specular-power10-nonlocal",
+            4,
+            3,
+            [0., 0., 0.],
+            [0., 0., 1., 0., 10.],
+            0.,
+            true,
+            false,
+            false,
+            1.,
+        ),
+        (
+            "point-light-16,5,-4-att0=1-att1=0.05",
+            5,
+            1,
+            [16., 5., -4.],
+            [1., 0., 0., 0., 0.],
+            0.,
+            false,
+            true,
+            false,
+            1.,
+        ),
+        (
+            "spot-light-16,6,-8-theta0.3-phi0.9",
+            6,
+            2,
+            [16., 6., -8.],
+            [1., 0., 0., 0., 0.],
+            0.,
+            false,
+            true,
+            false,
+            1.,
+        ),
+        (
+            "colorvertex-diffuse-source-emissive0.125",
+            7,
+            3,
+            [0., 0., 0.],
+            [1., 0., 0., 0.125, 0.],
+            0.,
+            false,
+            true,
+            false,
+            1.,
+        ),
+    ] {
+        let colorvertex = row == 7;
+        for (slot, value) in [
+            (137, 1),
+            (141, u32::from(colorvertex)),
+            (29, u32::from(specular)),
+            (142, u32::from(local)),
+            (143, u32::from(normalize)),
+            (139, if row == 2 { 0x404040 } else { 0 }),
+        ] {
+            assert_eq!(f.device_call(dev, "SetRenderState", &[slot, value]), 0);
+        }
+        let [d, a, s, e, power] = material;
+        let material: [f32; 17] = [d, d, d, 1., a, a, a, 1., s, s, s, 1., e, e, e, 1., power];
+        f.write(DATA + 0x200, bytemuck::bytes_of(&material));
+        assert_eq!(f.device_call(dev, "SetMaterial", &[DATA + 0x200]), 0);
+        let mut light = [0f32; 26];
+        light[0] = f32::from_bits(kind);
+        light[1..5].fill(1.);
+        light[5..8].fill(f32::from(u8::from(specular)));
+        light[8] = 1.;
+        light[9..12].fill(ambient);
+        light[12] = 1.;
+        light[13..16].copy_from_slice(&position);
+        light[18] = f32::from(u8::from(kind != 1));
+        light[19..26].copy_from_slice(&[
+            1000.,
+            1.,
+            1.,
+            if kind == 3 { 0. } else { 0.05 },
+            0.,
+            0.3,
+            0.9,
+        ]);
+        f.write(DATA + 0x200, bytemuck::bytes_of(&light));
+        assert_eq!(f.device_call(dev, "SetLight", &[0, DATA + 0x200]), 0);
+        assert_eq!(f.device_call(dev, "LightEnable", &[0, 1]), 0);
+        let mut input = vertices(row);
+        for (i, vertex) in input.iter_mut().enumerate() {
+            if row <= 4 {
+                let angle = (i as f32 * if specular { 3. } else { 6. }).to_radians();
+                vertex[3] = angle.sin() * normal_length;
+                vertex[5] = -angle.cos() * normal_length;
+            }
+            if colorvertex {
+                let red = i as u32 * 17;
+                vertex[6] = f32::from_bits(0xff000080 | red << 16 | (255 - red) << 8);
+            }
+        }
+        compare(&mut f, case, input, 0);
+    }
+    assert_eq!(f.device_call(dev, "SetRenderState", &[137, 0]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[29, 0]), 0);
+    let mut input = vertices(8);
+    for (i, vertex) in input.iter_mut().enumerate() {
+        let i = i as u32;
+        vertex[6] = f32::from_bits(0xff000000 | (i * 17) << 16 | (i * 16) << 8 | (255 - i * 3));
+    }
+    compare(&mut f, "unlit-passthrough", input, 0);
+    for (i, (case, vertex, table, range)) in [
+        ("vertex-fog-linear-0.2-0.8", 3, 0, 0),
+        ("vertex-fog-exp-2", 1, 0, 0),
+        ("vertex-fog-exp2-2", 2, 0, 0),
+        ("vertex-fog-linear-range", 3, 0, 1),
+        ("table-fog-linear-0.2-0.8", 0, 3, 0),
+        ("table-fog-exp-2", 0, 1, 0),
+        ("table-fog-exp2-2", 0, 2, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (slot, value) in [
+            (28, 1),
+            (34, 0xff0000),
+            (35, table),
+            (140, vertex),
+            (48, range),
+            (36, 0.2f32.to_bits()),
+            (37, 0.8f32.to_bits()),
+            (38, 2f32.to_bits()),
+        ] {
+            assert_eq!(f.device_call(dev, "SetRenderState", &[slot, value]), 0);
+        }
+        let mut input = vertices(9 + i as u32);
+        for (k, vertex) in input.iter_mut().enumerate() {
+            vertex[2] = k as f32 / 15.;
+            vertex[6] = f32::from_bits(0xff0000ff);
+        }
+        // The Windows table and vertex exponential fog rows differ by one LSB.
+        compare(&mut f, case, input, u8::from(matches!(table, 1 | 2)));
     }
 }

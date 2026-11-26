@@ -29,7 +29,6 @@ const SCENE_IN: u32 = 0x887602f8;
 const SCENE_NOT_IN: u32 = 0x887602f9;
 const SCENE_BEGIN_FAILED: u32 = 0x887602fa;
 const UNSUPPORTED_COLOR_ARGUMENT: u32 = 0x8876081a;
-const UNSUPPORTED: u32 = 0x80004001;
 const VB_LOCKED: u32 = 0x8876080e;
 
 fn gpu_error(error: gpu::Error) -> CallError {
@@ -258,11 +257,6 @@ impl Calls<'_> {
                 if rejects_rgb(device.kind, &state.fixed) {
                     return Ok(UNSUPPORTED_COLOR_ARGUMENT);
                 }
-                if self.store[sid].format.bytes() == 2
-                    && state.fixed.render[&Render::BlendEnable] != 0
-                {
-                    return Ok(UNSUPPORTED);
-                }
                 self.memory.arg_put_u32(args[1], 1)?;
             }
             "Clear" => {
@@ -319,8 +313,15 @@ impl Calls<'_> {
         if flags & 2 != 0 && z.is_none() {
             return Ok(0x88760816);
         }
-        let masks = target_masks(self.draw, self.store, sid);
-        let color = (flags & 1 != 0).then(|| pack_clear(fixed::tnl::color(args[4]), masks));
+        let color = (flags & 1 != 0).then(|| {
+            let color = fixed::tnl::color(args[4]);
+            let masks = self.store.packed_color(sid);
+            if masks[0] == 0 {
+                color.map(f64::from)
+            } else {
+                self.store.packed_clear(sid, color)
+            }
+        });
         let depth = (flags & 2 != 0).then_some(depth);
         let stencil = (flags & 4 != 0).then_some(args[6]);
         let extent = self.store[sid].rect();
@@ -448,14 +449,11 @@ impl Calls<'_> {
             return Ok(0);
         }
         let fixed = state.fixed.clone();
-        if self.store[sid].format.bytes() == 2 && fixed.render[&Render::BlendEnable] != 0 {
-            return Ok(UNSUPPORTED);
-        }
         let textures = state.textures;
         let kind = device.kind;
         let strided = method.ends_with("Strided");
         let vb = method.ends_with("VB");
-        let count = args[4];
+        let mut count = args[4];
         if count == 0 {
             return Ok(0);
         }
@@ -509,7 +507,7 @@ impl Calls<'_> {
         if entries == 0 {
             return Ok(0);
         }
-        let topology = match vertex::primitive(args[1], entries) {
+        let mut topology = match vertex::primitive(args[1], entries) {
             Ok(topology) => topology,
             Err(hr) => return Ok(hr),
         };
@@ -520,12 +518,103 @@ impl Calls<'_> {
         let Some(size) = count.checked_mul(layout.size) else {
             return Ok(INVALID);
         };
-        let bytes = if strided {
+        let mut bytes = if strided {
             let descriptor = read(self.memory, data)?;
             interleave(self.memory, descriptor, layout, count, weights)?
         } else {
             self.memory.arg_read(data, size as usize)?.into_owned()
         };
+        let flags = args[if indexed { 7 } else { 5 }];
+        let projection = Projection {
+            fixed: &fixed,
+            layout,
+            blend_weights,
+        };
+        let fill = fixed.render[&Render::FillMode];
+        let wrap = std::array::from_fn(|n| fixed.render[&(128 + n as i32)]);
+        let wraps = wrap
+            .iter()
+            .zip(layout.texcoords)
+            .any(|(&mask, coord)| mask != 0 && coord.is_some());
+        let triangles = matches!(topology, Topology::Triangles | Topology::TriangleStrip);
+        if (triangles && fill != 3) || (wraps && topology != Topology::Points) {
+            let vertex = |n| indices.as_ref().map_or(n, |indices| indices[n as usize]);
+            let spans = indices
+                .as_ref()
+                .map_or(count, |indices| indices.len() as u32);
+            let mut expanded = Vec::new();
+            if triangles {
+                let triangle = |i: u32| {
+                    if topology != Topology::TriangleStrip {
+                        [vertex(i * 3), vertex(i * 3 + 1), vertex(i * 3 + 2)]
+                    } else if i.is_multiple_of(2) {
+                        [vertex(i), vertex(i + 1), vertex(i + 2)]
+                    } else {
+                        [vertex(i), vertex(i + 2), vertex(i + 1)]
+                    }
+                };
+                let triangles = if topology == Topology::TriangleStrip {
+                    spans - 2
+                } else {
+                    spans / 3
+                };
+                let mut triangle_bytes = Vec::with_capacity(layout.size as usize * 3);
+                for i in 0..triangles {
+                    let vertices = triangle(i);
+                    if fill != 3 && projection.culled(&bytes, vertices) {
+                        continue;
+                    }
+                    triangle_bytes.clear();
+                    for vertex in vertices {
+                        append_vertex(&mut triangle_bytes, &bytes, vertex, layout.size);
+                    }
+                    wrap_vertices(&mut triangle_bytes, layout, &wrap);
+                    if fill != 3 && fixed.render[&Render::ShadeMode] == 1 {
+                        for offset in [layout.color, layout.specular.map(|(_, offset)| offset)]
+                            .into_iter()
+                            .flatten()
+                        {
+                            for i in 1..3 {
+                                let start = offset as usize;
+                                triangle_bytes.copy_within(
+                                    start..start + 4,
+                                    (i * layout.size + offset) as usize,
+                                );
+                            }
+                        }
+                    }
+                    if fill == 2 {
+                        for vertex in [0, 1, 1, 2, 2, 0] {
+                            append_vertex(&mut expanded, &triangle_bytes, vertex, layout.size);
+                        }
+                    } else {
+                        expanded.extend_from_slice(&triangle_bytes);
+                    }
+                }
+                topology = match fill {
+                    1 => Topology::Points,
+                    2 => Topology::Lines,
+                    _ => Topology::Triangles,
+                };
+            } else {
+                for entry in 0..spans {
+                    append_vertex(&mut expanded, &bytes, vertex(entry), layout.size);
+                }
+                if topology == Topology::Lines {
+                    for line in expanded.chunks_exact_mut(layout.size as usize * 2) {
+                        wrap_vertices(line, layout, &wrap);
+                    }
+                } else {
+                    wrap_strip(&mut expanded, layout, &wrap);
+                }
+            }
+            bytes = expanded;
+            indices = None;
+            count = bytes.len() as u32 / layout.size;
+            if count == 0 {
+                return Ok(0);
+            }
+        }
         let extent = self.store[sid].rect();
         let rules = rules(kind);
         let view = fixed.viewport_rect().clipped(extent);
@@ -569,7 +658,7 @@ impl Calls<'_> {
         let mut parameters = [[0; 4]; 40];
         let mut texture_words = [[0; 4]; 16];
         for (n, &texture) in textures[..active].iter().enumerate() {
-            let sampler = fixed
+            let mut sampler = fixed
                 .program_sampler(n)
                 .map_err(|error| format!("{error:?}"))?;
             let stage = if n == 0 {
@@ -582,6 +671,13 @@ impl Calls<'_> {
             } else {
                 &fixed.sampler_slots[n]
             };
+            let wrap = wrap[(stage[&Stage::CoordinateIndex] & 7) as usize];
+            if wrap & 1 != 0 {
+                sampler.u = gpu::Address::Repeat;
+            }
+            if wrap & 2 != 0 {
+                sampler.v = gpu::Address::Repeat;
+            }
             parameters[16 + n] = gpu::sampler_parameters(sampler);
             parameters[24 + n] = [
                 rules.texture_op(stage[&Stage::ColorOp]),
@@ -603,7 +699,8 @@ impl Calls<'_> {
                     _ => std::array::from_fn(|i| word(&format, 16 + i * 4)),
                 };
                 texture_words[n * 2] = masks;
-                let key = (fixed.render[&Render::ColorKeyEnable] != 0)
+                let key = (fixed.render[&Render::ColorKeyEnable] != 0
+                    || fixed.render[&Render::ColorKeyBlendEnable] != 0)
                     .then(|| self.draw.color_keys.get(&(texture, 8)).map(|&(low, _)| low))
                     .flatten();
                 texture_words[n * 2 + 1] = [
@@ -611,7 +708,11 @@ impl Calls<'_> {
                     rules
                         .color_key_mask
                         .unwrap_or_else(|| masks.into_iter().fold(0, |a, b| a | b)),
-                    2 | u32::from(key.is_some()),
+                    2 | u32::from(key.is_some())
+                        | (u32::from(self.store.packed_color(texture)[0] != 0) << 2)
+                        | (u32::from(
+                            key.is_some() && fixed.render[&Render::ColorKeyBlendEnable] != 0,
+                        ) << 3),
                     registers[&Sampler::MipLodBias],
                 ];
                 if sampler.mip.is_some() && self.draw.caps(texture)[0] & creation::MIPMAP != 0 {
@@ -624,7 +725,7 @@ impl Calls<'_> {
             };
             bindings.push(ProgramTexture { image, sampler });
         }
-        let lowered = fixed::lower(
+        let mut lowered = fixed::lower(
             &fixed,
             &fixed::Layout {
                 topology,
@@ -640,68 +741,14 @@ impl Calls<'_> {
             rules,
         )
         .map_err(|error| format!("{error:?}"))?;
-        if rules.line_last_pixel == Some(true)
-            && matches!(topology, Topology::Lines | Topology::LineStrip)
-            && layout.transformed
-            && active == 0
-            && !features_require_shader(lowered.program.features)
-            && target_masks(self.draw, self.store, sid) == [0; 4]
-        {
-            let positions = bytes
-                .chunks_exact(layout.size as usize)
-                .map(|row| {
-                    let position = fixed::tnl::pretransformed(
-                        bytemuck::pod_read_unaligned(&row[..16]),
-                        lowered.state.viewport,
-                    )?;
-                    let color = layout.color.map_or([1.; 4], |offset| {
-                        fixed::tnl::color(word(row, offset as usize))
-                    });
-                    Some(gpu::Vertex {
-                        position,
-                        color,
-                        uv: [0.; 2],
-                    })
-                })
-                .collect::<Vec<_>>();
-            let ordered = indices
-                .as_ref()
-                .map_or_else(|| (0..count).collect::<Vec<_>>(), Clone::clone);
-            let Some(vertices) = ordered
-                .into_iter()
-                .map(|i| positions[i as usize])
-                .collect::<Option<Vec<_>>>()
-            else {
-                return Ok(INVALID);
-            };
-            let target = self.target(sid, bounds, true, z.as_ref())?;
-            let d3d = self.draw.d3d.as_mut().unwrap();
-            recording::admit(
-                &mut d3d.queue,
-                &mut d3d.gpu,
-                Payload::Lines {
-                    target,
-                    vertices: Arc::new(vertices),
-                    state: lowered.state,
-                },
-                Effects {
-                    area: bounds,
-                    target: sid,
-                    depth: z.as_ref().map(|&(id, _)| id),
-                    view: extent,
-                    reads: &[],
-                    bytes: size as usize,
-                    state_key: hash((&bytes, &indices, fixed.key())),
-                },
-            )
-            .map_err(gpu_error)?;
-            return Ok(0);
-        }
         let viewport = lowered.state.viewport;
         parameters[0] = [viewport.width, viewport.height, viewport.x, viewport.y].map(f32::to_bits);
         parameters[1][2] = lowered.state.alpha_test as u32;
         parameters[1][3] = lowered.state.alpha_reference.to_bits();
-        parameters[3][0] = fixed.render[&Render::ClipPlaneEnable];
+        let clipping = fixed.render[&Render::Clipping] != 0 && flags & 4 == 0;
+        if clipping {
+            parameters[3][0] = fixed.render[&Render::ClipPlaneEnable];
+        }
         for (out, plane) in parameters[4..10].iter_mut().zip(fixed.clip_planes) {
             *out = plane.map(f32::to_bits);
         }
@@ -715,12 +762,38 @@ impl Calls<'_> {
         .map(|r| fixed.render[&r]);
         parameters[36] = fixed::tnl::color(fixed.render[&Render::TextureFactor]).map(f32::to_bits);
         parameters[38] = lowered.raster_parameters;
-        parameters[39] = target_masks(self.draw, self.store, sid);
+        let masks = self.store.packed_color(sid);
+        if lowered.state.blend.is_none() {
+            parameters[39] = masks;
+        } else if masks[0] != 0 && masks[3] == 0 {
+            lowered.state.color_write &= 7;
+        }
+        let entries = indices
+            .as_ref()
+            .map_or(count, |indices| indices.len() as u32);
+        let vertex_index = |entry| {
+            indices
+                .as_ref()
+                .map_or(entry, |indices| indices[entry as usize])
+        };
+        let line_ranges = if lowered.state.last_pixel && fixed.render[&Render::LastPixel] != 0 {
+            let pixel = |entry| {
+                projection
+                    .screen(&bytes, vertex_index(entry))
+                    .map(|[x, y, _]| [x.round(), y.round()])
+            };
+            gpu::Inclusive::ranges(topology, entries, |a, b| pixel(a) == pixel(b))
+        } else {
+            Vec::new()
+        };
+        let clip_extents = (fixed.render[&Render::Extents] != 0 && flags & 8 == 0)
+            .then(|| projection.extents(&bytes, (0..entries).map(vertex_index)));
         let legacy = Legacy {
             stages: active as u8,
             point_rounding: (topology == Topology::Points).then_some(rules.round_points),
             blend_weights,
             perspective: fixed.render[&Render::TexturePerspective] != 0,
+            clipping,
         };
         let features = (
             parameters[3][0],
@@ -751,6 +824,7 @@ impl Calls<'_> {
             program
         };
         let contents = hash((&bytes, &indices, fixed.key(), parameters, texture_words));
+        let draw_bytes = bytes.len();
         let stream = VertexStream {
             instance: false,
             bytes: VertexBytes::from(bytes),
@@ -775,7 +849,10 @@ impl Calls<'_> {
             textures: bindings,
             parameters,
         });
-        let target = self.target(sid, bounds, true, z.as_ref())?;
+        let mut target = self.target(sid, bounds, true, z.as_ref())?;
+        if masks[0] != 0 && masks[3] == 0 {
+            target = target.with_alpha_mode(gpu::AlphaMode::Opaque);
+        }
         let d3d = self.draw.d3d.as_mut().unwrap();
         recording::admit(
             &mut d3d.queue,
@@ -784,6 +861,7 @@ impl Calls<'_> {
                 target,
                 draw,
                 state: lowered.state,
+                line_ranges: (!line_ranges.is_empty()).then(|| line_ranges.into()),
             },
             Effects {
                 area: bounds,
@@ -791,17 +869,22 @@ impl Calls<'_> {
                 depth: z.as_ref().map(|&(id, _)| id),
                 view: extent,
                 reads: &reads,
-                bytes: size as usize,
+                bytes: draw_bytes,
                 state_key: contents,
             },
         )
         .map_err(gpu_error)?;
+        if let Some(extents) = clip_extents {
+            let state = ddraw::d3d::device_mut(self.draw, self.objects, args[0])
+                .unwrap()
+                .state
+                .as_mut()
+                .unwrap();
+            state.clip_status[0] |= 2;
+            state.clip_status[2..].copy_from_slice(&extents);
+        }
         Ok(0)
     }
-}
-
-fn features_require_shader(features: u32) -> bool {
-    features & !fixed::STAGE_ARGUMENTS != 0
 }
 
 fn rules(kind: caps::Device) -> Rules {
@@ -915,6 +998,129 @@ fn shader_constants(
     Ok((snapshot, usage))
 }
 
+struct Projection<'a> {
+    fixed: &'a fixed::State,
+    layout: fixed::VertexLayout,
+    blend_weights: u8,
+}
+
+impl Projection<'_> {
+    fn screen(&self, vertices: &[u8], index: u32) -> Option<[f32; 3]> {
+        let offset = (index * self.layout.size) as usize;
+        if self.layout.transformed {
+            let [x, y, z, rhw]: [f32; 4] =
+                bytemuck::pod_read_unaligned(&vertices[offset..offset + 16]);
+            return (rhw != 0. && [x, y, z, rhw].into_iter().all(f32::is_finite))
+                .then_some([x, y, z]);
+        }
+        let [x, y, z] = bytemuck::pod_read_unaligned(&vertices[offset..offset + 12]);
+        let input = [x, y, z, 1.];
+        let mut world = [0.; 4];
+        let mut remainder = 1.;
+        for i in 0..usize::from(self.blend_weights) {
+            let weight = f32::from_bits(word(vertices, offset + 12 + i * 4));
+            let matrix = if i == 0 { 0 } else { i + 2 };
+            for (out, v) in world
+                .iter_mut()
+                .zip(fixed::tnl::row(input, self.fixed.transform(matrix)))
+            {
+                *out += v * weight;
+            }
+            remainder -= weight;
+        }
+        let matrix = if self.blend_weights == 0 {
+            0
+        } else {
+            usize::from(self.blend_weights) + 2
+        };
+        for (out, v) in world
+            .iter_mut()
+            .zip(fixed::tnl::row(input, self.fixed.transform(matrix)))
+        {
+            *out += v * remainder;
+        }
+        let eye = fixed::tnl::row(world, self.fixed.transform(1));
+        let [x, y, z, w] = fixed::tnl::row(eye, self.fixed.transform(2));
+        let view = self.fixed.viewport_rect();
+        (w != 0. && [x, y, z, w].into_iter().all(f32::is_finite)).then(|| {
+            [
+                view.x as f32 + (x / w + 1.) * view.w as f32 * 0.5,
+                view.y as f32 + (1. - y / w) * view.h as f32 * 0.5,
+                z / w,
+            ]
+        })
+    }
+
+    fn culled(&self, bytes: &[u8], vertices: [u32; 3]) -> bool {
+        let [Some(a), Some(b), Some(c)] = vertices.map(|index| self.screen(bytes, index)) else {
+            return false;
+        };
+        let winding = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        winding == 0.
+            || match self.fixed.render[&Render::CullMode] {
+                2 => winding > 0.,
+                3 => winding < 0.,
+                _ => false,
+            }
+    }
+
+    fn extents(&self, bytes: &[u8], indices: impl Iterator<Item = u32>) -> [u32; 6] {
+        let mut bounds = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for position in indices.filter_map(|index| self.screen(bytes, index)) {
+            for (axis, value) in position.into_iter().enumerate() {
+                bounds[axis * 2] = bounds[axis * 2].min(value);
+                bounds[axis * 2 + 1] = bounds[axis * 2 + 1].max(value);
+            }
+        }
+        std::array::from_fn(|i| bounds[i].to_bits())
+    }
+}
+
+fn append_vertex(out: &mut Vec<u8>, bytes: &[u8], index: u32, stride: u32) {
+    out.extend_from_slice(&bytes[(index * stride) as usize..((index + 1) * stride) as usize]);
+}
+
+fn wrap_vertices(bytes: &mut [u8], layout: fixed::VertexLayout, wrap: &[u32; 8]) {
+    let mut vertices = bytes.chunks_exact_mut(layout.size as usize);
+    let anchor = vertices.next().unwrap();
+    for vertex in vertices {
+        wrap_vertex(anchor, vertex, layout, wrap);
+    }
+}
+
+fn wrap_strip(bytes: &mut [u8], layout: fixed::VertexLayout, wrap: &[u32; 8]) {
+    let mut vertices = bytes.chunks_exact_mut(layout.size as usize);
+    let mut previous = vertices.next().unwrap();
+    for vertex in vertices {
+        wrap_vertex(previous, vertex, layout, wrap);
+        previous = vertex;
+    }
+}
+
+fn wrap_vertex(anchor: &[u8], vertex: &mut [u8], layout: fixed::VertexLayout, wrap: &[u32; 8]) {
+    for (mask, coord) in wrap.iter().zip(layout.texcoords) {
+        if let Some((_, offset, dimensions)) = coord {
+            for axis in (0..dimensions).filter(|axis| mask & (1 << axis) != 0) {
+                let start = offset as usize + usize::from(axis) * 4;
+                let origin = f32::from_bits(word(anchor, start));
+                let value = f32::from_bits(word(vertex, start));
+                let delta = origin - value;
+                if delta.abs() > 0.5 {
+                    vertex[start..start + 4]
+                        .copy_from_slice(&(value + delta.round()).to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
 fn draw_bounds(
     fixed: &fixed::State,
     layout: fixed::VertexLayout,
@@ -952,33 +1158,6 @@ fn draw_bounds(
         w: right.saturating_sub(x),
         h: bottom.saturating_sub(y),
     }
-}
-
-fn target_masks(
-    draw: &ddraw::DirectDraw,
-    store: &adv_device::surface::SurfaceStore,
-    id: u32,
-) -> [u32; 4] {
-    if store[id].format.bytes() == 4 {
-        return [0; 4];
-    }
-    let format = draw.described[&id].format;
-    std::array::from_fn(|i| word(&format, 16 + i * 4))
-}
-
-fn pack_clear(color: [f32; 4], masks: [u32; 4]) -> [f64; 4] {
-    if masks[0] == 0 {
-        return color.map(f64::from);
-    }
-    let bits = masks
-        .into_iter()
-        .zip(color)
-        .filter(|&(mask, _)| mask != 0)
-        .fold(0, |bits, (mask, color)| {
-            let shift = mask.trailing_zeros();
-            bits | (((color * (mask >> shift) as f32).round() as u32) << shift)
-        });
-    fixed::tnl::color(bits).map(f64::from)
 }
 
 fn word(bytes: &[u8], offset: usize) -> u32 {

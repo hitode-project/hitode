@@ -7,10 +7,13 @@ fn legacy_tap(at: vec2<i32>, level: i32, config: vec4<u32>,
     }
     let xy = vec2(adv_address_texel(at.x, size.x, (config.x >> 4u) & 3u),
         adv_address_texel(at.y, size.y, (config.x >> 6u) & 3u));
-    let raw = legacy_raw(textureLoad(image, xy, level));
-    if (key.z & 1u) != 0u && (raw & key.y) == (key.x & key.y) { discard; }
-    return vec4(legacy_channel(raw, masks.x), legacy_channel(raw, masks.y),
-        legacy_channel(raw, masks.z), legacy_channel(raw, masks.w));
+    let texel = textureLoad(image, xy, level);
+    let raw = select(packed_raw(texel), packed_encode(texel, packed_storage_masks(masks)), (key.z & 4u) != 0u);
+    if (key.z & 9u) != 0u && (raw & key.y) == (key.x & key.y) {
+        if (key.z & 8u) != 0u { return vec4<f32>(0.0); }
+        discard;
+    }
+    return packed_decode(raw, masks);
 }
 fn legacy_level(uv: vec2<f32>, level: i32, linear: bool,
     config: vec4<u32>, masks: vec4<u32>, key: vec4<u32>) -> vec4<f32> {

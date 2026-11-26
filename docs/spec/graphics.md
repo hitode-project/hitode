@@ -125,7 +125,7 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 
 ### GFX-D3D7-3 Fixed-function state
 
-**Rule**: Device7 MUST translate its API state into the shared fixed-function registers and return its API values from getters. A state block MUST capture and apply only its member slots, including recorded changes to stage samplers and texture matrices.
+**Rule**: Device7 MUST translate its API state into the shared fixed-function registers and return its API values from getters. A state block MUST capture and apply only its member slots, including recorded changes to stage samplers and texture matrices. Device7 MUST reject retired render-state selectors with DDERR_INVALIDPARAMS.
 **Verification**: Test
 
 ### GFX-D3D7-4 Texture color keys
@@ -136,8 +136,8 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 
 ### GFX-D3D7-5 Shared surface access
 
-**Rule**: Device7 MUST admit immutable draw inputs and use shared surface residency for the textures it reads and render targets it writes. DirectDraw locks MUST see the results of the recorded GPU writes.
-The registry-only Device7 returns `E_NOTIMPL` for blending into packed 16-bit color targets. Opaque draws and clears use the target's channel masks.
+**Rule**: Device7 MUST admit immutable draw inputs and access shared surface residency for every texture read and render-target write. DirectDraw locks MUST see recorded GPU writes.
+Packed 16-bit targets MUST blend in resident BGRA and round to the nearest packed color at surface access, independent of `DITHERENABLE`.
 **Verification**: Test
 
 ### GFX-D3D7-6 Device scene on a lost target

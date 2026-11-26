@@ -20,7 +20,10 @@ def expectations(source):
         "tex-wrap-uv-minus-0.5-1.5", "subtract-half-0x40",
     }
     for row in rows(source, "d3d7_pixels"):
-        if row[:2] == ["px", "hal"] and row[2] in {"rt16-gouraud-dither0", "rt16-flat-dither0"}:
+        arithmetic = row[2].startswith(("modulate", "add-", "addsigned-", "selectarg", "blend", "alphatest"))
+        if row[:2] == ["px", "hal"] and arithmetic:
+            yield [*row[:4], "".join(row[4:])]
+        elif row[:2] == ["px", "hal"] and row[2] in {"rt16-gouraud-dither0", "rt16-flat-dither0"}:
             yield ["packed", *row[1:4], "".join(row[4:])]
         elif row[0] == "px" and row[2] in raster:
             if row[1] == "rgb" and row[2] not in {
@@ -29,12 +32,12 @@ def expectations(source):
                 continue
             yield [*row[:4], "".join(row[4:])]
     for row in rows(source, "d3d7_tnl"):
-        if row[0] == "vx" and row[2] == "directional-diffuse-6deg-steps":
-            yield [*row[:3], "".join(row[3:])]
-        elif row[0] == "vx" and row[2].startswith("vertex-blend-1weight-"):
+        if row[0] == "vx" and row[2].startswith("vertex-blend-1weight-"):
             yield row
         elif row[0] == "vx" and row[1] == "hal" and row[2] == "texgen-cameraspaceposition-u=x/32":
             yield ["stage", *row[1:3], "0", "".join(row[3:])]
+        elif row[0] == "vx":
+            yield [*row[:3], "".join(row[3:])]
         if row[0] == "px" and row[2] in {
             "z-coplanar-less", "z-coplanar-less-zbias1", "z-coplanar-less-zbias16",
             "texture-565-0x8410-expanded", "texture-1555-0x4210-expanded",
@@ -47,7 +50,7 @@ def expectations(source):
         elif row[0] == "ck":
             yield [*row[:4], "".join(row[4:])]
     for row in rows(source, "d3d7_semantics"):
-        if row[0] in {"device7", "zformat"}:
+        if row[0] in {"device7", "zformat", "texformat"}:
             yield row
         elif row[0] == "colorkey" and row[2].startswith("mode"):
             yield [*row[:5], "".join(row[5:])]

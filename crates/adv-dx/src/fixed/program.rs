@@ -95,6 +95,7 @@ pub(crate) struct Legacy {
     pub point_rounding: Option<bool>,
     pub blend_weights: u8,
     pub perspective: bool,
+    pub clipping: bool,
 }
 
 fn build_program(
@@ -151,6 +152,7 @@ fn build_program(
             .split_once("fn adv_border_texel")
             .unwrap();
         s.push_str(address);
+        s.push_str(adv_device::gpu::PACKED_WGSL);
         s.push_str(include_str!("legacy.wgsl"));
     } else {
         s.push_str(adv_device::gpu::BORDER_WGSL);
@@ -334,6 +336,9 @@ fn build_program(
         s.push_str("var size=bitcast<f32>(draw_parameters.values[11].w);\n");
     }
     s.push_str("size=clamp(size,bitcast<f32>(draw_parameters.values[12].x),bitcast<f32>(draw_parameters.values[12].y));out.position.x+=corner.x*size*out.position.w/bitcast<f32>(draw_parameters.values[0].x);out.position.y+=corner.y*size*out.position.w/bitcast<f32>(draw_parameters.values[0].y);if draw_parameters.values[12].z!=0u {out.t0=vec4<f32>((corner.x+1.0)*0.5,(1.0-corner.y)*0.5,0.0,1.0);} }\n");
+    if legacy.is_some_and(|legacy| !legacy.clipping) {
+        s.push_str("out.position.z=clamp(out.position.z,0.0,max(0.0,out.position.w));\n");
+    }
     s.push_str("return Interpolated(out.position");
     for (n, field) in fields().iter().enumerate() {
         if used[n] {
@@ -447,7 +452,7 @@ fn build_program(
         s.push_str("if draw_parameters.values[3].y!=0u {var factor=input.fog;let mode=draw_parameters.values[3].z;let values=bitcast<vec4<f32>>(draw_parameters.values[11]);let distance=input.position.z;if mode==1u {factor=exp(-values.z*distance);}else if mode==2u {factor=exp(-pow(values.z*distance,2.0));}else if mode==3u {factor=(values.y-distance)/(values.y-values.x);}color=vec4<f32>(mix(bitcast<vec4<f32>>(draw_parameters.values[10]).rgb,color.rgb,clamp(factor,0.0,1.0)),color.a);}\n");
     }
     if legacy.is_some() {
-        s.push_str("color=legacy_pack(color,draw_parameters.values[39]);\n");
+        s.push_str("let masks=draw_parameters.values[39];if masks.x!=0u {color=packed_decode(packed_encode(color,masks),packed_storage_masks(masks));}\n");
     }
     if fixed & 16 != 0 {
         s.push_str("let linear=clamp(color.rgb,vec3<f32>(0.0),vec3<f32>(1.0));color=vec4<f32>(select(1.055*pow(linear,vec3<f32>(1.0/2.4))-0.055,12.92*linear,linear<=vec3<f32>(0.0031308)),color.a);\n");

@@ -3,7 +3,7 @@ use crate::record::{
     Cursor, Front, Kind, Op, Reason, Recording, ResourceKey, damage::Input, key::hash,
 };
 use adv_device::{
-    gpu::{self, DrawState, Gpu, ProgrammableDraw, Target, Vertex},
+    gpu::{self, DrawState, Gpu, ProgrammableDraw, Target},
     surface::Rect,
 };
 use std::sync::Arc;
@@ -18,15 +18,11 @@ pub(super) enum Payload {
         depth: Option<f32>,
         stencil: Option<u32>,
     },
-    Lines {
-        target: Target,
-        vertices: Arc<Vec<Vertex>>,
-        state: DrawState,
-    },
     Draw {
         target: Target,
         draw: Arc<ProgrammableDraw>,
         state: DrawState,
+        line_ranges: Option<Arc<[std::ops::Range<u32>]>>,
     },
 }
 
@@ -68,20 +64,18 @@ impl Front for Adapter {
                 }
                 Ok(())
             }
-            Payload::Lines {
-                target,
-                vertices,
-                state,
-            } => sink
-                .gpu
-                .draw_arc_clips(target, vertices.clone(), None, *state, sink.clips),
             Payload::Draw {
                 target,
                 draw,
                 state,
-            } => sink
-                .gpu
-                .draw_programmable_arc_clips(target, draw.clone(), state, sink.clips),
+                line_ranges,
+            } => sink.gpu.draw_programmable_line_ranges(
+                target,
+                draw.clone(),
+                state,
+                sink.clips,
+                line_ranges.clone(),
+            ),
         }
     }
 
@@ -163,7 +157,7 @@ pub(super) fn admit(
             stencil.is_some(),
             color.is_some(),
         ),
-        Payload::Draw { state, .. } | Payload::Lines { state, .. } => (
+        Payload::Draw { state, .. } => (
             Kind::Draw,
             [None; 3],
             state.depth_write,
@@ -191,9 +185,7 @@ pub(super) fn admit(
         }
     }
     let target = match &payload {
-        Payload::Clear { target, .. }
-        | Payload::Lines { target, .. }
-        | Payload::Draw { target, .. } => target,
+        Payload::Clear { target, .. } | Payload::Draw { target, .. } => target,
     };
     let attachment = target.depth().map(|depth| {
         (

@@ -10,6 +10,8 @@ pub mod compile;
 mod depth;
 mod index_bytes;
 mod line;
+pub use line::Inclusive;
+pub const PACKED_WGSL: &str = include_str!("gpu/packed.wgsl");
 pub use index_bytes::IndexBytes;
 
 pub(crate) mod native;

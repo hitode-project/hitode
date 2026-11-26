@@ -399,6 +399,10 @@ impl DirectDraw {
         let mut parent = root;
         for (w, h, member) in levels {
             let sid = surfaces.create(w, h, false, format, m)?;
+            #[cfg(feature = "gpu")]
+            if self.d3d.is_some() {
+                surfaces.set_packed_color(sid, member.packed_render_masks());
+            }
             self.described.insert(sid, member);
             let result = self.com_version(objects, surfaces, Kind::Surface(sid), version, m);
             let Ok(Some(p)) = result else {
@@ -1577,7 +1581,7 @@ impl DirectDraw {
                 let owner_device_id = object.device_id;
                 let owner_modern = object.modern;
                 let surface_version = surface_version(version);
-                let format = (if d.caps[0] & TEXTURE != 0 {
+                let format = (if d.caps[0] & (TEXTURE | THREE_D_DEVICE) != 0 {
                     texture_storage
                 } else {
                     storage
@@ -1611,6 +1615,10 @@ impl DirectDraw {
                 };
                 // Like Windows, the kept descriptor has no client address.
                 d.flags &= !DDSD_LPSURFACE;
+                #[cfg(feature = "gpu")]
+                if self.d3d.is_some() {
+                    surfaces.set_packed_color(sid, d.packed_render_masks());
+                }
                 self.described.insert(sid, d);
                 let result =
                     self.com_version(objects, surfaces, Kind::Surface(sid), surface_version, m);
