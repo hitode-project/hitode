@@ -490,9 +490,10 @@ fn pixel_row(label: &str, device: &str, case: &str, row: &str) -> Vec<u32> {
                 .then(|| fields.next().unwrap())
         })
         .unwrap();
+    let digits = if label == "packed" { 4 } else { 6 };
     (0..raw.len())
-        .step_by(6)
-        .map(|i| u32::from_str_radix(&raw[i..i + 6], 16).unwrap())
+        .step_by(digits)
+        .map(|i| u32::from_str_radix(&raw[i..i + digits], 16).unwrap())
         .collect()
 }
 
@@ -762,6 +763,78 @@ fn rgb_value_rules_share_the_hal_raster_path() {
 
 fn pixel_format(flags: u32, bits: u32, masks: [u32; 4]) -> [u8; 32] {
     bytemuck::cast([32, flags, 0, bits, masks[0], masks[1], masks[2], masks[3]])
+}
+
+// spec: GFX-D3D7-2, GFX-D3D7-5
+#[test]
+fn packed_render_targets_use_hal_shading_and_dithering_rules() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.described_surface(
+        dd,
+        creation::Described {
+            flags: creation::DDSD_CAPS
+                | creation::DDSD_WIDTH
+                | creation::DDSD_HEIGHT
+                | creation::DDSD_PIXELFORMAT,
+            caps: [
+                creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+                0,
+                0,
+                0,
+            ],
+            width: 32,
+            height: 32,
+            format: pixel_format(0x40, 16, [0xf800, 0x7e0, 0x1f, 0]),
+            ..Default::default()
+        },
+    );
+    let mut vertices = quad(0., 0., 16., 16., 0);
+    for (vertex, color) in vertices
+        .iter_mut()
+        .zip([0xff000000, 0xffff0000, 0xff0000ff, 0xff00ff00])
+    {
+        vertex[4] = color;
+    }
+    for kind in [caps::Device::Hal, caps::Device::Rgb] {
+        let dev = f.device_kind(d3d, Face::Direct3D7, rt, kind);
+        assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+        for (shade, name) in [(1, "rt16-flat-dither0"), (2, "rt16-gouraud-dither0")] {
+            assert_eq!(f.device_call(dev, "SetRenderState", &[9, shade]), 0);
+            for dither in [0, 1] {
+                assert_eq!(f.device_call(dev, "SetRenderState", &[26, dither]), 0);
+                assert_eq!(
+                    f.device_call(dev, "Clear", &[0, 0, 1, 0, 1f32.to_bits(), 0]),
+                    0
+                );
+                draw_tl(&mut f, dev, 5, &vertices);
+                let (address, pitch) = f.lock(rt, 0x10);
+                for y in 0..16 {
+                    let actual = (0..16)
+                        .map(|x| {
+                            let pair = f.word(address + y * pitch + (x & !1) * 2);
+                            (pair >> ((x & 1) * 16)) & 0xffff
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual,
+                        pixel_row("packed", "hal", name, &y.to_string()),
+                        "{kind:?} {name} dither {dither} row {y}"
+                    );
+                }
+                f.unlock(rt);
+            }
+        }
+        assert_eq!(f.device_call(dev, "SetRenderState", &[27, 1]), 0);
+        assert_eq!(f.device_call(dev, "ValidateDevice", &[OUT]), 0x80004001);
+        assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+        assert_eq!(
+            f.device_call(dev, "DrawPrimitive", &[5, 0x1c4, DATA + 0x200, 4, 0]),
+            0x80004001
+        );
+        assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+    }
 }
 
 // spec: GFX-D3D7-4, GFX-D3D7-5

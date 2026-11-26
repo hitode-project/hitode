@@ -29,6 +29,7 @@ const SCENE_IN: u32 = 0x887602f8;
 const SCENE_NOT_IN: u32 = 0x887602f9;
 const SCENE_BEGIN_FAILED: u32 = 0x887602fa;
 const UNSUPPORTED_COLOR_ARGUMENT: u32 = 0x8876081a;
+const UNSUPPORTED: u32 = 0x80004001;
 const VB_LOCKED: u32 = 0x8876080e;
 
 fn gpu_error(error: gpu::Error) -> CallError {
@@ -257,6 +258,11 @@ impl Calls<'_> {
                 if rejects_rgb(device.kind, &state.fixed) {
                     return Ok(UNSUPPORTED_COLOR_ARGUMENT);
                 }
+                if self.store[sid].format.bytes() == 2
+                    && state.fixed.render[&Render::BlendEnable] != 0
+                {
+                    return Ok(UNSUPPORTED);
+                }
                 self.memory.arg_put_u32(args[1], 1)?;
             }
             "Clear" => {
@@ -442,6 +448,9 @@ impl Calls<'_> {
             return Ok(0);
         }
         let fixed = state.fixed.clone();
+        if self.store[sid].format.bytes() == 2 && fixed.render[&Render::BlendEnable] != 0 {
+            return Ok(UNSUPPORTED);
+        }
         let textures = state.textures;
         let kind = device.kind;
         let strided = method.ends_with("Strided");

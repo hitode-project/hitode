@@ -20,7 +20,9 @@ def expectations(source):
         "tex-wrap-uv-minus-0.5-1.5", "subtract-half-0x40",
     }
     for row in rows(source, "d3d7_pixels"):
-        if row[0] == "px" and row[2] in raster:
+        if row[:2] == ["px", "hal"] and row[2] in {"rt16-gouraud-dither0", "rt16-flat-dither0"}:
+            yield ["packed", *row[1:4], "".join(row[4:])]
+        elif row[0] == "px" and row[2] in raster:
             if row[1] == "rgb" and row[2] not in {
                 "line-1,1-6,4-points-1.5,6.5-3,6", "subtract-half-0x40"
             }:

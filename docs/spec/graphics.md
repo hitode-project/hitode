@@ -137,6 +137,7 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 ### GFX-D3D7-5 Shared surface access
 
 **Rule**: Device7 MUST admit immutable draw inputs and use shared surface residency for the textures it reads and render targets it writes. DirectDraw locks MUST see the results of the recorded GPU writes.
+The registry-only Device7 returns `E_NOTIMPL` for blending into packed 16-bit color targets. Opaque draws and clears use the target's channel masks.
 **Verification**: Test
 
 ### GFX-D3D7-6 Device scene on a lost target

@@ -17,7 +17,8 @@ fn legacy_channel(raw: u32, mask: u32) -> f32 {
 fn legacy_pack(color: vec4<f32>, masks: vec4<u32>) -> vec4<f32> {
     if masks.x == 0u { return color; }
     let shift = vec4<u32>(countTrailingZeros(masks.x), countTrailingZeros(masks.y), countTrailingZeros(masks.z), countTrailingZeros(masks.w)) & vec4<u32>(31);
-    let bits = vec4<u32>(round(clamp(color, vec4<f32>(0.0), vec4<f32>(1.0)) * vec4<f32>(masks >> shift))) << shift;
+    let scaled = clamp(color, vec4<f32>(0.0), vec4<f32>(1.0)) * vec4<f32>(masks >> shift);
+    let bits = vec4<u32>(ceil(scaled - 0.5)) << shift;
     let raw = bits.x | bits.y | bits.z | bits.w;
     return vec4<f32>(f32((raw >> 16u) & 255u), f32((raw >> 8u) & 255u), f32(raw & 255u), f32(raw >> 24u)) / 255.0;
 }

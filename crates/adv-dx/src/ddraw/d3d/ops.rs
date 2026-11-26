@@ -348,6 +348,14 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         .call(face, method, args)
     };
     match result {
+        Ok(hr @ 0x80004001) => {
+            adv_abi::warn_unavailable(
+                env,
+                &format!("{}::{method}", face.name()),
+                "Direct3D operation is outside the implemented paths",
+            );
+            Outcome::Return(hr)
+        }
         Ok(hr) => Outcome::Return(hr),
         Err(error) => error.outcome(env),
     }
