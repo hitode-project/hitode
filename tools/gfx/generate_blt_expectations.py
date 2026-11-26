@@ -20,8 +20,11 @@ def expectations(source):
             assert rows[0] == "ckey"
             caps.append(f"{pair}\t{rows[1]}")
             continue
-        assert kind == "blt" and pair in PAIRS
-        if name.startswith("getcolorkey"):
+        assert kind in ("blt", "key") and pair in PAIRS
+        if kind == "key":
+            name = f"key-api-{name}"
+            result = f"{value}:{'.'.join(rows)}"
+        elif name.startswith("getcolorkey"):
             result = f"{value}:{rows[0]}"
         elif rows:
             pixels = ".".join(pixel.lstrip("0") or "0" for row in rows for pixel in row.split("."))
@@ -31,12 +34,13 @@ def expectations(source):
         case = cases.setdefault(name, {})
         assert pair not in case
         case[pair] = result
-    header = ["# ddraw_blt.c: HRESULT[:row-major hex pixels], or low:high key.",
+    probe = source.with_suffix(".c").name
+    header = [f"# {probe}: HRESULT[:row-major hex pixels], or low:high key.",
               "# Columns: vid-vid, sys-sys, sys-vid, vid-sys. =N repeats column N (zero-based)."]
     rows = []
     for name, case in cases.items():
-        results = [case[pair] for pair in PAIRS]
-        fields = [result if results.index(result) == i else f"={results.index(result)}"
+        results = [case.get(pair, "-") if name == "key-mask-24" else case[pair] for pair in PAIRS]
+        fields = [result if result == "-" or results.index(result) == i else f"={results.index(result)}"
                   for i, result in enumerate(results)]
         rows.append("\t".join([name, *fields]))
     return "\n".join([*header, *caps, *rows]) + "\n"
@@ -45,14 +49,15 @@ def expectations(source):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dump", type=Path)
+    parser.add_argument("--output", type=Path, default=OUTPUT)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     expected = expectations(args.dump)
     if args.check:
-        if OUTPUT.read_text() != expected:
+        if args.output.read_text() != expected:
             raise SystemExit("Blt expectations differ from the probe")
     else:
-        OUTPUT.write_text(expected)
+        args.output.write_text(expected)
 
 
 if __name__ == "__main__":

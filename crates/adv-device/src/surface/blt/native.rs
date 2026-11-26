@@ -67,7 +67,7 @@ impl<P: Presenter> Surfaces<P> {
             parameters[0] = [origin[0], origin[1], dr.x, dr.y];
             parameters[1] = params.x.parameters();
             parameters[2] = params.y.parameters();
-            parameters[3] = [dr.w, dr.h, params.mask, params.conversion as u32];
+            parameters[3] = [dr.w, dr.h, params.mask, params.conversion.parameters()];
             parameters[4] = [
                 u32::from(params.key.is_some()),
                 params.key.unwrap_or(0),

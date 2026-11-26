@@ -690,7 +690,7 @@ fn clip_lists_limit_blits_and_fills_like_windows() {
     rect(&mut m, DATA + 0x700, [4, 4, 12, 12]);
     assert_eq!(
         call(&mut m, api::BLT, &[dst, DATA + 0x700, src, 0, 0, 0]),
-        0x80070057
+        0x88760096
     );
     assert_eq!(call(&mut m, api::SET_CLIPPER, &[dst, clipper]), 0);
     assert_eq!(
@@ -1422,3 +1422,5 @@ fn inaccessible_argument_pointers_answer_invalid_params() {
             .any(|(_, reason)| reason.contains("E_INVALIDARG"))
     );
 }
+
+mod blt;

@@ -38,19 +38,26 @@ fn sample_axis(x: u32, axis: vec4<u32>, dst: u32) -> u32 {
     return select(pixel, axis.w - 1u - pixel, axis.w != 0u);
 }
 
+fn expand5(value: u32) -> u32 {
+    return value << 3u | value >> 2u;
+}
+
 fn convert(raw: u32, mode: u32) -> u32 {
-    switch mode {
-        case 1u: {
-            let r = raw >> 11u;
+    var rgb: vec3<u32>;
+    switch (mode & 15u) {
+        case 1u: { rgb = (vec3(raw) >> vec3(16u, 8u, 0u)) & vec3(255u); }
+        case 2u: { rgb = vec3(expand5((raw >> 10u) & 31u), expand5((raw >> 5u) & 31u), expand5(raw & 31u)); }
+        case 3u: {
             let g = (raw >> 5u) & 63u;
-            let b = raw & 31u;
-            return ((r << 3u | r >> 2u) << 16u) | ((g << 2u | g >> 4u) << 8u) | (b << 3u | b >> 2u);
+            rgb = vec3(expand5(raw >> 11u), g << 2u | g >> 4u, expand5(raw & 31u));
         }
-        case 2u: {
-            return ((raw >> 19u) & 31u) << 11u | ((raw >> 10u) & 63u) << 5u | (raw >> 3u) & 31u;
-        }
-        case 3u: { return raw * 0x010101u; }
+        case 4u: { rgb = vec3(raw); }
         default: { return raw; }
+    }
+    switch (mode >> 4u) {
+        case 2u: { return (rgb.x >> 3u) << 10u | (rgb.y >> 3u) << 5u | (rgb.z >> 3u); }
+        case 3u: { return (rgb.x >> 3u) << 11u | (rgb.y >> 2u) << 5u | (rgb.z >> 3u); }
+        default: { return rgb.x << 16u | rgb.y << 8u | rgb.z; }
     }
 }
 
