@@ -54,7 +54,7 @@ fn reuse_draw(f: &mut Fixture, indices: &[u32], builds: &std::cell::Cell<u32>) {
     });
     assert!(matches!(outcome, Outcome::Return(0)));
     let owner = id(f);
-    let cached = frame(&mut env(f), owner).commands.last().unwrap().clone();
+    let cached = frame(&mut env(f), owner).commands().last().unwrap().clone();
     let reference =
         programmable::prepare(&mut env(f), pointer, 4, 1, None, Some(indices), 0).unwrap();
     let a = key::prepare(&mut env(f), owner, cached).unwrap();
@@ -82,8 +82,13 @@ fn d3d9_reuse_sequence_matches_uncached_commands_keys_and_pixels() {
             }
             reuse_draw(&mut f, &[0, 1, 2], &builds);
         }
-        keys.push(frame(&mut env(&mut f), owner).command_identities.clone());
-        assert_eq!(frame(&mut env(&mut f), owner).commands.len(), 4);
+        keys.push(
+            frame(&mut env(&mut f), owner)
+                .core
+                .command_identities
+                .clone(),
+        );
+        assert_eq!(frame(&mut env(&mut f), owner).core.commands.len(), 4);
         f.okay("IDirect3DDevice9::EndScene", &[f.device]);
         present(&mut f);
         f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
@@ -250,7 +255,7 @@ fn d3d9_reuse_invalidates_all_draw_inputs() {
     );
     let owner = id(&mut f);
     let Operation::Draw(draw) = frame(&mut env(&mut f), owner)
-        .commands
+        .commands()
         .last()
         .unwrap()
         .clone()
@@ -313,8 +318,9 @@ fn d3d9_reuse_rebases_onto_a_rotated_back_buffer_image() {
     let device_pointer = f.device;
     let e = env(&mut f);
     let d = device(&e, device_pointer).unwrap();
-    assert!(!d.frame.reuse.retains(&old));
-    assert!(d.frame.reuse.retains(&new));
+    let retains = |image| d.frame.reuse.any_entry(|e| e.draws_into(image));
+    assert!(!retains(&old));
+    assert!(retains(&new));
 }
 
 #[test]
@@ -386,7 +392,10 @@ fn d3d9_differential_frames_match_full_commands_damage_and_pixels_with_statebloc
                 assert_eq!(f.finish(outcome), 0);
             }
             let owner = id(&mut f);
-            let key = frame(&mut env(&mut f), owner).command_identities.clone();
+            let key = frame(&mut env(&mut f), owner)
+                .core
+                .command_identities
+                .clone();
             let published = f.m.ext.get::<Presents>().damage.len();
             f.okay("IDirect3DDevice9::EndScene", &[d]);
             present(&mut f);

@@ -2,7 +2,7 @@
 
 ID prefix: GFX
 
-This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API front ends. It includes capabilities, shaders, vertex input, samplers, buffers, caches and numerical behavior. `adv-dx` and the GPU renderer in `adv-device` implement them.
+This spec covers shared CPU compositing, the DirectDraw and Direct3D 9 API front ends, and the Direct3D 11 fixed-function tessellation core. It includes capabilities, shaders, vertex input, samplers, buffers, caches and numerical behavior. `adv-dx` and the GPU renderer in `adv-device` implement them.
 
 ## DirectDraw
 
@@ -351,6 +351,14 @@ changed categories. They copy only differing captured entries, preserving exact
 float bits, uncaptured state and COM ownership. Capturing a complete state category shares its immutable map and content key. An unchanged Capture reuses its
 snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-state and constant setters preserve category revisions while recording still captures their membership. Matching Capture/Apply bypass binding preparation and reference transfers; changes outside the captured subset refresh its observed revisions. Applying only shader or buffer changes MUST preserve the fixed-state key cache.
 
+## Tessellation
+
+### GFX-TESS-1 Fixed-function patch tessellation
+
+**Rule**: The tessellator MUST cull a patch if any edge factor is zero, negative or NaN. It MUST match the Direct3D 11 reference for domain-location bits, primitive counts, connectivity and winding. Primitive order and the first vertex of each triangle MAY vary.
+**Verification**: Test
+**Basis**: [Direct3D 11.3 functional specification §11.7](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#TessellationPattern)
+
 ## Vertex and raster input
 
 ### GFX-INPUT-1 Declarations
@@ -487,7 +495,10 @@ Binding changes MUST NOT start speculative preparation for transient shader pair
 
 ### GFX-NUM-1 Floating-point semantics
 
-**Rule**: Shader arithmetic MUST use f32 and preserve D3D9 reference behavior for special values, including zero multiplication, reciprocal zero, and logarithm zero.
+**Rule**: D3D9 shader arithmetic MUST use f32 and preserve reference behavior for special values, including zero multiplication, reciprocal zero, and logarithm zero.
+SM4–5 WGSL emission and scalar execution MUST apply the same DXBC arithmetic rules.
+DXBC floating-point arithmetic MUST flush denormals to sign-preserved zero where the instruction requires it.
+DXBC `f32tof16` MUST round toward zero and clamp finite overflow to the largest finite half.
 **Verification**: Test
 
 ## Surface copies

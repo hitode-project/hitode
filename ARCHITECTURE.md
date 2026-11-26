@@ -69,6 +69,10 @@ assembly can call guest Windows interfaces. DirectDraw keeps its private surface
 transitional dependency on `adv-os` for heaps, activation, Automation, files and
 input state.
 
+The shared `adv-dx` modules, including frame recording, shader translation and
+pacing, depend on no API front. `tools/layering/check_modules.py` also applies
+this rule to shared fixed-function code.
+
 For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe` and calls their imports through the machine. `adv-unix::builtin` installs those images in the prefix before process startup. `adv-runtime::wine` assembles the graphics fronts on that stack: our DirectDraw as such an image, with memory DCs from Wine's GDI. `adv-drv` holds the driver modules win32u loads, such as the user driver whose window reports give the fronts their geometry.
 
 ## A frame, from start to screen
@@ -262,7 +266,7 @@ The decoder reads input, code tables and ring history in place, so output can
 alias those inputs. It publishes zlib's stream and bit state, including error
 messages and block ends; error-message addresses resolve when the module binds.
 
-- **Graphics:** GDI, DirectDraw and Direct3D 9 share neutral surfaces and drawing services. Direct3D 9 shaders are translated within the limits in [docs/spec/graphics.md](docs/spec/graphics.md). Device services follow [docs/spec/device.md](docs/spec/device.md).
+- **Graphics:** GDI, DirectDraw and Direct3D 9 share neutral surfaces and drawing services. Direct3D 9 shaders are translated within the limits in [docs/spec/graphics.md](docs/spec/graphics.md). The DXBC core in `adv-dx::shader` verifies and reflects SM4–5 register programs, then lowers shared arithmetic rules for scalar execution and WGSL emission. Device services follow [docs/spec/device.md](docs/spec/device.md).
 - **Audio:** one mixer resamples with rubato and decodes with Symphonia. Wine MIDI output synthesizes through OxiSynth with the bundled General MIDI bank. Shared PCM buffers are read through stable views, so a device never reads storage that the guest has freed.
 - **Video:** DirectShow, MCI and wmvcore decode through FFmpeg when built with the `media` feature. See [docs/spec/media.md](docs/spec/media.md).
 - **Fonts:** `adv-runtime::wine::fonts` owns GDI data, layout, DIB composition and DirectWrite glyph services over `adv-device::text` (fontdb, skrifa and zeno). Required native bodies serve interpreted and translated calls; Wine's font backend stays dormant. Fonts that the guest supplies take priority.

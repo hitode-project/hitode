@@ -7,14 +7,7 @@ use smallvec::SmallVec;
 use std::hash::Hash;
 type Hasher = xxhash_rust::xxh3::Xxh3;
 
-pub(in crate::d3d9) fn hash(value: impl Hash) -> u128 {
-    let mut h = xxhash_rust::xxh3::Xxh3::new();
-    value.hash(&mut h);
-    h.digest128()
-}
-pub(in crate::d3d9) fn rect(r: adv_device::surface::Rect) -> (u32, u32, u32, u32) {
-    (r.x, r.y, r.w, r.h)
-}
+pub(in crate::d3d9) use crate::record::key::{hash, rect};
 fn image(i: &Image) -> (u32, u32, u32, u8) {
     (i.width(), i.height(), i.mip_levels(), i.alpha_mode() as u8)
 }
@@ -119,7 +112,6 @@ pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
 }
 struct ResourceIdentity {
     owner: Id,
-    pointer: u32,
     level: u32,
     levels: u32,
 }
@@ -131,37 +123,24 @@ impl ResourceIdentity {
         match com.get_identity(&env.sys.objects, id) {
             Some(Payload::Resource(r)) => {
                 let owner = r.container.unwrap_or(id);
-                let pointer = if let Some(container) = r.container {
-                    #[cfg(feature = "d3d9-counters")]
-                    lookup(1);
-                    match com.get_identity(&env.sys.objects, container) {
-                        Some(Payload::Resource(parent)) => parent.pointer,
-                        _ => r.pointer,
-                    }
-                } else {
-                    r.pointer
-                };
                 Self {
                     owner,
-                    pointer,
                     level: r.level,
                     levels: r.levels.len().max(1) as u32,
                 }
             }
             _ => Self {
                 owner: id,
-                pointer: 0,
                 level: 0,
                 levels: 1,
             },
         }
     }
     fn content(&self, level: Option<u32>, aspect: u8) -> Content {
-        Content(
-            self.owner,
-            level.unwrap_or(self.level),
+        crate::record::ResourceKey(
+            self.owner.key(),
+            u64::from(level.unwrap_or(self.level)),
             aspect,
-            self.pointer,
         )
     }
 }
@@ -233,33 +212,59 @@ pub(super) struct Prepared {
     pub bounds: adv_device::surface::Rect,
 }
 impl Prepared {
+    pub(super) fn kind(&self) -> crate::record::Kind {
+        use crate::record::Kind;
+        match self.operation {
+            Operation::Draw(_) => Kind::Draw,
+            Operation::Clear { .. } => Kind::Clear,
+            Operation::Copy { .. } => Kind::Copy,
+            Operation::Upload { .. } => Kind::Upload,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(super) fn damage(&self, target: Option<&Target>) -> crate::record::damage::Input<'_> {
+        let image = damage::image(&self.operation).unwrap();
+        let depth = match &self.operation {
+            Operation::Draw(d) => d.target.depth(),
+            Operation::Clear { target, .. } => target.depth(),
+            _ => None,
+        };
+        let attachment = depth.map(|d| {
+            (
+                adv_device::surface::Rect {
+                    x: 0,
+                    y: 0,
+                    w: d.width(),
+                    h: d.height(),
+                },
+                d.format() as u8,
+            )
+        });
+        crate::record::damage::Input {
+            kind: self.kind(),
+            view: damage::full(image),
+            attachment,
+            color_shape: image.alpha_mode() as u8,
+            slot: hash(target.map_or(image, |t| &t.image).id()),
+            bounds: self.bounds,
+            key: self.key,
+            reads: &self.reads,
+            samples: &self.samples,
+            writes: &self.writes,
+            ignores_sampled_color: self.ignores_sampled_color(),
+            clear_keys: self.clear_keys(),
+        }
+    }
     // A fixed-function draw without an alpha test never uses sampled color
     // to decide coverage or the written depth and stencil values.
-    pub(super) fn ignores_sampled_color(&self, content: Content) -> bool {
-        content.2 != 0
-            && matches!(&self.operation, Operation::Draw(d)
+    fn ignores_sampled_color(&self) -> bool {
+        matches!(&self.operation, Operation::Draw(d)
                 if (d.programmable.is_none() || d.fixed_vertex.as_ref().is_some_and(|v| v.fixed_pixel))
                     && d.state.alpha_test == adv_device::gpu::Compare::Always)
     }
 
-    pub(super) fn attachment_command(&self, command: u128, versions: &[Option<u128>]) -> u128 {
-        if !self
-            .writes
-            .iter()
-            .any(|(k, _)| self.ignores_sampled_color(*k))
-            || !self.reads.iter().any(|k| k.2 == 0)
-        {
-            return command;
-        }
-        let mut key = xxhash_rust::xxh3::Xxh3::new();
-        self.key.hash(&mut key);
-        for (&k, &version) in self.reads.iter().zip(versions).filter(|(k, _)| k.2 != 0) {
-            (k, version.unwrap_or(0)).hash(&mut key);
-        }
-        key.digest128()
-    }
-
-    pub(super) fn write_key(&self, content: Content, command: u128) -> u128 {
+    fn clear_keys(&self) -> [Option<u128>; 3] {
         let Operation::Clear {
             target,
             rectangle,
@@ -268,20 +273,24 @@ impl Prepared {
             stencil,
         } = &self.operation
         else {
-            return command;
+            return [None; 3];
         };
-        let component = match content.2 {
-            0 => hash((image(&target.image), color.map(|c| c.map(f64::to_bits)))),
-            1 => hash((
-                target.depth().map(|d| (d.width(), d.height(), d.format())),
-                depth.map(f32::to_bits),
-            )),
-            _ => hash((
-                target.depth().map(|d| (d.width(), d.height(), d.format())),
-                stencil,
-            )),
-        };
-        hash((content, rect(*rectangle), component))
+        let mut keys = [None; 3];
+        for &(content, _) in &self.writes {
+            let component = match content.2 {
+                0 => hash((image(&target.image), color.map(|c| c.map(f64::to_bits)))),
+                1 => hash((
+                    target.depth().map(|d| (d.width(), d.height(), d.format())),
+                    depth.map(f32::to_bits),
+                )),
+                _ => hash((
+                    target.depth().map(|d| (d.width(), d.height(), d.format())),
+                    stencil,
+                )),
+            };
+            keys[content.2 as usize] = Some(hash((content, rect(*rectangle), component)));
+        }
+        keys
     }
 }
 pub(super) fn prepare(env: &mut Env<'_>, owner: Id, operation: Operation) -> Result<Prepared, u32> {
