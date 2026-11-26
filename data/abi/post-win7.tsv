@@ -36,6 +36,7 @@ crypt32.dll	CryptGetAsyncParam	Windows 10 Build 20348	https://learn.microsoft.co
 crypt32.dll	CryptSetAsyncParam	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-cryptsetasyncparam
 dbghelp.dll	SymAddSourceStreamA	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/dbghelp/nf-dbghelp-symaddsourcestreama
 dbghelp.dll	SymMatchStringA	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/dbghelp/nf-dbghelp-symmatchstringa
+dxgi.dll	CreateDXGIFactory2	Windows 8.1	https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-createdxgifactory2
 imm32.dll	ImmDisableLegacyIME	Windows 8.0	windows8.0
 iphlpapi.dll	CaptureInterfaceHardwareCrossTimestamp	Windows 11 (Build 10.0.22000.194)	https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-captureinterfacehardwarecrosstimestamp
 iphlpapi.dll	FreeInterfaceDnsSettings	Windows 10 Build 19041	https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-freeinterfacednssettings

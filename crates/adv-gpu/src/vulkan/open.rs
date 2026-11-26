@@ -704,7 +704,9 @@ impl Device {
                 independent_blend: base.independent_blend,
                 dual_src_blend: base.dual_src_blend,
                 depth_clamp: base.depth_clamp,
+                multi_viewport: base.multi_viewport,
                 depth_bias_clamp: base.depth_bias_clamp,
+                sample_rate_shading: base.sample_rate_shading,
                 fill_mode_non_solid: base.fill_mode_non_solid,
                 sampler_anisotropy: base.sampler_anisotropy,
                 texture_compression_bc: base.texture_compression_bc,
@@ -905,6 +907,42 @@ impl Device {
                 feature_bits |= Features::BC_TEXTURES;
             }
             let l = adapter.props.limits;
+            for (available, feature) in [
+                (base.dual_src_blend, Features::DUAL_SOURCE_BLEND),
+                (base.depth_clamp, Features::DEPTH_CLAMP),
+                (
+                    l.standard_sample_locations,
+                    Features::STANDARD_SAMPLE_LOCATIONS,
+                ),
+                (base.multi_viewport, Features::MULTIPLE_VIEWPORTS),
+            ] {
+                if available != 0 {
+                    feature_bits |= feature;
+                }
+            }
+            if [Format::R32Uint, Format::R32Sint].into_iter().all(|f| {
+                instance
+                    .get_physical_device_format_properties(physical, formats::vk(f))
+                    .optimal_tiling_features
+                    .contains(vk::FormatFeatureFlags::STORAGE_IMAGE_ATOMIC)
+            }) {
+                feature_bits |= Features::IMAGE_ATOMICS;
+            }
+            let max_buffer_size = if adapter.props.api_version >= vk::API_VERSION_1_3 {
+                let mut maintenance = vk::PhysicalDeviceMaintenance4Properties::default();
+                instance.get_physical_device_properties2(
+                    physical,
+                    &mut vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance),
+                );
+                maintenance.max_buffer_size
+            } else {
+                let mut maintenance = vk::PhysicalDeviceMaintenance3Properties::default();
+                instance.get_physical_device_properties2(
+                    physical,
+                    &mut vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance),
+                );
+                maintenance.max_memory_allocation_size
+            };
             let sample_counts =
                 (l.framebuffer_color_sample_counts & l.framebuffer_depth_sample_counts).as_raw();
             if sample_counts & !1 != 0 {
@@ -928,9 +966,10 @@ impl Device {
                                 }
                                 caps
                             }),
+                            0,
                         );
                         #[cfg(not(target_os = "android"))]
-                        return (f, FormatCaps::empty());
+                        return (f, FormatCaps::empty(), 0);
                     }
                     let flags = instance
                         .get_physical_device_format_properties(physical, formats::vk(f))
@@ -957,6 +996,14 @@ impl Device {
                             caps |= public;
                         }
                     }
+                    if caps.contains(FormatCaps::STORAGE)
+                        && matches!(f, Format::R32Uint | Format::R32Sint | Format::R32Float)
+                    {
+                        caps |= FormatCaps::STORAGE_READ;
+                    }
+                    if f.is_bc() && base.texture_compression_bc == 0 {
+                        caps = FormatCaps::empty();
+                    }
                     if f == Format::Bgra4Unorm && !plan.use_4444 {
                         caps = FormatCaps::empty();
                     }
@@ -964,7 +1011,29 @@ impl Device {
                     if f == present::FORMAT {
                         caps |= present_caps;
                     }
-                    (f, caps)
+                    let attachment = if caps.contains(FormatCaps::COLOR) {
+                        vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    } else if caps.contains(FormatCaps::DEPTH_STENCIL) {
+                        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                    } else {
+                        return (f, caps, 0);
+                    };
+                    let sampled = if caps.contains(FormatCaps::SAMPLED) {
+                        vk::ImageUsageFlags::SAMPLED
+                    } else {
+                        vk::ImageUsageFlags::empty()
+                    };
+                    let counts = instance
+                        .get_physical_device_image_format_properties(
+                            physical,
+                            formats::vk(f),
+                            vk::ImageType::TYPE_2D,
+                            vk::ImageTiling::OPTIMAL,
+                            attachment | sampled,
+                            vk::ImageCreateFlags::empty(),
+                        )
+                        .map_or(0, |props| props.sample_counts.as_raw());
+                    (f, caps, counts)
                 })
                 .collect();
 
@@ -995,6 +1064,17 @@ impl Device {
                     max_image_3d: l.max_image_dimension3_d,
                     max_image_layers: l.max_image_array_layers,
                     max_color_attachments: l.max_color_attachments,
+                    // Vulkan has no separate limit on aggregate color bytes.
+                    max_color_bytes_per_sample: l.max_color_attachments * 16,
+                    max_fragment_input_components: l.max_fragment_input_components,
+                    max_framebuffer_layers: l.max_framebuffer_layers,
+                    max_uniform_buffer_bytes: l.max_uniform_buffer_range,
+                    max_viewports: if base.multi_viewport != 0 {
+                        l.max_viewports
+                    } else {
+                        1
+                    },
+                    max_buffer_size,
                     max_uniform_buffers: if use_indexing {
                         (l.max_bound_descriptor_sets - 1)
                             .min(l.max_descriptor_set_uniform_buffers_dynamic)
@@ -1043,18 +1123,11 @@ impl Device {
                 None
             };
             if let Some(heap) = &heap {
-                let indices = caps.limits.push_constant_bytes / 2;
-                caps.limits.max_sampled_images = caps
-                    .limits
-                    .max_sampled_images
-                    .min(indices)
-                    .min(heap.counts[0]);
-                caps.limits.max_samplers =
-                    caps.limits.max_samplers.min(indices).min(heap.counts[1]);
+                caps.limits.max_sampled_images = caps.limits.max_sampled_images.min(heap.counts[0]);
+                caps.limits.max_samplers = caps.limits.max_samplers.min(heap.counts[1]);
                 caps.limits.max_storage_bindings = caps
                     .limits
                     .max_storage_bindings
-                    .min(caps.limits.push_constant_bytes / 6)
                     .min(heap.counts[2])
                     .min(heap.counts[3]);
             }

@@ -9,12 +9,17 @@
 //! No game bytecode is embedded here. The token layout follows Microsoft's
 //! Instruction/Source/Destination Parameter Token and Relative Addressing specs.
 //! Translation deliberately fails for semantics requiring unavailable host state.
+pub mod analysis;
 mod cache;
+pub mod dxbc;
 pub mod interpreter;
+pub mod ir;
 mod parser;
+pub mod tessellator;
 #[cfg(test)]
 mod tests;
 mod translate;
+pub mod wgsl;
 
 pub const MAX_SHADER_TOKENS: usize = 65_536;
 pub const MAX_EXECUTION_STEPS: usize = 65_536;

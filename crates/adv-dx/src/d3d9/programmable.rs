@@ -1,14 +1,13 @@
 //! Assemble shader state into a neutral GPU command. Guest memory is validated
 //! once; raw stream bytes are retained by the command across deferred submits.
 use super::*;
+use crate::fixed::{self as fixed_core, Input, STAGE_ARGUMENTS, Setting, VertexProgram};
 use crate::shader::{SamplerDimension, Shader, Translation};
 use adv_device::gpu::{
     Attribute, AttributeFormat, IndexBytes, Program, ProgramTexture, ProgrammableDraw, VertexStream,
 };
-mod fixed_vertex;
 mod source;
 mod streams;
-pub(in crate::d3d9) mod transformed;
 pub(super) mod warmup;
 pub(super) use warmup::warm;
 #[cfg(test)]
@@ -24,7 +23,7 @@ struct ProgramKey {
     second: bool,
     features: (u32, bool),
     fixed: u32,
-    fixed_vertex: Option<fixed_vertex::Variant>,
+    fixed_vertex: Option<VertexProgram>,
 }
 impl std::hash::Hash for ProgramKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -58,17 +57,10 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(set_clip_plane_ABI);
     registry.register(get_clip_plane_ABI);
 }
-pub(super) fn apply_clip_plane_raw(f: &mut fixed::Fixed, index: u32, values: [f32; 4]) -> bool {
-    let changed = f.clip_planes[index as usize].map(f32::to_bits) != values.map(f32::to_bits);
-    f.clip_planes[index as usize] = values;
-    changed
-}
 pub(super) fn apply_clip_plane(f: &mut fixed::CachedFixed, index: u32, values: [f32; 4]) -> bool {
-    let changed = apply_clip_plane_raw(f.state_mut(), index, values);
-    if changed {
-        f.invalidate_key();
-    }
-    changed
+    f.state_mut()
+        .apply(Setting::ClipPlane(index as usize, values))
+        .changed
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetClipPlane",level=state)]
 fn set_clip_plane(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, plane: GuestPtr<f32>) -> u32 {
@@ -81,15 +73,11 @@ fn set_clip_plane(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, plane: Gues
     if values.iter().any(|v| !v.is_finite()) {
         return INVALID;
     }
-    if !fixed::mutate_fixed_raw(
+    fixed::update_fixed(
         env,
         this.addr(),
-        shaders::stateblocks::FixedKey::ClipPlane(index as usize),
-        |f| apply_clip_plane_raw(f, index, values),
-    ) {
-        return INVALID;
-    }
-    0
+        Ok(Setting::ClipPlane(index as usize, values)),
+    )
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetClipPlane",level=implement)]
 fn get_clip_plane(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, plane: GuestPtr<f32>) -> u32 {
@@ -118,9 +106,10 @@ pub(super) fn active(env: &Env<'_>, pointer: u32) -> bool {
         let hot = d.hot.borrow();
         hot.shaders.vertex.is_some()
             || hot.shaders.pixel.is_some()
-            || fixed_features(
+            || fixed_core::features(
                 &hot.fixed,
                 fixed::layout(env, pointer).ok().map(|l| l.transformed),
+                fixed::state_map::RULES,
             ) != 0
             || !matches!(
                 fixed::second_stage(
@@ -131,25 +120,22 @@ pub(super) fn active(env: &Env<'_>, pointer: u32) -> bool {
             )
     })
 }
-const STAGE_ARGUMENTS: u32 = 1 << 3;
-
-fn fixed_features(f: &fixed::Fixed, transformed: Option<bool>) -> u32 {
-    let stage_arguments = [2, 3, 5, 6]
-        .iter()
-        .any(|k| f.stage[k] > 2 || (f.stage_slots[1][&1] != 1 && f.stage_slots[1][k] > 2))
-        || fixed::compact_stage_ops(f).is_none();
-    u32::from(transformed == Some(false) && f.render[&137] != 0)
-        | (u32::from(f.render[&29] != 0) << 1)
-        | (u32::from(f.render[&9] == 1) << 2)
-        | (u32::from(stage_arguments) * STAGE_ARGUMENTS)
-        | (u32::from(f.render[&194] != 0) << 4)
-        | (u32::from(f.render[&28] != 0) << 5)
-        | (u32::from(
-            f.render[&157] != 0 || f.render[&156] != 0 || f.render[&154] != 1f32.to_bits(),
-        ) << 6)
-        | (u32::from(f.render[&175] != 0 || f.render[&195] != 0) << 7)
-        | (u32::from(transformed == Some(false) && f.render[&157] != 0) << 8)
+fn bounds(
+    variant: &crate::fixed::VertexProgram,
+    f: &fixed::Fixed,
+    count: u32,
+    fixed_pixel: bool,
+) -> fixed::VertexBounds {
+    fixed::VertexBounds {
+        transforms: (!variant.transformed()).then_some(f.transforms),
+        point_scale: variant
+            .scaled
+            .then(|| [158, 159, 160].map(|k| f32::from_bits(f.render[&k]))),
+        count,
+        fixed_pixel,
+    }
 }
+
 fn format(kind: u8) -> Result<AttributeFormat, u32> {
     use AttributeFormat::*;
     Ok(match kind {
@@ -172,13 +158,6 @@ fn format(kind: u8) -> Result<AttributeFormat, u32> {
         16 => Float16x4,
         _ => return Err(INVALID),
     })
-}
-#[derive(Clone)]
-struct Input {
-    stream: usize,
-    offset: u32,
-    format: AttributeFormat,
-    register: u32,
 }
 fn inputs(env: &Env<'_>, pointer: u32, vs: &Shader) -> Result<Vec<Input>, u32> {
     let d = device(env, pointer).ok_or(INVALID)?;
@@ -398,16 +377,22 @@ fn prepare_checked(
     } else {
         None
     };
-    let features = fixed_features(&hot.fixed, fixed_layout.map(|layout| layout.transformed));
     if instanced
         && let Some(layout) = fixed_layout
-        && (features != 0 || layout.specular.is_some())
+        && (fixed_core::features(
+            &hot.fixed,
+            Some(layout.transformed),
+            fixed::state_map::RULES,
+        ) != 0
+            || layout.specular.is_some())
     {
         return Err(UNAVAILABLE);
     }
+    let topology = fixed::topology(kind)?;
     let variant = fixed_layout
-        .map(|layout| fixed_vertex::Variant::new(layout, &hot.fixed, kind))
+        .map(|layout| VertexProgram::new(layout, &hot.fixed, topology))
         .transpose()
+        .map_err(fixed::Rejected::from)
         .map_err(|e| e.code)?;
     let mut output_indices = indices.map(|v| v.iter().copied().collect::<IndexBytes>());
     let first = indices.and_then(|i| i.iter().min().copied()).unwrap_or(0);
@@ -423,7 +408,7 @@ fn prepare_checked(
         i.rebase(first);
     }
     let input_spec = if let Some(layout) = fixed_layout {
-        fixed_vertex::inputs(layout)
+        fixed_core::inputs(layout)
     } else {
         inputs(env, pointer, &vs.as_ref().unwrap().parsed)?
     };
@@ -440,15 +425,16 @@ fn prepare_checked(
         instanced,
         fixed_layout.is_some(),
     )?;
-    let (target, image, state) =
-        fixed::prepare_state(env, pointer, kind, features & STAGE_ARGUMENTS != 0)
-            .map_err(|e| e.code)?;
+    let (target, image, lowered) =
+        fixed::prepare_state(env, pointer, topology, variant).map_err(|e| e.code)?;
+    let features = lowered.program.features;
+    let variant = lowered.program.vertex;
     let (recording_key, hashed) = recording::draw_state_identity(env, pointer);
     env.ext.get_mut::<State>().frames.draw_key_hashes += u64::from(hashed);
     let mut draw = fixed::Draw {
         target,
         image,
-        state,
+        state: lowered.state,
         vertices: Arc::default(),
         texcoords: None,
         programmable: None,
@@ -456,7 +442,7 @@ fn prepare_checked(
         program_key: 0,
         fixed_vertex: variant
             .as_ref()
-            .map(|v| v.bounds(&hot.fixed, length, ps.is_none())),
+            .map(|v| bounds(v, &hot.fixed, length, ps.is_none())),
     };
     let simple_fixed = vs_id.is_none()
         && ps_id.is_none()
@@ -570,19 +556,9 @@ fn prepare_checked(
     );
     parameters[2][3] = u32::from(expand_points);
     parameters[13] = second.unwrap_or_default();
-    parameters[36] = fixed::lighting::color(hot.fixed.render[&60]).map(f32::to_bits);
-    parameters[37] = [
-        if fixed::stage_enabled(&hot.fixed.stage, has_texture[0]) {
-            hot.fixed.stage[&1]
-        } else {
-            1
-        },
-        hot.fixed.stage[&2] | hot.fixed.stage[&3] << 8,
-        hot.fixed.stage[&4],
-        hot.fixed.stage[&5] | hot.fixed.stage[&6] << 8,
-    ];
-
-    parameters[38] = [hot.fixed.render[&195], hot.fixed.render[&175], 0, 0];
+    parameters[36] = fixed_core::tnl::color(hot.fixed.render[&60]).map(f32::to_bits);
+    parameters[37] = lowered.stage_zero;
+    parameters[38] = lowered.raster_parameters;
     parameters[15][0] = fixed_layout.map_or(0, |l| if l.transformed { 1 } else { 2 });
     parameters[3] = [
         hot.fixed.render[&152],
@@ -635,7 +611,10 @@ fn prepare_checked(
     }
     let pixel_constants = hot.shaders.pixel_constants.snapshot(usage[1], &extra);
     let vertex_constants = if let Some(variant) = &variant {
-        let (snapshot, registers) = variant.constants(&hot.fixed).map_err(|e| e.code)?;
+        let (snapshot, registers) = variant
+            .constants(&hot.fixed)
+            .map_err(fixed::Rejected::from)
+            .map_err(|e| e.code)?;
         usage[0] = registers;
         snapshot
     } else {
@@ -742,7 +721,11 @@ fn texture(
     let image = (env.ext.get::<State>().provider.target)(env.ext, r.surface.ok_or(INVALID)?)
         .ok_or(INVALID)?
         .image;
-    let mut sampler = hot.fixed.program_sampler(slot)?;
+    let mut sampler = hot
+        .fixed
+        .program_sampler(slot)
+        .map_err(fixed::Rejected::from)
+        .map_err(|e| e.code)?;
     sampler.first_level = if sampler.mip.is_none() {
         r.lod
     } else {

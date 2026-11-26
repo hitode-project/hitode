@@ -1,0 +1,4 @@
+# Struct	fields (name:primitive)
+D3DLINEPATTERN	wRepeatFactor:u16|wLinePattern:u16
+D3DDEVINFO_TEXTUREMANAGER	bThrashing:i32|dwApproxBytesDownloaded:u32|dwNumEvicts:u32|dwNumVidCreates:u32|dwNumTexturesUsed:u32|dwNumUsedTexInVid:u32|dwWorkingSet:u32|dwWorkingSetBytes:u32|dwTotalManaged:u32|dwTotalBytes:u32|dwLastPri:u32
+D3DDEVINFO_TEXTURING	dwNumLoads:u32|dwApproxBytesLoaded:u32|dwNumPreLoads:u32|dwNumSet:u32|dwNumCreates:u32|dwNumDestroys:u32|dwNumSetPriorities:u32|dwNumSetLODs:u32|dwNumLocks:u32|dwNumGetDCs:u32

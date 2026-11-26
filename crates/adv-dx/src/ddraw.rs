@@ -13,6 +13,7 @@ use adv_device::surface::{
 use adv_machine::Objects;
 
 mod creation;
+pub mod d3d;
 pub mod front;
 pub use front::{Provider, WindowGeometry, install, register};
 

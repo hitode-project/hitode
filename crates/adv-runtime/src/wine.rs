@@ -24,6 +24,7 @@ use crate::graphics::{guest_memory, install_store};
 pub use adv_drv::codec::vorbisfile;
 
 mod class;
+mod dmsynth;
 mod fonts;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;
@@ -70,6 +71,7 @@ const CREATED_BITMAP: u32 = 32;
 pub fn register(registry: &mut Registry) {
     adv_dx::ddraw::register(registry);
     class::register(registry);
+    dmsynth::register(registry);
     sound::register(registry);
     video::register(registry);
     winmm::register(registry);
@@ -122,6 +124,7 @@ pub fn install<B: Backend>(
         .map_err(|e| e.to_string())?;
     machine.ext.insert(Heap(heap));
     sound::install(machine, drive, allocator())?;
+    dmsynth::install(machine, drive, allocator())?;
     video::install(machine, drive)?;
     winmm::install(machine, drive)?;
     xaudio2::install(machine, drive)?;

@@ -75,7 +75,8 @@ pub(super) struct Compiled {
     /// Sorted by `(group, slot)`.
     pub(super) bindings: Vec<Binding>,
     pub(super) push: binding::PushLayout,
-    /// On heap tiers, atomic storage requires classic sets for the whole pipeline.
+    /// On heap tiers, use cached descriptor sets for storage atomics or when
+    /// the heap indices exceed the push-constant budget.
     pub(super) classic: bool,
     /// Bindless tier: uniform slots, one bit each.
     pub(super) uniforms: u64,
@@ -487,20 +488,22 @@ impl Device {
             &[vk::PipelineShaderStageCreateInfo<'_>],
         ) -> Result<vk::Pipeline>,
     ) -> Result<Compiled> {
-        let classic =
-            self.0.heap.is_some() && entries.iter().any(|e| e.shader.inner.storage_atomics());
-        let heap = self.0.heap.is_some() && !classic;
-        let push = match self.0.heap.as_ref().filter(|_| heap) {
-            Some(heap) => {
+        let push = self
+            .0
+            .heap
+            .as_ref()
+            .filter(|_| !entries.iter().any(|e| e.shader.inner.storage_atomics()))
+            .and_then(|heap| {
                 let mut strides = HashMap::new();
                 for entry in entries {
                     strides.extend(entry.shader.inner.storage_strides(entry.index));
                 }
                 let bytes = self.0.caps.limits.push_constant_bytes;
-                binding::PushLayout::new(bindings, heap, bytes, &strides)?
-            }
-            None => binding::PushLayout::default(),
-        };
+                binding::PushLayout::new(bindings, heap, bytes, &strides)
+            });
+        let heap = push.is_some();
+        let classic = self.0.heap.is_some() && !heap;
+        let push = push.unwrap_or_default();
         let video = video.map(|pool| {
             let set = if heap {
                 1 + bindings

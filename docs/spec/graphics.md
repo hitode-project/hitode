@@ -2,7 +2,7 @@
 
 ID prefix: GFX
 
-This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API front ends. It includes capabilities, shaders, vertex input, samplers, buffers, caches and numerical behavior. `adv-dx` and the GPU renderer in `adv-device` implement them.
+This spec covers shared CPU compositing, the DirectDraw and Direct3D 9 API front ends, and the Direct3D 11 fixed-function tessellation core. It includes capabilities, shaders, vertex input, samplers, buffers, caches and numerical behavior. `adv-dx` and the GPU renderer in `adv-device` implement them.
 
 ## DirectDraw
 
@@ -302,6 +302,28 @@ query's data size, and only zero or D3DGETDATA_FLUSH is accepted for GetData fla
 New queries are signaled with an unspecified initial answer. Completed queries
 retain their answer until reissued; later recorded work does not delay them.
 
+## DXGI
+
+### GFX-DXGI-1 Factory and adapter
+
+**Rule**: A factory created through `CreateDXGIFactory` MUST refuse the Factory1 IID and accept Factory2. Adapter enumeration MUST put the software adapter last. An untracked CPU allocation MUST NOT be reported as video memory.
+**Verification**: Test
+
+### GFX-DXGI-2 Swap capability
+
+**Rule**: The swap capability table MUST intersect each swap model's parameters with the presenter's executing paths and attachment backing.
+**Verification**: Test
+
+### GFX-DXGI-4 Display coordinates and modes
+
+**Rule**: Output desktop coordinates MUST follow the caller's DPI awareness. Mode enumeration and matching MUST use physical display modes from the shared display owner.
+**Verification**: Test
+
+### GFX-DXGI-5 Interface coverage
+
+**Rule**: Every returned DXGI interface MUST publish its generated vtable slots and register an implementation for each slot. Custom rasterizer DLLs MAY return an unsupported result.
+**Verification**: Test
+
 ## Capabilities
 
 ### GFX-CAP-1 Honest capabilities
@@ -317,6 +339,21 @@ retain their answer until reissued; later recorded work does not delay them.
 ### GFX-CAP-3 Excluded resources
 
 **Rule**: Shader Model 4+, D3D10/11, geometry and tessellation shaders, N-patches, and shader ProcessVertices MUST remain unsupported. Cube textures, volume textures, additional swap chains, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented.
+**Verification**: Test
+
+### GFX-CAP-4 Direct3D 11 capability derivation
+
+**Rule**: The Direct3D 11 capability core MUST select the highest level whose mandatory paths execute on the device. Optional compute support and feature queries MUST reflect the selected level and executing paths.
+**Verification**: Test
+
+### GFX-CAP-5 Direct3D 11 format capabilities
+
+**Rule**: Reported format and multisample capabilities MUST require an executing path on the resource backing. Queries MUST apply the selected level's restrictions and return the Windows status and output for unsupported formats.
+**Verification**: Test
+
+### GFX-CAP-6 Direct3D 7 capability derivation
+
+**Rule**: Direct3D 7 and legacy descriptors MUST report only the fixed-function paths admitted for that device. Texture and depth enumeration MUST use the same admitted paths.
 **Verification**: Test
 
 ### GFX-RES-1 Resource common methods
@@ -361,6 +398,25 @@ Capture and Apply track versions per state category and inspect values only in
 changed categories. They copy only differing captured entries, preserving exact
 float bits, uncaptured state and COM ownership. Capturing a complete state category shares its immutable map and content key. An unchanged Capture reuses its
 snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-state and constant setters preserve category revisions while recording still captures their membership. Matching Capture/Apply bypass binding preparation and reference transfers; changes outside the captured subset refresh its observed revisions. Applying only shader or buffer changes MUST preserve the fixed-state key cache.
+
+### GFX-SHADER-5 DXBC token coverage
+
+**Rule**: Each accepted SM4 and SM5 opcode, declaration, operand modifier and opcode extension MUST have a Windows fixture. Fixtures accepted by the DXBC parser MUST round-trip byte for byte, and their disassembly MUST match `D3DDisassemble`. Executable value cases MUST agree with the scalar interpreter and the applicable Windows measurements.
+**Verification**: Test
+
+The shader-core fixture directory holds the token ledger, Windows shader-creation HRESULTs
+and measured readbacks. GS, HS and DS execution belongs to expansion and programmable stages
+(T8 and T15). Class linkage execution belongs to T15. Residency feedback and double precision
+have Windows bytecode oracles. The shader core does not report tiled resources or emit
+64-bit floating-point operations.
+
+## Tessellation
+
+### GFX-TESS-1 Fixed-function patch tessellation
+
+**Rule**: The tessellator MUST cull a patch if any edge factor is zero, negative or NaN. It MUST match the Direct3D 11 reference for domain-location bits, primitive counts, connectivity and winding. Primitive order and the first vertex of each triangle MAY vary.
+**Verification**: Test
+**Basis**: [Direct3D 11.3 functional specification §11.7](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#TessellationPattern)
 
 ## Vertex and raster input
 
@@ -498,7 +554,11 @@ Binding changes MUST NOT start speculative preparation for transient shader pair
 
 ### GFX-NUM-1 Floating-point semantics
 
-**Rule**: Shader arithmetic MUST use f32 and preserve D3D9 reference behavior for special values, including zero multiplication, reciprocal zero, and logarithm zero.
+**Rule**: D3D9 shader arithmetic MUST use f32 and preserve reference behavior for special values, including zero multiplication, reciprocal zero, and logarithm zero.
+SM4–5 WGSL emission and scalar execution MUST apply the same DXBC arithmetic rules.
+DXBC floating-point arithmetic MUST flush denormals to sign-preserved zero where the instruction requires it.
+DXBC `f32tof16` MUST round toward zero and clamp finite overflow to the largest finite half.
+SM4–5 WGSL emission and scalar execution MUST agree on typed view values, resource queries, and UAV counter operations.
 **Verification**: Test
 
 ## Surface copies
