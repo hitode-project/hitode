@@ -106,7 +106,13 @@ pub fn install<B: Backend>(
                 geometry(ext, objects, hwnd)
             },
             completed: frame_completed,
-            submitted: adv_drv::user::input::shared_front_frame,
+            submitted: |ext, hwnd, surface, shared| {
+                if shared {
+                    adv_drv::user::input::shared_front_frame(ext, hwnd, surface);
+                } else {
+                    adv_drv::user::input::front_frame(ext, hwnd, surface);
+                }
+            },
             released: adv_drv::user::input::front_released,
             vsync: |ext| {
                 ext.try_get::<std::sync::Arc<adv_sync::vsync::Vsync>>()

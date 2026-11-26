@@ -26,7 +26,9 @@ pub struct Provider {
     pub memory: for<'a> fn(&'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a>,
     /// Resolve a window; zero selects the current presented game window.
     pub window: fn(&Ext, &Objects, u32) -> Option<WindowGeometry>,
-    pub submitted: fn(&Ext, u32, u32),
+    /// Notify the window driver of a submitted DirectDraw frame; `shared` is
+    /// true for windowed primaries that share content with GDI (WINE-GFX-11).
+    pub submitted: fn(&Ext, u32, u32, bool),
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
     /// The DirectDraw object is gone: its windows present their own surfaces.
     pub released: fn(&Ext, u32),
@@ -90,7 +92,8 @@ impl State {
             .filter(|&hwnd| hwnd != 0)
             .or(state.binding.map(|(_, hwnd)| hwnd))
             .unwrap_or(0);
-        (state.provider.submitted)(ext, hwnd, surface);
+        let shared = !state.draw.is_exclusive_surface(surface);
+        (state.provider.submitted)(ext, hwnd, surface, shared);
     }
 
     fn device(&self, objects: &Objects, pointer: u32) -> Option<u32> {
@@ -306,7 +309,7 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
     let geometry = binding.and_then(|(window, clipper)| {
         (provider.window)(env.ext, &env.sys.objects, window).map(|geometry| (geometry, clipper))
     });
-    let (result, presented, changed, submitted) = {
+    let (result, presented, changed, submitted, release_front) = {
         let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
         let mut memory = (provider.memory)(env.cpu);
         // Refresh for each operation; never retain an origin across movement,
@@ -317,7 +320,14 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
             None
         };
         if let Some((geometry, clipper)) = geometry {
-            if let Err(error) = store.configure_window(geometry.width, geometry.height, &mut memory)
+            let preserve_primary = (id != api::COOPERATIVE && store.exclusive_display_mode())
+                || store.primary_id().is_some_and(|primary| {
+                    state.draw.is_flippable(primary)
+                        || (id != api::COOPERATIVE && state.draw.is_exclusive_surface(primary))
+                });
+            if !preserve_primary
+                && let Err(error) =
+                    store.configure_window(geometry.width, geometry.height, &mut memory)
             {
                 return Outcome::Fail(format!("DirectDraw window: {error}"));
             }
@@ -325,6 +335,7 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
                 state.draw.configure_clipper(clipper, geometry.origin);
             }
         }
+        let was_exclusive = state.draw.exclusive_owner;
         state.draw.context = env.context;
         let before = store.stats.presentations;
         let result = state
@@ -341,13 +352,35 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
                 .device(&env.sys.objects, words[0])
                 .map(|device| (device, words[1]));
         }
+        let left_exclusive = matches!(result, Ok(0))
+            && ((id == api::COOPERATIVE
+                && was_exclusive.is_some()
+                && state.draw.exclusive_owner.is_none())
+                || (id == api::RESTORE_MODE && !store.exclusive_display_mode()));
+        let release_front = if left_exclusive {
+            let device = state.device(&env.sys.objects, words[0]);
+            if let Some((owner, surface)) = state.presented
+                && device == Some(owner)
+            {
+                state.presented = None;
+                Some(surface)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         (
             result,
             store.stats.presentations,
             store.stats.presentations != before,
             state.draw.submitted.take(),
+            release_front,
         )
     };
+    if let Some(surface) = release_front {
+        (provider.released)(env.ext, surface);
+    }
     if let Some(surface) = submitted {
         State::submitted(env.ext, surface);
     }
