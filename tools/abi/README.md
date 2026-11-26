@@ -71,6 +71,32 @@ COM tables include the activation, moniker, type-information, font, picture and 
 The exported `ole32!IsEqualGUID` helper uses the SDK import library's `_IsEqualGUID@8` declaration; its inline header spelling is absent from WinMD.
 Its scoped supplement preserves two GUID pointers and a BOOL result.
 
+## Graphics declarations and capability data
+
+`com.tsv` includes the Direct3D 1–7, DXGI, Direct3D 10.1 and Direct3D 11.1 slots.
+`gfx-iids.rs`, `structs.rs` and `constants.tsv` project interface IDs, x86 record
+layouts, enums and numeric D3D11 limits. The legacy COM declarations and legacy
+enum spellings come from the pinned SDK headers. To check them, run
+`python3 tools/abi/generate_d3d7.py <SDK-um> --check` with the x86 MinGW tools.
+
+`generate.ps1 -Winmd <winmd> -LayoutProbe <source.c>` writes the x86 layout probe.
+Compile it with `python3 tools/abi/check_gfx_layout.py --compile <source.c> <SDK-um> <exe>`.
+Run the executable on Windows and pass its stdout file to
+`python3 tools/abi/check_gfx_layout.py <output.tsv>`. The same check uses the
+checked-in result when no file is supplied. Rust checks those layout values
+with compile-time size, alignment and offset assertions.
+
+The pinned [DirectX-Headers archive](../../data/gfx/directx-headers-source.json)
+feeds `python3 tools/gfx/generate_directx_headers.py <archive> --check`.
+It supplies the SM4/5 bitfields and DXGI format layouts. The checked-in FXC
+fixtures exercise lossless SHDR and SHEX token encoding. Regenerate them with
+`tools/fixtures/build-dxbc.ps1 -Fxc <fxc.exe>` on Windows.
+
+`python3 tools/gfx/generate_format_support.py <source.md> --check` checks the
+published FL 11.0 format columns against their pinned Microsoft Learn source.
+`python3 tools/gfx/check_caps.py [probe-directory]` compares those columns, the
+feature levels and reported record sizes with the external Windows probe outputs.
+
 ## Selected legacy exports and DLL aliases
 
 DbgHelp is projected in full; ImageHlp retains only the `MakeSureDirectoryPathExists` alias.

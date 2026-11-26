@@ -482,5 +482,19 @@
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxcreatetexturefromfileinmemory",
       "https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxloadmeshfromxinmemory"
     ]
+  },
+  "direct3d7": {
+    "source": "Microsoft Windows SDK 10.0.26100.0",
+    "headers": {
+      "um/d3d.h": "84f8dae461136bd7cbcb37df522f1fb6f1b74b60e0c8cd2f9becf0c948f0db01",
+      "um/d3dtypes.h": "cc696006ec4e103ea4abb7a2d89ea70bc999157a55095ce462b382bd77b6d8f6",
+      "um/d3dcaps.h": "c0b1644b596f825382fe922e4887624597b0104da9f7ba4c9abae89cb0bb4edb"
+    },
+    "generator": "tools/abi/generate_d3d7.py"
+  },
+  "graphics_layout_probe": {
+    "source": "Microsoft Windows SDK 10.0.26100.0",
+    "header": "um/d3d11.h",
+    "sha256": "65964c91b641d5fc93d68796183318a9ebe493e41502f61fc26fbbf34e9d3ead"
   }
 }
