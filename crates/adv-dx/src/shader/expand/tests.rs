@@ -491,7 +491,7 @@ fn native_vertex_and_expansion_render_identical_pixels() {
                 depth_clip: true,
             }),
             stream_output: &[],
-            stream_statistics: false,
+            stream_statistics: 0,
         }
         .emit()
         .unwrap();
@@ -561,7 +561,7 @@ fn geometry_cuts_instances_and_stream_output_keep_primitive_order() {
             options: Options::default(),
         }),
         raster: None,
-        stream_statistics: false,
+        stream_statistics: 0,
         stream_output: &[StreamOutput {
             stream: 0,
             elements: vec![Some((0, 0)), Some((0, 1)), Some((1, 0)), None],
@@ -736,7 +736,7 @@ fn packed_and_storage_varyings_match() {
             depth_clip: true,
         }),
         stream_output: &[],
-        stream_statistics: false,
+        stream_statistics: 0,
     }
     .emit()
     .unwrap();
@@ -807,7 +807,7 @@ fn domain_points_are_shaded_once_and_streamed_as_a_list() {
         input_vertices: 3,
         geometry: None,
         raster: None,
-        stream_statistics: false,
+        stream_statistics: 0,
         stream_output: &[StreamOutput {
             stream: 0,
             elements: vec![Some((1, 0)), Some((1, 1)), Some((1, 2))],
@@ -1060,7 +1060,7 @@ fn bins_draw_only_matching_primitives_across_chunks() {
             depth_clip: true,
         }),
         stream_output: &[],
-        stream_statistics: false,
+        stream_statistics: 0,
     }
     .emit()
     .unwrap();
@@ -1276,7 +1276,7 @@ fn counted_fragments_obey_early_depth_and_sample_frequency() {
                 depth_clip: true,
             }),
             stream_output: &[],
-            stream_statistics: false,
+            stream_statistics: 0,
         }
         .emit()
         .unwrap();

@@ -332,7 +332,8 @@ pub struct Plan<'a> {
     pub raster: Option<Raster<'a>>,
     /// Each declaration here has a bound target.
     pub stream_output: &'a [StreamOutput],
-    pub stream_statistics: bool,
+    /// Mask of declared streams to count when SO statistics are active.
+    pub stream_statistics: u32,
 }
 
 pub struct ComputeProgram {
@@ -827,8 +828,9 @@ impl Plan<'_> {
             }
             _ => (None, None, None, Vec::new()),
         };
-        let stream_region =
-            (!self.stream_output.is_empty() && program.list_slots() != 0).then(|| {
+        let stream_region = (program.list_slots() != 0
+            && (!self.stream_output.is_empty() || self.stream_statistics != 0))
+            .then(|| {
                 let region = regions.len();
                 regions.push(ExpansionRegion {
                     bytes_per_primitive: program.list_slots()
@@ -840,26 +842,25 @@ impl Plan<'_> {
                 });
                 region
             });
-        let scan_region = stream_region.map(|_| {
-            let region = regions.len();
-            regions.push(ExpansionRegion {
-                bytes_per_primitive: 4
-                    * self.stream_output.len() as u32
-                    * program.list_slots()
-                    * program.items(),
-                fixed_bytes: 0,
-                element_stride: 4,
-            });
-            region
-        });
-        let primitive = program.emit(raster_region.zip(argument_region), stream_region);
-        let (scan, write) =
-            stream_region
-                .zip(scan_region)
-                .map_or((None, None), |(stream, scan)| {
-                    let (p, w) = program.stream_output(stream, scan);
-                    (Some(p), Some(w))
+        let scan_region = stream_region
+            .filter(|_| !self.stream_output.is_empty())
+            .map(|_| {
+                let region = regions.len();
+                regions.push(ExpansionRegion {
+                    bytes_per_primitive: 4
+                        * self.stream_output.len() as u32
+                        * program.list_slots()
+                        * program.items(),
+                    fixed_bytes: 0,
+                    element_stride: 4,
                 });
+                region
+            });
+        let primitive = program.emit(raster_region.zip(argument_region), stream_region);
+        let (scan, write) = stream_region.map_or((None, None), |stream| {
+            let (prefix, write) = program.stream_output(stream, scan_region);
+            (Some(prefix), write)
+        });
         Ok(Programs {
             source,
             primitive,

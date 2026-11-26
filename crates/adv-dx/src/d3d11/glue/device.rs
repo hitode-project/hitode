@@ -429,19 +429,24 @@ fn shader(env: &mut Env<'_>, stage: Stage, face: &str) -> Outcome {
     let (device, bytes, length, linkage, out) =
         (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     status((|| {
-        if linkage != 0
-            && !(table(env)
-                .get(&env.sys.objects, linkage)
-                .is_some_and(|object| {
-                    object.device() == Some(device) && object.class_linkage().is_some()
-                }))
-        {
-            return Err(Error::InvalidArgument);
-        }
+        validate_linkage(env, device, linkage)?;
         let bytecode = array::<u8>(env, bytes, length)?;
         let shader = Shader::new(stage, &bytecode, linkage != 0, report(env, device)?)?;
         attach_shader(env, device, out, face, shader, linkage)
     })())
+}
+
+fn validate_linkage(env: &Env<'_>, device: u32, linkage: u32) -> Result<(), Error> {
+    if linkage != 0
+        && !table(env)
+            .get(&env.sys.objects, linkage)
+            .is_some_and(|object| {
+                object.device() == Some(device) && object.class_linkage().is_some()
+            })
+    {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
 }
 
 fn attach_shader(
@@ -479,9 +484,10 @@ fn stream_output_shader(env: &mut Env<'_>) -> Outcome {
         out,
     ] = std::array::from_fn(|index| env.arg(index as u32));
     status((|| {
-        if linkage != 0 || count > 512 || stride_count > 4 {
+        if count > 512 || stride_count > 4 {
             return Err(Error::InvalidArgument);
         }
+        validate_linkage(env, device, linkage)?;
         let entries = array::<D3D11_SO_DECLARATION_ENTRY>(env, entries, count)?
             .into_iter()
             .map(|entry| {
@@ -495,12 +501,13 @@ fn stream_output_shader(env: &mut Env<'_>) -> Outcome {
         let strides = array::<u32>(env, strides, stride_count)?;
         let shader = Shader::with_stream_output(
             &bytes,
+            linkage != 0,
             report(env, device)?,
             &entries,
             &strides,
             rasterized,
         )?;
-        attach_shader(env, device, out, "ID3D11GeometryShader", shader, 0)
+        attach_shader(env, device, out, "ID3D11GeometryShader", shader, linkage)
     })())
 }
 

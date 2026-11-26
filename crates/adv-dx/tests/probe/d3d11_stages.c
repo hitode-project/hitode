@@ -53,6 +53,20 @@ static void stream_output(ID3D11Device *device, ID3D11DeviceContext *ctx)
             ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
             ID3D11DeviceContext_GSSetShader(ctx, gs, NULL, 0);
             ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+            D3D11_QUERY_DESC so_desc = {D3D11_QUERY_SO_STATISTICS, 0};
+            ID3D11Query *so_query = NULL;
+            if (SUCCEEDED(ID3D11Device_CreateQuery(device, &so_desc, &so_query))) {
+                D3D11_QUERY_DATA_SO_STATISTICS stats = {0};
+                ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)so_query);
+                ID3D11DeviceContext_Draw(ctx, 3, 0);
+                ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)so_query);
+                while ((hr = ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)so_query,
+                        &stats, sizeof(stats), 0)) == S_FALSE) Sleep(1);
+                printf("so-unbound\t%08lx\t%llu\t%llu\n", (unsigned long)hr,
+                        (unsigned long long)stats.NumPrimitivesWritten,
+                        (unsigned long long)stats.PrimitivesStorageNeeded);
+                ID3D11Query_Release(so_query);
+            }
             ID3D11DeviceContext_SOSetTargets(ctx, 1, &buffer, &offset);
             ID3D11DeviceContext_SOGetTargets(ctx, 1, &bound);
             printf("so-get\t%u\n", bound == buffer);

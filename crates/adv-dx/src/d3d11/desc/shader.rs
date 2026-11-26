@@ -43,6 +43,16 @@ impl Shader {
         if module.stage != stage || !accepts(stage, module.model, report) {
             return Err(Error::InvalidArgument);
         }
+        Self::admit(module, bytecode, has_linkage, report)
+    }
+
+    fn admit(
+        module: Module,
+        bytecode: &[u8],
+        has_linkage: bool,
+        report: &Report,
+    ) -> Result<Self, Error> {
+        let stage = module.stage;
         let reflection = crate::shader::analysis::analyze(&module);
         let linkage = if has_linkage {
             dxbc::linkage::Linkage::decode(bytecode)
@@ -115,6 +125,7 @@ impl Shader {
 
     pub fn with_stream_output(
         bytecode: &[u8],
+        has_linkage: bool,
         report: &Report,
         entries: &[(Option<Vec<u8>>, adv_abi::types::D3D11_SO_DECLARATION_ENTRY)],
         strides: &[u32],
@@ -197,17 +208,13 @@ impl Shader {
                 target.elements.resize((stride / 4) as usize, None);
             }
         }
-        let reflection = crate::shader::analysis::analyze(&module);
-        Ok(Self {
-            module,
-            reflection,
-            stage: Stage::Geometry,
-            linkage: None,
-            stream_output: Some(StreamOutput {
-                rasterized,
-                targets,
-            }),
-        })
+        let mut shader = Self::admit(module, bytecode, has_linkage, report)?;
+        shader.stage = Stage::Geometry;
+        shader.stream_output = Some(StreamOutput {
+            rasterized,
+            targets,
+        });
+        Ok(shader)
     }
 
     pub fn specialize(&self, classes: &[&[u8]]) -> Result<Self, Error> {

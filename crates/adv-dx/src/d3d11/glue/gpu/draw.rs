@@ -1120,7 +1120,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     let geometry = snapshot.stages[Stage::Geometry as usize].shader;
     let so = bound_shader(env, &snapshot, Stage::Geometry)
         .and_then(|shader| shader.stream_output.as_ref());
-    let (raster_stream, so_declarations): (_, Vec<_>) = if let Some(so) = so {
+    let (raster_stream, so_declarations, declared_streams): (_, Vec<_>, _) = if let Some(so) = so {
         let missing = so.targets.iter().zip(snapshot.so.buffers).fold(
             0,
             |mask, (target, buffer)| match target {
@@ -1145,9 +1145,24 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 ))
             })
             .collect();
-        (so.rasterized, targets)
+        let declared = so
+            .targets
+            .iter()
+            .flatten()
+            .fold(0, |mask, target| mask | (1u32 << target.stream));
+        (so.rasterized, targets, declared)
     } else {
-        (Some(0), Vec::new())
+        (Some(0), Vec::new(), 0)
+    };
+    let stream_statistics = if declared_streams == 0 {
+        None
+    } else {
+        queries::stream_queries(env)?
+    };
+    let counted_streams = if stream_statistics.is_some() {
+        declared_streams
+    } else {
+        0
     };
     let layout = snapshot.ia.layout;
     let raster = match pipeline(env, snapshot.rs.state) {
@@ -1301,7 +1316,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     }
     let raster_stream = raster_stream.filter(|_| !scissor.empty());
     if raster_stream.is_none() {
-        if so_declarations.is_empty() {
+        if so_declarations.is_empty() && counted_streams == 0 {
             return Ok(());
         }
         writes.clear();
@@ -1334,11 +1349,6 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         writes.push((key(env, pointer, 0), false));
         stream_output.push(declaration);
     }
-    let stream_statistics = if stream_output.is_empty() {
-        None
-    } else {
-        queries::stream_queries(env)?
-    };
     let alpha_to_coverage = blend.is_some_and(|blend| blend.AlphaToCoverageEnable != 0);
     let mut reads = Vec::new();
     let mut capture = IaCapture::default();
@@ -1457,7 +1467,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             wireframe: raster.FillMode == 2,
             geometry: geometry_shader.is_some(),
             tessellated: tessellation.is_some(),
-            stream_output: !stream_output.is_empty(),
+            stream_output: !stream_output.is_empty() || counted_streams != 0,
             rasterization_disabled: raster_stream.is_none(),
             ..Default::default()
         };
@@ -1615,7 +1625,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                     depth_clip: raster.DepthClipEnable != 0,
                 }),
                 stream_output: &stream_output,
-                stream_statistics: stream_statistics.is_some(),
+                stream_statistics: counted_streams,
             }
             .emit()
             .map_err(shader_error)?;

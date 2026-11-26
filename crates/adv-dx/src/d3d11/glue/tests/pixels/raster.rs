@@ -684,6 +684,7 @@ fn geometry_stream_output_appends_and_drives_draw_auto_through_guest_vtables() {
         },
     );
     write_value(&mut r.machine, ARRAY + 16, 16u32);
+    let linkage = create_object(&mut r.machine, r.device, 19, &[]);
     let shader = create_object(
         &mut r.machine,
         r.device,
@@ -696,10 +697,20 @@ fn geometry_stream_output_appends_and_drives_draw_auto_through_guest_vtables() {
             ARRAY + 16,
             1,
             u32::MAX,
-            0,
+            linkage,
         ],
     );
     r.call(23, &[shader, 0, 0]);
+    let query = r.object(
+        24,
+        adv_abi::types::D3D11_QUERY_DESC {
+            Query: 6,
+            MiscFlags: 0,
+        },
+    );
+    r.call(27, &[query]);
+    r.call(13, &[3, 0]);
+    r.call(28, &[query]);
     write_value(
         &mut r.machine,
         DESCRIPTOR,
@@ -748,6 +759,9 @@ fn geometry_stream_output_appends_and_drives_draw_auto_through_guest_vtables() {
     );
     let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
     let actual = r.read(output, staging, 28, 4);
+    r.call(29, &[query, DESCRIPTOR, 16, 0]);
+    let statistics: [u64; 2] = GuestPtr::new(DESCRIPTOR).read(&r.machine.cpu).unwrap();
+    assert_eq!(statistics, [0, 1]);
     let expected = [-1.0f32, 1., 0.5, 1., 3., 1., 0.5, 1., -1., -3., 0.5, 1.].map(f32::to_bits);
     assert_eq!(&actual[4..16], &expected);
     assert_eq!(&actual[16..], &expected);

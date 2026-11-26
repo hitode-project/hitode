@@ -626,7 +626,11 @@ impl<'a> Emitter<'a> {
         source.push_str("}\n");
     }
 
-    pub fn stream_output(&self, stream: usize, scan: usize) -> (ComputeProgram, ComputeProgram) {
+    pub fn stream_output(
+        &self,
+        stream: usize,
+        scan: Option<usize>,
+    ) -> (ComputeProgram, Option<ComputeProgram>) {
         let target_count = self.plan.stream_output.len();
         let args = |write: bool| {
             let mut source = String::new();
@@ -641,7 +645,9 @@ impl<'a> Emitter<'a> {
                 &format!("array<array<vec4<u32>, {}>>", self.outputs + 1),
                 false,
             );
-            storage(&mut source, SCAN_SLOT, "dx_offsets", "array<u32>", !write);
+            if scan.is_some() {
+                storage(&mut source, SCAN_SLOT, "dx_offsets", "array<u32>", !write);
+            }
             for i in 0..target_count {
                 storage(
                     &mut source,
@@ -653,11 +659,10 @@ impl<'a> Emitter<'a> {
             }
             source
         };
-        let mut expansion = vec![
-            params(),
-            scratch(STREAM_SLOT, stream),
-            scratch(SCAN_SLOT, scan),
-        ];
+        let mut expansion = vec![params(), scratch(STREAM_SLOT, stream)];
+        if let Some(scan) = scan {
+            expansion.push(scratch(SCAN_SLOT, scan));
+        }
         let mut prefix = args(false);
         for i in 0..target_count {
             storage(
@@ -678,7 +683,7 @@ impl<'a> Emitter<'a> {
                     .unwrap(),
             );
         }
-        if self.plan.stream_statistics {
+        if self.plan.stream_statistics != 0 {
             storage(
                 &mut prefix,
                 STREAM_STATISTICS,
@@ -711,8 +716,11 @@ impl<'a> Emitter<'a> {
             )
             .unwrap();
         }
-        if self.plan.stream_statistics {
-            prefix.push_str("if tag.w != 0u { dx_increment(4u * tag.z + 2u); }\n");
+        if self.plan.stream_statistics != 0 {
+            writeln!(prefix,
+                "if tag.w != 0u && ({}u & (1u << tag.z)) != 0u {{ dx_increment(4u * tag.z + 2u); }}",
+                self.plan.stream_statistics
+            ).unwrap();
         }
         let mut streams: Vec<_> = self
             .plan
@@ -745,7 +753,7 @@ impl<'a> Emitter<'a> {
                 fits.join(" && ")
             )
             .unwrap();
-            if self.plan.stream_statistics {
+            if self.plan.stream_statistics & (1 << stream) != 0 {
                 writeln!(prefix, "dx_increment(4u * {stream}u);").unwrap();
             }
             for (i, target) in targets {
@@ -761,9 +769,21 @@ impl<'a> Emitter<'a> {
             prefix.push_str("}\n");
         }
         prefix.push_str("}\n}\n");
+        let prefix = ComputeProgram {
+            source: prefix,
+            entry: "prefix_main",
+            bindings: Vec::new(),
+            counters: Vec::new(),
+            expansion: expansion.clone(),
+            workgroup_size: None,
+            items_per_primitive: 1,
+        };
+        if scan.is_none() {
+            return (prefix, None);
+        }
 
         let mut write = args(true);
-        let mut write_expansion = expansion.clone();
+        let mut write_expansion = expansion;
         if let Some(output) = self.tessellation {
             write_expansion.pop();
             output.declare(
@@ -807,16 +827,8 @@ impl<'a> Emitter<'a> {
         }
         write.push_str("}\n}\n");
         (
-            ComputeProgram {
-                source: prefix,
-                entry: "prefix_main",
-                bindings: Vec::new(),
-                counters: Vec::new(),
-                expansion: expansion.clone(),
-                workgroup_size: None,
-                items_per_primitive: 1,
-            },
-            ComputeProgram {
+            prefix,
+            Some(ComputeProgram {
                 source: write,
                 entry: "stream_main",
                 bindings: Vec::new(),
@@ -824,7 +836,7 @@ impl<'a> Emitter<'a> {
                 expansion: write_expansion,
                 workgroup_size: Some(WORKGROUP),
                 items_per_primitive: self.items(),
-            },
+            }),
         )
     }
 }
