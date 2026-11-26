@@ -112,7 +112,7 @@ struct Run {
     passes: Vec<pass::Pass>,
 }
 struct Attachments {
-    colors: smallvec::SmallVec<[Image; 8]>,
+    colors: super::stream::Colors,
     depth: Option<Depth>,
 }
 
