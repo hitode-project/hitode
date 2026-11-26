@@ -241,6 +241,12 @@ impl Encoder {
             vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
         );
     }
+    pub(crate) fn timestamp_barrier(&mut self) -> Result<()> {
+        // Timestamp markers also order commands tracked by image transitions.
+        self.synced = false;
+        self.memory_barrier();
+        Ok(())
+    }
     /// Orders compute shader writes before subsequent compute or indirect dispatches.
     fn compute_barrier(&mut self) {
         if !self.ready() || self.synced {
