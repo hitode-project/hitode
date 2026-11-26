@@ -1,0 +1,26 @@
+dinput: filter action map app data by device GUID and DIA_APPNOMAP
+
+DirectInput's SetActionMap maps only actions whose guidInstance matches the
+target device and whose dwFlags do not set DIA_APPNOMAP. When a program reuses
+one DIACTIONFORMAT across multiple devices, such as building and setting an
+action map for the keyboard and then for the mouse, unmapped or other-device
+actions can retain dwObjID values that match object type IDs on the current
+device.
+
+Wine's init_object_app_data matched actions only by dwObjID, so a later
+unmapped or other-device entry with a colliding dwObjID overwrote the target
+device object's app_data. Skipping DIA_APPNOMAP entries and entries whose
+guidInstance differs from the device matches SetActionMap's own filter and
+Windows behavior (WINE-IN-4).
+
+--- a/dlls/dinput/device.c
++++ b/dlls/dinput/device.c
+@@ -1967,6 +1967,8 @@
+ 
+     while (action-- > format->rgoAction)
+     {
++        if (action->dwFlags & DIA_APPNOMAP) continue;
++        if (!IsEqualGUID( &device->guid, &action->guidInstance )) continue;
+         if (action->dwObjID != instance->dwType) continue;
+         properties->app_data = action->uAppData;
+         break;

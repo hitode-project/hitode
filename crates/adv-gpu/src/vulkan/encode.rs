@@ -873,6 +873,7 @@ impl Encoder {
                 begun: false,
                 timestamp,
                 occlusion: None,
+                statistics: None,
                 preamble: None,
                 preamble_index,
                 resets: Vec::new(),
@@ -1373,7 +1374,11 @@ impl Encoder {
                 range.end - range.start,
                 dst.inner.0.handle,
                 offset,
-                8,
+                if set.inner.0.kind == crate::queue::QueryKind::PipelineStatistics {
+                    16
+                } else {
+                    8
+                },
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             );
         }
@@ -1582,6 +1587,7 @@ pub(crate) struct RenderPass<'e> {
     begun: bool,
     timestamp: Option<(vk::QueryPool, u32)>,
     occlusion: Option<(vk::QueryPool, u32)>,
+    statistics: Option<(vk::QueryPool, u32)>,
     preamble: Option<vk::CommandBuffer>,
     preamble_index: usize,
     resets: Vec<(vk::QueryPool, u32)>,
@@ -2112,8 +2118,19 @@ impl RenderPass<'_> {
         }
     }
     pub(crate) fn begin_occlusion(&mut self, set: &crate::queue::QuerySet, index: u32) {
+        self.occlusion = self.begin_query(set, index, vk::QueryControlFlags::PRECISE);
+    }
+    pub(crate) fn begin_statistics(&mut self, set: &crate::queue::QuerySet, index: u32) {
+        self.statistics = self.begin_query(set, index, vk::QueryControlFlags::empty());
+    }
+    fn begin_query(
+        &mut self,
+        set: &crate::queue::QuerySet,
+        index: u32,
+        flags: vk::QueryControlFlags,
+    ) -> Option<(vk::QueryPool, u32)> {
         if !self.encoder.ready() {
-            return;
+            return None;
         }
         if !self.begun {
             unsafe {
@@ -2125,14 +2142,10 @@ impl RenderPass<'_> {
                 );
             }
             if !self.ensure_begun() {
-                return;
+                return None;
             }
         } else {
-            if Self::ensure_preamble(self.encoder, &mut self.preamble, self.preamble_index)
-                .is_none()
-            {
-                return;
-            }
+            Self::ensure_preamble(self.encoder, &mut self.preamble, self.preamble_index)?;
             self.resets.push((set.inner.0.handle, index));
         }
         self.encoder.has_query_ops = true;
@@ -2141,14 +2154,22 @@ impl RenderPass<'_> {
                 self.encoder.command,
                 set.inner.0.handle,
                 index,
-                vk::QueryControlFlags::PRECISE,
+                flags,
             );
         }
-        self.occlusion = Some((set.inner.0.handle, index));
+        Some((set.inner.0.handle, index))
     }
     pub(crate) fn end_occlusion(&mut self) {
+        let query = self.occlusion.take();
+        self.end_query(query);
+    }
+    pub(crate) fn end_statistics(&mut self) {
+        let query = self.statistics.take();
+        self.end_query(query);
+    }
+    fn end_query(&mut self, query: Option<(vk::QueryPool, u32)>) {
         if self.encoder.ready()
-            && let Some((pool, index)) = self.occlusion.take()
+            && let Some((pool, index)) = query
         {
             unsafe {
                 self.encoder

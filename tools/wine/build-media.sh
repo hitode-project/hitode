@@ -14,8 +14,8 @@ for patch in "$tools"/patches/*.patch; do
     patch -d "$source" -p1 -R -s -f --dry-run < "$patch" >/dev/null 2>&1 ||
         patch -d "$source" -p1 -s < "$patch"
 done
-# winegstreamer is the added PE module; kernel32, dwrite and ntdll change with the patches.
-modules="winegstreamer kernel32 dwrite ntdll"
+# winegstreamer is the added PE module; the rest change with the patches.
+modules="winegstreamer kernel32 dwrite ntdll dinput dinput8"
 cd "$build"
 if [ ! -f Makefile ]; then
     # A relative source path keeps the builder's directories out of __FILE__.

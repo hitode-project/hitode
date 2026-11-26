@@ -394,6 +394,16 @@ changed categories. They copy only differing captured entries, preserving exact
 float bits, uncaptured state and COM ownership. Capturing a complete state category shares its immutable map and content key. An unchanged Capture reuses its
 snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-state and constant setters preserve category revisions while recording still captures their membership. Matching Capture/Apply bypass binding preparation and reference transfers; changes outside the captured subset refresh its observed revisions. Applying only shader or buffer changes MUST preserve the fixed-state key cache.
 
+### GFX-SHADER-5 Expansion order
+
+**Rule**: Expansion MUST preserve primitive order, the leading vertex and winding. It MUST append complete stream-output primitives in order and derive filled sizes from the append scan.
+**Verification**: Test
+
+### GFX-SHADER-6 Pipeline statistics
+
+**Rule**: Pipeline statistics MUST combine recorded work with raster and expansion counts. Rasterization-disabled draws MUST contribute zero clipping and fragment counts.
+**Verification**: Test
+
 ## Tessellation
 
 ### GFX-TESS-1 Fixed-function patch tessellation
@@ -542,6 +552,7 @@ Binding changes MUST NOT start speculative preparation for transient shader pair
 SM4–5 WGSL emission and scalar execution MUST apply the same DXBC arithmetic rules.
 DXBC floating-point arithmetic MUST flush denormals to sign-preserved zero where the instruction requires it.
 DXBC `f32tof16` MUST round toward zero and clamp finite overflow to the largest finite half.
+SM4–5 WGSL emission and scalar execution MUST agree on typed view values, resource queries, and UAV counter operations.
 **Verification**: Test
 
 ## Surface copies

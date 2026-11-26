@@ -173,6 +173,22 @@ fn operation(
         } => (std::slice::from_ref(interface), Some(*function)),
         Body::Declaration { .. } => return Err(Error::Invalid("expected instruction operands")),
     };
+    // FXC adds a zero word after the sample index for texture sample positions.
+    // Token decoding keeps it for re-encoding.
+    let operands = match operands {
+        [_, texture, _, padding]
+            if opcode == Opcode::SamplePos
+                && texture.kind == D3D10_SB_OPERAND_TYPE_RESOURCE
+                && padding.kind == D3D10_SB_OPERAND_TYPE_TEMP
+                && padding.components == 0
+                && padding.controls == 0
+                && padding.extensions.is_empty()
+                && padding.indices.is_empty() =>
+        {
+            &operands[..3]
+        }
+        _ => operands,
+    };
     let (destinations, sources) = opcode.types();
     if operands.len() != destinations.len() + sources.len() {
         return Err(Error::UnsupportedOpcode(opcode));

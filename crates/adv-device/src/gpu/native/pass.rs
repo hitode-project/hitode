@@ -245,23 +245,41 @@ fn settle_depth(ops: &[Op], passes: &mut [Pass], next: NextDepth, has_stencil: b
 
 pub(super) fn modern_attachments(
     draw: &super::modern::ModernDraw,
+    chunk: (bool, bool),
 ) -> adv_gpu::encode::RenderPassDesc<'_> {
     use adv_gpu::encode::{ColorAttachment, DepthAttachment, RenderPassDesc};
+    fn chunk_access<T: PartialEq>(
+        load: Load<T>,
+        store: Store,
+        (first, last): (bool, bool),
+    ) -> (Load<T>, Store) {
+        if load == Load::None {
+            (load, store)
+        } else {
+            (
+                if first { load } else { Load::Load },
+                if last { store } else { Store::Store },
+            )
+        }
+    }
     RenderPassDesc {
         colors: draw
             .colors
             .iter()
-            .map(|color| ColorAttachment {
-                view: &color.view,
-                load: color.load,
-                store: color.store,
-                resolve: None,
+            .map(|color| {
+                let (load, store) = chunk_access(color.load, color.store, chunk);
+                ColorAttachment {
+                    view: &color.view,
+                    load,
+                    store,
+                    resolve: None,
+                }
             })
             .collect(),
         depth_stencil: draw.depth.as_ref().map(|depth| DepthAttachment {
             view: &depth.view,
-            depth: depth.depth,
-            stencil: depth.stencil,
+            depth: chunk_access(depth.depth.0, depth.depth.1, chunk),
+            stencil: chunk_access(depth.stencil.0, depth.stencil.1, chunk),
             read_only: depth.read_only,
         }),
         area: draw.area,

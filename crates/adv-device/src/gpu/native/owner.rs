@@ -123,6 +123,7 @@ struct State {
     presenter: Box<dyn Presenter>,
     target: Option<Attachments>,
     predicate_pipeline: Option<adv_gpu::ComputePipeline>,
+    expansion: super::expand::Ring,
     timestamp_pipeline: Option<adv_gpu::ComputePipeline>,
     depths: Vec<Depth>,
     run: Run,
@@ -214,6 +215,7 @@ impl State {
             presenter,
             target: None,
             predicate_pipeline: None,
+            expansion: super::expand::Ring::default(),
             timestamp_pipeline: None,
             depths: Vec::new(),
             run: Run::default(),
@@ -381,6 +383,12 @@ impl State {
                 self.target = Some(Attachments { colors, depth });
             }
             Command::DrawModern(draw) => self.draw_modern(*draw)?,
+            Command::Expand(work) => {
+                let device = self.queue.device().clone();
+                let mut expansion = std::mem::take(&mut self.expansion);
+                expansion.encode(&device, self.encoder(), *work)?;
+                self.expansion = expansion;
+            }
             Command::Dispatch(work) => {
                 let work = *work;
                 let mut pass = self
@@ -569,6 +577,7 @@ impl State {
                 video,
                 windows,
             } => {
+                self.expansion.begin_frame();
                 let (raw, _, _) = self.image(&image)?;
                 let mut swap = match &image.storage {
                     Storage::Fixed { .. } => SwapImage::Private(raw),
@@ -608,6 +617,7 @@ impl State {
                 windows,
                 serial,
             } => {
+                self.expansion.begin_frame();
                 if self.encoder.is_some() {
                     self.submit(None)?;
                 }
@@ -637,49 +647,14 @@ impl State {
             })
             .transpose()?;
         let arguments = predicated.as_ref().unwrap_or(&draw.arguments);
-        let mut pass = self.encoder().render_pass(&pass::modern_attachments(&draw));
-        pass.set_pipeline(&render.pipeline);
-        let [x, y, w, h, min, max] = draw.viewport;
-        pass.set_viewport(x, y, w, h, min, max);
-        pass.set_scissor(pass::modern_scissor(draw.viewport, draw.scissor));
-        pass.set_stencil_reference(draw.stencil_reference);
-        pass.set_blend_constant(draw.blend_constant);
-        let [constant, slope, clamp] = draw.depth_bias;
-        pass.set_depth_bias(constant, slope, clamp);
-        for binding in &render.vertex {
-            pass.bind_vertex(binding.slot, binding.binding());
-        }
-        for binding in &render.fragment {
-            pass.bind(binding.slot, binding.binding());
-        }
-        if let Some((index, format)) = &draw.index {
-            pass.set_index_buffer(index.buffer.slice(index.range.clone()), *format);
-        }
-        if let Some(query) = &draw.occlusion {
-            pass.begin_occlusion(&query.set, query.index);
-        }
-        match arguments {
-            modern::DrawArguments::Direct {
-                vertices,
-                instances,
-                base_vertex,
-            } => {
-                if draw.index.is_some() {
-                    pass.draw_indexed(vertices.clone(), *base_vertex, instances.clone());
-                } else {
-                    pass.draw(vertices.clone(), instances.clone());
-                }
-            }
-            modern::DrawArguments::Indirect(buffer) => {
-                pass.draw_indirect(
-                    buffer.buffer.slice(buffer.range.clone()),
-                    draw.index.is_some(),
-                );
-            }
-        }
-        if draw.occlusion.is_some() {
-            pass.end_occlusion();
-        }
+        draw_modern_pass(
+            self.encoder(),
+            (&draw, &render.pipeline),
+            (&render.vertex, &render.fragment),
+            arguments,
+            render.statistics.as_ref(),
+            (true, true),
+        );
         Ok(())
     }
 
@@ -996,6 +971,69 @@ fn extent(rect: Rect) -> Extent {
         depth_or_layers: 1,
     }
 }
+pub(super) fn draw_modern_pass(
+    encoder: &mut Encoder,
+    (draw, pipeline): (&modern::ModernDraw, &adv_gpu::RenderPipeline),
+    (vertex, fragment): (&[modern::BoundSlot], &[modern::BoundSlot]),
+    arguments: &modern::DrawArguments,
+    statistics: Option<&modern::QuerySlot>,
+    chunk: (bool, bool),
+) {
+    #[cfg(target_vendor = "apple")]
+    let _ = statistics;
+    let mut pass = encoder.render_pass(&pass::modern_attachments(draw, chunk));
+    pass.set_pipeline(pipeline);
+    let [x, y, w, h, min, max] = draw.viewport;
+    pass.set_viewport(x, y, w, h, min, max);
+    pass.set_scissor(pass::modern_scissor(draw.viewport, draw.scissor));
+    pass.set_stencil_reference(draw.stencil_reference);
+    pass.set_blend_constant(draw.blend_constant);
+    let [constant, slope, clamp] = draw.depth_bias;
+    pass.set_depth_bias(constant, slope, clamp);
+    for binding in vertex {
+        pass.bind_vertex(binding.slot, binding.binding());
+    }
+    for binding in fragment {
+        pass.bind(binding.slot, binding.binding());
+    }
+    if let Some((index, format)) = &draw.index {
+        pass.set_index_buffer(index.buffer.slice(index.range.clone()), *format);
+    }
+    if let Some(query) = &draw.occlusion {
+        pass.begin_occlusion(&query.set, query.index);
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    if let Some(query) = statistics {
+        pass.begin_statistics(&query.set, query.index);
+    }
+    match arguments {
+        modern::DrawArguments::Direct {
+            vertices,
+            instances,
+            base_vertex,
+        } => {
+            if draw.index.is_some() {
+                pass.draw_indexed(vertices.clone(), *base_vertex, instances.clone());
+            } else {
+                pass.draw(vertices.clone(), instances.clone());
+            }
+        }
+        modern::DrawArguments::Indirect(buffer) => {
+            pass.draw_indirect(
+                buffer.buffer.slice(buffer.range.clone()),
+                draw.index.is_some(),
+            );
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    if statistics.is_some() {
+        pass.end_statistics();
+    }
+    if draw.occlusion.is_some() {
+        pass.end_occlusion();
+    }
+}
+
 fn next_depth<'a>(
     depth: Option<&Depth>,
     commands: impl Iterator<Item = (&'a Command, &'a [Draw])>,

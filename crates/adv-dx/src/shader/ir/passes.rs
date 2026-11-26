@@ -1,5 +1,7 @@
 //! Semantic lowering shared by shader execution and emission.
 
+pub(crate) mod variant;
+
 use super::*;
 use crate::shader::analysis::{Reflection, analyze};
 

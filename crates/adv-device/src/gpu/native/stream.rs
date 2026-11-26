@@ -90,6 +90,7 @@ pub(crate) enum Command {
     Draw(u32),
     DrawModern(Box<super::modern::Render>),
     Dispatch(Box<super::modern::Compute>),
+    Expand(Box<super::expand::Work>),
     Resolve {
         source: adv_gpu::ImageView,
         destination: adv_gpu::ImageView,
