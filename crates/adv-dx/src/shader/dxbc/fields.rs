@@ -774,14 +774,14 @@ pub const fn encode_extended_resource_dimension_structure_stride(stride: u32) ->
 }
 pub const fn decode_extended_resource_return_type(opcode_token_n: u32, component: u32) -> u32 {
     opcode_token_n
-        >> component * D3D10_SB_RESOURCE_RETURN_TYPE_NUMBITS
-            + D3D11_SB_EXTENDED_RESOURCE_RETURN_TYPE_SHIFT
+        >> (component * D3D10_SB_RESOURCE_RETURN_TYPE_NUMBITS
+            + D3D11_SB_EXTENDED_RESOURCE_RETURN_TYPE_SHIFT)
         & D3D10_SB_RESOURCE_RETURN_TYPE_MASK
 }
 pub const fn encode_extended_resource_return_type(return_type: u32, component: u32) -> u32 {
     (return_type & D3D10_SB_RESOURCE_RETURN_TYPE_MASK)
-        << component * D3D10_SB_RESOURCE_RETURN_TYPE_NUMBITS
-            + D3D11_SB_EXTENDED_RESOURCE_RETURN_TYPE_SHIFT
+        << (component * D3D10_SB_RESOURCE_RETURN_TYPE_NUMBITS
+            + D3D11_SB_EXTENDED_RESOURCE_RETURN_TYPE_SHIFT)
 }
 pub const fn decode_customdata_class(custom_data_desc_tok: u32) -> u32 {
     (custom_data_desc_tok & D3D10_SB_CUSTOMDATA_CLASS_MASK) >> D3D10_SB_CUSTOMDATA_CLASS_SHIFT
@@ -811,7 +811,7 @@ pub const fn encode_operand_4_component_mask(component_mask: u32) -> u32 {
     component_mask & D3D10_SB_OPERAND_4_COMPONENT_MASK_MASK
 }
 pub const fn operand_4_component_mask(component_name: u32) -> u32 {
-    1 << D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT + component_name
+    1 << (D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT + component_name)
         & D3D10_SB_OPERAND_4_COMPONENT_MASK_MASK
 }
 pub const fn decode_operand_4_component_swizzle(operand_token0: u32) -> u32 {
@@ -819,8 +819,8 @@ pub const fn decode_operand_4_component_swizzle(operand_token0: u32) -> u32 {
 }
 pub const fn decode_operand_4_component_swizzle_source(operand_token0: u32, dest_comp: u32) -> u32 {
     operand_token0
-        >> D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SHIFT
-            + 2 * (dest_comp & D3D10_SB_4_COMPONENT_NAME_MASK)
+        >> (D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SHIFT
+            + 2 * (dest_comp & D3D10_SB_4_COMPONENT_NAME_MASK))
         & D3D10_SB_4_COMPONENT_NAME_MASK
 }
 pub const fn encode_operand_4_component_swizzle(xsrc: u32, ysrc: u32, zsrc: u32, wsrc: u32) -> u32 {
@@ -943,12 +943,12 @@ pub const fn encode_resource_sample_count(sample_count: u32) -> u32 {
         & D3D10_SB_RESOURCE_SAMPLE_COUNT_MASK
 }
 pub const fn decode_resource_return_type(resource_return_type_token: u32, component: u32) -> u32 {
-    resource_return_type_token >> component * D3D10_SB_RESOURCE_RETURN_TYPE_NUMBITS
+    resource_return_type_token >> (component * D3D10_SB_RESOURCE_RETURN_TYPE_NUMBITS)
         & D3D10_SB_RESOURCE_RETURN_TYPE_MASK
 }
 pub const fn encode_resource_return_type(return_type: u32, component: u32) -> u32 {
     (return_type & D3D10_SB_RESOURCE_RETURN_TYPE_MASK)
-        << component * D3D10_SB_RESOURCE_RETURN_TYPE_NUMBITS
+        << (component * D3D10_SB_RESOURCE_RETURN_TYPE_NUMBITS)
 }
 pub const fn decode_sampler_mode(opcode_token0: u32) -> u32 {
     (opcode_token0 & D3D10_SB_SAMPLER_MODE_MASK) >> D3D10_SB_SAMPLER_MODE_SHIFT

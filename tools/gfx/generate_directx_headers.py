@@ -83,6 +83,14 @@ def tokens(header):
                 elif item.id in functions:
                     item.id = function_name(item.id)
         result = ast.unparse(node)
+        # Keep the arithmetic shift count explicit in the generated Rust.
+        for item in ast.walk(node):
+            if isinstance(item, ast.BinOp) and isinstance(item.op, (ast.LShift, ast.RShift)):
+                amount = item.right
+                if isinstance(amount, ast.BinOp) and isinstance(amount.op, (ast.Add, ast.Sub, ast.Mult)):
+                    op = "<<" if isinstance(item.op, ast.LShift) else ">>"
+                    text = ast.unparse(amount)
+                    result = result.replace(f"{op} {text}", f"{op} ({text})")
         # C conditionals in this header are either selections used as whole
         # expressions or the clamp handled above.
         if isinstance(node.body, ast.IfExp):

@@ -1,4 +1,10 @@
 //! Lossless token streams of SHDR and SHEX chunks in DXBC containers.
+mod checksum;
+mod container;
+mod disassemble;
+pub use disassemble::disassemble;
+mod lower;
+pub use container::{Container, ParseError, parse};
 pub mod fields;
 pub mod operand;
 
