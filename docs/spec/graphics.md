@@ -6,6 +6,12 @@ This spec covers shared CPU compositing, the DirectDraw and Direct3D 9 API front
 
 ## DirectDraw
 
+### GFX-BLT-1 Resident Blt rules
+
+**Rule**: Resident Blt MUST select display-driver rules only when both surfaces declare video memory. It MUST use the GPU executor only when both participating rectangles are GPU-current. Both executors MUST match the measured stretch, mirror, conversion, key, fill, bounds and overlap results.
+**Verification**: Test
+**Basis**: Windows DirectDraw Blt probe
+
 ### GFX-DDRAW-1 Lock and clipper state
 
 **Rule**: WRITEONLY Lock and Unlock MUST retain shared busy-state and write-version semantics. Primary Blt MUST refresh a window clipper's geometry after window movement without requiring reattachment. GetClipper MUST return the attached clipper with a new reference, or DDERR_NOCLIPPERATTACHED without writing the output.

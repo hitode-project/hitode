@@ -74,6 +74,22 @@ impl Region {
         self.add_cells::<false>(rect);
     }
 
+    /// Clears all cells touched by `rect`.
+    pub fn remove(&mut self, rect: Rect) {
+        if let Some((x0, x1, y0, y1)) = self.span(rect) {
+            for y in y0..y1 {
+                let row = &mut self.bits[y as usize * self.stride..][..self.stride];
+                let mut x = x0 as usize;
+                while x < x1 as usize {
+                    let word = x / 64;
+                    let end = (x1 as usize).min((word + 1) * 64);
+                    row[word] &= !mask(x % 64, end - word * 64);
+                    x = end;
+                }
+            }
+        }
+    }
+
     /// Marks `rect` and reports whether it added any cells.
     pub fn add_changed(&mut self, rect: Rect) -> bool {
         self.add_cells::<true>(rect)

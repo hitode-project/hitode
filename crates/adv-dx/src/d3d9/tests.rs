@@ -25,6 +25,11 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         allocator: test_allocator(),
         dc: test_dc(),
         insert: |_, _| unreachable!("ownership-only fixture"),
+        cpu_access: |ext, id, rect| {
+            let target = (ext.get::<State>().provider.target)(ext, id)?;
+            Some(CpuReadback::new(target.image, rect))
+        },
+        gpu_access: |env, id, _, _| (env.ext.get::<State>().provider.target)(env.ext, id),
         target: |_, _| None,
         remove: |_, _, _| Ok(()),
         replace: |_, _, _| unreachable!(),
