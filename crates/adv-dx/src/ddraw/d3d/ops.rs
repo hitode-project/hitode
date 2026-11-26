@@ -1,6 +1,9 @@
 //! Direct3D COM bindings. The installed DirectDraw personality does not
 //! register these entry points; the test assembly installs their tables.
 use super::desc::state as decode;
+mod execute;
+mod legacy;
+mod process;
 #[path = "render.rs"]
 mod render;
 use super::{
@@ -34,8 +37,9 @@ macro_rules! bind {
     };
 }
 
-/// Register the T10 front in an isolated registry.
+/// Register the Direct3D front in an isolated registry.
 pub fn register(registry: &mut Registry) {
+    front::palette::register(registry);
     bind!(
         registry,
         Direct3D,
@@ -281,10 +285,206 @@ pub fn register(registry: &mut Registry) {
         GetCaps,
         EnumTextureFormats
     );
+    bind!(registry, Direct3D, "IDirect3D", Initialize, FindDevice);
+    bind!(registry, Direct3D2, "IDirect3D2", FindDevice);
+    bind!(
+        registry,
+        Direct3D3,
+        "IDirect3D3",
+        FindDevice,
+        CreateVertexBuffer,
+        EvictManagedTextures
+    );
+    bind!(registry, Direct3D7, "IDirect3D7", EvictManagedTextures);
+    bind!(
+        registry,
+        Device1,
+        "IDirect3DDevice",
+        Initialize,
+        GetCaps,
+        SwapTextureHandles,
+        CreateExecuteBuffer,
+        GetStats,
+        Execute,
+        Pick,
+        GetPickRecords,
+        NextViewport,
+        EnumTextureFormats,
+        CreateMatrix,
+        SetMatrix,
+        GetMatrix,
+        DeleteMatrix,
+        BeginScene,
+        EndScene
+    );
+    bind!(
+        registry,
+        Device2,
+        "IDirect3DDevice2",
+        GetCaps,
+        SwapTextureHandles,
+        GetStats,
+        NextViewport,
+        EnumTextureFormats,
+        BeginScene,
+        EndScene,
+        SetCurrentViewport,
+        GetCurrentViewport,
+        SetRenderTarget,
+        GetRenderTarget,
+        Begin,
+        BeginIndexed,
+        Vertex,
+        Index,
+        End,
+        GetRenderState,
+        SetRenderState,
+        GetLightState,
+        SetLightState,
+        SetTransform,
+        GetTransform,
+        MultiplyTransform,
+        DrawPrimitive,
+        DrawIndexedPrimitive,
+        SetClipStatus,
+        GetClipStatus
+    );
+    bind!(
+        registry,
+        Device3,
+        "IDirect3DDevice3",
+        GetCaps,
+        GetStats,
+        NextViewport,
+        EnumTextureFormats,
+        BeginScene,
+        EndScene,
+        SetCurrentViewport,
+        GetCurrentViewport,
+        SetRenderTarget,
+        GetRenderTarget,
+        Begin,
+        BeginIndexed,
+        Vertex,
+        Index,
+        End,
+        GetRenderState,
+        SetRenderState,
+        GetLightState,
+        SetLightState,
+        SetTransform,
+        GetTransform,
+        MultiplyTransform,
+        DrawPrimitive,
+        DrawIndexedPrimitive,
+        SetClipStatus,
+        GetClipStatus,
+        DrawPrimitiveStrided,
+        DrawIndexedPrimitiveStrided,
+        DrawPrimitiveVB,
+        DrawIndexedPrimitiveVB,
+        ComputeSphereVisibility,
+        GetTexture,
+        SetTexture,
+        GetTextureStageState,
+        SetTextureStageState,
+        ValidateDevice
+    );
+    bind!(
+        registry,
+        Device7,
+        "IDirect3DDevice7",
+        ComputeSphereVisibility,
+        Load,
+        GetInfo
+    );
+    bind!(
+        registry,
+        Viewport3,
+        "IDirect3DViewport3",
+        Initialize,
+        GetViewport2,
+        SetViewport2,
+        TransformVertices,
+        LightElements,
+        SetBackground,
+        GetBackground,
+        SetBackgroundDepth,
+        GetBackgroundDepth,
+        Clear,
+        NextLight,
+        SetBackgroundDepth2,
+        GetBackgroundDepth2,
+        Clear2
+    );
+    bind!(registry, Light, "IDirect3DLight", Initialize);
+    bind!(
+        registry,
+        Material1,
+        "IDirect3DMaterial",
+        Initialize,
+        Reserve,
+        Unreserve
+    );
+    bind!(
+        registry,
+        Texture1,
+        "IDirect3DTexture",
+        Initialize,
+        PaletteChanged,
+        Load,
+        Unload
+    );
+    bind!(
+        registry,
+        Texture2,
+        "IDirect3DTexture2",
+        PaletteChanged,
+        Load
+    );
+    bind!(
+        registry,
+        VertexBuffer,
+        "IDirect3DVertexBuffer",
+        QueryInterface,
+        AddRef,
+        Release,
+        Lock,
+        Unlock,
+        GetVertexBufferDesc,
+        Optimize,
+        ProcessVertices
+    );
+    bind!(
+        registry,
+        VertexBuffer7,
+        "IDirect3DVertexBuffer7",
+        ProcessVertices,
+        ProcessVerticesStrided
+    );
+    bind!(
+        registry,
+        ExecuteBuffer,
+        "IDirect3DExecuteBuffer",
+        QueryInterface,
+        AddRef,
+        Release,
+        Initialize,
+        Lock,
+        Unlock,
+        SetExecuteData,
+        GetExecuteData,
+        Validate,
+        Optimize
+    );
 }
 
 /// Install the Direct3D registry tables after installing DirectDraw and the surface store.
 pub fn install<B: Backend>(machine: &mut Machine<B>) -> Result<(), String> {
+    if std::env::var_os("ADV_DDRAW_LEGACY").is_some_and(|value| value == "1") {
+        return Ok(());
+    }
+    front::palette::install(machine)?;
     let (state, store) = machine
         .ext
         .get2_installed_mut::<front::State, SurfaceStore>();
@@ -317,11 +517,20 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) -> Result<(), String> {
             memory.put_u32(table + u32::from(sig.com_slot.unwrap()) * 4, entry)?;
         }
     }
+    let desktop = front::modes::current(store);
+    state.draw.display = Some(front::modes::DisplayModes {
+        desktop,
+        requested: desktop,
+        suspended: false,
+    });
     state.draw.d3d = Some(d3d);
     Ok(())
 }
 
 fn dispatch(env: &mut Env<'_>) -> Outcome {
+    if let Err(error) = front::State::sync_activation(env) {
+        return error.outcome(env);
+    }
     let binding = env.sys.thunks.get(env.thunk).f;
     let face = Face::ALL[(binding.data >> 32) as usize];
     let mut args = [0; 8];
@@ -336,6 +545,9 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
     ) {
         return super::report::enumerate(env, face, method, args);
     }
+    if face == Face::ExecuteBuffer && method == "Validate" {
+        return execute::validate(env, args);
+    }
     let result = {
         let (state, store) = env.ext.get2_installed_mut::<front::State, SurfaceStore>();
         let mut memory = (state.provider.memory)(env.cpu);
@@ -348,14 +560,6 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         .call(face, method, args)
     };
     match result {
-        Ok(hr @ 0x80004001) => {
-            adv_abi::warn_unavailable(
-                env,
-                &format!("{}::{method}", face.name()),
-                "Direct3D operation is outside the implemented paths",
-            );
-            Outcome::Return(hr)
-        }
         Ok(hr) => Outcome::Return(hr),
         Err(error) => error.outcome(env),
     }
@@ -371,7 +575,7 @@ struct Calls<'a> {
 impl Calls<'_> {
     fn call(&mut self, face: Face, method: &str, args: &[u32]) -> Result<u32, CallError> {
         let this = args[0];
-        if face == Face::Device7
+        if matches!(face, Face::Device2 | Face::Device3 | Face::Device7)
             && matches!(
                 method,
                 "SetTransform"
@@ -401,7 +605,7 @@ impl Calls<'_> {
                     | "DeleteStateBlock"
             )
         {
-            return self.device_state(method, args);
+            return self.device_state(face, method, args);
         }
         Ok(match method {
             "QueryInterface" => {
@@ -420,35 +624,38 @@ impl Calls<'_> {
                 super::release(self.draw, self.store, self.objects, this)
             }
             "CreateDevice" => return self.create_device(face, args),
-            "GetCaps" => {
-                let Some(Object::Device(device)) = self
-                    .draw
-                    .com
-                    .and_then(|com| com.get::<Object>(self.objects, this))
-                else {
-                    return Ok(INVALID);
-                };
-                write(
-                    self.memory,
-                    args[1],
-                    &super::report::derive(self.store, device.kind).device,
-                )?;
-                0
+            "GetCaps" => return self.get_caps(face, args),
+            "CreateVertexBuffer" => return self.create_vertex_buffer(face, args),
+            "CreateExecuteBuffer" => return self.create_execute_buffer(args),
+            "Execute" => return self.execute(args),
+            "Pick" => return self.run_execute(&args[..4], Some(read(self.memory, args[4])?)),
+            "GetPickRecords" => return self.pick_records(args),
+            "TransformVertices" => return self.transform_vertices(args),
+            "LightElements" => 0x80004001, // Retired before the Direct3D 3 interface.
+
+            "Lock" | "Unlock" | "SetExecuteData" | "GetExecuteData" | "Optimize"
+                if face == Face::ExecuteBuffer =>
+            {
+                return self.execute_buffer(method, args);
             }
-            "CreateVertexBuffer" => return self.create_vertex_buffer(args),
+            "ProcessVertices" | "ProcessVerticesStrided" => {
+                return self.process_vertices(method, args);
+            }
             "Lock" | "Unlock" | "GetVertexBufferDesc" | "Optimize" => {
                 return self.vertex_buffer(method, args);
             }
             "BeginScene" | "EndScene" | "Clear" | "SetRenderTarget" | "GetRenderTarget"
-            | "SetTexture" | "GetTexture" | "PreLoad" | "ValidateDevice" => {
-                return self.render_method(method, args);
+            | "SetTexture" | "GetTexture" | "PreLoad" | "ValidateDevice"
+                if face != Face::Viewport3 =>
+            {
+                return self.render_method(face, method, args);
             }
             "DrawPrimitive"
             | "DrawIndexedPrimitive"
             | "DrawPrimitiveStrided"
             | "DrawIndexedPrimitiveStrided"
             | "DrawPrimitiveVB"
-            | "DrawIndexedPrimitiveVB" => return self.draw_primitive(method, args),
+            | "DrawIndexedPrimitiveVB" => return self.draw_primitive(face, method, args),
             "CreateLight" | "CreateMaterial" | "CreateViewport" => {
                 return self.create_child(face, method, args);
             }
@@ -482,7 +689,9 @@ impl Calls<'_> {
                     | Face::Light
                     | Face::Texture1
                     | Face::Texture2
-                    | Face::VertexBuffer7 => return Ok(INVALID),
+                    | Face::VertexBuffer7
+                    | Face::VertexBuffer
+                    | Face::ExecuteBuffer => return Ok(INVALID),
                 };
                 match super::query(self.draw, self.objects, parent, iid) {
                     Ok(pointer) => {
@@ -494,7 +703,7 @@ impl Calls<'_> {
             }
             "GetHandle" => return self.handle(face, args),
             "SetMaterial" | "GetMaterial" | "SetViewport" | "GetViewport" | "SetLight"
-            | "GetLight" => {
+            | "GetLight" | "SetViewport2" | "GetViewport2" => {
                 let Some(com) = self.draw.com else {
                     return Ok(INVALID);
                 };
@@ -503,7 +712,16 @@ impl Calls<'_> {
                 };
                 let words: &mut [u32] = match value {
                     Object::Material(value) => value,
-                    Object::Viewport { value, .. } => value,
+                    Object::Viewport { value, value2, .. } => {
+                        let second = method.ends_with('2');
+                        if !method.starts_with("Set") && value[0] != 0 && second != *value2 {
+                            return Ok(0x88760305);
+                        }
+                        if method.starts_with("Set") {
+                            *value2 = second;
+                        }
+                        value
+                    }
                     Object::Light { value, .. } => {
                         let count = self.memory.arg_u32(args[1])? / 4;
                         if !matches!(count, 19 | 20) {
@@ -511,7 +729,9 @@ impl Calls<'_> {
                         }
                         &mut value[..count as usize]
                     }
-                    Object::Device(_) | Object::VertexBuffer { .. } => return Ok(INVALID),
+                    Object::Device(_) | Object::VertexBuffer { .. } | Object::ExecuteBuffer(_) => {
+                        return Ok(INVALID);
+                    }
                 };
                 if self.memory.arg_u32(args[1])? != words.len() as u32 * 4 {
                     return Ok(INVALID);
@@ -528,7 +748,7 @@ impl Calls<'_> {
                 }
                 0
             }
-            _ => return Err(format!("unbound Direct3D method {method}").into()),
+            _ => return self.legacy_method(face, method, args),
         })
     }
 
@@ -565,6 +785,9 @@ impl Calls<'_> {
             .into_iter()
             .find(|device| device.guid() == guid);
         let Some(kind) = kind else { return Ok(INVALID) };
+        if face != Face::Direct3D7 && kind == caps::Device::TnlHal {
+            return Ok(INVALID);
+        }
         let faces: &[Face] = match face {
             Face::Direct3D2 => &[Face::Device2, Face::Device1],
             Face::Direct3D3 => &[Face::Device3, Face::Device2, Face::Device1],
@@ -581,10 +804,12 @@ impl Calls<'_> {
             | Face::Light
             | Face::Texture1
             | Face::Texture2
-            | Face::VertexBuffer7 => return Ok(NO_INTERFACE),
+            | Face::VertexBuffer7
+            | Face::VertexBuffer
+            | Face::ExecuteBuffer => return Ok(NO_INTERFACE),
         };
-        let mut device = object::Device::new(kind, parent, target);
-        if face == Face::Direct3D7 {
+        let mut device = object::Device::new(kind, faces[0], parent, target);
+        {
             let depth = self
                 .draw
                 .attached(sid)
@@ -603,15 +828,8 @@ impl Calls<'_> {
         Ok(0)
     }
 
-    fn device_state(&mut self, method: &str, args: &[u32]) -> Result<u32, CallError> {
-        let Some(object) = self
-            .draw
-            .com
-            .and_then(|com| com.get::<Object>(self.objects, args[0]))
-        else {
-            return Ok(INVALID);
-        };
-        let Object::Device(device) = object else {
+    fn device_state(&mut self, face: Face, method: &str, args: &[u32]) -> Result<u32, CallError> {
+        let Some(device) = super::device(self.draw, self.objects, args[0]) else {
             return Ok(INVALID);
         };
         let sid = self.draw.surface_id(self.objects, device.target).unwrap();
@@ -622,6 +840,12 @@ impl Calls<'_> {
             return Ok(INVALID);
         };
         let memory = &mut *self.memory;
+        if face != Face::Device7
+            && matches!(method, "SetRenderState" | "GetRenderState")
+            && decode::render_value(&state.fixed, args[1]).is_err()
+        {
+            return self.legacy_render_state(method, args);
+        }
         let mut references = [(0, 0); 8];
         let result = (|| -> Result<Result<(), u32>, CallError> {
             macro_rules! validated {
@@ -789,6 +1013,9 @@ impl Calls<'_> {
                     device: None,
                     lights: Vec::new(),
                     value: [0; 11],
+                    value2: false,
+                    background: 0,
+                    depth: 0,
                 },
             ),
             "CreateMaterial" => {
@@ -808,7 +1035,9 @@ impl Calls<'_> {
                     | Face::Light
                     | Face::Texture1
                     | Face::Texture2
-                    | Face::VertexBuffer7 => return Ok(INVALID),
+                    | Face::VertexBuffer7
+                    | Face::VertexBuffer
+                    | Face::ExecuteBuffer => return Ok(INVALID),
                 };
                 self.make(&faces, &[], Object::Material([0; 20]))
             }

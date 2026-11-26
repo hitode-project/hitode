@@ -64,3 +64,12 @@ pub(in crate::ddraw::d3d) fn expand_fan(indices: impl Fn(u32) -> u32, count: u32
         .flat_map(|i| [indices(0), indices(i), indices(i + 1)])
         .collect()
 }
+
+pub(in crate::ddraw::d3d) fn legacy_fvf(kind: u32) -> Option<u32> {
+    match kind {
+        1 => Some(0x112), // D3DVERTEX
+        2 => Some(0x1e2), // D3DLVERTEX
+        3 => Some(0x1c4), // D3DTLVERTEX
+        _ => None,
+    }
+}

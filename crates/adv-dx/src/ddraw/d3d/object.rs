@@ -14,11 +14,15 @@ pub(super) enum Object {
         size: u32,
         locked: bool,
     },
+    ExecuteBuffer(ExecuteBuffer),
     Material([u32; 20]),
     Viewport {
         device: Option<u32>,
         lights: Vec<u32>,
         value: [u32; 11],
+        value2: bool,
+        background: u32,
+        depth: u32,
     },
     Light {
         viewport: Option<u32>,
@@ -26,11 +30,23 @@ pub(super) enum Object {
     },
 }
 
+pub(super) struct ExecuteBuffer {
+    pub device: u32,
+    pub data: u32,
+    pub size: u32,
+    pub owned: bool,
+    pub locked: bool,
+    pub execute: adv_abi::types::D3DEXECUTEDATA,
+}
+
 pub(in crate::ddraw) struct Device {
     pub kind: super::caps::Device,
+    pub(super) face: Face,
     pub parent: u32,
     pub target: u32,
     pub viewports: Vec<u32>,
+    pub(super) current_viewport: u32,
+    pub(super) legacy: LegacyState,
     pub(super) state: Option<super::state::State>,
     material_handles: BTreeMap<u32, u32>,
     texture_handles: BTreeMap<u32, u32>,
@@ -38,13 +54,58 @@ pub(in crate::ddraw) struct Device {
     retired_material_handles: Vec<u32>,
 }
 
+#[derive(Default)]
+pub(super) struct LegacyState {
+    pub matrices: BTreeMap<u32, [f32; 16]>,
+    pub next_matrix: u32,
+    pub render: BTreeMap<u32, u32>,
+    pub light: BTreeMap<u32, u32>,
+    pub batch: Option<PrimitiveBatch>,
+    pub stats: [u32; 5],
+    pub picked: Vec<adv_abi::types::D3DPICKRECORD>,
+}
+
+pub(super) struct PrimitiveBatch {
+    pub primitive: u32,
+    pub fvf: u32,
+    pub flags: u32,
+    pub vertices: Vec<u8>,
+    pub indices: Option<Vec<u32>>,
+}
+
 impl Device {
-    pub fn new(kind: super::caps::Device, parent: u32, target: u32) -> Self {
+    pub(super) fn texture_for_handle(&self, handle: u32) -> Option<u32> {
+        self.texture_handles
+            .iter()
+            .find_map(|(&texture, &id)| (id == handle).then_some(texture))
+    }
+
+    pub(super) fn material_for_handle(&self, handle: u32) -> Option<u32> {
+        self.material_handles
+            .iter()
+            .find_map(|(&material, &id)| (id == handle).then_some(material))
+    }
+
+    pub(super) fn swap_texture_handles(&mut self, a: u32, b: u32) {
+        let first = self.texture_handles.remove(&a);
+        let second = self.texture_handles.remove(&b);
+        if let Some(first) = first {
+            self.texture_handles.insert(b, first);
+        }
+        if let Some(second) = second {
+            self.texture_handles.insert(a, second);
+        }
+    }
+
+    pub fn new(kind: super::caps::Device, face: Face, parent: u32, target: u32) -> Self {
         Self {
             kind,
+            face,
             parent,
             target,
             viewports: Vec::new(),
+            current_viewport: 0,
+            legacy: LegacyState::default(),
             state: None,
             material_handles: BTreeMap::new(),
             texture_handles: BTreeMap::new(),
@@ -188,7 +249,11 @@ pub(super) fn attachment<P: Presenter>(
             return INVALID;
         }
         *device = add.then_some(parent);
-        &mut super::device_mut(draw, objects, parent).unwrap().viewports
+        let device = super::device_mut(draw, objects, parent).unwrap();
+        if !add && device.current_viewport == child {
+            device.current_viewport = 0;
+        }
+        &mut device.viewports
     } else {
         let Some(Object::Light { viewport, .. }) = com.get_mut::<Object>(objects, child) else {
             return INVALID;

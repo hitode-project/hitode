@@ -1,5 +1,5 @@
 //! Display modes of the software DirectDraw device, independent of surfaces.
-use super::{ComState, Kind, State};
+use super::{ComState, DirectDraw, Kind, Loss, State};
 use adv_abi::{Env, GuestPtr, Outcome, win32};
 use adv_cpu::backend::{Prot, Reg};
 use adv_device::surface::{self, PixelFormat, SurfaceStore};
@@ -46,10 +46,17 @@ pub(crate) fn sizes(current: (u32, u32)) -> Vec<(u32, u32)> {
     sizes
 }
 
-fn catalog(current: (u32, u32), legacy: bool) -> Vec<Descriptor> {
+fn catalog(current: (u32, u32), legacy: bool, indexed: bool) -> Vec<Descriptor> {
     let mut modes = Vec::new();
     for (width, height) in sizes(current) {
-        for format in [PixelFormat::Rgb565, PixelFormat::Bgra32] {
+        for format in [
+            PixelFormat::Rgb565,
+            PixelFormat::Bgra32,
+            PixelFormat::Indexed8,
+        ]
+        .into_iter()
+        .take(if indexed { 3 } else { 2 })
+        {
             let mut d = [0; 124];
             let (red, green, blue) = format.masks();
             for (offset, value) in [
@@ -60,7 +67,14 @@ fn catalog(current: (u32, u32), legacy: bool) -> Vec<Descriptor> {
                 (16, (width * format.bytes() + 3) & !3),
                 (24, 60),
                 (72, 32),
-                (76, 0x40),
+                (
+                    76,
+                    if format == PixelFormat::Indexed8 {
+                        0x60
+                    } else {
+                        0x40
+                    },
+                ),
                 (84, format.bytes() * 8),
                 (88, red),
                 (92, green),
@@ -129,8 +143,7 @@ pub(super) fn enum_modes(
     }
     let legacy = object.version(this.addr()) < 4;
     let length = if legacy { 108 } else { 124 };
-    // Standard VGA requests are accepted, but this device exposes no 8-bit
-    // display modes. REFRESHRATES exposes the single supported 60 Hz profile.
+    // REFRESHRATES exposes the supported 60 Hz profile.
     if flags & !3 != 0 || callback.is_null() || !env.cpu.accessible(callback.addr(), 1, Prot::EXEC)
     {
         return Outcome::Return(INVALID);
@@ -148,10 +161,16 @@ pub(super) fn enum_modes(
         Some(d)
     };
     let store = env.ext.get::<SurfaceStore>();
-    let mut modes = catalog((store.width, store.height), legacy);
+    let size = draw
+        .display
+        .as_ref()
+        .map_or((store.width, store.height), |display| {
+            (display.desktop.0, display.desktop.1)
+        });
+    let mut modes = catalog(size, legacy, draw.display.is_some());
     modes.retain(|mode| filter.as_ref().is_none_or(|f| matches(f, mode)));
     for mode in &mut modes {
-        if legacy || flags & 1 == 0 {
+        if flags & 1 == 0 || (legacy && draw.display.is_none()) {
             mode[24..28].fill(0);
         }
     }
@@ -177,6 +196,58 @@ pub(super) fn enum_modes(
         scratch,
         length,
     )
+}
+
+pub(in crate::ddraw) type DisplayMode = (u32, u32, PixelFormat);
+
+pub(in crate::ddraw) struct DisplayModes {
+    pub desktop: DisplayMode,
+    pub requested: DisplayMode,
+    pub suspended: bool,
+}
+
+pub(in crate::ddraw) fn current(store: &surface::Surfaces<impl surface::Presenter>) -> DisplayMode {
+    (store.width, store.height, store.display_format)
+}
+
+pub(in crate::ddraw) fn set_current(
+    store: &mut surface::Surfaces<impl surface::Presenter>,
+    mode: DisplayMode,
+) {
+    (store.width, store.height, store.display_format) = mode;
+}
+
+impl DirectDraw {
+    pub(in crate::ddraw) fn lose_video_surfaces(&mut self, cause: Loss) {
+        use crate::ddraw::creation::{MANAGED, VIDEO_MEMORY};
+        for (&sid, desc) in &self.described {
+            if desc.caps[0] & VIDEO_MEMORY != 0 && desc.caps[1] & MANAGED == 0 {
+                self.lost.insert(sid, cause);
+            }
+        }
+    }
+
+    pub(in crate::ddraw) fn sync_activation(
+        &mut self,
+        store: &mut SurfaceStore,
+        active: bool,
+    ) -> Result<(), crate::argument::CallError> {
+        let Some(display) = self.display.as_mut() else {
+            return Ok(());
+        };
+        if active == display.suspended {
+            #[cfg(feature = "gpu")]
+            self.d3d.as_mut().unwrap().flush()?;
+            display.suspended = !active;
+            if active {
+                set_current(store, display.requested);
+            } else {
+                set_current(store, display.desktop);
+                self.lose_video_surfaces(Loss::Activation);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

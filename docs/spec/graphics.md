@@ -125,7 +125,7 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 
 ### GFX-D3D7-3 Fixed-function state
 
-**Rule**: Device7 MUST translate its API state into the shared fixed-function registers and return its API values from getters. A state block MUST capture and apply only its member slots, including recorded changes to stage samplers and texture matrices. Device7 MUST reject retired render-state selectors with DDERR_INVALIDPARAMS.
+**Rule**: Device7 MUST translate API state into shared fixed-function registers, return API values from getters, and reject retired selectors with DDERR_INVALIDPARAMS. State blocks MUST capture and apply only their member slots, and legacy faces MUST translate vertex types, handles and viewport-owned lights into the shared registers. Execute buffers MUST provide a stable guest address, reject execution while locked, and process state, vertices, branches and primitives in instruction order.
 **Verification**: Test
 
 ### GFX-D3D7-4 Texture color keys
@@ -140,9 +140,9 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 Packed 16-bit targets MUST blend in resident BGRA and round to the nearest packed color at surface access, independent of `DITHERENABLE`.
 **Verification**: Test
 
-### GFX-D3D7-6 Device scene on a lost target
+### GFX-D3D7-6 Surface loss and restoration
 
-**Rule**: Device7 MUST reject scene entry on a lost render target. Clear, DrawPrimitive and SetTexture on the lost device MUST succeed without submitting work, and EndScene MUST return D3DERR_SCENE_NOT_IN_SCENE after a failed BeginScene. The same device MUST accept draws again after DirectDraw restores the target.
+**Rule**: Exclusive mode changes, deactivation and exit from exclusivity MUST lose video memory while preserving system memory and managed textures. Lost surfaces MUST reject Blt and Flip, and Lock MUST accept only primary, back and depth surfaces. On lost targets, Device7 MUST refuse BeginScene and EndScene and suppress Clear, DrawPrimitive and SetTexture until Restore succeeds in the creation mode.
 **Verification**: Test
 **Basis**: Windows DirectDraw lost-surface probe
 
