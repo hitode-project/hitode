@@ -13,7 +13,7 @@ impl Writer<'_> {
                 self.line(&format!(
                     "@location({}){} dx_bary{i}: vec2<f32>,",
                     i + 1,
-                    interpolation(*mode)
+                    interpolation(*mode, variant.eval_center)
                 ));
             }
         }
@@ -21,7 +21,7 @@ impl Writer<'_> {
             self.line(&format!(
                 "@location({}){} dx_v{}: {},",
                 field.location,
-                interpolation(field.mode),
+                interpolation(field.mode, variant.eval_center),
                 field.location,
                 field.ty()
             ));
@@ -181,7 +181,18 @@ impl Varying {
     }
 }
 
-fn interpolation(mode: Interpolation) -> &'static str {
+fn interpolation(mode: Interpolation, eval_center: bool) -> &'static str {
+    let mode = if eval_center {
+        match mode {
+            Interpolation::PerspectiveCentroid | Interpolation::PerspectiveSample => {
+                Interpolation::Perspective
+            }
+            Interpolation::LinearCentroid | Interpolation::LinearSample => Interpolation::Linear,
+            mode => mode,
+        }
+    } else {
+        mode
+    };
     match mode {
         Interpolation::Undefined | Interpolation::Perspective => "",
         Interpolation::Flat => " @interpolate(flat)",

@@ -76,3 +76,15 @@ diff --git a/naga/src/back/msl/writer.rs b/naga/src/back/msl/writer.rs
                  write!(self.out, "{em_str} ")?;
              }
 ```
+
+## SPIR-V texture atomics
+
+The SPIR-V writer passes the selected descriptor element pointer to
+`OpImageTexelPointer` when an atomic targets a storage texture in a binding
+array. Direct storage textures use their global variable pointer.
+
+## SPIR-V sample masks
+
+Vulkan requires an integer array for the SampleMask interface variable. The
+SPIR-V writer represents the WGSL scalar as the first element of a one-word
+array in both directions.

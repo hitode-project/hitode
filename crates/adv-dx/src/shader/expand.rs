@@ -11,7 +11,7 @@ use super::dxbc::fields::*;
 use super::ir::{Error, Module, Opcode, Stage, Statement, Vector};
 use super::tessellator::{self, Domain, Partitioning};
 use super::variant::Variant;
-use super::wgsl::{BindingLocation, STATISTICS_SLOT, pulled};
+use super::wgsl::{BindingLocation, Options, STATISTICS_SLOT, pulled};
 use adv_device::gpu::{
     BufferRange, Expand, ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude,
     ExpansionRegion, Gpu, ModernDraw, ModernShader, QuerySlot, SlotBindings, StorageBinding,
@@ -65,6 +65,7 @@ impl Topology {
 pub struct Shader<'a> {
     pub ir: &'a Module,
     pub variant: &'a Variant,
+    pub options: Options<'a>,
 }
 
 pub enum Source<'a> {
@@ -141,6 +142,7 @@ pub struct ComputeProgram {
     pub entry: &'static str,
     /// The guest register layout before modern pipeline slot compaction.
     pub bindings: Vec<BindingLocation>,
+    pub counters: Vec<(u32, u32)>,
     expansion: Vec<ExpansionBinding>,
     workgroup_size: Option<u32>,
 }
@@ -200,6 +202,7 @@ impl Programs {
         variant: &Variant,
         producer: &Reflection,
         shader_identity: u64,
+        options: Options<'_>,
     ) -> Result<Arc<ModernShader>, adv_device::gpu::Error> {
         let mut producer = producer.clone();
         producer
@@ -212,6 +215,7 @@ impl Programs {
             &producer,
             self.topology.vertices(),
             self.registers,
+            options,
         )
         .map_err(|error| adv_device::gpu::Error::Invalid(error.to_string()))?;
         ModernShader::wgsl(
@@ -523,7 +527,7 @@ impl Plan<'_> {
         ) {
             return Err(Error::Invalid("expansion source stage"));
         }
-        let pulled = pulled::emit(shader.ir, shader.variant, invocation)?;
+        let pulled = pulled::emit(shader.ir, shader.variant, invocation, shader.options)?;
         let mut source = pulled.source;
         storage(
             &mut source,
@@ -618,6 +622,7 @@ impl Plan<'_> {
                 source,
                 entry: "source_main",
                 bindings: pulled.locations,
+                counters: pulled.counters,
                 expansion,
                 workgroup_size: Some(WORKGROUP),
             },

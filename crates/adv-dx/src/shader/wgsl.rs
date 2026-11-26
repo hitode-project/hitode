@@ -29,12 +29,45 @@ pub struct Translation {
     pub entry_point: &'static str,
     pub reflection: Reflection,
     pub locations: Vec<BindingLocation>,
+    /// UAV slot and group 3 binding of each separate 32-bit counter.
+    pub counters: Vec<(u32, u32)>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Options<'a> {
     /// Formats of the typed UAV views, keyed by their DXBC register slot.
     pub storage_formats: &'a [(u32, naga::StorageFormat)],
+    /// Typed buffer SRV formats, keyed by their DXBC register slot.
+    pub buffer_formats: &'a [(u32, naga::StorageFormat)],
+    /// Logical element counts of subword views, whose bindings include padding.
+    pub buffer_elements: &'a [(Register, u32, u32)],
+    /// Buffer-backed R32 textures, keyed by UAV slot, with the view's XYZ extent.
+    pub storage_extents: &'a [(u32, [u32; 3])],
+    pub image_atomics: bool,
+    pub lod_samplers: &'a [(u32, LodSampler)],
+    pub raster_samples: u32,
+}
+
+impl Default for Options<'_> {
+    fn default() -> Self {
+        Self {
+            storage_formats: &[],
+            buffer_formats: &[],
+            buffer_elements: &[],
+            storage_extents: &[],
+            image_atomics: false,
+            lod_samplers: &[],
+            raster_samples: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LodSampler {
+    pub bias: f32,
+    pub min: f32,
+    pub max: f32,
+    pub max_anisotropy: u16,
 }
 
 pub fn emit(module: &Module, options: Options<'_>) -> Result<Translation, Error> {
@@ -48,6 +81,7 @@ pub fn emit_variant(
     module: &Module,
     variant: &super::variant::Variant,
     fragment: Option<&Reflection>,
+    options: Options<'_>,
 ) -> Result<Translation, Error> {
     let (mut module, mut reflection) = passes::prepare(module)?;
     let interface = passes::variant::apply(&mut module, &reflection, variant, fragment)?;
@@ -63,6 +97,7 @@ pub fn emit_variant(
         reflection,
         Options {
             storage_formats: variant.storage_formats(),
+            ..options
         },
         Some(&interface),
     )
@@ -76,6 +111,7 @@ pub fn emit_expanded_fragment(
     producer: &Reflection,
     vertices: u32,
     registers: u32,
+    options: Options<'_>,
 ) -> Result<Translation, Error> {
     let (mut module, mut reflection) = passes::prepare(module)?;
     let mut interface = passes::variant::apply(&mut module, &reflection, variant, None)?;
@@ -98,6 +134,7 @@ pub fn emit_expanded_fragment(
         reflection,
         Options {
             storage_formats: variant.storage_formats(),
+            ..options
         },
         Some(&interface),
     )
@@ -120,11 +157,11 @@ fn emit_entry(
             return Err(Error::UnsupportedStage(module.stage));
         }
     };
-    let mut writer = Writer::new(&module, &reflection, options.storage_formats);
+    let mut writer = Writer::new(&module, &reflection, options);
     if module.stage == Stage::Vertex && interface.is_some_and(|i| i.native_clip) {
         writer.source.push_str("enable clip_distances;\n");
     }
-    writer.source.push_str(alu::HELPERS);
+    writer.helpers(&reflection);
     writer.declarations(&module, &reflection)?;
     writer.entry(entry_point, &module, &reflection, interface)?;
     let terminates = writer.block(&module.body)?;
@@ -133,13 +170,17 @@ fn emit_entry(
     }
     writer.source.push_str("}\n");
     let Writer {
-        source, locations, ..
+        source,
+        locations,
+        counters,
+        ..
     } = writer;
     Ok(Translation {
         source,
         entry_point,
         reflection,
         locations,
+        counters,
     })
 }
 
@@ -150,17 +191,14 @@ struct Writer<'a> {
     serial: u32,
     bindings: HashMap<(Register, u32), BindingKind>,
     locations: Vec<BindingLocation>,
-    storage_formats: &'a [(u32, naga::StorageFormat)],
+    counters: Vec<(u32, u32)>,
+    options: Options<'a>,
     atomic_bindings: &'a HashSet<(Register, u32)>,
     depth: usize,
 }
 
 impl<'a> Writer<'a> {
-    fn new(
-        module: &Module,
-        reflection: &'a Reflection,
-        storage_formats: &'a [(u32, naga::StorageFormat)],
-    ) -> Self {
+    fn new(module: &Module, reflection: &'a Reflection, options: Options<'a>) -> Self {
         Self {
             source: String::new(),
             stage: module.stage,
@@ -168,9 +206,20 @@ impl<'a> Writer<'a> {
             serial: 0,
             bindings: HashMap::new(),
             locations: Vec::new(),
-            storage_formats,
+            counters: Vec::new(),
+            options,
             atomic_bindings: &reflection.atomic_bindings,
             depth: 0,
+        }
+    }
+
+    fn helpers(&mut self, reflection: &Reflection) {
+        self.source.push_str(alu::HELPERS);
+        if reflection.lod_queries {
+            self.source.push_str(memory::LOD_HELPERS);
+        }
+        if reflection.sample_positions || reflection.interpolation_queries {
+            self.source.push_str(interface::SAMPLE_POSITIONS);
         }
     }
 
@@ -323,12 +372,14 @@ impl<'a> Writer<'a> {
             args.push(name);
         }
         let mut writes = Vec::new();
-        let resource =
-            if src_types.contains(&ValueType::Binding) || dst_types.contains(&ValueType::Binding) {
-                self.resource(op, &args)?
-            } else {
-                None
-            };
+        let resource = if op.opcode.is_interpolation() {
+            Some(self.evaluate_input(op, &args)?)
+        } else if src_types.contains(&ValueType::Binding) || dst_types.contains(&ValueType::Binding)
+        {
+            self.resource(op, &args)?
+        } else {
+            None
+        };
         for (i, (operand, ty)) in op.destinations.iter().zip(dst_types).enumerate() {
             if *ty == ValueType::Binding || matches!(operand.register(), Some((Register::Null, _)))
             {

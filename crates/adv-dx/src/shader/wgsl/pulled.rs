@@ -7,6 +7,7 @@ use crate::shader::variant::Variant;
 pub(crate) struct Pulled {
     pub source: String,
     pub locations: Vec<BindingLocation>,
+    pub counters: Vec<(u32, u32)>,
     pub inputs: u32,
     pub outputs: u32,
 }
@@ -29,6 +30,7 @@ pub(crate) fn emit(
     module: &Module,
     variant: &Variant,
     invocation: Invocation,
+    options: Options<'_>,
 ) -> Result<Pulled, Error> {
     let (mut module, reflection) = passes::prepare(module)?;
     let interface = passes::variant::apply(&mut module, &reflection, variant, None)?;
@@ -40,8 +42,15 @@ pub(crate) fn emit(
     }
     let inputs = register_count(&module.signatures.input);
     let outputs = register_count(&module.signatures.output);
-    let mut writer = Writer::new(&module, &reflection, variant.storage_formats());
-    writer.source.push_str(alu::HELPERS);
+    let mut writer = Writer::new(
+        &module,
+        &reflection,
+        Options {
+            storage_formats: variant.storage_formats(),
+            ..options
+        },
+    );
+    writer.helpers(&reflection);
     writer.declarations(&module, &reflection)?;
     writer.line(&format!("alias DxOutput = array<vec4<u32>, {outputs}>;"));
     match invocation {
@@ -104,6 +113,7 @@ pub(crate) fn emit(
     Ok(Pulled {
         source: writer.source,
         locations: writer.locations,
+        counters: writer.counters,
         inputs,
         outputs,
     })
@@ -144,7 +154,7 @@ pub(crate) fn raster(
         .find(|e| e.system_value == SystemValue::Position)
         .ok_or(Error::Invalid("expansion raster position"))?
         .register;
-    let mut writer = Writer::new(&module, &reflection, &[]);
+    let mut writer = Writer::new(&module, &reflection, Options::default());
     if interface.native_clip {
         writer.line("enable clip_distances;");
     }

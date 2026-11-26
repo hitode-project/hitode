@@ -422,7 +422,7 @@ fn native_vertex_and_expansion_render_identical_pixels() {
     let ps_reflection = analyze(&ps);
     let ordinary_ps = Variant::select(&ps_reflection, &DrawFacts::default(), &caps);
     let ordinary_ps = shader(
-        wgsl::emit_variant(&ps, &ordinary_ps, None).unwrap(),
+        wgsl::emit_variant(&ps, &ordinary_ps, None, Options::default()).unwrap(),
         ShaderStage::Fragment,
     );
     let stats_facts = DrawFacts {
@@ -431,7 +431,7 @@ fn native_vertex_and_expansion_render_identical_pixels() {
     };
     let counting = Variant::select(&ps_reflection, &stats_facts, &caps);
     let counting = shader(
-        wgsl::emit_variant(&ps, &counting, None).unwrap(),
+        wgsl::emit_variant(&ps, &counting, None, Options::default()).unwrap(),
         ShaderStage::Fragment,
     );
     let reference = image(&gpu, 1);
@@ -450,7 +450,7 @@ fn native_vertex_and_expansion_render_identical_pixels() {
         };
         let variant = Variant::select(&reflection, &ordinary, &caps);
         let native = shader(
-            wgsl::emit_variant(&vs, &variant, Some(&ps_reflection)).unwrap(),
+            wgsl::emit_variant(&vs, &variant, Some(&ps_reflection), Options::default()).unwrap(),
             ShaderStage::Vertex,
         );
         gpu.draw_modern(
@@ -469,6 +469,7 @@ fn native_vertex_and_expansion_render_identical_pixels() {
             source: Source::Vertex(Shader {
                 ir: &vs,
                 variant: &variant,
+                options: Options::default(),
             }),
             topology: Topology::Triangle,
             input_vertices: 3,
@@ -541,12 +542,14 @@ fn geometry_cuts_instances_and_stream_output_keep_primitive_order() {
         source: Source::Vertex(Shader {
             ir: &vs,
             variant: &source,
+            options: Options::default(),
         }),
         topology: Topology::Triangle,
         input_vertices: 3,
         geometry: Some(Shader {
             ir: &gs,
             variant: &geometry,
+            options: Options::default(),
         }),
         raster: None,
         stream_output: &[StreamOutput {
@@ -618,11 +621,11 @@ fn native_query_counts_only_raster() {
     let ps_variant = Variant::select(&ps_reflection, &facts, caps);
     assert!(!vs_variant.pulled());
     let vertex = shader(
-        wgsl::emit_variant(&vs, &vs_variant, Some(&ps_reflection)).unwrap(),
+        wgsl::emit_variant(&vs, &vs_variant, Some(&ps_reflection), Options::default()).unwrap(),
         ShaderStage::Vertex,
     );
     let fragment = shader(
-        wgsl::emit_variant(&ps, &ps_variant, None).unwrap(),
+        wgsl::emit_variant(&ps, &ps_variant, None, Options::default()).unwrap(),
         ShaderStage::Fragment,
     );
     let color = image(&gpu, 1);
@@ -681,11 +684,17 @@ fn packed_and_storage_varyings_match() {
         draw(
             &reference,
             shader(
-                wgsl::emit_variant(&vs, &vertex_native, Some(&pixel_reflection)).unwrap(),
+                wgsl::emit_variant(
+                    &vs,
+                    &vertex_native,
+                    Some(&pixel_reflection),
+                    Options::default(),
+                )
+                .unwrap(),
                 ShaderStage::Vertex,
             ),
             shader(
-                wgsl::emit_variant(&ps, &pixel_native, None).unwrap(),
+                wgsl::emit_variant(&ps, &pixel_native, None, Options::default()).unwrap(),
                 ShaderStage::Fragment,
             ),
         ),
@@ -703,6 +712,7 @@ fn packed_and_storage_varyings_match() {
         source: Source::Vertex(Shader {
             ir: &vs,
             variant: &vs_variant,
+            options: Options::default(),
         }),
         topology: Topology::Triangle,
         input_vertices: 3,
@@ -723,7 +733,7 @@ fn packed_and_storage_varyings_match() {
     let draw = draw(
         &expanded,
         plan.vertex_shader(0).unwrap(),
-        plan.fragment_shader(&ps, &ps_variant, &vertex_reflection, 2)
+        plan.fragment_shader(&ps, &ps_variant, &vertex_reflection, 2, Options::default())
             .unwrap(),
     );
     let command = plan
@@ -776,6 +786,7 @@ fn domain_points_are_shaded_once_and_streamed_as_a_list() {
             shader: Shader {
                 ir: &module,
                 variant: &variant,
+                options: Options::default(),
             },
             control_points: 1,
             control_registers: 1,
@@ -1012,13 +1023,14 @@ fn bins_draw_only_matching_primitives_across_chunks() {
     let references: Vec<_> = variants.iter().collect();
     let pixel = Variant::select(&fragment, &facts, caps);
     let pixel = shader(
-        wgsl::emit_variant(&ps, &pixel, None).unwrap(),
+        wgsl::emit_variant(&ps, &pixel, None, Options::default()).unwrap(),
         ShaderStage::Fragment,
     );
     let plan = Plan {
         source: Source::Vertex(Shader {
             ir: &vs,
             variant: &variants[0],
+            options: Options::default(),
         }),
         topology: Topology::Triangle,
         input_vertices: 3,
@@ -1139,11 +1151,11 @@ fn clip_discard_matches_native_clip_distances() {
         let draw = draw(
             target,
             shader(
-                wgsl::emit_variant(&vs, &v, Some(&fragment)).unwrap(),
+                wgsl::emit_variant(&vs, &v, Some(&fragment), Options::default()).unwrap(),
                 ShaderStage::Vertex,
             ),
             shader(
-                wgsl::emit_variant(&ps, &p, None).unwrap(),
+                wgsl::emit_variant(&ps, &p, None, Options::default()).unwrap(),
                 ShaderStage::Fragment,
             ),
         );
@@ -1217,13 +1229,14 @@ fn counted_fragments_obey_early_depth_and_sample_frequency() {
         let v_variant = Variant::select(&vs_reflection, &facts, &caps);
         assert_eq!(ps_variant.early_tests(), !depth_output);
         let ps = shader(
-            wgsl::emit_variant(&ps, &ps_variant, None).unwrap(),
+            wgsl::emit_variant(&ps, &ps_variant, None, Options::default()).unwrap(),
             ShaderStage::Fragment,
         );
         let plan = Plan {
             source: Source::Vertex(Shader {
                 ir: &vs,
                 variant: &v_variant,
+                options: Options::default(),
             }),
             topology: Topology::Triangle,
             input_vertices: 3,
@@ -1320,7 +1333,7 @@ fn typed_view_formats_specialize_only_declared_uav_slots() {
     ))
     .unwrap();
     let reflection = analyze(&ir);
-    let select = |storage_formats| {
+    let select = |storage_formats: &[(u32, naga::StorageFormat)]| {
         Variant::select(
             &reflection,
             &DrawFacts {

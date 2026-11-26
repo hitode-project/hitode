@@ -1315,10 +1315,7 @@ impl BlockContext<'_> {
         value: Handle<crate::Expression>,
         block: &mut Block,
     ) -> Result<(), Error> {
-        let image_id = match self.ir_function.originating_global(image) {
-            Some(handle) => self.writer.global_variables[handle].var_id,
-            _ => return Err(Error::Validation("Unexpected image type")),
-        };
+        let image_id = self.image_atomic_pointer(image, block)?;
         let crate::TypeInner::Image { class, .. } =
             *self.fun_info[image].ty.inner_with(&self.ir_module.types)
         else {

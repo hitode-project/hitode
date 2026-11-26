@@ -536,6 +536,7 @@ enum LocalType {
         image_type_id: Word,
     },
     Sampler,
+    SampleMask,
     BindingArray {
         base: Handle<crate::Type>,
         size: u32,

@@ -26,6 +26,7 @@ pub(crate) struct Interface {
     pub storage: Option<Storage>,
     pub discard_clip: bool,
     pub count_fragments: bool,
+    pub eval_center: bool,
     #[cfg(feature = "gpu")]
     pub pulled: bool,
 }
@@ -99,6 +100,7 @@ pub(crate) fn apply(
             fragment
         } {
             interface.varyings = pack(reflection, fragment);
+            interface.eval_center = fragment.interpolation_queries;
         }
         #[cfg(test)]
         verify(module)?;

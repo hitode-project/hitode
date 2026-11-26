@@ -45,6 +45,7 @@ impl<'a> Emitter<'a> {
                         inputs: plan.input_vertices,
                         max_vertices,
                     },
+                    shader.options,
                 )?;
                 (
                     shader.ir,
@@ -278,6 +279,10 @@ impl<'a> Emitter<'a> {
                 .geometry
                 .as_ref()
                 .map_or_else(Vec::new, |g| g.locations.clone()),
+            counters: self
+                .geometry
+                .as_ref()
+                .map_or_else(Vec::new, |g| g.counters.clone()),
             expansion,
             workgroup_size: Some(WORKGROUP),
         }
@@ -657,6 +662,7 @@ impl<'a> Emitter<'a> {
                 source: prefix,
                 entry: "prefix_main",
                 bindings: Vec::new(),
+                counters: Vec::new(),
                 expansion: expansion.clone(),
                 workgroup_size: None,
             },
@@ -664,6 +670,7 @@ impl<'a> Emitter<'a> {
                 source: write,
                 entry: "stream_main",
                 bindings: Vec::new(),
+                counters: Vec::new(),
                 expansion,
                 workgroup_size: Some(WORKGROUP),
             },
@@ -689,6 +696,7 @@ pub(super) fn initialize(bins: usize, argument_region: usize) -> ComputeProgram 
         source,
         entry: "initialize_main",
         bindings: Vec::new(),
+        counters: Vec::new(),
         expansion: vec![scratch(ARGUMENTS_SLOT, argument_region)],
         workgroup_size: None,
     }

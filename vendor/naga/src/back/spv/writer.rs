@@ -1310,10 +1310,11 @@ impl Writer {
                         binding,
                     )?;
                     iface.varying_ids.push(varying_id);
-                    let id = self.load_io_with_f16_polyfill(
+                    let id = self.load_varying(
                         &mut prelude.body,
                         varying_id,
                         argument_type_id,
+                        binding,
                     );
                     if binding == &crate::Binding::BuiltIn(crate::BuiltIn::LocalInvocationIndex) {
                         local_invocation_index_id = Some(id);
@@ -1339,8 +1340,7 @@ impl Writer {
                             binding,
                         )?;
                         iface.varying_ids.push(varying_id);
-                        let id =
-                            self.load_io_with_f16_polyfill(&mut prelude.body, varying_id, type_id);
+                        let id = self.load_varying(&mut prelude.body, varying_id, type_id, binding);
                         constituent_ids.push(id);
                         if binding == &crate::Binding::BuiltIn(crate::BuiltIn::LocalInvocationIndex)
                         {
@@ -2173,6 +2173,11 @@ impl Writer {
                 Instruction::type_image(id, type_id, image.dim, image.flags, image.image_format)
             }
             LocalType::Sampler => Instruction::type_sampler(id),
+            LocalType::SampleMask => {
+                let word_type = self.get_u32_type_id();
+                let count = self.get_index_constant(1);
+                Instruction::type_array(id, word_type, count)
+            }
             LocalType::SampledImage { image_type_id } => {
                 Instruction::type_sampled_image(id, image_type_id)
             }
@@ -2983,7 +2988,10 @@ impl Writer {
         let ty_inner = &ir_module.types[ty].inner;
         let needs_polyfill = self.needs_f16_polyfill(ty_inner);
 
-        let pointer_type_id = if needs_polyfill {
+        let pointer_type_id = if binding.to_built_in() == Some(crate::BuiltIn::SampleMask) {
+            let array_type_id = self.get_localtype_id(LocalType::SampleMask);
+            self.get_pointer_type_id(array_type_id, class)
+        } else if needs_polyfill {
             let f32_value_local =
                 super::f16_polyfill::F16IoPolyfill::create_polyfill_type(ty_inner)
                     .expect("needs_polyfill returned true but create_polyfill_type returned None");
@@ -3357,6 +3365,33 @@ impl Writer {
                 Ok(BindingDecorations::BuiltIn(built_in, others))
             }
         }
+    }
+
+    pub(super) fn sample_mask_element(
+        &mut self,
+        body: &mut Vec<Instruction>,
+        varying_id: Word,
+        class: spirv::StorageClass,
+    ) -> Word {
+        let word_type = self.get_u32_type_id();
+        let pointer_type = self.get_pointer_type_id(word_type, class);
+        let zero = self.get_index_constant(0);
+        let element = self.id_gen.next();
+        body.push(Instruction::access_chain(pointer_type, element, varying_id, &[zero]));
+        element
+    }
+
+    fn load_varying(
+        &mut self,
+        body: &mut Vec<Instruction>,
+        mut varying_id: Word,
+        target_type_id: Word,
+        binding: &crate::Binding,
+    ) -> Word {
+        if binding.to_built_in() == Some(crate::BuiltIn::SampleMask) {
+            varying_id = self.sample_mask_element(body, varying_id, spirv::StorageClass::Input);
+        }
+        self.load_io_with_f16_polyfill(body, varying_id, target_type_id)
     }
 
     /// Load an IO variable, converting from `f32` to `f16` if polyfill is active.
