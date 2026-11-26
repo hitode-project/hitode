@@ -1553,7 +1553,8 @@ fn reset(
         d.creation.reset();
         let mut hot = d.hot.borrow_mut();
         hot.texture = None;
-        *hot.fixed = fixed::Fixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
+        *hot.fixed =
+            fixed::state_map::defaults(normalized.BackBufferWidth, normalized.BackBufferHeight);
         hot.fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
     }
     depth::release_binding(env, old_depth);
@@ -2129,18 +2130,8 @@ fn validate_device(env: &mut Env<'_>, this: GuestPtr<()>, passes: GuestPtr<u32>)
                 )
                 .err(),
                 hot.texture.is_some()
-                    && (fixed::combine(
-                        hot.fixed.stage[&1],
-                        hot.fixed.stage[&2],
-                        hot.fixed.stage[&3],
-                    )
-                    .is_none()
-                        || fixed::combine(
-                            hot.fixed.stage[&4],
-                            hot.fixed.stage[&5],
-                            hot.fixed.stage[&6],
-                        )
-                        .is_none()),
+                    && crate::fixed::compact_stage_ops(&hot.fixed, fixed::state_map::RULES)
+                        .is_none(),
             )
         } else {
             (None, false)
