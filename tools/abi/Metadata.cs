@@ -204,7 +204,7 @@ public static class AbiMetadata
         "IDXGIFactory IDXGIFactory1 IDXGIFactory2 IDXGIFactory3 IDXGIFactory4 IDXGIFactory5 IDXGIFactory6 IDXGIFactory7 " +
         "IDXGIAdapter IDXGIAdapter1 IDXGIAdapter2 IDXGIAdapter3 IDXGIAdapter4 " +
         "IDXGIOutput IDXGIOutput1 IDXGIOutput2 IDXGIOutput3 IDXGIOutput4 IDXGIOutput5 IDXGIOutput6 " +
-        "IDXGIOutputDuplication IDXGISwapChain IDXGISwapChain1 " +
+        "IDXGIOutputDuplication IDXGISwapChain IDXGISwapChain1 IDXGISwapChain2 " +
         "IDXGISurface IDXGISurface1 IDXGISurface2 IDXGIDevice IDXGIDevice1 IDXGIDevice2 IDXGIDevice3 IDXGIDevice4 " +
         "ID3D10Device ID3D10Device1 ID3D10DeviceChild ID3D10Resource ID3D10Buffer ID3D10Texture1D " +
         "ID3D10Texture2D ID3D10Texture3D ID3D10View ID3D10ShaderResourceView ID3D10ShaderResourceView1 " +
