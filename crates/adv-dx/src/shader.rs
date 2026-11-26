@@ -15,6 +15,7 @@ pub mod dxbc;
 pub mod interpreter;
 pub mod ir;
 mod parser;
+pub mod tessellator;
 #[cfg(test)]
 mod tests;
 mod translate;
