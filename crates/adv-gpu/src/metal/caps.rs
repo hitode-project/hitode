@@ -14,7 +14,16 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
         | Features::PIPELINE_CACHE
         | Features::INDIRECT
         | Features::MULTISAMPLE
-        | Features::PRESENTABLE_BUFFERS;
+        | Features::PRESENTABLE_BUFFERS
+        | Features::STANDARD_SAMPLE_LOCATIONS
+        | Features::DUAL_SOURCE_BLEND
+        | Features::DEPTH_CLAMP;
+    if apple || mac {
+        features |= Features::MULTIPLE_VIEWPORTS;
+    }
+    if apple6 && objc2::available!(macos = 14.0, ios = 17.0) {
+        features |= Features::IMAGE_ATOMICS;
+    }
     if apple {
         features |= Features::TRANSIENT_ATTACHMENTS | Features::TILE_SHADERS;
     }
@@ -32,15 +41,38 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
     if bc {
         features |= Features::BC_TEXTURES;
     }
-    let formats = FORMATS
-        .iter()
-        .map(|&f| (f, format_caps(raw, f, apple, bc)))
-        .collect();
     let sample_counts = [1usize, 2, 4, 8, 16]
         .into_iter()
         .enumerate()
         .filter(|&(_, n)| raw.supportsTextureSampleCount(n))
         .fold(0, |mask, (i, _)| mask | (1 << i));
+    let formats = FORMATS
+        .iter()
+        .map(|&f| {
+            let caps = format_caps(raw, f, apple, bc);
+            let samples = if !caps.intersects(FormatCaps::COLOR | FormatCaps::DEPTH_STENCIL) {
+                0
+            } else if apple
+                && !apple7
+                && matches!(
+                    f,
+                    Format::R32Uint
+                        | Format::R32Sint
+                        | Format::Rg32Uint
+                        | Format::Rg32Sint
+                        | Format::Rg32Float
+                        | Format::Rgba32Uint
+                        | Format::Rgba32Sint
+                        | Format::Rgba32Float
+                )
+            {
+                1
+            } else {
+                sample_counts
+            };
+            (f, caps, samples)
+        })
+        .collect();
     Caps {
         features,
         ieee_f32: true,
@@ -54,6 +86,17 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
             max_image_3d: 2048,
             max_image_layers: 2048,
             max_color_attachments: 8,
+            max_color_bytes_per_sample: if apple7 || mac { 128 } else { 64 },
+            max_fragment_input_components: if apple { 124 } else { 128 },
+            max_framebuffer_layers: 2048,
+            // The backend binds real MTLBuffers, not inlined constant data.
+            max_uniform_buffer_bytes: raw.maxBufferLength().min(u32::MAX as usize) as u32,
+            max_viewports: if features.contains(Features::MULTIPLE_VIEWPORTS) {
+                16
+            } else {
+                1
+            },
+            max_buffer_size: raw.maxBufferLength() as u64,
             max_uniform_buffers: 31,
             max_sampled_images: if apple && !apple6 { 96 } else { 128 },
             max_samplers: 32,
@@ -86,6 +129,47 @@ pub(super) fn timestamp_counter(
 
 const FORMATS: &[Format] = &[
     Format::R8Unorm,
+    Format::R8Snorm,
+    Format::R8Uint,
+    Format::R8Sint,
+    Format::R16Unorm,
+    Format::R16Snorm,
+    Format::R16Uint,
+    Format::R16Sint,
+    Format::R32Sint,
+    Format::Rg8Snorm,
+    Format::Rg8Uint,
+    Format::Rg8Sint,
+    Format::Rg16Unorm,
+    Format::Rg16Snorm,
+    Format::Rg16Uint,
+    Format::Rg16Sint,
+    Format::Rg32Uint,
+    Format::Rg32Sint,
+    Format::Rgba8Snorm,
+    Format::Rgba8Uint,
+    Format::Rgba8Sint,
+    Format::Rgba16Unorm,
+    Format::Rgba16Snorm,
+    Format::Rgba16Uint,
+    Format::Rgba16Sint,
+    Format::Rgba32Uint,
+    Format::Rgba32Sint,
+    Format::A8Unorm,
+    Format::Rgb10a2Uint,
+    Format::Rg11b10Float,
+    Format::Rgb9e5Float,
+    Format::Bc1Srgb,
+    Format::Bc2Srgb,
+    Format::Bc3Srgb,
+    Format::Bc4Unorm,
+    Format::Bc4Snorm,
+    Format::Bc5Unorm,
+    Format::Bc5Snorm,
+    Format::Bc6hUfloat,
+    Format::Bc6hSfloat,
+    Format::Bc7Unorm,
+    Format::Bc7Srgb,
     Format::Rg8Unorm,
     Format::Rgba8Unorm,
     Format::Rgba8Srgb,
@@ -131,7 +215,7 @@ fn format_caps(
                 C::empty()
             }
         }
-        Format::Bc1Unorm | Format::Bc2Unorm | Format::Bc3Unorm => {
+        f if f.is_bc() => {
             if bc {
                 C::SAMPLED | C::FILTERED
             } else {
@@ -154,11 +238,17 @@ fn format_caps(
             caps
         }
         present::FORMAT => color | C::STORAGE | C::PRESENTABLE,
-        Format::R32Uint => C::SAMPLED | C::COLOR | C::STORAGE,
+
+        Format::Rgb9e5Float if !apple => C::SAMPLED | C::FILTERED,
+        Format::R32Uint | Format::R32Sint => C::SAMPLED | C::COLOR | C::STORAGE | C::STORAGE_READ,
+        f if f.is_uint() || f.is_sint() => C::SAMPLED | C::COLOR | C::STORAGE,
         Format::R32Float | Format::Rg32Float | Format::Rgba32Float => {
             let mut caps = C::SAMPLED | C::COLOR | C::STORAGE | C::BLEND;
             if raw.supports32BitFloatFiltering() {
                 caps |= C::FILTERED;
+            }
+            if f == Format::R32Float {
+                caps |= C::STORAGE_READ;
             }
             caps
         }
@@ -177,6 +267,47 @@ pub(super) fn pixel_format(f: Format) -> Option<MTLPixelFormat> {
     use MTLPixelFormat as M;
     Some(match f {
         Format::R8Unorm => M::R8Unorm,
+        Format::R8Snorm => M::R8Snorm,
+        Format::R8Uint => M::R8Uint,
+        Format::R8Sint => M::R8Sint,
+        Format::R16Unorm => M::R16Unorm,
+        Format::R16Snorm => M::R16Snorm,
+        Format::R16Uint => M::R16Uint,
+        Format::R16Sint => M::R16Sint,
+        Format::R32Sint => M::R32Sint,
+        Format::Rg8Snorm => M::RG8Snorm,
+        Format::Rg8Uint => M::RG8Uint,
+        Format::Rg8Sint => M::RG8Sint,
+        Format::Rg16Unorm => M::RG16Unorm,
+        Format::Rg16Snorm => M::RG16Snorm,
+        Format::Rg16Uint => M::RG16Uint,
+        Format::Rg16Sint => M::RG16Sint,
+        Format::Rg32Uint => M::RG32Uint,
+        Format::Rg32Sint => M::RG32Sint,
+        Format::Rgba8Snorm => M::RGBA8Snorm,
+        Format::Rgba8Uint => M::RGBA8Uint,
+        Format::Rgba8Sint => M::RGBA8Sint,
+        Format::Rgba16Unorm => M::RGBA16Unorm,
+        Format::Rgba16Snorm => M::RGBA16Snorm,
+        Format::Rgba16Uint => M::RGBA16Uint,
+        Format::Rgba16Sint => M::RGBA16Sint,
+        Format::Rgba32Uint => M::RGBA32Uint,
+        Format::Rgba32Sint => M::RGBA32Sint,
+        Format::A8Unorm => M::R8Unorm,
+        Format::Rgb10a2Uint => M::RGB10A2Uint,
+        Format::Rg11b10Float => M::RG11B10Float,
+        Format::Rgb9e5Float => M::RGB9E5Float,
+        Format::Bc1Srgb => M::BC1_RGBA_sRGB,
+        Format::Bc2Srgb => M::BC2_RGBA_sRGB,
+        Format::Bc3Srgb => M::BC3_RGBA_sRGB,
+        Format::Bc4Unorm => M::BC4_RUnorm,
+        Format::Bc4Snorm => M::BC4_RSnorm,
+        Format::Bc5Unorm => M::BC5_RGUnorm,
+        Format::Bc5Snorm => M::BC5_RGSnorm,
+        Format::Bc6hUfloat => M::BC6H_RGBUfloat,
+        Format::Bc6hSfloat => M::BC6H_RGBFloat,
+        Format::Bc7Unorm => M::BC7_RGBAUnorm,
+        Format::Bc7Srgb => M::BC7_RGBAUnorm_sRGB,
         Format::Rg8Unorm => M::RG8Unorm,
         Format::Rgba8Unorm => M::RGBA8Unorm,
         Format::Rgba8Srgb => M::RGBA8Unorm_sRGB,
@@ -208,6 +339,41 @@ pub(super) fn pixel_format(f: Format) -> Option<MTLPixelFormat> {
 pub(super) fn block(f: Format) -> (u32, u32) {
     match f {
         Format::Bc1Unorm => (4, 8),
+        Format::Bc2Srgb
+        | Format::Bc3Srgb
+        | Format::Bc5Unorm
+        | Format::Bc5Snorm
+        | Format::Bc6hUfloat
+        | Format::Bc6hSfloat
+        | Format::Bc7Unorm
+        | Format::Bc7Srgb => (4, 16),
+        Format::Bc1Srgb | Format::Bc4Unorm | Format::Bc4Snorm => (4, 8),
+        Format::Rgba32Uint | Format::Rgba32Sint => (1, 16),
+        Format::Rg32Uint
+        | Format::Rg32Sint
+        | Format::Rgba16Unorm
+        | Format::Rgba16Snorm
+        | Format::Rgba16Uint
+        | Format::Rgba16Sint => (1, 8),
+        Format::R32Sint
+        | Format::Rg16Unorm
+        | Format::Rg16Snorm
+        | Format::Rg16Uint
+        | Format::Rg16Sint
+        | Format::Rgba8Snorm
+        | Format::Rgba8Uint
+        | Format::Rgba8Sint
+        | Format::Rgb10a2Uint
+        | Format::Rg11b10Float
+        | Format::Rgb9e5Float => (1, 4),
+        Format::R16Unorm
+        | Format::R16Snorm
+        | Format::R16Uint
+        | Format::R16Sint
+        | Format::Rg8Snorm
+        | Format::Rg8Uint
+        | Format::Rg8Sint => (1, 2),
+        Format::R8Snorm | Format::R8Uint | Format::R8Sint | Format::A8Unorm => (1, 1),
         Format::Bc2Unorm | Format::Bc3Unorm => (4, 16),
         Format::R8Unorm => (1, 1),
         Format::Rg8Unorm

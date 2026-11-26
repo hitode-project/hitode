@@ -853,6 +853,12 @@ Windowless VMR-7 (`CLSID_VideoMixingRenderer`) converts pushed uncompressed RGB 
 **Verification**: Test
 **Basis**: Wine 11 `dlls/winmm/winmm.c`; Wine winmm `midi` test, which passes on Windows.
 
+### WINE-AUD-13 Native DirectMusic synthesizer
+
+**Rule**: DirectMusic software synthesis MUST run through `adv-device::midi::Synth` and the session mixer on host time. Prefixes MUST install a default General MIDI collection when absent without replacing an existing file. Structured MIDI messages, SysEx messages and volume properties MUST control synthesized PCM output.
+**Verification**: Test
+**Basis**: Wine 11.0 `dmsynth.dll`, `dmusic.dll` and `dmloader.dll`.
+
 ## Native XAudio2
 
 ### WINE-XAUDIO-1 Native XAudio2 graph

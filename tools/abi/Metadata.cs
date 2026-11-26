@@ -198,11 +198,13 @@ public static class AbiMetadata
         return string.Join("|", sig.ParameterTypes.Select((t, i) => names.GetValueOrDefault(i + 1, "arg" + i) + ":" + t.Name + ":" + t.Kind + ":" + Round(t.Size, 4) / 4));
     }
 
-    // Core interfaces through DXGI 1.5 (IDXGIDevice4), D3D10.1 and D3D11.1.
+    // DXGI display objects, D3D10.1 and D3D11.1.
     static readonly string[] GraphicsInterfaces = (
         "IDXGIObject IDXGIDeviceSubObject IDXGIResource IDXGIResource1 IDXGIKeyedMutex " +
-        "IDXGIFactory IDXGIFactory1 IDXGIFactory2 IDXGIAdapter IDXGIAdapter1 IDXGIAdapter2 " +
-        "IDXGIOutput IDXGIOutput1 IDXGIOutputDuplication IDXGISwapChain IDXGISwapChain1 " +
+        "IDXGIFactory IDXGIFactory1 IDXGIFactory2 IDXGIFactory3 IDXGIFactory4 IDXGIFactory5 IDXGIFactory6 IDXGIFactory7 " +
+        "IDXGIAdapter IDXGIAdapter1 IDXGIAdapter2 IDXGIAdapter3 IDXGIAdapter4 " +
+        "IDXGIOutput IDXGIOutput1 IDXGIOutput2 IDXGIOutput3 IDXGIOutput4 IDXGIOutput5 IDXGIOutput6 " +
+        "IDXGIOutputDuplication IDXGISwapChain IDXGISwapChain1 " +
         "IDXGISurface IDXGISurface1 IDXGISurface2 IDXGIDevice IDXGIDevice1 IDXGIDevice2 IDXGIDevice3 IDXGIDevice4 " +
         "ID3D10Device ID3D10Device1 ID3D10DeviceChild ID3D10Resource ID3D10Buffer ID3D10Texture1D " +
         "ID3D10Texture2D ID3D10Texture3D ID3D10View ID3D10ShaderResourceView ID3D10ShaderResourceView1 " +
@@ -780,7 +782,7 @@ public static class AbiMetadata
             #include <d3d.h>
             #include <d3d10_1.h>
             #include <d3d11_4.h>
-            #include <dxgi1_5.h>
+            #include <dxgi1_6.h>
             #include <stddef.h>
             #include "gfx-layout-sdk.h"
             #include <stdio.h>

@@ -524,6 +524,7 @@ fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
             .ok_or_else(|| format!("links.tsv: {line}"))?;
         link(&config.dist.join(MODULES).join(module), &drive.join(path))?;
     }
+    super::dmsynth::ensure_gm_dls(&drive)?;
     Ok((prefix, drive))
 }
 
@@ -698,7 +699,13 @@ fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
     let notices = adv_dx::dsound::pump(machine)?;
     let winmm = super::winmm::pump(machine)?;
     let xaudio = adv_dx::xaudio2::pump(machine)?;
-    let notices = notices.into_iter().chain(winmm).chain(xaudio).min();
+    let dmsynth = adv_dx::dmsynth::pump(machine)?;
+    let notices = notices
+        .into_iter()
+        .chain(winmm)
+        .chain(xaudio)
+        .chain(dmsynth)
+        .min();
     machine.ext.insert(SoundDeadline(notices));
     let video = adv_dx::dshow::pump_video(machine)?;
     machine.ext.insert(VideoDeadline(video));
@@ -1729,6 +1736,24 @@ mod link_tests {
         super::prefix(&config).unwrap();
         assert_eq!(std::fs::read(system32.join("dxgi.dll")).unwrap(), b"native");
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // spec: WINE-AUD-13
+    #[test]
+    fn prefix_installs_default_gm_dls_without_replacing_user_file() {
+        let root = std::env::temp_dir().join(format!("adv-prefix-gm-dls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let drive = root.join("drive_c");
+        super::super::dmsynth::ensure_gm_dls(&drive).unwrap();
+        let gm = drive.join("windows/system32/drivers/gm.dls");
+        assert_eq!(
+            std::fs::read(&gm).unwrap(),
+            adv_dx::dmsynth::default_gm_dls()
+        );
+        std::fs::write(&gm, b"custom-dls").unwrap();
+        super::super::dmsynth::ensure_gm_dls(&drive).unwrap();
+        assert_eq!(std::fs::read(&gm).unwrap(), b"custom-dls");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

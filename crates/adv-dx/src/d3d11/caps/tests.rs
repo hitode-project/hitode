@@ -1,0 +1,411 @@
+use super::*;
+use adv_gpu::{Format, FormatCaps, Limits};
+
+#[derive(Clone)]
+struct Fixture {
+    limits: Limits,
+    features: Features,
+    rgba: FormatCaps,
+    rgba_samples: u32,
+    storage_read: bool,
+}
+
+impl Fixture {
+    fn caps(&self) -> Caps {
+        let color =
+            FormatCaps::COLOR | FormatCaps::BLEND | FormatCaps::SAMPLED | FormatCaps::FILTERED;
+        let storage_read = if self.storage_read {
+            FormatCaps::STORAGE_READ
+        } else {
+            FormatCaps::empty()
+        };
+        Caps::from_reported_formats(
+            self.limits,
+            self.features,
+            vec![
+                (
+                    Format::Rgba8Unorm,
+                    self.rgba | storage_read,
+                    self.rgba_samples,
+                ),
+                (Format::Bgra8Unorm, color, self.limits.sample_counts),
+                (Format::Rgba8Srgb, color, self.limits.sample_counts),
+                (
+                    Format::Rgba16Float,
+                    color | FormatCaps::STORAGE,
+                    self.limits.sample_counts,
+                ),
+                (Format::Rgb10a2Unorm, color, self.limits.sample_counts),
+                (
+                    Format::Depth32FloatStencil8,
+                    FormatCaps::DEPTH_STENCIL | FormatCaps::SAMPLED,
+                    self.limits.sample_counts,
+                ),
+            ],
+        )
+    }
+    fn m1() -> Self {
+        Self {
+            limits: Limits {
+                max_image_2d: 16384,
+                max_image_3d: 2048,
+                max_image_layers: 2048,
+                max_color_attachments: 8,
+                max_uniform_buffers: 30,
+                max_sampled_images: 128,
+                max_samplers: 16,
+                max_storage_bindings: 30,
+                max_workgroup_storage: 32768,
+                max_workgroup_invocations: 1024,
+                uniform_offset_alignment: 256,
+                storage_offset_alignment: 16,
+                sample_counts: 7,
+                tile: (0, 0),
+                push_constant_bytes: 0,
+                max_viewports: 16,
+                max_buffer_size: 1 << 32,
+                max_color_bytes_per_sample: 128,
+                max_fragment_input_components: 124,
+                max_framebuffer_layers: 2048,
+                max_uniform_buffer_bytes: 65536,
+            },
+            features: Features::INDIRECT
+                | Features::MULTISAMPLE
+                | Features::BC_TEXTURES
+                | Features::OCCLUSION_QUERIES
+                | Features::TIMESTAMPS
+                | Features::DUAL_SOURCE_BLEND
+                | Features::DEPTH_CLAMP
+                | Features::STANDARD_SAMPLE_LOCATIONS,
+            rgba: FormatCaps::COLOR
+                | FormatCaps::BLEND
+                | FormatCaps::SAMPLED
+                | FormatCaps::FILTERED
+                | FormatCaps::STORAGE,
+            rgba_samples: 7,
+            storage_read: true,
+        }
+    }
+
+    fn a12() -> Self {
+        let mut result = Self::m1();
+        result.limits.max_sampled_images = 96;
+        result.limits.max_color_bytes_per_sample = 64;
+        result.limits.max_buffer_size = 1 << 28;
+        result.features.remove(Features::BC_TEXTURES);
+        result
+    }
+
+    fn adreno_610() -> Self {
+        // Report 7037, the oldest Adreno 610 driver in vulkan-floor.tsv.
+        let mut result = Self::m1();
+        result.limits.max_sampled_images = 256;
+        result.limits.max_storage_bindings = 72;
+        result.limits.max_uniform_buffers = 96;
+        result.limits.max_workgroup_storage = 16384;
+        result.limits.push_constant_bytes = 128;
+        result.limits.max_fragment_input_components = 112;
+        result.limits.max_viewports = 1;
+        result.features.remove(Features::BC_TEXTURES);
+        result
+    }
+
+    fn mali_r48() -> Self {
+        // Report 51870 (Mali-G57 MC2, r48p0).
+        let mut result = Self::m1();
+        result.limits.max_image_layers = 4096;
+        result.limits.max_sampled_images = 500_000;
+        result.limits.max_storage_bindings = 500_000;
+        result.limits.max_uniform_buffers = 500_000;
+        result.limits.max_workgroup_invocations = 512;
+        result.limits.max_viewports = 1;
+        result.limits.max_framebuffer_layers = 256;
+        result.limits.max_fragment_input_components = 128;
+        result.features.remove(Features::BC_TEXTURES);
+        result
+    }
+
+    fn mali_r21() -> Self {
+        // Report 14237 (Mali-G57, r21p0).
+        let mut result = Self::mali_r48();
+        result.limits.max_image_2d = 8192;
+        result.limits.max_image_layers = 256;
+        result.limits.max_sampled_images = 16;
+        result.limits.max_storage_bindings = 35;
+        result.limits.max_uniform_buffers = 12;
+        result.features.remove(Features::DUAL_SOURCE_BLEND);
+        result
+    }
+}
+
+fn requirements() -> Vec<(Requirement, u32)> {
+    Requirement::ALL
+        .iter()
+        .map(|&requirement| {
+            let maximum = FeatureLevel::ALL
+                .into_iter()
+                .map(|level| level.limit(requirement))
+                .max()
+                .unwrap();
+            (requirement, maximum)
+        })
+        .collect()
+}
+
+const EMULATED: &[Requirement] = &[
+    Requirement::PsInputRegisters,
+    Requirement::Viewports,
+    Requirement::Scissors,
+    Requirement::FramebufferLayers,
+    Requirement::Bc1ThroughBc3,
+    Requirement::Bc4Bc5,
+    Requirement::Bc6hBc7,
+    Requirement::R32UavAtomics,
+    Requirement::QueryTimestampAndDisjoint,
+];
+
+const FEATURES: &[FeaturePath] = &[
+    FeaturePath::ConcurrentCreates,
+    FeaturePath::CommandLists,
+    FeaturePath::Discard,
+    FeaturePath::UpdateCopyFlags,
+    FeaturePath::ClearView,
+    FeaturePath::OverlappingCopy,
+    FeaturePath::PartialConstantUpdate,
+    FeaturePath::ConstantOffsets,
+    FeaturePath::DynamicConstantNoOverwrite,
+    FeaturePath::DynamicSrvNoOverwrite,
+    FeaturePath::Sad4,
+    FeaturePath::FullNonPowerOfTwo,
+    FeaturePath::ShadowComparison,
+    FeaturePath::ClearDepthView,
+    FeaturePath::SimpleInstancing,
+    FeaturePath::MixedCubeDepthView,
+];
+
+// spec: GFX-CAP-4
+#[test]
+fn mandatory_rows_follow_device_and_coverage() {
+    let requirements = requirements();
+    let formats = format::fixture_rows();
+    let paths = Coverage {
+        requirements: &requirements,
+        emulated: EMULATED,
+        formats: &formats,
+        features: FEATURES,
+    };
+    for (name, fixture, level, compute) in [
+        ("M1", Fixture::m1(), FeatureLevel::L11_0, true),
+        ("A12", Fixture::a12(), FeatureLevel::L9_3, false),
+        (
+            "Adreno 610",
+            Fixture::adreno_610(),
+            FeatureLevel::L10_1,
+            true,
+        ),
+        (
+            "Mali-G57 r48",
+            Fixture::mali_r48(),
+            FeatureLevel::L10_1,
+            false,
+        ),
+        (
+            "Mali-G57 r21",
+            Fixture::mali_r21(),
+            FeatureLevel::L9_3,
+            false,
+        ),
+    ] {
+        let report =
+            Report::derive(&fixture.caps(), paths).unwrap_or_else(|| panic!("{name}: no level"));
+        assert_eq!(
+            (report.level, report.compute_4x),
+            (level, compute),
+            "{name}"
+        );
+        assert_eq!(
+            report.check_feature(4, 4, 0).unwrap().words(),
+            &[u32::from(compute)]
+        );
+    }
+
+    let without_fallbacks = Coverage {
+        emulated: &[],
+        ..paths
+    };
+    assert!(Report::derive(&Fixture::mali_r48().caps(), without_fallbacks).is_none());
+    assert_eq!(
+        Report::derive(
+            &Fixture::adreno_610().caps(),
+            Coverage {
+                emulated: &[Requirement::Bc1ThroughBc3],
+                ..paths
+            }
+        )
+        .unwrap()
+        .level,
+        FeatureLevel::L9_3
+    );
+    for level in FeatureLevel::ALL {
+        assert_eq!(level::requirements(level).len(), Requirement::ALL.len());
+    }
+    assert!(Report::derive(&Fixture::m1().caps(), Coverage::default()).is_none());
+}
+
+// spec: GFX-CAP-4
+#[test]
+fn feature_layouts_masks_and_creation_status() {
+    let requirements = requirements();
+    let formats = format::fixture_rows();
+    let paths = Coverage {
+        requirements: &requirements,
+        emulated: EMULATED,
+        formats: &formats,
+        features: FEATURES,
+    };
+    let high = Report::derive(&Fixture::m1().caps(), paths).unwrap();
+    let low = Report::derive_at_most(&Fixture::m1().caps(), paths, FeatureLevel::L9_3).unwrap();
+    for feature in Feature::ALL {
+        let probe_format = 28;
+        let size = feature.size();
+        assert_eq!(
+            high.check_feature(feature as u32, size, probe_format)
+                .unwrap()
+                .words()
+                .len()
+                * 4,
+            size
+        );
+        assert_eq!(
+            high.check_feature(feature as u32, size - 4, probe_format),
+            Err(Error::InvalidArgument)
+        );
+    }
+    assert_eq!(low.check_feature(5, 56, 0).unwrap().words()[9], 0);
+    assert_eq!(low.check_feature(5, 56, 0).unwrap().words()[11], 0);
+    assert_eq!(high.check_feature(5, 56, 0).unwrap().words()[9], 1);
+    assert_eq!(high.check_feature(5, 56, 0).unwrap().words()[11], 1);
+    assert_eq!(high.check_feature(14, 36, 0).unwrap().words()[7], 1);
+    assert_eq!(high.check_feature(21, 4, 0), Err(Error::InvalidArgument));
+    let counter = high.counter_info();
+    assert_eq!(
+        (
+            counter.LastDeviceDependentCounter,
+            counter.NumSimultaneousCounters,
+            counter.NumDetectableParallelUnits
+        ),
+        (0, 0, 1)
+    );
+
+    let request = DeviceRequest {
+        driver: Driver::Hardware,
+        has_adapter: false,
+        has_software_module: false,
+        levels: None,
+        flags: 0,
+        wants_device: false,
+    };
+    assert_eq!(
+        request.choose(Some(high.level)),
+        Ok(DeviceChoice {
+            level: FeatureLevel::L11_0,
+            status: 1,
+            adapter: DeviceAdapter::Hardware
+        })
+    );
+    for (levels, flags, error) in [
+        (Some(&[][..]), 0, Error::Unsupported),
+        (Some(&[0xb100][..]), 0, Error::Unsupported),
+        (Some(&[0xb001][..]), 0, Error::InvalidArgument),
+        (None, 2, Error::SdkComponentMissing),
+        (None, 0x400, Error::SdkComponentMissing),
+    ] {
+        let request = DeviceRequest {
+            levels,
+            flags,
+            ..request
+        };
+        assert_eq!(request.choose(Some(high.level)), Err(error));
+    }
+}
+
+// spec: GFX-CAP-5
+#[test]
+fn formats_follow_the_backing_and_the_operation() {
+    let requirements = requirements();
+    let formats = format::fixture_rows();
+    let paths = Coverage {
+        requirements: &requirements,
+        emulated: EMULATED,
+        formats: &formats,
+        features: FEATURES,
+    };
+    let fixture = Fixture::m1();
+    let report = Report::derive(&fixture.caps(), paths).unwrap();
+    assert_ne!(report.check_format(28).unwrap() & 0xc000, 0);
+    assert_eq!(report.check_format2(28).unwrap() & 0xc0, 0xc0);
+    assert_eq!(report.check_format(103), Err(Error::FormatUnsupported));
+    assert_eq!(report.check_format2(103), Err(Error::FormatUnsupported));
+    assert_eq!(report.multisample_quality(28, 1), Ok(1));
+    assert_eq!(report.multisample_quality(28, 4), Ok(1));
+    assert!(report.supports_multisample_quality(28, 4, 0xffffffff));
+    assert!(!report.supports_multisample_quality(28, 4, 1));
+    assert_eq!(report.multisample_quality(28, 32), Ok(0));
+    assert_eq!(report.multisample_quality(103, 1), Ok(1));
+    assert_eq!(report.multisample_quality(103, 4), Ok(0));
+    assert_eq!(
+        report.multisample_quality(116, 1),
+        Err(Error::InvalidArgument)
+    );
+
+    assert_eq!(report.multisample_quality(28, 8), Ok(0));
+    let with_8x = Fixture {
+        rgba_samples: 15,
+        ..fixture.clone()
+    };
+    let report = Report::derive(&with_8x.caps(), paths).unwrap();
+    assert_eq!(report.multisample_quality(28, 8), Ok(1));
+    let no_typed_load = Fixture {
+        storage_read: false,
+        ..fixture.clone()
+    };
+    let report = Report::derive(&no_typed_load.caps(), paths).unwrap();
+    assert_eq!(report.level, FeatureLevel::L11_0);
+    assert_eq!(report.check_format2(28).unwrap() & 0xc0, 0x80);
+    let no_uav = Fixture {
+        rgba: fixture.rgba - FormatCaps::STORAGE,
+        ..fixture
+    };
+    let report = Report::derive(&no_uav.caps(), paths).unwrap();
+    assert!(report.level < FeatureLevel::L11_0);
+    assert_eq!(report.check_format(98), Err(Error::FormatUnsupported));
+}
+
+// spec: GFX-DXGI-2
+#[test]
+fn swap_models_use_present_paths_and_renderable_formats() {
+    use crate::dxgi::caps::{SwapCoverage, SwapEffect};
+    let caps = Fixture::m1().caps();
+    let paths = SwapCoverage {
+        bitblt: true,
+        flip: true,
+        srgb: true,
+        multisample: true,
+        flags: 0,
+    };
+    let discard = SwapEffect::Discard.model();
+    let flip = SwapEffect::FlipDiscard.model();
+    assert!(discard.supports(&caps, paths, 28, 1, 4, 0));
+    assert!(discard.supports(&caps, paths, 29, 1, 1, 0));
+    assert!(!discard.supports(&caps, paths, 88, 1, 1, 0));
+    assert!(flip.supports(&caps, paths, 24, 2, 1, 0));
+    assert!(!flip.supports(&caps, paths, 24, 4, 1, 0));
+    assert!(!flip.supports(&caps, paths, 24, 1, 1, 0));
+    assert!(!flip.supports(&caps, paths, 29, 2, 1, 0));
+    assert!(!flip.supports(&caps, paths, 28, 2, 4, 0));
+    assert!(!flip.supports(&caps, paths, 28, 2, 1, 1));
+    assert!(!flip.supports(&caps, SwapCoverage::default(), 28, 2, 1, 0));
+    assert!(!discard.sequential_buffers && discard.occluded_status);
+    let sequential = SwapEffect::FlipSequential.model();
+    assert!(sequential.sequential_buffers && !sequential.occluded_status);
+}
