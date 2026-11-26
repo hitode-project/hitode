@@ -566,6 +566,52 @@ fn device7_draws_transformed_vertices_into_a_lockable_surface() {
     }
 }
 
+// spec: GFX-D3D7-5, GFX-BLT-1
+#[test]
+fn blit_between_recorded_draws_updates_both_texture_memory_classes() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let caps = creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE | creation::VIDEO_MEMORY;
+    let source = f.surface(dd, true, caps, 4, 4);
+    let output = f.surface(dd, true, caps, 4, 4);
+    let dev = f.device(d3d, Face::Direct3D7, source);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+    for (pool, color) in [
+        (creation::VIDEO_MEMORY, 0xff804020),
+        (creation::SYSTEM_MEMORY, 0xff20c080),
+    ] {
+        let tex = f.surface(dd, true, creation::TEXTURE | pool, 4, 4);
+        assert_eq!(f.device_call(dev, "SetRenderTarget", &[source, 0]), 0);
+        assert_eq!(f.device_call(dev, "SetTexture", &[0, 0]), 0);
+        assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+        f.write(
+            DATA + 0x200,
+            bytemuck::cast_slice(&quad(0., 0., 4., 4., color)),
+        );
+        assert_eq!(
+            f.device_call(dev, "DrawPrimitive", &[5, 0x1c4, DATA + 0x200, 4, 0]),
+            0
+        );
+        assert_eq!(
+            f.call("IDirectDrawSurface7::Blt", &[tex, 0, source, 0, 0, 0]),
+            0
+        );
+        assert_eq!(f.device_call(dev, "SetRenderTarget", &[output, 0]), 0);
+        assert_eq!(f.device_call(dev, "SetTexture", &[0, tex]), 0);
+        f.write(
+            DATA + 0x200,
+            bytemuck::cast_slice(&quad(0., 0., 4., 4., u32::MAX)),
+        );
+        assert_eq!(
+            f.device_call(dev, "DrawPrimitive", &[5, 0x1c4, DATA + 0x200, 4, 0]),
+            0
+        );
+        assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+        assert_eq!(f.pixels(output, 4, 4), [color & 0xffffff; 16]);
+    }
+}
+
 // spec: GFX-D3D7-4, GFX-D3D7-5
 #[test]
 fn device7_color_key_tests_raw_bits_before_filtering() {
