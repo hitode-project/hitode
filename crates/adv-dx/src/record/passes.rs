@@ -1,11 +1,11 @@
 //! Backward liveness for complete, contiguous target passes. Uploads remain
 //! barriers: their fresh content keys do not prove a full pixel overwrite.
-use super::*;
+use super::{Kind, ResourceKey as Content, key::hash};
 use rustc_hash::FxHashSet as HashSet;
 use smallvec::SmallVec;
 
 #[derive(Clone)]
-pub(super) struct Effects {
+pub(crate) struct Effects {
     pass: u128,
     barrier: bool,
     clear: bool,
@@ -15,7 +15,7 @@ pub(super) struct Effects {
     writes: SmallVec<[(Content, bool); 3]>,
 }
 #[derive(Default)]
-pub(super) struct Plan {
+pub(crate) struct Plan {
     effects: Vec<Effects>,
     skipped: Vec<bool>,
     clear_masks: Vec<u8>,
@@ -24,7 +24,7 @@ pub(super) struct Plan {
 impl Plan {
     pub fn record(
         &mut self,
-        operation: &Operation,
+        kind: Kind,
         reads: SmallVec<[Content; 4]>,
         read_versions: smallvec::SmallVec<[Option<u128>; 4]>,
         writes: SmallVec<[(Content, bool); 3]>,
@@ -33,9 +33,9 @@ impl Plan {
     ) -> Option<Effects> {
         let effect = Effects {
             pass: hash(writes.first().map(|(k, _)| (k.0, k.1))),
-            barrier: matches!(operation, Operation::Upload { .. }),
-            clear: matches!(operation, Operation::Clear { .. }),
-            draw_bounds: matches!(operation, Operation::Draw(_)).then_some(bounds),
+            barrier: kind == Kind::Upload,
+            clear: kind == Kind::Clear,
+            draw_bounds: (kind == Kind::Draw).then_some(bounds),
             reads,
             read_versions,
             writes,
@@ -69,6 +69,16 @@ impl Plan {
         };
         std::mem::size_of::<Effects>() + spill + 1
     }
+    pub fn retains_aspects(&self, n: usize, selected: Option<&[Content]>) -> bool {
+        self.effects[n].clear
+            && selected.is_some_and(|keys| {
+                self.effects[n]
+                    .writes
+                    .iter()
+                    .any(|(key, _)| !keys.contains(key))
+            })
+    }
+
     pub fn truncate(&mut self, len: usize) {
         self.effects.truncate(len);
         self.skipped.clear();
@@ -169,18 +179,10 @@ mod tests {
     #[test]
     // spec: GFX-REC-9
     fn complete_overwrites_protect_reads_partial_writes_mips_and_aspects() {
-        let mut m = crate::d3d9::tests::machine();
-        let mut env = Env {
-            context: m.sys.current,
-            cpu: &mut m.cpu,
-            sys: &mut m.sys,
-            ext: &mut m.ext,
-            thunk: 0,
-        };
-        let (_, _, _, id) = crate::d3d9::tests::setup(&mut env);
-        let a = Content(id, 0, 0, 1);
-        let b = Content(id, 1, 0, 1);
-        let depth = Content(id, 0, 1, 1);
+        use crate::record::ResourceKey;
+        let a = ResourceKey((1, 0), 0, 0);
+        let b = ResourceKey((1, 0), 1, 0);
+        let depth = ResourceKey((1, 0), 0, 1);
         let effect = |pass, reads, writes, barrier| Effects {
             pass,
             reads: SmallVec::from_vec(reads),
