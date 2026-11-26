@@ -4,12 +4,15 @@
 //! A flush owns the device until its Present/readback finishes. Busy restores
 //! only the unexecuted command, so continuations never replay successful prefixes.
 use super::*;
+pub use crate::record::Counters;
+use crate::record::{self, Cursor, Front as _, ResourceKey as Content};
+#[cfg(feature = "d3d9-counters")]
+use crate::record::{lookup, lookups};
 use rustc_hash::FxHashMap as HashMap;
 pub(super) mod damage;
 mod encode;
 mod fast;
 mod key;
-mod passes;
 mod reuse;
 pub mod trace;
 pub(super) use key::fixed as fixed_key;
@@ -52,78 +55,6 @@ pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
     draw_state_identity(env, pointer).0
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Content(Id, u32, u8, u32);
-#[derive(Default)]
-struct Contents {
-    indices: HashMap<Content, usize>,
-    slots: Vec<(Content, Option<u128>, Option<u128>)>,
-    touched: Vec<usize>,
-    vacant: Vec<usize>,
-}
-impl Contents {
-    fn resolve(&mut self, key: Content) -> usize {
-        #[cfg(feature = "d3d9-counters")]
-        lookup(1);
-        *self.indices.entry(key).or_insert_with(|| {
-            if let Some(n) = self.vacant.pop() {
-                self.slots[n] = (key, None, None);
-                n
-            } else {
-                self.slots.push((key, None, None));
-                self.slots.len() - 1
-            }
-        })
-    }
-    fn get(&self, key: &Content) -> Option<&u128> {
-        #[cfg(feature = "d3d9-counters")]
-        lookup(1);
-        self.slots.get(*self.indices.get(key)?)?.1.as_ref()
-    }
-    fn had_base(&self, key: &Content) -> bool {
-        #[cfg(feature = "d3d9-counters")]
-        lookup(1);
-        self.indices
-            .get(key)
-            .is_some_and(|&n| self.slots[n].2.is_some())
-    }
-    fn restore(&mut self, key: Content, value: Option<u128>, had_base: bool) {
-        let n = self.resolve(key);
-        self.slots[n].1 = value;
-        if !had_base {
-            self.slots[n].2 = None;
-        }
-    }
-    fn unchanged(&self) -> bool {
-        self.touched.iter().all(|&n| {
-            self.slots[n]
-                .2
-                .is_none_or(|base| self.slots[n].1 == Some(base))
-        })
-    }
-    fn reset(&mut self) {
-        for n in self.touched.drain(..) {
-            self.slots[n].2 = None;
-        }
-    }
-    fn forget(&mut self, pointer: u32) -> bool {
-        let before = self.indices.len();
-        self.indices.retain(|k, &mut n| {
-            if k.3 != pointer {
-                return true;
-            }
-            self.slots[n].1 = None;
-            self.slots[n].2 = None;
-            self.vacant.push(n);
-            false
-        });
-        self.indices.len() != before
-    }
-    #[cfg(test)]
-    fn keys(&self) -> impl Iterator<Item = &Content> {
-        self.slots.iter().filter(|s| s.1.is_some()).map(|s| &s.0)
-    }
-}
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Reason {
     Present,
@@ -134,87 +65,38 @@ pub(super) enum Reason {
     Release,
     Limit,
     Wait,
+    Query,
 }
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Counters {
-    pub fixed_draws: u64,
-    pub fixed_shaders_built: u64,
-    pub fixed_shader_cache_hits: u64,
-    pub draw_key_hashes: u64,
-    /// Draws that reused a previous frame's preparation, and draws that
-    /// skipped the attempt while their target rested.
-    pub reused_draws: u64,
-    pub rested_draws: u64,
-    pub readback_bytes: u64,
-    pub presents: u64,
-    pub recorded_draws: u64,
-    pub recorded_draw_bytes: u64,
-    pub recording_lookups: u64,
-    pub stateblock_applies: u64,
-    pub stateblock_items: u64,
-    pub eliminated_passes: u64,
-    pub recorded_commands: u64,
-    pub gpu_draws: u64,
-    pub uncoalesced_gpu_draws: u64,
-    pub fast_path_draws: u64,
-    pub general_path_draws: u64,
-    /// Present, readback, lock, DC, Reset, Release, limit, existing GPU wait.
-    pub flushes: [u64; 8],
-    pub eliminated_frames: u64,
-    pub verification_mismatches: u64,
-    pub full_executions: u64,
-    pub clipped_executions: u64,
-    pub clipped_area_sum: f64,
-    /// Presents that changed the whole surface, by cause: a flush that
-    /// changed contents outside the analysis, a new presentation, a whole
-    /// COPY publication, and the analysis itself (a whole change).
-    pub whole: [u64; 4],
-    /// Final chains planned whole because a late demand reached writes
-    /// already planned.
-    pub promotions: u64,
-    pub intermediate_promotions: u64,
-    /// Recorded writes submitted, once per scissor, and the pixels those
-    /// submissions covered (a whole write counts its image).
-    pub submissions: u64,
-    pub submitted_pixels: u64,
-    /// Input vertices submitted, including instances and repeated scissors.
-    pub submitted_vertices: u64,
-    pub repeated_vertices: u64,
-    /// Backbuffer cell areas accumulated once per completed present.
-    pub changed_pixels: u64,
-    pub executed_pixels: u64,
-    pub extra_pixels: u64,
-}
-impl Counters {
-    pub fn work_report(&self) -> String {
-        if !cfg!(feature = "d3d9-counters") {
-            return String::new();
+impl crate::record::Front for Payload {
+    type Payload = Operation;
+    type Sink<'a> = Env<'a>;
+    type Completion = Completion;
+    type Error = Error;
+    type Boundary = (Reason, Option<Content>);
+
+    fn encode(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, Error> {
+        execute_gpu(env, operation)
+    }
+
+    fn reason((reason, target): Self::Boundary) -> record::Reason {
+        match reason {
+            Reason::Readback => target.map_or(record::Reason::Wait, record::Reason::Readback),
+            Reason::Query => record::Reason::Query,
+            Reason::Lock => record::Reason::Map,
+            Reason::Wait => record::Reason::Wait,
+            Reason::Limit => record::Reason::CommandLimit,
+            Reason::Dc | Reason::Reset => record::Reason::Barrier,
+            Reason::Release => record::Reason::Release,
+            Reason::Present => unreachable!("present planning needs the output slot"),
         }
-        format!(
-            "\nD3D9 work: draws {}; recorded bytes {} ({:.2}/draw); recording lookups {} ({:.2}/draw); StateBlock applies {}; applied items {} ({:.2}/apply); dead frames {}; dead passes {}",
-            self.recorded_draws,
-            self.recorded_draw_bytes,
-            self.recorded_draw_bytes as f64 / self.recorded_draws.max(1) as f64,
-            self.recording_lookups,
-            self.recording_lookups as f64 / self.recorded_draws.max(1) as f64,
-            self.stateblock_applies,
-            self.stateblock_items,
-            self.stateblock_items as f64 / self.stateblock_applies.max(1) as f64,
-            self.eliminated_frames,
-            self.eliminated_passes
-        )
     }
 }
-#[cfg(feature = "d3d9-counters")]
-thread_local! { static LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
-#[cfg(feature = "d3d9-counters")]
-fn lookup(count: u64) {
-    LOOKUPS.set(LOOKUPS.get() + count);
+
+struct Recorded {
+    operation: Operation,
+    vertices: Option<std::ops::Range<usize>>,
 }
-#[cfg(feature = "d3d9-counters")]
-fn lookups() -> u64 {
-    LOOKUPS.get()
-}
+
 struct ReadbackTarget {
     source: Content,
     destination: u32,
@@ -224,81 +106,44 @@ struct ReadbackTarget {
     in_flight: Option<u32>,
 }
 
-#[cfg(test)]
-type TestExecutionPlan = Vec<(bool, u8, Option<Vec<adv_device::surface::Rect>>)>;
-
 #[derive(Default)]
 pub(super) struct Recording {
-    commands: Vec<Operation>,
-    #[cfg(test)]
-    command_identities: Vec<u128>,
-    /// The damage analysis write behind each command, while it knows it.
-    nodes: Vec<Option<usize>>,
+    core: record::Recording<Recorded>,
+    plan: Option<record::Plan<Recorded>>,
     #[cfg(test)]
     separate_draws: bool,
     #[cfg(test)]
     general_draws: bool,
-    #[cfg(test)]
-    test_plan: Option<TestExecutionPlan>,
     fast: fast::Cache,
     vertices: Vec<u8>,
-    vertex_ranges: Vec<Option<std::ops::Range<usize>>>,
-    /// The content a readback flush observes, and the writes, by content,
-    /// that flush executes; the rest wait for presentation.
+    /// The resource version the next readback observes.
     observe: Option<Content>,
-    select: Option<HashMap<usize, Vec<Content>>>,
     reuse: reuse::Cache,
     readback_targets: HashMap<adv_device::gpu::ImageId, ReadbackTarget>,
-    passes: passes::Plan,
-    damage: damage::Analysis,
-    verify_region: Option<adv_device::surface::Region>,
-    output_slot: Option<u128>,
-    executed: HashMap<u128, adv_device::surface::Region>,
     verify_image: Option<adv_device::gpu::Image>,
     baseline: Option<adv_device::gpu::Image>,
     pub(super) rotate: bool,
     held_uploads: Vec<(Id, Option<u32>)>,
-    head: usize,
-    /// Scissors the operation at `head` finished before it was busy.
-    part: usize,
-    bytes: usize,
-    contents: Contents,
     binding_cache: Option<key::Bindings>,
-    upload: u128,
     active: Option<u64>,
     next: u64,
-    partial: bool,
-    last: Option<u128>,
     last_copy: Option<(u32, presentation::Copy)>,
-    last_serial: Option<u64>,
-    verdict: Option<bool>,
     presented: Option<(Completion, Option<u64>)>,
-    previous: Option<(u32, u32, Vec<u8>)>,
     readback: Option<adv_device::gpu::Readback>,
     job: Option<adv_sync::background::Task>,
 }
-impl Recording {
-    /// Drops the damage analysis; pending commands then run whole.
-    fn forget_damage(&mut self) {
-        self.damage.invalidate();
-        self.readback_targets.clear();
-        self.nodes.fill(None);
-    }
-}
-pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
+pub(super) fn forget(env: &mut Env<'_>, owner: Id, id: Option<Id>, pointer: u32) {
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
         let f = &mut d.frame;
-        let changed = f.contents.forget(pointer);
+        let allocation = id.map(Id::key);
+        if let Some(allocation) = allocation {
+            f.core.forget(allocation);
+        }
         f.binding_cache = None;
         f.fast.clear();
         f.reuse.invalidate();
-        f.damage.forget(pointer);
         f.readback_targets
-            .retain(|_, r| r.source.3 != pointer && r.destination != pointer);
-        if changed {
-            f.partial = true;
-            f.last = None;
-        }
+            .retain(|_, r| Some(r.source.0) != allocation && r.destination != pointer);
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -314,7 +159,7 @@ pub(super) fn readback_regions(
     use adv_device::surface::{Region, rects};
     let source = key::content(env, source, None, 0);
     let f = frame(env, owner);
-    let version = f.contents.get(&source).copied();
+    let version = f.core.contents.get(&source).copied();
     let size = (image.width(), image.height());
     let regions = if let Some(r) = f.readback_targets.get(&image.id()).filter(|r| {
         r.source == source
@@ -378,13 +223,22 @@ pub(super) fn complete_readback(
 
 /// What the frame being presented changed since the previous presentation, when known.
 pub(super) fn changed(f: &Recording) -> Option<adv_device::surface::Region> {
-    f.verify_region.clone()
+    f.core.verify_region.clone()
 }
 fn frame<'a>(env: &'a mut Env<'_>, owner: Id) -> &'a mut Recording {
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) else {
         unreachable!("retained recording device")
     };
     &mut d.frame
+}
+fn frame_and_counters<'a>(
+    env: &'a mut Env<'_>,
+    owner: Id,
+) -> (&'a mut Recording, &'a mut Counters) {
+    let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) else {
+        unreachable!("retained recording device")
+    };
+    (&mut d.frame, &mut env.ext.get_mut::<State>().frames)
 }
 pub(super) fn owner(env: &Env<'_>, id: Id) -> Id {
     match com(env).get_identity(&env.sys.objects, id) {
@@ -404,34 +258,34 @@ fn token(env: &mut Env<'_>, owner: Id) -> u64 {
     f.next
 }
 pub(super) fn query_pixels(f: &Recording, queries: &mut queries::DeviceState) -> u64 {
-    for operation in &f.commands[queries.scanned..] {
-        if let Operation::Draw(draw) = operation {
+    for command in f.core.commands[queries.scanned..].iter().flatten() {
+        if let Operation::Draw(draw) = &command.operation {
             let area = u64::from(draw.target.image.width()) * u64::from(draw.target.image.height());
             queries.pixels = queries.pixels.wrapping_add(area);
         }
     }
-    queries.scanned = f.commands.len();
+    queries.scanned = f.core.commands.len();
     queries.pixels
 }
 pub(super) fn query_pending(f: &Recording) -> bool {
-    !f.commands.is_empty() || f.active.is_some()
+    !f.core.commands.is_empty() || f.active.is_some()
 }
 pub(super) fn query_flush(env: &mut Env<'_>, owner: Id) -> Result<(), Error> {
     if frame(env, owner).active.is_some() {
         return Err(Error::Busy);
     }
-    if frame(env, owner).commands.is_empty() {
+    if frame(env, owner).core.commands.is_empty() {
         return Ok(());
     }
     let token = token(env, owner);
-    let result = flush(env, owner, token, Reason::Wait);
+    let result = flush(env, owner, token, Reason::Query);
     if matches!(result, Err(Error::Busy)) {
         cancel(
             env,
             &Operation::Flush {
                 owner,
                 token,
-                reason: Reason::Wait,
+                reason: Reason::Query,
             },
         );
     } else {
@@ -443,7 +297,7 @@ pub(super) fn has_work(env: &mut Env<'_>, owner: Id) -> bool {
     matches!(
         com(env).get_identity(&env.sys.objects, owner),
         Some(Payload::Device(_))
-    ) && (!frame(env, owner).commands.is_empty()
+    ) && (!frame(env, owner).core.commands.is_empty()
         || frame(env, owner).active.is_some()
         || restore_operation(env, owner).is_some())
 }
@@ -455,20 +309,12 @@ pub(super) fn observes(env: &mut Env<'_>, owner: Id, surface: Id) -> bool {
     }
     let content = key::content(env, surface, None, 0);
     let f = frame(env, owner);
-    if f.active.is_some() || f.commands.is_empty() {
+    if f.active.is_some() || f.core.commands.is_empty() {
         return true;
     }
-    // A version the slot already holds needs no flush.
-    if !env.ext.get::<State>().verify_frames && frame(env, owner).damage.settled(&content) {
-        return false;
-    }
+    let verify = env.ext.get::<State>().verify_frames;
     let f = frame(env, owner);
-    let pending = f.commands[f.head..]
-        .iter()
-        .zip(&f.nodes[f.head..])
-        .any(|(op, node)| {
-            !matches!(op, Operation::Consumed) && node.is_none_or(|n| f.damage.pending(n, &content))
-        });
+    let pending = f.core.observes(content, verify);
     if pending {
         f.observe = Some(content);
     }
@@ -535,7 +381,7 @@ pub(super) fn barrier(
     ) {
         return then(env);
     }
-    if frame(env, owner).commands.is_empty() && frame(env, owner).active.is_none() {
+    if frame(env, owner).core.commands.is_empty() && frame(env, owner).active.is_none() {
         if let Some(operation) = restore_operation(env, owner) {
             let image = damage::image(&operation).unwrap().clone();
             let result = dispatch_now(env, owner, operation);
@@ -598,127 +444,49 @@ fn append(
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
         return Outcome::Return(INVALID);
     };
-    let retained = entry.and_then(|e| e.saved.get());
-    let shared = retained.filter(|saved| {
-        p.writes
-            .iter()
-            .zip(&saved.destinations)
-            .all(|((k, _), old)| {
-                d.frame.damage.independent(k) || d.frame.contents.get(k).copied() == *old
-            })
-    });
-    let bytes = if retained.is_some() { 0 } else { p.bytes };
-    let lost = d.gpu_lost;
-    let index = d.frame.commands.len();
-    let limit = d.frame.commands.len() + 1 >= 4096 || d.frame.bytes + bytes >= 64 * 1024 * 1024;
-    // Ordinary admission unlocks immediately. A limit flush retains its lock
-    // until execution, preserving the existing Busy API reservation.
-    if (!limit || lost)
-        && let Operation::Upload {
+    let upload = match &p.operation {
+        Operation::Upload {
             resource, level, ..
-        } = &p.operation
-        && let Some(Payload::Resource(r)) =
-            com(env).get_identity_mut(&mut env.sys.objects, *resource)
-    {
-        if let Some(n) = level {
-            r.levels[*n as usize].lock = None
-        } else {
-            r.lock = None
+        } => Some((*resource, *level)),
+        _ => None,
+    };
+    if d.gpu_lost {
+        if let Some((resource, level)) = upload {
+            clear_upload_lock(env, resource, level, false);
         }
-    }
-    if lost {
         return Outcome::Return(0);
     }
     let f = frame(env, owner);
-    trace::command(index, p, shared.is_some(), &f.contents);
-    let previous = limit.then(|| {
-        (
-            bytes,
-            p.writes
-                .iter()
-                .map(|(k, _)| (*k, f.contents.get(k).copied(), f.contents.had_base(k)))
-                .collect::<Vec<_>>(),
-        )
-    });
-    let destinations = entry.filter(|e| e.saved.get().is_none()).map(|_| {
-        p.writes
-            .iter()
-            .map(|(k, _)| f.contents.get(k).copied())
-            .collect()
-    });
-    let read_versions: smallvec::SmallVec<[Option<u128>; 4]> = if shared.is_none() {
-        p.reads.iter().map(|k| f.contents.get(k).copied()).collect()
-    } else {
-        smallvec::SmallVec::new()
-    };
-    let mut draw_key_hashes = 0;
-    let (command, attachment, damage) = if let Some(saved) = shared {
-        let slot = hash(target.as_ref().unwrap().image.id());
-        f.damage.replay(&saved.damage, slot, &f.contents);
-        (saved.command, saved.attachment, None)
-    } else {
-        draw_key_hashes += 1;
-        use std::hash::Hash;
-        let mut command = xxhash_rust::xxh3::Xxh3::new();
-        p.key.hash(&mut command);
-        p.reads.len().hash(&mut command);
-        for (&k, &version) in p.reads.iter().zip(&read_versions) {
-            (k, version.unwrap_or(0)).hash(&mut command);
-        }
-        let command = command.digest128();
-        let attachment = p.attachment_command(command, &read_versions);
-        (
-            command,
-            attachment,
-            f.damage.record(
-                p,
-                [command, attachment],
-                &f.contents,
-                &read_versions,
-                target.as_ref().map(|t| hash(t.image.id())),
-                destinations.is_some(),
-            ),
-        )
-    };
-    let mut outputs = Vec::new();
-    for (n, &(k, overwrite)) in p.writes.iter().enumerate() {
-        let command = p.write_key(k, if k.2 == 0 { command } else { attachment });
-        let slot = f.contents.resolve(k);
-        let old = f.contents.slots[slot].1.unwrap_or(0);
-        if f.contents.slots[slot].2.is_none() {
-            f.contents.slots[slot].2 = Some(old);
-            f.contents.touched.push(slot);
-        }
-        let next = if matches!(&p.operation, Operation::Upload { pixels, .. } if matches!(pixels.key(), UploadKey::Admission(_)))
-        {
-            f.upload = f.upload.checked_add(1).expect("upload content exhausted");
-            f.upload
-        } else if let Some(saved) = shared.filter(|saved| saved.destinations[n].unwrap_or(0) == old)
-        {
-            saved.outputs[n]
-        } else {
-            draw_key_hashes += 1;
-            if overwrite {
-                hash((k, command))
-            } else {
-                hash((old, command))
-            }
-        };
-        f.contents.slots[slot].1 = Some(next);
-        if destinations.is_some() {
-            outputs.push(next);
-        }
+    let effects = p.damage(target.as_ref());
+    let mut operation = p.operation.clone();
+    if let (Some(target), Operation::Draw(draw)) = (target, &mut operation) {
+        draw.target = target;
     }
-    if limit
-        && let Operation::Upload {
-            resource, level, ..
-        } = &p.operation
-    {
-        f.held_uploads.push((*resource, *level));
+    let is_draw = matches!(&operation, Operation::Draw(_));
+    let fixed = matches!(&operation, Operation::Draw(d) if d.fixed_vertex.is_some() || d.programmable.is_none());
+    let captured = vertices.is_some();
+    let detail = |index, reused, contents: &crate::record::Contents| {
+        trace::command(index, p, reused, contents)
+    };
+    let admitted = f.core.admit(record::Op {
+        payload: Recorded { operation, vertices },
+        effects,
+        bytes: p.bytes,
+        fresh: matches!(&p.operation, Operation::Upload { pixels, .. } if matches!(pixels.key(), UploadKey::Admission(_))),
+        reuse: entry.map(|entry| &entry.saved),
+        trace: trace::capturing().then_some(&detail as &dyn Fn(_, _, &crate::record::Contents)),
+    });
+    if let Some((resource, level)) = upload {
+        // A limit flush keeps the upload reserved while it can suspend.
+        if admitted.at_limit() {
+            f.held_uploads.push((resource, level));
+        } else {
+            clear_upload_lock(env, resource, level, false);
+        }
     }
     #[cfg(feature = "d3d9-counters")]
-    let work = (shared.is_none() && matches!(p.operation, Operation::Draw(_))).then_some((
-        (passes::Plan::bytes(p.reads.len())
+    let work = (!admitted.reused() && is_draw).then_some((
+        (record::Recording::<Recorded>::effect_bytes(p.reads.len())
             + std::mem::size_of::<Operation>()
             + match &p.operation {
                 Operation::Draw(d) => d.programmable.as_ref().map_or(p.bytes, |draw| {
@@ -743,78 +511,30 @@ fn append(
         count.recorded_draw_bytes += bytes;
         count.recording_lookups += lookups;
     }
-    #[cfg(feature = "d3d9-counters")]
-    let f = frame(env, owner);
-    f.bytes += bytes;
-    if let Some(saved) = shared {
-        f.passes.replay(saved.pass.clone());
-    } else {
-        let pass = f.passes.record(
-            &p.operation,
-            p.reads.clone(),
-            read_versions,
-            p.writes.clone(),
-            p.bounds,
-            destinations.is_some(),
-        );
-        if let (Some(entry), Some(destinations)) = (entry, destinations) {
-            let _ = entry.saved.set(reuse::Saved {
-                command,
-                attachment,
-                damage: damage.unwrap(),
-                pass: pass.unwrap(),
-                destinations,
-                outputs,
-            });
-        }
-    }
-    let mut operation = p.operation.clone();
-    if let (Some(target), Operation::Draw(draw)) = (target, &mut operation) {
-        draw.target = target;
-    }
-    let is_draw = matches!(&operation, Operation::Draw(_));
-    let fixed = matches!(&operation, Operation::Draw(d) if d.fixed_vertex.is_some() || d.programmable.is_none());
-    f.commands.push(operation);
-    let captured = vertices.is_some();
-    f.vertex_ranges.push(vertices);
-    #[cfg(test)]
-    f.command_identities.push(command);
-    f.nodes.push(f.damage.len().checked_sub(1));
-    let limit = f.commands.len() >= 4096 || f.bytes >= 64 * 1024 * 1024;
     let counters = &mut env.ext.get_mut::<State>().frames;
     counters.recorded_commands += 1;
     counters.fast_path_draws += u64::from(captured);
     counters.general_path_draws += u64::from(is_draw && !captured);
     counters.fixed_draws += u64::from(fixed);
     if is_draw {
-        counters.draw_key_hashes += draw_key_hashes + u64::from(captured);
+        counters.draw_key_hashes += admitted.key_hashes + u64::from(captured);
     }
-    if limit {
+    if admitted.at_limit() {
         let outcome = barrier(env, owner, Reason::Limit, |_| Outcome::Return(0));
         // Parking allocation failure rejects the incoming command. Successful
         // prefixes stay committed; older accepted commands retain their order.
         if matches!(outcome, Outcome::Return(OUT_OF_MEMORY)) {
-            let (bytes, contents) = previous.unwrap();
             let f = frame(env, owner);
-            assert!(f.head < f.commands.len());
-            let rejected = f.commands.pop();
-            if let Some(vertices) = f.vertex_ranges.pop().flatten() {
+            let recorded = f.core.reject(admitted);
+            if let Some(vertices) = recorded.vertices {
                 f.vertices.truncate(vertices.start);
             }
-            #[cfg(test)]
-            f.command_identities.pop();
-            f.nodes.pop();
-            let len = f.commands.len();
-            f.passes.truncate(f.commands.len());
-            f.forget_damage();
-            f.bytes -= bytes;
-            for (k, old, had_base) in contents {
-                f.contents.restore(k, old, had_base);
-            }
+            f.readback_targets.clear();
+            let len = f.core.commands.len();
             if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner)
                 && d.queries.scanned > len
             {
-                if let Some(Operation::Draw(draw)) = rejected {
+                if let Operation::Draw(draw) = recorded.operation {
                     let area = u64::from(draw.target.image.width())
                         * u64::from(draw.target.image.height());
                     d.queries.pixels = d.queries.pixels.wrapping_sub(area);
@@ -844,26 +564,26 @@ fn enter(env: &mut Env<'_>, owner: Id, token: u64, reason: Reason) -> Result<(),
         Some(n) if n != token => Err(Error::Busy),
         Some(_) => Ok(()),
         None => {
-            frame(env, owner).active = Some(token);
-            trace::flush(reason, frame(env, owner).commands.len());
+            let (f, counters) = frame_and_counters(env, owner);
+            f.active = Some(token);
+            let counter_reason = if matches!(reason, Reason::Query) {
+                Reason::Wait
+            } else {
+                reason
+            };
+            trace::flush(counter_reason, f.core.commands.len());
             if !matches!(reason, Reason::Present) {
-                // Flushes that only execute keep the damage analysis: it follows
-                // the recorded commands, not when they run. CPU access, Reset
-                // and Release change contents outside it.
-                if !matches!(reason, Reason::Readback | Reason::Wait | Reason::Limit) {
-                    frame(env, owner).forget_damage();
+                let reason = Payload::reason((reason, f.observe.take()));
+                if matches!(
+                    reason,
+                    record::Reason::Map | record::Reason::Barrier | record::Reason::Release
+                ) {
+                    f.readback_targets.clear();
                 }
-                let f = frame(env, owner);
-                if let Some(content) = f
-                    .observe
-                    .take()
-                    .filter(|_| matches!(reason, Reason::Readback))
-                {
-                    f.select = Some(f.damage.closure(content));
-                }
+                f.plan = Some(f.core.plan(reason));
                 f.reuse.invalidate();
             }
-            env.ext.get_mut::<State>().frames.flushes[reason as usize] += 1;
+            counters.flushes[counter_reason as usize] += 1;
             Ok(())
         }
     }
@@ -883,7 +603,7 @@ pub(super) fn flush(
     if !frame(env, owner).rotate
         && let Some(operation) = restore_operation(env, owner)
     {
-        execute_gpu(env, &operation)?;
+        Payload::encode(env, &operation)?;
         let image = damage::image(&operation).unwrap();
         let f = frame(env, owner);
         f.baseline = Some(image.clone());
@@ -891,7 +611,7 @@ pub(super) fn flush(
     }
     loop {
         let f = frame(env, owner);
-        if f.head == f.commands.len() {
+        if f.core.cursor.ops == f.core.commands.len() {
             let surface = match com(env).get_identity(&env.sys.objects, owner) {
                 Some(Payload::Device(d)) => d.surface,
                 _ => unreachable!(),
@@ -899,11 +619,6 @@ pub(super) fn flush(
             frame(env, owner).baseline =
                 (env.ext.get::<State>().provider.target)(env.ext, surface).map(|t| t.image);
             return Ok(Completion::Command);
-        }
-        if f.passes.skip(f.head) {
-            f.commands[f.head] = Operation::Consumed;
-            f.head += 1;
-            continue;
         }
         #[cfg(test)]
         let separate_draws = f.separate_draws;
@@ -918,180 +633,147 @@ pub(super) fn flush(
             }
         }
         let f = frame(env, owner);
-        let node = f.nodes[f.head];
-        let selected = match &f.select {
-            Some(select) => match node.map(|n| select.get(&n)) {
-                Some(None) => {
-                    // Not needed by the observation: it waits for presentation.
-                    f.head += 1;
-                    continue;
-                }
-                Some(Some(contents)) => Some(contents.clone()),
-                None => None,
-            },
-            None => None,
-        };
-        let mut operation = std::mem::replace(&mut f.commands[f.head], Operation::Consumed);
-        // Keep the original template across Busy; the captured bytes still
-        // belong to the frame and may form part of a run on the next attempt.
-        let mut captured = None;
-        if let Some(range) = &f.vertex_ranges[f.head]
-            && let Operation::Draw(draw) = &operation
-        {
-            let mut draw = draw.clone();
-            fast::materialize(&mut draw, &f.vertices[range.clone()]);
-            captured = Some(Operation::Draw(draw));
-        }
-        let execution = captured.as_ref();
-        // A clear the observation needs only part of runs that part now and
-        // keeps the rest in order.
-        let mut original = None;
-        if let (
-            Some(contents),
-            Operation::Clear {
-                target,
-                rectangle,
-                color,
-                depth,
-                stencil,
-            },
-        ) = (&selected, &mut operation)
-        {
-            let aspect = |a: u8| contents.iter().any(|k| k.2 == a);
-            let rest = (
-                color.filter(|_| !aspect(0)),
-                depth.filter(|_| !aspect(1)),
-                stencil.filter(|_| !aspect(2)),
+        let head = f.core.cursor.ops;
+        let Some(planned) = f.plan.as_ref().unwrap().at(&f.core, head) else {
+            f.core.retire(
+                f.plan.as_ref().unwrap(),
+                Cursor {
+                    ops: head + 1,
+                    scissors: 0,
+                },
             );
-            if rest != (None, None, None) {
-                let whole = Operation::Clear {
+            continue;
+        };
+        let (node, scissors, mask, retains_aspects) = (
+            planned.node,
+            planned.scissors,
+            planned.clear_mask,
+            planned.retains_aspects,
+        );
+        let mut command = f.core.commands[head].take().unwrap();
+        let original = if let Operation::Clear {
+            target,
+            rectangle,
+            color,
+            depth,
+            stencil,
+        } = &mut command.operation
+        {
+            let rest = (
+                color.filter(|_| mask & 1 == 0),
+                depth.filter(|_| mask & 2 == 0),
+                stencil.filter(|_| mask & 4 == 0),
+            );
+            let original =
+                (retains_aspects && rest != (None, None, None)).then(|| Operation::Clear {
                     target: target.clone(),
                     rectangle: *rectangle,
                     color: *color,
                     depth: *depth,
                     stencil: *stencil,
-                };
-                let rest = Operation::Clear {
-                    target: target.clone(),
-                    rectangle: *rectangle,
-                    color: rest.0,
-                    depth: rest.1,
-                    stencil: rest.2,
-                };
-                (*color, *depth, *stencil) = (
-                    color.filter(|_| aspect(0)),
-                    depth.filter(|_| aspect(1)),
-                    stencil.filter(|_| aspect(2)),
-                );
-                original = Some(whole);
-                let f = frame(env, owner);
-                let head = f.head;
-                f.commands[head] = rest;
+                });
+            if original.is_some() {
+                f.core.commands[head] = Some(Recorded {
+                    operation: Operation::Clear {
+                        target: target.clone(),
+                        rectangle: *rectangle,
+                        color: rest.0,
+                        depth: rest.1,
+                        stencil: rest.2,
+                    },
+                    vertices: None,
+                });
             }
-        }
-        let f = frame(env, owner);
-        if let Operation::Clear {
-            color,
-            depth,
-            stencil,
-            ..
-        } = &mut operation
-        {
-            let mask = f.passes.clear_mask(f.head);
-            if mask & 1 == 0 {
-                *color = None;
-            }
-            if mask & 2 == 0 {
-                *depth = None;
-            }
-            if mask & 4 == 0 {
-                *stencil = None;
-            }
-        }
-        // The write's scissors, unless it runs whole (GFX-REC-5).
-        let parts = (!env.ext.get::<State>().verify_frames)
-            .then(|| node.and_then(|n| frame(env, owner).damage.clip(n).map(<[_]>::len)))
-            .flatten();
-        let result = if let Some(parts) = parts {
-            let effective = execution.unwrap_or(&operation);
-            if let Operation::Draw(draw) = effective {
-                let mut clips = smallvec::SmallVec::<[adv_device::surface::Rect; 8]>::new();
-                {
-                    let f = frame(env, owner);
-                    let all_clips = f.damage.clip(node.unwrap()).unwrap();
-                    for &clip in &all_clips[f.part..parts] {
-                        if !f.passes.outside_damage(f.head, clip) {
-                            clips.push(clip);
-                        }
-                    }
-                }
-                if clips.is_empty() {
-                    frame(env, owner).part = parts;
+            *color = color.filter(|_| mask & 1 != 0);
+            *depth = depth.filter(|_| mask & 2 != 0);
+            *stencil = stencil.filter(|_| mask & 4 != 0);
+            original
+        } else {
+            None
+        };
+        // The retained template survives a busy draw. Only the encoder
+        // materializes the captured vertices.
+        let captured =
+            if let (Some(range), Operation::Draw(draw)) = (&command.vertices, &command.operation) {
+                let mut draw = draw.clone();
+                fast::materialize(&mut draw, &f.vertices[range.clone()]);
+                Some(Operation::Draw(draw))
+            } else {
+                None
+            };
+        let operation = captured.as_ref().unwrap_or(&command.operation);
+        let mut cursor = f.core.cursor;
+        let result = if let Some(scissors) = &scissors {
+            let remaining = &scissors[cursor.scissors..];
+            if let Operation::Draw(draw) = operation {
+                if remaining.is_empty() {
                     Ok(Completion::Command)
                 } else {
-                    let result = execute_draw_clips(env, draw, &clips);
+                    let result = execute_draw_clips(env, draw, remaining);
                     if result.is_ok() {
-                        for clip in clips {
-                            submitted(env, owner, node, &operation, Some(clip));
+                        for &clip in remaining {
+                            submitted(env, owner, node, &command.operation, Some(clip));
                         }
-                        frame(env, owner).part = parts;
                     }
                     result
                 }
             } else {
                 let mut result = Ok(Completion::Command);
-                // A write meeting several scissors resumes after the ones it
-                // finished when it was busy, so no blend applies twice.
-                while result.is_ok() && frame(env, owner).part < parts {
-                    let f = frame(env, owner);
-                    let clip = f.damage.clip(node.unwrap()).unwrap()[f.part];
-                    if !f.passes.outside_damage(f.head, clip) {
-                        let gpu = env.ext.get_mut::<State>().gpu.as_mut().unwrap();
-                        gpu.set_clip(Some(clip));
-                        result = execute_gpu(env, effective);
-                        env.ext
-                            .get_mut::<State>()
-                            .gpu
-                            .as_mut()
-                            .unwrap()
-                            .set_clip(None);
-                        if result.is_err() {
-                            break;
-                        }
-                        submitted(env, owner, node, &operation, Some(clip));
+                for &clip in remaining {
+                    env.ext
+                        .get_mut::<State>()
+                        .gpu
+                        .as_mut()
+                        .unwrap()
+                        .set_clip(Some(clip));
+                    result = Payload::encode(env, operation);
+                    env.ext
+                        .get_mut::<State>()
+                        .gpu
+                        .as_mut()
+                        .unwrap()
+                        .set_clip(None);
+                    if result.is_err() {
+                        break;
                     }
-                    frame(env, owner).part += 1;
+                    submitted(env, owner, node, &command.operation, Some(clip));
+                    cursor.scissors += 1;
                 }
                 result
             }
         } else {
-            let result = execute_gpu(env, execution.unwrap_or(&operation));
+            let result = Payload::encode(env, operation);
             if result.is_ok() {
-                submitted(env, owner, node, &operation, None);
+                submitted(env, owner, node, &command.operation, None);
             }
             result
         };
         match result {
             Err(Error::Busy) => {
                 let f = frame(env, owner);
-                f.commands[f.head] = original.unwrap_or(operation);
+                if let Some(original) = original {
+                    command.operation = original;
+                }
+                f.core.commands[head] = Some(command);
+                f.core.retire(f.plan.as_ref().unwrap(), cursor);
                 return Err(Error::Busy);
             }
             Err(Error::Device(_)) => return Ok(lose(env, owner)),
             result => {
                 if let Operation::Upload {
                     resource, level, ..
-                } = &operation
+                } = &command.operation
                 {
                     release_upload(env, owner, *resource, *level, false);
                 }
                 let f = frame(env, owner);
-                if let Some(n) = node {
-                    f.damage.executed(n, selected.as_deref());
-                }
-                f.head += 1;
-                f.part = 0;
-                f.partial = true;
+                f.core.retire(
+                    f.plan.as_ref().unwrap(),
+                    Cursor {
+                        ops: head + 1,
+                        scissors: 0,
+                    },
+                );
                 result?;
             }
         }
@@ -1100,14 +782,8 @@ pub(super) fn flush(
 fn lose(env: &mut Env<'_>, owner: Id) -> Completion {
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
         d.gpu_lost = true;
-        d.frame.damage.invalidate();
-        d.frame.commands.clear();
-        d.frame.vertex_ranges.clear();
+        d.frame.core.lose();
         d.frame.vertices.clear();
-        d.frame.nodes.clear();
-        d.frame.passes.truncate(0);
-        d.frame.head = 0;
-        d.frame.part = 0;
     }
     Completion::Command
 }
@@ -1135,11 +811,6 @@ fn submitted(
         Operation::Copy { region, .. } => area.clipped(*region),
         _ => area,
     };
-    frame(env, owner)
-        .executed
-        .entry(hash(image.id()))
-        .or_insert_with(|| adv_device::surface::Region::empty((image.width(), image.height())))
-        .add(area.into());
     let vertices = match operation {
         Operation::Draw(d) => d
             .programmable
@@ -1171,23 +842,20 @@ fn submitted(
         let f = frame(env, owner);
         if let Some(readback) = f.readback_targets.get_mut(&image.id()) {
             let area = node
-                .and_then(|n| f.damage.write_bounds(n))
+                .and_then(|n| f.core.damage.write_bounds(n))
                 .map_or(area, |r| area.clipped(r));
             readback.damage.add(area.into());
         }
     }
-    let repeated = node.is_some_and(|n| {
-        frame(env, owner)
-            .damage
-            .submitted(n, area, aspects, vertices)
-    });
-    let counters = &mut env.ext.get_mut::<State>().frames;
-    counters.submissions += 1;
-    counters.submitted_pixels += u64::from(area.w) * u64::from(area.h);
-    counters.submitted_vertices += vertices;
-    if repeated {
-        counters.repeated_vertices += vertices;
-    }
+    let (f, counters) = frame_and_counters(env, owner);
+    f.core.submitted(
+        node,
+        (hash(image.id()), (image.width(), image.height())),
+        area,
+        aspects,
+        vertices,
+        counters,
+    );
 }
 fn clear_upload_lock(env: &mut Env<'_>, resource: Id, level: Option<u32>, dirty: bool) {
     if let Some(Payload::Resource(r)) = com(env).get_identity_mut(&mut env.sys.objects, resource) {
@@ -1225,35 +893,9 @@ pub(super) fn unlock(env: &mut Env<'_>, owner: Id, token: u64) {
         let f = &mut d.frame;
         let held = std::mem::take(&mut f.held_uploads);
         f.active = None;
-        // Commands a readback did not need stay recorded, in order; other
-        // flushes end with nothing pending.
-        let selective = f.select.take().is_some();
-        let keep: Vec<bool> = f
-            .commands
-            .iter()
-            .map(|op| selective && !matches!(op, Operation::Consumed))
-            .collect();
-        let mut n = 0;
-        f.commands.retain(|_| {
-            n += 1;
-            keep[n - 1]
-        });
-        let mut n = 0;
-        f.nodes.retain(|_| {
-            n += 1;
-            keep[n - 1]
-        });
-        let mut n = 0;
-        f.vertex_ranges.retain(|_| {
-            n += 1;
-            keep[n - 1]
-        });
-        f.passes.retain(&keep);
-        d.queries.scanned = f.commands.len();
-        f.head = 0;
-        f.part = 0;
-        if f.commands.is_empty() {
-            f.bytes = 0;
+        f.core.end(f.plan.take());
+        d.queries.scanned = f.core.commands.len();
+        if f.core.commands.is_empty() {
             f.vertices.clear();
         }
         for (resource, level) in held {
@@ -1272,15 +914,12 @@ pub(super) fn cancel(env: &mut Env<'_>, operation: &Operation) {
         let f = frame(env, *owner);
         if f.active == Some(*token) {
             f.active = None;
-            f.partial = true;
-            f.passes.truncate(f.commands.len());
-            f.last = None;
+            f.core.cancel();
             f.last_copy = None;
-            f.forget_damage();
-            f.select = None;
+            f.readback_targets.clear();
+            f.plan = None;
             f.rotate = false;
             f.verify_image = None;
-            f.verdict = None;
             f.presented = None;
             if let Some(ticket) = f.readback.take() {
                 ticket.cancel();
@@ -1344,13 +983,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
     let verify = env.ext.get::<State>().verify_frames;
     let serial = (env.ext.get::<State>().provider.presentation_serial)(env.ext);
     let f = frame(env, *owner);
-    let repeat = *f.verdict.get_or_insert_with(|| {
-        !f.partial
-            && f.last == Some(presentation)
-            && f.last_serial.is_some()
-            && f.last_serial == serial
-            && f.contents.unchanged()
-    });
+    let repeat = f.core.repeated(presentation, serial);
     if repeat && !verify {
         let provider = env.ext.get::<State>().provider;
         let serial = (provider.repeat)(env.ext, *surface)?;
@@ -1366,99 +999,45 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         );
         return Ok(Completion::Presented(serial, *deadline));
     }
-    if !frame(env, *owner).damage.planned {
+    if frame(env, *owner).plan.is_none() {
         let provider = env.ext.get::<State>().provider;
         let image = (provider.target)(env.ext, *surface).unwrap().image;
-        let f = frame(env, *owner);
-        let force = f.last.is_none();
-        let _dead_passes = if !verify && !f.partial && f.head == 0 {
-            f.passes.plan()
-        } else {
-            0
-        };
         let slot = hash(image.id());
-        let promotions = f.damage.plan(force, slot);
-        #[cfg(test)]
-        if let Some(plan) = &mut f.test_plan {
-            plan.extend(f.nodes.iter().enumerate().map(|(n, node)| {
-                (
-                    f.passes.skip(n),
-                    f.passes.clear_mask(n),
-                    node.and_then(|node| f.damage.clip(node).map(<[_]>::to_vec)),
-                )
-            }));
-        }
-        f.rotate = !force && !f.partial && f.damage.rotatable(slot);
+        let size = (image.width(), image.height());
+        let (f, counters) = frame_and_counters(env, *owner);
+        let plan = f.core.plan(record::Reason::Present { slot, verify });
+        f.rotate = f.core.rotatable(slot);
         if verify && copy.is_none() {
-            f.verify_image = Some(image.clone());
+            f.verify_image = Some(image);
         }
-        let full = adv_device::surface::Rect {
-            x: 0,
-            y: 0,
-            w: image.width(),
-            h: image.height(),
-        };
-        f.output_slot = Some(slot);
-        let size = (full.w, full.h);
-        let delta = f.damage.changed.get(&slot);
-        f.verify_region = Some(if let Some((_, copy)) = copy {
-            // The private front survives intervening publications. The surface
-            // provider accounts separately for a change of published source.
-            copy.damage(
-                f.last_copy.map(|(_, copy)| copy),
-                delta,
-                !force
-                    && !f.partial
-                    && delta.is_some()
-                    && f.last_copy.is_some_and(|(old, _)| old == *surface),
-            )
-        } else if force {
-            adv_device::surface::Region::whole(size)
-        } else {
-            delta
-                .cloned()
-                .unwrap_or_else(|| adv_device::surface::Region::empty(size))
-        });
-        trace::present(
-            f.partial,
-            force,
+        let force = f.core.force_present();
+        let last_copy = f.last_copy;
+        f.core.present_damage(
+            &plan,
+            size,
             copy.is_some(),
-            promotions,
-            &f.damage.execution,
+            |delta, current| {
+                if let Some((_, copy)) = copy {
+                    // The private front survives intervening publications. The
+                    // surface provider handles a change of published source.
+                    copy.damage(
+                        last_copy.map(|(_, copy)| copy),
+                        delta,
+                        current
+                            && delta.is_some()
+                            && last_copy.is_some_and(|(old, _)| old == *surface),
+                    )
+                } else if force {
+                    adv_device::surface::Region::whole(size)
+                } else {
+                    delta
+                        .cloned()
+                        .unwrap_or_else(|| adv_device::surface::Region::empty(size))
+                }
+            },
+            counters,
         );
-        let whole = if force {
-            Some(1)
-        } else if f.verify_region.as_ref().is_some_and(|r| r.is_whole()) {
-            Some(if f.partial {
-                0
-            } else if copy.is_some() {
-                2
-            } else {
-                3
-            })
-        } else {
-            None
-        };
-        let executed = f.damage.execution.get(&slot).filter(|r| !r.is_whole());
-        let clipped = executed.is_some();
-        let area = executed.map_or(u64::from(full.w) * u64::from(full.h), |r| r.area());
-        let fraction = area as f64 / (f64::from(full.w) * f64::from(full.h));
-        let counters = &mut env.ext.get_mut::<State>().frames;
-        #[cfg(feature = "d3d9-counters")]
-        {
-            counters.eliminated_passes += _dead_passes;
-        }
-        if let Some(cause) = whole {
-            counters.whole[cause] += 1;
-        }
-        counters.intermediate_promotions += promotions[0];
-        counters.promotions += promotions[1];
-        if verify || !clipped {
-            counters.full_executions += 1;
-        } else {
-            counters.clipped_executions += 1;
-        }
-        counters.clipped_area_sum += fraction;
+        f.plan = Some(plan);
     }
     flush(env, *owner, *token, Reason::Present)?;
     if matches!(com(env).get_identity(&env.sys.objects,*owner),Some(Payload::Device(d)) if d.gpu_lost)
@@ -1473,7 +1052,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
             .as_ref()
             .ok_or_else(|| Error::Unavailable("D3D9 GPU is absent".into()))?
             .admit_present()?;
-        let completion = execute_gpu(env, operation)?;
+        let completion = Payload::encode(env, operation)?;
         window_presented(env, *owner);
         let Completion::Presented(serial, _) = completion else {
             unreachable!()
@@ -1497,42 +1076,15 @@ fn finish(
     copy: Option<(u32, presentation::Copy)>,
     serial: Option<u64>,
 ) {
-    let f = frame(env, owner);
-    let delta = f.output_slot.and_then(|s| f.damage.changed.get(&s));
-    let changed = delta.map_or(0, damage::area);
-    let executed = f.output_slot.and_then(|s| f.executed.get(&s)).cloned();
-    let execution_area = executed.as_ref().map_or(0, damage::area);
-    let extra = match (executed, delta) {
-        (Some(mut r), Some(delta)) => {
-            r.intersect(delta);
-            execution_area - damage::area(&r)
-        }
-        _ => execution_area,
-    };
-    trace::work(&f.damage.work, f.damage.planned);
-    let counters = &mut env.ext.get_mut::<State>().frames;
-    counters.presents += 1;
-    counters.changed_pixels += changed;
-    counters.executed_pixels += execution_area;
-    counters.extra_pixels += extra;
-    trace::frame_end();
+    let (f, counters) = frame_and_counters(env, owner);
+    f.core.finish_metrics(counters);
     unlock(env, owner, token);
     let f = frame(env, owner);
-    f.damage.finish();
+    f.core.finish(presentation, serial);
     f.rotate = false;
     f.verify_image = None;
-    f.verify_region = None;
-    f.output_slot = None;
-    f.executed.clear();
-    f.last = Some(presentation);
     f.last_copy = copy;
-    f.last_serial = serial;
-    f.contents.reset();
-    #[cfg(test)]
-    f.command_identities.clear();
     f.reuse.finish();
-    f.partial = false;
-    f.verdict = None;
 }
 fn verify_pixels(
     env: &mut Env<'_>,
@@ -1588,37 +1140,14 @@ fn verify_pixels(
             Err(_) => return Err(Error::Device("frame verification service stopped".into())),
         }
     }
-    let f = frame(env, owner);
+    let (f, counters) = frame_and_counters(env, owner);
     let ticket = f.readback.as_mut().unwrap();
     let Some(pixels) = ticket.poll() else {
         return Err(Error::Busy);
     };
     let pixels = (ticket.width, ticket.height, pixels?);
-    let region = if repeat {
-        adv_device::surface::Region::empty((pixels.0, pixels.1))
-    } else {
-        f.verify_region.clone().unwrap()
-    };
-    let mismatch = f.previous.as_ref().is_some_and(|previous| {
-        previous.0 == pixels.0
-            && previous.1 == pixels.1
-            && pixels
-                .2
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(previous.2.as_chunks::<4>().0.iter())
-                .enumerate()
-                .any(|(n, (a, b))| {
-                    let (x, y) = (n as u32 % pixels.0, n as u32 / pixels.0);
-                    a != b
-                        && !region.intersects(adv_device::surface::Rect { x, y, w: 1, h: 1 }.into())
-                })
-    });
-    f.previous = Some(pixels);
     f.readback = None;
-    if mismatch {
-        env.ext.get_mut::<State>().frames.verification_mismatches += 1;
+    if f.core.verify(pixels, repeat, counters) {
         log::warn!("D3D9 frame pixel verification mismatch outside damage");
     }
     Ok(())
@@ -1629,8 +1158,16 @@ mod tests;
 
 #[cfg(test)]
 impl Recording {
+    fn commands(&self) -> impl DoubleEndedIterator<Item = &Operation> {
+        self.core
+            .commands
+            .iter()
+            .flatten()
+            .map(|command| &command.operation)
+    }
+
     pub(super) fn force_limit(&mut self) {
-        self.bytes = 64 * 1024 * 1024;
+        self.core.set_bytes(64 * 1024 * 1024);
     }
 }
 
@@ -1639,12 +1176,13 @@ pub(super) fn command_keys(env: &mut Env<'_>, pointer: u32) -> Vec<u128> {
     let owner = com(env)
         .identity::<Payload>(&env.sys.objects, pointer)
         .unwrap();
-    let commands = std::mem::take(&mut frame(env, owner).commands);
+    let commands = std::mem::take(&mut frame(env, owner).core.commands);
     let mut keys = Vec::new();
-    for operation in commands {
-        let prepared = key::prepare(env, owner, operation).ok().unwrap();
+    for mut command in commands.into_iter().flatten() {
+        let prepared = key::prepare(env, owner, command.operation).ok().unwrap();
         keys.push(prepared.key);
-        frame(env, owner).commands.push(prepared.operation);
+        command.operation = prepared.operation;
+        frame(env, owner).core.commands.push(Some(command));
     }
     keys
 }

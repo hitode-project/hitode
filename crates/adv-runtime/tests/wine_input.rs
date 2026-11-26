@@ -187,3 +187,70 @@ fn host_input_in_each_presenter() {
         );
     }
 }
+
+// spec: WINE-IN-4
+#[test]
+fn directinput_action_map_filters_by_device() {
+    if std::env::var_os("ADV_INPUT_PROBE_CHILD").is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "directinput_action_map_filters_by_device",
+                "--nocapture",
+            ])
+            .env("ADV_INPUT_PROBE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
+        return;
+    };
+    let root =
+        std::env::temp_dir().join(format!("adv-wine-dinput-action-map-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let stdout = File::create(root.join("stdout")).unwrap();
+    let config = Config {
+        dist: &dist,
+        prefix: &root.join("session"),
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: Some(&probes.join("dinput_action_map.exe")),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: Some(stdout.as_raw_fd()),
+    };
+    let wake = adv_sync::WakeEvent::new().unwrap();
+    let mut session = Session::start(&config, wake, |_| Ok(())).unwrap();
+    let stop = session.run(Instant::now() + Duration::from_secs(60));
+    drop(session);
+    drop(stdout);
+    let text = std::fs::read_to_string(root.join("stdout")).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    for check in [
+        "create_dinput",
+        "create_keyboard",
+        "create_mouse",
+        "kbd_app_data",
+        "shared_default",
+        "shared_preserve",
+        "appnomap_ignored",
+        "unmapped_resets",
+        "generic_button_reuse",
+    ] {
+        assert!(
+            text.lines().any(|line| line == format!("{check}=ok")),
+            "{check}: {text}"
+        );
+    }
+}
