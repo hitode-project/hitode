@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Rust module dependencies against A64A-DEP-1."""
+"""Check Rust module dependencies for adv-cpu-a64 and adv-dx."""
 
 from __future__ import annotations
 
@@ -9,6 +9,10 @@ import re
 import sys
 
 SRCDIR = Path(__file__).resolve().parents[2] / "crates/adv-cpu-a64/src"
+
+DX_SRC = SRCDIR.parent.parent / "adv-dx/src"
+DX_SHARED = {"fixed", "shader", "record", "pacing"}
+DX_FRONTS = {"d3d9", "ddraw", "dshow", "dsound", "wmvcore", "xaudio2", "dxgi", "d3d10", "d3d11"}
 
 EMIT = {"runtime", "asm", "encode"}
 LOWER = EMIT | {"translate::front", "facts"}
@@ -177,7 +181,7 @@ def external(path: tuple[str, ...]) -> str | None:
     return None
 
 
-def inspect(source: str, module: tuple[str, ...]):
+def inspect(source: str, module: tuple[str, ...], *, dx=False):
     """Collect imports, qualified external paths and test scopes."""
     tokens, lines = lex(source)
     ends = delimiters(tokens)
@@ -219,6 +223,14 @@ def inspect(source: str, module: tuple[str, ...]):
                 only_test = False
             elif token in {";", ","}:
                 only_test = False
+            elif dx and token in {"crate", "super", "adv_dx"} and tokens[i + 1:i + 2] == ["::"]:
+                path = ["crate" if token == "adv_dx" else token]
+                j = i + 2
+                while tokens[j + 1:j + 2] == ["::"]:
+                    path.append(tokens[j])
+                    j += 2
+                imports.append((scope, tuple(path + [tokens[j]]), lines[i], in_test))
+                i = j
             elif tokens[i:i + 4] == ["crate", "::", "encode", "::"]:
                 if role(module) == "translate::front":
                     imports.append((scope, ("crate", "encode", tokens[i + 4]), lines[i], in_test))
@@ -311,6 +323,22 @@ def violations(sources: dict[str, str], transitional=TRANSITIONAL) -> list[str]:
     return sorted(errors)
 
 
+def dx_violations(sources: dict[str, str]) -> list[str]:
+    errors = set()
+    for file, source in sources.items():
+        module = module_path(file)
+        if not module or module[0] not in DX_SHARED:
+            continue
+        imports, _, _ = inspect(source, module, dx=True)
+        for scope, path, line, _ in imports:
+            if path[0] == "adv_dx":
+                path = ("crate", *path[1:])
+            target = import_path(scope, path)
+            if target and target[0] in DX_FRONTS | {"*"}:
+                errors.add(f"{file}:{line}: {module[0]} -> {target[0]}: disallowed")
+    return sorted(errors)
+
+
 def main() -> int:
     sources = {path.relative_to(SRCDIR).as_posix(): path.read_text(encoding="utf-8")
                for path in SRCDIR.rglob("*.rs")}
@@ -318,7 +346,13 @@ def main() -> int:
     for error in errors:
         print(error)
     print("a64 module dependencies:", "FAILED" if errors else "ok")
-    return int(bool(errors))
+    dx_sources = {path.relative_to(DX_SRC).as_posix(): path.read_text(encoding="utf-8")
+                  for path in DX_SRC.rglob("*.rs")}
+    dx_errors = dx_violations(dx_sources)
+    for error in dx_errors:
+        print(error)
+    print("adv-dx module dependencies:", "FAILED" if dx_errors else "ok")
+    return int(bool(errors or dx_errors))
 
 
 if __name__ == "__main__":

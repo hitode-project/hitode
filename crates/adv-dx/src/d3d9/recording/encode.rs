@@ -5,29 +5,15 @@ use super::*;
 use adv_device::gpu::{ProgrammableDraw, Topology};
 use adv_device::surface::Rect;
 
-fn draw_at(f: &Recording, n: usize) -> Option<&fixed::Draw> {
-    if f.passes.skip(n)
-        || f.select
-            .as_ref()
-            .is_some_and(|select| f.nodes[n].is_some_and(|node| !select.contains_key(&node)))
-    {
-        return None;
-    }
-    match &f.commands[n] {
-        Operation::Draw(draw) => Some(draw),
+fn draw_at(
+    f: &Recording,
+    n: usize,
+) -> Option<(&fixed::Draw, Option<smallvec::SmallVec<[Rect; 8]>>)> {
+    let entry = f.plan.as_ref().unwrap().at(&f.core, n)?;
+    match &entry.payload.operation {
+        Operation::Draw(draw) => Some((draw, entry.scissors)),
         _ => None,
     }
-}
-
-fn clips(f: &Recording, n: usize) -> Option<smallvec::SmallVec<[Rect; 8]>> {
-    Some(
-        f.damage
-            .clip(f.nodes[n]?)?
-            .iter()
-            .copied()
-            .filter(|&r| !f.passes.outside_damage(n, r))
-            .collect(),
-    )
 }
 
 fn same_image(a: Option<&adv_device::gpu::Image>, b: Option<&adv_device::gpu::Image>) -> bool {
@@ -188,11 +174,10 @@ fn combine<'a>(
 
 pub(super) fn run(env: &mut Env<'_>, owner: Id) -> Result<bool, Error> {
     let f = frame(env, owner);
-    let start = f.head;
-    let Some(first) = draw_at(f, start) else {
+    let start = f.core.cursor.ops;
+    let Some((first, scissors)) = draw_at(f, start) else {
         return Ok(false);
     };
-    let scissors = clips(f, start);
     if scissors.as_ref().is_some_and(|clips| clips.is_empty()) {
         return Ok(false);
     }
@@ -207,9 +192,8 @@ pub(super) fn run(env: &mut Env<'_>, owner: Id) -> Result<bool, Error> {
             .sum::<usize>();
     }
     let mut end = start + 1;
-    while let Some(next) = f.commands.get(end).and_then(|_| draw_at(f, end)) {
-        if !f.passes.can_merge(start, end) || clips(f, end) != scissors || !compatible(first, next)
-        {
+    while let Some((next, next_scissors)) = draw_at(f, end) {
+        if !f.core.can_merge(start, end) || next_scissors != scissors || !compatible(first, next) {
             break;
         }
         let (more_indices, more_bytes) = draw_size(next);
@@ -226,18 +210,23 @@ pub(super) fn run(env: &mut Env<'_>, owner: Id) -> Result<bool, Error> {
     let operation = Operation::Draw(combine(
         first,
         (start..end).map(|n| {
+            let command = f.core.commands[n].as_ref().unwrap();
+            let Operation::Draw(draw) = &command.operation else {
+                unreachable!()
+            };
             (
-                draw_at(f, n).unwrap(),
-                f.vertex_ranges[n]
+                draw,
+                command
+                    .vertices
                     .as_ref()
                     .map(|range| &f.vertices[range.clone()]),
             )
         }),
     ));
-    let mut part = f.part;
+    let mut cursor = f.core.cursor;
     let count = scissors.as_ref().map_or(1, |clips| clips.len());
-    while part < count {
-        let clip = scissors.as_ref().map(|clips| clips[part]);
+    while cursor.scissors < count {
+        let clip = scissors.as_ref().map(|clips| clips[cursor.scissors]);
         let before = env.ext.get::<State>().frames.gpu_draws;
         env.ext
             .get_mut::<State>()
@@ -245,7 +234,7 @@ pub(super) fn run(env: &mut Env<'_>, owner: Id) -> Result<bool, Error> {
             .as_mut()
             .unwrap()
             .set_clip(clip);
-        let result = execute_gpu(env, &operation);
+        let result = Payload::encode(env, &operation);
         env.ext
             .get_mut::<State>()
             .gpu
@@ -257,29 +246,22 @@ pub(super) fn run(env: &mut Env<'_>, owner: Id) -> Result<bool, Error> {
         counters.uncoalesced_gpu_draws += (counters.gpu_draws - before) * (end - start - 1) as u64;
         for n in start..end {
             let f = frame(env, owner);
-            let operation = std::mem::replace(&mut f.commands[n], Operation::Consumed);
-            let node = f.nodes[n];
-            submitted(env, owner, node, &operation, clip);
-            frame(env, owner).commands[n] = operation;
+            let node = f.core.node(n);
+            let command = f.core.commands[n].take().unwrap();
+            submitted(env, owner, node, &command.operation, clip);
+            frame(env, owner).core.commands[n] = Some(command);
         }
-        part += 1;
-        frame(env, owner).part = part;
+        cursor.scissors += 1;
+        let f = frame(env, owner);
+        f.core.retire(f.plan.as_ref().unwrap(), cursor);
     }
     let f = frame(env, owner);
-    for n in start..end {
-        if let Some(node) = f.nodes[n] {
-            f.damage.executed(
-                node,
-                f.select
-                    .as_ref()
-                    .and_then(|s| s.get(&node))
-                    .map(Vec::as_slice),
-            );
-        }
-        f.commands[n] = Operation::Consumed;
-    }
-    f.head = end;
-    f.part = 0;
-    f.partial = true;
+    f.core.retire(
+        f.plan.as_ref().unwrap(),
+        Cursor {
+            ops: end,
+            scissors: 0,
+        },
+    );
     Ok(true)
 }
