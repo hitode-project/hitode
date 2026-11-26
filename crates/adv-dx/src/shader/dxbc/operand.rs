@@ -71,18 +71,19 @@ impl<'a> Operand<'a> {
         }
         let literals = match kind {
             D3D10_SB_OPERAND_TYPE_IMMEDIATE32 | D3D10_SB_OPERAND_TYPE_IMMEDIATE64 => {
-                let count = match components {
-                    D3D10_SB_OPERAND_0_COMPONENT => 0,
-                    D3D10_SB_OPERAND_1_COMPONENT => 1,
-                    D3D10_SB_OPERAND_4_COMPONENT => 4,
-                    _ => return Err(Error::OperandComponents),
-                };
-                let width = if kind == D3D10_SB_OPERAND_TYPE_IMMEDIATE64 {
+                let words_per_scalar = if kind == D3D10_SB_OPERAND_TYPE_IMMEDIATE64 {
                     2
                 } else {
                     1
                 };
-                take_words(words, count * width)?
+                let count = match components {
+                    D3D10_SB_OPERAND_0_COMPONENT => 0,
+                    D3D10_SB_OPERAND_1_COMPONENT => words_per_scalar,
+                    // Four register lanes hold two 64-bit values or four 32-bit values.
+                    D3D10_SB_OPERAND_4_COMPONENT => 4,
+                    _ => return Err(Error::OperandComponents),
+                };
+                take_words(words, count)?
             }
             _ => &[],
         };

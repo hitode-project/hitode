@@ -277,8 +277,21 @@ fn verify_declaration(decl: &Declaration) -> Result<(), Error> {
         Some(2)
     } else if matches!(decl.opcode, DclIndexableTemp | DclThreadGroup) {
         Some(3)
-    } else if matches!(decl.opcode, DclFunctionTable | DclInterface) {
-        None
+    } else if decl.opcode == DclFunctionTable {
+        match decl.data.as_slice() {
+            [_, count, ids @ ..] if ids.len() == *count as usize => None,
+            _ => return Err(Error::Invalid("function table declaration")),
+        }
+    } else if decl.opcode == DclInterface {
+        use crate::shader::dxbc::fields::decode_interface_table_length;
+        match decl.data.as_slice() {
+            [_, _, lengths, tables @ ..]
+                if tables.len() == decode_interface_table_length(*lengths) as usize =>
+            {
+                None
+            }
+            _ => return Err(Error::Invalid("interface declaration")),
+        }
     } else {
         Some(0)
     };

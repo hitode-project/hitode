@@ -124,6 +124,11 @@ fn operation(op: &Instruction) -> String {
     if let Some(returns) = op.resource.returns {
         write!(name, "{}", returns_string(returns)).unwrap();
     }
+    if op.opcode == SampleInfo
+        && decode_instruction_return_type(op.controls) == D3D10_SB_INSTRUCTION_RETURN_UINT
+    {
+        name.push_str("_uint");
+    }
     if op.opcode == Resinfo {
         match decode_resinfo_instruction_return_type(op.controls) {
             D3D10_SB_RESINFO_INSTRUCTION_RETURN_UINT => name.push_str("_uint"),
@@ -144,19 +149,24 @@ fn operation(op: &Instruction) -> String {
                 .map(|(op, &ty)| operand(op, ty, false)),
         )
         .collect();
-    let separator = if op.opcode == Mov { "," } else { ", " };
-    // The typeless mov uses a compact literal, but its operand separator matches other instructions.
-    let operands = if op.opcode == Mov
-        && op
-            .sources
-            .first()
-            .is_some_and(|source| matches!(source.value, OperandValue::Immediate(_)))
+    let mut operands = operands;
+    if matches!(op.opcode, Mov | StoreUavTyped) {
+        // These operands use the typeless literal separator.
+        operands[1] = operands[1].replace(", ", ",");
+    } else if op.opcode == Movc {
+        for value in &mut operands[2..] {
+            *value = value.replace(", ", ",");
+        }
+    }
+    if matches!(op.opcode, Gather4PoC | Gather4PoCFeedback)
+        && let OperandValue::Immediate(value) = op.sources[4].value
     {
-        let literal = operands[1].replace(", ", separator);
-        format!("{}, {literal}", operands[0])
-    } else {
-        operands.join(", ")
-    };
+        *operands.last_mut().unwrap() = format!("l(0x{:08x})", value[0]);
+    }
+    if let Some(function) = op.interface_function {
+        write!(operands[0], "[{function}]").unwrap();
+    }
+    let operands = operands.join(", ");
     format!("{name} {operands}")
 }
 
@@ -169,6 +179,39 @@ fn declaration(decl: &Declaration) -> String {
         .as_ref()
         .map(|op| operand(op, ValueType::Bits, true))
         .unwrap_or_default();
+    if matches!(
+        decl.opcode,
+        DclFunctionBody | DclFunctionTable | DclInterface
+    ) {
+        let references = |prefix, ids: &[u32]| {
+            ids.iter()
+                .map(|id| format!("{prefix}{id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        return match decl.opcode {
+            DclFunctionBody => format!("{name} fb{}", decl.data[0]),
+            DclFunctionTable => format!(
+                "{name} ft{} = {{{}}}",
+                decl.data[0],
+                references("fb", &decl.data[2..])
+            ),
+            DclInterface => format!(
+                "{name} fp{}[{}][{}] = {{{}}}",
+                decl.data[0],
+                decode_interface_array_length(decl.data[2]),
+                decl.data[1],
+                references("ft", &decl.data[3..])
+            ),
+            _ => unreachable!(),
+        };
+    }
+    if decl.opcode == DclIndexableTemp {
+        let [index, rows, columns] = decl.data[..] else {
+            unreachable!("verified indexable temporary declaration");
+        };
+        return format!("dcl_indexableTemp x{index}[{rows}], {columns}");
+    }
     if decl.opcode == DclGlobalFlags {
         let names = [
             "refactoringAllowed",
@@ -177,8 +220,8 @@ fn declaration(decl: &Declaration) -> String {
             "enableRawAndStructuredBuffers",
             "skipOptimization",
             "enableMinimumPrecision",
-            "enableDoubleExtensions",
-            "enableShaderExtensions",
+            "enable11_1DoubleExtensions",
+            "enable11_1ShaderExtensions",
             "allResourcesBound",
         ];
         let flags: Vec<_> = names
@@ -224,7 +267,7 @@ fn declaration(decl: &Declaration) -> String {
                     "dcl_uav_typed"
                 };
                 let samples = if samples != 0 {
-                    format!(" ({samples})")
+                    format!("({samples})")
                 } else {
                     String::new()
                 };
@@ -247,7 +290,13 @@ fn declaration(decl: &Declaration) -> String {
                 if binding.register == Register::ThreadGroupSharedMemory {
                     format!("dcl_tgsm_structured {argument}, {stride}, {elements}")
                 } else if binding.register == Register::UnorderedAccessView {
-                    format!("dcl_uav_structured {argument}, {stride}")
+                    let counter = if binding.flags & D3D11_SB_UAV_HAS_ORDER_PRESERVING_COUNTER != 0
+                    {
+                        "_opc"
+                    } else {
+                        ""
+                    };
+                    format!("dcl_uav_structured{counter} {argument}, {stride}")
                 } else {
                     format!("dcl_resource_structured {argument}, {stride}")
                 }
@@ -551,7 +600,7 @@ fn system_value(value: u32) -> &'static str {
         3 => "cullDistance",
         4 => "renderTargetArrayIndex",
         5 => "viewportArrayIndex",
-        6 => "vertexID",
+        6 => "vertex_id",
         7 => "primitiveID",
         8 => "instanceID",
         9 => "isFrontFace",

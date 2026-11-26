@@ -536,6 +536,7 @@ Binding changes MUST NOT start speculative preparation for transient shader pair
 SM4–5 WGSL emission and scalar execution MUST apply the same DXBC arithmetic rules.
 DXBC floating-point arithmetic MUST flush denormals to sign-preserved zero where the instruction requires it.
 DXBC `f32tof16` MUST round toward zero and clamp finite overflow to the largest finite half.
+SM4–5 WGSL emission and scalar execution MUST agree on typed view values, resource queries, and UAV counter operations.
 **Verification**: Test
 
 ## Surface copies
