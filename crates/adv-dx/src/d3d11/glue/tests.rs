@@ -36,11 +36,8 @@ fn machine() -> Machine<JitCpu> {
     assert_eq!(
         excluded,
         [
-            "ID3D11Device1::CreateGeometryShader",
-            "ID3D11Device1::CreateGeometryShaderWithStreamOutput",
             "ID3D11Device1::CreateHullShader",
             "ID3D11Device1::CreateDomainShader",
-            "ID3D11Device1::CreateClassLinkage",
             "ID3D11Device1::CreateDeferredContext",
             "ID3D11Device1::CreateDeferredContext1",
             "ID3D11Device1::CreateDeviceContextState",

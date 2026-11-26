@@ -3,6 +3,7 @@ mod checksum;
 mod container;
 mod disassemble;
 pub use disassemble::disassemble;
+pub mod linkage;
 mod lower;
 pub use container::{Container, ParseError, parse};
 pub mod fields;

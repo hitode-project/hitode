@@ -9,7 +9,7 @@ pub(crate) fn prepare(module: &Module) -> Result<(Module, Reflection), Error> {
     verify(module)?;
     let mut reflection = analyze(module);
     let mut module = module.clone();
-    if inline_calls(&mut module, reflection.temporary_count)? {
+    if inline_calls(&mut module, reflection.temporary_count, None)? {
         reflection = analyze(&module);
     }
     flush_denormals(&mut module, &reflection);
@@ -101,22 +101,39 @@ fn instructions(block: &mut Block, f: &mut impl FnMut(&mut Instruction)) {
     }
 }
 
-fn static_label(statement: &Statement) -> Option<u64> {
+const FUNCTION_BODY: u64 = 1 << 32;
+
+/// Replace interface calls with the class instance's selected function body.
+pub fn specialize_interfaces(module: &Module, tables: &[u32]) -> Result<Module, Error> {
+    verify(module)?;
+    let mut module = module.clone();
+    let temporary_count = analyze(&module).temporary_count;
+    inline_calls(&mut module, temporary_count, Some(tables))?;
+    verify(&module)?;
+    Ok(module)
+}
+
+fn static_label(statement: &Statement, linkage: bool) -> Option<u64> {
     let Statement::Execute(op) = statement else {
         return None;
     };
     match (op.opcode, op.sources.first()?.register()?) {
         (Opcode::Label, (Register::Label, [Index::Direct(label)])) => Some(*label),
+        (Opcode::Label, (Register::FunctionBody, [Index::Direct(body)])) if linkage => {
+            Some(FUNCTION_BODY | *body)
+        }
         _ => None,
     }
 }
 
-fn inline_calls(module: &mut Module, flag: u32) -> Result<bool, Error> {
+fn inline_calls(module: &mut Module, flag: u32, tables: Option<&[u32]>) -> Result<bool, Error> {
     let mut labels = module
         .body
         .iter()
         .enumerate()
-        .filter_map(|(index, stmt)| static_label(stmt).map(|label| (index, label)))
+        .filter_map(|(index, stmt)| {
+            static_label(stmt, tables.is_some()).map(|label| (index, label))
+        })
         .peekable();
     let Some(&(entry_end, _)) = labels.peek() else {
         return Ok(false);
@@ -128,6 +145,8 @@ fn inline_calls(module: &mut Module, flag: u32) -> Result<bool, Error> {
     }
     let mut inliner = CallInliner {
         routines,
+        tables,
+        declarations: &module.body[..entry_end],
         flag: OperandValue::Register {
             register: Register::Temp,
             indices: vec![Index::Direct(u64::from(flag))],
@@ -154,12 +173,18 @@ fn inline_calls(module: &mut Module, flag: u32) -> Result<bool, Error> {
             }),
         );
     }
+    if tables.is_some() {
+        body.retain(|statement| !matches!(statement, Statement::Declare(decl)
+            if matches!(decl.opcode, Opcode::DclInterface | Opcode::DclFunctionBody | Opcode::DclFunctionTable)));
+    }
     module.body = body;
     Ok(true)
 }
 
 struct CallInliner<'a> {
     routines: std::collections::HashMap<u64, &'a [Statement]>,
+    tables: Option<&'a [u32]>,
+    declarations: &'a [Statement],
     flag: OperandValue,
     active: Vec<u64>,
     remaining: usize,
@@ -214,17 +239,92 @@ impl CallInliner<'_> {
         else {
             return Err(Error::Invalid("call target"));
         };
+        self.body(*label)
+    }
+
+    fn interface_call(&mut self, instruction: &Instruction) -> Result<Block, Error> {
+        let Some((Register::Interface, [Index::Direct(base), index])) =
+            instruction.sources[0].register()
+        else {
+            return Err(Error::Invalid("interface call operand"));
+        };
+        let invalid = Error::Invalid("interface call target");
+        let function = instruction.interface_function.unwrap() as usize;
+        let interface = self
+            .declarations
+            .iter()
+            .find_map(|stmt| match stmt {
+                Statement::Declare(decl)
+                    if decl.opcode == Opcode::DclInterface && u64::from(decl.data[0]) == *base =>
+                {
+                    Some(decl.data.as_slice())
+                }
+                _ => None,
+            })
+            .ok_or(invalid)?;
+        let count = crate::shader::dxbc::fields::decode_interface_array_length(interface[2]);
+        let base = *base as usize;
+        let tables = self
+            .tables
+            .unwrap()
+            .get(base..base + count as usize)
+            .ok_or(invalid)?;
+        let body = |table| {
+            if !interface[3..].contains(&table) {
+                return Err(invalid);
+            }
+            self.declarations
+                .iter()
+                .find_map(|stmt| match stmt {
+                    Statement::Declare(decl)
+                        if decl.opcode == Opcode::DclFunctionTable && decl.data[0] == table =>
+                    {
+                        decl.data.get(2 + function)
+                    }
+                    _ => None,
+                })
+                .copied()
+                .map(|id| FUNCTION_BODY | u64::from(id))
+                .ok_or(invalid)
+        };
+        match index {
+            Index::Direct(index) => self.body(body(*tables.get(*index as usize).ok_or(invalid)?)?),
+            Index::Relative { base, register } => {
+                let targets = tables
+                    .iter()
+                    .copied()
+                    .map(body)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let cases = targets
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, target)| {
+                        Ok(Case {
+                            value: Some((index as u32).wrapping_sub(*base as u32)),
+                            body: self.body(target)?,
+                        })
+                    })
+                    .collect::<Result<_, Error>>()?;
+                Ok(vec![Statement::Switch {
+                    selector: (**register).clone(),
+                    cases,
+                }])
+            }
+        }
+    }
+
+    fn body(&mut self, label: u64) -> Result<Block, Error> {
         let routine = *self
             .routines
-            .get(label)
+            .get(&label)
             .ok_or(Error::Invalid("call target"))?;
         if self.active.len() == crate::shader::MAX_FLOW_DEPTH {
             return Ok(Vec::new());
         }
-        if self.active.contains(label) {
+        if self.active.contains(&label) {
             return Err(Error::Invalid("recursive call"));
         }
-        self.active.push(*label);
+        self.active.push(label);
         let mut body = self.block(routine)?;
         self.active.pop();
         body.push(Statement::Execute(call_instruction(
@@ -251,6 +351,11 @@ impl CallInliner<'_> {
                     } else {
                         output.extend(body);
                     }
+                }
+                Statement::Execute(op)
+                    if self.tables.is_some() && op.opcode == Opcode::InterfaceCall =>
+                {
+                    output.extend(self.interface_call(op)?);
                 }
                 Statement::Execute(op) if !self.active.is_empty() && op.opcode == Opcode::Ret => {
                     output.extend(self.return_block());

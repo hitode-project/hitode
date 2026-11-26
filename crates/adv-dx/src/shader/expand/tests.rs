@@ -194,7 +194,7 @@ fn geometry() -> Module {
     let mut body = vec![
         declaration(
             Opcode::DclGsOutputPrimitiveTopology,
-            D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            encode_gs_output_primitive_topology(D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP),
             vec![],
         ),
         declaration(Opcode::DclMaxOutputVertexCount, 0, vec![8]),
@@ -369,12 +369,15 @@ fn draw(image: &Image, vertex: Arc<ModernShader>, fragment: Arc<ModernShader>) -
 fn inputs(gpu: &Gpu, index: &[u32]) -> Inputs {
     Inputs {
         primitives: index.len() as u32 / 3,
-        vertices: upload(gpu, &[0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]),
-        indices: upload(gpu, index),
+        vertices: Some(upload(
+            gpu,
+            &[0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+        )),
+        indices: Some(upload(gpu, index)),
         vertex: SlotBindings::default(),
         geometry: SlotBindings::default(),
         statistics: None,
-        stream_output: None,
+        stream_output: Vec::new(),
     }
 }
 
@@ -574,7 +577,7 @@ fn geometry_cuts_instances_and_stream_output_keep_primitive_order() {
         Memory::Readback,
     );
     let mut inputs = inputs(&gpu, &[0, 1, 2]);
-    inputs.stream_output = Some((vec![target.clone()], filled.clone()));
+    inputs.stream_output = vec![(target.clone(), filled.clone())];
     inputs.statistics = Some(stats.clone());
     let command = plan.command(&gpu, inputs, Vec::new()).unwrap();
     gpu.expand(command).unwrap();
@@ -821,12 +824,12 @@ fn domain_points_are_shaded_once_and_streamed_as_a_list() {
     let filled = buffer(&gpu, &[0], BufferUsage::STORAGE, Memory::Readback);
     let input = Inputs {
         primitives: indices.len() as u32 / 3,
-        vertices: upload(&gpu, bytemuck::cast_slice(&vertices)),
-        indices: upload(&gpu, &indices),
+        vertices: Some(upload(&gpu, bytemuck::cast_slice(&vertices))),
+        indices: Some(upload(&gpu, &indices)),
         vertex: SlotBindings::default(),
         geometry: SlotBindings::default(),
         statistics: None,
-        stream_output: Some((vec![target.clone()], filled.clone())),
+        stream_output: vec![(target.clone(), filled.clone())],
     };
     let command = plan.command(&gpu, input, vec![]).unwrap();
     assert_eq!(command.prelude.as_ref().unwrap().groups, [1, 1, 1]);

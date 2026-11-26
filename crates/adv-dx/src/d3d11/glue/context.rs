@@ -4,7 +4,8 @@ use crate::d3d11::{
     desc::Bind,
     state::{
         BoundView, CONSTANTS, ConstantBuffer, ContextState, IndexBuffer, RENDER_TARGETS, SAMPLERS,
-        SRVS, STREAM_OUTPUTS, STREAMS, Snapshot, Stage, UAVS, VIEWPORTS, VertexBuffer, ViewSlot,
+        SRVS, STREAM_OUTPUTS, STREAMS, Snapshot, Stage, StreamOutput, UAVS, VIEWPORTS,
+        VertexBuffer, ViewSlot,
     },
 };
 use std::ops::Range;
@@ -56,7 +57,7 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     OMSetBlendState => om_set_blend State,
     OMSetDepthStencilState => om_set_depth State,
     SOSetTargets => so_set_targets State,
-    DrawAuto => draw_auto State,
+    DrawAuto => draw_auto Implement,
     DrawIndexedInstancedIndirect => draw_indexed_indirect Implement,
     DrawInstancedIndirect => draw_indirect Implement,
     Dispatch => dispatch Implement,
@@ -232,11 +233,6 @@ stage_methods!(Compute,
     cs_get_constants1 => get_constants1,
 );
 
-fn draw_auto(_: &mut Env<'_>) -> Outcome {
-    // The immediate context has no stream-output position.
-    Outcome::Return(0)
-}
-
 fn excluded_command_list(env: &mut Env<'_>) -> Outcome {
     adv_abi::stub::warn_unavailable(env, "ExecuteCommandList", "deferred contexts");
     Outcome::Return(0)
@@ -404,14 +400,21 @@ fn ia_set_vertices(env: &mut Env<'_>) -> Outcome {
         let buffers = array::<u32>(env, buffers, count)?;
         let strides = array::<u32>(env, strides, count)?;
         let offsets = array::<u32>(env, offsets, count)?;
+        let output = groups(env)?.so.buffers;
         let vertices: Vec<_> = buffers
             .into_iter()
             .zip(strides)
             .zip(offsets)
-            .map(|((buffer, stride), offset)| VertexBuffer {
-                buffer: buffer_pointer(env, buffer, Bind::VERTEX),
-                stride,
-                offset,
+            .map(|((buffer, stride), offset)| {
+                if output.contains(&buffer) {
+                    VertexBuffer::default()
+                } else {
+                    VertexBuffer {
+                        buffer: buffer_pointer(env, buffer, Bind::VERTEX),
+                        stride,
+                        offset,
+                    }
+                }
             })
             .collect();
         let old = groups(env)?.ia.clone();
@@ -491,29 +494,91 @@ fn ia_get_topology(env: &mut Env<'_>) -> Outcome {
 
 fn set_shader(env: &mut Env<'_>, stage: Stage) -> Outcome {
     use crate::shader::ir::Stage as ShaderStage;
-    let old = match groups(env) {
-        Ok(groups) => groups.stages[stage as usize].shader,
-        Err(error) => return Outcome::Return(error.hresult()),
-    };
-    let new = object_pointer(env, env.arg(1), |object| {
-        object.shader().is_some_and(|shader| {
-            matches!(
-                (stage, shader.module().stage),
-                (Stage::Vertex, ShaderStage::Vertex)
-                    | (Stage::Pixel, ShaderStage::Pixel)
-                    | (Stage::Compute, ShaderStage::Compute)
-            )
-        })
-    });
-    replace(env, [(old, new)], |state| state.set_shader(stage, new))
+    let result = (|| {
+        let old = groups(env)?.stages[stage as usize].clone();
+        let new = object_pointer(env, env.arg(1), |object| {
+            object.shader().is_some_and(|shader| {
+                matches!(
+                    (stage, shader.stage),
+                    (Stage::Vertex, ShaderStage::Vertex)
+                        | (Stage::Geometry, ShaderStage::Geometry)
+                        | (Stage::Hull, ShaderStage::Hull)
+                        | (Stage::Domain, ShaderStage::Domain)
+                        | (Stage::Pixel, ShaderStage::Pixel)
+                        | (Stage::Compute, ShaderStage::Compute)
+                )
+            })
+        });
+        if env.arg(3) > 256 {
+            return Err(Error::InvalidArgument);
+        }
+        let classes = if new == 0 {
+            Vec::new()
+        } else {
+            array::<u32>(env, env.arg(2), env.arg(3))?
+        };
+        if old.shader == new && old.classes == classes {
+            return Ok(None);
+        }
+        let specialized = if let Some(object) = owned(env, new) {
+            let shader = object.shader().unwrap();
+            if shader.linkage.is_some() {
+                let linkage = object.shader_linkage().unwrap();
+                let names = classes
+                    .iter()
+                    .map(|&pointer| {
+                        let instance = owned(env, pointer)
+                            .and_then(Object::class_instance)
+                            .filter(|instance| instance.linkage == linkage)
+                            .ok_or(Error::InvalidArgument)?;
+                        Ok(instance.class.as_slice())
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                Some(std::sync::Arc::new(shader.specialize(&names)?))
+            } else {
+                if !classes.is_empty() {
+                    return Err(Error::InvalidArgument);
+                }
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Some((old, new, classes, specialized)))
+    })();
+    match result {
+        Ok(Some((old, new, classes, specialized))) => {
+            let changed = std::iter::once((old.shader, new))
+                .chain((0..old.classes.len().max(classes.len())).map(|index| {
+                    (
+                        old.classes.get(index).copied().unwrap_or(0),
+                        classes.get(index).copied().unwrap_or(0),
+                    )
+                }))
+                .collect::<smallvec::SmallVec<[_; 1]>>();
+            replace(env, changed, |state| {
+                state.set_shader(stage, new, classes, specialized)
+            })
+        }
+        Ok(None) => Outcome::Return(0),
+        Err(error) => Outcome::Return(error.hresult()),
+    }
 }
 
 fn get_shader(env: &mut Env<'_>, stage: Stage) -> Outcome {
-    let (out, count) = (env.arg(1), env.arg(3));
+    let (out, instances, count) = (env.arg(1), env.arg(2), env.arg(3));
     call((|| {
-        let shader = groups(env)?.stages[stage as usize].shader;
-        reference_array(env, out, &[shader])?;
-        optional(env, count, 0u32)
+        let stage = groups(env)?.stages[stage as usize].clone();
+        reference_array(env, out, &[stage.shader])?;
+        if instances != 0 {
+            let capacity = read::<u32>(env, count)? as usize;
+            reference_array(
+                env,
+                instances,
+                &stage.classes[..stage.classes.len().min(capacity)],
+            )?;
+        }
+        optional(env, count, stage.classes.len() as u32)
     })())
 }
 
@@ -779,7 +844,11 @@ fn om_set_uavs(env: &mut Env<'_>) -> Outcome {
         };
         let counters = binds.len();
         if uavs != u32::MAX {
-            let slots = range(first, uavs, UAVS)?;
+            let length = device::report(env, owner(env)?)?
+                .level
+                .limit(crate::d3d11::caps::Requirement::OutputMergerUavSlots)
+                as usize;
+            let slots = range(first, uavs, length)?;
             binds.extend(view_inputs(env, slots, pointers, ViewSlot::om_uav)?);
         }
         Ok((binds, counters))
@@ -967,15 +1036,73 @@ fn get_predication(env: &mut Env<'_>) -> Outcome {
     })())
 }
 
-fn so_set_targets(_: &mut Env<'_>) -> Outcome {
-    Outcome::Return(0)
+fn so_set_targets(env: &mut Env<'_>) -> Outcome {
+    let (count, targets, offsets) = (env.arg(1), env.arg(2), env.arg(3));
+    let result = (|| {
+        let slots = range(0, count, STREAM_OUTPUTS)?;
+        let pointers = array::<u32>(env, targets, count)?;
+        let offsets = array::<u32>(env, offsets, count)?;
+        let mut new = StreamOutput::default();
+        for ((slot, pointer), offset) in slots.zip(pointers).zip(offsets) {
+            let pointer = buffer_pointer(env, pointer, Bind::STREAM_OUTPUT);
+            if let Some(Resource::Buffer(buffer)) = owned(env, pointer).and_then(Object::resource) {
+                if offset != u32::MAX && (offset % 4 != 0 || offset > buffer.size()) {
+                    return Err(Error::InvalidArgument);
+                }
+                if new.buffers.contains(&pointer) {
+                    return Err(Error::InvalidArgument);
+                }
+                new.buffers[slot] = pointer;
+                new.offsets[slot] = offset;
+            }
+        }
+        let old = groups(env)?.clone();
+        let mut vertices = old.ia.vertices;
+        for vertex in &mut vertices {
+            if vertex.buffer != 0 && new.buffers.contains(&vertex.buffer) {
+                *vertex = VertexBuffer::default();
+            }
+        }
+        let index = if new.buffers.contains(&old.ia.indices.buffer) {
+            IndexBuffer::default()
+        } else {
+            old.ia.indices
+        };
+        #[cfg(feature = "gpu")]
+        gpu::reset_stream_cursors(env, &new)?;
+        Ok((old, new, vertices, index))
+    })();
+    match result {
+        Ok((old, new, vertices, index)) => {
+            let changes = old
+                .so
+                .buffers
+                .into_iter()
+                .zip(new.buffers)
+                .chain(
+                    old.ia
+                        .vertices
+                        .iter()
+                        .zip(&vertices)
+                        .map(|(old, new)| (old.buffer, new.buffer)),
+                )
+                .chain([(old.ia.indices.buffer, index.buffer)]);
+            replace(env, changes, |state| {
+                state.set_vertices(0, &vertices);
+                state.set_indices(index);
+                state.set_stream_output(new);
+            })
+        }
+        Err(error) => Outcome::Return(error.hresult()),
+    }
 }
 
 fn so_get_targets(env: &mut Env<'_>) -> Outcome {
     let (count, output) = (env.arg(1), env.arg(2));
     call((|| {
         let slots = range(0, count, STREAM_OUTPUTS)?;
-        reference_array(env, output, &[0; STREAM_OUTPUTS][slots])
+        let buffers = groups(env)?.so.buffers;
+        reference_array(env, output, &buffers[slots])
     })())
 }
 
@@ -1120,7 +1247,7 @@ fn discard(_: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 
-gpu_methods!(clear_view, copy_structure_count);
+gpu_methods!(clear_view, copy_structure_count, draw_auto);
 
 fn reset_counters(
     env: &mut Env<'_>,

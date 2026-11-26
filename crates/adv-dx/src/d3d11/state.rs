@@ -123,6 +123,8 @@ pub struct InputAssembler {
 #[derive(Clone)]
 pub struct ShaderStage {
     pub shader: u32,
+    pub classes: Vec<u32>,
+    pub specialized: Option<Arc<super::desc::Shader>>,
     pub constants: [ConstantBuffer; CONSTANTS],
     pub samplers: [u32; SAMPLERS],
     srvs: [Option<BoundView>; SRVS],
@@ -133,6 +135,8 @@ impl Default for ShaderStage {
     fn default() -> Self {
         Self {
             shader: 0,
+            classes: Vec::new(),
+            specialized: None,
             constants: Default::default(),
             samplers: Default::default(),
             srvs: [const { None }; SRVS],
@@ -214,6 +218,7 @@ impl Snapshot {
             .for_each(|vertex| visit(vertex.buffer));
         for stage in &self.stages {
             visit(stage.shader);
+            stage.classes.iter().copied().for_each(&mut visit);
             stage
                 .constants
                 .iter()
@@ -371,10 +376,26 @@ impl ContextState {
         }
     }
 
-    pub fn set_shader(&mut self, stage: Stage, shader: u32) {
+    pub fn set_stream_output(&mut self, output: StreamOutput) {
+        let current = &mut self.groups.so;
+        if current.buffers != output.buffers || current.offsets != output.offsets {
+            *Arc::make_mut(current) = output;
+        }
+    }
+
+    pub fn set_shader(
+        &mut self,
+        stage: Stage,
+        shader: u32,
+        classes: Vec<u32>,
+        specialized: Option<Arc<super::desc::Shader>>,
+    ) {
         let state = &mut self.groups.stages[stage as usize];
-        if state.shader != shader {
-            Arc::make_mut(state).shader = shader;
+        if state.shader != shader || state.classes != classes {
+            let state = Arc::make_mut(state);
+            state.shader = shader;
+            state.classes = classes;
+            state.specialized = specialized;
         }
     }
 

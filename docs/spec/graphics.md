@@ -2,7 +2,7 @@
 
 ID prefix: GFX
 
-This spec covers shared CPU compositing, the DirectDraw and Direct3D 9 API front ends, and the Direct3D 11 fixed-function tessellation core. It includes capabilities, shaders, vertex input, samplers, buffers, caches and numerical behavior. `adv-dx` and the GPU renderer in `adv-device` implement them.
+This spec covers shared CPU compositing, the DirectDraw and Direct3D 9 API front ends, and the private Direct3D 11 API front end. It includes capabilities, shaders, vertex input, samplers, buffers, caches and numerical behavior. `adv-dx` and the GPU renderer in `adv-device` implement them.
 
 ## DirectDraw
 
@@ -482,6 +482,23 @@ Pretransformed draws MUST retain index order.
 **Rule**: SetFVF MUST store any nonzero FVF as state, replacing a bound declaration, and zero MUST succeed without change. After SetFVF, GetVertexDeclaration MUST return one device-retained declaration per FVF, built by the D3D9 FVF element mapping. Draws MUST reject an FVF without a supported layout.
 **Verification**: Test
 **Basis**: Wine d3d9 `test_fvf_decl_conversion` and `test_fvf_decl_management`, which pass on Windows.
+
+## Direct3D 11 stages
+
+### GFX-STAGE-1 Stream output
+
+**Rule**: Each stream output buffer MUST track its own byte cursor and emitted vertex count. Append bindings MUST preserve both values. `DrawAuto` MUST consume the vertex count from input assembler slot zero.
+**Verification**: Test
+
+### GFX-STAGE-2 Indirect dispatch
+
+**Rule**: Indirect dispatch MUST consume its group counts at execution in recording order.
+**Verification**: Test
+
+### GFX-STAGE-3 Class linkage
+
+**Rule**: Each bound class instance MUST select the interface function table supported by its class. Draws MUST use the class instances captured at shader binding.
+**Verification**: Test
 
 ## Samplers
 

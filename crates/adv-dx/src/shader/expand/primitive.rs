@@ -51,14 +51,16 @@ impl<'a> Emitter<'a> {
                     shader.ir,
                     pulled.outputs,
                     Some(pulled),
-                    Topology::from_geometry(topology)?,
+                    Topology::from_geometry(decode_gs_output_primitive_topology(topology))?,
                     max_vertices,
                     instances,
                     shader.variant,
                 )
             } else {
                 let shader = match plan.source {
-                    Source::Vertex(shader) | Source::Domain { shader, .. } => shader,
+                    Source::Vertex(shader)
+                    | Source::InputAssembler { shader, .. }
+                    | Source::Domain { shader, .. } => shader,
                 };
                 (
                     input_ir,
@@ -262,7 +264,14 @@ impl<'a> Emitter<'a> {
         } else {
             let arity = self.topology.vertices();
             let values = (0..arity)
-                .map(|j| format!("dx_input(primitive, {j}u)"))
+                .map(|j| {
+                    let corner = match self.plan.input_vertices {
+                        4 if arity == 2 => j + 1,
+                        6 if arity == 3 => j * 2,
+                        _ => j,
+                    };
+                    format!("dx_input(primitive, {corner}u)")
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             writeln!(
@@ -558,7 +567,15 @@ impl<'a> Emitter<'a> {
             source
         };
         let mut prefix = args(false);
-        storage(&mut prefix, FILLED_SLOT, "dx_filled", "array<u32>", true);
+        for i in 0..target_count {
+            storage(
+                &mut prefix,
+                FILLED_BASE + i as u32,
+                &format!("filled{i}"),
+                "array<u32>",
+                true,
+            );
+        }
         entry(&mut prefix, "prefix_main", 1);
         let arity = self.topology.vertices();
         let slots = self.list_slots();
@@ -596,7 +613,7 @@ impl<'a> Emitter<'a> {
                 .iter()
                 .map(|(i, target)| {
                     format!(
-                        "dx_filled[{i}] / 4u + {}u <= arrayLength(&target{i})",
+                        "filled{i}[0] / 4u + {}u <= arrayLength(&target{i})",
                         arity as usize * target.elements.len(),
                     )
                 })
@@ -611,8 +628,9 @@ impl<'a> Emitter<'a> {
                 let stride = target.elements.len();
                 writeln!(
                     prefix,
-                    "dx_offsets[at * {target_count}u + {i}u] = dx_filled[{i}] / 4u;
-                    dx_filled[{i}] += {}u;",
+                    "dx_offsets[at * {target_count}u + {i}u] = filled{i}[0] / 4u;
+                    filled{i}[0] += {}u;
+                    filled{i}[1] += {arity}u;",
                     4 * stride * arity as usize
                 )
                 .unwrap();

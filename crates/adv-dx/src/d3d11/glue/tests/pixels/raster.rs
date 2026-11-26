@@ -665,3 +665,209 @@ fn legacy_shared_handle_keeps_cross_device_aliases_live() {
     );
     assert_eq!(r.machine.cpu.read_u32(OUT).unwrap(), 0);
 }
+
+// spec: GFX-STAGE-1
+#[test]
+fn geometry_stream_output_appends_and_drives_draw_auto_through_guest_vtables() {
+    use adv_abi::types::D3D11_SO_DECLARATION_ENTRY;
+    let mut r = Raster::new();
+    let gs = include_bytes!("../../../../../tests/fixtures/shader-core/gs_5_0.dxbc");
+    r.machine.cpu.write(CODE_BYTES, gs).unwrap();
+    r.machine.cpu.write(ARRAY, b"SV_Position\0").unwrap();
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_SO_DECLARATION_ENTRY {
+            SemanticName: ARRAY,
+            ComponentCount: 4,
+            ..Default::default()
+        },
+    );
+    write_value(&mut r.machine, ARRAY + 16, 16u32);
+    let shader = create_object(
+        &mut r.machine,
+        r.device,
+        14,
+        &[
+            CODE_BYTES,
+            gs.len() as u32,
+            DESCRIPTOR,
+            1,
+            ARRAY + 16,
+            1,
+            u32::MAX,
+            0,
+        ],
+    );
+    r.call(23, &[shader, 0, 0]);
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 112,
+            BindFlags: Bind::STREAM_OUTPUT | Bind::VERTEX,
+            ..Default::default()
+        },
+    );
+    let output = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    write_value(&mut r.machine, ARRAY, [output, 16]);
+    r.call(37, &[1, ARRAY, ARRAY + 4]);
+    r.call(13, &[3, 0]);
+    write_value(&mut r.machine, ARRAY + 4, u32::MAX);
+    r.call(37, &[1, ARRAY, ARRAY + 4]);
+    r.call(13, &[3, 0]);
+    r.call(37, &[0, 0, 0]);
+    r.call(23, &[0, 0, 0]);
+
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 112,
+            Usage: 3,
+            CPUAccessFlags: 0x20000,
+            ..Default::default()
+        },
+    );
+    let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    let actual = r.read(output, staging, 28, 4);
+    let expected = [-1.0f32, 1., 0.5, 1., 3., 1., 0.5, 1., -1., -3., 0.5, 1.].map(f32::to_bits);
+    assert_eq!(&actual[4..16], &expected);
+    assert_eq!(&actual[16..], &expected);
+
+    let vs = include_bytes!("../../../../../tests/fixtures/shader-core/vs_5_0.dxbc");
+    r.shader(12, 11, vs);
+    r.machine.cpu.write(ARRAY, b"POSITION\0TEXCOORD\0").unwrap();
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        [
+            D3D11_INPUT_ELEMENT_DESC {
+                SemanticName: ARRAY,
+                Format: 2,
+                ..Default::default()
+            },
+            D3D11_INPUT_ELEMENT_DESC {
+                SemanticName: ARRAY + 9,
+                Format: 16,
+                ..Default::default()
+            },
+        ],
+    );
+    let layout = create_object(
+        &mut r.machine,
+        r.device,
+        11,
+        &[DESCRIPTOR, 2, CODE_BYTES, vs.len() as u32],
+    );
+    r.call(17, &[layout]);
+    write_value(&mut r.machine, ARRAY, [output, 16, 16]);
+    r.call(18, &[0, 1, ARRAY, ARRAY + 4, ARRAY + 8]);
+    let transform = buffer(&mut r.machine, r.device, Bind::CONSTANT, 32);
+    update_dynamic(
+        &mut r.machine,
+        r.context,
+        transform,
+        &[1.0f32, 1., 1., 1., 0., 0., 0., 0.],
+    );
+    write_value(&mut r.machine, ARRAY, transform);
+    r.call(7, &[0, 1, ARRAY]);
+    r.shader(
+        15,
+        9,
+        include_bytes!("../../../../../tests/fixtures/d3d11/guest_color.dxbc"),
+    );
+    let (target, view, staging) = r.target(4, 28);
+    r.clear(view, [0., 0., 0., 1.]);
+    update_dynamic(
+        &mut r.machine,
+        r.context,
+        r.constants,
+        &[1.0f32, 0., 0., 1.],
+    );
+    write_value(&mut r.machine, DESCRIPTOR, [0i32, 0, 4, 1]);
+    r.call(45, &[1, DESCRIPTOR]);
+    r.call(38, &[]);
+    assert_eq!(r.read(target, staging, 4, 4), [0xff0000ff; 4]);
+}
+
+// spec: GFX-STAGE-2
+#[test]
+fn shader_dispatch_indirect_consumes_recorded_group_counts() {
+    let mut r = Raster::new();
+    r.shader(
+        18,
+        69,
+        include_bytes!("../../../../../tests/fixtures/shader-core/cs_5_0.dxbc"),
+    );
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 64,
+            BindFlags: Bind::UNORDERED,
+            MiscFlags: Misc::STRUCTURED,
+            StructureByteStride: 4,
+            ..Default::default()
+        },
+    );
+    let output = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    let view = create_object(&mut r.machine, r.device, 8, &[output, 0]);
+    write_value(&mut r.machine, ARRAY, view);
+    r.call(68, &[0, 1, ARRAY, 0]);
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            MiscFlags: Misc::INDIRECT,
+            ..Default::default()
+        },
+    );
+    let indirect = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    write_value(&mut r.machine, ARRAY, [99u32, 2, 1, 1]);
+    r.call(48, &[indirect, 0, 0, ARRAY, 0, 0]);
+    r.call(42, &[indirect, 4]);
+
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 64,
+            Usage: 3,
+            CPUAccessFlags: 0x20000,
+            ..Default::default()
+        },
+    );
+    let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    let expected: Vec<_> = (0..16).map(|id: u32| (id ^ 7).pow(2)).collect();
+    assert_eq!(r.read(output, staging, 16, 4), expected);
+}
+
+// spec: GFX-STAGE-3
+#[test]
+fn class_instances_select_interface_bodies_through_guest_vtables() {
+    let mut r = Raster::new();
+    let linkage = create_object(&mut r.machine, r.device, 19, &[]);
+    let bytes = include_bytes!("../../../../../tests/fixtures/shader-core/linkage.dxbc");
+    r.machine.cpu.write(CODE_BYTES, bytes).unwrap();
+    let shader = create_object(
+        &mut r.machine,
+        r.device,
+        15,
+        &[CODE_BYTES, bytes.len() as u32, linkage],
+    );
+    let (target, _, staging) = r.target(1, 2);
+    for (name, expected) in [
+        (b"Blue\0".as_slice(), [0.0f32, 0., 0.5, 1.]),
+        (b"Red\0".as_slice(), [0.5f32, 0., 0., 1.]),
+    ] {
+        r.machine.cpu.write(ARRAY, name).unwrap();
+        let instance = create_object(&mut r.machine, linkage, 8, &[ARRAY, 0, 0, 0, 0]);
+        write_value(&mut r.machine, ARRAY, instance);
+        r.call(9, &[shader, ARRAY, 1]);
+        method(&mut r.machine, instance, 2, &[]);
+        r.draw(0..1, [0.; 4]);
+        assert_eq!(r.read(target, staging, 4, 4), expected.map(f32::to_bits));
+    }
+}

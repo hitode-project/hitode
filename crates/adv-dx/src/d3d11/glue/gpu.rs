@@ -20,8 +20,8 @@ use adv_gpu::{
 };
 use adv_machine::Ext;
 pub(super) use draw::{
-    dispatch, dispatch_indirect, draw, draw_indexed, draw_indexed_indirect, draw_indexed_instanced,
-    draw_indirect, draw_instanced,
+    dispatch, dispatch_indirect, draw, draw_auto, draw_indexed, draw_indexed_indirect,
+    draw_indexed_instanced, draw_indirect, draw_instanced,
 };
 pub(super) use queries::{begin_query, end_query, get_data};
 use std::sync::mpsc::TryRecvError;
@@ -987,6 +987,59 @@ pub(super) fn clear_view(env: &mut Env<'_>) -> Result<(), Error> {
 pub(super) fn check(ext: &Ext) -> Result<(), Error> {
     if let Some(execution) = ext.get::<State>().execution.as_ref() {
         execution.gpu.check()?;
+    }
+    Ok(())
+}
+
+fn stream_cursor(env: &mut Env<'_>, pointer: u32) -> Result<BufferRange, Error> {
+    let cursor = table(env)
+        .get_mut(&mut env.sys.objects, pointer)
+        .and_then(Object::stream_cursor)
+        .ok_or(Error::InvalidArgument)?;
+    let buffer = if let Some(buffer) = cursor {
+        buffer.clone()
+    } else {
+        let usage = BufferUsage::STORAGE | BufferUsage::COPY_DST;
+        let buffer = resource::upload(&execution(env.ext)?.gpu, &[], usage, 8)?;
+        *cursor = Some(buffer.clone());
+        buffer
+    };
+    Ok(BufferRange {
+        buffer,
+        range: 0..8,
+    })
+}
+
+pub(super) fn reset_stream_cursors(
+    env: &mut Env<'_>,
+    output: &super::super::state::StreamOutput,
+) -> Result<(), Error> {
+    if null_device(env)? {
+        return Ok(());
+    }
+    for (&pointer, offset) in output.buffers.iter().zip(output.offsets) {
+        if pointer == 0 || offset == u32::MAX {
+            continue;
+        }
+        let cursor = stream_cursor(env, pointer)?;
+        let key = key(env, pointer, 0);
+        let execution = execution(env.ext)?;
+        for (word, value) in [offset, 0].into_iter().enumerate() {
+            let at = word as u64 * 4;
+            let transfer = ModernTransfer::FillBuffer {
+                destination: BufferRange {
+                    buffer: cursor.buffer.clone(),
+                    range: at..at + 4,
+                },
+                value,
+            };
+            execution.append(
+                Command::Transfer(transfer),
+                extent_rect([4, 1, 1]),
+                None,
+                key,
+            )?;
+        }
     }
     Ok(())
 }

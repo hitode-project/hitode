@@ -26,9 +26,15 @@ impl Backing {
             if bind.contains(Bind::CONSTANT) {
                 usage |= BufferUsage::UNIFORM;
             }
-            if [Bind::VERTEX, Bind::SHADER, Bind::UNORDERED]
-                .into_iter()
-                .any(|bit| bind.contains(bit))
+            if [
+                Bind::VERTEX,
+                Bind::INDEX,
+                Bind::STREAM_OUTPUT,
+                Bind::SHADER,
+                Bind::UNORDERED,
+            ]
+            .into_iter()
+            .any(|bit| bind.contains(bit))
             {
                 usage |= BufferUsage::STORAGE;
             }

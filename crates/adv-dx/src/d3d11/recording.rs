@@ -3,7 +3,7 @@ use crate::record;
 pub use crate::record::ResourceKey;
 use adv_device::{
     gpu::{
-        Dispatch, DispatchArguments, Error, Gpu, ModernDraw, ModernTransfer, QuerySlot,
+        Dispatch, DispatchArguments, Error, Expand, Gpu, ModernDraw, ModernTransfer, QuerySlot,
         SlotBindings,
     },
     surface::Rect,
@@ -18,6 +18,7 @@ pub enum Command {
         fragment: SlotBindings,
         statistics: Option<QuerySlot>,
     },
+    Expand(Box<Expand>),
     Dispatch {
         pipeline: Arc<Dispatch>,
         bindings: SlotBindings,
@@ -63,6 +64,7 @@ impl record::Front for Front {
                 ),
                 None => gpu.draw_modern((**draw).clone(), vertex, fragment),
             },
+            Command::Expand(expansion) => gpu.expand((**expansion).clone()),
             Command::Dispatch {
                 pipeline,
                 bindings,
@@ -111,7 +113,7 @@ impl Recording {
     ) -> Result<(), Error> {
         let op = |payload| {
             let kind = match &payload {
-                Command::Draw { .. } => record::Kind::Draw,
+                Command::Draw { .. } | Command::Expand(_) => record::Kind::Draw,
                 Command::Resolve { .. } => record::Kind::Copy,
                 Command::Dispatch { .. } | Command::GenerateMips(_) | Command::Transfer(_) => {
                     record::Kind::Upload

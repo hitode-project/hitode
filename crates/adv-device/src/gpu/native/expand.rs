@@ -40,6 +40,7 @@ pub enum ExpansionBinding {
     Scratch { slot: u32, region: usize },
 }
 
+#[derive(Clone)]
 pub struct ExpansionDispatch {
     pub dispatch: Dispatch,
     pub slots: SlotBindings,
@@ -48,6 +49,7 @@ pub struct ExpansionDispatch {
     pub workgroup_size: Option<u32>,
 }
 
+#[derive(Clone)]
 pub struct ExpansionDraw {
     pub draw: ModernDraw,
     pub vertex: SlotBindings,
@@ -61,12 +63,14 @@ pub struct ExpansionDraw {
 }
 
 /// Compute once before chunking (for example, one invocation per domain point).
+#[derive(Clone)]
 pub struct ExpansionPrelude {
     pub dispatch: Dispatch,
     pub slots: SlotBindings,
     pub groups: [u32; 3],
 }
 
+#[derive(Clone)]
 pub struct Expand {
     pub primitives: u32,
     pub prelude: Option<ExpansionPrelude>,
