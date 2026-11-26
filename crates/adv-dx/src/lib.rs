@@ -6,6 +6,7 @@
 #[cfg(feature = "gpu")]
 pub mod d3d9;
 pub mod ddraw;
+pub mod dmsynth;
 pub mod dshow;
 pub mod dsound;
 pub(crate) mod pacing;
