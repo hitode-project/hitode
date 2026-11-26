@@ -301,6 +301,7 @@ impl Image {
         if !planar
             && format != self.core.desc.format
             && !self.core.desc.view_formats.contains(&format)
+            && (self.core.desc.format, format) != (Format::A8Unorm, Format::R8Unorm)
         {
             return Err(Error::Invalid(
                 "image view format not declared in view_formats".into(),
@@ -342,7 +343,12 @@ impl Image {
         let aspect = if planar {
             [vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1][desc.plane as usize]
         } else {
-            formats::aspect(format)
+            match desc.plane {
+                0 => formats::aspect(format),
+                1 if format.has_stencil() => vk::ImageAspectFlags::STENCIL,
+                2 if format.has_stencil() => vk::ImageAspectFlags::DEPTH,
+                _ => return Err(Error::Invalid("image view aspect".into())),
+            }
         };
         let caps = self.core.context.caps.format(format);
         if caps.is_empty() {
@@ -364,7 +370,12 @@ impl Image {
                 allowed |= usage;
             }
         }
-        let view_usage = self.core.usage & allowed;
+        let mut view_usage = self.core.usage & allowed;
+        let swizzle_alpha =
+            format == Format::A8Unorm && view_usage.contains(vk::ImageUsageFlags::SAMPLED);
+        if (!planar && desc.plane != 0) || swizzle_alpha {
+            view_usage &= vk::ImageUsageFlags::SAMPLED;
+        }
         if !view_usage.intersects(
             vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::STORAGE
@@ -394,6 +405,22 @@ impl Image {
                     .base_array_layer(desc.layers.start)
                     .layer_count(desc.layers.end - desc.layers.start),
             );
+        use vk::ComponentSwizzle as Swizzle;
+        if !planar && desc.plane == 1 {
+            info = info.components(vk::ComponentMapping {
+                r: Swizzle::ZERO,
+                g: Swizzle::R,
+                b: Swizzle::ZERO,
+                a: Swizzle::ONE,
+            });
+        } else if swizzle_alpha {
+            info = info.components(vk::ComponentMapping {
+                r: Swizzle::ZERO,
+                g: Swizzle::ZERO,
+                b: Swizzle::ZERO,
+                a: Swizzle::R,
+            });
+        }
         if self.core.conversion.is_some() {
             info = info.push_next(&mut conversion);
         }
@@ -443,6 +470,9 @@ pub(super) fn layers(desc: &ImageDesc) -> u32 {
     }
 }
 impl ImageView {
+    pub(crate) fn format(&self) -> Format {
+        self.0.format
+    }
     pub(crate) fn image(&self) -> &crate::Image {
         &self.0.image
     }
@@ -646,7 +676,7 @@ impl Device {
             .collect();
         let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
         if !desc.view_formats.is_empty() {
-            flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
+            flags |= vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE;
         }
         if desc.dimension == Dimension::Cube {
             flags |= vk::ImageCreateFlags::CUBE_COMPATIBLE;

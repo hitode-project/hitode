@@ -43,6 +43,8 @@
 //!
 
 mod backing;
+mod compressed;
+mod modern;
 mod owner;
 pub(crate) mod pass;
 mod pipelines;
@@ -53,6 +55,11 @@ pub(crate) mod stream;
 #[path = "../test_support/native.rs"]
 pub mod test_support;
 
+pub use compressed::BlockTexture;
+pub use modern::{
+    BufferRange, Dispatch, DispatchArguments, DrawArguments, ModernColor, ModernDepth, ModernDraw,
+    ModernShader, Predicate, QuerySlot, SlotBindings, StorageBinding, TimestampDisjoint,
+};
 pub use record::Readback;
 pub use resources::{Depth, Image, ImageId, Staged, Target};
 

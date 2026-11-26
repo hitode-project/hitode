@@ -1075,13 +1075,7 @@ impl Device {
                         1
                     },
                     max_buffer_size,
-                    max_uniform_buffers: if use_indexing {
-                        (l.max_bound_descriptor_sets - 1)
-                            .min(l.max_descriptor_set_uniform_buffers_dynamic)
-                            .min(l.max_per_stage_descriptor_uniform_buffers)
-                    } else {
-                        l.max_per_stage_descriptor_uniform_buffers
-                    },
+                    max_uniform_buffers: l.max_per_stage_descriptor_uniform_buffers,
                     max_sampled_images: l.max_per_stage_descriptor_sampled_images,
                     max_samplers: l.max_per_stage_descriptor_samplers,
                     max_storage_bindings: l
@@ -1188,6 +1182,8 @@ impl Device {
                 api: adapter.api,
                 anisotropy: base.sampler_anisotropy != 0,
                 max_anisotropy: l.max_sampler_anisotropy,
+                max_heap_uniform_slots: (l.max_bound_descriptor_sets - 1)
+                    .min(l.max_descriptor_set_uniform_buffers_dynamic),
                 mirror_clamp: plan.use_mirror_clamp,
             });
             let device = crate::Device {

@@ -75,6 +75,7 @@ pub(crate) struct Context {
     mirror_clamp: bool,
     pipelines: Mutex<pipeline::Pipelines>,
     heap: Option<binding::Heap>,
+    max_heap_uniform_slots: u32,
     push: ash::khr::push_descriptor::Device,
     /// Set when extended dynamic state is in use.
     eds: Option<Eds>,

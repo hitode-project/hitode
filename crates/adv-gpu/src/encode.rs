@@ -182,6 +182,37 @@ impl Encoder {
     pub fn retain(&mut self, span: Span) {
         self.inner.retain(span)
     }
+    /// Resolve matching color subresources. The source contents are preserved.
+    pub fn resolve(&mut self, source: &ImageView, destination: &ImageView) {
+        let size = source.size();
+        let desc = RenderPassDesc {
+            colors: [ColorAttachment {
+                view: source,
+                load: Load::Load,
+                store: Store::Store,
+                resolve: Some(destination),
+            }]
+            .into_iter()
+            .collect(),
+            depth_stencil: None,
+            area: Rect {
+                x: 0,
+                y: 0,
+                w: size.width,
+                h: size.height,
+            },
+            timestamps: None,
+            label: "resolve",
+        };
+        drop(self.render_pass(&desc));
+    }
+
+    /// Fill the remaining levels of a filterable view from its first level.
+    /// The image needs COPY_SRC and COPY_DST usage.
+    pub fn generate_mips(&mut self, view: &ImageView) {
+        self.inner.generate_mips(view);
+    }
+
     /// Copy query results into `dst` as 64-bit values. They are there when
     /// this submission's token completes; read them on the host, not from
     /// later commands of this encoder (Metal resolves timestamps after the
@@ -209,6 +240,11 @@ impl RenderPass<'_> {
     pub fn bind(&mut self, slot: u32, resource: Bind<'_>) {
         self.inner.bind(slot, resource)
     }
+    /// Bind a compacted vertex register in the vertex-only bank.
+    pub fn bind_vertex(&mut self, slot: u32, resource: Bind<'_>) {
+        self.inner.bind_vertex(slot, resource)
+    }
+
     /// Bind this buffer's prebuilt converted-video set. Set its pool's video
     /// pipeline first. No descriptor is written on the encoding path.
     pub fn bind_video(&mut self, image: &crate::PresentImage) {

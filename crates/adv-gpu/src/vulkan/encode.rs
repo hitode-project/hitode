@@ -560,9 +560,13 @@ impl Encoder {
                 );
                 let clear = match color.load {
                     Load::Clear(value) => vk::ClearValue {
-                        color: if view.0.format == Format::R32Uint {
+                        color: if view.0.format.is_uint() {
                             vk::ClearColorValue {
                                 uint32: value.map(|v| v as u32),
+                            }
+                        } else if view.0.format.is_sint() {
+                            vk::ClearColorValue {
+                                int32: value.map(|v| v as i32),
                             }
                         } else {
                             vk::ClearColorValue {
@@ -591,7 +595,7 @@ impl Encoder {
                         vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                     );
                     info = info
-                        .resolve_mode(if matches!(view.0.format, Format::R32Uint) {
+                        .resolve_mode(if view.0.format.is_uint() || view.0.format.is_sint() {
                             vk::ResolveModeFlags::SAMPLE_ZERO
                         } else {
                             vk::ResolveModeFlags::AVERAGE
@@ -707,9 +711,13 @@ impl Encoder {
                 );
                 let clear = match color.load {
                     Load::Clear(value) => vk::ClearValue {
-                        color: if view.0.format == Format::R32Uint {
+                        color: if view.0.format.is_uint() {
                             vk::ClearColorValue {
                                 uint32: value.map(|v| v as u32),
+                            }
+                        } else if view.0.format.is_sint() {
+                            vk::ClearColorValue {
+                                int32: value.map(|v| v as i32),
                             }
                         } else {
                             vk::ClearColorValue {
@@ -1034,6 +1042,140 @@ impl Encoder {
             vk::PipelineStageFlags2::TRANSFER,
         );
     }
+    pub(crate) fn generate_mips(&mut self, view: &crate::ImageView) {
+        let image = view.image();
+        let desc = &view.inner.0.desc;
+        if desc.mips.len() == 1 {
+            return;
+        }
+        if formats::vk(view.format()) != formats::vk(image.desc().format) {
+            self.generate_view_mips(view);
+            return;
+        }
+        let core = &image.inner.core;
+        let is_3d = core.desc.dimension == crate::resource::Dimension::D3;
+        let offsets = |level: u32| {
+            let axis = |n: u32| (n >> level).max(1) as i32;
+            [
+                vk::Offset3D::default(),
+                vk::Offset3D {
+                    x: axis(core.desc.size.width),
+                    y: axis(core.desc.size.height),
+                    z: if is_3d {
+                        axis(core.desc.size.depth_or_layers)
+                    } else {
+                        1
+                    },
+                },
+            ]
+        };
+        let layers = |level| {
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(level)
+                .base_array_layer(desc.layers.start)
+                .layer_count(desc.layers.len() as u32)
+        };
+        for dst in desc.mips.start + 1..desc.mips.end {
+            let src = dst - 1;
+            let mut barriers = Vec::new();
+            self.push_transition(
+                &mut barriers,
+                core,
+                src..src + 1,
+                desc.layers.clone(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags2::TRANSFER_READ,
+                vk::PipelineStageFlags2::TRANSFER,
+            );
+            self.push_transition(
+                &mut barriers,
+                core,
+                dst..dst + 1,
+                desc.layers.clone(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::TRANSFER,
+            );
+            self.flush_image_barriers(&barriers);
+            if self.ready() {
+                let region = vk::ImageBlit::default()
+                    .src_subresource(layers(src))
+                    .src_offsets(offsets(src))
+                    .dst_subresource(layers(dst))
+                    .dst_offsets(offsets(dst));
+                unsafe {
+                    self.shared.context.device.cmd_blit_image(
+                        self.command,
+                        core.handle,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        core.handle,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                        vk::Filter::LINEAR,
+                    );
+                }
+            }
+        }
+    }
+
+    fn generate_view_mips(&mut self, view: &crate::ImageView) {
+        use crate::resource::{Dimension, ImageDesc, Usage};
+        let src = view.image();
+        let desc = &view.inner.0.desc;
+        let dimension = match src.desc().dimension {
+            Dimension::Cube => Dimension::D2,
+            dimension => dimension,
+        };
+        let is_3d = dimension == Dimension::D3;
+        // Vulkan blits use the allocation's format. Copy the view's bits to
+        // a matching image first so e.g. sRGB mip generation filters in linear space.
+        let size = view.size();
+        let scratch = match Device(self.shared.context.clone()).create_image(&ImageDesc {
+            dimension,
+            size,
+            format: view.format(),
+            mips: desc.mips.len() as u32,
+            samples: 1,
+            usage: Usage::COPY_SRC | Usage::COPY_DST,
+            view_formats: &[],
+            label: "mip view",
+        }) {
+            Ok(image) => image,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
+        let copy = |image, mip, layer| ImageCopy {
+            image,
+            mip,
+            layer,
+            origin: (0, 0, 0),
+        };
+        self.copy_image(
+            copy(src, desc.mips.start, desc.layers.start),
+            copy(&scratch, 0, 0),
+            size,
+        );
+        self.generate_mips(scratch.view());
+        for mip in 1..desc.mips.len() as u32 {
+            self.copy_image(
+                copy(&scratch, mip, 0),
+                copy(src, desc.mips.start + mip, desc.layers.start),
+                Extent {
+                    width: (size.width >> mip).max(1),
+                    height: (size.height >> mip).max(1),
+                    depth_or_layers: if is_3d {
+                        (size.depth_or_layers >> mip).max(1)
+                    } else {
+                        size.depth_or_layers
+                    },
+                },
+            );
+        }
+    }
+
     pub(crate) fn copy_image(&mut self, src: ImageCopy<'_>, dst: ImageCopy<'_>, size: Extent) {
         self.copy_image_regions(
             src.image,
@@ -1696,6 +1838,9 @@ impl RenderPass<'_> {
             },
         );
         self.encoder.bindings = Some(bindings);
+    }
+    pub(crate) fn bind_vertex(&mut self, slot: u32, resource: Bind<'_>) {
+        self.bind(slot, resource);
     }
     #[cfg(target_os = "android")]
     pub(crate) fn bind_video(&mut self, image: &crate::PresentImage) {
