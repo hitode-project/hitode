@@ -180,6 +180,7 @@ pub struct Coverage<'a> {
     pub clip_planes: u16,
     pub vertex_blend_matrices: u16,
     pub max_vertices: u32,
+    pub converted_packed_render_targets: bool,
     pub render_formats: &'a [Format],
     pub converted_textures: &'a [TextureFormat],
     pub converted_depths: &'a [DepthFormat],
@@ -272,7 +273,16 @@ impl Report {
                     Format::B5g6r5Unorm | Format::Bgr5a1Unorm | Format::Bgra4Unorm
                 );
                 bits | (u32::from(rgba) * 0x100) | (u32::from(packed) * 0x400)
-            });
+            })
+            | if coverage.converted_packed_render_targets
+                && caps
+                    .format(Format::Bgra8Unorm)
+                    .contains(FormatCaps::COLOR | FormatCaps::BLEND)
+            {
+                0x400
+            } else {
+                0
+            };
         let z_depths = depth_formats.iter().fold(0, |bits, format| {
             bits | match format.dwRGBBitCount {
                 16 => 0x400,

@@ -32,8 +32,8 @@ pub struct Provider {
     pub vsync: fn(&Ext) -> Option<(std::time::Duration, std::time::Duration)>,
 }
 pub struct State {
-    draw: DirectDraw,
-    provider: Provider,
+    pub(super) draw: DirectDraw,
+    pub(super) provider: Provider,
     binding: Option<(u32, u32)>,
     presented: Option<(u32, u32)>,
 }

@@ -176,6 +176,15 @@ macro_rules! register_slots {
             $($slot = $index),+
         }
 
+        impl $name {
+            pub(crate) fn from_raw(value: i32) -> Option<Self> {
+                match value {
+                    $($index => Some(Self::$slot),)+
+                    _ => None,
+                }
+            }
+        }
+
         impl Index<&$name> for StateMap {
             type Output = u32;
 
@@ -187,9 +196,12 @@ macro_rules! register_slots {
 }
 
 register_slots!(Render {
+    Antialias = 2,
+    TexturePerspective = 4,
     DepthEnable = 7,
     FillMode = 8,
     ShadeMode = 9,
+    LinePattern = 10,
     DepthWrite = 14,
     AlphaTest = 15,
     LastPixel = 16,
@@ -203,11 +215,16 @@ register_slots!(Render {
     BlendEnable = 27,
     FogEnable = 28,
     SpecularEnable = 29,
+    StippledAlpha = 33,
     FogColor = 34,
     TableFog = 35,
     FogStart = 36,
     FogEnd = 37,
     FogDensity = 38,
+    StippleEnable = 39,
+    EdgeAntialias = 40,
+    ColorKeyEnable = 41,
+    ZBias = 47,
     RangeFog = 48,
     StencilEnable = 52,
     StencilFail = 53,
@@ -228,11 +245,13 @@ register_slots!(Render {
     Wrap7 = 135,
     Clipping = 136,
     Lighting = 137,
+    Extents = 138,
     Ambient = 139,
     VertexFog = 140,
     ColorVertex = 141,
     LocalViewer = 142,
     NormalizeNormals = 143,
+    ColorKeyBlendEnable = 144,
     DiffuseSource = 145,
     SpecularSource = 146,
     AmbientSource = 147,

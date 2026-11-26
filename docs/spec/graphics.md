@@ -109,6 +109,49 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 **Verification**: Test
 **Basis**: Wine ddraw `ddraw1`–`ddraw7` tests, which pass on Windows.
 
+## DirectDraw 3D
+
+### GFX-D3D7-1 Interface identity and reachability
+
+**Rule**: DirectDrawCreate MUST supply three distinct Direct3D 1–3 faces and DirectDrawCreateEx MUST supply Direct3D7, sharing the owning DirectDraw count. Surface-owned textures and Device1 faces MUST share the surface count, and created devices and child objects MUST follow their measured face and attachment ownership rules. The production DirectDraw registry MUST refuse the Direct3D IIDs until the complete front is installed.
+**Verification**: Test
+**Basis**: Windows Direct3D legacy and Direct3D7 semantics probes
+
+### GFX-D3D7-2 Device classes
+
+**Rule**: Device7 MUST enumerate RGB, HAL and T&L HAL in that order, and legacy Direct3D MUST enumerate RGB then HAL. The RGB device MUST retain its texture limit, point rounding, terminal line pixel and combiner decisions while sharing HAL rasterization. An unsupported RGB texture cascade MUST return D3DERR_UNSUPPORTEDCOLORARG from ValidateDevice and report one pass.
+**Verification**: Test
+**Basis**: Windows Direct3D7 semantics and pixel probes
+
+### GFX-D3D7-3 Fixed-function state
+
+**Rule**: Device7 MUST translate its API state into the shared fixed-function registers and return its API values from getters. A state block MUST capture and apply only its member slots, including recorded changes to stage samplers and texture matrices. Device7 MUST reject retired render-state selectors with DDERR_INVALIDPARAMS.
+**Verification**: Test
+
+### GFX-D3D7-4 Texture color keys
+
+**Rule**: Enabled color keying MUST discard a fragment when a contributing filter tap matches the raw source key. HAL MUST compare the bits in the texture's format masks. RGB MUST compare all stored bits.
+**Verification**: Test
+**Basis**: Windows Direct3D7 color-key probe
+
+### GFX-D3D7-5 Shared surface access
+
+**Rule**: Device7 MUST admit immutable draw inputs and access shared surface residency for every texture read and render-target write. DirectDraw locks MUST see recorded GPU writes.
+Packed 16-bit targets MUST blend in resident BGRA and round to the nearest packed color at surface access, independent of `DITHERENABLE`.
+**Verification**: Test
+
+### GFX-D3D7-6 Device scene on a lost target
+
+**Rule**: Device7 MUST reject scene entry on a lost render target. Clear, DrawPrimitive and SetTexture on the lost device MUST succeed without submitting work, and EndScene MUST return D3DERR_SCENE_NOT_IN_SCENE after a failed BeginScene. The same device MUST accept draws again after DirectDraw restores the target.
+**Verification**: Test
+**Basis**: Windows DirectDraw lost-surface probe
+
+### GFX-D3D7-7 Device limits
+
+**Rule**: HAL and T&L HAL creation MUST reject render targets with any dimension over 2048. The texture extent MUST be capped by the device class limit of 1024 for RGB and 16384 for HAL and T&L HAL.
+**Verification**: Test
+**Basis**: Windows DirectDraw desktop and Direct3D7 semantics probes
+
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws

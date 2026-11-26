@@ -1233,7 +1233,16 @@ fn counted_fragments_obey_early_depth_and_sample_frequency() {
         let v_variant = Variant::select(&vs_reflection, &facts, &caps);
         assert_eq!(ps_variant.early_tests(), !depth_output);
         let ps = shader(
-            wgsl::emit_variant(&ps, &ps_variant, None, Options::default()).unwrap(),
+            wgsl::emit_variant(
+                &ps,
+                &ps_variant,
+                None,
+                Options {
+                    raster_samples: samples,
+                    ..Options::default()
+                },
+            )
+            .unwrap(),
             ShaderStage::Fragment,
         );
         let plan = Plan {

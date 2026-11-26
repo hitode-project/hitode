@@ -3,7 +3,8 @@ use crate::gpu::{DrawState, Program, ProgramTexture, ProgrammableDraw, Target};
 use std::sync::LazyLock;
 
 static BLT: LazyLock<Program> = LazyLock::new(|| {
-    let mut program = Program::new(include_str!("blt.wgsl").into(), vec![false]);
+    let source = [crate::gpu::PACKED_WGSL, include_str!("blt.wgsl")].concat();
+    let mut program = Program::new(source.into(), vec![false]);
     program.constants = Default::default();
     program
 });
@@ -24,6 +25,10 @@ impl<P: Presenter> Surfaces<P> {
         };
         let mut bytes = value.to_le_bytes();
         bytes[format.bytes() as usize..].fill(0);
+        let masks = self.packed_color(destination.id);
+        if masks[0] != 0 {
+            bytes = super::super::render::unpack_color(value as u16, masks);
+        }
         let [b, g, r, a] = bytes.map(|v| f64::from(v) / 255.);
         self.gpu
             .clear_region(
@@ -49,6 +54,8 @@ impl<P: Presenter> Surfaces<P> {
         let dr = destination.rect;
         let mut src = self.gpu_access(source.id, sr, Access::Read, memory)?;
         let dst = self.gpu_access(destination.id, dr, Access::Write, memory)?;
+        let source_masks = self.packed_color(source.id);
+        let destination_masks = self.packed_color(destination.id);
         let gpu = &mut self.gpu;
         let result = (|| {
             let origin = if src.shares_storage(&dst) {
@@ -59,7 +66,7 @@ impl<P: Presenter> Surfaces<P> {
             } else {
                 [sr.x, sr.y]
             };
-            if params.direct_copy() {
+            if params.direct_copy() && source_masks == destination_masks {
                 let [x, y] = origin;
                 return gpu.copy(&src, Rect { x, y, ..sr }, &dst, dr.x, dr.y);
             }
@@ -74,6 +81,8 @@ impl<P: Presenter> Surfaces<P> {
                 0,
                 0,
             ];
+            parameters[5] = source_masks;
+            parameters[6] = destination_masks;
             let mut state = DrawState::new(dst.width(), dst.height());
             state.scissor = Some(dr);
             let draw = ProgrammableDraw {
