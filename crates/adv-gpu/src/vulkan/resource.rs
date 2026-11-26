@@ -520,6 +520,7 @@ pub(crate) struct QuerySet(pub(super) Arc<QueryCore>);
 pub(super) struct QueryCore {
     pub(super) context: Arc<Context>,
     pub(super) handle: vk::QueryPool,
+    pub(super) kind: QueryKind,
     period: f64,
 }
 impl QuerySet {
@@ -860,6 +861,7 @@ impl Device {
         let feature = match kind {
             QueryKind::Timestamp => Features::TIMESTAMPS,
             QueryKind::Occlusion => Features::OCCLUSION_QUERIES,
+            QueryKind::PipelineStatistics => Features::PIPELINE_STATISTICS_QUERY,
         };
         if !self.caps().features.contains(feature) {
             return Err(Error::Unavailable(format!("{kind:?} queries")));
@@ -868,8 +870,15 @@ impl Device {
             .query_type(match kind {
                 QueryKind::Timestamp => vk::QueryType::TIMESTAMP,
                 QueryKind::Occlusion => vk::QueryType::OCCLUSION,
+                QueryKind::PipelineStatistics => vk::QueryType::PIPELINE_STATISTICS,
             })
-            .query_count(count);
+            .query_count(count)
+            .pipeline_statistics(if kind == QueryKind::PipelineStatistics {
+                vk::QueryPipelineStatisticFlags::CLIPPING_PRIMITIVES
+                    | vk::QueryPipelineStatisticFlags::FRAGMENT_SHADER_INVOCATIONS
+            } else {
+                vk::QueryPipelineStatisticFlags::empty()
+            });
         let handle = self.0.result_in(
             unsafe { self.0.device.create_query_pool(&info, None) },
             "query pool",
@@ -886,6 +895,7 @@ impl Device {
                 context: self.0.clone(),
                 handle,
                 period,
+                kind,
             })),
         })
     }

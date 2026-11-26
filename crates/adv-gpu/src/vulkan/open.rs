@@ -711,6 +711,7 @@ impl Device {
                 sampler_anisotropy: base.sampler_anisotropy,
                 texture_compression_bc: base.texture_compression_bc,
                 occlusion_query_precise: base.occlusion_query_precise,
+                pipeline_statistics_query: base.pipeline_statistics_query,
                 vertex_pipeline_stores_and_atomics: base.vertex_pipeline_stores_and_atomics,
                 fragment_stores_and_atomics: base.fragment_stores_and_atomics,
                 shader_storage_image_extended_formats: base.shader_storage_image_extended_formats,
@@ -899,6 +900,15 @@ impl Device {
                 && adapter.props.limits.timestamp_compute_and_graphics != 0
             {
                 feature_bits |= Features::TIMESTAMPS;
+            }
+            if base.pipeline_statistics_query != 0 {
+                feature_bits |= Features::PIPELINE_STATISTICS_QUERY;
+            }
+            if base.shader_clip_distance != 0 {
+                feature_bits |= Features::CLIP_DISTANCES;
+            }
+            if base.fill_mode_non_solid != 0 {
+                feature_bits |= Features::WIREFRAME;
             }
             if base.occlusion_query_precise != 0 {
                 feature_bits |= Features::OCCLUSION_QUERIES;

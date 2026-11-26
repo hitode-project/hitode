@@ -24,7 +24,7 @@ pub enum StorageBinding {
 
 /// The stage's original register arrays, indexed by the shader's register
 /// number. Holes and bindings unused by the entry point are never visited.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SlotBindings {
     pub uniforms: Vec<Option<BufferRange>>,
     pub images: Vec<Option<ImageView>>,
@@ -152,7 +152,7 @@ impl ModernShader {
         self.bindings.iter().map(|&(_, binding)| binding)
     }
 
-    fn compact(&self, slots: &SlotBindings) -> Result<Vec<BoundSlot>, Error> {
+    pub(super) fn compact(&self, slots: &SlotBindings) -> Result<Vec<BoundSlot>, Error> {
         self.bindings
             .iter()
             .map(|&(register, binding)| {
@@ -390,14 +390,15 @@ pub struct Predicate {
 
 pub(crate) struct Render {
     pub draw: ModernDraw,
+    pub statistics: Option<QuerySlot>,
     pub pipeline: adv_gpu::RenderPipeline,
     pub vertex: Vec<BoundSlot>,
     pub fragment: Vec<BoundSlot>,
 }
 
 pub struct Dispatch {
-    pipeline: adv_gpu::ComputePipeline,
-    shader: Arc<ModernShader>,
+    pub(super) pipeline: adv_gpu::ComputePipeline,
+    pub(super) shader: Arc<ModernShader>,
 }
 
 pub(crate) struct Compute {
@@ -413,6 +414,27 @@ impl Gpu {
         vertex: &SlotBindings,
         fragment: &SlotBindings,
     ) -> Result<(), Error> {
+        self.record_modern_draw(draw, vertex, fragment, None)
+    }
+
+    /// The slot brackets only this draw's raster pass.
+    pub fn draw_modern_statistics(
+        &mut self,
+        draw: ModernDraw,
+        vertex: &SlotBindings,
+        fragment: &SlotBindings,
+        statistics: QuerySlot,
+    ) -> Result<(), Error> {
+        self.record_modern_draw(draw, vertex, fragment, Some(statistics))
+    }
+
+    fn record_modern_draw(
+        &mut self,
+        draw: ModernDraw,
+        vertex: &SlotBindings,
+        fragment: &SlotBindings,
+        statistics: Option<QuerySlot>,
+    ) -> Result<(), Error> {
         let vertex = draw.vertex.compact(vertex)?;
         let fragment = draw
             .fragment
@@ -423,6 +445,7 @@ impl Gpu {
         self.enqueue_modern(super::record::WorkerItem::DrawModern {
             facade: self.facade_id,
             draw: Box::new(draw),
+            statistics,
             vertex,
             fragment,
         })

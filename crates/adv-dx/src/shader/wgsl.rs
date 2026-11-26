@@ -3,6 +3,11 @@
 mod alu;
 mod interface;
 mod memory;
+#[cfg(feature = "gpu")]
+pub(crate) mod pulled;
+mod variant_interface;
+
+pub use variant_interface::STATISTICS_SLOT;
 
 use super::{analysis::Reflection, ir::*};
 use std::{
@@ -34,6 +39,76 @@ pub struct Options<'a> {
 
 pub fn emit(module: &Module, options: Options<'_>) -> Result<Translation, Error> {
     let (module, reflection) = passes::prepare(module)?;
+    emit_entry(module, reflection, options, None)
+}
+
+/// Emit a raster or compute entry using the variant selected for this draw.
+#[cfg(feature = "gpu")]
+pub fn emit_variant(
+    module: &Module,
+    variant: &super::variant::Variant,
+    fragment: Option<&Reflection>,
+) -> Result<Translation, Error> {
+    let (mut module, mut reflection) = passes::prepare(module)?;
+    let interface = passes::variant::apply(&mut module, &reflection, variant, fragment)?;
+    if interface.pulled || variant.storage_varyings() {
+        return Err(Error::Invalid("pulled shader requires an expansion plan"));
+    }
+    if variant.early_tests() {
+        reflection.global_flags |=
+            super::dxbc::fields::D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL;
+    }
+    emit_entry(
+        module,
+        reflection,
+        Options {
+            storage_formats: variant.storage_formats(),
+        },
+        Some(&interface),
+    )
+}
+
+/// Emit the pixel stage for an expanded primitive with storage-backed inputs.
+#[cfg(feature = "gpu")]
+pub fn emit_expanded_fragment(
+    module: &Module,
+    variant: &super::variant::Variant,
+    producer: &Reflection,
+    vertices: u32,
+    registers: u32,
+) -> Result<Translation, Error> {
+    let (mut module, mut reflection) = passes::prepare(module)?;
+    let mut interface = passes::variant::apply(&mut module, &reflection, variant, None)?;
+    if variant.storage_varyings() {
+        passes::variant::storage_varyings(
+            &mut interface,
+            &reflection,
+            producer,
+            &reflection,
+            vertices,
+            registers,
+        );
+    }
+    if variant.early_tests() {
+        reflection.global_flags |=
+            super::dxbc::fields::D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL;
+    }
+    emit_entry(
+        module,
+        reflection,
+        Options {
+            storage_formats: variant.storage_formats(),
+        },
+        Some(&interface),
+    )
+}
+
+fn emit_entry(
+    module: Module,
+    reflection: Reflection,
+    options: Options<'_>,
+    interface: Option<&passes::variant::Interface>,
+) -> Result<Translation, Error> {
     if reflection.doubles {
         return Err(Error::DoublePrecision);
     }
@@ -45,20 +120,13 @@ pub fn emit(module: &Module, options: Options<'_>) -> Result<Translation, Error>
             return Err(Error::UnsupportedStage(module.stage));
         }
     };
-    let mut writer = Writer {
-        source: String::new(),
-        stage: module.stage,
-        result: String::new(),
-        serial: 0,
-        bindings: HashMap::new(),
-        locations: Vec::new(),
-        storage_formats: options.storage_formats,
-        atomic_bindings: &reflection.atomic_bindings,
-        depth: 0,
-    };
+    let mut writer = Writer::new(&module, &reflection, options.storage_formats);
+    if module.stage == Stage::Vertex && interface.is_some_and(|i| i.native_clip) {
+        writer.source.push_str("enable clip_distances;\n");
+    }
     writer.source.push_str(alu::HELPERS);
     writer.declarations(&module, &reflection)?;
-    writer.entry(entry_point, &module, &reflection)?;
+    writer.entry(entry_point, &module, &reflection, interface)?;
     let terminates = writer.block(&module.body)?;
     if !terminates && !writer.result.is_empty() {
         writer.line(&format!("return {};", writer.result));
@@ -87,7 +155,25 @@ struct Writer<'a> {
     depth: usize,
 }
 
-impl Writer<'_> {
+impl<'a> Writer<'a> {
+    fn new(
+        module: &Module,
+        reflection: &'a Reflection,
+        storage_formats: &'a [(u32, naga::StorageFormat)],
+    ) -> Self {
+        Self {
+            source: String::new(),
+            stage: module.stage,
+            result: String::new(),
+            serial: 0,
+            bindings: HashMap::new(),
+            locations: Vec::new(),
+            storage_formats,
+            atomic_bindings: &reflection.atomic_bindings,
+            depth: 0,
+        }
+    }
+
     fn line(&mut self, line: &str) {
         for _ in 0..self.depth {
             self.source.push_str("    ");
@@ -196,6 +282,30 @@ impl Writer<'_> {
             }
             return Ok(());
         }
+        if self.stage == Stage::Geometry
+            && matches!(
+                op.opcode,
+                Emit | Cut | Emitthencut | EmitStream | CutStream | EmitthencutStream
+            )
+        {
+            let stream = match op.sources.first() {
+                Some(source) => source
+                    .register()
+                    .and_then(|(_, indices)| indices.first().and_then(Index::direct))
+                    .ok_or(Error::Invalid("geometry stream index"))?,
+                None => 0,
+            };
+            if matches!(
+                op.opcode,
+                Emit | Emitthencut | EmitStream | EmitthencutStream
+            ) {
+                self.line(&format!("dx_emit({stream}u, o);"));
+            }
+            if matches!(op.opcode, Cut | Emitthencut | CutStream | EmitthencutStream) {
+                self.line(&format!("dx_cut({stream}u);"));
+            }
+            return Ok(());
+        }
         if op.opcode == Sync {
             return self.barrier(op);
         }
@@ -283,7 +393,24 @@ impl Writer<'_> {
             .ok_or(Error::Invalid("expected register"))?;
         let name = match register {
             Register::Temp => format!("r[{}]", self.index(&indices[0], 1)?),
+            Register::Input if self.stage == Stage::Geometry => {
+                format!(
+                    "v[{}][{}]",
+                    self.index(&indices[0], 1)?,
+                    self.index(&indices[1], 1)?
+                )
+            }
             Register::Input => format!("v[{}]", self.index(&indices[0], 1)?),
+            Register::InputControlPoint => {
+                format!(
+                    "v_cp[{}][{}]",
+                    self.index(&indices[0], 1)?,
+                    self.index(&indices[1], 1)?
+                )
+            }
+            Register::InputPatchConstant => format!("v_patch[{}]", self.index(&indices[0], 1)?),
+            Register::InputDomainPoint => "v_domain".into(),
+            Register::InputGsInstanceId => "v_gs_instance".into(),
             Register::Output => format!("o[{}]", self.index(&indices[0], 1)?),
             Register::IndexableTemp => {
                 let array = indices[0]

@@ -296,6 +296,15 @@ impl RenderPass<'_> {
     pub fn end_occlusion(&mut self) {
         self.inner.end_occlusion()
     }
+    /// Bracket raster work with a native pipeline statistics query.
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn begin_statistics(&mut self, set: &QuerySet, index: u32) {
+        self.inner.begin_statistics(set, index)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn end_statistics(&mut self) {
+        self.inner.end_statistics()
+    }
 }
 
 pub struct ComputePass<'e> {

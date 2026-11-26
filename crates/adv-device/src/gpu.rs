@@ -3,6 +3,9 @@
 //! Apple device requests, native draws, copies and compilation drain their
 //! autoreleased temporaries on the calling thread.
 use crate::surface::Rect;
+pub use adv_gpu::pipeline::Topology as ModernTopology;
+pub use adv_gpu::shader::Stage as ShaderStage;
+pub use adv_gpu::{Caps, Features};
 
 mod constant_snapshot;
 pub use constant_snapshot::ConstantSnapshot;
@@ -22,9 +25,10 @@ pub use depth::{DepthFormat, Stencil, StencilFace, StencilOp};
 pub use native::test_support;
 
 pub use native::{
-    BlockTexture, BufferRange, Depth, Dispatch, DispatchArguments, DrawArguments, Gpu, Image,
-    ImageId, ModernColor, ModernDepth, ModernDraw, ModernShader, Predicate, QuerySlot, Readback,
-    SlotBindings, Staged, StorageBinding, Target, TimestampDisjoint,
+    BlockTexture, BufferRange, Depth, Dispatch, DispatchArguments, DrawArguments, Expand,
+    ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude, ExpansionRegion, Gpu,
+    Image, ImageId, ModernColor, ModernDepth, ModernDraw, ModernShader, Predicate, QuerySlot,
+    Readback, SlotBindings, Staged, StorageBinding, Target, TimestampDisjoint,
 };
 pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,

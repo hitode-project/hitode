@@ -44,6 +44,7 @@
 
 mod backing;
 mod compressed;
+mod expand;
 mod modern;
 mod owner;
 pub(crate) mod pass;
@@ -56,6 +57,9 @@ pub(crate) mod stream;
 pub mod test_support;
 
 pub use compressed::BlockTexture;
+pub use expand::{
+    Expand, ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude, ExpansionRegion,
+};
 pub use modern::{
     BufferRange, Dispatch, DispatchArguments, DrawArguments, ModernColor, ModernDepth, ModernDraw,
     ModernShader, Predicate, QuerySlot, SlotBindings, StorageBinding, TimestampDisjoint,

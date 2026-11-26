@@ -233,6 +233,8 @@ impl Fence {
 pub enum QueryKind {
     Occlusion,
     Timestamp,
+    /// Two consecutive u64 values: clipping primitives, fragment invocations.
+    PipelineStatistics,
 }
 
 pub struct QuerySet {

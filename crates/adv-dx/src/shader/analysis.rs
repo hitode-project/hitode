@@ -18,6 +18,8 @@ pub struct Reflection {
     pub workgroup_size: Option<[u32; 3]>,
     pub temporary_count: u32,
     pub doubles: bool,
+    pub discard: bool,
+    pub interpolation: HashMap<u32, Interpolation>,
 }
 
 pub fn analyze(module: &Module) -> Reflection {
@@ -32,6 +34,8 @@ pub fn analyze(module: &Module) -> Reflection {
         feature_flags: module.feature_flags,
         workgroup_size: None,
         temporary_count: 0,
+        discard: false,
+        interpolation: HashMap::new(),
         // D3D_SHADER_REQUIRES_DOUBLES and D3D_SHADER_REQUIRES_11_1_DOUBLE_EXTENSIONS.
         doubles: module.feature_flags & 0x21 != 0,
     };
@@ -44,6 +48,13 @@ impl Reflection {
         for statement in block {
             match statement {
                 Statement::Declare(decl) => {
+                    if let Some(mode) = decl.interpolation
+                        && let Some((Register::Input, [index])) =
+                            decl.operand.as_ref().and_then(Operand::register)
+                        && let Some(register) = index.direct()
+                    {
+                        self.interpolation.insert(register, mode);
+                    }
                     if let Some(binding) = decl.binding
                         && binding.register != Register::ThreadGroupSharedMemory
                     {
@@ -85,6 +96,7 @@ impl Reflection {
     }
 
     fn instruction(&mut self, op: &Instruction) {
+        self.discard |= op.opcode == Opcode::Discard;
         let (destinations, sources) = op.opcode.types();
         self.doubles |=
             destinations.contains(&ValueType::Double) || sources.contains(&ValueType::Double);
