@@ -193,6 +193,12 @@ impl Variant {
     pub fn bin(&self) -> Bin {
         self.bin
     }
+    pub(super) fn pull_input(&self) -> Self {
+        let mut variant = self.clone();
+        variant.bits |= PULL;
+        variant
+    }
+
     pub fn pulled(&self) -> bool {
         self.bits & PULL != 0
     }

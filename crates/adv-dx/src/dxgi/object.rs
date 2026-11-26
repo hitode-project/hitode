@@ -8,6 +8,7 @@ pub(super) enum Kind {
     Factory(Factory),
     Adapter(Adapter),
     Output,
+    SwapChain(Box<super::swap::Chain>),
 }
 
 pub(super) enum PrivateData {

@@ -392,6 +392,13 @@ impl View {
         }
     }
 
+    #[cfg(feature = "gpu")]
+    pub fn has_counter(&self) -> bool {
+        self.kind == ViewKind::UnorderedAccess
+            && self.desc.dimension == 1
+            && self.desc.words[2] & 6 != 0
+    }
+
     pub fn kind(&self) -> ViewKind {
         self.kind
     }

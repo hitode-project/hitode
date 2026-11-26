@@ -80,7 +80,7 @@ pub(super) fn create_factory(
     )
 }
 
-fn create(
+pub(super) fn create(
     env: &mut Env<'_>,
     vtable: u32,
     kind: Kind,
@@ -124,7 +124,7 @@ fn free(env: &mut Env<'_>, pointer: u32) {
     heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
 }
 
-fn object<'a>(env: &'a Env<'_>, this: u32) -> Result<&'a Object, Error> {
+pub(super) fn object<'a>(env: &'a Env<'_>, this: u32) -> Result<&'a Object, Error> {
     env.ext
         .get::<State>()
         .com
@@ -132,7 +132,7 @@ fn object<'a>(env: &'a Env<'_>, this: u32) -> Result<&'a Object, Error> {
         .ok_or(Error::InvalidCall)
 }
 
-fn object_mut<'a>(env: &'a mut Env<'_>, this: u32) -> Result<&'a mut Object, Error> {
+pub(super) fn object_mut<'a>(env: &'a mut Env<'_>, this: u32) -> Result<&'a mut Object, Error> {
     env.ext
         .get::<State>()
         .com
@@ -186,6 +186,9 @@ fn destroy(env: &mut Env<'_>, this: u32, interfaces: &mut Vec<u32>) -> u32 {
                     PrivateData::Bytes(_) => None,
                 }),
         );
+        if let Kind::SwapChain(chain) = destroyed.value.kind {
+            chain.destroy(env, this, interfaces);
+        }
         if let Some(parent) = destroyed.value.parent {
             destroy(env, parent, interfaces);
         }
@@ -193,7 +196,11 @@ fn destroy(env: &mut Env<'_>, this: u32, interfaces: &mut Vec<u32>) -> u32 {
     released.references
 }
 
-fn release_interfaces(env: &mut Env<'_>, mut interfaces: Vec<u32>, result: u32) -> Outcome {
+pub(super) fn release_interfaces(
+    env: &mut Env<'_>,
+    mut interfaces: Vec<u32>,
+    result: u32,
+) -> Outcome {
     match interfaces.pop() {
         Some(pointer) => unknown_call(env, pointer, 2, move |env| {
             release_interfaces(env, interfaces, result)
@@ -305,7 +312,7 @@ pub(super) fn enum_output(env: &mut Env<'_>, this: u32, index: u32) -> Result<u3
 pub(super) fn adapter(env: &Env<'_>, this: u32) -> Result<Adapter, Error> {
     match object(env, this)?.kind {
         Kind::Adapter(adapter) => Ok(adapter),
-        Kind::Factory(_) | Kind::Output => Err(Error::InvalidCall),
+        Kind::Factory(_) | Kind::Output | Kind::SwapChain(_) => Err(Error::InvalidCall),
     }
 }
 
@@ -331,7 +338,7 @@ pub(super) fn interface_support(env: &Env<'_>, this: u32, iid: Iid) -> Result<u6
     }
     Ok(match adapter {
         Adapter::Hardware => env.ext.get::<State>().provider.adapter.driver_version,
-        Adapter::Software => 0,
+        Adapter::Software | Adapter::Null => 0,
     })
 }
 

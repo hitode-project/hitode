@@ -1,5 +1,6 @@
 //! Device-child COM operations.
 use super::object::{Error as ObjectError, Object, PrivateData, Release, Table};
+use super::{caps, desc};
 use adv_abi::{Env, com::Iid};
 
 #[derive(Clone, Copy)]
@@ -8,6 +9,12 @@ pub(super) enum Error {
     NotFound,
     MoreData,
     Object(ObjectError),
+    Caps(caps::Error),
+    Description(desc::Error),
+    Dxgi(crate::dxgi::Error),
+    Map(super::object::map::Error),
+    #[cfg(feature = "gpu")]
+    Device,
 }
 
 impl From<ObjectError> for Error {
@@ -67,4 +74,44 @@ pub(super) fn set_private(
     data: Option<PrivateData>,
 ) -> Result<Option<PrivateData>, Error> {
     Ok(object_mut(env, table, pointer)?.set_private(iid, data))
+}
+
+impl From<caps::Error> for Error {
+    fn from(value: caps::Error) -> Self {
+        Self::Caps(value)
+    }
+}
+
+impl From<desc::Error> for Error {
+    fn from(value: desc::Error) -> Self {
+        Self::Description(value)
+    }
+}
+
+impl From<crate::dxgi::Error> for Error {
+    fn from(value: crate::dxgi::Error) -> Self {
+        Self::Dxgi(value)
+    }
+}
+
+impl From<super::object::map::Error> for Error {
+    fn from(value: super::object::map::Error) -> Self {
+        Self::Map(value)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl From<adv_device::gpu::Error> for Error {
+    fn from(value: adv_device::gpu::Error) -> Self {
+        log::debug!("D3D11 GPU command: {value}");
+        Self::Device
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl From<adv_gpu::Error> for Error {
+    fn from(value: adv_gpu::Error) -> Self {
+        log::debug!("D3D11 GPU resource: {value}");
+        Self::Device
+    }
 }

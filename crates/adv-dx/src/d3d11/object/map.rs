@@ -1,5 +1,8 @@
 //! Map admission before synchronization or guest allocation.
 mod storage;
+#[cfg(feature = "gpu")]
+pub(in crate::d3d11) use storage::coherent;
+pub(in crate::d3d11) use storage::has_shadow;
 pub use storage::{Layout, Layouts, Storage};
 
 use super::super::desc::{Resource, Usage};

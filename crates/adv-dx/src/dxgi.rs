@@ -12,7 +12,10 @@ mod ops;
 mod state;
 pub mod swap;
 
-pub use glue::{create_device_factory, install, register};
+pub use glue::{
+    adapter_kind, create_device_adapter, create_device_factory, install, query_adapter, register,
+};
+pub use glue::{create_device_swap_chain, device_output, install_swap_chains};
 pub use state::{DeviceCall, DeviceOperation, Devices, Provider, shared_display};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

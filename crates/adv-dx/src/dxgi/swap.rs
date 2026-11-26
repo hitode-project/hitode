@@ -141,3 +141,76 @@ pub struct Resize {
 
 #[cfg(test)]
 mod tests;
+
+use crate::pacing::PresentQueue;
+use adv_abi::types::{DXGI_MODE_DESC, DXGI_SWAP_CHAIN_FULLSCREEN_DESC};
+use adv_abi::{Env, com::Iid};
+use adv_machine::{Ext, Objects};
+
+/// The device front owns back-buffer objects and performs recorded presentation.
+pub trait Buffers: Sync {
+    fn validate_device(&self, env: &Env<'_>, device: u32) -> Result<(), Error>;
+    fn caps<'a>(&self, ext: &'a Ext) -> Result<&'a Caps, Error>;
+    fn retain_device(&self, env: &mut Env<'_>, device: u32) -> Result<(), Error>;
+    fn create(
+        &self,
+        env: &mut Env<'_>,
+        device: u32,
+        desc: DXGI_SWAP_CHAIN_DESC1,
+    ) -> Result<Vec<u32>, Error>;
+    fn query(&self, env: &mut Env<'_>, pointer: u32, iid: Iid) -> Result<u32, Error>;
+    fn referenced(&self, env: &Env<'_>, pointer: u32) -> bool;
+    fn release(&self, env: &mut Env<'_>, pointer: u32, interfaces: &mut Vec<u32>);
+    fn present(
+        &self,
+        env: &mut Env<'_>,
+        resource: u32,
+        size: [u32; 2],
+        serial: u64,
+        first: bool,
+    ) -> Result<(), Error>;
+    fn latency(&self, env: &Env<'_>, device: u32) -> u32;
+    fn output(&self, env: &mut Env<'_>, device: u32) -> Result<u32, Error>;
+}
+
+pub struct Services {
+    pub reported_build: u32,
+    pub buffers: &'static dyn Buffers,
+    pub window: fn(&Ext, &Objects, u32) -> Option<Window>,
+    pub resize: fn(&mut Env<'_>, u32, DXGI_MODE_DESC) -> Result<(), Error>,
+}
+
+pub(super) struct Chain {
+    pub device: u32,
+    pub buffers: Vec<u32>,
+    pub description: Description,
+    pub window: u32,
+    pub fullscreen: DXGI_SWAP_CHAIN_FULLSCREEN_DESC,
+    pub target: u32,
+    pub generation: u64,
+    pub queue: PresentQueue,
+    pub background: [f32; 4],
+    pub rotation: i32,
+    pub source: [u32; 2],
+    pub waitable: u32,
+    pub latency: u32,
+}
+
+impl Chain {
+    pub fn destroy(self, env: &mut Env<'_>, pointer: u32, interfaces: &mut Vec<u32>) {
+        if self.fullscreen.Windowed == 0 {
+            crate::ddraw::front::modes::set_modern_exclusive(env.ext, pointer, false);
+        }
+        if self.waitable != 0 {
+            env.sys.objects.close(self.waitable);
+        }
+        let backend = env.ext.get::<Services>().buffers;
+        for buffer in self.buffers {
+            backend.release(env, buffer, interfaces);
+        }
+        interfaces.push(self.device);
+        if self.target != 0 {
+            interfaces.push(self.target);
+        }
+    }
+}

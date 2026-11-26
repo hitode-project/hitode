@@ -3,6 +3,7 @@ use super::Error;
 use crate::{
     d3d11::caps::{FeatureLevel, Report, Requirement},
     shader::{
+        analysis::Reflection,
         dxbc,
         ir::{BindingKind, Model, Module, Register, Stage, Statement},
         wgsl,
@@ -11,7 +12,7 @@ use crate::{
 
 pub struct Shader {
     module: Module,
-    translation: wgsl::Translation,
+    reflection: Reflection,
 }
 
 impl Shader {
@@ -28,14 +29,20 @@ impl Shader {
         if module.stage != stage || !accepts(stage, module.model, report) {
             return Err(Error::InvalidArgument);
         }
-        let translation =
-            wgsl::emit(&module, wgsl::Options::default()).map_err(|_| Error::InvalidArgument)?;
+        let reflection = crate::shader::analysis::analyze(&module);
+        match wgsl::emit(&module, wgsl::Options::default()) {
+            Ok(_)
+            | Err(
+                crate::shader::ir::Error::MissingStorageFormat(_)
+                | crate::shader::ir::Error::MissingTypedBufferFormat(_)
+                | crate::shader::ir::Error::MissingTypedBufferElements(..)
+                | crate::shader::ir::Error::MissingStorageExtent(_),
+            ) => (),
+            Err(_) => return Err(Error::InvalidArgument),
+        }
         if stage == Stage::Compute {
             let level = report.level;
-            let threads = translation
-                .reflection
-                .workgroup_size
-                .ok_or(Error::InvalidArgument)?;
+            let threads = reflection.workgroup_size.ok_or(Error::InvalidArgument)?;
             let maximum = u64::from(level.limit(Requirement::ComputeThreads));
             let shared = u64::from(level.limit(Requirement::ComputeSharedBytes));
             if threads
@@ -45,7 +52,7 @@ impl Shader {
                 .is_none_or(|size| size == 0 || size > maximum)
                 || shared_bytes(&module) > shared
                 || (level < FeatureLevel::L11_0 && threads[2] != 1)
-                || translation.reflection.bindings.iter().any(|binding| {
+                || reflection.bindings.iter().any(|binding| {
                     binding.register == Register::UnorderedAccessView
                         && (binding.slot >= level.limit(Requirement::ComputeUavSlots)
                             || (level < FeatureLevel::L11_0
@@ -55,18 +62,15 @@ impl Shader {
                 return Err(Error::InvalidArgument);
             }
         }
-        Ok(Self {
-            module,
-            translation,
-        })
+        Ok(Self { module, reflection })
     }
 
     pub fn module(&self) -> &Module {
         &self.module
     }
 
-    pub fn translation(&self) -> &wgsl::Translation {
-        &self.translation
+    pub fn reflection(&self) -> &Reflection {
+        &self.reflection
     }
 }
 

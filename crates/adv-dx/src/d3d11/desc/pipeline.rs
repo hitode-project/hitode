@@ -9,9 +9,9 @@ use crate::d3d11::{
     caps::{FeatureLevel, Requirement},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum PipelineState {
-    Blend(D3D11_BLEND_DESC1),
+    Blend(Box<D3D11_BLEND_DESC1>),
     DepthStencil(D3D11_DEPTH_STENCIL_DESC),
     Rasterizer(D3D11_RASTERIZER_DESC1),
     Sampler(D3D11_SAMPLER_DESC),
@@ -89,7 +89,7 @@ impl PipelineState {
         if !independent {
             desc.RenderTarget = [desc.RenderTarget[0]; 8];
         }
-        Ok(Self::Blend(desc))
+        Ok(Self::Blend(Box::new(desc)))
     }
 
     pub fn depth_stencil(mut desc: D3D11_DEPTH_STENCIL_DESC) -> Result<Self, Error> {
@@ -204,7 +204,7 @@ impl PipelineState {
 
     pub fn descriptor_bytes(&self) -> &[u8] {
         match self {
-            Self::Blend(desc) => bytemuck::bytes_of(desc),
+            Self::Blend(desc) => bytemuck::bytes_of(desc.as_ref()),
             Self::DepthStencil(desc) => bytemuck::bytes_of(desc),
             Self::Rasterizer(desc) => bytemuck::bytes_of(desc),
             Self::Sampler(desc) => bytemuck::bytes_of(desc),

@@ -40,6 +40,7 @@ pub enum DeviceOperation {
     DuplicateOutput1,
 }
 
+#[derive(Clone, Copy)]
 pub struct DeviceCall {
     pub operation: DeviceOperation,
     pub this: u32,
@@ -76,6 +77,7 @@ pub(super) struct State {
     pub factory_vtable: u32,
     pub adapter_vtable: u32,
     pub output_vtable: u32,
+    pub swap_chain_vtable: u32,
     pub provider: Provider,
 }
 

@@ -194,3 +194,207 @@ pub(crate) fn raster(
     writer.close();
     Ok(writer.source)
 }
+
+/// Storage slots above the shader-resource and expansion bindings.
+pub const VERTEX_STREAM_BASE: u32 = 192;
+
+#[derive(Clone, Copy, Debug, Hash)]
+pub enum InputStep {
+    Vertex,
+    Instance(u32),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct VertexFetch {
+    pub register: u32,
+    pub mask: u8,
+    pub stream: u32,
+    pub offset: u32,
+    pub stride: u32,
+    pub step: InputStep,
+    pub format: VertexFormat,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct VertexFormat {
+    pub bytes: u32,
+    pub bits: [u8; 4],
+    pub kinds: [VertexComponent; 4],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum VertexComponent {
+    Float,
+    Sint,
+    Snorm,
+    Uint,
+    Unorm,
+}
+
+pub fn vertex(
+    module: &Module,
+    variant: &Variant,
+    fragment: Option<&Reflection>,
+    options: Options<'_>,
+    fetches: &[VertexFetch],
+    instance_start: u32,
+) -> Result<Translation, Error> {
+    use std::collections::BTreeSet;
+    let pulled = emit(module, &variant.pull_input(), Invocation::Vertex, options)?;
+    let mut module = module.clone();
+    let reflection = super::super::analysis::analyze(&module);
+    let interface = passes::variant::apply(&mut module, &reflection, variant, fragment)?;
+    let position = reflection
+        .signatures
+        .output
+        .iter()
+        .find(|element| element.system_value == SystemValue::Position)
+        .ok_or(Error::Invalid("vertex position"))?
+        .register;
+    let mut writer = Writer::new(&module, &reflection, options);
+    if interface.native_clip {
+        writer.line("enable clip_distances;");
+    }
+    writer.source.push_str(&pulled.source);
+    let streams: BTreeSet<_> = fetches.iter().map(|fetch| fetch.stream).collect();
+    for stream in streams {
+        let binding = VERTEX_STREAM_BASE + stream;
+        writer.line(&format!(
+            "@group(3) @binding({binding}) var<storage, read> dx_stream_{stream}: array<u32>;"
+        ));
+        writer.open(&format!("fn dx_byte_{stream}(at: u32) -> u32"));
+        writer.line(&format!(
+            "return (dx_stream_{stream}[at / 4u] >> ((at % 4u) * 8u)) & 255u;"
+        ));
+        writer.close();
+    }
+    writer.open("struct DxPulledVertex");
+    writer.line("@builtin(position) position: vec4<f32>,");
+    writer.varying_fields(&interface);
+    writer.clip_field(&interface);
+    writer.close();
+    writer.open("@vertex fn vertex_main(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> DxPulledVertex");
+    writer.line(&format!("var v: array<vec4<u32>, {}>;", pulled.inputs));
+    for input in &reflection.signatures.input {
+        match input.system_value {
+            SystemValue::VertexId => writer.line(&format!("v[{}].x = vertex_id;", input.register)),
+            SystemValue::InstanceId => {
+                writer.line(&format!("v[{}].x = instance_id;", input.register))
+            }
+            _ => (),
+        }
+    }
+    for (index, fetch) in fetches.iter().enumerate() {
+        emit_fetch(&mut writer, index, *fetch, instance_start)?;
+    }
+    writer.line("let o = dx_run(v);");
+    let mut outputs = vec![format!("bitcast<vec4<f32>>(o[{position}])")];
+    outputs.extend(super::variant_interface::variant_outputs(&interface, "o"));
+    writer.line(&format!("return DxPulledVertex({});", outputs.join(", ")));
+    writer.close();
+    Ok(Translation {
+        source: writer.source,
+        entry_point: "vertex_main",
+        reflection,
+        locations: pulled.locations,
+        counters: pulled.counters,
+    })
+}
+
+fn emit_fetch(
+    writer: &mut Writer<'_>,
+    index: usize,
+    fetch: VertexFetch,
+    instance_start: u32,
+) -> Result<(), Error> {
+    use VertexComponent::*;
+    let VertexFetch {
+        register,
+        mask,
+        stream,
+        offset,
+        stride,
+        step,
+        format,
+    } = fetch;
+    let index_expr = match step {
+        InputStep::Vertex => "vertex_id".into(),
+        InputStep::Instance(0) => format!("{instance_start}u"),
+        InputStep::Instance(rate) => {
+            format!("{instance_start}u + (instance_id - {instance_start}u) / {rate}u")
+        }
+    };
+    let address = format!("dx_address_{index}");
+    writer.line(&format!(
+        "let {address} = {offset}u + ({index_expr}) * {stride}u;"
+    ));
+    let bytes = format.bytes;
+    let bound = format!("dx_size_{index}");
+    writer.line(&format!(
+        "let {bound} = arrayLength(&dx_stream_{stream}) * 4u;"
+    ));
+    writer.open(&format!(
+        "if {address} <= {bound} && {bytes}u <= {bound} - {address}"
+    ));
+    let mut bit = 0u32;
+    let mut component = 0;
+    for lane in 0..4 {
+        if mask & (1 << lane) == 0 {
+            continue;
+        }
+        let bits = u32::from(format.bits[component]);
+        let kind = format.kinds[0];
+        let value = if bits == 0 {
+            if component == 3 {
+                match kind {
+                    Sint | Uint => "1u",
+                    _ => "0x3f800000u",
+                }
+                .into()
+            } else {
+                "0u".into()
+            }
+        } else {
+            let first = bit / 8;
+            let shift = bit % 8;
+            let raw = (0..(bits + shift).div_ceil(8))
+                .map(|byte| {
+                    format!(
+                        "(dx_byte_{stream}({address} + {}u) << {}u)",
+                        first + byte,
+                        byte * 8
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let maximum = 2u64.pow(bits) - 1;
+            let raw = format!("((({raw}) >> {shift}u) & {maximum}u)");
+            let sign = 32 - bits;
+            let signed = format!("(bitcast<i32>({raw} << {sign}u) >> {sign}u)");
+            bit += bits;
+            match format.kinds[component] {
+                Uint | Sint if bits == 32 => raw,
+                Uint => raw,
+                Sint => format!("bitcast<u32>({signed})"),
+                Float if bits == 32 => raw,
+                Float if bits == 16 => format!("bitcast<u32>(unpack2x16float({raw}).x)"),
+                Float if bits == 10 || bits == 11 => {
+                    let mantissa = bits - 5;
+                    format!(
+                        "bitcast<u32>(unpack2x16float({raw} << {}u).x)",
+                        10 - mantissa
+                    )
+                }
+                Unorm => format!("bitcast<u32>(f32({raw}) / {maximum}.0)"),
+                Snorm => format!("bitcast<u32>(max(-1.0, f32({signed}) / {}.0))", maximum / 2),
+                Float => {
+                    return Err(Error::Invalid("vertex fetch format"));
+                }
+            }
+        };
+        writer.line(&format!("v[{register}][{lane}] = {value};"));
+        component += 1;
+    }
+    writer.close();
+    Ok(())
+}

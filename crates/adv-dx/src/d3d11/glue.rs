@@ -1,7 +1,7 @@
 //! Marshal generated device-child COM signatures onto the object table.
 use super::{
     abi::*,
-    desc::{PipelineState, Resource, TextureKind, Usage, View, ViewKind},
+    desc::{PipelineState, Resource, TextureKind, View, ViewKind},
     object::{Error as ObjectError, Object, PrivateData, Release, Table, map},
     ops::{self, Error},
 };
@@ -9,13 +9,20 @@ use adv_abi::{Api, Env, GuestPtr, ImplementationLevel, Outcome, Registry, com::I
 use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_machine::Machine;
 use bytemuck::Pod;
+use device::{query_desc, query_size};
 use std::{collections::BTreeMap, num::NonZeroU32};
+
+mod context;
+mod device;
+mod dxgi;
+#[cfg(feature = "gpu")]
+mod gpu;
 
 const DLL: &str = "d3d11.dll";
 type Slot = (&'static str, adv_abi::Handler, ImplementationLevel);
 
 macro_rules! face {
-    ($interface:literal, $($method:ident => $handler:ident $level:ident),+ $(,)?) => {
+    ($interface:literal $(, $method:ident => $handler:ident $level:ident)* $(,)?) => {
         ($interface, &[
             (concat!($interface, "::QueryInterface"), query, ImplementationLevel::Implement),
             (concat!($interface, "::AddRef"), add_ref, ImplementationLevel::Implement),
@@ -24,7 +31,7 @@ macro_rules! face {
             (concat!($interface, "::GetPrivateData"), get_private, ImplementationLevel::Implement),
             (concat!($interface, "::SetPrivateData"), set_private, ImplementationLevel::Implement),
             (concat!($interface, "::SetPrivateDataInterface"), set_interface, ImplementationLevel::Implement),
-            $((concat!($interface, "::", stringify!($method)), $handler, ImplementationLevel::$level)),+
+            $((concat!($interface, "::", stringify!($method)), $handler, ImplementationLevel::$level),)*
         ])
     };
 }
@@ -47,6 +54,17 @@ macro_rules! view {
 }
 
 const FACES: &[(&str, &[Slot])] = &[
+    device::FACE,
+    device::MULTITHREAD,
+    dxgi::FACE,
+    dxgi::SURFACE,
+    context::FACE,
+    face!("ID3D11VertexShader"),
+    face!("ID3D11PixelShader"),
+    face!("ID3D11ComputeShader"),
+    face!("ID3D11InputLayout"),
+    face!("ID3D11Query", GetDataSize => query_size State, GetDesc => query_desc State),
+    face!("ID3D11Predicate", GetDataSize => query_size State, GetDesc => query_desc State),
     resource!("ID3D11Buffer"),
     resource!("ID3D11Texture1D"),
     resource!("ID3D11Texture2D"),
@@ -63,10 +81,33 @@ const FACES: &[(&str, &[Slot])] = &[
 
 struct State {
     table: Table,
+    devices: device::CreateDevices,
+    #[cfg(feature = "gpu")]
+    execution: Option<gpu::Execution>,
     vtables: BTreeMap<&'static str, u32>,
 }
 
 pub fn register_children(registry: &mut Registry) {
+    registry.register(Api {
+        module: DLL,
+        name: "D3D11CreateDevice",
+        handler: device::create,
+        level: ImplementationLevel::Implement,
+        conv: signature::lookup(DLL, "D3D11CreateDevice")
+            .unwrap()
+            .conv
+            .unwrap(),
+    });
+    registry.register(Api {
+        module: DLL,
+        name: "D3D11CreateDeviceAndSwapChain",
+        handler: device::create_and_swap,
+        level: ImplementationLevel::Implement,
+        conv: signature::lookup(DLL, "D3D11CreateDeviceAndSwapChain")
+            .unwrap()
+            .conv
+            .unwrap(),
+    });
     for &(face, slots) in FACES {
         for (index, &(name, handler, level)) in slots.iter().enumerate() {
             let (_, method) = name.split_once("::").unwrap();
@@ -108,7 +149,13 @@ pub fn install_children<B: Backend>(machine: &mut Machine<B>) -> Result<(), Stri
             address += 4;
         }
     }
-    machine.ext.insert(State { table, vtables });
+    machine.ext.insert(State {
+        table,
+        vtables,
+        devices: Default::default(),
+        #[cfg(feature = "gpu")]
+        execution: None,
+    });
     Ok(())
 }
 
@@ -147,7 +194,7 @@ pub fn attach_resource(
             TextureKind::D3 => "ID3D11Texture3D",
         },
     };
-    let layouts = if matches!(resource.usage(), Usage::Dynamic | Usage::Staging) {
+    let layouts = if map::has_shadow(resource) {
         let alignment = NonZeroU32::new(128).unwrap();
         Some(map::Layouts::new(resource, alignment).ok_or(ObjectError::Exhausted)?)
     } else {
@@ -179,7 +226,19 @@ pub fn attach_resource(
         }
         free(env, pointer);
     }
-    result.map(|()| pointer)
+    result?;
+    if let Resource::Texture(texture) = resource
+        && texture.kind() == TextureKind::D2
+        && texture.levels() == 1
+        && texture.layers() == 1
+        && let Err(error) = dxgi::attach_surface_face(env, pointer)
+    {
+        let table = table(env);
+        let release = table.release(&mut env.sys.objects, pointer);
+        retire(env, release);
+        return Err(error);
+    }
+    Ok(pointer)
 }
 
 pub fn attach_view(env: &mut Env<'_>, resource: u32, view: View) -> Result<u32, ObjectError> {
@@ -226,6 +285,14 @@ impl Error {
             Self::InvalidArgument | Self::Object(ObjectError::InvalidObject) => 0x80070057,
             Self::NotFound => 0x887a0002,
             Self::MoreData => 0x887a0003,
+            Self::Caps(error) => error.hresult(),
+            Self::Description(super::desc::Error::InvalidArgument) => 0x80070057,
+            Self::Description(super::desc::Error::UnsupportedView) => 0x80004005,
+            Self::Dxgi(error) => error.hresult(),
+            Self::Map(map::Error::InvalidArgument) => 0x80070057,
+            Self::Map(map::Error::StillDrawing) => 0x887a000a,
+            #[cfg(feature = "gpu")]
+            Self::Device => 0x887a0005,
             Self::Object(ObjectError::NoInterface) => 0x80004002,
             Self::Object(ObjectError::Exhausted) => 0x8007000e,
             Self::Object(ObjectError::TooManyUniqueStates) => 0x887c0001,
@@ -484,11 +551,12 @@ fn pipeline_desc1(env: &mut Env<'_>) -> Outcome {
 fn pipeline_description(env: &mut Env<'_>, version1: bool) -> Outcome {
     let (this, out) = (env.arg(0), env.arg(1));
     let result = (|| {
-        let pipeline = *ops::object(env, table(env), this)?
+        let pipeline = ops::object(env, table(env), this)?
             .pipeline()
+            .cloned()
             .ok_or(Error::InvalidArgument)?;
         match pipeline {
-            PipelineState::Blend(desc) if version1 => write(env, out, desc),
+            PipelineState::Blend(desc) if version1 => write(env, out, *desc),
             PipelineState::Blend(desc) => write(
                 env,
                 out,
@@ -527,3 +595,81 @@ fn pipeline_description(env: &mut Env<'_>, version1: bool) -> Outcome {
 
 #[cfg(test)]
 mod tests;
+
+pub fn configure_devices<B: Backend>(
+    machine: &mut Machine<B>,
+    hardware: &adv_gpu::Caps,
+    paths: super::caps::Coverage<'_>,
+) {
+    machine.ext.get_mut::<State>().devices = device::CreateDevices::derive(hardware, paths);
+}
+
+fn array<T: Pod>(env: &Env<'_>, address: u32, count: u32) -> Result<Vec<T>, Error> {
+    let bytes = count
+        .checked_mul(size_of::<T>() as u32)
+        .ok_or(Error::InvalidArgument)?;
+    if bytes == 0 {
+        return Ok(Vec::new());
+    }
+    adv_abi::guest::check_range(env.cpu, address, bytes, Prot::READ)
+        .map_err(|_| Error::InvalidArgument)?;
+    let mut values = vec![T::zeroed(); count as usize];
+    env.cpu
+        .read(address, bytemuck::cast_slice_mut(&mut values))
+        .map_err(|_| Error::InvalidArgument)?;
+    Ok(values)
+}
+
+fn output(
+    env: &mut Env<'_>,
+    address: u32,
+    make: impl FnOnce(&mut Env<'_>) -> Result<u32, Error>,
+) -> Result<u32, Error> {
+    if address == 0 {
+        return Ok(1);
+    }
+    write(env, address, 0u32)?;
+    let pointer = make(env)?;
+    write(env, address, pointer)?;
+    Ok(0)
+}
+
+fn status(result: Result<u32, Error>) -> Outcome {
+    Outcome::Return(result.unwrap_or_else(Error::hresult))
+}
+
+#[cfg(feature = "gpu")]
+pub fn configure_gpu<B: Backend>(
+    machine: &mut Machine<B>,
+    gpu: adv_device::gpu::Gpu,
+    paths: super::caps::Coverage<'_>,
+) {
+    configure_devices(machine, gpu.device().caps(), paths);
+    machine.ext.get_mut::<State>().execution = Some(gpu::Execution::new(gpu));
+}
+
+#[cfg(feature = "gpu")]
+pub fn configure_swap_chains<B: Backend>(
+    machine: &mut Machine<B>,
+    reported_build: u32,
+    window: fn(&adv_machine::Ext, &adv_machine::Objects, u32) -> Option<crate::dxgi::swap::Window>,
+    resize: fn(&mut Env<'_>, u32, adv_abi::types::DXGI_MODE_DESC) -> Result<(), crate::dxgi::Error>,
+) {
+    crate::dxgi::install_swap_chains(
+        machine,
+        crate::dxgi::swap::Services {
+            buffers: &dxgi::SwapBuffers,
+            window,
+            resize,
+            reported_build,
+        },
+    );
+}
+
+#[cfg(feature = "gpu")]
+pub fn configure_surface_dc<B: Backend>(
+    machine: &mut Machine<B>,
+    provider: crate::interop::MemoryDc,
+) {
+    machine.ext.insert(provider);
+}

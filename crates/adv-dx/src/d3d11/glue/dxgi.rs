@@ -1,0 +1,539 @@
+//! IDXGIDevice shares the owning D3D11 object's COM identity.
+use super::*;
+use crate::dxgi::{self, caps::Adapter};
+use adv_abi::gfx_iids::*;
+
+macro_rules! methods {
+    ($($method:ident => $handler:ident $level:ident),+ $(,)?) => {
+        ("IDXGIDevice1", &[
+            $((concat!("IDXGIDevice1::", stringify!($method)), $handler, ImplementationLevel::$level)),+
+        ])
+    };
+}
+
+pub(super) const FACE: (&str, &[Slot]) = methods!(
+    QueryInterface => query Implement,
+    AddRef => add_ref Implement,
+    Release => release Implement,
+    SetPrivateData => set_private Implement,
+    SetPrivateDataInterface => set_interface Implement,
+    GetPrivateData => get_private Implement,
+    GetParent => parent Implement,
+    GetAdapter => adapter Implement,
+    CreateSurface => create_surface Implement,
+    QueryResourceResidency => residency Implement,
+    SetGPUThreadPriority => set_priority State,
+    GetGPUThreadPriority => get_priority State,
+    SetMaximumFrameLatency => set_latency State,
+    GetMaximumFrameLatency => get_latency State,
+);
+
+pub(super) fn attach_device_face(
+    env: &mut Env<'_>,
+    device: u32,
+    adapter: Adapter,
+) -> Result<(), Error> {
+    let face = alloc(env, FACE.0)?;
+    let table = table(env);
+    table.register_faces(
+        &mut env.sys.objects,
+        device,
+        face,
+        &[IID_IDXGIOBJECT, IID_IDXGIDEVICE, IID_IDXGIDEVICE1],
+    );
+    let pointer = dxgi::create_device_adapter(env, adapter)?;
+    let state = ops::object_mut(env, table, device)?
+        .device_state_mut()
+        .unwrap();
+    state.adapter = pointer;
+    state.null_device = adapter == Adapter::Null;
+    Ok(())
+}
+
+fn get_state<'a>(env: &'a Env<'_>) -> Result<&'a super::super::object::Device, Error> {
+    ops::object(env, table(env), env.arg(0))?
+        .device_state()
+        .ok_or(Error::InvalidArgument)
+}
+
+fn adapter(env: &mut Env<'_>) -> Outcome {
+    let out = env.arg(1);
+    match get_state(env).map(|state| state.adapter) {
+        Ok(pointer) => retain_adapter(env, pointer, IID_IDXGIADAPTER, out),
+        Err(error) => Outcome::Return(error.hresult()),
+    }
+}
+
+fn parent(env: &mut Env<'_>) -> Outcome {
+    let out = env.arg(2);
+    match (get_state(env), read(env, env.arg(1))) {
+        (Ok(state), Ok(iid)) => retain_adapter(env, state.adapter, iid, out),
+        (Err(error), _) | (_, Err(error)) => Outcome::Return(error.hresult()),
+    }
+}
+
+fn retain_adapter(env: &mut Env<'_>, adapter: u32, iid: Iid, out: u32) -> Outcome {
+    call((|| {
+        write(env, out, 0u32)?;
+        let pointer = dxgi::query_adapter(env, adapter, iid)?;
+        write(env, out, pointer)
+    })())
+}
+
+fn residency(env: &mut Env<'_>) -> Outcome {
+    let (this, pointers, output, count) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    call((|| {
+        let table = table(env);
+        let owner = table
+            .canonical(&env.sys.objects, this)
+            .ok_or(Error::InvalidArgument)?;
+        let resources = array::<u32>(env, pointers, count)?;
+        for resource in resources {
+            let object = ops::object(env, table, resource)?;
+            if object.device() != Some(owner) || object.resource().is_none() {
+                return Err(Error::InvalidArgument);
+            }
+        }
+        for index in 0..count {
+            write(env, output + 4 * index, 1u32)?;
+        }
+        Ok(())
+    })())
+}
+
+fn set_priority(env: &mut Env<'_>) -> Outcome {
+    let (this, value) = (env.arg(0), env.arg(1) as i32);
+    call((|| {
+        if !(-7..=7).contains(&value) {
+            return Err(Error::InvalidArgument);
+        }
+        let state = ops::object_mut(env, table(env), this)?
+            .device_state_mut()
+            .ok_or(Error::InvalidArgument)?;
+        state.priority = value;
+        Ok(())
+    })())
+}
+
+fn get_priority(env: &mut Env<'_>) -> Outcome {
+    let out = env.arg(1);
+    call((|| {
+        let value = get_state(env)?.priority;
+        write(env, out, value)
+    })())
+}
+
+fn set_latency(env: &mut Env<'_>) -> Outcome {
+    let (this, value) = (env.arg(0), env.arg(1));
+    call((|| {
+        if value > 16 {
+            return Err(Error::InvalidArgument);
+        }
+        let state = ops::object_mut(env, table(env), this)?
+            .device_state_mut()
+            .ok_or(Error::InvalidArgument)?;
+        state.latency = if value == 0 { 3 } else { value };
+        Ok(())
+    })())
+}
+
+fn get_latency(env: &mut Env<'_>) -> Outcome {
+    let out = env.arg(1);
+    call((|| {
+        let value = get_state(env)?.latency;
+        write(env, out, value)
+    })())
+}
+
+fn create_surface(env: &mut Env<'_>) -> Outcome {
+    use super::super::desc::{Bind, Texture};
+    use adv_abi::types::DXGI_SURFACE_DESC;
+    let [face, desc, count, usage, shared, out] =
+        std::array::from_fn(|index| env.arg(index as u32));
+    call((|| {
+        if count == 0 || shared != 0 || usage & !(16 | 32 | 256 | 1024) != 0 {
+            return Err(Error::Dxgi(dxgi::Error::InvalidCall));
+        }
+        let desc: DXGI_SURFACE_DESC = read(env, desc)?;
+        let table = table(env);
+        let device = table
+            .canonical(&env.sys.objects, face)
+            .ok_or(Error::InvalidArgument)?;
+        let report = device::report(env, device)?;
+        let staging = usage & 256 != 0;
+        let bind = (if usage & 16 != 0 { Bind::SHADER } else { 0 })
+            | (if usage & 32 != 0 {
+                Bind::RENDER_TARGET
+            } else {
+                0
+            })
+            | (if usage & 1024 != 0 {
+                Bind::UNORDERED
+            } else {
+                0
+            });
+        let texture = Texture::new_2d(
+            D3D11_TEXTURE2D_DESC {
+                Width: desc.Width,
+                Height: desc.Height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: desc.Format,
+                SampleDesc: desc.SampleDesc,
+                Usage: if staging { 3 } else { 0 },
+                BindFlags: bind,
+                CPUAccessFlags: if staging { 0x20000 } else { 0 },
+                ..Default::default()
+            },
+            false,
+            report,
+        )?;
+        let bytes = count.checked_mul(4).ok_or(Error::InvalidArgument)?;
+        adv_abi::guest::check_range(env.cpu, out, bytes, Prot::WRITE)
+            .map_err(|_| Error::InvalidArgument)?;
+        let mut surfaces = Vec::new();
+        for _ in 0..count {
+            let resource = match attach_resource(env, device, Resource::Texture(texture)) {
+                Ok(pointer) => pointer,
+                Err(error) => {
+                    for pointer in surfaces {
+                        let released = table.release(&mut env.sys.objects, pointer);
+                        retire(env, released);
+                    }
+                    return Err(error.into());
+                }
+            };
+            let face = table.query(&mut env.sys.objects, resource, IID_IDXGISURFACE)?;
+            let released = table.release(&mut env.sys.objects, resource);
+            retire(env, released);
+            surfaces.push(face);
+        }
+        env.cpu
+            .write(out, bytemuck::cast_slice(&surfaces))
+            .map_err(|_| Error::InvalidArgument)
+    })())
+}
+
+#[cfg(feature = "gpu")]
+pub(super) struct SwapBuffers;
+
+#[cfg(feature = "gpu")]
+impl dxgi::swap::Buffers for SwapBuffers {
+    fn validate_device(&self, env: &Env<'_>, device: u32) -> Result<(), dxgi::Error> {
+        device_state(env, device).map(|_| ())
+    }
+
+    fn caps<'a>(&self, ext: &'a adv_machine::Ext) -> Result<&'a adv_gpu::Caps, dxgi::Error> {
+        gpu::caps(ext).ok_or(dxgi::Error::Unsupported)
+    }
+
+    fn retain_device(&self, env: &mut Env<'_>, device: u32) -> Result<(), dxgi::Error> {
+        table(env)
+            .add_ref(&mut env.sys.objects, device)
+            .map(|_| ())
+            .map_err(com_error)
+    }
+
+    fn create(
+        &self,
+        env: &mut Env<'_>,
+        device: u32,
+        desc: adv_abi::types::DXGI_SWAP_CHAIN_DESC1,
+    ) -> Result<Vec<u32>, dxgi::Error> {
+        use super::super::desc::{Bind, Misc, Texture};
+        let device = table(env)
+            .canonical(&env.sys.objects, device)
+            .ok_or(dxgi::Error::InvalidArgument)?;
+        let report = device::report(env, device).map_err(|_| dxgi::Error::InvalidArgument)?;
+        let texture = Texture::new_2d(
+            D3D11_TEXTURE2D_DESC {
+                Width: desc.Width,
+                Height: desc.Height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: desc.Format,
+                SampleDesc: desc.SampleDesc,
+                BindFlags: Bind::RENDER_TARGET
+                    | if desc.BufferUsage & 16 != 0 {
+                        Bind::SHADER
+                    } else {
+                        0
+                    },
+                MiscFlags: if desc.Flags & 4 != 0 {
+                    Misc::GDI_COMPATIBLE
+                } else {
+                    0
+                },
+                ..Default::default()
+            },
+            false,
+            report,
+        )
+        .map_err(|_| dxgi::Error::InvalidArgument)?;
+        let mut result = Vec::new();
+        for _ in 0..desc.BufferCount {
+            let pointer = match attach_resource(env, device, Resource::Texture(texture)) {
+                Ok(pointer) => pointer,
+                Err(error) => {
+                    for pointer in result {
+                        let released = table(env).release_bound(&mut env.sys.objects, pointer);
+                        retire(env, released);
+                    }
+                    return Err(com_error(error));
+                }
+            };
+            let table = table(env);
+            table
+                .retain_bound(&mut env.sys.objects, pointer)
+                .map_err(com_error)?;
+            let released = table.release(&mut env.sys.objects, pointer);
+            retire(env, released);
+            result.push(pointer);
+        }
+        Ok(result)
+    }
+
+    fn query(&self, env: &mut Env<'_>, pointer: u32, iid: Iid) -> Result<u32, dxgi::Error> {
+        table(env)
+            .query(&mut env.sys.objects, pointer, iid)
+            .map_err(com_error)
+    }
+
+    fn referenced(&self, env: &Env<'_>, pointer: u32) -> bool {
+        table(env).buffer_referenced(&env.sys.objects, pointer)
+    }
+
+    fn release(&self, env: &mut Env<'_>, pointer: u32, interfaces: &mut Vec<u32>) {
+        let released = table(env).release_bound(&mut env.sys.objects, pointer);
+        for pointer in released.allocations {
+            free(env, pointer);
+        }
+        interfaces.extend(released.private_interfaces);
+    }
+
+    fn present(
+        &self,
+        env: &mut Env<'_>,
+        resource: u32,
+        size: [u32; 2],
+        serial: u64,
+        first: bool,
+    ) -> Result<(), dxgi::Error> {
+        if device_state(
+            env,
+            table(env)
+                .get(&env.sys.objects, resource)
+                .and_then(Object::device)
+                .unwrap(),
+        )?
+        .null_device
+        {
+            return Ok(());
+        }
+        gpu::present(env, resource, size, serial, first).map_err(|_| dxgi::Error::Unavailable)
+    }
+
+    fn latency(&self, env: &Env<'_>, device: u32) -> u32 {
+        device_state(env, device).unwrap().latency
+    }
+
+    fn output(&self, env: &mut Env<'_>, device: u32) -> Result<u32, dxgi::Error> {
+        let adapter = device_state(env, device)?.adapter;
+        dxgi::device_output(env, adapter)
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn device_state<'a>(
+    env: &'a Env<'_>,
+    pointer: u32,
+) -> Result<&'a super::super::object::Device, dxgi::Error> {
+    table(env)
+        .get(&env.sys.objects, pointer)
+        .and_then(Object::device_state)
+        .ok_or(dxgi::Error::InvalidArgument)
+}
+
+#[cfg(feature = "gpu")]
+fn com_error(error: ObjectError) -> dxgi::Error {
+    match error {
+        ObjectError::InvalidObject => dxgi::Error::InvalidArgument,
+        ObjectError::NoInterface => dxgi::Error::NoInterface,
+        ObjectError::Exhausted | ObjectError::TooManyUniqueStates => dxgi::Error::OutOfMemory,
+    }
+}
+
+pub(super) const SURFACE: (&str, &[Slot]) = (
+    "IDXGISurface1",
+    &[
+        (
+            "IDXGISurface1::QueryInterface",
+            query,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface1::AddRef",
+            add_ref,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface1::Release",
+            release,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface1::SetPrivateData",
+            set_private,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface1::SetPrivateDataInterface",
+            set_interface,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface1::GetPrivateData",
+            get_private,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface1::GetParent",
+            surface_device,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface1::GetDevice",
+            surface_device,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface1::GetDesc",
+            surface_desc,
+            ImplementationLevel::State,
+        ),
+        (
+            "IDXGISurface1::Map",
+            surface_map,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface1::Unmap",
+            surface_unmap,
+            ImplementationLevel::State,
+        ),
+        (
+            "IDXGISurface1::GetDC",
+            get_dc,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface1::ReleaseDC",
+            release_dc,
+            ImplementationLevel::Implement,
+        ),
+    ],
+);
+
+pub(super) fn attach_surface_face(env: &mut Env<'_>, resource: u32) -> Result<(), ObjectError> {
+    let face = alloc(env, SURFACE.0)?;
+    table(env).register_faces(
+        &mut env.sys.objects,
+        resource,
+        face,
+        &[
+            IID_IDXGIOBJECT,
+            IID_IDXGIDEVICESUBOBJECT,
+            IID_IDXGISURFACE,
+            IID_IDXGISURFACE1,
+        ],
+    );
+    Ok(())
+}
+
+fn surface_device(env: &mut Env<'_>) -> Outcome {
+    let table = table(env);
+    let (surface, iid, out) = (env.arg(0), read::<Iid>(env, env.arg(1)), env.arg(2));
+    call((|| {
+        write(env, out, 0u32)?;
+        let device = ops::object(env, table, surface)?
+            .device()
+            .ok_or(Error::InvalidArgument)?;
+        let pointer = table.query(&mut env.sys.objects, device, iid?)?;
+        write(env, out, pointer)
+    })())
+}
+
+fn surface_desc(env: &mut Env<'_>) -> Outcome {
+    let (surface, out) = (env.arg(0), env.arg(1));
+    call((|| {
+        let Resource::Texture(texture) = ops::object(env, table(env), surface)?
+            .resource()
+            .ok_or(Error::InvalidArgument)?
+        else {
+            return Err(Error::InvalidArgument);
+        };
+        let desc = texture.desc_2d();
+        write(
+            env,
+            out,
+            adv_abi::types::DXGI_SURFACE_DESC {
+                Width: desc.Width,
+                Height: desc.Height,
+                Format: desc.Format,
+                SampleDesc: desc.SampleDesc,
+            },
+        )
+    })())
+}
+
+fn surface_map(env: &mut Env<'_>) -> Outcome {
+    let (surface, out, flags) = (env.arg(0), env.arg(1), env.arg(2));
+    call((|| {
+        let mode = match flags {
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            6 => 4,
+            _ => return Err(dxgi::Error::InvalidCall.into()),
+        };
+        let pointer = table(env)
+            .canonical(&env.sys.objects, surface)
+            .ok_or(Error::InvalidArgument)?;
+        let mapped = context::map_subresource(env, pointer, 0, mode, 0)?;
+        write(
+            env,
+            out,
+            adv_abi::types::DXGI_MAPPED_RECT {
+                Pitch: mapped.RowPitch as i32,
+                pBits: mapped.pData,
+            },
+        )
+    })())
+}
+
+fn surface_unmap(_: &mut Env<'_>) -> Outcome {
+    Outcome::Return(0)
+}
+
+fn get_dc(env: &mut Env<'_>) -> Outcome {
+    #[cfg(feature = "gpu")]
+    return dc::get(env);
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = env;
+        Outcome::Return(dxgi::Error::Unavailable.hresult())
+    }
+}
+
+fn release_dc(env: &mut Env<'_>) -> Outcome {
+    #[cfg(feature = "gpu")]
+    return dc::release(env);
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = env;
+        Outcome::Return(dxgi::Error::Unavailable.hresult())
+    }
+}
+
+#[cfg(feature = "gpu")]
+mod dc;

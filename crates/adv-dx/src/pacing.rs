@@ -22,3 +22,37 @@ pub(crate) fn scanline(
     };
     (line >= height, line)
 }
+
+#[derive(Default)]
+pub(crate) struct PresentQueue {
+    deadlines: std::collections::VecDeque<u64>,
+    pub count: u32,
+    pub sync: u64,
+}
+
+impl PresentQueue {
+    pub fn available(&mut self, now: u64, limit: u32) -> Option<u64> {
+        while self
+            .deadlines
+            .front()
+            .is_some_and(|&deadline| deadline <= now)
+        {
+            self.deadlines.pop_front();
+        }
+        self.deadlines
+            .get(self.deadlines.len().wrapping_sub(limit as usize))
+            .copied()
+    }
+
+    pub fn submit(&mut self, now: u64, interval: u32, hz: u32) {
+        self.count = self.count.wrapping_add(1);
+        let first = now.max(self.deadlines.back().copied().unwrap_or(0));
+        if interval == 0 {
+            self.sync = first;
+        } else {
+            let tick = u128::from(first) * u128::from(hz) / 1_000_000 + u128::from(interval);
+            self.sync = (tick * 1_000_000).div_ceil(u128::from(hz)) as u64;
+            self.deadlines.push_back(self.sync);
+        }
+    }
+}

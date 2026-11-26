@@ -287,6 +287,14 @@ impl Com {
         true
     }
 
+    pub fn internal_references<T: Any>(
+        &self,
+        objects: &Objects,
+        id: ComIdentity<T>,
+    ) -> Option<u32> {
+        Some(self.object(objects, id)?.internal)
+    }
+
     pub fn references<T: Any>(&self, objects: &Objects, id: ComIdentity<T>) -> Option<u32> {
         let object = self.object(objects, id)?;
         if object

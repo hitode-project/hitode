@@ -2,7 +2,10 @@
 use crate::record;
 pub use crate::record::ResourceKey;
 use adv_device::{
-    gpu::{Dispatch, DispatchArguments, Error, Gpu, ModernDraw, SlotBindings},
+    gpu::{
+        Dispatch, DispatchArguments, Error, Gpu, ModernDraw, ModernTransfer, QuerySlot,
+        SlotBindings,
+    },
     surface::Rect,
 };
 use adv_gpu::ImageView;
@@ -13,6 +16,7 @@ pub enum Command {
         draw: Box<ModernDraw>,
         vertex: SlotBindings,
         fragment: SlotBindings,
+        statistics: Option<QuerySlot>,
     },
     Dispatch {
         pipeline: Arc<Dispatch>,
@@ -24,6 +28,7 @@ pub enum Command {
         destination: ImageView,
     },
     GenerateMips(ImageView),
+    Transfer(ModernTransfer),
 }
 
 #[derive(Clone, Copy)]
@@ -48,7 +53,16 @@ impl record::Front for Front {
                 draw,
                 vertex,
                 fragment,
-            } => gpu.draw_modern((**draw).clone(), vertex, fragment),
+                statistics,
+            } => match statistics {
+                Some(statistics) => gpu.draw_modern_statistics(
+                    (**draw).clone(),
+                    vertex,
+                    fragment,
+                    statistics.clone(),
+                ),
+                None => gpu.draw_modern((**draw).clone(), vertex, fragment),
+            },
             Command::Dispatch {
                 pipeline,
                 bindings,
@@ -59,6 +73,7 @@ impl record::Front for Front {
                 destination,
             } => gpu.resolve(source.clone(), destination.clone()),
             Command::GenerateMips(view) => gpu.generate_mips(view.clone()),
+            Command::Transfer(transfer) => gpu.transfer(transfer.clone()),
         }
     }
 
@@ -98,7 +113,9 @@ impl Recording {
             let kind = match &payload {
                 Command::Draw { .. } => record::Kind::Draw,
                 Command::Resolve { .. } => record::Kind::Copy,
-                Command::Dispatch { .. } | Command::GenerateMips(_) => record::Kind::Upload,
+                Command::Dispatch { .. } | Command::GenerateMips(_) | Command::Transfer(_) => {
+                    record::Kind::Upload
+                }
             };
             record::Op {
                 payload,
@@ -138,6 +155,26 @@ impl Recording {
             gpu.flush()?;
         }
         Ok(())
+    }
+
+    pub(super) fn present(
+        &mut self,
+        gpu: &mut Gpu,
+        key: ResourceKey,
+        size: (u32, u32),
+        serial: u64,
+        first: bool,
+    ) -> Result<adv_device::surface::Region, Error> {
+        use adv_device::surface::Region;
+        let damage = self.inner.damage.written_region(key, size);
+        let damage = if first || damage.is_empty() {
+            Region::whole(size)
+        } else {
+            damage
+        };
+        self.submit(gpu, record::Reason::Wait)?;
+        self.inner.finish(u128::from(serial), Some(serial));
+        Ok(damage)
     }
 
     fn submit(&mut self, gpu: &mut Gpu, reason: record::Reason) -> Result<(), Error> {

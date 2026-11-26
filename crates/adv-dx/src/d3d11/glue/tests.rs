@@ -24,11 +24,36 @@ fn machine() -> Machine<JitCpu> {
     register_children(&mut registry);
     let coverage = registry.coverage();
     assert_eq!(
-        coverage.implement + coverage.state,
-        FACES.iter().map(|(_, slots)| slots.len()).sum::<usize>()
+        coverage.implement + coverage.state + coverage.safe_fail,
+        2 + FACES.iter().map(|(_, slots)| slots.len()).sum::<usize>()
     );
-    assert_eq!((coverage.safe_fail, coverage.legacy), (0, 0));
+    assert_eq!(coverage.legacy, 0);
+    let excluded: Vec<_> = FACES
+        .iter()
+        .flat_map(|(_, slots)| slots.iter())
+        .filter_map(|&(name, _, level)| (level == ImplementationLevel::SafeFail).then_some(name))
+        .collect();
+    assert_eq!(
+        excluded,
+        [
+            "ID3D11Device1::CreateGeometryShader",
+            "ID3D11Device1::CreateGeometryShaderWithStreamOutput",
+            "ID3D11Device1::CreateHullShader",
+            "ID3D11Device1::CreateDomainShader",
+            "ID3D11Device1::CreateClassLinkage",
+            "ID3D11Device1::CreateDeferredContext",
+            "ID3D11Device1::OpenSharedResource",
+            "ID3D11Device1::CreateDeferredContext1",
+            "ID3D11Device1::CreateDeviceContextState",
+            "ID3D11Device1::OpenSharedResource1",
+            "ID3D11Device1::OpenSharedResourceByName",
+            "ID3D11DeviceContext1::ExecuteCommandList",
+            "ID3D11DeviceContext1::FinishCommandList",
+            "ID3D11DeviceContext1::SwapDeviceContextState",
+        ]
+    );
     assert!(registry.signature_conflicts().is_empty());
+    crate::dxgi::register(&mut registry);
     registry.add("fixture", "exit", Conv::Stdcall { argc: 0 }, |_| {
         Outcome::ExitThread(0)
     });
@@ -80,6 +105,21 @@ fn machine() -> Machine<JitCpu> {
     machine.cpu.map(CODE, 4096, Prot::RX).unwrap();
     machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
     install_children(&mut machine).unwrap();
+    crate::dxgi::install(
+        &mut machine,
+        crate::dxgi::Provider {
+            adapter: Default::default(),
+            display: crate::dxgi::shared_display,
+            window_exists: |_, _, window| window == 1,
+            next_vblank: |_| None,
+            devices: None,
+        },
+    )
+    .unwrap();
+    machine.ext.get_mut::<State>().devices = device::CreateDevices {
+        reports: FeatureLevel::ALL.map(|level| Some(Arc::new(fixture_report(level)))),
+        max_buffer_size: 1 << 28,
+    };
     machine
 }
 
@@ -201,3 +241,75 @@ fn resource_view_and_private_data_calls_use_guest_vtables() {
     );
     assert!(state.table.get(&machine.sys.objects, texture).is_none());
 }
+
+fn create(machine: &mut Machine<JitCpu>, driver: u32, adapter: u32, levels: &[u32]) -> (u32, u32) {
+    let levels_address = DATA + 0x600;
+    machine
+        .cpu
+        .write(levels_address, bytemuck::cast_slice(levels))
+        .unwrap();
+    let call = machine.resolve_import(DLL, "D3D11CreateDevice").unwrap();
+    assert_eq!(
+        guest_call(
+            machine,
+            call,
+            &[
+                adapter,
+                driver,
+                0,
+                0,
+                levels_address,
+                levels.len() as u32,
+                7,
+                OUT,
+                LEVEL,
+                CONTEXT
+            ]
+        ),
+        0
+    );
+    (
+        machine.cpu.read_u32(OUT).unwrap(),
+        machine.cpu.read_u32(CONTEXT).unwrap(),
+    )
+}
+
+const LEVEL: u32 = OUT + 16;
+const CONTEXT: u32 = OUT + 20;
+
+// spec: GFX-CAP-4 GFX-DXGI-1
+#[test]
+fn device_entry_negotiates_levels_and_retains_its_immediate_context() {
+    let mut machine = machine();
+    let (device, context) = create(&mut machine, 5, 0, &[0x9100, 0xb000]);
+    assert_eq!(machine.cpu.read_u32(LEVEL).unwrap(), 0x9100);
+    assert_eq!(method(&mut machine, device, 37, &[]), 0x9100);
+    assert_eq!(refs(&mut machine, device), 2);
+    assert_eq!(method(&mut machine, context, 112, &[]), 0);
+    assert_eq!(method(&mut machine, context, 2, &[]), 0);
+    assert_eq!(refs(&mut machine, device), 1);
+    assert_eq!(method(&mut machine, device, 40, &[CONTEXT]), 0);
+    assert_eq!(machine.cpu.read_u32(CONTEXT).unwrap(), context);
+    assert_eq!(refs(&mut machine, device), 2);
+    machine.cpu.write(IID, &IID_IDXGIDEVICE).unwrap();
+    assert_eq!(method(&mut machine, device, 0, &[IID, OUT]), 0);
+    let dxgi = machine.cpu.read_u32(OUT).unwrap();
+    assert_ne!(device, dxgi);
+    machine.cpu.write(IID, &adv_abi::com::IUNKNOWN).unwrap();
+    assert_eq!(method(&mut machine, dxgi, 0, &[IID, OUT]), 0);
+    assert_eq!(machine.cpu.read_u32(OUT).unwrap(), device);
+    assert_eq!(method(&mut machine, dxgi, 7, &[OUT]), 0);
+    let adapter = machine.cpu.read_u32(OUT).unwrap();
+    let desc = DATA + 0x650;
+    assert_eq!(method(&mut machine, adapter, 8, &[desc]), 0);
+    let desc: adv_abi::types::DXGI_ADAPTER_DESC = GuestPtr::new(desc).read(&machine.cpu).unwrap();
+    assert_eq!((desc.VendorId, desc.DeviceId), (0x1414, 0x008c));
+    assert_eq!(method(&mut machine, adapter, 2, &[]), 1);
+    assert_eq!(method(&mut machine, dxgi, 2, &[]), 3);
+    assert_eq!(method(&mut machine, device, 2, &[]), 2);
+    assert_eq!(method(&mut machine, context, 2, &[]), 0);
+    assert_eq!(method(&mut machine, device, 2, &[]), 0);
+}
+
+#[cfg(feature = "gpu")]
+mod pixels;

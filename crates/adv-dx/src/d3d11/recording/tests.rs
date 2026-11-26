@@ -115,6 +115,7 @@ fn recorded_dispatch_finishes_before_the_draw_reads_its_image() {
             occlusion: None,
             predicate: None,
         }),
+        statistics: None,
         vertex: SlotBindings::default(),
         fragment: SlotBindings {
             images: vec![Some(storage.view().clone())],

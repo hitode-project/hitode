@@ -22,6 +22,8 @@ macro_rules! vtable {
     };
 }
 
+mod swap_chain;
+
 const FACTORY: &[Slot] = vtable!("IDXGIFactory7",
     QueryInterface => query Implement,
     AddRef => add_ref Implement,
@@ -114,7 +116,7 @@ const OUTPUT: &[Slot] = vtable!("IDXGIOutput6",
 pub fn register(registry: &mut Registry) {
     registry.register(create_factory_ABI);
     registry.register(create_factory1_ABI);
-    for slots in [FACTORY, ADAPTER, OUTPUT] {
+    for slots in [FACTORY, ADAPTER, OUTPUT, swap_chain::SLOTS] {
         for (index, &(name, handler, level)) in slots.iter().enumerate() {
             let (interface, method) = name.split_once("::").unwrap();
             let signature =
@@ -149,6 +151,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>, provider: Provider) -> Resu
         table(machine, FACTORY)?,
         table(machine, ADAPTER)?,
         table(machine, OUTPUT)?,
+        table(machine, swap_chain::SLOTS)?,
     ];
     let com = adv_abi::com::Com::new(&mut machine.sys.objects).ok_or("DXGI COM namespace")?;
     let storage = machine
@@ -161,14 +164,24 @@ pub fn install<B: Backend>(machine: &mut Machine<B>, provider: Provider) -> Resu
         )
         .map_err(|e| e.to_string())?;
     let mut address = storage;
-    let [factory_vtable, adapter_vtable, output_vtable] = entries.each_ref().map(|entries| {
+    let [
+        factory_vtable,
+        adapter_vtable,
+        output_vtable,
+        swap_chain_vtable,
+    ] = entries.each_ref().map(|entries| {
         let start = address;
         address += entries.len() as u32 * 4;
         start
     });
-    for (address, entries) in [factory_vtable, adapter_vtable, output_vtable]
-        .into_iter()
-        .zip(&entries)
+    for (address, entries) in [
+        factory_vtable,
+        adapter_vtable,
+        output_vtable,
+        swap_chain_vtable,
+    ]
+    .into_iter()
+    .zip(&entries)
     {
         machine
             .cpu
@@ -180,6 +193,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>, provider: Provider) -> Resu
         factory_vtable,
         adapter_vtable,
         output_vtable,
+        swap_chain_vtable,
         provider,
     });
     Ok(())
@@ -188,6 +202,21 @@ pub fn install<B: Backend>(machine: &mut Machine<B>, provider: Provider) -> Resu
 /// Construct the parent factory for a device-created adapter.
 pub fn create_device_factory(env: &mut Env<'_>, iid: Iid) -> Result<u32, u32> {
     ops::create_factory(env, FactoryOrigin::Device, iid).map_err(Error::hresult)
+}
+
+pub fn query_adapter(env: &mut Env<'_>, adapter: u32, iid: Iid) -> Result<u32, Error> {
+    ops::query(env, adapter, iid)
+}
+
+pub fn adapter_kind(env: &Env<'_>, adapter: u32) -> Result<Adapter, Error> {
+    ops::adapter(env, adapter)
+}
+
+pub fn create_device_adapter(env: &mut Env<'_>, adapter: Adapter) -> Result<u32, Error> {
+    let factory = ops::create_factory(env, FactoryOrigin::Device, IID_IDXGIFACTORY1)?;
+    let result = ops::enum_adapter(env, factory, adapter);
+    ops::release(env, factory);
+    result
 }
 
 fn call(f: impl FnOnce() -> Result<(), Error>) -> Outcome {
@@ -671,11 +700,17 @@ macro_rules! device_glue {
             for (index, argument) in arguments.iter_mut().take($argc).enumerate() {
                 *argument = env.arg(index as u32 + 1);
             }
-            ops::device(env, DeviceCall {
+            let invocation = DeviceCall {
                 operation: DeviceOperation::$operation,
                 this: env.arg(0),
                 arguments,
-            })
+            };
+            if env.ext.try_get::<super::swap::Services>().is_some()
+                && let Some(outcome) = swap_chain::create(env, invocation)
+            {
+                return outcome;
+            }
+            ops::device(env, invocation)
         }
     };
 }
@@ -797,3 +832,25 @@ device_glue!(duplicate1, DuplicateOutput1, 5, |env: &mut Env<'_>| {
 
 #[cfg(test)]
 mod tests;
+
+/// Install the window and device services for private swap-chain callers.
+pub fn install_swap_chains<B: Backend>(machine: &mut Machine<B>, services: super::swap::Services) {
+    machine.ext.insert(services);
+}
+
+pub fn device_output(env: &mut Env<'_>, adapter: u32) -> Result<u32, Error> {
+    ops::enum_output(env, adapter, 0)
+}
+
+pub fn create_device_swap_chain(
+    env: &mut Env<'_>,
+    adapter: u32,
+    device: u32,
+    desc: u32,
+    output: u32,
+) -> Result<(), Error> {
+    let factory = ops::parent(env, adapter, IID_IDXGIFACTORY1)?;
+    let result = swap_chain::create_legacy(env, factory, device, desc, output);
+    ops::release(env, factory);
+    result
+}

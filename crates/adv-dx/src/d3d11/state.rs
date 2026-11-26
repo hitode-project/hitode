@@ -6,14 +6,14 @@ use super::desc::{View, ViewKind};
 use hazard::Index;
 use std::sync::Arc;
 
-const SRVS: usize = 128;
-const SAMPLERS: usize = 16;
-const CONSTANTS: usize = 14;
-const RENDER_TARGETS: usize = 8;
-const UAVS: usize = 8;
-const STREAMS: usize = 32;
-const VIEWPORTS: usize = 16;
-const STREAM_OUTPUTS: usize = 4;
+pub(super) const SRVS: usize = 128;
+pub(super) const SAMPLERS: usize = 16;
+pub(super) const CONSTANTS: usize = 14;
+pub(super) const RENDER_TARGETS: usize = 8;
+pub(super) const UAVS: usize = 8;
+pub(super) const STREAMS: usize = 32;
+pub(super) const VIEWPORTS: usize = 16;
+pub(super) const STREAM_OUTPUTS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -199,6 +199,46 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub(super) fn for_each_binding(&self, mut visit: impl FnMut(u32)) {
+        let mut visit = |pointer| {
+            if pointer != 0 {
+                visit(pointer);
+            }
+        };
+        visit(self.ia.layout);
+        visit(self.ia.indices.buffer);
+        self.ia
+            .vertices
+            .iter()
+            .for_each(|vertex| visit(vertex.buffer));
+        for stage in &self.stages {
+            visit(stage.shader);
+            stage
+                .constants
+                .iter()
+                .for_each(|constant| visit(constant.buffer));
+            stage.samplers.iter().copied().for_each(&mut visit);
+            stage
+                .srvs
+                .iter()
+                .chain(&stage.uavs)
+                .flatten()
+                .for_each(|view| visit(view.pointer));
+        }
+        visit(self.rs.state);
+        visit(self.om.blend);
+        visit(self.om.depth_stencil);
+        self.om
+            .targets
+            .iter()
+            .chain(std::iter::once(&self.om.depth))
+            .chain(&self.om.uavs)
+            .flatten()
+            .for_each(|view| visit(view.pointer));
+        self.so.buffers.iter().copied().for_each(&mut visit);
+        visit(self.predication.predicate);
+    }
+
     pub fn view(&self, slot: ViewSlot) -> Option<&BoundView> {
         match slot.0 {
             Slot::Srv(stage, slot) => self.stages[stage as usize].srvs[slot].as_ref(),

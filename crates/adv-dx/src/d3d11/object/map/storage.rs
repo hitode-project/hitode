@@ -2,7 +2,7 @@
 use super::{Access, Error, Map};
 use crate::d3d11::{
     abi::D3D11_MAPPED_SUBRESOURCE,
-    desc::{Resource, Usage},
+    desc::{Misc, Resource, Usage},
 };
 use adv_device::surface::{Access as SurfaceAccess, Rect, Residency};
 use std::num::NonZeroU32;
@@ -17,6 +17,10 @@ pub struct Layout {
 }
 
 impl Layout {
+    pub(super) fn rows(self) -> u32 {
+        self.blocks.1
+    }
+
     pub fn row_pitch(self) -> u32 {
         self.row_pitch
     }
@@ -39,6 +43,14 @@ impl Layout {
     }
 }
 
+pub(in crate::d3d11) fn coherent(resource: Resource) -> bool {
+    resource.usage() == Usage::Staging || resource.misc().contains(Misc::GDI_COMPATIBLE)
+}
+
+pub(in crate::d3d11) fn has_shadow(resource: Resource) -> bool {
+    resource.usage() == Usage::Dynamic || coherent(resource)
+}
+
 pub struct Layouts {
     resource: Resource,
     layouts: Box<[Layout]>,
@@ -47,9 +59,8 @@ pub struct Layouts {
 
 impl Layouts {
     pub fn new(resource: Resource, alignment: NonZeroU32) -> Option<Self> {
-        match resource.usage() {
-            Usage::Default | Usage::Immutable => return None,
-            Usage::Dynamic | Usage::Staging => (),
+        if !has_shadow(resource) {
+            return None;
         }
         let mut layouts = Vec::with_capacity(resource.subresources() as usize);
         let mut offset = 0u32;
@@ -105,7 +116,7 @@ impl Layouts {
             .into_iter()
             .map(|layout| Subresource {
                 layout,
-                staging: if self.resource.usage() == Usage::Staging {
+                staging: if coherent(self.resource) {
                     (0..layout.depth).map(|_| Residency::cpu()).collect()
                 } else {
                     Box::default()
@@ -136,6 +147,26 @@ impl Storage {
         self.pointer
     }
 
+    pub(in crate::d3d11) fn initialize<E>(
+        &self,
+        subresource: u32,
+        bytes: &[u8],
+        mut write: impl FnMut(u32, &[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let layout = self.layout(subresource);
+        let row_bytes = bytes.len() / (layout.rows() * layout.depth) as usize;
+        for (i, row) in bytes.chunks_exact(row_bytes).enumerate() {
+            let y = i as u32 % layout.rows();
+            let z = i as u32 / layout.rows();
+            write(layout.slice(self.pointer, z) + y * layout.row_pitch, row)?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::d3d11) fn layout(&self, subresource: u32) -> Layout {
+        self.subresources[subresource as usize].layout
+    }
+
     pub fn map(
         &mut self,
         subresource: u32,
@@ -147,30 +178,52 @@ impl Storage {
         let request = Map::admit(self.resource, subresource, mode, flags)?;
         request.check_busy(busy)?;
         let mut download = download;
-        let subresource = &mut self.subresources[subresource as usize];
-        let layout = subresource.layout;
         if let Map::Staging { access, .. } = request {
             let access = match access {
                 Access::Read => SurfaceAccess::Read,
                 Access::Write | Access::ReadWrite => SurfaceAccess::Write,
             };
-            for slice in &mut subresource.staging {
-                slice.cpu_access(layout.full(), access, |&slice, parts| {
-                    download(layout, slice, parts)
-                })?;
-            }
+            return self.cpu_access(subresource, access, &mut download);
         }
-        Ok(D3D11_MAPPED_SUBRESOURCE {
+        Ok(self.mapped(subresource))
+    }
+
+    fn mapped(&self, subresource: u32) -> D3D11_MAPPED_SUBRESOURCE {
+        let layout = self.layout(subresource);
+        D3D11_MAPPED_SUBRESOURCE {
             pData: layout.slice(self.pointer, 0),
             RowPitch: layout.row_pitch,
             DepthPitch: layout.depth_pitch,
-        })
+        }
+    }
+
+    pub(in crate::d3d11) fn cpu_access<E>(
+        &mut self,
+        index: u32,
+        access: SurfaceAccess,
+        mut download: impl FnMut(Layout, u32, &[Rect]) -> Result<(), E>,
+    ) -> Result<D3D11_MAPPED_SUBRESOURCE, E> {
+        let subresource = &mut self.subresources[index as usize];
+        let layout = subresource.layout;
+        for slice in &mut subresource.staging {
+            slice.cpu_access(layout.full(), access, |&slice, parts| {
+                download(layout, slice, parts)
+            })?;
+        }
+        Ok(self.mapped(index))
     }
 
     pub fn attach_staging_gpu(&mut self, subresource: u32) {
         let subresource = &mut self.subresources[subresource as usize];
         for (index, slice) in subresource.staging.iter_mut().enumerate() {
             slice.attach_gpu(subresource.layout.blocks, index as u32);
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(in crate::d3d11) fn staging_gpu_overwrite(&mut self, subresource: u32) {
+        for slice in &mut self.subresources[subresource as usize].staging {
+            slice.gpu_overwrite();
         }
     }
 

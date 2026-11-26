@@ -80,6 +80,7 @@ impl Misc {
     pub const INDIRECT: u32 = 16;
     pub const RAW: u32 = 32;
     pub const STRUCTURED: u32 = 64;
+    pub const RESOURCE_CLAMP: u32 = 128;
     pub const GDI_COMPATIBLE: u32 = 512;
 
     pub fn contains(self, flags: u32) -> bool {
@@ -405,9 +406,12 @@ impl Texture {
             || (bind.contains(Bind::DEPTH_STENCIL) && kind == TextureKind::D3)
             || (bind.contains(Bind::UNORDERED)
                 && (report.level < FeatureLevel::L11_0 || samples != 1))
-            || misc.0 & !(Misc::GENERATE_MIPS | Misc::CUBE | Misc::GDI_COMPATIBLE) != 0
+            || misc.0
+                & !(Misc::GENERATE_MIPS | Misc::CUBE | Misc::RESOURCE_CLAMP | Misc::GDI_COMPATIBLE)
+                != 0
             || (misc.contains(Misc::GENERATE_MIPS)
                 && !bind.contains(Bind::SHADER | Bind::RENDER_TARGET))
+            || (misc.contains(Misc::RESOURCE_CLAMP) && !bind.contains(Bind::SHADER))
             || (misc.contains(Misc::GDI_COMPATIBLE)
                 && (kind != TextureKind::D2
                     || !matches!(format, 87 | 90 | 91)
