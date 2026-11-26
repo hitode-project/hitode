@@ -3,7 +3,7 @@
 //! arena, so a guest can read or patch them; every vtable slot points at a registry thunk.
 //! Pixels belong to the shared surface store; assembly lends a memory DC over them.
 use crate::argument::{Arguments, CallError};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use adv_abi::com::{Com as CommonCom, ComIdentity, QueryError};
 use adv_device::surface::{
@@ -200,6 +200,7 @@ const NOT_FOUND: u32 = 0x887600ff;
 const NO_EXCLUSIVE_MODE: u32 = 0x887600e1;
 const EXCLUSIVE_MODE_ALREADY_SET: u32 = 0x88760245;
 const SURFACE_LOST: u32 = 0x887601c2;
+const WRONG_MODE: u32 = 0x8876024b;
 const NO_CLIPPER_ATTACHED: u32 = 0x88760238;
 const INVALID_CLIP_LIST: u32 = 0x8876006e;
 const CLIPPER_IS_USING_HWND: u32 = 0x88760237;
@@ -211,6 +212,12 @@ const ALREADY_INITIALIZED: u32 = 0x88760005;
 /// DDCKEY_DESTBLT, DDCKEY_DESTOVERLAY, DDCKEY_SRCBLT and DDCKEY_SRCOVERLAY.
 const KEY_KINDS: [u32; 4] = [2, 4, 8, 0x10];
 const NOT_LOCKED: u32 = 0x88760248;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Loss {
+    Mode,
+    Activation,
+}
 
 pub struct DirectDraw {
     pub(super) context: u32,
@@ -266,8 +273,12 @@ pub struct DirectDraw {
     surface_owners: BTreeMap<u32, u64>,
     /// Current screen origin of the window-backed primary for this operation.
     primary_origin: Option<(i32, i32)>,
-    /// Surfaces lost to another DirectDraw object's exclusive mode.
-    lost: BTreeSet<u32>,
+    display: Option<front::modes::DisplayModes>,
+    palette_table: u32,
+    surface_palettes: BTreeMap<u32, u32>,
+    creation_modes: BTreeMap<u32, front::modes::DisplayMode>,
+    /// Surfaces lost to an exclusive or display mode change.
+    lost: BTreeMap<u32, Loss>,
     /// Primary flip chains -> the member holding GDI's memory, which flips
     /// move along the chain.
     gdi: BTreeMap<u32, u32>,
@@ -308,7 +319,11 @@ impl DirectDraw {
             next_device_id: 1,
             surface_owners: BTreeMap::new(),
             primary_origin: None,
-            lost: BTreeSet::new(),
+            display: None,
+            palette_table: 0,
+            surface_palettes: BTreeMap::new(),
+            creation_modes: BTreeMap::new(),
+            lost: BTreeMap::new(),
             gdi: BTreeMap::new(),
         }
     }
@@ -412,6 +427,10 @@ impl DirectDraw {
                 return Ok(false);
             };
             self.surface_owners.insert(sid, owner);
+            if self.display.is_some() {
+                self.creation_modes
+                    .insert(sid, front::modes::current(surfaces));
+            }
             self.members.insert(sid, (root, p));
             self.complex.entry(parent).or_default().push(sid);
             parent = sid;
@@ -535,6 +554,7 @@ struct ComState {
     initialized: bool,
     device_id: u64,
     was_exclusive: bool,
+    changed_exclusive_mode: bool,
     focus_window: u32,
     windowed: bool,
     /// SetCooperativeLevel has set a normal or exclusive level.
@@ -792,6 +812,7 @@ impl DirectDraw {
             initialized: true,
             device_id,
             was_exclusive: false,
+            changed_exclusive_mode: false,
             focus_window: 0,
             windowed: false,
             cooperative: false,
@@ -953,6 +974,12 @@ impl DirectDraw {
                 }
                 if self.exclusive_owner == Some(destroyed.value.device_id) {
                     self.exclusive_owner = None;
+                    if let Some(display) = &mut self.display {
+                        display.requested = display.desktop;
+                        display.suspended = false;
+                        front::modes::set_current(surfaces, display.desktop);
+                        self.lose_video_surfaces(Loss::Mode);
+                    }
                 }
             }
             if let Kind::Surface(sid) = destroyed.value.kind {
@@ -961,6 +988,10 @@ impl DirectDraw {
                     d3d.forget_surface(sid);
                 }
                 self.lost.remove(&sid);
+                self.creation_modes.remove(&sid);
+                if let Some(palette) = self.surface_palettes.remove(&sid) {
+                    front::palette::release(com, objects, surfaces, palette);
+                }
                 self.surface_objects.remove(&sid);
                 self.surface_owners.remove(&sid);
                 self.page_locks.remove(&sid);
@@ -1276,6 +1307,7 @@ impl DirectDraw {
                     device_state.cooperative = true;
                     let device_id = device_state.device_id;
                     let device = device_state.modern;
+                    let leaving = self.exclusive_owner == Some(device_id) && !exclusive;
                     if exclusive {
                         device_state.was_exclusive = true;
                         self.exclusive_owner = Some(device_id);
@@ -1284,6 +1316,12 @@ impl DirectDraw {
                         if self.exclusive_owner == Some(device_id) {
                             self.exclusive_owner = None;
                         }
+                    }
+                    if leaving && let Some(display) = &mut self.display {
+                        display.requested = display.desktop;
+                        display.suspended = false;
+                        front::modes::set_current(surfaces, display.desktop);
+                        self.lose_video_surfaces(Loss::Mode);
                     }
                     // Exclusive mode loses the surfaces of every other
                     // DirectDraw object, so a primary another object made, or
@@ -1296,7 +1334,7 @@ impl DirectDraw {
                         if self.surface_objects.contains_key(&sid)
                             || self.members.contains_key(&sid)
                         {
-                            self.lost.insert(sid);
+                            self.lost.insert(sid, Loss::Mode);
                         } else {
                             surfaces.delete(sid);
                         }
@@ -1475,8 +1513,38 @@ impl DirectDraw {
                 if !matches!(kind, Kind::Device)
                     || surface::size(a[1], a[2]).is_err()
                     || !matches!(a[3], 16 | 32)
+                        && (self.display.is_none() || !matches!(a[3], 8 | 24))
                 {
                     return Ok(INVALID);
+                }
+                if let Some(display) = &mut self.display {
+                    if self.exclusive_owner != Some(object.device_id) || display.suspended {
+                        return Ok(NO_EXCLUSIVE_MODE);
+                    }
+                    if !front::modes::sizes((display.desktop.0, display.desktop.1))
+                        .contains(&(a[1], a[2]))
+                    {
+                        return Ok(UNSUPPORTED);
+                    }
+                    let mode = (
+                        a[1],
+                        a[2],
+                        match a[3] {
+                            8 => PixelFormat::Indexed8,
+                            16 => PixelFormat::Rgb565,
+                            _ => PixelFormat::Bgra32,
+                        },
+                    );
+                    if mode != display.requested {
+                        surfaces.flush(m, surface::FlushReason::Immediate)?;
+                        display.requested = mode;
+                        front::modes::set_current(surfaces, mode);
+                        com.get_mut::<ComState>(objects, a[0])
+                            .unwrap()
+                            .changed_exclusive_mode = true;
+                        self.lose_video_surfaces(Loss::Mode);
+                    }
+                    return Ok(0);
                 }
                 if surfaces.primary_id().is_some() {
                     return Ok(BUSY);
@@ -1492,11 +1560,18 @@ impl DirectDraw {
                 0
             }
             api::RESTORE_MODE => {
-                if matches!(kind, Kind::Device) {
-                    0
-                } else {
-                    INVALID
+                if !matches!(kind, Kind::Device) {
+                    return Ok(INVALID);
                 }
+                if self.exclusive_owner == Some(object.device_id)
+                    && let Some(display) = &mut self.display
+                    && display.requested != display.desktop
+                {
+                    display.requested = display.desktop;
+                    front::modes::set_current(surfaces, display.desktop);
+                    self.lose_video_surfaces(Loss::Mode);
+                }
+                0
             }
             api::GET_DISPLAY_MODE => {
                 if !matches!(kind, Kind::Device) {
@@ -1506,10 +1581,28 @@ impl DirectDraw {
                 if !matches!(len, 108 | 124) {
                     return Ok(INVALID);
                 }
-                let sid = surfaces.primary(m)?;
-                let mut desc = desc(surfaces, sid);
-                desc[..4].copy_from_slice(&len.to_le_bytes());
-                m.arg_write(a[1], &desc[..len as usize])?;
+                if self.display.is_some() {
+                    let (width, height, format) = front::modes::current(surfaces);
+                    let display = creation::Described {
+                        flags: creation::DDSD_WIDTH
+                            | creation::DDSD_HEIGHT
+                            | creation::DDSD_PITCH
+                            | creation::DDSD_PIXELFORMAT,
+                        width,
+                        height,
+                        format: creation::pixel_format(format),
+                        ..Default::default()
+                    };
+                    m.arg_write(
+                        a[1],
+                        &display.bytes(len, (width * format.bytes() + 3) & !3, 0),
+                    )?;
+                } else {
+                    let sid = surfaces.primary(m)?;
+                    let mut desc = desc(surfaces, sid);
+                    desc[..4].copy_from_slice(&len.to_le_bytes());
+                    m.arg_write(a[1], &desc[..len as usize])?;
+                }
                 0
             }
             api::GET_CAPS => {
@@ -1588,6 +1681,18 @@ impl DirectDraw {
                 })(&d.format)
                 .expect("validated format");
                 let sid = if primary {
+                    if self.display.is_some()
+                        && let Some(previous) = surfaces.primary_id()
+                        && !self.surface_objects.contains_key(&previous)
+                        && (
+                            surfaces[previous].width,
+                            surfaces[previous].height,
+                            surfaces[previous].format,
+                        ) != mode
+                    {
+                        surfaces.detach_primary();
+                        surfaces.delete(previous);
+                    }
                     let primary = surfaces.primary(m)?;
                     if flip && self.complex.contains_key(&primary) {
                         return Ok(BUSY);
@@ -1636,6 +1741,9 @@ impl DirectDraw {
                     }
                 }
                 self.surface_owners.insert(sid, owner_device_id);
+                if self.display.is_some() {
+                    self.creation_modes.insert(sid, mode);
+                }
                 // Surfaces from DirectDraw4 and 7 keep their creator alive.
                 if version >= 4 {
                     if com.add_ref::<ComState>(objects, a[0]).is_none() {
@@ -1669,6 +1777,14 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
+                if self.display.is_some()
+                    && self.lost.contains_key(&sid)
+                    && self.caps(sid)[0]
+                        & (creation::PRIMARY | creation::BACKBUFFER | creation::ZBUFFER)
+                        == 0
+                {
+                    return Ok(SURFACE_LOST);
+                }
                 let len = m.arg_u32(a[2])?;
                 if !matches!(len, 108 | 124) || a[4] != 0 {
                     return Ok(INVALID);
@@ -1745,7 +1861,14 @@ impl DirectDraw {
                 if !matches!(kind, Kind::Device) {
                     return Ok(INVALID);
                 }
-                if object.was_exclusive && self.exclusive_owner != Some(object.device_id) {
+                if self.display.as_ref().is_some_and(|mode| mode.suspended)
+                    && self.exclusive_owner == Some(object.device_id)
+                {
+                    NO_EXCLUSIVE_MODE
+                } else if self.display.is_some() && object.changed_exclusive_mode && object.windowed
+                {
+                    WRONG_MODE
+                } else if object.was_exclusive && self.exclusive_owner != Some(object.device_id) {
                     NO_EXCLUSIVE_MODE
                 } else if self
                     .exclusive_owner
@@ -1767,8 +1890,20 @@ impl DirectDraw {
                     return Ok(EXCLUSIVE_MODE_ALREADY_SET);
                 }
                 let owner_id = object.device_id;
+                if let Some(display) = &self.display
+                    && self.lost.keys().any(|sid| {
+                        self.surface_owners.get(sid) == Some(&owner_id)
+                            && (display.suspended
+                                || self
+                                    .creation_modes
+                                    .get(sid)
+                                    .is_some_and(|&mode| mode != front::modes::current(surfaces)))
+                    })
+                {
+                    return Ok(WRONG_MODE);
+                }
                 self.lost
-                    .retain(|sid| self.surface_owners.get(sid) != Some(&owner_id));
+                    .retain(|sid, _| self.surface_owners.get(sid) != Some(&owner_id));
                 0
             }
             api::GET_GDI_SURFACE => {
@@ -1893,10 +2028,28 @@ impl DirectDraw {
                 }
             }
             api::IS_LOST | api::RESTORE => match kind {
-                Kind::Surface(sid) if id == api::IS_LOST && self.lost.contains(&sid) => {
+                Kind::Surface(sid) if id == api::IS_LOST && self.lost.contains_key(&sid) => {
                     SURFACE_LOST
                 }
                 Kind::Surface(sid) => {
+                    if let Some(display) = &self.display
+                        && self.lost.contains_key(&sid)
+                    {
+                        if display.suspended
+                            || self
+                                .creation_modes
+                                .get(&sid)
+                                .is_some_and(|&mode| mode != front::modes::current(surfaces))
+                        {
+                            return Ok(WRONG_MODE);
+                        }
+                        if self
+                            .exclusive_owner
+                            .is_some_and(|owner| self.surface_owners.get(&sid) != Some(&owner))
+                        {
+                            return Ok(NO_EXCLUSIVE_MODE);
+                        }
+                    }
                     if surfaces.primary_id() == Some(sid)
                         || self
                             .exclusive_owner
@@ -1920,7 +2073,7 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
-                if self.lost.contains(&sid) {
+                if self.lost.contains_key(&sid) {
                     return Ok(SURFACE_LOST);
                 }
                 // DirectDraw7 also matches DDSCAPS2; earlier versions pass junk there.
@@ -1961,7 +2114,7 @@ impl DirectDraw {
                 if a[1] == a[0] || caps & (FRONTBUFFER | OVERLAY) == 0 {
                     return Ok(NOT_FLIPPABLE);
                 }
-                if self.lost.contains(&dst) {
+                if self.lost.contains_key(&dst) {
                     return Ok(SURFACE_LOST);
                 }
                 if caps & PRIMARY != 0
@@ -2132,6 +2285,11 @@ impl DirectDraw {
                 ) else {
                     return Ok(INVALID);
                 };
+                if self.display.is_some()
+                    && (self.lost.contains_key(&dst) || self.lost.contains_key(&src))
+                {
+                    return Ok(SURFACE_LOST);
+                }
                 // DDBLTFAST_SRCCOLORKEY, WAIT and DONOTWAIT.
                 if a[5] & !0x31 != 0 {
                     return Ok(UNSUPPORTED);
@@ -2193,6 +2351,9 @@ impl DirectDraw {
                     let Some(dst) = self.surface_id(objects, a[0]) else {
                         return Ok(INVALID);
                     };
+                    if self.display.is_some() && self.lost.contains_key(&dst) {
+                        return Ok(SURFACE_LOST);
+                    }
                     // DDBLT_COLORFILL with ASYNC, WAIT or DONOTWAIT.
                     if a[5] == 0 || a[4] & !(0x400 | 0x200 | 0x0100_0000 | 0x0800_0000) != 0 {
                         return Ok(UNSUPPORTED);
@@ -2240,6 +2401,11 @@ impl DirectDraw {
                 ) else {
                     return Ok(INVALID);
                 };
+                if self.display.is_some()
+                    && (self.lost.contains_key(&dst) || self.lost.contains_key(&src))
+                {
+                    return Ok(SURFACE_LOST);
+                }
                 // DDBLT_DDFX, KEYSRC, KEYSRCOVERRIDE, ASYNC, WAIT and DONOTWAIT.
                 if a[4] & !(0x800 | 0x8000 | 0x10000 | 0x200 | 0x0100_0000 | 0x0800_0000) != 0 {
                     return Ok(UNSUPPORTED);

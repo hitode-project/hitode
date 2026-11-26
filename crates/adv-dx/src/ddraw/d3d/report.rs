@@ -1,5 +1,5 @@
 //! Capability answers and ordered COM enumerations.
-use super::{Face, INVALID, caps, object::Object};
+use super::{Face, INVALID, caps};
 use adv_abi::{Env, Outcome};
 use adv_cpu::backend::{Prot, Reg};
 use adv_device::surface::SurfaceStore;
@@ -86,6 +86,16 @@ pub(super) fn derive(store: &SurfaceStore, device: Device) -> Report {
     )
 }
 
+pub(super) fn legacy_caps(store: &SurfaceStore, device: Device) -> Report {
+    const EXECUTE_SYSTEM_MEMORY: u32 = 0x10;
+    let mut report = derive(store, device);
+    match device {
+        Device::Rgb => report.software.dwDevCaps |= EXECUTE_SYSTEM_MEMORY,
+        Device::Hal | Device::TnlHal => report.hardware.dwDevCaps |= EXECUTE_SYSTEM_MEMORY,
+    }
+    report
+}
+
 pub(super) fn enumerate(env: &mut Env<'_>, face: Face, method: &str, args: &[u32]) -> Outcome {
     let state = env.ext.get::<super::super::front::State>();
     let objects = &env.sys.objects;
@@ -94,7 +104,7 @@ pub(super) fn enumerate(env: &mut Env<'_>, face: Face, method: &str, args: &[u32
         return Outcome::Return(INVALID);
     };
     let (callback, context, rows) = if method == "EnumTextureFormats" {
-        let Some(Object::Device(device)) = com.get::<Object>(objects, args[0]) else {
+        let Some(device) = super::device(&state.draw, objects, args[0]) else {
             return Outcome::Return(INVALID);
         };
         (
@@ -103,7 +113,19 @@ pub(super) fn enumerate(env: &mut Env<'_>, face: Face, method: &str, args: &[u32
             derive(store, device.kind)
                 .texture_formats
                 .into_iter()
-                .map(Row::single)
+                .map(|format| {
+                    if matches!(face, Face::Device1 | Face::Device2) {
+                        let mut desc = [0u32; 27];
+                        desc[0] = 108;
+                        desc[1] = 0x1001; // DDSD_PIXELFORMAT | DDSD_CAPS
+                        desc[18..26]
+                            .copy_from_slice(bytemuck::cast_slice(bytemuck::bytes_of(&format)));
+                        desc[26] = super::super::creation::TEXTURE;
+                        Row::single(desc)
+                    } else {
+                        Row::single(format)
+                    }
+                })
                 .collect(),
         )
     } else {
@@ -138,7 +160,11 @@ pub(super) fn enumerate(env: &mut Env<'_>, face: Face, method: &str, args: &[u32
                 .map(|device| {
                     let mut row = Row::default();
                     let (name, description) = device.name();
-                    let report = derive(store, device);
+                    let report = if modern {
+                        derive(store, device)
+                    } else {
+                        legacy_caps(store, device)
+                    };
                     if !modern {
                         row.push(&device.guid());
                     }

@@ -48,10 +48,12 @@ mod legacy {
         Texture1,
         Texture2,
         VertexBuffer7,
+        VertexBuffer,
+        ExecuteBuffer,
     }
 
     impl Face {
-        pub const ALL: [Self; 16] = [
+        pub const ALL: [Self; 18] = [
             Self::Direct3D,
             Self::Direct3D2,
             Self::Direct3D3,
@@ -68,6 +70,8 @@ mod legacy {
             Self::Texture1,
             Self::Texture2,
             Self::VertexBuffer7,
+            Self::VertexBuffer,
+            Self::ExecuteBuffer,
         ];
         pub const fn name(self) -> &'static str {
             match self {
@@ -87,6 +91,8 @@ mod legacy {
                 Self::Texture1 => "IDirect3DTexture",
                 Self::Texture2 => "IDirect3DTexture2",
                 Self::VertexBuffer7 => "IDirect3DVertexBuffer7",
+                Self::VertexBuffer => "IDirect3DVertexBuffer",
+                Self::ExecuteBuffer => "IDirect3DExecuteBuffer",
             }
         }
         pub const fn iid(self) -> Iid {
@@ -107,6 +113,8 @@ mod legacy {
                 Self::Texture1 => IID_IDIRECT3DTEXTURE,
                 Self::Texture2 => IID_IDIRECT3DTEXTURE2,
                 Self::VertexBuffer7 => IID_IDIRECT3DVERTEXBUFFER7,
+                Self::VertexBuffer => IID_IDIRECT3DVERTEXBUFFER,
+                Self::ExecuteBuffer => IID_IDIRECT3DEXECUTEBUFFER,
             }
         }
     }
@@ -255,8 +263,14 @@ mod legacy {
                     .and_then(|&identity| com.canonical(objects, identity))
                     .unwrap_or(0);
                 let target = com.get::<ComState>(objects, this).unwrap().old;
-                draw.d3d_surface_devices
-                    .insert(pointer, super::object::Device::new(kind, parent, target));
+                let mut device = super::object::Device::new(kind, Face::Device1, parent, target);
+                let desc = draw.described[&sid];
+                let depth = draw
+                    .attached(sid)
+                    .into_iter()
+                    .any(|id| draw.caps(id)[0] & creation::ZBUFFER != 0);
+                device.state = Some(super::state::State::new(desc.width, desc.height, depth));
+                draw.d3d_surface_devices.insert(pointer, device);
             }
             Ok(pointer)
         } else {
@@ -269,6 +283,18 @@ mod legacy {
         com.add_ref::<ComState>(objects, this)
             .or_else(|| com.add_ref::<Object>(objects, this))
             .unwrap_or(0)
+    }
+
+    pub(in crate::ddraw) fn device<'a>(
+        draw: &'a DirectDraw,
+        objects: &'a Objects,
+        this: u32,
+    ) -> Option<&'a super::object::Device> {
+        if let Some(Object::Device(device)) = draw.com?.get::<Object>(objects, this) {
+            Some(device)
+        } else {
+            draw.d3d_surface_devices.get(&this)
+        }
     }
 
     pub(in crate::ddraw) fn device_mut<'a>(
@@ -318,7 +344,10 @@ mod legacy {
                     draw.release_com(objects, surfaces, device.parent);
                     device.dispose(surfaces);
                 }
-                Object::Viewport { lights, .. } => {
+                Object::Viewport { lights, depth, .. } => {
+                    if depth != 0 {
+                        draw.release_com(objects, surfaces, depth);
+                    }
                     for light in lights {
                         if let Some(Object::Light { viewport, .. }) =
                             com.get_mut::<Object>(objects, light)
@@ -333,6 +362,12 @@ mod legacy {
                 }
                 Object::Light { .. } => (),
                 Object::VertexBuffer { data, size, .. } => surfaces.release(data, size),
+                Object::ExecuteBuffer(buffer) => {
+                    if buffer.owned {
+                        surfaces.release(buffer.data, buffer.size);
+                    }
+                    release(draw, surfaces, objects, buffer.device);
+                }
             }
             for pointer in destroyed.interfaces {
                 surfaces.release(pointer, 16);
@@ -357,6 +392,11 @@ mod legacy {
                         *device = None;
                     }
                     release(draw, surfaces, objects, viewport);
+                }
+                if let Some(state) = &device.state {
+                    for pointer in state.texture_references() {
+                        draw.release_com(objects, surfaces, pointer);
+                    }
                 }
                 device.dispose(surfaces);
             }

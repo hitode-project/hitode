@@ -255,11 +255,24 @@ fn clipper_is_clip_list_changed(
 fn create_palette(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
-    _flags: u32,
-    _entries: GuestPtr<()>,
+    flags: u32,
+    entries: GuestPtr<()>,
     palette: GuestPtr<u32>,
-    _outer: GuestPtr<()>,
+    outer: GuestPtr<()>,
 ) -> Outcome {
+    if env.ext.get::<State>().draw.palette_table != 0 {
+        return super::palette::surface_api(
+            env,
+            "CreatePalette",
+            &[
+                this.addr(),
+                flags,
+                entries.addr(),
+                palette.addr(),
+                outer.addr(),
+            ],
+        );
+    }
     unavailable_device(
         env,
         this,
@@ -502,6 +515,9 @@ fn get_overlay_position(
 
 #[win32(ddraw, name = "IDirectDrawSurface7::GetPalette", level = implement)]
 fn get_palette(env: &mut Env<'_>, this: GuestPtr<()>, palette: GuestPtr<u32>) -> Outcome {
+    if env.ext.get::<State>().draw.palette_table != 0 {
+        return super::palette::surface_api(env, "GetPalette", &[this.addr(), palette.addr()]);
+    }
     unavailable_surface(
         env,
         this,
@@ -523,7 +539,10 @@ fn set_overlay_position(env: &mut Env<'_>, this: GuestPtr<()>, _x: i32, _y: i32)
 }
 
 #[win32(ddraw, name = "IDirectDrawSurface7::SetPalette", level = implement)]
-fn set_palette(env: &mut Env<'_>, this: GuestPtr<()>, _palette: GuestPtr<()>) -> Outcome {
+fn set_palette(env: &mut Env<'_>, this: GuestPtr<()>, palette: GuestPtr<()>) -> Outcome {
+    if env.ext.get::<State>().draw.palette_table != 0 {
+        return super::palette::surface_api(env, "SetPalette", &[this.addr(), palette.addr()]);
+    }
     unavailable_surface(
         env,
         this,

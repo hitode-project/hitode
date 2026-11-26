@@ -12,6 +12,7 @@ use adv_machine::{Ext, Machine};
 mod enumeration;
 mod extras;
 pub(crate) mod modes;
+pub(super) mod palette;
 #[derive(Clone, Copy)]
 pub struct WindowGeometry {
     pub hwnd: u32,
@@ -36,8 +37,43 @@ pub struct State {
     pub(super) provider: Provider,
     binding: Option<(u32, u32)>,
     presented: Option<(u32, u32)>,
+    activation: Option<fn(&Ext, u32) -> Option<bool>>,
+    application_active: bool,
 }
 impl State {
+    /// Supplies the active state of the window owning the display mode.
+    pub fn set_activation_provider(&mut self, provider: fn(&Ext, u32) -> Option<bool>) {
+        self.activation = Some(provider);
+    }
+
+    /// Record host activation for an exclusive DirectDraw session.
+    pub fn set_application_active(&mut self, active: bool) {
+        self.application_active = active;
+    }
+
+    pub(super) fn sync_activation(env: &mut Env<'_>) -> Result<(), CallError> {
+        let state = env.ext.get::<Self>();
+        if state.draw.display.is_none() {
+            return Ok(());
+        }
+        let Some(active) = (|| {
+            let owner = state.draw.exclusive_owner?;
+            let identity = *state.draw.device_objects.get(&owner)?;
+            let object = state.draw.com?.get_identity(&env.sys.objects, identity)?;
+            Some(
+                state.application_active
+                    && state
+                        .activation
+                        .and_then(|query| query(env.ext, object.focus_window))
+                        .unwrap_or(true),
+            )
+        })() else {
+            return Ok(());
+        };
+        let (state, store) = env.ext.get2_installed_mut::<Self, SurfaceStore>();
+        state.draw.sync_activation(store, active)
+    }
+
     pub fn configure_clipper(&mut self, clipper: u32, origin: (i32, i32)) {
         self.draw.configure_clipper(clipper, origin);
     }
@@ -145,6 +181,8 @@ pub fn install<B: Backend>(
         provider,
         binding: None,
         presented: None,
+        activation: None,
+        application_active: true,
     });
     Ok(entries)
 }
@@ -222,6 +260,9 @@ fn reserve_surface(env: &mut Env<'_>, desc: u32) -> Result<(), u32> {
     Ok(())
 }
 fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
+    if let Err(error) = State::sync_activation(env) {
+        return error.outcome(env);
+    }
     let provider = env.ext.get::<State>().provider;
     if id == api::COOPERATIVE
         && words[2] == 0x80

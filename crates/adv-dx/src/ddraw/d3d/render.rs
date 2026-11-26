@@ -10,7 +10,7 @@ use crate::{
             recording::{self, Boundary, Effects, Payload},
         },
     },
-    fixed::{self, Render, Rules, Sampler, Stage, VertexProgram, program::Legacy},
+    fixed::{self, Render, Rules, Sampler, Setting, Stage, VertexProgram, program::Legacy},
     record::key::hash,
 };
 use adv_abi::types::{D3DDP_PTRSTRIDE, D3DDRAWPRIMITIVESTRIDEDDATA, D3DVERTEXBUFFERDESC};
@@ -36,9 +36,13 @@ fn gpu_error(error: gpu::Error) -> CallError {
 }
 
 impl Calls<'_> {
-    pub(super) fn create_vertex_buffer(&mut self, args: &[u32]) -> Result<u32, CallError> {
+    pub(super) fn create_vertex_buffer(
+        &mut self,
+        face: Face,
+        args: &[u32],
+    ) -> Result<u32, CallError> {
         self.memory.arg_put_u32(args[2], 0)?;
-        if args[3] != 0 {
+        if args[3] != 0 || (face == Face::Direct3D3 && args[4] != 0) {
             return Ok(INVALID);
         }
         let desc: D3DVERTEXBUFFERDESC = read(self.memory, args[1])?;
@@ -57,7 +61,11 @@ impl Calls<'_> {
         }
         let data = self.store.alloc(size, self.memory)?;
         let result = self.make(
-            &[Face::VertexBuffer7],
+            &[if face == Face::Direct3D3 {
+                Face::VertexBuffer
+            } else {
+                Face::VertexBuffer7
+            }],
             &[],
             Object::VertexBuffer {
                 desc,
@@ -124,12 +132,13 @@ impl Calls<'_> {
         Ok(0)
     }
 
-    pub(super) fn render_method(&mut self, method: &str, args: &[u32]) -> Result<u32, CallError> {
-        let Some(Object::Device(device)) = self
-            .draw
-            .com
-            .and_then(|com| com.get::<Object>(self.objects, args[0]))
-        else {
+    pub(super) fn render_method(
+        &mut self,
+        face: Face,
+        method: &str,
+        args: &[u32],
+    ) -> Result<u32, CallError> {
+        let Some(device) = ddraw::d3d::device(self.draw, self.objects, args[0]) else {
             return Ok(INVALID);
         };
         let Some(state) = &device.state else {
@@ -137,14 +146,25 @@ impl Calls<'_> {
         };
         let target = device.target;
         let sid = self.draw.surface_id(self.objects, target).unwrap();
-        let lost = self.draw.lost.contains(&sid);
+        let lost = self.draw.lost.contains_key(&sid);
         match method {
             "BeginScene" => {
                 if state.scene {
                     return Ok(SCENE_IN);
                 }
                 if lost {
-                    return Ok(SCENE_BEGIN_FAILED);
+                    return Ok(
+                        if self.draw.lost.get(&sid) == Some(&ddraw::Loss::Activation)
+                            || (self.draw.exclusive_owner.is_none()
+                                && self.draw.creation_modes.get(&sid).is_some_and(|&mode| {
+                                    mode != crate::ddraw::front::modes::current(self.store)
+                                }))
+                        {
+                            ddraw::SURFACE_LOST
+                        } else {
+                            SCENE_BEGIN_FAILED
+                        },
+                    );
                 }
                 ddraw::d3d::device_mut(self.draw, self.objects, args[0])
                     .unwrap()
@@ -175,6 +195,24 @@ impl Calls<'_> {
                         return Ok(INVALID);
                     };
                     (texture, args[2])
+                };
+                let iid = match (face, method) {
+                    (Face::Device2, "GetRenderTarget") => Some(ddraw::IID_SURFACE),
+                    (Face::Device3, "GetRenderTarget") => Some(ddraw::IID_SURFACE4),
+                    (Face::Device3, "GetTexture") => Some(adv_abi::gfx_iids::IID_IDIRECT3DTEXTURE2),
+                    _ => None,
+                };
+                let pointer = if let Some(iid) = iid.filter(|_| pointer != 0) {
+                    match self.draw.com.unwrap().resolve_interface::<ddraw::ComState>(
+                        self.objects,
+                        pointer,
+                        iid,
+                    ) {
+                        Ok(pointer) => pointer,
+                        Err(_) => return Ok(INVALID),
+                    }
+                } else {
+                    pointer
                 };
                 self.memory.arg_put_u32(out, pointer)?;
                 if pointer != 0 {
@@ -271,7 +309,7 @@ impl Calls<'_> {
         Ok(0)
     }
 
-    fn clear(&mut self, sid: u32, view: Rect, args: &[u32]) -> Result<u32, CallError> {
+    pub(super) fn clear(&mut self, sid: u32, view: Rect, args: &[u32]) -> Result<u32, CallError> {
         let flags = args[3];
         if flags == 0 || flags & !7 != 0 {
             return Ok(INVALID);
@@ -434,27 +472,33 @@ impl Calls<'_> {
         Ok(image)
     }
 
-    pub(super) fn draw_primitive(&mut self, method: &str, args: &[u32]) -> Result<u32, CallError> {
+    pub(super) fn draw_primitive(
+        &mut self,
+        face: Face,
+        method: &str,
+        args: &[u32],
+    ) -> Result<u32, CallError> {
         let Some(com) = self.draw.com else {
             return Ok(INVALID);
         };
-        let Some(Object::Device(device)) = com.get::<Object>(self.objects, args[0]) else {
-            return Ok(INVALID);
-        };
-        let Some(state) = &device.state else {
+        let Some(device) = ddraw::d3d::device(self.draw, self.objects, args[0]) else {
             return Ok(INVALID);
         };
         let sid = self.draw.surface_id(self.objects, device.target).unwrap();
-        if self.draw.lost.contains(&sid) {
+        if self.draw.lost.contains_key(&sid) {
             return Ok(0);
         }
-        let fixed = state.fixed.clone();
-        let textures = state.textures;
-        let kind = device.kind;
+        if face != Face::Device7 && device.current_viewport != 0 {
+            let hr = self.select_viewport(args[0], device.current_viewport)?;
+            if hr != 0 {
+                return Ok(hr);
+            }
+        }
         let strided = method.ends_with("Strided");
         let vb = method.ends_with("VB");
-        let mut count = args[4];
-        if count == 0 {
+        let old_indexed_vb = face == Face::Device3 && method == "DrawIndexedPrimitiveVB";
+        let mut count = if old_indexed_vb { 0 } else { args[4] };
+        if count == 0 && !old_indexed_vb {
             return Ok(0);
         }
         let (fvf, data) = if vb {
@@ -467,14 +511,23 @@ impl Calls<'_> {
             if *locked {
                 return Ok(VB_LOCKED);
             }
-            if args[3]
+            if old_indexed_vb {
+                count = desc.dwNumVertices;
+            }
+            let start = if old_indexed_vb { 0 } else { args[3] };
+            if start
                 .checked_add(count)
                 .is_none_or(|n| n > desc.dwNumVertices)
             {
                 return Ok(INVALID);
             }
             let layout = vertex::layout(desc.dwFVF).unwrap();
-            (desc.dwFVF, data + args[3] * layout.size)
+            (desc.dwFVF, data + start * layout.size)
+        } else if face == Face::Device2 {
+            let Some(fvf) = vertex::legacy_fvf(args[2]) else {
+                return Ok(INVALID);
+            };
+            (fvf, args[3])
         } else {
             (args[2], args[3])
         };
@@ -482,14 +535,12 @@ impl Calls<'_> {
             Ok(layout) => layout,
             Err(hr) => return Ok(hr),
         };
-        let weights = (fvf & 0xe).saturating_sub(4) / 2;
-        if weights != 0 && kind != caps::Device::TnlHal {
-            return Ok(0x80004005);
-        }
-        let blend_weights = weights.min(fixed.render[&Render::VertexBlend]) as u8;
         let indexed = method.starts_with("DrawIndexed");
-        let mut indices = if indexed {
-            let bytes = self.memory.arg_read(args[5], args[6] as usize * 2)?;
+        let indices = if indexed {
+            let index_arg = if old_indexed_vb { 3 } else { 5 };
+            let bytes = self
+                .memory
+                .arg_read(args[index_arg], args[index_arg + 1] as usize * 2)?;
             let values = bytes
                 .as_chunks::<2>()
                 .0
@@ -503,28 +554,96 @@ impl Calls<'_> {
         } else {
             None
         };
+        let Some(size) = count.checked_mul(layout.size) else {
+            return Ok(INVALID);
+        };
+        let bytes = if strided {
+            let descriptor = read(self.memory, data)?;
+            interleave(
+                self.memory,
+                descriptor,
+                layout,
+                count,
+                (fvf & 0xe).saturating_sub(4) / 2,
+            )?
+        } else {
+            self.memory.arg_read(data, size as usize)?.into_owned()
+        };
+        self.emit_primitive(
+            args[0],
+            super::object::PrimitiveBatch {
+                vertices: bytes,
+                indices,
+                flags: args[if indexed && !old_indexed_vb { 7 } else { 5 }],
+                primitive: args[1],
+                fvf,
+            },
+            None,
+        )
+    }
+
+    pub(super) fn emit_primitive(
+        &mut self,
+        this: u32,
+        batch: super::object::PrimitiveBatch,
+        triangle_edges: Option<&[u16]>,
+    ) -> Result<u32, CallError> {
+        let super::object::PrimitiveBatch {
+            mut vertices,
+            mut indices,
+            flags,
+            primitive,
+            fvf,
+        } = batch;
+        let Some(device) = ddraw::d3d::device(self.draw, self.objects, this) else {
+            return Ok(INVALID);
+        };
+        let sid = self.draw.surface_id(self.objects, device.target).unwrap();
+        if self.draw.lost.contains_key(&sid) {
+            return Ok(0);
+        }
+        let state = device.state.as_ref().unwrap();
+        let mut fixed = state.fixed.clone();
+        let textures = state.textures;
+        let kind = device.kind;
+        let legacy_device = device.face != Face::Device7;
+        let layout = vertex::layout(fvf).unwrap();
+        let mut count = vertices.len() as u32 / layout.size;
         let entries = indices.as_ref().map_or(count as usize, Vec::len);
         if entries == 0 {
             return Ok(0);
         }
-        let mut topology = match vertex::primitive(args[1], entries) {
+        if indices
+            .as_ref()
+            .is_some_and(|values| values.iter().any(|&i| i >= count))
+        {
+            return Ok(INVALID);
+        }
+        let mut topology = match vertex::primitive(primitive, entries) {
             Ok(topology) => topology,
             Err(hr) => return Ok(hr),
         };
-        if args[1] == 6 {
+        let stats = match primitive {
+            1 => (2, entries),
+            2 => (1, entries / 2),
+            3 => (1, entries - 1),
+            4 => (0, entries / 3),
+            5 | 6 => (0, entries - 2),
+            _ => unreachable!(),
+        };
+        let weights = (fvf & 0xe).saturating_sub(4) / 2;
+        if weights != 0 && kind != caps::Device::TnlHal {
+            return Ok(0x80004005);
+        }
+        if flags & 0x10 != 0 {
+            fixed.apply(Setting::Render(Render::Lighting, 0));
+        }
+        let blend_weights = weights.min(fixed.render[&Render::VertexBlend]) as u8;
+        if primitive == 6 {
             let vertex = |n| indices.as_ref().map_or(n, |i| i[n as usize]);
             indices = Some(vertex::expand_fan(vertex, entries as u32));
         }
-        let Some(size) = count.checked_mul(layout.size) else {
-            return Ok(INVALID);
-        };
-        let mut bytes = if strided {
-            let descriptor = read(self.memory, data)?;
-            interleave(self.memory, descriptor, layout, count, weights)?
-        } else {
-            self.memory.arg_read(data, size as usize)?.into_owned()
-        };
-        let flags = args[if indexed { 7 } else { 5 }];
+        let mut bytes = std::mem::take(&mut vertices);
         let projection = Projection {
             fixed: &fixed,
             layout,
@@ -584,8 +703,15 @@ impl Calls<'_> {
                         }
                     }
                     if fill == 2 {
-                        for vertex in [0, 1, 1, 2, 2, 0] {
-                            append_vertex(&mut expanded, &triangle_bytes, vertex, layout.size);
+                        for (edge, pair) in [[0, 1], [1, 2], [2, 0]].into_iter().enumerate() {
+                            if triangle_edges
+                                .is_some_and(|flags| flags[i as usize] & (0x100 << edge) == 0)
+                            {
+                                continue;
+                            }
+                            for vertex in pair {
+                                append_vertex(&mut expanded, &triangle_bytes, vertex, layout.size);
+                            }
                         }
                     } else {
                         expanded.extend_from_slice(&triangle_bytes);
@@ -874,8 +1000,15 @@ impl Calls<'_> {
             },
         )
         .map_err(gpu_error)?;
+        if legacy_device {
+            let dev = ddraw::d3d::device_mut(self.draw, self.objects, this).unwrap();
+            dev.legacy.stats[stats.0] += stats.1 as u32;
+            if !layout.transformed {
+                dev.legacy.stats[4] += count;
+            }
+        }
         if let Some(extents) = clip_extents {
-            let state = ddraw::d3d::device_mut(self.draw, self.objects, args[0])
+            let state = ddraw::d3d::device_mut(self.draw, self.objects, this)
                 .unwrap()
                 .state
                 .as_mut()
@@ -911,7 +1044,7 @@ fn texture_limit(device: caps::Device, limit: u32) -> u32 {
     })
 }
 
-fn interleave(
+pub(super) fn interleave(
     memory: &dyn SurfaceMemory,
     desc: D3DDRAWPRIMITIVESTRIDEDDATA,
     layout: fixed::VertexLayout,
