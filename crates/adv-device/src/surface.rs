@@ -13,6 +13,8 @@ mod sprite;
 pub use sprite::{Sprite, SpriteAlpha, SpriteMode};
 mod packed;
 mod planes;
+#[cfg(feature = "gpu")]
+mod render;
 mod residency;
 pub use planes::Plane;
 pub use residency::Access;

@@ -222,26 +222,6 @@ impl<P: Presenter> Surfaces<P> {
         Ok(&entry.layout)
     }
 
-    #[cfg(feature = "gpu")]
-    pub fn fork_gpu(&self) -> Result<crate::gpu::Gpu, crate::gpu::Error> {
-        self.gpu.fork()
-    }
-
-    /// Obtain the color attachment and preserve the requested cells before a draw.
-    #[cfg(feature = "gpu")]
-    pub fn render_access(
-        &mut self,
-        id: u32,
-        rect: Rect,
-        access: Access,
-        memory: &dyn SurfaceMemory,
-    ) -> Result<Target, String> {
-        Ok(Target::from_parts(
-            self.gpu_access(id, rect, access, memory)?,
-            None,
-        ))
-    }
-
     /// Obtain the current GPU copy, uploading only the requested stale cells.
     /// Packed CPU texels use the low bytes of a BGRA8 texel to retain their bits.
     #[cfg(feature = "gpu")]
