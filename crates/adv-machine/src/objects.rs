@@ -39,6 +39,13 @@ pub struct Identity<T: Any> {
     marker: PhantomData<fn() -> T>,
 }
 
+impl<T: Any> Identity<T> {
+    /// The table and serial of this identity as an opaque value key.
+    pub fn key(self) -> [u64; 2] {
+        [self.table, self.id]
+    }
+}
+
 impl<T: Any> Copy for Identity<T> {}
 impl<T: Any> Clone for Identity<T> {
     fn clone(&self) -> Self {

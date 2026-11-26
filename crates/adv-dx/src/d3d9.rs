@@ -706,11 +706,15 @@ fn object(
 }
 fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
     // Interfaces, not the payload's pointer field, name every registration.
+    let mut resource_id = None;
     if let Some(owner) = child_owner(&destroyed.value)
         && let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner)
     {
         for pointer in &destroyed.interfaces {
-            d.children.remove(pointer);
+            let id = d.children.remove(pointer);
+            if matches!(&destroyed.value, Payload::Resource(r) if r.pointer == *pointer) {
+                resource_id = id;
+            }
         }
     }
 
@@ -761,7 +765,7 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
             destroy(env, factory);
         }
     } else if let Payload::Resource(resource) = destroyed.value {
-        recording::forget(env, resource.device, resource.pointer);
+        recording::forget(env, resource.device, resource_id, resource.pointer);
         resources::destroy(env, resource);
     } else if let Payload::Buffer(buffer) = destroyed.value {
         buffers::destroy(env, buffer);

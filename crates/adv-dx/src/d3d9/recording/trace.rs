@@ -1,47 +1,14 @@
-//! One frame's recorded commands as text, captured on request for the live
-//! debugger. Idle unless armed: each hook is one relaxed load.
+//! D3D9 command details for the frame trace.
 use super::*;
+pub use crate::record::trace::take_or_arm;
+pub(super) use crate::record::trace::{capturing, frame_end, present, work};
+use crate::record::trace::{name, push, rect};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Idle, waiting for a frame boundary, or capturing until the next one.
-static STATE: AtomicU8 = AtomicU8::new(IDLE);
-const IDLE: u8 = 0;
-const ARMED: u8 = 1;
-const ARMED_PAIR: u8 = 2;
-const CAPTURING: u8 = 3;
-const CAPTURING_PAIR: u8 = 4;
-static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static LAST: Mutex<Option<String>> = Mutex::new(None);
 /// Why the command being prepared has no proven sample mapping.
 static UNMAPPED: Mutex<Option<&'static str>> = Mutex::new(None);
 static DETAIL: Mutex<Option<String>> = Mutex::new(None);
 
-/// The last captured frame, or arms a capture of the next whole frame.
-pub fn take_or_arm(pair: bool) -> Option<String> {
-    let last = LAST.lock().unwrap().take();
-    if last.is_none() {
-        let armed = if pair { ARMED_PAIR } else { ARMED };
-        let _ = STATE.compare_exchange(IDLE, armed, Ordering::Relaxed, Ordering::Relaxed);
-    }
-    last
-}
-pub(super) fn capturing() -> bool {
-    STATE.load(Ordering::Relaxed) >= CAPTURING
-}
-fn push(line: String) {
-    LINES.lock().unwrap().push(line);
-}
-fn name(c: &Content) -> String {
-    let aspect = ["color", "depth", "stencil"]
-        .get(c.2 as usize)
-        .copied()
-        .unwrap_or("?");
-    format!("{:x}.{}.{aspect}", c.3, c.1)
-}
-fn rect(r: adv_device::surface::Rect) -> String {
-    format!("{}x{}+{}+{}", r.w, r.h, r.x, r.y)
-}
 pub(super) fn detail(text: String) {
     *DETAIL.lock().unwrap() = Some(text);
 }
@@ -200,12 +167,6 @@ pub(super) fn command(index: usize, p: &key::Prepared, reused: bool, contents: &
         push(detail);
     }
 }
-pub(super) fn forward(content: Content, generation: usize, event: std::fmt::Arguments<'_>) {
-    push(format!(
-        "forward {} generation {generation}: {event}",
-        name(&content)
-    ));
-}
 pub(in crate::d3d9) fn readback(env: &Env<'_>, id: Id) {
     if capturing() {
         push(format!(
@@ -217,80 +178,5 @@ pub(in crate::d3d9) fn readback(env: &Env<'_>, id: Id) {
 pub(super) fn flush(reason: Reason, commands: usize) {
     if capturing() {
         push(format!("flush {reason:?} after {commands} commands"));
-    }
-}
-pub(super) fn present(
-    partial: bool,
-    force: bool,
-    copy: bool,
-    promotions: [u64; 2],
-    execution: &rustc_hash::FxHashMap<u128, adv_device::surface::Region>,
-) {
-    if capturing() {
-        let mut slots: Vec<_> = execution
-            .iter()
-            .map(|(slot, r)| {
-                let area: u64 = adv_device::surface::rects(r)
-                    .iter()
-                    .map(|r| u64::from(r.w) * u64::from(r.h))
-                    .sum();
-                let (w, h) = r.size();
-                format!(
-                    "{:04x} {area}/{} px",
-                    *slot as u16,
-                    u64::from(w) * u64::from(h)
-                )
-            })
-            .collect();
-        slots.sort();
-        push(format!(
-            "present: partial {partial}, force {force}, copy {copy}, promotions intermediate {} late {}; planned [{}]",
-            promotions[0],
-            promotions[1],
-            slots.join(", ")
-        ));
-    }
-}
-pub(super) fn work(work: &HashMap<(Content, usize, u128), damage::Work>, planned: bool) {
-    if !capturing() {
-        return;
-    }
-    if !planned {
-        push("present: repeated; E 0 px, submissions 0, vertices 0".into());
-        return;
-    }
-    let mut rows: Vec<_> = work.iter().map(|((content, generation, slot), work)| {
-        let [delta, executed, extra] = work.areas();
-        format!(
-            "slot {:04x} {} generation {generation}: delta {delta} px, E {executed} px, E\\delta {extra} px; submissions {}, vertices {}, repeated vertices {}",
-            *slot as u16, name(content), work.submissions, work.vertices, work.repeated_vertices
-        )
-    }).collect();
-    rows.sort();
-    for row in rows {
-        push(row);
-    }
-}
-pub(super) fn frame_end() {
-    match STATE.load(Ordering::Relaxed) {
-        state @ (ARMED | ARMED_PAIR) => {
-            LINES.lock().unwrap().clear();
-            let capturing = if state == ARMED_PAIR {
-                CAPTURING_PAIR
-            } else {
-                CAPTURING
-            };
-            STATE.store(capturing, Ordering::Relaxed);
-        }
-        CAPTURING_PAIR => {
-            push("--- next frame ---".into());
-            STATE.store(CAPTURING, Ordering::Relaxed);
-        }
-        CAPTURING => {
-            let lines = std::mem::take(&mut *LINES.lock().unwrap());
-            *LAST.lock().unwrap() = Some(lines.join("\n"));
-            STATE.store(IDLE, Ordering::Relaxed);
-        }
-        _ => {}
     }
 }

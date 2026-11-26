@@ -4,12 +4,15 @@
 //! A flush owns the device until its Present/readback finishes. Busy restores
 //! only the unexecuted command, so continuations never replay successful prefixes.
 use super::*;
+pub use crate::record::Counters;
+use crate::record::{Contents, ResourceKey as Content, damage::Analysis, passes};
+#[cfg(feature = "d3d9-counters")]
+use crate::record::{lookup, lookups};
 use rustc_hash::FxHashMap as HashMap;
 pub(super) mod damage;
 mod encode;
 mod fast;
 mod key;
-mod passes;
 mod reuse;
 pub mod trace;
 pub(super) use key::fixed as fixed_key;
@@ -52,78 +55,6 @@ pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
     draw_state_identity(env, pointer).0
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Content(Id, u32, u8, u32);
-#[derive(Default)]
-struct Contents {
-    indices: HashMap<Content, usize>,
-    slots: Vec<(Content, Option<u128>, Option<u128>)>,
-    touched: Vec<usize>,
-    vacant: Vec<usize>,
-}
-impl Contents {
-    fn resolve(&mut self, key: Content) -> usize {
-        #[cfg(feature = "d3d9-counters")]
-        lookup(1);
-        *self.indices.entry(key).or_insert_with(|| {
-            if let Some(n) = self.vacant.pop() {
-                self.slots[n] = (key, None, None);
-                n
-            } else {
-                self.slots.push((key, None, None));
-                self.slots.len() - 1
-            }
-        })
-    }
-    fn get(&self, key: &Content) -> Option<&u128> {
-        #[cfg(feature = "d3d9-counters")]
-        lookup(1);
-        self.slots.get(*self.indices.get(key)?)?.1.as_ref()
-    }
-    fn had_base(&self, key: &Content) -> bool {
-        #[cfg(feature = "d3d9-counters")]
-        lookup(1);
-        self.indices
-            .get(key)
-            .is_some_and(|&n| self.slots[n].2.is_some())
-    }
-    fn restore(&mut self, key: Content, value: Option<u128>, had_base: bool) {
-        let n = self.resolve(key);
-        self.slots[n].1 = value;
-        if !had_base {
-            self.slots[n].2 = None;
-        }
-    }
-    fn unchanged(&self) -> bool {
-        self.touched.iter().all(|&n| {
-            self.slots[n]
-                .2
-                .is_none_or(|base| self.slots[n].1 == Some(base))
-        })
-    }
-    fn reset(&mut self) {
-        for n in self.touched.drain(..) {
-            self.slots[n].2 = None;
-        }
-    }
-    fn forget(&mut self, pointer: u32) -> bool {
-        let before = self.indices.len();
-        self.indices.retain(|k, &mut n| {
-            if k.3 != pointer {
-                return true;
-            }
-            self.slots[n].1 = None;
-            self.slots[n].2 = None;
-            self.vacant.push(n);
-            false
-        });
-        self.indices.len() != before
-    }
-    #[cfg(test)]
-    fn keys(&self) -> impl Iterator<Item = &Content> {
-        self.slots.iter().filter(|s| s.1.is_some()).map(|s| &s.0)
-    }
-}
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Reason {
     Present,
@@ -134,86 +65,6 @@ pub(super) enum Reason {
     Release,
     Limit,
     Wait,
-}
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Counters {
-    pub fixed_draws: u64,
-    pub fixed_shaders_built: u64,
-    pub fixed_shader_cache_hits: u64,
-    pub draw_key_hashes: u64,
-    /// Draws that reused a previous frame's preparation, and draws that
-    /// skipped the attempt while their target rested.
-    pub reused_draws: u64,
-    pub rested_draws: u64,
-    pub readback_bytes: u64,
-    pub presents: u64,
-    pub recorded_draws: u64,
-    pub recorded_draw_bytes: u64,
-    pub recording_lookups: u64,
-    pub stateblock_applies: u64,
-    pub stateblock_items: u64,
-    pub eliminated_passes: u64,
-    pub recorded_commands: u64,
-    pub gpu_draws: u64,
-    pub uncoalesced_gpu_draws: u64,
-    pub fast_path_draws: u64,
-    pub general_path_draws: u64,
-    /// Present, readback, lock, DC, Reset, Release, limit, existing GPU wait.
-    pub flushes: [u64; 8],
-    pub eliminated_frames: u64,
-    pub verification_mismatches: u64,
-    pub full_executions: u64,
-    pub clipped_executions: u64,
-    pub clipped_area_sum: f64,
-    /// Presents that changed the whole surface, by cause: a flush that
-    /// changed contents outside the analysis, a new presentation, a whole
-    /// COPY publication, and the analysis itself (a whole change).
-    pub whole: [u64; 4],
-    /// Final chains planned whole because a late demand reached writes
-    /// already planned.
-    pub promotions: u64,
-    pub intermediate_promotions: u64,
-    /// Recorded writes submitted, once per scissor, and the pixels those
-    /// submissions covered (a whole write counts its image).
-    pub submissions: u64,
-    pub submitted_pixels: u64,
-    /// Input vertices submitted, including instances and repeated scissors.
-    pub submitted_vertices: u64,
-    pub repeated_vertices: u64,
-    /// Backbuffer cell areas accumulated once per completed present.
-    pub changed_pixels: u64,
-    pub executed_pixels: u64,
-    pub extra_pixels: u64,
-}
-impl Counters {
-    pub fn work_report(&self) -> String {
-        if !cfg!(feature = "d3d9-counters") {
-            return String::new();
-        }
-        format!(
-            "\nD3D9 work: draws {}; recorded bytes {} ({:.2}/draw); recording lookups {} ({:.2}/draw); StateBlock applies {}; applied items {} ({:.2}/apply); dead frames {}; dead passes {}",
-            self.recorded_draws,
-            self.recorded_draw_bytes,
-            self.recorded_draw_bytes as f64 / self.recorded_draws.max(1) as f64,
-            self.recording_lookups,
-            self.recording_lookups as f64 / self.recorded_draws.max(1) as f64,
-            self.stateblock_applies,
-            self.stateblock_items,
-            self.stateblock_items as f64 / self.stateblock_applies.max(1) as f64,
-            self.eliminated_frames,
-            self.eliminated_passes
-        )
-    }
-}
-#[cfg(feature = "d3d9-counters")]
-thread_local! { static LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
-#[cfg(feature = "d3d9-counters")]
-fn lookup(count: u64) {
-    LOOKUPS.set(LOOKUPS.get() + count);
-}
-#[cfg(feature = "d3d9-counters")]
-fn lookups() -> u64 {
-    LOOKUPS.get()
 }
 struct ReadbackTarget {
     source: Content,
@@ -250,7 +101,7 @@ pub(super) struct Recording {
     reuse: reuse::Cache,
     readback_targets: HashMap<adv_device::gpu::ImageId, ReadbackTarget>,
     passes: passes::Plan,
-    damage: damage::Analysis,
+    damage: Analysis,
     verify_region: Option<adv_device::surface::Region>,
     output_slot: Option<u128>,
     executed: HashMap<u128, adv_device::surface::Region>,
@@ -285,16 +136,17 @@ impl Recording {
         self.nodes.fill(None);
     }
 }
-pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
+pub(super) fn forget(env: &mut Env<'_>, owner: Id, id: Option<Id>, pointer: u32) {
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
         let f = &mut d.frame;
-        let changed = f.contents.forget(pointer);
+        let allocation = id.map(Id::key);
+        let changed = f.contents.forget(|key| Some(key.0) == allocation);
         f.binding_cache = None;
         f.fast.clear();
         f.reuse.invalidate();
-        f.damage.forget(pointer);
+        f.damage.forget(|key| Some(key.0) == allocation);
         f.readback_targets
-            .retain(|_, r| r.source.3 != pointer && r.destination != pointer);
+            .retain(|_, r| Some(r.source.0) != allocation && r.destination != pointer);
         if changed {
             f.partial = true;
             f.last = None;
@@ -671,11 +523,10 @@ fn append(
             command,
             attachment,
             f.damage.record(
-                p,
+                p.damage(target.as_ref()),
                 [command, attachment],
                 &f.contents,
                 &read_versions,
-                target.as_ref().map(|t| hash(t.image.id())),
                 destinations.is_some(),
             ),
         )
@@ -750,7 +601,7 @@ fn append(
         f.passes.replay(saved.pass.clone());
     } else {
         let pass = f.passes.record(
-            &p.operation,
+            p.kind(),
             p.reads.clone(),
             read_versions,
             p.writes.clone(),
@@ -1499,13 +1350,13 @@ fn finish(
 ) {
     let f = frame(env, owner);
     let delta = f.output_slot.and_then(|s| f.damage.changed.get(&s));
-    let changed = delta.map_or(0, damage::area);
+    let changed = delta.map_or(0, crate::record::damage::area);
     let executed = f.output_slot.and_then(|s| f.executed.get(&s)).cloned();
-    let execution_area = executed.as_ref().map_or(0, damage::area);
+    let execution_area = executed.as_ref().map_or(0, crate::record::damage::area);
     let extra = match (executed, delta) {
         (Some(mut r), Some(delta)) => {
             r.intersect(delta);
-            execution_area - damage::area(&r)
+            execution_area - crate::record::damage::area(&r)
         }
         _ => execution_area,
     };

@@ -313,8 +313,9 @@ fn d3d9_reuse_rebases_onto_a_rotated_back_buffer_image() {
     let device_pointer = f.device;
     let e = env(&mut f);
     let d = device(&e, device_pointer).unwrap();
-    assert!(!d.frame.reuse.retains(&old));
-    assert!(d.frame.reuse.retains(&new));
+    let retains = |image| d.frame.reuse.any_entry(|e| e.draws_into(image));
+    assert!(!retains(&old));
+    assert!(retains(&new));
 }
 
 #[test]

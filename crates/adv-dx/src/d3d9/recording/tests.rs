@@ -1210,7 +1210,7 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
         frame(&mut env(&mut f), owner)
             .contents
             .keys()
-            .any(|k| k.0 == first)
+            .any(|k| k.0 == first.key())
     );
     let outcome = f.call("IDirect3DSurface9::Release", &[source]);
     assert_eq!(f.finish(outcome), 0);
@@ -1218,7 +1218,7 @@ fn logical_versions_include_sample_identity_and_contents_and_retire_with_resourc
         !frame(&mut env(&mut f), owner)
             .contents
             .keys()
-            .any(|k| k.0 == first)
+            .any(|k| k.0 == first.key())
     );
 }
 
