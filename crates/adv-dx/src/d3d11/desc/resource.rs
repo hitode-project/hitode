@@ -82,7 +82,14 @@ impl Misc {
     pub const RAW: u32 = 32;
     pub const STRUCTURED: u32 = 64;
     pub const RESOURCE_CLAMP: u32 = 128;
+    pub const SHARED_KEYEDMUTEX: u32 = 256;
     pub const GDI_COMPATIBLE: u32 = 512;
+    pub const SHARED_NTHANDLE: u32 = 2048;
+    pub const SHARING: u32 = Self::SHARED | Self::SHARED_KEYEDMUTEX | Self::SHARED_NTHANDLE;
+
+    pub fn shared(self) -> bool {
+        self.0 & Self::SHARING != 0
+    }
 
     pub fn contains(self, flags: u32) -> bool {
         self.0 & flags == flags
@@ -409,12 +416,14 @@ impl Texture {
                 && (report.level < FeatureLevel::L11_0 || samples != 1))
             || misc.0
                 & !(Misc::GENERATE_MIPS
-                    | Misc::SHARED
+                    | Misc::SHARING
                     | Misc::CUBE
                     | Misc::RESOURCE_CLAMP
                     | Misc::GDI_COMPATIBLE)
                 != 0
-            || (misc.contains(Misc::SHARED)
+            || misc.contains(Misc::SHARED | Misc::SHARED_KEYEDMUTEX)
+            || (misc.contains(Misc::SHARED_NTHANDLE) && !misc.contains(Misc::SHARED_KEYEDMUTEX))
+            || (misc.shared()
                 && (kind != TextureKind::D2
                     || layers != 1
                     || resolved_mips != 1

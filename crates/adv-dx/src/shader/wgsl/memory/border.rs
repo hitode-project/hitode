@@ -132,38 +132,15 @@ impl Writer<'_> {
             format!("1.0 - ({})", inside(&format!("u32({level} + 0.5)")))
         };
         let channels = std::array::from_fn::<_, 4, _>(|lane| {
-            let value = sampler.color[lane];
-            let quantize = |max: u32, lower: f32| {
-                (value.clamp(lower, 1.) * max as f32).round_ties_even() / max as f32
-            };
-            match format.channels[lane] {
-                BorderChannel::Missing => 0f32,
-                BorderChannel::Float => value,
-                BorderChannel::Unorm(bits) => quantize(u32::MAX >> (32 - bits), 0.),
-                BorderChannel::Snorm(bits) => quantize(u32::MAX >> (33 - bits), -1.),
-            }
+            channel(sampler.color[lane], format.channels[lane])
         });
         let value = channels.map(|channel| format!("bitcast<f32>({}u)", channel.to_bits()));
         if matches!(opcode, SampleC | SampleCLz) {
             let reference = extra(1);
-            let compare = |site: &str| {
-                let op = match sampler.comparison {
-                    1 => return "0.0".to_owned(),
-                    2 => "<",
-                    3 => "==",
-                    4 => "<=",
-                    5 => ">",
-                    6 => "!=",
-                    7 => ">=",
-                    8 => return "1.0".to_owned(),
-                    _ => unreachable!(),
-                };
-                format!("select(0.0, 1.0, {reference} {op} {site})")
-            };
             return format!(
                 "({native} + ({weight}) * ({} - {}))",
-                compare(&value[0]),
-                compare("0.0")
+                compare(sampler.comparison, &reference, &value[0]),
+                compare(sampler.comparison, &reference, "0.0")
             );
         }
         if depth {
@@ -177,4 +154,71 @@ impl Writer<'_> {
             result
         }
     }
+
+    pub(super) fn border_gather(
+        &mut self,
+        coord: &str,
+        texture: &str,
+        [x, y]: [i32; 2],
+        axes: [bool; 3],
+        (border, scalar): (&str, &str),
+        sample: &str,
+    ) -> String {
+        let name = format!("gather_border_{}", self.serial);
+        let size = format!("{name}_size");
+        let origin = format!("{name}_origin");
+        self.line(&format!(
+            "let {size} = vec2<f32>(textureDimensions({texture}, 0u));"
+        ));
+        self.line(&format!(
+            "let {origin} = floor({coord} * {size} - vec2<f32>(0.5)) + vec2<f32>({x}.0, {y}.0);"
+        ));
+        let axes = [axes[0], axes[1]];
+        let masks = [(0, 1), (1, 1), (1, 0), (0, 0)].map(|(u, v)| {
+            [("x", u), ("y", v)]
+                .into_iter()
+                .zip(axes)
+                .filter(|(_, border)| *border)
+                .map(|((axis, offset), _)| {
+                    let tap = format!("({origin}.{axis} + {offset}.0)");
+                    format!("({tap} < 0.0 || {tap} >= {size}.{axis})")
+                })
+                .collect::<Vec<_>>()
+                .join(" || ")
+        });
+        if axes == [false, false] {
+            sample.into()
+        } else {
+            format!(
+                "select({sample}, vec4<{scalar}>({scalar}({border})), vec4<bool>({}))",
+                masks.join(", ")
+            )
+        }
+    }
+}
+
+pub(super) fn channel(value: f32, channel: BorderChannel) -> f32 {
+    let quantize =
+        |max: u32, lower: f32| (value.clamp(lower, 1.) * max as f32).round_ties_even() / max as f32;
+    match channel {
+        BorderChannel::Missing => 0.0,
+        BorderChannel::Float => value,
+        BorderChannel::Unorm(bits) => quantize(u32::MAX >> (32 - bits), 0.),
+        BorderChannel::Snorm(bits) => quantize(u32::MAX >> (33 - bits), -1.),
+    }
+}
+
+pub(super) fn compare(comparison: i32, reference: &str, texel: &str) -> String {
+    let op = match comparison {
+        1 => return "0.0".into(),
+        2 => "<",
+        3 => "==",
+        4 => "<=",
+        5 => ">",
+        6 => "!=",
+        7 => ">=",
+        8 => return "1.0".into(),
+        _ => unreachable!(),
+    };
+    format!("select(0.0, 1.0, {reference} {op} {texel})")
 }

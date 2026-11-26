@@ -256,7 +256,9 @@ impl DeviceRequest<'_> {
         {
             return Err(Error::InvalidArgument);
         }
-        if self.flags & !0x9ef != 0 || self.flags & 0x42 != 0 {
+        let d3d10 = self.flags & 0xc000_0000 != 0;
+        let allowed = if d3d10 { 0xc000_09ff } else { 0x9ef };
+        if self.flags & !allowed != 0 || self.flags & 0x42 != 0 {
             return Err(Error::SdkComponentMissing);
         }
         let adapter = match self.driver {
@@ -279,6 +281,34 @@ impl DeviceRequest<'_> {
         Ok(DeviceChoice {
             level,
             status: u32::from(!self.wants_device && !self.wants_context),
+            adapter,
+        })
+    }
+    pub(super) fn choose_core(&self, maximum: Option<FeatureLevel>) -> Result<DeviceChoice, Error> {
+        if self.flags & 0x402 != 0 {
+            return Err(Error::SdkComponentMissing);
+        }
+        let adapter = match self.driver {
+            Driver::Unknown => DeviceAdapter::Explicit,
+            Driver::Hardware if self.has_adapter => DeviceAdapter::Explicit,
+            Driver::Hardware => DeviceAdapter::Hardware,
+            Driver::Reference | Driver::Warp => DeviceAdapter::Software,
+            Driver::Null => DeviceAdapter::Null,
+            Driver::Software => return Err(Error::Unsupported),
+        };
+        let level = self
+            .levels
+            .unwrap_or_default()
+            .iter()
+            .find_map(|&requested| {
+                FeatureLevel::ALL.into_iter().find(|&level| {
+                    level as u32 == requested && maximum.is_some_and(|max| level <= max)
+                })
+            })
+            .ok_or(Error::Unsupported)?;
+        Ok(DeviceChoice {
+            level,
+            status: u32::from(!self.wants_device),
             adapter,
         })
     }

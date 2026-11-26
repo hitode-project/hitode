@@ -288,6 +288,11 @@ impl ContextState {
         self.groups.clone()
     }
 
+    #[cfg(feature = "gpu")]
+    pub(super) fn replace_groups(&mut self, snapshot: Snapshot) -> Snapshot {
+        std::mem::replace(&mut self.groups, snapshot)
+    }
+
     pub fn groups(&self) -> &Snapshot {
         &self.groups
     }

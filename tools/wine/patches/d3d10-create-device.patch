@@ -1,0 +1,624 @@
+Route Direct3D 10 device creation through the Direct3D 11 runtime.
+
+--- a/dlls/d3d10/Makefile.in
++++ b/dlls/d3d10/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = d3d10.dll
+ IMPORTLIB = d3d10
+-IMPORTS   = uuid d3d10core d3dcompiler_39 dxgi wined3d
++IMPORTS   = uuid d3d10core d3d11 d3dcompiler_39 dxgi wined3d
+ EXTRADEFS = -DD3D_COMPILER_VERSION=0
+ PARENTSRC = ../d3dcompiler_43
+ EXTRAINCL = $(VKD3D_PE_CFLAGS)
+--- a/dlls/d3d10/d3d10_main.c
++++ b/dlls/d3d10/d3d10_main.c
+@@ -21,213 +21,79 @@
+  */
+ 
+ #include "d3d10_private.h"
++#include "d3d11.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d3d10);
+ 
+-#define WINE_D3D10_TO_STR(x) case x: return #x
++HRESULT WINAPI D3D10CoreRegisterLayers(void);
+ 
+-static const char *debug_d3d10_driver_type(D3D10_DRIVER_TYPE driver_type)
++HRESULT WINAPI D3D10RegisterLayers(void)
+ {
++    return D3D10CoreRegisterLayers();
++}
++
++static HRESULT d3d10_create_device(IDXGIAdapter *adapter, D3D10_DRIVER_TYPE driver_type,
++        HMODULE swrast, UINT flags, UINT sdk_version, DXGI_SWAP_CHAIN_DESC *desc,
++        IDXGISwapChain **swapchain, ID3D10Device **device)
++{
++    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_10_0;
++    D3D_DRIVER_TYPE driver;
++    ID3D11Device *device11;
++    HRESULT hr;
++
++    if (device)
++        *device = NULL;
++    if (swapchain)
++        *swapchain = NULL;
++    if (sdk_version != D3D10_SDK_VERSION)
++        return E_INVALIDARG;
++
++    if (adapter && driver_type != D3D10_DRIVER_TYPE_HARDWARE)
++        return E_INVALIDARG;
+     switch (driver_type)
+     {
+-        WINE_D3D10_TO_STR(D3D10_DRIVER_TYPE_HARDWARE);
+-        WINE_D3D10_TO_STR(D3D10_DRIVER_TYPE_REFERENCE);
+-        WINE_D3D10_TO_STR(D3D10_DRIVER_TYPE_NULL);
+-        WINE_D3D10_TO_STR(D3D10_DRIVER_TYPE_SOFTWARE);
+-        WINE_D3D10_TO_STR(D3D10_DRIVER_TYPE_WARP);
++        case D3D10_DRIVER_TYPE_HARDWARE:
++            driver = adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
++            break;
++        case D3D10_DRIVER_TYPE_REFERENCE:
++            driver = D3D_DRIVER_TYPE_REFERENCE;
++            break;
++        case D3D10_DRIVER_TYPE_NULL:
++            driver = D3D_DRIVER_TYPE_NULL;
++            break;
++        case D3D10_DRIVER_TYPE_SOFTWARE:
++            if (!swrast)
++                return E_INVALIDARG;
++            driver = D3D_DRIVER_TYPE_SOFTWARE;
++            break;
++        case D3D10_DRIVER_TYPE_WARP:
++            driver = D3D_DRIVER_TYPE_WARP;
++            break;
+         default:
+-            FIXME("Unrecognised D3D10_DRIVER_TYPE %#x.\n", driver_type);
+-            return "unrecognised";
+-    }
+-}
+-
+-#undef WINE_D3D10_TO_STR
+-
+-static HRESULT d3d10_create_device(IDXGIAdapter *adapter, D3D10_DRIVER_TYPE driver_type,
+-        HMODULE swrast, UINT flags, UINT sdk_version, ID3D10Device **device)
+-{
+-    IDXGIFactory *factory;
+-    HRESULT hr;
+-
+-    TRACE("adapter %p, driver_type %s, swrast %p, flags %#x, sdk_version %#x, device %p.\n",
+-            adapter, debug_d3d10_driver_type(driver_type), swrast, flags, sdk_version, device);
+-
+-    if (sdk_version != D3D10_SDK_VERSION)
+-    {
+-        WARN("Invalid SDK version %#x.\n", sdk_version);
+-        return E_INVALIDARG;
++            return E_INVALIDARG;
+     }
+ 
+-    if (adapter)
+-    {
+-        IDXGIAdapter_AddRef(adapter);
+-        hr = IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory, (void **)&factory);
+-        if (FAILED(hr))
+-        {
+-            WARN("Failed to get dxgi factory, returning %#lx.\n", hr);
+-            return hr;
+-        }
+-    }
+-    else
+-    {
+-        hr = CreateDXGIFactory(&IID_IDXGIFactory, (void **)&factory);
+-        if (FAILED(hr))
+-        {
+-            WARN("Failed to create dxgi factory, returning %#lx.\n", hr);
+-            return hr;
+-        }
++    hr = D3D11CreateDeviceAndSwapChain(adapter, driver, swrast, flags | 0x40000000,
++            &level, 1, D3D11_SDK_VERSION, desc, swapchain, device ? &device11 : NULL, NULL, NULL);
++    if (FAILED(hr) || !device)
++        return hr;
+ 
+-        switch (driver_type)
+-        {
+-            case D3D10_DRIVER_TYPE_WARP:
+-                FIXME("WARP driver not implemented, falling back to hardware.\n");
+-            case D3D10_DRIVER_TYPE_HARDWARE:
+-            {
+-                hr = IDXGIFactory_EnumAdapters(factory, 0, &adapter);
+-                if (FAILED(hr))
+-                {
+-                    WARN("No adapters found, returning %#lx.\n", hr);
+-                    IDXGIFactory_Release(factory);
+-                    return hr;
+-                }
+-                break;
+-            }
+-
+-            case D3D10_DRIVER_TYPE_NULL:
+-                FIXME("NULL device not implemented, falling back to refrast.\n");
+-                /* fall through, for now */
+-            case D3D10_DRIVER_TYPE_REFERENCE:
+-            {
+-                HMODULE refrast = LoadLibraryA("d3d10ref.dll");
+-                if (!refrast)
+-                {
+-                    WARN("Failed to load refrast, returning E_FAIL.\n");
+-                    IDXGIFactory_Release(factory);
+-                    return E_FAIL;
+-                }
+-                hr = IDXGIFactory_CreateSoftwareAdapter(factory, refrast, &adapter);
+-                FreeLibrary(refrast);
+-                if (FAILED(hr))
+-                {
+-                    WARN("Failed to create a software adapter, returning %#lx.\n", hr);
+-                    IDXGIFactory_Release(factory);
+-                    return hr;
+-                }
+-                break;
+-            }
+-
+-            case D3D10_DRIVER_TYPE_SOFTWARE:
+-            {
+-                if (!swrast)
+-                {
+-                    WARN("Software device requested, but NULL swrast passed, returning E_FAIL.\n");
+-                    IDXGIFactory_Release(factory);
+-                    return E_FAIL;
+-                }
+-                hr = IDXGIFactory_CreateSoftwareAdapter(factory, swrast, &adapter);
+-                if (FAILED(hr))
+-                {
+-                    WARN("Failed to create a software adapter, returning %#lx.\n", hr);
+-                    IDXGIFactory_Release(factory);
+-                    return hr;
+-                }
+-                break;
+-            }
+-
+-            default:
+-                FIXME("Unhandled driver type %#x.\n", driver_type);
+-                IDXGIFactory_Release(factory);
+-                return E_FAIL;
+-        }
+-    }
+-
+-    hr = D3D10CoreCreateDevice(factory, adapter, flags, D3D_FEATURE_LEVEL_10_0, device);
+-    IDXGIAdapter_Release(adapter);
+-    IDXGIFactory_Release(factory);
+-    if (FAILED(hr))
+-    {
+-        WARN("Failed to create a device, returning %#lx.\n", hr);
+-        return hr;
+-    }
+-
+-    TRACE("Created ID3D10Device %p.\n", *device);
+-
++    hr = ID3D11Device_QueryInterface(device11, &IID_ID3D10Device, (void **)device);
++    ID3D11Device_Release(device11);
+     return hr;
+ }
+ 
+ HRESULT WINAPI D3D10CreateDevice(IDXGIAdapter *adapter, D3D10_DRIVER_TYPE driver_type,
+         HMODULE swrast, UINT flags, UINT sdk_version, ID3D10Device **device)
+ {
+-    return d3d10_create_device(adapter, driver_type, swrast, flags, sdk_version, device);
++    return d3d10_create_device(adapter, driver_type, swrast, flags, sdk_version, NULL, NULL, device);
+ }
+ 
+ HRESULT WINAPI D3D10CreateDeviceAndSwapChain(IDXGIAdapter *adapter, D3D10_DRIVER_TYPE driver_type,
+         HMODULE swrast, UINT flags, UINT sdk_version, DXGI_SWAP_CHAIN_DESC *swapchain_desc,
+         IDXGISwapChain **swapchain, ID3D10Device **device)
+ {
+-    IDXGIDevice *dxgi_device;
+-    IDXGIFactory *factory;
+-    HRESULT hr;
+-
+-    TRACE("adapter %p, driver_type %s, swrast %p, flags %#x, sdk_version %d, "
+-            "swapchain_desc %p, swapchain %p, device %p\n",
+-            adapter, debug_d3d10_driver_type(driver_type), swrast, flags, sdk_version,
+-            swapchain_desc, swapchain, device);
+-
+-    /* Avoid forwarding to D3D10CreateDevice(), since it breaks applications
+-     * hooking these entry-points. */
+-    if (FAILED(hr = d3d10_create_device(adapter, driver_type, swrast, flags, sdk_version, device)))
+-    {
+-        WARN("Failed to create a device, returning %#lx.\n", hr);
+-        *device = NULL;
+-        return hr;
+-    }
+-
+-    TRACE("Created ID3D10Device %p\n", *device);
+-
+-    hr = ID3D10Device_QueryInterface(*device, &IID_IDXGIDevice, (void **)&dxgi_device);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to get a dxgi device from the d3d10 device, returning %#lx.\n", hr);
+-        ID3D10Device_Release(*device);
+-        *device = NULL;
+-        return hr;
+-    }
+-
+-    hr = IDXGIDevice_GetAdapter(dxgi_device, &adapter);
+-    IDXGIDevice_Release(dxgi_device);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to get the device adapter, returning %#lx.\n", hr);
+-        ID3D10Device_Release(*device);
+-        *device = NULL;
+-        return hr;
+-    }
+-
+-    hr = IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory, (void **)&factory);
+-    IDXGIAdapter_Release(adapter);
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to get the adapter factory, returning %#lx.\n", hr);
+-        ID3D10Device_Release(*device);
+-        *device = NULL;
+-        return hr;
+-    }
+-
+-    hr = IDXGIFactory_CreateSwapChain(factory, (IUnknown *)*device, swapchain_desc, swapchain);
+-    IDXGIFactory_Release(factory);
+-    if (FAILED(hr))
+-    {
+-        ID3D10Device_Release(*device);
+-        *device = NULL;
+-
+-        WARN("Failed to create a swapchain, returning %#lx.\n", hr);
+-        return hr;
+-    }
+-
+-    TRACE("Created IDXGISwapChain %p\n", *swapchain);
+-
+-    return S_OK;
++    return d3d10_create_device(adapter, driver_type, swrast, flags, sdk_version, swapchain_desc, swapchain, device);
+ }
+ 
+ HRESULT WINAPI D3D10CompileEffectFromMemory(void *data, SIZE_T data_size, const char *filename,
+--- a/dlls/d3d10/d3d10.spec
++++ b/dlls/d3d10/d3d10.spec
+@@ -15,11 +15,11 @@
+ @ stdcall D3D10GetOutputSignatureBlob(ptr long ptr) d3dcompiler_43.D3DGetOutputSignatureBlob
+ @ stdcall D3D10GetPixelShaderProfile(ptr)
+ @ stdcall D3D10GetShaderDebugInfo(ptr long ptr) d3dcompiler_43.D3DGetDebugInfo
+-@ stub D3D10GetVersion
++@ stdcall D3D10GetVersion() d3d10core.D3D10CoreGetVersion
+ @ stdcall D3D10GetVertexShaderProfile(ptr)
+ @ stub D3D10PreprocessShader
+ @ stdcall D3D10ReflectShader(ptr long ptr)
+-@ stub D3D10RegisterLayers
++@ stdcall D3D10RegisterLayers()
+ @ stdcall D3D10StateBlockMaskDifference(ptr ptr ptr)
+ @ stdcall D3D10StateBlockMaskDisableAll(ptr)
+ @ stdcall D3D10StateBlockMaskDisableCapture(ptr long long long)
+--- a/dlls/d3d10_1/Makefile.in
++++ b/dlls/d3d10_1/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = d3d10_1.dll
+ IMPORTLIB = d3d10_1
+-IMPORTS   = dxguid d3d10core dxgi
++IMPORTS   = dxguid d3d10core d3d11 dxgi
+ 
+ SOURCES = \
+ 	d3d10_1_main.c \
+--- a/dlls/d3d10_1/d3d10_1_main.c
++++ b/dlls/d3d10_1/d3d10_1_main.c
+@@ -21,237 +21,89 @@
+ 
+ #define COBJMACROS
+ #include "d3d10_1.h"
++#include "d3d11.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d3d10);
+ 
+-HRESULT WINAPI D3D10CoreCreateDevice(IDXGIFactory *factory, IDXGIAdapter *adapter,
+-        unsigned int flags, D3D_FEATURE_LEVEL feature_level, ID3D10Device **device);
++HRESULT WINAPI D3D10CoreRegisterLayers(void);
+ 
+-#define WINE_D3D10_TO_STR(x) case x: return #x
++HRESULT WINAPI D3D10RegisterLayers(void)
++{
++    return D3D10CoreRegisterLayers();
++}
+ 
+-static const char *debug_d3d10_driver_type(D3D10_DRIVER_TYPE driver_type)
++static HRESULT d3d10_create_device1(IDXGIAdapter *adapter, D3D10_DRIVER_TYPE driver_type,
++        HMODULE swrast, UINT flags, D3D10_FEATURE_LEVEL1 hw_level, UINT sdk_version, DXGI_SWAP_CHAIN_DESC *desc,
++        IDXGISwapChain **swapchain, ID3D10Device1 **device)
+ {
++    D3D_FEATURE_LEVEL level = (D3D_FEATURE_LEVEL)hw_level;
++    D3D_DRIVER_TYPE driver;
++    ID3D11Device *device11;
++    HRESULT hr;
++
++    if (device)
++        *device = NULL;
++    if (swapchain)
++        *swapchain = NULL;
++    if (sdk_version != D3D10_1_SDK_VERSION)
++        return E_INVALIDARG;
++
++    switch (hw_level)
++    {
++        case D3D10_FEATURE_LEVEL_9_1:
++        case D3D10_FEATURE_LEVEL_9_2:
++        case D3D10_FEATURE_LEVEL_9_3:
++        case D3D10_FEATURE_LEVEL_10_0:
++        case D3D10_FEATURE_LEVEL_10_1:
++            break;
++        default:
++            return E_INVALIDARG;
++    }
++
++    if (adapter && driver_type != D3D10_DRIVER_TYPE_HARDWARE)
++        return E_INVALIDARG;
+     switch (driver_type)
+     {
+-        WINE_D3D10_TO_STR(D3D10_DRIVER_TYPE_HARDWARE);
+-        WINE_D3D10_TO_STR(D3D10_DRIVER_TYPE_REFERENCE);
+-        WINE_D3D10_TO_STR(D3D10_DRIVER_TYPE_NULL);
+-        WINE_D3D10_TO_STR(D3D10_DRIVER_TYPE_SOFTWARE);
+-        WINE_D3D10_TO_STR(D3D10_DRIVER_TYPE_WARP);
++        case D3D10_DRIVER_TYPE_HARDWARE:
++            driver = adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
++            break;
++        case D3D10_DRIVER_TYPE_REFERENCE:
++            driver = D3D_DRIVER_TYPE_REFERENCE;
++            break;
++        case D3D10_DRIVER_TYPE_NULL:
++            driver = D3D_DRIVER_TYPE_NULL;
++            break;
++        case D3D10_DRIVER_TYPE_SOFTWARE:
++            if (!swrast)
++                return E_INVALIDARG;
++            driver = D3D_DRIVER_TYPE_SOFTWARE;
++            break;
++        case D3D10_DRIVER_TYPE_WARP:
++            driver = D3D_DRIVER_TYPE_WARP;
++            break;
+         default:
+-            FIXME("Unrecognized D3D10_DRIVER_TYPE %#x.\n", driver_type);
+-            return "unrecognized";
+-    }
+-}
+-
+-static const char *debug_d3d10_feature_level(D3D10_FEATURE_LEVEL1 feature_level)
+-{
+-    switch (feature_level)
+-    {
+-        WINE_D3D10_TO_STR(D3D10_FEATURE_LEVEL_10_0);
+-        WINE_D3D10_TO_STR(D3D10_FEATURE_LEVEL_10_1);
+-        WINE_D3D10_TO_STR(D3D10_FEATURE_LEVEL_9_1);
+-        WINE_D3D10_TO_STR(D3D10_FEATURE_LEVEL_9_2);
+-        WINE_D3D10_TO_STR(D3D10_FEATURE_LEVEL_9_3);
+-        default:
+-            FIXME("Unrecognized D3D10_FEATURE_LEVEL1 %#x.\n", feature_level);
+-            return "unrecognized";
+-    }
+-}
+-
+-#undef WINE_D3D10_TO_STR
+-
+-static D3D_FEATURE_LEVEL d3d_feature_level_from_d3d10_1(D3D10_FEATURE_LEVEL1 level)
+-{
+-    return (D3D_FEATURE_LEVEL)level;
+-}
+-
+-static HRESULT d3d10_create_device1(IDXGIAdapter *adapter, D3D10_DRIVER_TYPE driver_type, HMODULE swrast,
+-        UINT flags, D3D10_FEATURE_LEVEL1 hw_level, UINT sdk_version, ID3D10Device1 **device)
+-{
+-    IDXGIFactory *factory;
+-    HRESULT hr;
+-
+-    TRACE("adapter %p, driver_type %s, swrast %p, flags %#x, hw_level %s, sdk_version %d, device %p.\n",
+-            adapter, debug_d3d10_driver_type(driver_type), swrast, flags,
+-            debug_d3d10_feature_level(hw_level), sdk_version, device);
+-
+-    if (!device)
+-        return E_INVALIDARG;
+-
+-    *device = NULL;
+-
+-    if (!hw_level)
+-        return E_INVALIDARG;
+-
+-    if (adapter)
+-    {
+-        IDXGIAdapter_AddRef(adapter);
+-        if (FAILED(hr = IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory, (void **)&factory)))
+-        {
+-            WARN("Failed to get dxgi factory, hr %#lx.\n", hr);
+-            return hr;
+-        }
+-    }
+-    else
+-    {
+-        if (FAILED(hr = CreateDXGIFactory(&IID_IDXGIFactory, (void **)&factory)))
+-        {
+-            WARN("Failed to create dxgi factory, hr %#lx.\n", hr);
+-            return hr;
+-        }
+-
+-        switch (driver_type)
+-        {
+-            case D3D10_DRIVER_TYPE_WARP:
+-                FIXME("WARP driver not implemented, falling back to hardware.\n");
+-            case D3D10_DRIVER_TYPE_HARDWARE:
+-            {
+-                if (FAILED(hr = IDXGIFactory_EnumAdapters(factory, 0, &adapter)))
+-                {
+-                    WARN("No adapters found, hr %#lx.\n", hr);
+-                    IDXGIFactory_Release(factory);
+-                    return hr;
+-                }
+-                break;
+-            }
+-
+-            case D3D10_DRIVER_TYPE_NULL:
+-                FIXME("NULL device not implemented, falling back to refrast.\n");
+-                /* Fall through, for now. */
+-            case D3D10_DRIVER_TYPE_REFERENCE:
+-            {
+-                HMODULE refrast;
+-
+-                if (!(refrast = LoadLibraryA("d3d10ref.dll")))
+-                {
+-                    WARN("Failed to load refrast, returning E_FAIL.\n");
+-                    IDXGIFactory_Release(factory);
+-                    return E_FAIL;
+-                }
+-                hr = IDXGIFactory_CreateSoftwareAdapter(factory, refrast, &adapter);
+-                FreeLibrary(refrast);
+-                if (FAILED(hr))
+-                {
+-                    WARN("Failed to create a software adapter, hr %#lx.\n", hr);
+-                    IDXGIFactory_Release(factory);
+-                    return hr;
+-                }
+-                break;
+-            }
+-
+-            case D3D10_DRIVER_TYPE_SOFTWARE:
+-            {
+-                if (!swrast)
+-                {
+-                    WARN("Software device requested, but NULL swrast passed, returning E_FAIL.\n");
+-                    IDXGIFactory_Release(factory);
+-                    return E_FAIL;
+-                }
+-                if (FAILED(hr = IDXGIFactory_CreateSoftwareAdapter(factory, swrast, &adapter)))
+-                {
+-                    WARN("Failed to create a software adapter, hr %#lx.\n", hr);
+-                    IDXGIFactory_Release(factory);
+-                    return hr;
+-                }
+-                break;
+-            }
+-
+-            default:
+-                FIXME("Unhandled driver type %#x.\n", driver_type);
+-                IDXGIFactory_Release(factory);
+-                return E_FAIL;
+-        }
++            return E_INVALIDARG;
+     }
+ 
+-    hr = D3D10CoreCreateDevice(factory, adapter, flags,
+-            d3d_feature_level_from_d3d10_1(hw_level), (ID3D10Device **)device);
+-    IDXGIAdapter_Release(adapter);
+-    IDXGIFactory_Release(factory);
+-    if (FAILED(hr))
+-    {
+-        WARN("Failed to create a device, hr %#lx.\n", hr);
++    hr = D3D11CreateDeviceAndSwapChain(adapter, driver, swrast, flags | 0x80000000,
++            &level, 1, D3D11_SDK_VERSION, desc, swapchain, device ? &device11 : NULL, NULL, NULL);
++    if (FAILED(hr) || !device)
+         return hr;
+-    }
+ 
+-    TRACE("Created device %p.\n", *device);
+-
++    hr = ID3D11Device_QueryInterface(device11, &IID_ID3D10Device1, (void **)device);
++    ID3D11Device_Release(device11);
+     return hr;
+ }
+ 
+-HRESULT WINAPI D3D10CreateDevice1(IDXGIAdapter *adapter, D3D10_DRIVER_TYPE driver_type, HMODULE swrast,
+-        UINT flags, D3D10_FEATURE_LEVEL1 hw_level, UINT sdk_version, ID3D10Device1 **device)
++HRESULT WINAPI D3D10CreateDevice1(IDXGIAdapter *adapter, D3D10_DRIVER_TYPE driver_type,
++        HMODULE swrast, UINT flags, D3D10_FEATURE_LEVEL1 hw_level, UINT sdk_version, ID3D10Device1 **device)
+ {
+-    return d3d10_create_device1(adapter, driver_type, swrast, flags, hw_level, sdk_version, device);
++    return d3d10_create_device1(adapter, driver_type, swrast, flags, hw_level, sdk_version, NULL, NULL, device);
+ }
+ 
+ HRESULT WINAPI D3D10CreateDeviceAndSwapChain1(IDXGIAdapter *adapter, D3D10_DRIVER_TYPE driver_type,
+-        HMODULE swrast, UINT flags, D3D10_FEATURE_LEVEL1 feature_level, UINT sdk_version,
+-        DXGI_SWAP_CHAIN_DESC *swapchain_desc, IDXGISwapChain **swapchain, ID3D10Device1 **device)
++        HMODULE swrast, UINT flags, D3D10_FEATURE_LEVEL1 hw_level, UINT sdk_version, DXGI_SWAP_CHAIN_DESC *swapchain_desc,
++        IDXGISwapChain **swapchain, ID3D10Device1 **device)
+ {
+-    IDXGIDevice *dxgi_device;
+-    IDXGIFactory *factory;
+-    HRESULT hr;
+-
+-    TRACE("adapter %p, driver_type %s, swrast %p, flags %#x, "
+-            "feature_level %s, sdk_version %d, swapchain_desc %p, swapchain %p, device %p.\n",
+-            adapter, debug_d3d10_driver_type(driver_type), swrast, flags,
+-            debug_d3d10_feature_level(feature_level), sdk_version, swapchain_desc, swapchain, device);
+-
+-    if (swapchain)
+-        *swapchain = NULL;
+-
+-    if (!device)
+-        return E_INVALIDARG;
+-
+-    /* Avoid forwarding to D3D10CreateDevice1(), since it breaks applications
+-     * hooking these entry-points. */
+-    if (FAILED(hr = d3d10_create_device1(adapter, driver_type, swrast, flags, feature_level, sdk_version, device)))
+-    {
+-        WARN("Failed to create a device, returning %#lx.\n", hr);
+-        *device = NULL;
+-        return hr;
+-    }
+-
+-    if (swapchain)
+-    {
+-        if (FAILED(hr = ID3D10Device1_QueryInterface(*device, &IID_IDXGIDevice, (void **)&dxgi_device)))
+-        {
+-            ERR("Failed to get a dxgi device from the d3d10 device, returning %#lx.\n", hr);
+-            goto cleanup;
+-        }
+-
+-        hr = IDXGIDevice_GetAdapter(dxgi_device, &adapter);
+-        IDXGIDevice_Release(dxgi_device);
+-        if (FAILED(hr))
+-        {
+-            ERR("Failed to get the device adapter, returning %#lx.\n", hr);
+-            goto cleanup;
+-        }
+-
+-        hr = IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory, (void **)&factory);
+-        IDXGIAdapter_Release(adapter);
+-        if (FAILED(hr))
+-        {
+-            ERR("Failed to get the adapter factory, returning %#lx.\n", hr);
+-            goto cleanup;
+-        }
+-
+-        hr = IDXGIFactory_CreateSwapChain(factory, (IUnknown *)*device, swapchain_desc, swapchain);
+-        IDXGIFactory_Release(factory);
+-        if (FAILED(hr))
+-        {
+-            WARN("Failed to create a swapchain, returning %#lx.\n", hr);
+-            goto cleanup;
+-        }
+-
+-        TRACE("Created IDXGISwapChain %p.\n", *swapchain);
+-    }
+-
+-    return S_OK;
+-
+-cleanup:
+-    ID3D10Device1_Release(*device);
+-    *device = NULL;
+-    return hr;
++    return d3d10_create_device1(adapter, driver_type, swrast, flags, hw_level, sdk_version, swapchain_desc, swapchain, device);
+ }
+--- a/dlls/d3d10_1/d3d10_1.spec
++++ b/dlls/d3d10_1/d3d10_1.spec
+@@ -15,11 +15,11 @@
+ @ stdcall D3D10GetOutputSignatureBlob(ptr long ptr) d3d10.D3D10GetOutputSignatureBlob
+ @ stdcall D3D10GetPixelShaderProfile(ptr) d3d10.D3D10GetPixelShaderProfile
+ @ stdcall D3D10GetShaderDebugInfo(ptr long ptr) d3d10.D3D10GetShaderDebugInfo
+-@ stub D3D10GetVersion
++@ stdcall D3D10GetVersion() d3d10core.D3D10CoreGetVersion
+ @ stdcall D3D10GetVertexShaderProfile(ptr) d3d10.D3D10GetVertexShaderProfile
+ @ stub D3D10PreprocessShader
+ @ stdcall D3D10ReflectShader(ptr long ptr) d3d10.D3D10ReflectShader
+-@ stub D3D10RegisterLayers
++@ stdcall D3D10RegisterLayers()
+ @ stdcall D3D10StateBlockMaskDifference(ptr ptr ptr) d3d10.D3D10StateBlockMaskDifference
+ @ stdcall D3D10StateBlockMaskDisableAll(ptr) d3d10.D3D10StateBlockMaskDisableAll
+ @ stdcall D3D10StateBlockMaskDisableCapture(ptr long long long) d3d10.D3D10StateBlockMaskDisableCapture

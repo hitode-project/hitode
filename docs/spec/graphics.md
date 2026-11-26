@@ -403,6 +403,24 @@ Alt+Enter on an associated swap-chain window uses the shared exclusive-mode owne
 **Rule**: Direct3D 7 and legacy descriptors MUST report only the fixed-function paths admitted for that device. Texture and depth enumeration MUST use the same admitted paths.
 **Verification**: Test
 
+### GFX-CTX-1 Direct3D 11 contexts
+
+**Rule**: Deferred contexts MUST capture commands and CPU inputs, including at feature level 9_3, and require discard on each resource's first map in a list. Command lists MUST preserve order, retain resources, and honor state restoration on finish and execution. Swapping context states MUST restore bindings and their hazard index.
+**Verification**: Test
+
+### GFX-INTEROP-1 Direct3D library creation
+
+**Rule**: The D3D10 and D3D10.1 library creation calls MUST use the D3D11 core and return their own interface over the created device. The private core exports MUST use the measured x86 conventions, layer argument handling, and return values. WARP and REFERENCE MUST use the software adapter, and NULL devices MUST validate creation, preserve staging CPU contents, and complete queries without GPU work.
+**Verification**: Test
+
+### GFX-INTEROP-2 Direct3D resource interoperability
+
+**Rule**: Shared textures opened within an execution MUST alias one backing allocation. Legacy and NT handles MUST retain their respective lifetimes, and keyed mutexes MUST grant access only after a matching key is released. Packed D24S8 CPU transfers MUST preserve both aspects.
+**Verification**: Test
+
+Texture gathers use the top mip regardless of sampler filter. Two-dimensional gathers
+apply the border color per tap, and cube gathers address across face boundaries.
+
 ### GFX-RES-1 Resource common methods
 
 **Rule**: Resource interfaces MUST share per-object private data, priority, device ownership, and type queries. Private interface pointers MUST receive reference transfers on storage, retrieval, replacement, freeing, and object destruction. Stored-only device state MUST round-trip without changing rendered output.

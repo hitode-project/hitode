@@ -132,15 +132,7 @@ pub(super) fn backing(
             },
             (Backing::Image(image), Resource::Texture(texture)) => {
                 let destination = resource::region(image, texture, index as u32);
-                ModernTransfer::Upload {
-                    source: resource::texture_transfer(
-                        &execution.gpu,
-                        texture,
-                        &destination,
-                        bytes,
-                    )?,
-                    destination,
-                }
+                resource::texture_transfer(&execution.gpu, texture, destination, bytes)?
             }
             _ => unreachable!(),
         };
@@ -390,12 +382,7 @@ fn upload_shadow(
             },
             (Backing::Image(image), Resource::Texture(texture)) => {
                 let destination = pixel_region(image, texture, subresource, shadow.slice, rect);
-                let source =
-                    resource::texture_transfer(&execution.gpu, texture, &destination, &bytes)?;
-                ModernTransfer::Upload {
-                    source,
-                    destination,
-                }
+                resource::texture_transfer(&execution.gpu, texture, destination, &bytes)?
             }
             _ => unreachable!(),
         };
@@ -587,6 +574,64 @@ pub(super) fn copy_resource(env: &mut Env<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+pub(super) fn write_dynamic(
+    env: &mut Env<'_>,
+    pointer: u32,
+    subresource: u32,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    if null_device(env)? {
+        return Ok(());
+    }
+    let location = Location::new(env, pointer, subresource)?;
+    let size = location.extent();
+    let table = table(env);
+    let shadow = table
+        .get_mut(&mut env.sys.objects, pointer)
+        .unwrap()
+        .mapping()
+        .unwrap();
+    let layout = shadow.layout(subresource);
+    let base = layout.slice(shadow.pointer(), 0);
+    env.cpu
+        .write(base, bytes)
+        .map_err(|_| Error::InvalidArgument)?;
+    let backing = location.acquire(env, false)?;
+    let gpu = &execution(env.ext)?.gpu;
+    let transfer = match (backing, location.resource) {
+        (Backing::Buffer(buffer), Resource::Buffer(_)) => ModernTransfer::CopyBuffer {
+            source: BufferRange {
+                buffer: resource::upload(gpu, bytes, BufferUsage::COPY_SRC, buffer.desc().size)?,
+                range: 0..bytes.len() as u64,
+            },
+            destination: buffer,
+            offset: 0,
+        },
+        (Backing::Image(image), Resource::Texture(texture)) => {
+            let format = texture.format();
+            let row = size[0].div_ceil(u32::from(format.alignment[0]))
+                * u32::from(format.aligned_unit_bytes);
+            let rows = size[1].div_ceil(u32::from(format.alignment[1]));
+            let mut packed = Vec::with_capacity((row * rows * size[2]) as usize);
+            for z in 0..size[2] {
+                for y in 0..rows {
+                    let offset = (z * layout.depth_pitch() + y * layout.row_pitch()) as usize;
+                    packed.extend_from_slice(&bytes[offset..offset + row as usize]);
+                }
+            }
+            resource::texture_transfer(
+                gpu,
+                texture,
+                resource::region(&image, texture, subresource),
+                &packed,
+            )?
+        }
+        _ => unreachable!(),
+    };
+    let write = key(env, pointer, subresource);
+    execution(env.ext)?.append(Command::Transfer(transfer), extent_rect(size), None, write)
+}
+
 fn box_extent(input: D3D11_BOX) -> ([u32; 3], [u32; 3]) {
     (
         [input.left, input.top, input.front],
@@ -680,12 +725,7 @@ pub(super) fn update_resource(env: &mut Env<'_>) -> Result<(), Error> {
                 height: size[1],
                 depth_or_layers: size[2],
             };
-            let source =
-                resource::texture_transfer(&execution(env.ext)?.gpu, texture, &dest, &packed)?;
-            ModernTransfer::Upload {
-                source,
-                destination: dest,
-            }
+            resource::texture_transfer(&execution(env.ext)?.gpu, texture, dest, &packed)?
         }
         _ => unreachable!(),
     };
@@ -816,6 +856,10 @@ pub(super) fn generate_mips(env: &mut Env<'_>) -> Result<(), Error> {
     let (view, key) = image_view(env, env.arg(1), ViewKind::ShaderResource)?;
     let extent = view_rect(&view);
     execution(env.ext)?.append(Command::GenerateMips(view), extent, Some(key), key)
+}
+
+pub(super) fn flush_shared(env: &mut Env<'_>) -> Result<(), Error> {
+    execution(env.ext)?.barrier(Boundary::Flush)
 }
 
 pub(super) fn flush(env: &mut Env<'_>) -> Result<(), Error> {
@@ -1011,11 +1055,21 @@ pub(super) fn reset_counters(
     pointers: &[u32],
     initial: u32,
 ) -> Result<(), Error> {
-    if initial == 0 || pointers.is_empty() || null_device(env)? {
+    if initial == 0 || pointers.is_empty() {
         return Ok(());
     }
     let values = array::<u32>(env, initial, pointers.len() as u32)?;
-    for (&pointer, value) in pointers.iter().zip(values) {
+    reset_counter_values(env, pointers.iter().copied().zip(values))
+}
+
+pub(super) fn reset_counter_values(
+    env: &mut Env<'_>,
+    counters: impl IntoIterator<Item = (u32, u32)>,
+) -> Result<(), Error> {
+    if null_device(env)? {
+        return Ok(());
+    }
+    for (pointer, value) in counters {
         if value == u32::MAX
             || !context::owned(env, pointer)
                 .and_then(Object::view)

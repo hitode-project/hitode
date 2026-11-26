@@ -340,6 +340,38 @@ impl Encoder {
             }
         }
     }
+    pub(crate) fn upload_depth_stencil(
+        &mut self,
+        depth: BufferCopy<'_>,
+        stencil: BufferCopy<'_>,
+        dst: ImageCopy<'_>,
+        size: Extent,
+    ) {
+        let blit = self.blit();
+        for (source, option) in [
+            (depth, MTLBlitOption::DepthFromDepthStencil),
+            (stencil, MTLBlitOption::StencilFromDepthStencil),
+        ] {
+            let pitch = source.row_pitch as usize;
+            let stride = pitch * source.rows as usize;
+            for (slice, origin, depth, offset) in regions(dst, size) {
+                unsafe {
+                    blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
+                        &source.buffer.inner.0.raw,
+                        source.offset as usize + offset * stride,
+                        pitch,
+                        stride,
+                        metal_size(size.width, size.height, depth),
+                        &dst.image.inner.data.raw,
+                        slice,
+                        dst.mip as usize,
+                        origin,
+                        option,
+                    );
+                }
+            }
+        }
+    }
     pub(crate) fn copy_image_to_buffer(
         &mut self,
         src: ImageCopy<'_>,
