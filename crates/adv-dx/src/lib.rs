@@ -3,11 +3,13 @@
 //! adv-device. DirectDraw and D3D9 receive allocator, DC and window services from
 //! assembly; other fronts use adv-os process state.
 
+pub mod d3d11;
 #[cfg(feature = "gpu")]
 pub mod d3d9;
 pub mod ddraw;
 pub mod dshow;
 pub mod dsound;
+pub mod dxgi;
 #[cfg(feature = "gpu")]
 pub(crate) mod fixed;
 pub(crate) mod pacing;

@@ -297,6 +297,28 @@ query's data size, and only zero or D3DGETDATA_FLUSH is accepted for GetData fla
 New queries are signaled with an unspecified initial answer. Completed queries
 retain their answer until reissued; later recorded work does not delay them.
 
+## DXGI
+
+### GFX-DXGI-1 Factory and adapter
+
+**Rule**: A factory created through `CreateDXGIFactory` MUST refuse the Factory1 IID and accept Factory2. Adapter enumeration MUST put the software adapter last. An untracked CPU allocation MUST NOT be reported as video memory.
+**Verification**: Test
+
+### GFX-DXGI-2 Swap capability
+
+**Rule**: The swap capability table MUST intersect each swap model's parameters with the presenter's executing paths and attachment backing.
+**Verification**: Test
+
+### GFX-DXGI-4 Display coordinates and modes
+
+**Rule**: Output desktop coordinates MUST follow the caller's DPI awareness. Mode enumeration and matching MUST use physical display modes from the shared display owner.
+**Verification**: Test
+
+### GFX-DXGI-5 Interface coverage
+
+**Rule**: Every returned DXGI interface MUST publish its generated vtable slots and register an implementation for each slot. Custom rasterizer DLLs MAY return an unsupported result.
+**Verification**: Test
+
 ## Capabilities
 
 ### GFX-CAP-1 Honest capabilities
@@ -312,6 +334,21 @@ retain their answer until reissued; later recorded work does not delay them.
 ### GFX-CAP-3 Excluded resources
 
 **Rule**: Shader Model 4+, D3D10/11, geometry and tessellation shaders, N-patches, and shader ProcessVertices MUST remain unsupported. Cube textures, volume textures, additional swap chains, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented.
+**Verification**: Test
+
+### GFX-CAP-4 Direct3D 11 capability derivation
+
+**Rule**: The Direct3D 11 capability core MUST select the highest level whose mandatory paths execute on the device. Optional compute support and feature queries MUST reflect the selected level and executing paths.
+**Verification**: Test
+
+### GFX-CAP-5 Direct3D 11 format capabilities
+
+**Rule**: Reported format and multisample capabilities MUST require an executing path on the resource backing. Queries MUST apply the selected level's restrictions and return the Windows status and output for unsupported formats.
+**Verification**: Test
+
+### GFX-CAP-6 Direct3D 7 capability derivation
+
+**Rule**: Direct3D 7 and legacy descriptors MUST report only the fixed-function paths admitted for that device. Texture and depth enumeration MUST use the same admitted paths.
 **Verification**: Test
 
 ### GFX-RES-1 Resource common methods

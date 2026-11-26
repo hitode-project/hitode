@@ -1,0 +1,7 @@
+{
+  "project": "https://github.com/microsoft/DirectX-Headers",
+  "version": "v1.618.2",
+  "archive_url": "https://codeload.github.com/microsoft/DirectX-Headers/tar.gz/refs/tags/v1.618.2",
+  "archive_sha256": "62004f45e2ab00cbb5c7f03c47262632c22fbce0a237383fc458d9324c44cf36",
+  "license": "MIT"
+}

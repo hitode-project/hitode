@@ -43,6 +43,47 @@ pub enum Format {
     /// Y, then interleaved Cr and Cb, 4:2:0. Presentable YUV pools only.
     Nv21,
     P010,
+    R8Snorm,
+    R8Uint,
+    R8Sint,
+    R16Unorm,
+    R16Snorm,
+    R16Uint,
+    R16Sint,
+    R32Sint,
+    Rg8Snorm,
+    Rg8Uint,
+    Rg8Sint,
+    Rg16Unorm,
+    Rg16Snorm,
+    Rg16Uint,
+    Rg16Sint,
+    Rg32Uint,
+    Rg32Sint,
+    Rgba8Snorm,
+    Rgba8Uint,
+    Rgba8Sint,
+    Rgba16Unorm,
+    Rgba16Snorm,
+    Rgba16Uint,
+    Rgba16Sint,
+    Rgba32Uint,
+    Rgba32Sint,
+    A8Unorm,
+    Rgb10a2Uint,
+    Rg11b10Float,
+    Rgb9e5Float,
+    Bc1Srgb,
+    Bc2Srgb,
+    Bc3Srgb,
+    Bc4Unorm,
+    Bc4Snorm,
+    Bc5Unorm,
+    Bc5Snorm,
+    Bc6hUfloat,
+    Bc6hSfloat,
+    Bc7Unorm,
+    Bc7Srgb,
 }
 
 impl Format {
@@ -61,6 +102,60 @@ impl Format {
             Self::Depth24UnormStencil8 | Self::Depth32FloatStencil8
         )
     }
+    #[cfg(feature = "backend")]
+    pub(crate) fn is_bc(self) -> bool {
+        matches!(
+            self,
+            Self::Bc1Unorm
+                | Self::Bc2Unorm
+                | Self::Bc3Unorm
+                | Self::Bc1Srgb
+                | Self::Bc2Srgb
+                | Self::Bc3Srgb
+                | Self::Bc4Unorm
+                | Self::Bc4Snorm
+                | Self::Bc5Unorm
+                | Self::Bc5Snorm
+                | Self::Bc6hUfloat
+                | Self::Bc6hSfloat
+                | Self::Bc7Unorm
+                | Self::Bc7Srgb
+        )
+    }
+
+    #[cfg(feature = "backend")]
+    pub(crate) fn is_uint(self) -> bool {
+        matches!(
+            self,
+            Self::R32Uint
+                | Self::R8Uint
+                | Self::R16Uint
+                | Self::Rg8Uint
+                | Self::Rg16Uint
+                | Self::Rg32Uint
+                | Self::Rgba8Uint
+                | Self::Rgba16Uint
+                | Self::Rgba32Uint
+                | Self::Rgb10a2Uint
+        )
+    }
+
+    #[cfg(feature = "backend")]
+    pub(crate) fn is_sint(self) -> bool {
+        matches!(
+            self,
+            Self::R8Sint
+                | Self::R16Sint
+                | Self::R32Sint
+                | Self::Rg8Sint
+                | Self::Rg16Sint
+                | Self::Rg32Sint
+                | Self::Rgba8Sint
+                | Self::Rgba16Sint
+                | Self::Rgba32Sint
+        )
+    }
+
     pub fn planes(self) -> u32 {
         match self {
             Self::Nv12 | Self::Nv21 | Self::P010 => 2,
