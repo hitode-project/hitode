@@ -9,7 +9,7 @@ struct Link {
 }
 
 pub(super) struct Index {
-    first: FxHashMap<u32, ViewSlot>,
+    first: FxHashMap<(u64, u64), ViewSlot>,
     links: Box<[Link]>,
 }
 
@@ -31,7 +31,7 @@ impl Index {
         self.first.clear();
     }
 
-    pub(super) fn first(&self, resource: u32) -> Option<ViewSlot> {
+    pub(super) fn first(&self, resource: (u64, u64)) -> Option<ViewSlot> {
         self.first.get(&resource).copied()
     }
 
@@ -39,7 +39,7 @@ impl Index {
         self.links[slot.index()].next
     }
 
-    pub(super) fn insert(&mut self, resource: u32, slot: ViewSlot) {
+    pub(super) fn insert(&mut self, resource: (u64, u64), slot: ViewSlot) {
         let next = self.first.insert(resource, slot);
         self.links[slot.index()] = Link {
             previous: None,
@@ -50,7 +50,7 @@ impl Index {
         }
     }
 
-    pub(super) fn remove(&mut self, resource: u32, slot: ViewSlot) {
+    pub(super) fn remove(&mut self, resource: (u64, u64), slot: ViewSlot) {
         let Link { previous, next } = self.links[slot.index()];
         match (previous, next) {
             (Some(previous), _) => self.links[previous.index()].next = next,

@@ -13,8 +13,8 @@ pub(super) fn group(kind: BindingKind) -> u32 {
 }
 /// Read-only layouts keep framebuffer compression on tilers that drop it in
 /// `GENERAL`; storage images stay in `GENERAL`.
-pub(super) fn sampled_layout(format: Format) -> vk::ImageLayout {
-    if format.has_depth() {
+pub(super) fn sampled_layout(format: Format, usage: Usage) -> vk::ImageLayout {
+    if format.has_depth() && usage.contains(Usage::DEPTH_STENCIL) {
         vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
     } else {
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
@@ -527,7 +527,7 @@ impl Bindings {
                     "YCbCr images need a combined immutable sampler"
                 );
                 let layout = if sampled {
-                    sampled_layout(core.format)
+                    sampled_layout(core.format, core.image.inner.core.desc.usage)
                 } else {
                     vk::ImageLayout::GENERAL
                 };

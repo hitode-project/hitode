@@ -45,7 +45,7 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     CreatePredicate => create_predicate Implement,
     CreateCounter => check_counter Implement,
     CreateDeferredContext => excluded_deferred SafeFail,
-    OpenSharedResource => open_shared SafeFail,
+    OpenSharedResource => open_shared Implement,
     CheckFormatSupport => format_support Implement,
     CheckMultisampleQualityLevels => multisample_quality Implement,
     CheckCounterInfo => counter_info Implement,
@@ -65,7 +65,7 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     CreateBlendState1 => blend1 Implement,
     CreateRasterizerState1 => rasterizer1 Implement,
     CreateDeviceContextState => excluded_context_state SafeFail,
-    OpenSharedResource1 => open_shared SafeFail,
+    OpenSharedResource1 => open_shared_nt SafeFail,
     OpenSharedResourceByName => open_shared_by_name SafeFail,
 );
 
@@ -597,6 +597,24 @@ fn excluded_deferred(env: &mut Env<'_>) -> Outcome {
     unsupported_output(env, 2, 0x80004001)
 }
 fn open_shared(env: &mut Env<'_>) -> Outcome {
+    let (device, handle, iid, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    call((|| {
+        write(env, out, 0u32)?;
+        #[cfg(feature = "gpu")]
+        {
+            report(env, device)?;
+            let iid = read(env, iid)?;
+            let resource = dxgi::open_resource(env, device, handle, iid)?;
+            write(env, out, resource)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (device, handle, iid);
+            Err(Error::InvalidArgument)
+        }
+    })())
+}
+fn open_shared_nt(env: &mut Env<'_>) -> Outcome {
     unsupported_output(env, 3, 0x80070057)
 }
 fn excluded_context_state(env: &mut Env<'_>) -> Outcome {

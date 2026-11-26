@@ -28,6 +28,7 @@ fn binding(pointer: u32, desc: View) -> BoundView {
     BoundView {
         pointer,
         resource: 10,
+        allocation: (10, 0),
         desc: Arc::new(desc),
     }
 }

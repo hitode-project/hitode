@@ -390,7 +390,9 @@ impl Field {
             register.push('.');
             register.push(component);
         }
-        if self.ty == "u32" || self.ty == "vec4<u32>" {
+        if self.attribute == "@builtin(frag_depth)" {
+            format!("bitcast<f32>(dx_sat({register}))")
+        } else if self.ty == "u32" || self.ty == "vec4<u32>" {
             register
         } else {
             format!("bitcast<{}>({register})", self.ty)

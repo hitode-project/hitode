@@ -42,7 +42,6 @@ fn machine() -> Machine<JitCpu> {
             "ID3D11Device1::CreateDomainShader",
             "ID3D11Device1::CreateClassLinkage",
             "ID3D11Device1::CreateDeferredContext",
-            "ID3D11Device1::OpenSharedResource",
             "ID3D11Device1::CreateDeferredContext1",
             "ID3D11Device1::CreateDeviceContextState",
             "ID3D11Device1::OpenSharedResource1",
@@ -54,6 +53,13 @@ fn machine() -> Machine<JitCpu> {
     );
     assert!(registry.signature_conflicts().is_empty());
     crate::dxgi::register(&mut registry);
+    #[cfg(feature = "gpu")]
+    {
+        crate::ddraw::register(&mut registry);
+        registry.add("fixture", "alt_enter", Conv::Stdcall { argc: 1 }, |env| {
+            Outcome::Return(u32::from(crate::dxgi::alt_enter(env, env.arg(0))))
+        });
+    }
     registry.add("fixture", "exit", Conv::Stdcall { argc: 0 }, |_| {
         Outcome::ExitThread(0)
     });
@@ -141,6 +147,23 @@ fn method(machine: &mut Machine<JitCpu>, object: u32, slot: u32, arguments: &[u3
     let entry = machine.cpu.read_u32(vtable + slot * 4).unwrap();
     let arguments = [std::slice::from_ref(&object), arguments].concat();
     guest_call(machine, entry, &arguments)
+}
+
+fn check_vtable(machine: &mut Machine<JitCpu>, object: u32, dll: &str, interface: &str) {
+    let vtable = machine.cpu.read_u32(object).unwrap();
+    for signature in adv_abi::signature::com_signatures()
+        .iter()
+        .filter(|signature| signature.module == interface)
+    {
+        let name = format!("{interface}::{}", signature.name);
+        let index = u32::from(signature.com_slot.unwrap());
+        let published = machine.resolve_import(dll, &name).unwrap();
+        assert_eq!(
+            machine.cpu.read_u32(vtable + 4 * index).unwrap(),
+            published,
+            "{name}"
+        );
+    }
 }
 
 fn refs(machine: &mut Machine<JitCpu>, object: u32) -> u32 {
@@ -282,6 +305,8 @@ const CONTEXT: u32 = OUT + 20;
 fn device_entry_negotiates_levels_and_retains_its_immediate_context() {
     let mut machine = machine();
     let (device, context) = create(&mut machine, 5, 0, &[0x9100, 0xb000]);
+    check_vtable(&mut machine, device, DLL, "ID3D11Device1");
+    check_vtable(&mut machine, context, DLL, "ID3D11DeviceContext1");
     assert_eq!(machine.cpu.read_u32(LEVEL).unwrap(), 0x9100);
     assert_eq!(method(&mut machine, device, 37, &[]), 0x9100);
     assert_eq!(refs(&mut machine, device), 2);
@@ -294,6 +319,7 @@ fn device_entry_negotiates_levels_and_retains_its_immediate_context() {
     machine.cpu.write(IID, &IID_IDXGIDEVICE).unwrap();
     assert_eq!(method(&mut machine, device, 0, &[IID, OUT]), 0);
     let dxgi = machine.cpu.read_u32(OUT).unwrap();
+    check_vtable(&mut machine, dxgi, DLL, "IDXGIDevice1");
     assert_ne!(device, dxgi);
     machine.cpu.write(IID, &adv_abi::com::IUNKNOWN).unwrap();
     assert_eq!(method(&mut machine, dxgi, 0, &[IID, OUT]), 0);

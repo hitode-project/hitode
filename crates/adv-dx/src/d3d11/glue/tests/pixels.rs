@@ -1,4 +1,6 @@
 use super::*;
+
+mod raster;
 use crate::d3d11::desc::Misc;
 use adv_abi::types::{D3D11_INPUT_ELEMENT_DESC, D3D11_SUBRESOURCE_DATA};
 use adv_device::gpu::Gpu;
@@ -767,6 +769,7 @@ fn guest_swap_chain_presents_the_back_buffer_and_resizes_after_release() {
         0
     );
     let chain = machine.cpu.read_u32(swap_output).unwrap();
+    check_vtable(&mut machine, chain, "dxgi.dll", "IDXGISwapChain2");
     let device = machine.cpu.read_u32(OUT).unwrap();
     let context = machine.cpu.read_u32(CONTEXT).unwrap();
     machine.cpu.write(IID, &IID_IDXGISWAPCHAIN2).unwrap();
@@ -951,4 +954,96 @@ fn gdi_surface_dc_reads_gpu_output_and_uploads_gdi_writes() {
     let mapped = map(&mut machine, context, staging, 1);
     assert_eq!(machine.cpu.read_u32(mapped.pData).unwrap(), 0xff0000ff);
     assert_eq!(machine.cpu.read_u32(mapped.pData + 4).unwrap(), 0xffff0000);
+}
+
+// spec: GFX-DXGI-5
+#[test]
+fn alt_enter_respects_window_association_and_toggles_exclusive_mode() {
+    use adv_abi::types::{DXGI_MODE_DESC, DXGI_SWAP_CHAIN_DESC};
+    let mut machine = machine();
+    crate::ddraw::install(
+        &mut machine,
+        crate::ddraw::Provider {
+            dc: crate::interop::MemoryDc {
+                create: |_, _, _| unreachable!(),
+                flush: |_, _, _, _| unreachable!(),
+                release: |_, _, _| unreachable!(),
+                discard: |_, _| unreachable!(),
+            },
+            memory: |_| unreachable!(),
+            window: |_, _, _| None,
+            submitted: |_, _, _| (),
+            completed: |_, _| None,
+            released: |_, _| (),
+            vsync: |_| None,
+        },
+    )
+    .unwrap();
+    let gpu = Gpu::request(!cfg!(target_vendor = "apple")).unwrap();
+    machine.ext.get_mut::<State>().execution = Some(gpu::Execution::new(gpu));
+    configure_swap_chains(
+        &mut machine,
+        9600,
+        |_, _, hwnd| {
+            (hwnd == 1).then_some(crate::dxgi::swap::Window {
+                client: [8, 6],
+                minimized: false,
+            })
+        },
+        |_, _, _| Ok(()),
+    );
+    write_value(
+        &mut machine,
+        DESCRIPTOR,
+        DXGI_SWAP_CHAIN_DESC {
+            BufferDesc: DXGI_MODE_DESC {
+                Format: 28,
+                ..Default::default()
+            },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferCount: 1,
+            BufferUsage: 32,
+            OutputWindow: 1,
+            Windowed: 1,
+            ..Default::default()
+        },
+    );
+    let create = machine
+        .resolve_import(DLL, "D3D11CreateDeviceAndSwapChain")
+        .unwrap();
+    let chain_out = OUT + 4;
+    assert_eq!(
+        guest_call(
+            &mut machine,
+            create,
+            &[
+                0, 1, 0, 0, 0, 0, 7, DESCRIPTOR, chain_out, OUT, LEVEL, CONTEXT
+            ]
+        ),
+        0
+    );
+    let chain = machine.cpu.read_u32(chain_out).unwrap();
+    let alt = machine.resolve_import("fixture", "alt_enter").unwrap();
+    assert_eq!(guest_call(&mut machine, alt, &[1]), 1);
+    assert_eq!(method(&mut machine, chain, 11, &[OUT, 0]), 0);
+    assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 1);
+    assert_eq!(guest_call(&mut machine, alt, &[1]), 1);
+    assert_eq!(method(&mut machine, chain, 11, &[OUT, 0]), 0);
+    assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 0);
+
+    machine.cpu.write(IID, &IID_IDXGIFACTORY1).unwrap();
+    assert_eq!(method(&mut machine, chain, 6, &[IID, OUT]), 0);
+    let factory = machine.cpu.read_u32(OUT).unwrap();
+    assert_eq!(method(&mut machine, factory, 8, &[0, 2]), 0x887a0001);
+    for flags in [1, 2] {
+        assert_eq!(method(&mut machine, factory, 8, &[1, flags]), 0);
+        assert_eq!(guest_call(&mut machine, alt, &[1]), 0);
+    }
+    assert_eq!(method(&mut machine, factory, 8, &[1, 0]), 0);
+    assert_eq!(guest_call(&mut machine, alt, &[1]), 1);
+    assert_eq!(method(&mut machine, chain, 2, &[]), 0);
+    assert!(!crate::dxgi::has_swap_chain(&machine.ext, 1));
 }

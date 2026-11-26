@@ -349,6 +349,7 @@ pub(super) fn associate_window(
     flags: u32,
 ) -> Result<(), Error> {
     if flags & !7 != 0
+        || (window == 0 && flags != 0)
         || (window != 0
             && !(env.ext.get::<State>().provider.window_exists)(env.ext, &env.sys.objects, window))
     {
@@ -357,7 +358,7 @@ pub(super) fn associate_window(
     let Kind::Factory(factory) = &mut object_mut(env, this)?.kind else {
         return Err(Error::InvalidCall);
     };
-    factory.window = window;
+    factory.window = Some(window);
     factory.window_flags = flags;
     Ok(())
 }
@@ -366,7 +367,7 @@ pub(super) fn window(env: &Env<'_>, this: u32) -> Result<u32, Error> {
     let Kind::Factory(factory) = &object(env, this)?.kind else {
         return Err(Error::InvalidCall);
     };
-    Ok(factory.window)
+    Ok(factory.window.unwrap_or_default())
 }
 
 fn display(env: &Env<'_>) -> Option<Display> {

@@ -365,6 +365,8 @@ pub struct ModernDraw {
     pub vertex: Arc<ModernShader>,
     pub fragment: Option<Arc<ModernShader>>,
     pub colors: ArrayVec<ModernColor, { p::MAX_COLOR_TARGETS }>,
+    /// Color locations in increasing slot order. None uses consecutive slots.
+    pub color_slots: Option<u8>,
     pub depth: Option<ModernDepth>,
     pub samples: u32,
     pub alpha_to_coverage: bool,

@@ -3,13 +3,15 @@ use super::*;
 use crate::{
     d3d11::{
         desc::{Aspects, InputRate, Misc},
-        state::{Snapshot, Stage, ViewSlot},
+        state::{STREAMS, Snapshot, Stage, ViewSlot},
     },
     shader::{
+        analysis::Reflection,
         ir::{BindingKind, Register, ResourceDimension, SamplerMode, SystemValue},
         variant::{DrawFacts, Variant},
         wgsl::{
-            self, Options, Translation,
+            self, BorderChannel, BorderSampler, BorderTexture, LodSampler, Options, TextureLod,
+            Translation,
             pulled::{
                 self, DRAW_ARGUMENTS_SLOT, DrawStart, InputStep, VERTEX_STREAM_BASE,
                 VertexComponent, VertexFetch, VertexFormat,
@@ -176,11 +178,34 @@ fn pipeline<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a PipelineState> {
     table(env).get(&env.sys.objects, pointer)?.pipeline()
 }
 
+#[derive(Default)]
+struct IaCapture {
+    hash: xxhash_rust::xxh3::Xxh3,
+    bytes: usize,
+}
+
+impl IaCapture {
+    fn record(&mut self, pointer: u32, range: &Range<u32>, bytes: &[u8]) {
+        for word in [pointer, range.start, range.end] {
+            self.hash.update(&word.to_le_bytes());
+        }
+        self.hash.update(bytes);
+        self.bytes += bytes.len();
+    }
+}
+
+struct CapturedIndex {
+    binding: (BufferRange, IndexFormat),
+    vertices: Option<Range<u32>>,
+}
+
 fn ensure_index(
     env: &mut Env<'_>,
     state: &Snapshot,
-    args: &DrawRange,
-) -> Result<(BufferRange, IndexFormat), Error> {
+    args: &mut DrawRange,
+    strip: bool,
+    capture: &mut IaCapture,
+) -> Result<CapturedIndex, Error> {
     let binding = state.ia.indices;
     let (format, stride) = match binding.format {
         42 => (IndexFormat::U32, 4),
@@ -198,41 +223,146 @@ fn ensure_index(
     {
         return Err(Error::InvalidArgument);
     }
-    let backing = capture_buffer(env, binding.buffer, BufferUsage::INDEX)?;
-    Ok((
-        BufferRange {
-            buffer: backing,
-            range: u64::from(binding.offset)..u64::from(buffer.size()),
-        },
-        format,
-    ))
+    if desc.usage() == Usage::Dynamic
+        && let DrawRange::Direct {
+            vertices,
+            base_vertex,
+            ..
+        } = args
+    {
+        let range =
+            binding.offset + vertices.start * stride..binding.offset + vertices.end * stride;
+        let bytes = shadow_bytes(env, binding.buffer, range.clone())?;
+        capture.record(binding.buffer, &range, &bytes);
+        let restart = if stride == 2 { 0xffff } else { u32::MAX };
+        let mut first = u32::MAX;
+        let mut last = 0;
+        for bytes in bytes.chunks_exact(stride as usize) {
+            let mut word = [0; 4];
+            word[..bytes.len()].copy_from_slice(bytes);
+            let index = u32::from_le_bytes(word);
+            if strip && index == restart {
+                continue;
+            }
+            let vertex = i64::from(index) + i64::from(*base_vertex);
+            if let Ok(vertex) = u32::try_from(vertex) {
+                first = first.min(vertex);
+                last = last.max(vertex);
+            }
+        }
+        *vertices = 0..vertices.len() as u32;
+        let length = bytes.len();
+        let backing = resource::upload(
+            &execution(env.ext)?.gpu,
+            &bytes,
+            BufferUsage::INDEX,
+            (length as u64).next_multiple_of(4),
+        )?;
+        let range = 0..length as u64;
+        let fetched = if first <= last {
+            first..last.saturating_add(1)
+        } else {
+            0..0
+        };
+        return Ok(CapturedIndex {
+            binding: (
+                BufferRange {
+                    buffer: backing,
+                    range,
+                },
+                format,
+            ),
+            vertices: Some(fetched),
+        });
+    }
+    let backing = capture_buffer(
+        env,
+        binding.buffer,
+        BufferUsage::INDEX,
+        binding.offset..buffer.size(),
+        capture,
+    )?;
+    let native = if desc.usage() == Usage::Dynamic {
+        0..u64::from(buffer.size() - binding.offset)
+    } else {
+        u64::from(binding.offset)..u64::from(buffer.size())
+    };
+    Ok(CapturedIndex {
+        binding: (
+            BufferRange {
+                buffer: backing,
+                range: native,
+            },
+            format,
+        ),
+        vertices: None,
+    })
+}
+
+fn shadow_bytes(env: &mut Env<'_>, pointer: u32, range: Range<u32>) -> Result<Vec<u8>, Error> {
+    let table = table(env);
+    let object = table.get_mut(&mut env.sys.objects, pointer).unwrap();
+    let base = object.mapping().unwrap().pointer();
+    array(env, base + range.start, range.end - range.start)
 }
 
 fn capture_buffer(
     env: &mut Env<'_>,
     pointer: u32,
     usage: BufferUsage,
+    range: Range<u32>,
+    capture: &mut IaCapture,
 ) -> Result<adv_gpu::Buffer, Error> {
     let desc = description(env, pointer)?;
-    let Resource::Buffer(buffer) = desc else {
+    let Resource::Buffer(_) = desc else {
         return Err(Error::InvalidArgument);
     };
     if desc.usage() == Usage::Dynamic {
-        let table = table(env);
-        let object = table.get_mut(&mut env.sys.objects, pointer).unwrap();
-        let pointer = object.mapping().unwrap().pointer();
-        let bytes = array::<u8>(env, pointer, buffer.size())?;
-        return resource::upload(
+        let bytes = shadow_bytes(env, pointer, range.clone())?;
+        capture.record(pointer, &range, &bytes);
+        let size = bytes.len();
+        let buffer = resource::upload(
             &execution(env.ext)?.gpu,
             &bytes,
             usage,
-            u64::from(buffer.size()).next_multiple_of(4),
-        );
+            (size as u64).max(1).next_multiple_of(4),
+        )?;
+        return Ok(buffer);
     }
     let Backing::Buffer(buffer) = backing(env, pointer, desc)? else {
         unreachable!()
     };
     Ok(buffer)
+}
+
+fn vertex_capture(
+    fetch: VertexFetch,
+    size: u32,
+    args: &DrawRange,
+    vertices: Option<&Range<u32>>,
+) -> Range<u32> {
+    let elements = match (fetch.step, args) {
+        (InputStep::Vertex, _) => vertices.cloned(),
+        (InputStep::Instance(rate), DrawRange::Direct { instances, .. }) => {
+            let last = (instances.len() as u32 - 1).checked_div(rate).unwrap_or(0);
+            Some(instances.start..instances.start + last + 1)
+        }
+        _ => None,
+    };
+    let address = |index: u32| {
+        (u64::from(index) * u64::from(fetch.stride) + u64::from(fetch.offset)).min(u64::from(size))
+            as u32
+    };
+    match elements {
+        Some(elements) if elements.is_empty() => 0..0,
+        Some(elements) => {
+            address(elements.start)
+                ..address(elements.end - 1)
+                    .saturating_add(fetch.format.bytes)
+                    .min(size)
+        }
+        None => fetch.offset.min(size)..size,
+    }
 }
 
 fn capture_texture(
@@ -393,18 +523,12 @@ fn slots_for(
                 );
             }
             Sampler => {
-                let desc = match pipeline(env, state.samplers[index]) {
-                    Some(PipelineState::Sampler(desc)) => *desc,
-                    _ => D3D11_SAMPLER_DESC {
-                        Filter: 0x15,
-                        AddressU: 3,
-                        AddressV: 3,
-                        AddressW: 3,
-                        MaxLOD: f32::MAX,
-                        ComparisonFunc: 1,
-                        ..Default::default()
-                    },
-                };
+                let mut desc = sampler_description(env, state.samplers[index]);
+                let shader_bias = round_point_mip(desc);
+                if let Some(minimum) = location.sampler_min_lod_bits.map(f32::from_bits) {
+                    desc.MinLOD = desc.MinLOD.max(minimum);
+                    desc.MaxLOD = desc.MaxLOD.max(desc.MinLOD);
+                }
                 let mode = shader
                     .reflection
                     .bindings
@@ -414,10 +538,11 @@ fn slots_for(
                     })
                     .unwrap()
                     .kind;
-                let sampler = execution(env.ext)?
-                    .gpu
-                    .device()
-                    .sampler(&sampler_desc(desc, mode))?;
+                let sampler = execution(env.ext)?.gpu.device().sampler(&sampler_desc(
+                    desc,
+                    mode,
+                    shader_bias,
+                ))?;
                 set_slot(&mut slots.samplers, binding, sampler);
             }
             Resource | UnorderedAccessView => {
@@ -493,7 +618,175 @@ fn set_slot<T>(slots: &mut Vec<Option<T>>, slot: usize, value: T) {
     slots[slot] = Some(value);
 }
 
-fn sampler_desc(desc: D3D11_SAMPLER_DESC, mode: BindingKind) -> r::SamplerDesc {
+fn sampler_description(env: &Env<'_>, pointer: u32) -> D3D11_SAMPLER_DESC {
+    match pipeline(env, pointer) {
+        Some(PipelineState::Sampler(desc)) => *desc,
+        _ => D3D11_SAMPLER_DESC {
+            Filter: 0x15,
+            AddressU: 3,
+            AddressV: 3,
+            AddressW: 3,
+            MaxLOD: f32::MAX,
+            ComparisonFunc: 1,
+            ..Default::default()
+        },
+    }
+}
+
+#[derive(Default)]
+struct Sampling {
+    lods: Vec<TextureLod>,
+    samplers: Vec<(u32, LodSampler)>,
+    border_samplers: Vec<BorderSampler>,
+    border_textures: Vec<BorderTexture>,
+    depths: Vec<u32>,
+    depths24: Vec<u32>,
+    unorm: Vec<(u32, [u8; 4])>,
+}
+
+impl Sampling {
+    fn new(env: &Env<'_>, snapshot: &Snapshot, stage: Stage, reflection: &Reflection) -> Self {
+        use crate::dxgi::formats::Interpretation;
+        let mut state = Self::default();
+        for binding in &reflection.bindings {
+            if binding.register != Register::Sampler {
+                continue;
+            }
+            let slot = binding.slot;
+            let sampler =
+                sampler_description(env, snapshot.stages[stage as usize].samplers[slot as usize]);
+            let lod = LodSampler {
+                bias: sampler.MipLODBias,
+                min: sampler.MinLOD,
+                max: sampler.MaxLOD,
+                max_anisotropy: if sampler.Filter & 0x40 == 0 {
+                    1
+                } else {
+                    sampler.MaxAnisotropy as u16
+                },
+                round_mip: round_point_mip(sampler),
+                point: sampler.Filter == 0,
+                linear_comparison: sampler.Filter & 0x184 == 0x84,
+            };
+            if reflection.lod_queries || lod.round_mip || lod.point || lod.linear_comparison {
+                state.samplers.push((slot, lod));
+            }
+            if custom_border(sampler) {
+                state.border_samplers.push(BorderSampler {
+                    slot,
+                    axes: [sampler.AddressU, sampler.AddressV, sampler.AddressW]
+                        .map(|address| address == 4),
+                    color: sampler.BorderColor,
+                    linear: [0x10, 0x4, 0x1].map(|mask| sampler.Filter & mask != 0),
+                    lod,
+                    comparison: sampler.ComparisonFunc,
+                });
+            }
+        }
+        for binding in &reflection.bindings {
+            if binding.register != Register::Resource {
+                continue;
+            }
+            let Some(view) =
+                ViewSlot::srv(stage, binding.slot as usize).and_then(|slot| snapshot.view(slot))
+            else {
+                continue;
+            };
+            let minimum = context::owned(env, view.resource)
+                .and_then(Object::min_lod)
+                .unwrap_or(0.);
+            let mips = &view.desc.subresources().mips;
+            let minimum = minimum - mips.start as f32;
+            let depth = view.desc.aspects().intersects(Aspects::DEPTH);
+            if depth {
+                state.depths.push(binding.slot);
+            }
+            if view.desc.format() == 46 {
+                state.depths24.push(binding.slot);
+            }
+            let format = crate::dxgi::formats::format_layout(view.desc.format());
+            if !depth
+                && let Some(format) = format
+                && format.alignment == [1; 3]
+            {
+                let widths = std::array::from_fn(|lane| {
+                    let bits = format.component_bits[lane];
+                    if format.interpretations[lane] == Interpretation::Unorm && bits <= 16 {
+                        bits
+                    } else {
+                        0
+                    }
+                });
+                if widths != [0; 4] {
+                    state.unorm.push((binding.slot, widths));
+                }
+            } else if view.desc.format() == 98 {
+                state.unorm.push((binding.slot, [8; 4]));
+            }
+            if !state.border_samplers.is_empty()
+                && let Some(format) = format
+            {
+                let channels = std::array::from_fn(|lane| {
+                    let bits = format.component_bits[lane];
+                    match format.interpretations[lane] {
+                        _ if bits == 0 => BorderChannel::Missing,
+                        Interpretation::Unorm => BorderChannel::Unorm(bits),
+                        Interpretation::Snorm => BorderChannel::Snorm(bits),
+                        _ => BorderChannel::Float,
+                    }
+                });
+                state.border_textures.push(BorderTexture {
+                    slot: binding.slot,
+                    channels,
+                });
+            }
+            if minimum > 0. {
+                let format = format.unwrap();
+                let default_alpha = if format.component_bits[3] != 0 {
+                    0
+                } else if matches!(
+                    format.interpretations[0],
+                    Interpretation::Uint | Interpretation::Sint
+                ) {
+                    1
+                } else {
+                    1f32.to_bits()
+                };
+                state.lods.push(TextureLod {
+                    slot: binding.slot,
+                    minimum,
+                    last: mips.len() as u32 - 1,
+                    default_alpha,
+                });
+            }
+        }
+        state
+    }
+
+    fn options(&self) -> Options<'_> {
+        Options {
+            texture_lods: &self.lods,
+            lod_samplers: &self.samplers,
+            border_samplers: &self.border_samplers,
+            border_textures: &self.border_textures,
+            depth_textures: &self.depths,
+            depth24_textures: &self.depths24,
+            exact_unorm: &self.unorm,
+            ..Default::default()
+        }
+    }
+}
+
+fn custom_border(desc: D3D11_SAMPLER_DESC) -> bool {
+    [desc.AddressU, desc.AddressV, desc.AddressW].contains(&4)
+        && ![[0.; 4], [0., 0., 0., 1.], [1.; 4]].contains(&desc.BorderColor)
+}
+
+fn round_point_mip(desc: D3D11_SAMPLER_DESC) -> bool {
+    matches!(desc.Filter, 0 | 0x14) && desc.MinLOD.fract() == 0. && desc.MaxLOD.fract() == 0.
+}
+
+fn sampler_desc(desc: D3D11_SAMPLER_DESC, mode: BindingKind, shader_bias: bool) -> r::SamplerDesc {
     let linear = |mask| {
         if desc.Filter & mask != 0 {
             r::Filter::Linear
@@ -511,7 +804,7 @@ fn sampler_desc(desc: D3D11_SAMPLER_DESC, mode: BindingKind) -> r::SamplerDesc {
     };
     let border = if desc.BorderColor == [1.; 4] {
         r::BorderColor::OpaqueWhite
-    } else if desc.BorderColor[3] == 1. {
+    } else if desc.BorderColor == [0., 0., 0., 1.] {
         r::BorderColor::OpaqueBlack
     } else {
         r::BorderColor::TransparentBlack
@@ -523,7 +816,11 @@ fn sampler_desc(desc: D3D11_SAMPLER_DESC, mode: BindingKind) -> r::SamplerDesc {
         mip: linear(0x1),
         address: [desc.AddressU, desc.AddressV, desc.AddressW].map(address),
         border,
-        lod_bias: (desc.MipLODBias * 256.).round() as i16,
+        lod_bias: if shader_bias {
+            0
+        } else {
+            (desc.MipLODBias * 256.).round() as i16
+        },
         lod_min: get_lod(desc.MinLOD),
         lod_max: get_lod(desc.MaxLOD),
         anisotropy: if desc.Filter & 0x40 == 0 {
@@ -669,7 +966,7 @@ fn depth_stencil(
     }
 }
 
-fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error> {
+fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), Error> {
     if null_device(env)?
         || matches!(&args, DrawRange::Direct { vertices, instances, .. } if vertices.is_empty() || instances.is_empty())
     {
@@ -711,6 +1008,7 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
         _ => return Err(Error::InvalidArgument),
     };
     let mut colors = Vec::new();
+    let mut color_slots = 0;
     let mut writes = Vec::new();
     for slot in 0..super::super::super::state::RENDER_TARGETS {
         let Some(bound) = snapshot.view(ViewSlot::rtv(slot).unwrap()) else {
@@ -718,6 +1016,7 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
         };
         let (view, key) = image_view(env, bound.pointer, ViewKind::RenderTarget)?;
         colors.push(blend_color(blend, slot, view));
+        color_slots |= 1 << slot;
         writes.push((key, false));
     }
     let bias = raster.DepthBias != 0 || raster.SlopeScaledDepthBias != 0.;
@@ -765,7 +1064,22 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
         }
     }
     let alpha_to_coverage = blend.is_some_and(|blend| blend.AlphaToCoverageEnable != 0);
-    let (vertex_shader, pixel_shader, vertex_code, pixel_code, fetches) = {
+    let mut reads = Vec::new();
+    let mut capture = IaCapture::default();
+    let (index, vertices) = if indexed {
+        let strip = matches!(
+            topology,
+            p::Topology::LineStrip | p::Topology::TriangleStrip
+        );
+        let index = ensure_index(env, &snapshot, &mut args, strip, &mut capture)?;
+        reads.push(key(env, snapshot.ia.indices.buffer, 0));
+        (Some(index.binding), index.vertices)
+    } else if let DrawRange::Direct { vertices, .. } = &args {
+        (None, Some(vertices.clone()))
+    } else {
+        (None, None)
+    };
+    let (vertex_shader, pixel_shader, vertex_code, pixel_code, captures, fetches) = {
         let caps = env
             .ext
             .get::<State>()
@@ -783,6 +1097,7 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
         let pixel_reflection = pixel_shader.map(|shader| (u64::from(pixel), shader.reflection()));
         let input_layout = context::owned(env, layout).and_then(Object::input_layout);
         let mut fetches = Vec::new();
+        let mut captures: [Option<Range<u32>>; STREAMS] = std::array::from_fn(|_| None);
         for input in &reflection.signatures.input {
             if input.system_value != SystemValue::None {
                 continue;
@@ -794,7 +1109,7 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
             if bound.buffer == 0 {
                 continue;
             }
-            fetches.push(VertexFetch {
+            let fetch = VertexFetch {
                 register: input.register,
                 mask: input.mask,
                 stream: entry.slot as u32,
@@ -808,7 +1123,25 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
                     InputRate::Instance(rate) => InputStep::Instance(rate),
                 },
                 format: vertex_format(entry.format)?,
-            });
+            };
+            let desc = description(env, bound.buffer)?;
+            let Resource::Buffer(buffer) = desc else {
+                return Err(Error::InvalidArgument);
+            };
+            if desc.usage() == Usage::Dynamic {
+                let range = vertex_capture(fetch, buffer.size(), &args, vertices.as_ref());
+                if !range.is_empty() {
+                    let captured = captures[entry.slot].get_or_insert_with(|| range.clone());
+                    captured.start = captured.start.min(range.start);
+                    captured.end = captured.end.max(range.end);
+                }
+            }
+            fetches.push(fetch);
+        }
+        for fetch in &mut fetches {
+            if let Some(range) = &captures[fetch.stream as usize] {
+                fetch.offset = fetch.offset.wrapping_sub(range.start);
+            }
         }
         let facts = DrawFacts {
             fragment: pixel_reflection,
@@ -820,9 +1153,10 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
         if variant.pulled() {
             return Err(Error::InvalidArgument);
         }
+        let sampling = Sampling::new(env, &snapshot, Stage::Vertex, reflection);
         let options = Options {
             raster_samples: samples,
-            ..Options::default()
+            ..sampling.options()
         };
         let vertex_code = pulled::vertex(
             vertex_shader.module(),
@@ -836,8 +1170,17 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
         let vertex = modern_shader(&vertex_code, adv_gpu::shader::Stage::Vertex)?;
         let (pixel, pixel_code) = if let Some(shader) = pixel_shader {
             let variant = Variant::select(shader.reflection(), &facts, caps);
-            let code = wgsl::emit_variant(shader.module(), &variant, None, options)
-                .map_err(shader_error)?;
+            let sampling = Sampling::new(env, &snapshot, Stage::Pixel, shader.reflection());
+            let code = wgsl::emit_variant(
+                shader.module(),
+                &variant,
+                None,
+                Options {
+                    raster_samples: samples,
+                    ..sampling.options()
+                },
+            )
+            .map_err(shader_error)?;
             (
                 Some(modern_shader(&code, adv_gpu::shader::Stage::Fragment)?),
                 Some(code),
@@ -845,9 +1188,8 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
         } else {
             (None, None)
         };
-        (vertex, pixel, vertex_code, pixel_code, fetches)
+        (vertex, pixel, vertex_code, pixel_code, captures, fetches)
     };
-    let mut reads = Vec::new();
     let mut vertex_bindings = slots_for(env, &snapshot, Stage::Vertex, &vertex_code, &mut reads)?;
     if let DrawRange::Indirect(args, resource) = &args {
         reads.push(*resource);
@@ -866,7 +1208,8 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
         .transpose()?
         .unwrap_or_default();
     for fetch in fetches {
-        let slot = (VERTEX_STREAM_BASE + fetch.stream) as usize;
+        let stream = fetch.stream as usize;
+        let slot = VERTEX_STREAM_BASE as usize + stream;
         if vertex_bindings
             .storage
             .get(slot)
@@ -874,8 +1217,14 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
         {
             continue;
         }
-        let pointer = snapshot.ia.vertices[fetch.stream as usize].buffer;
-        let buffer = capture_buffer(env, pointer, BufferUsage::STORAGE)?;
+        let pointer = snapshot.ia.vertices[stream].buffer;
+        let buffer = capture_buffer(
+            env,
+            pointer,
+            BufferUsage::STORAGE,
+            captures[stream].clone().unwrap_or(0..0),
+            &mut capture,
+        )?;
         reads.push(key(env, pointer, 0));
         let range = 0..buffer.desc().size;
         set_slot(
@@ -884,13 +1233,6 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
             StorageBinding::Buffer(BufferRange { buffer, range }),
         );
     }
-    let index = if indexed {
-        let index = ensure_index(env, &snapshot, &args)?;
-        reads.push(key(env, snapshot.ia.indices.buffer, 0));
-        Some(index)
-    } else {
-        None
-    };
     let (vertices, primitives) = match &args {
         DrawRange::Direct {
             vertices,
@@ -929,6 +1271,7 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
             vertex: vertex_shader,
             fragment: pixel_shader,
             colors: colors.into_iter().collect(),
+            color_slots: Some(color_slots),
             depth,
             samples,
             alpha_to_coverage,
@@ -977,10 +1320,10 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
         Effects {
             extent,
             bounds: scissor,
-            key: 0,
+            key: capture.hash.digest128(),
             reads: &reads,
             writes: &writes,
-            retained_bytes: 0,
+            retained_bytes: capture.bytes,
         },
     )?;
     Ok(())
@@ -1084,6 +1427,7 @@ fn compute(
         ..Default::default()
     };
     let variant = Variant::select(shader.reflection(), &facts, caps);
+    let sampling = Sampling::new(env, &snapshot, Stage::Compute, shader.reflection());
     let code = wgsl::emit_variant(
         shader.module(),
         &variant,
@@ -1092,7 +1436,7 @@ fn compute(
             buffer_formats: &buffer_formats,
             buffer_elements: &buffer_elements,
             image_atomics: caps.features.contains(adv_gpu::Features::IMAGE_ATOMICS),
-            ..Default::default()
+            ..sampling.options()
         },
     )
     .map_err(shader_error)?;
@@ -1125,7 +1469,7 @@ fn compute(
     Ok(())
 }
 
-fn storage_format(format: u32) -> Result<naga::StorageFormat, Error> {
+pub(super) fn storage_format(format: u32) -> Result<naga::StorageFormat, Error> {
     use naga::StorageFormat::*;
     Ok(match format {
         2 => Rgba32Float,
@@ -1202,4 +1546,35 @@ fn vertex_format(format: &crate::dxgi::formats::FormatLayout) -> Result<VertexFo
         bits: format.component_bits,
         kinds,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // spec: GFX-REC-7
+    #[test]
+    fn dynamic_ia_captures_only_the_window_determined_at_admission() {
+        let draw = DrawRange::direct(3, 5, 5, 3, 0).ok().unwrap();
+        let fetch = VertexFetch {
+            register: 0,
+            mask: 15,
+            stream: 0,
+            offset: 12,
+            stride: 24,
+            step: InputStep::Vertex,
+            format: VertexFormat {
+                bytes: 16,
+                bits: [32; 4],
+                kinds: [VertexComponent::Float; 4],
+            },
+        };
+        assert_eq!(vertex_capture(fetch, 1024, &draw, Some(&(5..8))), 132..196);
+        assert_eq!(vertex_capture(fetch, 1024, &draw, None), 12..1024);
+        let instanced = VertexFetch {
+            step: InputStep::Instance(2),
+            ..fetch
+        };
+        assert_eq!(vertex_capture(instanced, 1024, &draw, None), 84..148);
+    }
 }

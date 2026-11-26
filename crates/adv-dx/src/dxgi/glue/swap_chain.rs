@@ -227,6 +227,14 @@ fn create_chain(
         Some(factory),
         base.into_iter().chain(extended),
     )?;
+    if window != 0 {
+        env.ext
+            .get_mut::<State>()
+            .chains
+            .entry(window)
+            .or_default()
+            .push(pointer);
+    }
     if fullscreen.Windowed == 0
         && let Err(error) = change_fullscreen(env, pointer, true, 0)
     {
@@ -334,6 +342,33 @@ fn present_call(env: &mut Env<'_>, this: u32, interval: u32, flags: u32) -> Outc
 fn set_fullscreen(env: &mut Env<'_>) -> Outcome {
     let (this, full, target) = (env.arg(0), env.arg(1) != 0, env.arg(2));
     call(|| change_fullscreen(env, this, full, target))
+}
+
+pub fn alt_enter(env: &mut Env<'_>, window: u32) -> bool {
+    let state = env.ext.get::<State>();
+    let Some(pointer) = state
+        .chains
+        .get(&window)
+        .and_then(|chains| chains.last())
+        .copied()
+    else {
+        return false;
+    };
+    let object = ops::object(env, pointer).unwrap();
+    let Kind::SwapChain(chain) = &object.kind else {
+        unreachable!()
+    };
+    let Kind::Factory(factory) = &ops::object(env, object.parent.unwrap()).unwrap().kind else {
+        unreachable!()
+    };
+    if factory
+        .window
+        .is_some_and(|associated| associated != window)
+        || factory.window_flags & 3 != 0
+    {
+        return false;
+    }
+    change_fullscreen(env, pointer, chain.fullscreen.Windowed != 0, 0).is_ok()
 }
 
 fn change_fullscreen(env: &mut Env<'_>, this: u32, full: bool, target: u32) -> Result<(), Error> {

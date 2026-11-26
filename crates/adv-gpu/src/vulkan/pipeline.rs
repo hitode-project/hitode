@@ -14,19 +14,21 @@ struct RenderKey {
     bindings: Vec<Binding>,
     primitive: Primitive,
     colors: Vec<ColorTarget>,
+    color_slots: u8,
     depth: Option<DepthStencil>,
     samples: u32,
     alpha: bool,
     video: Option<u64>,
 }
 impl RenderKey {
-    fn new(desc: &RenderPipelineDesc, modern: Modern) -> Self {
+    fn new(desc: &RenderPipelineDesc, color_slots: u8, modern: Modern) -> Self {
         let mut key = Self {
             vertex: entry_key(&desc.vertex),
             fragment: desc.fragment.as_ref().map(entry_key),
             bindings: desc.bindings.clone(),
             primitive: desc.primitive,
             colors: desc.colors.to_vec(),
+            color_slots,
             depth: desc.depth_stencil,
             samples: desc.samples,
             alpha: desc.alpha_to_coverage,
@@ -60,11 +62,20 @@ impl RenderKey {
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ComputeKey(EntryKey, Vec<Binding>);
+
+#[derive(PartialEq, Eq, Hash)]
+struct PipelinePassKey {
+    colors: Vec<Format>,
+    depth: Option<Format>,
+    samples: u32,
+    slots: u8,
+}
+
 #[derive(Default)]
 pub(super) struct Pipelines {
     render: HashMap<RenderKey, Arc<Compiled>>,
     compute: HashMap<ComputeKey, Arc<Compiled>>,
-    passes: HashMap<(Vec<Format>, Option<Format>, u32), vk::RenderPass>,
+    passes: HashMap<PipelinePassKey, vk::RenderPass>,
 }
 /// A driver pipeline and what binding needs from it, resolved once. Lives
 /// in the device's cache until the device drops.
@@ -104,20 +115,22 @@ impl Pipelines {
         &mut self,
         context: &Context,
         desc: &RenderPipelineDesc,
+        slots: u8,
     ) -> Result<vk::RenderPass> {
-        let key = (
-            desc.colors.iter().map(|c| c.format).collect::<Vec<_>>(),
-            desc.depth_stencil.map(|d| d.format),
-            desc.samples,
-        );
+        let key = PipelinePassKey {
+            colors: desc.colors.iter().map(|c| c.format).collect(),
+            depth: desc.depth_stencil.map(|d| d.format),
+            samples: desc.samples,
+            slots,
+        };
         if let Some(&pass) = self.passes.get(&key) {
             return Ok(pass);
         }
         let attachments: Vec<_> = key
-            .0
+            .colors
             .iter()
             .copied()
-            .chain(key.1)
+            .chain(key.depth)
             .map(|format| {
                 vk::AttachmentDescription::default()
                     .format(formats::vk(format))
@@ -130,12 +143,13 @@ impl Pipelines {
                     .final_layout(vk::ImageLayout::GENERAL)
             })
             .collect();
-        let colors: Vec<_> = (0..desc.colors.len())
-            .map(|i| vk::AttachmentReference {
-                attachment: i as u32,
+        let mut colors = vec![unused_attachment(); slot_count(slots)];
+        for (attachment, slot) in color_slots(slots).enumerate() {
+            colors[slot] = vk::AttachmentReference {
+                attachment: attachment as u32,
                 layout: vk::ImageLayout::GENERAL,
-            })
-            .collect();
+            };
+        }
         let depth = vk::AttachmentReference {
             attachment: desc.colors.len() as u32,
             layout: vk::ImageLayout::GENERAL,
@@ -143,7 +157,7 @@ impl Pipelines {
         let mut subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&colors);
-        if key.1.is_some() {
+        if key.depth.is_some() {
             subpass = subpass.depth_stencil_attachment(&depth);
         }
         let pass = context.result(unsafe {
@@ -365,17 +379,18 @@ fn layouts(
     }
 }
 impl Device {
-    pub(crate) fn pipeline_identity(&self, desc: &RenderPipelineDesc) -> u64 {
+    pub(crate) fn pipeline_identity(&self, desc: &RenderPipelineDesc, slots: u8) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        RenderKey::new(desc, self.caps().modern).hash(&mut hasher);
+        RenderKey::new(desc, slots, self.caps().modern).hash(&mut hasher);
         hasher.finish()
     }
     pub(crate) fn create_render_pipeline(
         &self,
         desc: &RenderPipelineDesc,
+        slots: u8,
         cache: Option<&crate::pipeline::PipelineCache>,
     ) -> Result<crate::RenderPipeline> {
-        self.render_pipeline(desc, cache, None)
+        self.render_pipeline(desc, slots, cache, None)
     }
     #[cfg(target_os = "android")]
     pub(crate) fn create_video_pipeline(
@@ -393,15 +408,21 @@ impl Device {
             .video
             .as_ref()
             .ok_or_else(|| Error::Unsupported("pool has no converted video sampler".into()))?;
-        self.render_pipeline(desc.pipeline, cache, Some(video))
+        self.render_pipeline(
+            desc.pipeline,
+            dense_color_slots(desc.pipeline.colors.len()),
+            cache,
+            Some(video),
+        )
     }
     fn render_pipeline(
         &self,
         desc: &RenderPipelineDesc,
+        slots: u8,
         cache: Option<&crate::pipeline::PipelineCache>,
         video: Option<&Arc<VideoPool>>,
     ) -> Result<crate::RenderPipeline> {
-        let mut key = RenderKey::new(desc, self.caps().modern);
+        let mut key = RenderKey::new(desc, slots, self.caps().modern);
         key.video = video.map(|v| v.resources.layout.as_raw());
         let mut pipelines = self.0.pipelines.lock().unwrap();
         let compiled = match pipelines.render.get(&key) {
@@ -418,7 +439,7 @@ impl Device {
                 let compiled =
                     Arc::new(
                         self.compile(&key.bindings, &entries, video, |layout, stages| {
-                            self.compile_render(desc, layout, stages, cache, &mut pipelines)
+                            self.compile_render(desc, slots, layout, stages, cache, &mut pipelines)
                         })?,
                     );
                 pipelines.render.insert(key, compiled.clone());
@@ -570,6 +591,7 @@ impl Device {
     fn compile_render(
         &self,
         desc: &RenderPipelineDesc,
+        slots: u8,
         layout: vk::PipelineLayout,
         stages: &[vk::PipelineShaderStageCreateInfo<'_>],
         cache: vk::PipelineCache,
@@ -610,25 +632,25 @@ impl Device {
                     .back(stencil(back, d));
             }
         }
-        let attachments: Vec<_> = desc
-            .colors
-            .iter()
-            .map(|c| {
-                let mut attachment = vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(vk::ColorComponentFlags::from_raw(c.write_mask as u32));
-                if let Some((rgb, alpha)) = c.blend {
-                    attachment = attachment
-                        .blend_enable(true)
-                        .src_color_blend_factor(factor(rgb.src))
-                        .dst_color_blend_factor(factor(rgb.dst))
-                        .color_blend_op(blend_op(rgb.op))
-                        .src_alpha_blend_factor(factor(alpha.src))
-                        .dst_alpha_blend_factor(factor(alpha.dst))
-                        .alpha_blend_op(blend_op(alpha.op));
-                }
-                attachment
-            })
-            .collect();
+        let mut attachments =
+            vec![vk::PipelineColorBlendAttachmentState::default(); slot_count(slots)];
+        let mut formats = vec![vk::Format::UNDEFINED; slot_count(slots)];
+        for (slot, c) in color_slots(slots).zip(&desc.colors) {
+            let mut attachment = vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::from_raw(c.write_mask as u32));
+            if let Some((rgb, alpha)) = c.blend {
+                attachment = attachment
+                    .blend_enable(true)
+                    .src_color_blend_factor(factor(rgb.src))
+                    .dst_color_blend_factor(factor(rgb.dst))
+                    .color_blend_op(blend_op(rgb.op))
+                    .src_alpha_blend_factor(factor(alpha.src))
+                    .dst_alpha_blend_factor(factor(alpha.dst))
+                    .alpha_blend_op(blend_op(alpha.op));
+            }
+            attachments[slot] = attachment;
+            formats[slot] = formats::vk(c.format);
+        }
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
         let mut dynamic = vec![
             vk::DynamicState::VIEWPORT,
@@ -655,7 +677,6 @@ impl Device {
             ]);
         }
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
-        let formats: Vec<_> = desc.colors.iter().map(|c| formats::vk(c.format)).collect();
         let mut rendering =
             vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
         if let Some(d) = desc.depth_stencil {
@@ -680,7 +701,7 @@ impl Device {
         if modern.contains(Modern::DYNAMIC_RENDERING) {
             info = info.push_next(&mut rendering);
         } else {
-            info = info.render_pass(pipelines.compatible_pass(context, desc)?);
+            info = info.render_pass(pipelines.compatible_pass(context, desc, slots)?);
         }
         let created = unsafe {
             context

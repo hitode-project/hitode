@@ -13,13 +13,14 @@ struct RenderKey {
     vertex: Entry,
     fragment: Option<Entry>,
     colors: Vec<ColorKey>,
+    color_slots: u8,
     depth: MTLPixelFormat,
     stencil: MTLPixelFormat,
     samples: u32,
     alpha_to_coverage: bool,
 }
 impl RenderKey {
-    fn new(desc: &RenderPipelineDesc) -> Self {
+    fn new(desc: &RenderPipelineDesc, color_slots: u8) -> Self {
         let depth = desc
             .depth_stencil
             .and_then(|d| caps::pixel_format(d.format))
@@ -36,6 +37,7 @@ impl RenderKey {
                     write_mask: c.write_mask,
                 })
                 .collect(),
+            color_slots,
             depth,
             stencil: if depth == MTLPixelFormat::Depth32Float_Stencil8 {
                 depth
@@ -155,14 +157,15 @@ pub(super) struct ComputeData {
 }
 
 impl Device {
-    pub(crate) fn pipeline_identity(&self, desc: &RenderPipelineDesc) -> u64 {
+    pub(crate) fn pipeline_identity(&self, desc: &RenderPipelineDesc, slots: u8) -> u64 {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
-        RenderKey::new(desc).hash(&mut hash);
+        RenderKey::new(desc, slots).hash(&mut hash);
         hash.finish()
     }
     pub(crate) fn create_render_pipeline(
         &self,
         desc: &RenderPipelineDesc,
+        slots: u8,
         cache: Option<&crate::pipeline::PipelineCache>,
     ) -> Result<crate::RenderPipeline> {
         self.check()?;
@@ -183,7 +186,7 @@ impl Device {
                     self.used(&desc.bindings, Stages::FRAGMENT, f)
                 })?,
             ];
-            let key = RenderKey::new(desc);
+            let key = RenderKey::new(desc, slots);
             let d = MTLRenderPipelineDescriptor::new();
             d.setLabel(Some(&NSString::from_str(desc.label)));
             d.setVertexFunction(Some(&vertex.raw));
@@ -192,7 +195,7 @@ impl Device {
             d.setAlphaToCoverageEnabled(key.alpha_to_coverage);
             d.setDepthAttachmentPixelFormat(key.depth);
             d.setStencilAttachmentPixelFormat(key.stencil);
-            for (i, c) in key.colors.iter().enumerate() {
+            for (i, c) in color_slots(slots).zip(&key.colors) {
                 let color = unsafe { d.colorAttachments().objectAtIndexedSubscript(i) };
                 color.setPixelFormat(c.format);
                 let mask = c.write_mask;

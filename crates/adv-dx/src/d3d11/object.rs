@@ -42,6 +42,15 @@ pub struct Object {
     private: BTreeMap<Iid, PrivateData>,
 }
 
+#[cfg(feature = "gpu")]
+pub(super) struct Shared {
+    pub handle: u32,
+    pub identity: (u64, u64),
+    pub resource: Resource,
+    pub adapter: crate::dxgi::caps::Adapter,
+    pub backing: super::resource::Backing,
+}
+
 enum Kind {
     Device(Device),
     ImmediateContext(Box<ContextState>),
@@ -58,6 +67,8 @@ enum Kind {
         pub_dc: u32,
         #[cfg(feature = "gpu")]
         backing: Option<super::resource::Backing>,
+        #[cfg(feature = "gpu")]
+        shared: Option<Arc<Shared>>,
         #[cfg(feature = "gpu")]
         pending: BTreeMap<u32, std::sync::mpsc::Receiver<()>>,
     },
@@ -155,6 +166,26 @@ impl Kind {
 }
 
 impl Object {
+    #[cfg(feature = "gpu")]
+    pub(super) fn shared(&self) -> Option<&Arc<Shared>> {
+        match &self.kind {
+            Kind::Resource { shared, .. } => shared.as_ref(),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(super) fn share(&mut self, alias: Arc<Shared>) {
+        let Kind::Resource {
+            backing, shared, ..
+        } = &mut self.kind
+        else {
+            unreachable!()
+        };
+        *backing = Some(alias.backing.clone());
+        *shared = Some(alias);
+    }
+
     pub fn resource(&self) -> Option<Resource> {
         match &self.kind {
             Kind::Resource { desc, .. } => Some(*desc),
@@ -353,6 +384,8 @@ pub struct Release {
     pub references: u32,
     pub allocations: Vec<u32>,
     pub private_interfaces: Vec<u32>,
+    #[cfg(feature = "gpu")]
+    pub(super) shared: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -486,6 +519,8 @@ impl Table {
                 #[cfg(feature = "gpu")]
                 backing: None,
                 #[cfg(feature = "gpu")]
+                shared: None,
+                #[cfg(feature = "gpu")]
                 pending: BTreeMap::new(),
             },
         )
@@ -609,11 +644,18 @@ impl Table {
         Ok(interface)
     }
 
-    #[cfg(feature = "gpu")]
     pub(super) fn key(self, objects: &Objects, pointer: u32) -> Option<(u64, u64)> {
         self.com
             .identity::<Object>(objects, pointer)
             .map(|identity| identity.key())
+    }
+
+    pub(super) fn allocation_key(self, objects: &Objects, pointer: u32) -> Option<(u64, u64)> {
+        #[cfg(feature = "gpu")]
+        if let Some(shared) = self.get(objects, pointer).and_then(Object::shared) {
+            return Some(shared.identity);
+        }
+        self.key(objects, pointer)
     }
 
     pub(super) fn canonical(self, objects: &Objects, pointer: u32) -> Option<u32> {
@@ -707,6 +749,12 @@ impl Table {
     }
 
     fn destroy(self, objects: &mut Objects, destroyed: Destroyed<Object>, result: &mut Release) {
+        #[cfg(feature = "gpu")]
+        if let Some(shared) = destroyed.value.shared()
+            && Arc::strong_count(shared) == 1
+        {
+            result.shared.push(shared.handle);
+        }
         let Object {
             device,
             kind,

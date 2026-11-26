@@ -87,6 +87,7 @@ impl ViewSlot {
 pub struct BoundView {
     pub pointer: u32,
     pub resource: u32,
+    pub allocation: (u64, u64),
     pub desc: Arc<View>,
 }
 
@@ -307,7 +308,7 @@ impl ContextState {
             if slot.kind() != binding.desc.kind() {
                 return;
             }
-            let mut candidate = self.index.first(binding.resource);
+            let mut candidate = self.index.first(binding.allocation);
             while let Some(other) = candidate {
                 candidate = self.index.next(other);
                 if slot != other && hazard::conflict(binding, self.groups.view(other).unwrap()) {
@@ -329,10 +330,10 @@ impl ContextState {
     }
 
     fn replace(&mut self, slot: ViewSlot, new: Option<BoundView>) -> Option<BoundView> {
-        let resource = new.as_ref().map(|view| view.resource);
+        let resource = new.as_ref().map(|view| view.allocation);
         let old = self.groups.replace_view(slot, new);
         if let Some(old) = &old {
-            self.index.remove(old.resource, slot);
+            self.index.remove(old.allocation, slot);
         }
         if let Some(resource) = resource {
             self.index.insert(resource, slot);

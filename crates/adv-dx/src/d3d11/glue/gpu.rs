@@ -96,11 +96,10 @@ fn description(env: &Env<'_>, pointer: u32) -> Result<Resource, Error> {
 }
 
 fn key(env: &Env<'_>, pointer: u32, subresource: u32) -> ResourceKey {
-    ResourceKey(
-        table(env).key(&env.sys.objects, pointer).unwrap(),
-        u64::from(subresource),
-        0,
-    )
+    let identity = table(env)
+        .allocation_key(&env.sys.objects, pointer)
+        .unwrap();
+    ResourceKey(identity, u64::from(subresource), 0)
 }
 
 pub(super) fn backing(
@@ -236,33 +235,54 @@ pub(super) fn download(
         };
         let row = rect.w * unit;
         let pitch = row.next_multiple_of(256);
+        let packed_depth = matches!(backing, Backing::Image(image)
+            if image.desc().format == adv_gpu::Format::Depth24UnormStencil8);
         let buffer = execution.gpu.device().create_buffer(&BufferDesc {
             size: u64::from(pitch) * u64::from(rect.h),
-            usage: BufferUsage::COPY_DST,
+            usage: if packed_depth {
+                BufferUsage::STORAGE
+            } else {
+                BufferUsage::COPY_DST
+            },
             memory: Memory::Readback,
             label: "D3D11 staging readback",
         })?;
-        let transfer = match (backing, resource) {
-            (Backing::Buffer(source), Resource::Buffer(_)) => ModernTransfer::CopyBuffer {
-                source: BufferRange {
-                    buffer: source.clone(),
-                    range: rect.x as u64..rect.x as u64 + u64::from(rect.w),
-                },
-                destination: buffer.clone(),
-                offset: 0,
-            },
-            (Backing::Image(image), Resource::Texture(texture)) => ModernTransfer::Download {
-                source: pixel_region(image, texture, subresource, slice, rect),
-                destination: TransferBuffer {
-                    buffer: buffer.clone(),
-                    offset: 0,
-                    row_pitch: pitch,
-                    rows: rect.h,
-                },
-            },
-            _ => unreachable!(),
-        };
-        execution.gpu.transfer(transfer)?;
+        match (backing, resource) {
+            (Backing::Image(image), Resource::Texture(texture)) if packed_depth => {
+                depth24::pack(
+                    &mut execution.gpu,
+                    resource::region(image, texture, subresource),
+                    rect,
+                    pitch,
+                    buffer.clone(),
+                )?;
+            }
+            _ => {
+                let transfer = match (backing, resource) {
+                    (Backing::Buffer(source), Resource::Buffer(_)) => ModernTransfer::CopyBuffer {
+                        source: BufferRange {
+                            buffer: source.clone(),
+                            range: rect.x as u64..rect.x as u64 + u64::from(rect.w),
+                        },
+                        destination: buffer.clone(),
+                        offset: 0,
+                    },
+                    (Backing::Image(image), Resource::Texture(texture)) => {
+                        ModernTransfer::Download {
+                            source: pixel_region(image, texture, subresource, slice, rect),
+                            destination: TransferBuffer {
+                                buffer: buffer.clone(),
+                                offset: 0,
+                                row_pitch: pitch,
+                                rows: rect.h,
+                            },
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                execution.gpu.transfer(transfer)?;
+            }
+        }
         execution
             .gpu
             .completion()?
@@ -282,6 +302,8 @@ pub(super) fn download(
     }
     Ok(())
 }
+
+mod depth24;
 
 pub(super) fn staging_access(
     env: &mut Env<'_>,
@@ -826,50 +848,10 @@ fn clear_uav(env: &mut Env<'_>, integer: bool) -> Result<(), Error> {
     let desc = description(env, pointer)?;
     let key = key(env, pointer, view.subresources().mips.start);
     let backing = backing(env, pointer, desc)?;
-    let (command, extent) = match backing {
-        Backing::Buffer(buffer) => {
-            let Resource::Buffer(desc) = desc else {
-                unreachable!()
-            };
-            let layout = crate::dxgi::formats::format_layout(view.format());
-            let unit = layout.map_or(desc.stride().max(4), |format| {
-                u32::from(format.aligned_unit_bytes)
-            });
-            if unit != 4 && view.format() != 0 {
-                return Err(Error::InvalidArgument);
-            }
-            let range = view.elements();
-            (
-                ModernTransfer::FillBuffer {
-                    destination: BufferRange {
-                        buffer,
-                        range: u64::from(range.start * unit)..u64::from(range.end * unit),
-                    },
-                    value: raw[0],
-                },
-                extent_rect([desc.size(), 1, 1]),
-            )
-        }
-        Backing::Image(image) => {
-            let view = Backing::Image(image).view(&view)?;
-            let extent = view_rect(&view);
-            let values = if integer {
-                raw.map(f64::from)
-            } else {
-                raw.map(|value| f64::from(f32::from_bits(value)))
-            };
-            (
-                ModernTransfer::ClearColor {
-                    view,
-                    value: values,
-                    area: None,
-                },
-                extent,
-            )
-        }
-    };
-    execution(env.ext)?.append(Command::Transfer(command), extent, None, key)
+    uav::clear(execution(env.ext)?, key, desc, &view, backing, raw, integer)
 }
+
+mod uav;
 
 pub(super) fn caps(ext: &Ext) -> Option<&adv_gpu::Caps> {
     ext.get::<State>()

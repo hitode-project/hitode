@@ -143,7 +143,8 @@ pub struct ImageCopyRegion {
 pub struct BufferCopy<'a> {
     pub buffer: &'a Buffer,
     pub offset: u64,
-    /// Bytes per row and rows per layer; rows are packed when zero.
+    /// Bytes per row and storage rows per layer. Compressed rows count blocks.
+    /// Zero selects packed rows.
     pub row_pitch: u32,
     pub rows: u32,
 }
@@ -154,7 +155,15 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn render_pass<'e>(&'e mut self, desc: &RenderPassDesc<'_>) -> RenderPass<'e> {
-        self.inner.render_pass(desc)
+        self.render_pass_slots(desc, crate::pipeline::dense_color_slots(desc.colors.len()))
+    }
+    /// Color attachments in ascending order of the set bits in `slots`.
+    pub fn render_pass_slots<'e>(
+        &'e mut self,
+        desc: &RenderPassDesc<'_>,
+        slots: u8,
+    ) -> RenderPass<'e> {
+        self.inner.render_pass(desc, slots)
     }
     pub fn compute_pass<'e>(&'e mut self, desc: &ComputePassDesc<'_>) -> ComputePass<'e> {
         self.inner.compute_pass(desc)

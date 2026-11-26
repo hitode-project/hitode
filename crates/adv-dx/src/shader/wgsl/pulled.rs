@@ -110,6 +110,7 @@ pub(crate) fn emit(
         writer.line("return o;");
     }
     writer.close();
+    writer.clamped_sampler_declarations();
     Ok(Pulled {
         source: writer.source,
         locations: writer.locations,

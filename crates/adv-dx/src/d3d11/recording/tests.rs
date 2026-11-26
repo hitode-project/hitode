@@ -79,6 +79,7 @@ fn recorded_dispatch_finishes_before_the_draw_reads_its_image() {
     );
     let draw = Command::Draw {
         draw: Box::new(ModernDraw {
+            color_slots: None,
             state_ids: [0; 4],
             vertex,
             fragment: Some(fragment),

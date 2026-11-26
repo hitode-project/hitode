@@ -28,6 +28,160 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     GetMaximumFrameLatency => get_latency State,
 );
 
+macro_rules! resource_methods {
+    ($($method:ident => $handler:ident $level:ident),+ $(,)?) => {
+        ("IDXGIResource", &[
+            $((concat!("IDXGIResource::", stringify!($method)), $handler, ImplementationLevel::$level)),+
+        ])
+    };
+}
+
+pub(super) const RESOURCE: (&str, &[Slot]) = resource_methods!(
+    QueryInterface => query Implement,
+    AddRef => add_ref Implement,
+    Release => release Implement,
+    SetPrivateData => set_private Implement,
+    SetPrivateDataInterface => set_interface Implement,
+    GetPrivateData => get_private Implement,
+    GetParent => surface_device Implement,
+    GetDevice => surface_device Implement,
+    GetSharedHandle => shared_handle Implement,
+    GetUsage => resource_usage State,
+    SetEvictionPriority => set_priority State,
+    GetEvictionPriority => eviction_priority State,
+);
+
+pub(super) fn attach_resource_face(env: &mut Env<'_>, resource: u32) -> Result<(), ObjectError> {
+    let face = alloc(env, RESOURCE.0)?;
+    let table = table(env);
+    let has_surface = matches!(table.get(&env.sys.objects, resource).unwrap().resource(),
+        Some(Resource::Texture(texture)) if texture.kind() == TextureKind::D2
+            && texture.levels() == 1 && texture.layers() == 1);
+    let iids: &[_] = if has_surface {
+        &[IID_IDXGIRESOURCE]
+    } else {
+        &[IID_IDXGIRESOURCE, IID_IDXGIOBJECT, IID_IDXGIDEVICESUBOBJECT]
+    };
+    table.register_faces(&mut env.sys.objects, resource, face, iids);
+    Ok(())
+}
+
+fn resource_usage(env: &mut Env<'_>) -> Outcome {
+    use super::super::desc::{Bind, Misc};
+    let (pointer, out) = (env.arg(0), env.arg(1));
+    call((|| {
+        let desc = ops::object(env, table(env), pointer)?.resource().unwrap();
+        let mut usage = 0;
+        for (bind, flag) in [
+            (Bind::SHADER, 16),
+            (Bind::RENDER_TARGET, 32),
+            (Bind::UNORDERED, 1024),
+        ] {
+            if desc.bind().contains(bind) {
+                usage |= flag;
+            }
+        }
+        if desc.misc().contains(Misc::SHARED) {
+            usage |= 128;
+        }
+        write(env, out, usage)
+    })())
+}
+
+fn eviction_priority(env: &mut Env<'_>) -> Outcome {
+    let (pointer, out) = (env.arg(0), env.arg(1));
+    call((|| {
+        let priority = ops::object(env, table(env), pointer)?.priority().unwrap();
+        write(env, out, priority)
+    })())
+}
+
+fn shared_handle(env: &mut Env<'_>) -> Outcome {
+    let (pointer, out) = (env.arg(0), env.arg(1));
+    call((|| {
+        write(env, out, 0u32)?;
+        #[cfg(feature = "gpu")]
+        {
+            let handle = share(env, pointer)?;
+            write(env, out, handle)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = pointer;
+            Err(dxgi::Error::InvalidCall.into())
+        }
+    })())
+}
+
+#[cfg(feature = "gpu")]
+fn share(env: &mut Env<'_>, pointer: u32) -> Result<u32, Error> {
+    use super::super::{desc::Misc, object::Shared};
+    use std::sync::Arc;
+
+    let table = table(env);
+    let object = ops::object(env, table, pointer)?;
+    if let Some(shared) = object.shared() {
+        return Ok(shared.handle);
+    }
+    let resource = object.resource().unwrap();
+    let device = object.device().unwrap();
+    if !resource.misc().contains(Misc::SHARED) || device_state(env, device)?.null_device {
+        return Err(dxgi::Error::InvalidCall.into());
+    }
+    let adapter = dxgi::adapter_kind(env, device_state(env, device)?.adapter)?;
+    let identity = table.key(&env.sys.objects, pointer).unwrap();
+    let backing = gpu::backing(env, pointer, resource)?;
+    let state = env.ext.get_mut::<State>();
+    state.last_shared = state
+        .last_shared
+        .checked_add(1)
+        .ok_or(ObjectError::Exhausted)?;
+    let handle = state.last_shared;
+    let shared = Arc::new(Shared {
+        handle,
+        identity,
+        resource,
+        adapter,
+        backing,
+    });
+    state.shared.insert(handle, Arc::downgrade(&shared));
+    table
+        .get_mut(&mut env.sys.objects, pointer)
+        .unwrap()
+        .share(shared);
+    Ok(handle)
+}
+
+#[cfg(feature = "gpu")]
+pub(super) fn open_resource(
+    env: &mut Env<'_>,
+    device: u32,
+    handle: u32,
+    iid: Iid,
+) -> Result<u32, Error> {
+    let shared = env
+        .ext
+        .get::<State>()
+        .shared
+        .get(&handle)
+        .and_then(std::sync::Weak::upgrade)
+        .ok_or(Error::InvalidArgument)?;
+    let adapter = dxgi::adapter_kind(env, device_state(env, device)?.adapter)?;
+    if adapter != shared.adapter {
+        return Err(Error::InvalidArgument);
+    }
+    let resource = attach_resource(env, device, shared.resource)?;
+    let table = table(env);
+    table
+        .get_mut(&mut env.sys.objects, resource)
+        .unwrap()
+        .share(shared);
+    let result = table.query(&mut env.sys.objects, resource, iid);
+    let release = table.release(&mut env.sys.objects, resource);
+    retire(env, release);
+    Ok(result?)
+}
+
 pub(super) fn attach_device_face(
     env: &mut Env<'_>,
     device: u32,

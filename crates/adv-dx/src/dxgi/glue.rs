@@ -195,6 +195,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>, provider: Provider) -> Resu
         output_vtable,
         swap_chain_vtable,
         provider,
+        chains: Default::default(),
     });
     Ok(())
 }
@@ -837,6 +838,13 @@ mod tests;
 pub fn install_swap_chains<B: Backend>(machine: &mut Machine<B>, services: super::swap::Services) {
     machine.ext.insert(services);
 }
+
+pub fn has_swap_chain(ext: &adv_machine::Ext, window: u32) -> bool {
+    ext.try_get::<State>()
+        .is_some_and(|state| state.chains.contains_key(&window))
+}
+
+pub use swap_chain::alt_enter;
 
 pub fn device_output(env: &mut Env<'_>, adapter: u32) -> Result<u32, Error> {
     ops::enum_output(env, adapter, 0)

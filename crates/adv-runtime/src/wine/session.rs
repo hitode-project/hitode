@@ -1440,6 +1440,16 @@ impl Session {
             wparam.into(),
             lparam.into(),
         );
+        if (message, wparam) == (0x104, 0x0d)
+            && lparam & 0x6000_0000 == 0x2000_0000
+            && let Some(window) = adv_drv::user::input::presented_window(&self.machine.ext)
+            && adv_dx::dxgi::has_swap_chain(&self.machine.ext, window)
+            && self
+                .machine
+                .visit_context(None, |env| adv_dx::dxgi::alt_enter(env, window))?
+        {
+            return self.poke();
+        }
         let restoring = matches!((message, wparam), (5, 0) | (0x201 | 0x204, _));
         if !(restoring && project::restore(&mut self.machine.ext)) {
             adv_drv::user::input::post(&mut self.machine.ext, pointer, message, wparam, lparam)?;

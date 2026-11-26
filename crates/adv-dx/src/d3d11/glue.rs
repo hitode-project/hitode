@@ -58,6 +58,7 @@ const FACES: &[(&str, &[Slot])] = &[
     device::MULTITHREAD,
     dxgi::FACE,
     dxgi::SURFACE,
+    dxgi::RESOURCE,
     context::FACE,
     face!("ID3D11VertexShader"),
     face!("ID3D11PixelShader"),
@@ -84,6 +85,10 @@ struct State {
     devices: device::CreateDevices,
     #[cfg(feature = "gpu")]
     execution: Option<gpu::Execution>,
+    #[cfg(feature = "gpu")]
+    shared: BTreeMap<u32, std::sync::Weak<super::object::Shared>>,
+    #[cfg(feature = "gpu")]
+    last_shared: u32,
     vtables: BTreeMap<&'static str, u32>,
 }
 
@@ -155,6 +160,10 @@ pub fn install_children<B: Backend>(machine: &mut Machine<B>) -> Result<(), Stri
         devices: Default::default(),
         #[cfg(feature = "gpu")]
         execution: None,
+        #[cfg(feature = "gpu")]
+        shared: BTreeMap::new(),
+        #[cfg(feature = "gpu")]
+        last_shared: 0xf000_0000,
     });
     Ok(())
 }
@@ -227,6 +236,11 @@ pub fn attach_resource(
         free(env, pointer);
     }
     result?;
+    if let Err(error) = dxgi::attach_resource_face(env, pointer) {
+        let released = table(env).release(&mut env.sys.objects, pointer);
+        retire(env, released);
+        return Err(error);
+    }
     if let Resource::Texture(texture) = resource
         && texture.kind() == TextureKind::D2
         && texture.levels() == 1
@@ -336,6 +350,10 @@ fn release(env: &mut Env<'_>) -> Outcome {
 }
 
 fn retire(env: &mut Env<'_>, released: Release) -> Outcome {
+    #[cfg(feature = "gpu")]
+    for handle in released.shared {
+        env.ext.get_mut::<State>().shared.remove(&handle);
+    }
     for pointer in released.allocations {
         free(env, pointer);
     }

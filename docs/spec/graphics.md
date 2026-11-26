@@ -208,6 +208,8 @@ Hot state setters, getters, scene boundaries, and unchanged bindings or state bl
 
 Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices and indices use 128-bit content keys. Whole-image upload snapshots hash their texels during capture unless a large texture's sampled probe changed from its previous upload. Partial uploads, changed probes, and fills use admission identities. Insufficient storage wraps before the complete binding window exceeds the buffer. Immutable snapshots retain only used registers, reuse unchanged captures across writes to unused registers and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
 
+Direct3D 11 captures the dynamic index window and the vertex and instance windows determined at draw admission. GPU-resident index and indirect-argument buffers keep their data on the GPU.
+
 ### GFX-REC-8 Frontend work counters
 
 **Rule**: Diagnostic counter builds MUST report retained bytes and lookups per draw, entries per successful StateBlock Apply, and dead frame/pass eliminations. Ordinary builds MUST compile out work instrumentation.
@@ -318,6 +320,8 @@ retain their answer until reissued; later recorded work does not delay them.
 
 **Rule**: Every returned DXGI interface MUST publish its generated vtable slots and register an implementation for each slot. Custom rasterizer DLLs MAY return an unsupported result.
 **Verification**: Test
+
+Alt+Enter on an associated swap-chain window uses the shared exclusive-mode owner. Either DXGI window-association flag that disables Alt+Enter handling leaves the event to the application.
 
 ## Capabilities
 

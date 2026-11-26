@@ -282,19 +282,52 @@ fn mask(width: u32) -> u32 {
     u32::MAX >> (32 - width)
 }
 
+#[cfg(feature = "gpu")]
+pub(crate) fn clear_pattern(format: naga::StorageFormat, integer: bool) -> Result<String, Error> {
+    let layout = Layout::new(format)?;
+    let mut source = [super::super::alu::HELPERS, PACK_UFLOAT].concat();
+    source.push_str(
+        "fn clear_pattern(value: vec4<u32>) -> vec4<u32> {\n  var packed = vec4<u32>(0u);\n",
+    );
+    for (lane, channel) in layout.channels.iter().enumerate() {
+        let field = format!("value[{lane}]");
+        let bits = if integer {
+            format!("({field} & {}u)", mask(channel.width))
+        } else {
+            if matches!(channel.encoding, Encoding::Uint | Encoding::Sint) {
+                return Err(Error::Invalid("float clear of an integer UAV"));
+            }
+            if matches!(channel.encoding, Encoding::Snorm) {
+                channel.encode(&format!("select({field}, 0u, dx_nan({field}))"))
+            } else {
+                channel.encode(&field)
+            }
+        };
+        writeln!(
+            source,
+            "  packed[{}] |= {bits} << {}u;",
+            channel.offset / 32,
+            channel.offset % 32
+        )
+        .unwrap();
+    }
+    source.push_str("  return packed;\n}\n");
+    Ok(source)
+}
+
 pub(super) const PACK_UFLOAT: &str = "
-fn dx_pack_ufloat(bits: u32, precision: u32) -> u32 {
+fn dx_pack_ufloat(bits: u32, mantissa_bits: u32) -> u32 {
     let exp = (bits >> 23u) & 255u;
     let frac = bits & 0x7fffffu;
-    let infinity = 31u << precision;
-    if exp == 255u && frac != 0u { return infinity | (1u << (precision - 1u)); }
-    if bits >> 31u != 0u || exp < 112u - precision { return 0u; }
+    let infinity = 31u << mantissa_bits;
+    if exp == 255u && frac != 0u { return infinity | (1u << (mantissa_bits - 1u)); }
+    if bits >> 31u != 0u || exp < 112u - mantissa_bits { return 0u; }
     if exp > 142u { return infinity; }
-    let shift = (23u - precision) + (113u - min(exp, 113u));
+    let shift = (23u - mantissa_bits) + (113u - min(exp, 113u));
     let base = select(frac, frac | 0x800000u, exp < 113u);
     let half = 1u << (shift - 1u);
     let rounded = (base + half - 1u + ((base >> shift) & 1u)) >> shift;
     let exponent = max(exp, 112u) - 112u;
-    return (exponent << precision) + rounded;
+    return (exponent << mantissa_bits) + rounded;
 }
 ";

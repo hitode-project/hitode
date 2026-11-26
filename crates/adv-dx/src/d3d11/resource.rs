@@ -45,7 +45,11 @@ impl Backing {
         let Resource::Texture(texture) = resource else {
             unreachable!()
         };
-        let format = native_format(texture.format().format).ok_or(Error::InvalidArgument)?;
+        let format = match (texture.format().format, bind.contains(Bind::DEPTH_STENCIL)) {
+            (39, true) => Format::Depth32Float,
+            (53, true) => Format::Depth16Unorm,
+            (format, _) => native_format(format).ok_or(Error::InvalidArgument)?,
+        };
         let dimension = if resource.misc().contains(Misc::CUBE) {
             Dimension::Cube
         } else {
@@ -67,7 +71,7 @@ impl Backing {
                 usage |= flag;
             }
         }
-        if bind.contains(Bind::RENDER_TARGET) {
+        if bind.contains(Bind::RENDER_TARGET) || format == Format::Depth24UnormStencil8 {
             usage |= Usage::SAMPLED;
         }
         let image = gpu.device().create_image(&ImageDesc {
@@ -96,7 +100,14 @@ impl Backing {
             return Err(Error::InvalidArgument);
         };
         let range = view.subresources();
-        let format = native_format(view.format()).ok_or(Error::InvalidArgument)?;
+        let format = if image.desc().format.has_depth()
+            && view.kind() == ViewKind::ShaderResource
+            && matches!(view.format(), 41 | 56)
+        {
+            image.desc().format
+        } else {
+            native_format(view.format()).ok_or(Error::InvalidArgument)?
+        };
         let plane = match (
             image.desc().format.has_stencil(),
             view.kind(),

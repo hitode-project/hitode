@@ -198,6 +198,18 @@ pub(super) struct Chain {
 
 impl Chain {
     pub fn destroy(self, env: &mut Env<'_>, pointer: u32, interfaces: &mut Vec<u32>) {
+        if self.window != 0
+            && let std::collections::btree_map::Entry::Occupied(mut entry) = env
+                .ext
+                .get_mut::<super::state::State>()
+                .chains
+                .entry(self.window)
+        {
+            entry.get_mut().retain(|&chain| chain != pointer);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
         if self.fullscreen.Windowed == 0 {
             crate::ddraw::front::modes::set_modern_exclusive(env.ext, pointer, false);
         }

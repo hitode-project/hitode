@@ -632,6 +632,7 @@ fn as_view(env: &Env<'_>, pointer: u32) -> Option<BoundView> {
     Some(BoundView {
         pointer,
         resource,
+        allocation: table(env).allocation_key(&env.sys.objects, resource)?,
         desc: desc.clone(),
     })
 }

@@ -414,13 +414,21 @@ fn swap_models_use_present_paths_and_renderable_formats() {
 }
 
 pub(in crate::d3d11) fn fixture_report(maximum: FeatureLevel) -> Report {
+    fixture_report_samples(maximum, Fixture::m1().rgba_samples)
+}
+
+pub(in crate::d3d11) fn fixture_report_samples(maximum: FeatureLevel, rgba_samples: u32) -> Report {
     let paths = Coverage {
         requirements: &requirements(),
         emulated: EMULATED,
         formats: &format::fixture_rows(),
         features: FEATURES,
     };
-    let report = Report::derive_at_most(&Fixture::m1().caps(), paths, maximum).unwrap();
+    let fixture = Fixture {
+        rgba_samples,
+        ..Fixture::m1()
+    };
+    let report = Report::derive_at_most(&fixture.caps(), paths, maximum).unwrap();
     assert_eq!(report.level, maximum);
     report
 }

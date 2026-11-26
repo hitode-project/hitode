@@ -76,6 +76,7 @@ pub struct Misc(u32);
 
 impl Misc {
     pub const GENERATE_MIPS: u32 = 1;
+    pub const SHARED: u32 = 2;
     pub const CUBE: u32 = 4;
     pub const INDIRECT: u32 = 16;
     pub const RAW: u32 = 32;
@@ -407,8 +408,19 @@ impl Texture {
             || (bind.contains(Bind::UNORDERED)
                 && (report.level < FeatureLevel::L11_0 || samples != 1))
             || misc.0
-                & !(Misc::GENERATE_MIPS | Misc::CUBE | Misc::RESOURCE_CLAMP | Misc::GDI_COMPATIBLE)
+                & !(Misc::GENERATE_MIPS
+                    | Misc::SHARED
+                    | Misc::CUBE
+                    | Misc::RESOURCE_CLAMP
+                    | Misc::GDI_COMPATIBLE)
                 != 0
+            || (misc.contains(Misc::SHARED)
+                && (kind != TextureKind::D2
+                    || layers != 1
+                    || resolved_mips != 1
+                    || samples != 1
+                    || access.usage != Usage::Default
+                    || !report.supports(format, FormatOperation::Share)))
             || (misc.contains(Misc::GENERATE_MIPS)
                 && !bind.contains(Bind::SHADER | Bind::RENDER_TARGET))
             || (misc.contains(Misc::RESOURCE_CLAMP) && !bind.contains(Bind::SHADER))

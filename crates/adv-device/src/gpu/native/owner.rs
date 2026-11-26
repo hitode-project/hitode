@@ -1063,7 +1063,11 @@ pub(super) fn draw_modern_pass(
 ) {
     #[cfg(target_vendor = "apple")]
     let _ = statistics;
-    let mut pass = encoder.render_pass(&pass::modern_attachments(draw, chunk));
+    let desc = pass::modern_attachments(draw, chunk);
+    let mut pass = match draw.color_slots {
+        Some(slots) => encoder.render_pass_slots(&desc, slots),
+        None => encoder.render_pass(&desc),
+    };
     pass.set_pipeline(pipeline);
     let [x, y, w, h, min, max] = draw.viewport;
     pass.set_viewport(x, y, w, h, min, max);
