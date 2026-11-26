@@ -351,6 +351,17 @@ changed categories. They copy only differing captured entries, preserving exact
 float bits, uncaptured state and COM ownership. Capturing a complete state category shares its immutable map and content key. An unchanged Capture reuses its
 snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-state and constant setters preserve category revisions while recording still captures their membership. Matching Capture/Apply bypass binding preparation and reference transfers; changes outside the captured subset refresh its observed revisions. Applying only shader or buffer changes MUST preserve the fixed-state key cache.
 
+### GFX-SHADER-5 DXBC token coverage
+
+**Rule**: Each accepted SM4 and SM5 opcode, declaration, operand modifier and opcode extension MUST have a Windows fixture. Fixtures accepted by the DXBC parser MUST round-trip byte for byte, and their disassembly MUST match `D3DDisassemble`. Executable value cases MUST agree with the scalar interpreter and the applicable Windows measurements.
+**Verification**: Test
+
+The shader-core fixture directory holds the token ledger, Windows shader-creation HRESULTs
+and measured readbacks. GS, HS and DS execution belongs to expansion and programmable stages
+(T8 and T15). Class linkage execution belongs to T15. Residency feedback and double precision
+have Windows bytecode oracles. The shader core does not report tiled resources or emit
+64-bit floating-point operations.
+
 ## Tessellation
 
 ### GFX-TESS-1 Fixed-function patch tessellation

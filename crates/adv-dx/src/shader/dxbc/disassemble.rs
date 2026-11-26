@@ -82,7 +82,12 @@ fn block(output: &mut String, body: &Block, indent: usize) {
 
 fn operation(op: &Instruction) -> String {
     use Opcode::*;
-    let mut name = op.opcode.mnemonic().to_owned();
+    let mut name = match op.opcode {
+        Emitthencut => "emit_then_cut",
+        EmitthencutStream => "emit_then_cut_stream",
+        _ => op.opcode.mnemonic(),
+    }
+    .to_owned();
     if matches!(op.opcode, If | Breakc | Callc | Continuec | Retc | Discard) {
         name.push_str(if op.test_nonzero { "_nz" } else { "_z" });
     }
@@ -142,12 +147,21 @@ fn operation(op: &Instruction) -> String {
         .iter()
         .zip(dest)
         .map(|(op, &ty)| operand(op, ty, false))
-        .chain(
-            op.sources
-                .iter()
-                .zip(src)
-                .map(|(op, &ty)| operand(op, ty, false)),
-        )
+        .chain(op.sources.iter().zip(src).map(|(source, &ty)| {
+            let precision = match op.opcode {
+                Mov | Mul => Some(op.destinations[0].precision),
+                Imul | Umul
+                    if op
+                        .destinations
+                        .iter()
+                        .any(|dst| dst.precision == Precision::Default) =>
+                {
+                    Some(Precision::Default)
+                }
+                _ => None,
+            };
+            format_operand(source, ty, false, precision)
+        }))
         .collect();
     let mut operands = operands;
     if matches!(op.opcode, Mov | StoreUavTyped) {
@@ -324,7 +338,12 @@ fn declaration(decl: &Declaration) -> String {
         decl.opcode,
         DclInputSgv | DclInputSiv | DclOutputSgv | DclOutputSiv
     ) {
-        return format!("{name} {argument}, {}", system_value(decl.data[0]));
+        let value = if decl.opcode == DclOutputSgv && decl.data[0] == D3D10_SB_NAME_PRIMITIVE_ID {
+            "primitive_id"
+        } else {
+            system_value(decl.data[0])
+        };
+        return format!("{name} {argument}, {value}");
     }
     if decl.opcode == DclGsInputPrimitive {
         let primitive = match decode_gs_input_primitive(controls) {
@@ -352,6 +371,12 @@ fn declaration(decl: &Declaration) -> String {
             _ => "undefined",
         };
         return format!("dcl_outputtopology {topology} ");
+    }
+    if decl.opcode == DclGsInstanceCount {
+        return format!("dcl_gsinstances {}", decl.data[0]);
+    }
+    if decl.opcode == DclHsMaxTessfactor {
+        return format!("{name} l({:.6})", f32::from_bits(decl.data[0]));
     }
     if decl.opcode == DclMaxOutputVertexCount {
         return format!("dcl_maxout {}", decl.data[0]);
@@ -424,6 +449,15 @@ fn literal(bits: u32, ty: ValueType) -> String {
 }
 
 fn operand(op: &Operand, ty: ValueType, declaration: bool) -> String {
+    format_operand(op, ty, declaration, None)
+}
+
+fn format_operand(
+    op: &Operand,
+    ty: ValueType,
+    declaration: bool,
+    used_precision: Option<Precision>,
+) -> String {
     let indices = |prefix: &str, indices: &[Index], inline| {
         let mut name = prefix.to_string();
         for (i, address) in indices.iter().enumerate() {
@@ -476,7 +510,7 @@ fn operand(op: &Operand, ty: ValueType, declaration: bool) -> String {
                 Register::Sampler => ("s", true),
                 Register::Resource => ("t", true),
                 Register::ImmediateConstantBuffer => ("icb", false),
-                Register::Label => ("l", true),
+                Register::Label => ("label", true),
                 Register::InputPrimitiveId => ("vPrim", true),
                 Register::OutputDepth => ("oDepth", true),
                 Register::Null => ("null", true),
@@ -540,6 +574,27 @@ fn operand(op: &Operand, ty: ValueType, declaration: bool) -> String {
                     .map(|lane| lanes[lane as usize] as char),
             );
         }
+    }
+    let precision_name = |precision| match precision {
+        Precision::Default => "def32",
+        Precision::Float16 => "min16f",
+        Precision::Float2_8 => "min2_8f",
+        Precision::Int16 => "min16i",
+        Precision::Uint16 => "min16u",
+    };
+    if let Some(used) = used_precision.filter(|&used| used != op.precision) {
+        write!(
+            name,
+            " {{{} as {}}}",
+            precision_name(op.precision),
+            precision_name(used)
+        )
+        .unwrap();
+    } else if op.precision != Precision::Default {
+        write!(name, " {{{}}}", precision_name(op.precision)).unwrap();
+    }
+    if op.non_uniform {
+        name.push_str(" { nonuniform }");
     }
     match op.modifier {
         Modifier::None => name,

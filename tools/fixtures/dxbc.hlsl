@@ -85,3 +85,15 @@ Vertex ds(Patch constants, float3 uvw : SV_DomainLocation, const OutputPatch<Ver
     return result;
 }
 #endif
+
+#ifndef LEVEL9
+[domain("tri")]
+[partitioning("fractional_even")]
+[outputtopology("triangle_cw")]
+[outputcontrolpoints(3)]
+[patchconstantfunc("patch_constants")]
+[maxtessfactor(32.0)]
+Vertex limited_hull(InputPatch<Vertex, 3> patch, uint i : SV_OutputControlPointID) {
+    return patch[i];
+}
+#endif

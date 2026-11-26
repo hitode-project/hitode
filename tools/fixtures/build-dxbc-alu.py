@@ -102,10 +102,12 @@ def main():
     parser.add_argument("probe", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--raster-output", type=Path)
+    parser.add_argument("--encoded-output", type=Path)
     args = parser.parse_args()
     source = args.probe.read_text()
     rows = {"hw": {}, "warp": {}}
     raster = {"hw": {}, "warp": {}}
+    encoded = []
     with args.dump.open() as stream:
         for tag, *fields in csv.reader(stream, delimiter="\t"):
             if tag == "op" and not fields[1].startswith("d:"):
@@ -114,10 +116,15 @@ def main():
             if tag == "raster":
                 driver, name, row, *results = fields
                 raster[driver][name, row] = results
+            if tag in {"encoded", "encoded-error", "encoded-exit", "encoded-unreliable"}:
+                encoded.append([tag, *fields])
     with args.output.open("w", newline="") as stream:
         csv.writer(stream, delimiter="\t", lineterminator="\n").writerows(
             vectors(rows, probe_values(source, "fvals"), probe_values(source, "ivals"))
         )
+    if args.encoded_output:
+        with args.encoded_output.open("w", newline="") as stream:
+            csv.writer(stream, delimiter="\t", lineterminator="\n").writerows(encoded)
     if args.raster_output:
         if not raster["hw"] or raster["hw"].keys() != raster["warp"].keys():
             raise ValueError("the raster oracle requires paired hardware and WARP rows")
