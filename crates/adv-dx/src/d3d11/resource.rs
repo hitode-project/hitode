@@ -260,9 +260,43 @@ pub fn upload(gpu: &Gpu, bytes: &[u8], usage: BufferUsage, size: u64) -> Result<
 pub fn texture_transfer(
     gpu: &Gpu,
     texture: Texture,
-    region: &ImageRegion,
+    region: ImageRegion,
     bytes: &[u8],
-) -> Result<TransferBuffer, Error> {
+) -> Result<adv_device::gpu::ModernTransfer, Error> {
+    use adv_device::gpu::ModernTransfer;
+    if region.image.desc().format == Format::Depth24UnormStencil8 {
+        let mut depth = Vec::with_capacity(bytes.len());
+        let mut stencil = Vec::with_capacity(bytes.len() / 4);
+        for &texel in bytes.as_chunks::<4>().0 {
+            let packed = u32::from_le_bytes(texel);
+            let unorm = packed & 0x00ff_ffff;
+            let depth_bits = if cfg!(target_vendor = "apple") {
+                (unorm as f32 / 16_777_215.0).to_bits()
+            } else {
+                unorm
+            };
+            depth.extend_from_slice(&depth_bits.to_le_bytes());
+            stencil.push(texel[3]);
+        }
+        let rows = region.extent.height;
+        return Ok(ModernTransfer::UploadDepthStencil {
+            depth: transfer_buffer(
+                gpu,
+                region.extent.width * 4,
+                rows,
+                region.extent.depth_or_layers,
+                &depth,
+            )?,
+            stencil: transfer_buffer(
+                gpu,
+                region.extent.width,
+                rows,
+                region.extent.depth_or_layers,
+                &stencil,
+            )?,
+            destination: region,
+        });
+    }
     let format = texture.format();
     let row = region.extent.width.div_ceil(u32::from(format.alignment[0]))
         * u32::from(format.aligned_unit_bytes);
@@ -270,8 +304,22 @@ pub fn texture_transfer(
         .extent
         .height
         .div_ceil(u32::from(format.alignment[1]));
+    let source = transfer_buffer(gpu, row, rows, region.extent.depth_or_layers, bytes)?;
+    Ok(ModernTransfer::Upload {
+        source,
+        destination: region,
+    })
+}
+
+fn transfer_buffer(
+    gpu: &Gpu,
+    row: u32,
+    rows: u32,
+    layers: u32,
+    bytes: &[u8],
+) -> Result<TransferBuffer, Error> {
     let pitch = row.next_multiple_of(256);
-    let size = u64::from(pitch) * u64::from(rows) * u64::from(region.extent.depth_or_layers);
+    let size = u64::from(pitch) * u64::from(rows) * u64::from(layers);
     let buffer = gpu.device().create_buffer(&BufferDesc {
         size,
         usage: BufferUsage::COPY_SRC,

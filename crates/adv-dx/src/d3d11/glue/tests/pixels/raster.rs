@@ -1250,3 +1250,198 @@ fn instanced_geometry_streams_each_instance_in_order() {
     let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
     assert_eq!(r.read(output, staging, 4, 4), [0, 0, 1, 1]);
 }
+
+// spec: GFX-INTEROP-2
+#[test]
+fn nt_shared_texture_survives_handle_duplication_and_keyed_handoff() {
+    let mut r = Raster::new();
+    let (other, other_context) = create(&mut r.machine, 1, 0, &[0xb000]);
+    let texture = r.image(
+        D3D11_TEXTURE2D_DESC {
+            Width: 2,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: 28,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BindFlags: Bind::RENDER_TARGET,
+            MiscFlags: Misc::SHARED_NTHANDLE | Misc::SHARED_KEYEDMUTEX,
+            ..Default::default()
+        },
+        0,
+    );
+    let view = create_object(&mut r.machine, r.device, 9, &[texture, 0]);
+    let query = |machine: &mut Machine<JitCpu>, pointer, iid: Iid| {
+        machine.cpu.write(IID, &iid).unwrap();
+        assert_eq!(method(machine, pointer, 0, &[IID, OUT]), 0);
+        machine.cpu.read_u32(OUT).unwrap()
+    };
+    let keyed = query(&mut r.machine, texture, IID_IDXGIKEYEDMUTEX);
+    let resource = query(&mut r.machine, texture, IID_IDXGIRESOURCE1);
+    let name = ARRAY + 0x100;
+    let wide: Vec<_> = "Local\\T14Texture".encode_utf16().chain([0]).collect();
+    r.machine
+        .cpu
+        .write(name, bytemuck::cast_slice(&wide))
+        .unwrap();
+    assert_eq!(
+        method(&mut r.machine, resource, 13, &[0, 0x80000001, name, OUT]),
+        0
+    );
+    let handle = r.machine.cpu.read_u32(OUT).unwrap();
+    let duplicate = r.machine.sys.objects.duplicate(handle).unwrap();
+    assert!(r.machine.sys.objects.close(handle).is_some());
+    r.machine.cpu.write(IID, &IID_ID3D11TEXTURE2D).unwrap();
+    assert_eq!(method(&mut r.machine, other, 48, &[duplicate, IID, OUT]), 0);
+    let alias = r.machine.cpu.read_u32(OUT).unwrap();
+    assert_eq!(
+        method(&mut r.machine, other, 49, &[name, 0x80000000, IID, OUT]),
+        0
+    );
+    let by_name = r.machine.cpu.read_u32(OUT).unwrap();
+    assert!(r.machine.sys.objects.close(duplicate).is_some());
+    let other_keyed = query(&mut r.machine, alias, IID_IDXGIKEYEDMUTEX);
+    assert_eq!(method(&mut r.machine, other_keyed, 8, &[1, 0, 0]), 258);
+    assert_eq!(method(&mut r.machine, keyed, 8, &[0, 0, 0]), 0);
+    r.clear(view, [0., 1., 0., 1.]);
+    assert_eq!(method(&mut r.machine, other_keyed, 8, &[0, 0, 0]), 258);
+    assert_eq!(method(&mut r.machine, keyed, 9, &[9, 1]), 0);
+    assert_eq!(method(&mut r.machine, other_keyed, 8, &[9, 1, 0]), 0);
+
+    r.device = other;
+    r.context = other_context;
+    let staging = r.texture(2, 1, 28, 0, 0);
+    assert_eq!(r.read(by_name, staging, 2, 4), [0xff00ff00; 2]);
+    assert_eq!(method(&mut r.machine, other_keyed, 9, &[0, 0]), 0);
+}
+
+// spec: GFX-INTEROP-2
+#[test]
+fn packed_d24s8_cpu_writes_preserve_both_aspects() {
+    let mut r = Raster::new();
+    let description = D3D11_TEXTURE2D_DESC {
+        Width: 3,
+        Height: 1,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: 45,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: 3,
+        CPUAccessFlags: 0x10000,
+        ..Default::default()
+    };
+    let upload = r.image(description, 0);
+    let readback = r.image(
+        D3D11_TEXTURE2D_DESC {
+            CPUAccessFlags: 0x20000,
+            ..description
+        },
+        0,
+    );
+    let render = r.image(
+        D3D11_TEXTURE2D_DESC {
+            Usage: 0,
+            CPUAccessFlags: 0,
+            BindFlags: Bind::DEPTH_STENCIL,
+            ..description
+        },
+        0,
+    );
+    let expected = [0x34555555u32, 0x92805104, 0xeafffffe];
+    let mapped = map(&mut r.machine, r.context, upload, 2);
+    write_value(&mut r.machine, mapped.pData, expected);
+    r.call(15, &[upload, 0]);
+    r.call(47, &[render, upload]);
+    assert_eq!(r.read(render, readback, 3, 4), expected);
+}
+
+// spec: GFX-CTX-1
+#[test]
+fn deferred_replay_owns_update_data_and_is_repeatable() {
+    let mut r = Raster::new();
+    let buffer = D3D11_BUFFER_DESC {
+        ByteWidth: 4,
+        ..Default::default()
+    };
+    write_value(&mut r.machine, DESCRIPTOR, buffer);
+    let target = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            Usage: 3,
+            CPUAccessFlags: 0x20000,
+            ..buffer
+        },
+    );
+    let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    let deferred = create_object(&mut r.machine, r.device, 27, &[0]);
+    write_value(&mut r.machine, INIT, 0x12345678u32);
+    assert_eq!(
+        method(&mut r.machine, deferred, 48, &[target, 0, 0, INIT, 0, 0]),
+        0
+    );
+    let list = create_object(&mut r.machine, deferred, 114, &[0]);
+    write_value(&mut r.machine, INIT, 0x87654321u32);
+    r.call(48, &[target, 0, 0, INIT, 0, 0]);
+    assert_eq!(r.read(target, staging, 1, 4), [0x87654321]);
+    let nested = create_object(&mut r.machine, r.device, 44, &[0]);
+    assert_eq!(method(&mut r.machine, nested, 58, &[list, 0]), 0);
+    let combined = create_object(&mut r.machine, nested, 114, &[0]);
+    assert_eq!(method(&mut r.machine, list, 2, &[]), 0);
+    for _ in 0..2 {
+        r.call(58, &[combined, 1]);
+        assert_eq!(r.read(target, staging, 1, 4), [0x12345678]);
+        r.call(48, &[target, 0, 0, INIT, 0, 0]);
+    }
+}
+
+// spec: GFX-CTX-1
+#[test]
+fn deferred_map_requires_an_initial_discard_and_replays_its_bytes() {
+    let mut r = Raster::new();
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: 4,
+        Usage: 2,
+        BindFlags: Bind::VERTEX,
+        CPUAccessFlags: 0x10000,
+        ..Default::default()
+    };
+    write_value(&mut r.machine, DESCRIPTOR, desc);
+    let buffer = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            Usage: 3,
+            BindFlags: 0,
+            CPUAccessFlags: 0x20000,
+            ..desc
+        },
+    );
+    let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    let context = create_object(&mut r.machine, r.device, 27, &[0]);
+    assert_eq!(
+        method(&mut r.machine, context, 14, &[buffer, 0, 5, 0, OUT]),
+        0x887c0004
+    );
+    let deferred_map = map(&mut r.machine, context, buffer, 4);
+    let immediate_map = map(&mut r.machine, r.context, buffer, 4);
+    assert_ne!(deferred_map.pData, immediate_map.pData);
+    write_value(&mut r.machine, deferred_map.pData, 0xc1234567u32);
+    write_value(&mut r.machine, immediate_map.pData, 0x81234567u32);
+    assert_eq!(method(&mut r.machine, context, 15, &[buffer, 0]), 0);
+    let list = create_object(&mut r.machine, context, 114, &[1]);
+    assert_eq!(
+        method(&mut r.machine, context, 14, &[buffer, 0, 5, 0, OUT]),
+        0x887c0004
+    );
+    r.call(58, &[list, 0]);
+    assert_eq!(r.read(buffer, staging, 1, 4), [0xc1234567]);
+}

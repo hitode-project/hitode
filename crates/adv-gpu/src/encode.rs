@@ -191,6 +191,17 @@ impl Encoder {
     pub fn copy_buffer_to_image(&mut self, src: BufferCopy<'_>, dst: ImageCopy<'_>, size: Extent) {
         self.inner.copy_buffer_to_image(src, dst, size)
     }
+    /// Upload the four-byte depth aspect and the one-byte stencil aspect.
+    pub fn upload_depth_stencil(
+        &mut self,
+        depth: BufferCopy<'_>,
+        stencil: BufferCopy<'_>,
+        destination: ImageCopy<'_>,
+        size: Extent,
+    ) {
+        self.inner
+            .upload_depth_stencil(depth, stencil, destination, size)
+    }
     pub fn copy_image_to_buffer(&mut self, src: ImageCopy<'_>, dst: BufferCopy<'_>, size: Extent) {
         self.inner.copy_image_to_buffer(src, dst, size)
     }

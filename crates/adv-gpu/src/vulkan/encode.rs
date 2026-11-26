@@ -1000,6 +1000,46 @@ impl Encoder {
             );
         }
     }
+    pub(crate) fn upload_depth_stencil(
+        &mut self,
+        depth: BufferCopy<'_>,
+        stencil: BufferCopy<'_>,
+        dst: ImageCopy<'_>,
+        size: Extent,
+    ) {
+        self.memory_barrier();
+        self.copy_transition(
+            dst,
+            size,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        if !self.ready() {
+            return;
+        }
+        self.synced = false;
+        for (source, aspect, bytes) in [
+            (depth, vk::ImageAspectFlags::DEPTH, 4),
+            (stencil, vk::ImageAspectFlags::STENCIL, 1),
+        ] {
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(source.offset)
+                .buffer_row_length(source.row_pitch / bytes)
+                .buffer_image_height(source.rows)
+                .image_subresource(subresource(dst, size).aspect_mask(aspect))
+                .image_offset(offset(dst.origin))
+                .image_extent(copy_extent(dst, size));
+            unsafe {
+                self.shared.context.device.cmd_copy_buffer_to_image(
+                    self.command,
+                    source.buffer.inner.0.handle,
+                    dst.image.inner.core.handle,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            }
+        }
+    }
     pub(crate) fn copy_image_to_buffer(
         &mut self,
         src: ImageCopy<'_>,

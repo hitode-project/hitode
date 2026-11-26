@@ -31,6 +31,8 @@ pub enum Error {
     Unavailable,
     OutOfMemory,
     FrameStatisticsDisjoint,
+    NameAlreadyExists,
+    AccessDenied,
 }
 
 impl Error {
@@ -45,6 +47,8 @@ impl Error {
             Self::Unavailable => 0x887a0022,
             Self::OutOfMemory => 0x8007000e,
             Self::FrameStatisticsDisjoint => 0x887a000b,
+            Self::NameAlreadyExists => 0x887a002c,
+            Self::AccessDenied => 0x887a002b,
         }
     }
 }

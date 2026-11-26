@@ -1,4 +1,6 @@
 //! Assembly services for private guest storage and memory DC interoperation.
+pub(crate) mod ddi;
+
 use adv_abi::{Env, Outcome};
 use adv_device::surface::PixelFormat;
 

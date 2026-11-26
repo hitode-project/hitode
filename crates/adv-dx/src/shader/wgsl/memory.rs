@@ -787,6 +787,12 @@ impl Writer<'_> {
         if op.opcode == Lod {
             return Ok(self.lod_query(texture, sampler, dimension, width, &coord, lod));
         }
+        let border = self
+            .options
+            .border_samplers
+            .iter()
+            .find(|border| border.slot == sampler)
+            .copied();
         if matches!(op.opcode, Gather4 | Gather4C | Gather4Po | Gather4PoC) {
             if lod.is_some_and(|lod| lod.minimum >= 1.) {
                 return Ok(format!(
@@ -800,24 +806,69 @@ impl Writer<'_> {
                     "({coord} + vec2<f32>(bitcast<vec2<i32>>({dynamic}.xy << vec2<u32>(26u)) >> vec2<u32>(26u)) / vec2<f32>(textureDimensions({texture}, 0u)))"
                 );
             }
-            let call = if matches!(op.opcode, Gather4 | Gather4Po) {
-                format!(
-                    "textureGather({component}i, {texture}, s{sampler}, {coord}{suffix}{offset})"
-                )
+            let comparison = matches!(op.opcode, Gather4C | Gather4PoC);
+            let mut call = if matches!(op.opcode, Gather4 | Gather4Po) {
+                let component = if self.options.depth_textures.contains(&slot) {
+                    String::new()
+                } else {
+                    format!("{component}i, ")
+                };
+                format!("textureGather({component}{texture}, s{sampler}, {coord}{suffix}{offset})")
             } else {
                 let reference = args.last().unwrap();
                 format!(
                     "textureGatherCompare({texture}, s{sampler}, {coord}{suffix}, bitcast<f32>({reference}.x){offset})"
                 )
             };
+            if matches!(
+                dimension,
+                ResourceDimension::Texture2D | ResourceDimension::Texture2DArray
+            ) && let Some(border) = border
+                && let Some(format) = self
+                    .options
+                    .border_textures
+                    .iter()
+                    .find(|format| format.slot == slot)
+            {
+                let lane = if comparison {
+                    0
+                } else {
+                    usize::from(component)
+                };
+                let channel =
+                    if lane == 3 && matches!(format.channels[lane], BorderChannel::Missing) {
+                        1.0
+                    } else {
+                        border::channel(border.color[lane], format.channels[lane])
+                    };
+                let replacement = format!("bitcast<f32>({}u)", channel.to_bits());
+                let value = if comparison {
+                    let reference = format!("bitcast<f32>({}.x)", args.last().unwrap());
+                    border::compare(border.comparison, &reference, &replacement)
+                } else {
+                    replacement
+                };
+                let [x, y, _] = op.resource.offset.unwrap_or_default();
+                let BindingKind::Typed { returns, .. } = self.bindings[&(Register::Resource, slot)]
+                else {
+                    unreachable!()
+                };
+                let scalar = if comparison {
+                    "f32"
+                } else {
+                    scalar(returns[0])?
+                };
+                call = self.border_gather(
+                    &coord,
+                    texture,
+                    [x, y],
+                    border.axes,
+                    (&value, scalar),
+                    &call,
+                );
+            }
             return Ok(format!("bitcast<vec4<u32>>({call})"));
         }
-        let border = self
-            .options
-            .border_samplers
-            .iter()
-            .find(|border| border.slot == sampler)
-            .copied();
         let sampling = self
             .options
             .lod_samplers

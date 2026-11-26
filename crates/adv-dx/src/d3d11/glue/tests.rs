@@ -25,7 +25,11 @@ fn machine() -> Machine<JitCpu> {
     let coverage = registry.coverage();
     assert_eq!(
         coverage.implement + coverage.state + coverage.safe_fail,
-        2 + FACES.iter().map(|(_, slots)| slots.len()).sum::<usize>()
+        140 + FACES
+            .iter()
+            .chain(d3d10::FACES)
+            .map(|(_, slots)| slots.len())
+            .sum::<usize>()
     );
     assert_eq!(coverage.legacy, 0);
     let excluded: Vec<_> = FACES
@@ -33,19 +37,7 @@ fn machine() -> Machine<JitCpu> {
         .flat_map(|(_, slots)| slots.iter())
         .filter_map(|&(name, _, level)| (level == ImplementationLevel::SafeFail).then_some(name))
         .collect();
-    assert_eq!(
-        excluded,
-        [
-            "ID3D11Device1::CreateDeferredContext",
-            "ID3D11Device1::CreateDeferredContext1",
-            "ID3D11Device1::CreateDeviceContextState",
-            "ID3D11Device1::OpenSharedResource1",
-            "ID3D11Device1::OpenSharedResourceByName",
-            "ID3D11DeviceContext1::ExecuteCommandList",
-            "ID3D11DeviceContext1::FinishCommandList",
-            "ID3D11DeviceContext1::SwapDeviceContextState",
-        ]
-    );
+    assert!(excluded.is_empty());
     assert!(registry.signature_conflicts().is_empty());
     crate::dxgi::register(&mut registry);
     #[cfg(feature = "gpu")]
@@ -58,6 +50,34 @@ fn machine() -> Machine<JitCpu> {
     registry.add("fixture", "exit", Conv::Stdcall { argc: 0 }, |_| {
         Outcome::ExitThread(0)
     });
+    registry.add("fixture", "layer_size", Conv::Stdcall { argc: 3 }, |env| {
+        assert_eq!(env.arg(0), 0xaaaa0001);
+        assert_eq!(env.arg(2), 40);
+        let shifted: [u32; 10] = GuestPtr::new(env.arg(1)).read(env.cpu).unwrap();
+        assert_eq!(
+            &shifted[..4],
+            &[0xc0de0000, 0xc0de0001, DATA + 0x904, DATA + 0x914]
+        );
+        Outcome::Return(0x1234)
+    });
+    registry.add(
+        "fixture",
+        "layer_create",
+        Conv::Stdcall { argc: 6 },
+        |env| {
+            assert_eq!(env.arg(0), 0xaaaa0001);
+            assert_eq!(env.arg(2), 40);
+            assert_eq!(env.arg(3), 0x77);
+            assert_eq!(env.arg(4), IID);
+            let shifted: [u32; 10] = GuestPtr::new(env.arg(1)).read(env.cpu).unwrap();
+            assert_eq!(
+                &shifted[..4],
+                &[0xc0de0000, 0xc0de0001, DATA + 0x904, DATA + 0x914]
+            );
+            env.cpu.write_u32(env.arg(5), 0x5678).unwrap();
+            Outcome::Return(0x123)
+        },
+    );
     registry.add(
         "fixture",
         "create_resource_view",
@@ -334,3 +354,5 @@ fn device_entry_negotiates_levels_and_retains_its_immediate_context() {
 
 #[cfg(feature = "gpu")]
 mod pixels;
+
+mod interop;

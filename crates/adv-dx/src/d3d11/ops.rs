@@ -5,6 +5,8 @@ use adv_abi::{Env, com::Iid};
 
 #[derive(Clone, Copy)]
 pub(super) enum Error {
+    #[cfg(feature = "gpu")]
+    InitialDiscardRequired,
     InvalidArgument,
     NotFound,
     MoreData,

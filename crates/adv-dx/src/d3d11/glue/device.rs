@@ -7,6 +7,7 @@ use crate::d3d11::{
 };
 use crate::shader::ir::Stage;
 use adv_abi::types::{D3D11_COUNTER_DESC, D3D11_INPUT_ELEMENT_DESC, D3D11_SUBRESOURCE_DATA};
+use context::deferred::{create_deferred, create_state};
 use std::sync::Arc;
 
 macro_rules! methods {
@@ -45,7 +46,7 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     CreateQuery => create_query Implement,
     CreatePredicate => create_predicate Implement,
     CreateCounter => check_counter Implement,
-    CreateDeferredContext => excluded_deferred SafeFail,
+    CreateDeferredContext => create_deferred Implement,
     OpenSharedResource => open_shared Implement,
     CheckFormatSupport => format_support Implement,
     CheckMultisampleQualityLevels => multisample_quality Implement,
@@ -62,12 +63,12 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     SetExceptionMode => set_exception_mode State,
     GetExceptionMode => exception_mode State,
     GetImmediateContext1 => immediate_context Implement,
-    CreateDeferredContext1 => excluded_deferred SafeFail,
+    CreateDeferredContext1 => create_deferred Implement,
     CreateBlendState1 => blend1 Implement,
     CreateRasterizerState1 => rasterizer1 Implement,
-    CreateDeviceContextState => excluded_context_state SafeFail,
-    OpenSharedResource1 => open_shared_nt SafeFail,
-    OpenSharedResourceByName => open_shared_by_name SafeFail,
+    CreateDeviceContextState => create_state Implement,
+    OpenSharedResource1 => open_shared_nt Implement,
+    OpenSharedResourceByName => open_shared_by_name Implement,
 );
 
 #[derive(Default)]
@@ -91,15 +92,28 @@ impl CreateDevices {
 
 pub(super) fn create(env: &mut Env<'_>) -> Outcome {
     let arguments = std::array::from_fn(|index| env.arg(index as u32));
-    create_device(env, arguments, None)
+    create_device(env, arguments, None, false)
 }
 
 pub(super) fn create_and_swap(env: &mut Env<'_>) -> Outcome {
     let arguments = std::array::from_fn(|i| env.arg(if i < 7 { i as u32 } else { i as u32 + 2 }));
-    create_device(env, arguments, Some((env.arg(7), env.arg(8))))
+    create_device(env, arguments, Some((env.arg(7), env.arg(8))), false)
 }
 
-fn create_device(env: &mut Env<'_>, arguments: [u32; 10], swap: Option<(u32, u32)>) -> Outcome {
+pub(super) fn create_core(env: &mut Env<'_>) -> Outcome {
+    let arguments = std::array::from_fn(|i| if i == 9 { 0 } else { env.arg(i as u32 + 1) });
+    if arguments[0] == 0 && arguments[1] == 0 && arguments[4] != 0 && arguments[5] != 0 {
+        return super::super::exports::access_violation(env);
+    }
+    create_device(env, arguments, None, true)
+}
+
+fn create_device(
+    env: &mut Env<'_>,
+    arguments: [u32; 10],
+    swap: Option<(u32, u32)>,
+    core: bool,
+) -> Outcome {
     let [
         adapter,
         driver,
@@ -126,6 +140,9 @@ fn create_device(env: &mut Env<'_>, arguments: [u32; 10], swap: Option<(u32, u32
             if pointer != 0 {
                 write(env, pointer, 0u32)?;
             }
+        }
+        if level_out != 0 {
+            write(env, level_out, 0u32)?;
         }
         let driver = match driver {
             0 => Driver::Unknown,
@@ -158,7 +175,11 @@ fn create_device(env: &mut Env<'_>, arguments: [u32; 10], swap: Option<(u32, u32
             .flatten()
             .next()
             .map(|report| report.level);
-        let choice = request.choose(maximum)?;
+        let choice = if core {
+            request.choose_core(maximum)?
+        } else {
+            request.choose(maximum)?
+        };
         let report = devices.reports[choice.level.column()]
             .clone()
             .ok_or(crate::d3d11::caps::Error::Unsupported)?;
@@ -184,6 +205,9 @@ fn create_device(env: &mut Env<'_>, arguments: [u32; 10], swap: Option<(u32, u32
         let context = match (|| {
             dxgi::attach_device_face(env, device, adapter_kind)?;
             attach_multithread(env, device, flags)?;
+            if flags & d3d10::CREATE_FLAGS != 0 {
+                d3d10::attach_device(env, device)?;
+            }
             attach_context(env, device, flags)
         })() {
             Ok(context) => context,
@@ -399,6 +423,9 @@ pub(super) fn semantic_name(env: &Env<'_>, pointer: u32) -> Result<Vec<u8>, Erro
 fn view<T: Pod + Into<ViewDesc>>(env: &mut Env<'_>, kind: ViewKind) -> Outcome {
     let (device, resource, desc, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     status((|| {
+        let resource = table(env)
+            .canonical(&env.sys.objects, resource)
+            .ok_or(Error::InvalidArgument)?;
         let object = ops::object(env, table(env), resource)?;
         if object.device() != Some(device) {
             return Err(Error::InvalidArgument);
@@ -652,6 +679,7 @@ fn device_state<'a>(env: &'a Env<'_>) -> Result<&'a super::super::object::Device
         .ok_or(Error::InvalidArgument)
 }
 
+#[cfg(not(feature = "gpu"))]
 fn unsupported_output(env: &mut Env<'_>, slot: u32, error: u32) -> Outcome {
     let output = env.arg(slot);
     if output != 0 {
@@ -660,9 +688,6 @@ fn unsupported_output(env: &mut Env<'_>, slot: u32, error: u32) -> Outcome {
     Outcome::Return(error)
 }
 
-fn excluded_deferred(env: &mut Env<'_>) -> Outcome {
-    unsupported_output(env, 2, 0x80004001)
-}
 fn open_shared(env: &mut Env<'_>) -> Outcome {
     let (device, handle, iid, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     call((|| {
@@ -671,7 +696,7 @@ fn open_shared(env: &mut Env<'_>) -> Outcome {
         {
             report(env, device)?;
             let iid = read(env, iid)?;
-            let resource = dxgi::open_resource(env, device, handle, iid)?;
+            let resource = dxgi::shared::open_legacy(env, device, handle, iid)?;
             write(env, out, resource)
         }
         #[cfg(not(feature = "gpu"))]
@@ -682,14 +707,16 @@ fn open_shared(env: &mut Env<'_>) -> Outcome {
     })())
 }
 fn open_shared_nt(env: &mut Env<'_>) -> Outcome {
+    #[cfg(feature = "gpu")]
+    return dxgi::shared::open_shared_nt(env);
+    #[cfg(not(feature = "gpu"))]
     unsupported_output(env, 3, 0x80070057)
-}
-fn excluded_context_state(env: &mut Env<'_>) -> Outcome {
-    adv_abi::stub::warn_unavailable(env, "CreateDeviceContextState", "device context state");
-    unsupported_output(env, 7, 0x80004001)
 }
 
 fn open_shared_by_name(env: &mut Env<'_>) -> Outcome {
+    #[cfg(feature = "gpu")]
+    return dxgi::shared::open_shared_by_name(env);
+    #[cfg(not(feature = "gpu"))]
     unsupported_output(env, 4, 0x80070057)
 }
 

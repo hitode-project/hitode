@@ -170,6 +170,7 @@ pub trait Buffers: Sync {
         first: bool,
     ) -> Result<(), Error>;
     fn latency(&self, env: &Env<'_>, device: u32) -> u32;
+    fn shared_adapter(&self, env: &Env<'_>, handle: u32) -> Result<super::caps::Adapter, Error>;
     fn output(&self, env: &mut Env<'_>, device: u32) -> Result<u32, Error>;
 }
 

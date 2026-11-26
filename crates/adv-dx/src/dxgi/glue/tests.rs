@@ -234,7 +234,7 @@ fn every_queried_interface_uses_covered_guest_thunks() {
     let count = registry.coverage();
     assert_eq!(
         count.implement + count.state + count.safe_fail,
-        FACTORY.len() + ADAPTER.len() + OUTPUT.len() + swap_chain::SLOTS.len() + 2
+        FACTORY.len() + ADAPTER.len() + OUTPUT.len() + swap_chain::SLOTS.len() + 50
     );
     assert_eq!(count.safe_fail, 1);
     assert_eq!(count.legacy, 0);

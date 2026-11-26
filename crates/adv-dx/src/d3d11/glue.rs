@@ -9,10 +9,12 @@ use adv_abi::{Api, Env, GuestPtr, ImplementationLevel, Outcome, Registry, com::I
 use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_machine::Machine;
 use bytemuck::Pod;
+use context::list_flags;
 use device::{query_desc, query_size};
 use std::{collections::BTreeMap, num::NonZeroU32};
 
-mod context;
+pub(super) mod context;
+mod d3d10;
 mod device;
 mod dxgi;
 #[cfg(feature = "gpu")]
@@ -62,7 +64,10 @@ const FACES: &[(&str, &[Slot])] = &[
     dxgi::FACE,
     dxgi::SURFACE,
     dxgi::RESOURCE,
+    dxgi::KEYED_MUTEX,
     context::FACE,
+    face!("ID3DDeviceContextState"),
+    face!("ID3D11CommandList", GetContextFlags => list_flags State),
     face!("ID3D11VertexShader"),
     face!("ID3D11PixelShader"),
     face!("ID3D11ComputeShader"),
@@ -88,8 +93,9 @@ const FACES: &[(&str, &[Slot])] = &[
     face!("ID3D11SamplerState", GetDesc => pipeline_desc State),
 ];
 
-struct State {
+pub(super) struct State {
     table: Table,
+    pub(super) layers: Vec<[u32; 4]>,
     devices: device::CreateDevices,
     #[cfg(feature = "gpu")]
     execution: Option<gpu::Execution>,
@@ -101,6 +107,7 @@ struct State {
 }
 
 pub fn register_children(registry: &mut Registry) {
+    super::exports::register(registry, device::create_core);
     registry.register(Api {
         module: DLL,
         name: "D3D11CreateDevice",
@@ -121,7 +128,7 @@ pub fn register_children(registry: &mut Registry) {
             .conv
             .unwrap(),
     });
-    for &(face, slots) in FACES {
+    for &(face, slots) in FACES.iter().chain(d3d10::FACES) {
         for (index, &(name, handler, level)) in slots.iter().enumerate() {
             let (_, method) = name.split_once("::").unwrap();
             let signature =
@@ -140,14 +147,19 @@ pub fn register_children(registry: &mut Registry) {
 
 pub fn install_children<B: Backend>(machine: &mut Machine<B>) -> Result<(), String> {
     let table = Table::new(&mut machine.sys.objects).map_err(|_| "D3D11 COM namespace")?;
-    let size = FACES.iter().map(|(_, slots)| slots.len()).sum::<usize>() as u32 * 4;
+    let size = FACES
+        .iter()
+        .chain(d3d10::FACES)
+        .map(|(_, slots)| slots.len())
+        .sum::<usize>() as u32
+        * 4;
     let mut address = machine
         .sys
         .vm
         .alloc(&mut machine.cpu, size, Prot::RW)
         .map_err(|e| e.to_string())?;
     let mut vtables = BTreeMap::new();
-    for &(face, slots) in FACES {
+    for &(face, slots) in FACES.iter().chain(d3d10::FACES) {
         vtables.insert(face, address);
         for &(name, _, _) in slots {
             let entry = machine
@@ -164,6 +176,7 @@ pub fn install_children<B: Backend>(machine: &mut Machine<B>) -> Result<(), Stri
     }
     machine.ext.insert(State {
         table,
+        layers: Vec::new(),
         vtables,
         devices: Default::default(),
         #[cfg(feature = "gpu")]
@@ -260,6 +273,11 @@ pub fn attach_resource(
         retire(env, release);
         return Err(error);
     }
+    if let Err(error) = d3d10::attach_child(env, pointer) {
+        let release = table(env).release(&mut env.sys.objects, pointer);
+        retire(env, release);
+        return Err(error);
+    }
     Ok(pointer)
 }
 
@@ -304,6 +322,8 @@ pub fn attach_pipeline(
 impl Error {
     fn hresult(self) -> u32 {
         match self {
+            #[cfg(feature = "gpu")]
+            Self::InitialDiscardRequired => 0x887c0004,
             Self::InvalidArgument | Self::Object(ObjectError::InvalidObject) => 0x80070057,
             Self::NotFound => 0x887a0002,
             Self::MoreData => 0x887a0003,
@@ -326,13 +346,13 @@ fn call(result: Result<(), Error>) -> Outcome {
     Outcome::Return(result.map_or_else(Error::hresult, |()| 0))
 }
 
-fn read<T: Pod>(env: &Env<'_>, addr: u32) -> Result<T, Error> {
+pub(super) fn read<T: Pod>(env: &Env<'_>, addr: u32) -> Result<T, Error> {
     GuestPtr::new(addr)
         .read(env.cpu)
         .map_err(|_| Error::InvalidArgument)
 }
 
-fn write<T: Pod>(env: &mut Env<'_>, addr: u32, value: T) -> Result<(), Error> {
+pub(super) fn write<T: Pod>(env: &mut Env<'_>, addr: u32, value: T) -> Result<(), Error> {
     GuestPtr::new(addr)
         .write(env.cpu, value)
         .map_err(|_| Error::InvalidArgument)
@@ -358,6 +378,10 @@ fn release(env: &mut Env<'_>) -> Outcome {
 }
 
 fn retire(env: &mut Env<'_>, released: Release) -> Outcome {
+    #[cfg(feature = "gpu")]
+    for event in released.keyed_wakes {
+        env.sys.set_event(event);
+    }
     #[cfg(feature = "gpu")]
     for handle in released.shared {
         env.ext.get_mut::<State>().shared.remove(&handle);
@@ -630,7 +654,7 @@ pub fn configure_devices<B: Backend>(
     machine.ext.get_mut::<State>().devices = device::CreateDevices::derive(hardware, paths);
 }
 
-fn array<T: Pod>(env: &Env<'_>, address: u32, count: u32) -> Result<Vec<T>, Error> {
+pub(super) fn array<T: Pod>(env: &Env<'_>, address: u32, count: u32) -> Result<Vec<T>, Error> {
     let bytes = count
         .checked_mul(size_of::<T>() as u32)
         .ok_or(Error::InvalidArgument)?;
@@ -656,6 +680,11 @@ fn output(
     }
     write(env, address, 0u32)?;
     let pointer = make(env)?;
+    if let Err(error) = d3d10::attach_child(env, pointer) {
+        let release = table(env).release(&mut env.sys.objects, pointer);
+        retire(env, release);
+        return Err(error.into());
+    }
     write(env, address, pointer)?;
     Ok(0)
 }

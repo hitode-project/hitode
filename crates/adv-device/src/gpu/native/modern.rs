@@ -614,6 +614,11 @@ pub enum ModernTransfer {
         source: TransferBuffer,
         destination: ImageRegion,
     },
+    UploadDepthStencil {
+        depth: TransferBuffer,
+        stencil: TransferBuffer,
+        destination: ImageRegion,
+    },
     Download {
         source: ImageRegion,
         destination: TransferBuffer,

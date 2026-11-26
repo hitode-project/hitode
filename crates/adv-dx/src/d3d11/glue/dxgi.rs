@@ -30,8 +30,8 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
 
 macro_rules! resource_methods {
     ($($method:ident => $handler:ident $level:ident),+ $(,)?) => {
-        ("IDXGIResource", &[
-            $((concat!("IDXGIResource::", stringify!($method)), $handler, ImplementationLevel::$level)),+
+        ("IDXGIResource1", &[
+            $((concat!("IDXGIResource1::", stringify!($method)), $handler, ImplementationLevel::$level)),+
         ])
     };
 }
@@ -49,25 +49,125 @@ pub(super) const RESOURCE: (&str, &[Slot]) = resource_methods!(
     GetUsage => resource_usage State,
     SetEvictionPriority => set_priority State,
     GetEvictionPriority => eviction_priority State,
+    CreateSubresourceSurface => subresource_surface Implement,
+    CreateSharedHandle => create_shared_handle Implement,
+);
+
+pub(super) const KEYED_MUTEX: (&str, &[Slot]) = (
+    "IDXGIKeyedMutex",
+    &[
+        (
+            "IDXGIKeyedMutex::QueryInterface",
+            query,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGIKeyedMutex::AddRef",
+            add_ref,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGIKeyedMutex::Release",
+            release,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGIKeyedMutex::SetPrivateData",
+            set_private,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGIKeyedMutex::SetPrivateDataInterface",
+            set_interface,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGIKeyedMutex::GetPrivateData",
+            get_private,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGIKeyedMutex::GetParent",
+            surface_device,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGIKeyedMutex::GetDevice",
+            surface_device,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGIKeyedMutex::AcquireSync",
+            acquire_sync,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGIKeyedMutex::ReleaseSync",
+            release_sync,
+            ImplementationLevel::Implement,
+        ),
+    ],
 );
 
 pub(super) fn attach_resource_face(env: &mut Env<'_>, resource: u32) -> Result<(), ObjectError> {
+    use super::super::desc::Misc;
     let face = alloc(env, RESOURCE.0)?;
     let table = table(env);
-    let has_surface = matches!(table.get(&env.sys.objects, resource).unwrap().resource(),
-        Some(Resource::Texture(texture)) if texture.kind() == TextureKind::D2
+    let description = table
+        .get(&env.sys.objects, resource)
+        .unwrap()
+        .resource()
+        .unwrap();
+    let has_surface = matches!(description,
+        Resource::Texture(texture) if texture.kind() == TextureKind::D2
             && texture.levels() == 1 && texture.layers() == 1);
     let iids: &[_] = if has_surface {
-        &[IID_IDXGIRESOURCE]
+        &[IID_IDXGIRESOURCE, IID_IDXGIRESOURCE1]
     } else {
-        &[IID_IDXGIRESOURCE, IID_IDXGIOBJECT, IID_IDXGIDEVICESUBOBJECT]
+        &[
+            IID_IDXGIRESOURCE,
+            IID_IDXGIRESOURCE1,
+            IID_IDXGIOBJECT,
+            IID_IDXGIDEVICESUBOBJECT,
+        ]
     };
     table.register_faces(&mut env.sys.objects, resource, face, iids);
+    if description.misc().contains(Misc::SHARED_KEYEDMUTEX) {
+        let face = alloc(env, KEYED_MUTEX.0)?;
+        table.register_faces(&mut env.sys.objects, resource, face, &[IID_IDXGIKEYEDMUTEX]);
+    }
     Ok(())
 }
 
+fn subresource_surface(env: &mut Env<'_>) -> Outcome {
+    let (resource, subresource, out) = (env.arg(0), env.arg(1), env.arg(2));
+    call((|| {
+        write(env, out, 0u32)?;
+        if subresource != 0 {
+            return Err(dxgi::Error::InvalidCall.into());
+        }
+        let surface = table(env).query(&mut env.sys.objects, resource, IID_IDXGISURFACE2)?;
+        write(env, out, surface)
+    })())
+}
+
+macro_rules! sharing_methods {
+    ($($name:ident),+ $(,)?) => {$(
+        fn $name(env: &mut Env<'_>) -> Outcome {
+            #[cfg(feature = "gpu")]
+            return shared::$name(env);
+            #[cfg(not(feature = "gpu"))]
+            {
+                let _ = env;
+                Outcome::Return(dxgi::Error::InvalidCall.hresult())
+            }
+        }
+    )+};
+}
+sharing_methods!(create_shared_handle, acquire_sync, release_sync);
+
 fn resource_usage(env: &mut Env<'_>) -> Outcome {
-    use super::super::desc::{Bind, Misc};
+    use super::super::desc::Bind;
     let (pointer, out) = (env.arg(0), env.arg(1));
     call((|| {
         let desc = ops::object(env, table(env), pointer)?.resource().unwrap();
@@ -81,7 +181,7 @@ fn resource_usage(env: &mut Env<'_>) -> Outcome {
                 usage |= flag;
             }
         }
-        if desc.misc().contains(Misc::SHARED) {
+        if desc.misc().shared() {
             usage |= 128;
         }
         write(env, out, usage)
@@ -102,7 +202,7 @@ fn shared_handle(env: &mut Env<'_>) -> Outcome {
         write(env, out, 0u32)?;
         #[cfg(feature = "gpu")]
         {
-            let handle = share(env, pointer)?;
+            let handle = shared::legacy_handle(env, pointer)?;
             write(env, out, handle)
         }
         #[cfg(not(feature = "gpu"))]
@@ -111,75 +211,6 @@ fn shared_handle(env: &mut Env<'_>) -> Outcome {
             Err(dxgi::Error::InvalidCall.into())
         }
     })())
-}
-
-#[cfg(feature = "gpu")]
-fn share(env: &mut Env<'_>, pointer: u32) -> Result<u32, Error> {
-    use super::super::{desc::Misc, object::Shared};
-    use std::sync::Arc;
-
-    let table = table(env);
-    let object = ops::object(env, table, pointer)?;
-    if let Some(shared) = object.shared() {
-        return Ok(shared.handle);
-    }
-    let resource = object.resource().unwrap();
-    let device = object.device().unwrap();
-    if !resource.misc().contains(Misc::SHARED) || device_state(env, device)?.null_device {
-        return Err(dxgi::Error::InvalidCall.into());
-    }
-    let adapter = dxgi::adapter_kind(env, device_state(env, device)?.adapter)?;
-    let identity = table.key(&env.sys.objects, pointer).unwrap();
-    let backing = gpu::backing(env, pointer, resource)?;
-    let state = env.ext.get_mut::<State>();
-    state.last_shared = state
-        .last_shared
-        .checked_add(1)
-        .ok_or(ObjectError::Exhausted)?;
-    let handle = state.last_shared;
-    let shared = Arc::new(Shared {
-        handle,
-        identity,
-        resource,
-        adapter,
-        backing,
-    });
-    state.shared.insert(handle, Arc::downgrade(&shared));
-    table
-        .get_mut(&mut env.sys.objects, pointer)
-        .unwrap()
-        .share(shared);
-    Ok(handle)
-}
-
-#[cfg(feature = "gpu")]
-pub(super) fn open_resource(
-    env: &mut Env<'_>,
-    device: u32,
-    handle: u32,
-    iid: Iid,
-) -> Result<u32, Error> {
-    let shared = env
-        .ext
-        .get::<State>()
-        .shared
-        .get(&handle)
-        .and_then(std::sync::Weak::upgrade)
-        .ok_or(Error::InvalidArgument)?;
-    let adapter = dxgi::adapter_kind(env, device_state(env, device)?.adapter)?;
-    if adapter != shared.adapter {
-        return Err(Error::InvalidArgument);
-    }
-    let resource = attach_resource(env, device, shared.resource)?;
-    let table = table(env);
-    table
-        .get_mut(&mut env.sys.objects, resource)
-        .unwrap()
-        .share(shared);
-    let result = table.query(&mut env.sys.objects, resource, iid);
-    let release = table.release(&mut env.sys.objects, resource);
-    retire(env, release);
-    Ok(result?)
 }
 
 pub(super) fn attach_device_face(
@@ -491,6 +522,10 @@ impl dxgi::swap::Buffers for SwapBuffers {
         device_state(env, device).unwrap().latency
     }
 
+    fn shared_adapter(&self, env: &Env<'_>, handle: u32) -> Result<Adapter, dxgi::Error> {
+        shared::adapter(env, handle).ok_or(dxgi::Error::InvalidCall)
+    }
+
     fn output(&self, env: &mut Env<'_>, device: u32) -> Result<u32, dxgi::Error> {
         let adapter = device_state(env, device)?.adapter;
         dxgi::device_output(env, adapter)
@@ -518,71 +553,76 @@ fn com_error(error: ObjectError) -> dxgi::Error {
 }
 
 pub(super) const SURFACE: (&str, &[Slot]) = (
-    "IDXGISurface1",
+    "IDXGISurface2",
     &[
         (
-            "IDXGISurface1::QueryInterface",
+            "IDXGISurface2::QueryInterface",
             query,
             ImplementationLevel::Implement,
         ),
         (
-            "IDXGISurface1::AddRef",
+            "IDXGISurface2::AddRef",
             add_ref,
             ImplementationLevel::Implement,
         ),
         (
-            "IDXGISurface1::Release",
+            "IDXGISurface2::Release",
             release,
             ImplementationLevel::Implement,
         ),
         (
-            "IDXGISurface1::SetPrivateData",
+            "IDXGISurface2::SetPrivateData",
             set_private,
             ImplementationLevel::Implement,
         ),
         (
-            "IDXGISurface1::SetPrivateDataInterface",
+            "IDXGISurface2::SetPrivateDataInterface",
             set_interface,
             ImplementationLevel::Implement,
         ),
         (
-            "IDXGISurface1::GetPrivateData",
+            "IDXGISurface2::GetPrivateData",
             get_private,
             ImplementationLevel::Implement,
         ),
         (
-            "IDXGISurface1::GetParent",
+            "IDXGISurface2::GetParent",
             surface_device,
             ImplementationLevel::Implement,
         ),
         (
-            "IDXGISurface1::GetDevice",
+            "IDXGISurface2::GetDevice",
             surface_device,
             ImplementationLevel::Implement,
         ),
         (
-            "IDXGISurface1::GetDesc",
+            "IDXGISurface2::GetDesc",
             surface_desc,
             ImplementationLevel::State,
         ),
         (
-            "IDXGISurface1::Map",
+            "IDXGISurface2::Map",
             surface_map,
             ImplementationLevel::Implement,
         ),
         (
-            "IDXGISurface1::Unmap",
+            "IDXGISurface2::Unmap",
             surface_unmap,
             ImplementationLevel::State,
         ),
         (
-            "IDXGISurface1::GetDC",
+            "IDXGISurface2::GetDC",
             get_dc,
             ImplementationLevel::Implement,
         ),
         (
-            "IDXGISurface1::ReleaseDC",
+            "IDXGISurface2::ReleaseDC",
             release_dc,
+            ImplementationLevel::Implement,
+        ),
+        (
+            "IDXGISurface2::GetResource",
+            surface_resource,
             ImplementationLevel::Implement,
         ),
     ],
@@ -599,9 +639,21 @@ pub(super) fn attach_surface_face(env: &mut Env<'_>, resource: u32) -> Result<()
             IID_IDXGIDEVICESUBOBJECT,
             IID_IDXGISURFACE,
             IID_IDXGISURFACE1,
+            IID_IDXGISURFACE2,
         ],
     );
     Ok(())
+}
+
+fn surface_resource(env: &mut Env<'_>) -> Outcome {
+    let (surface, iid, out, subresource) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    call((|| {
+        write(env, out, 0u32)?;
+        context::optional(env, subresource, 0u32)?;
+        let iid = read(env, iid)?;
+        let resource = table(env).query(&mut env.sys.objects, surface, iid)?;
+        write(env, out, resource)
+    })())
 }
 
 fn surface_device(env: &mut Env<'_>) -> Outcome {
@@ -691,3 +743,5 @@ fn release_dc(env: &mut Env<'_>) -> Outcome {
 
 #[cfg(feature = "gpu")]
 mod dc;
+#[cfg(feature = "gpu")]
+pub(super) mod shared;
