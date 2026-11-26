@@ -6,11 +6,13 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 
 ## DirectDraw
 
-### GFX-BLT-1 Resident Blt rules
+### GFX-BLT-1 Measured DirectDraw Blt rules
 
-**Rule**: Resident Blt MUST select display-driver rules only when both surfaces declare video memory. It MUST use the GPU executor only when both participating rectangles are GPU-current. Both executors MUST match the measured stretch, mirror, conversion, key, fill, bounds and overlap results.
+**Rule**: DirectDraw Blt MUST select display-driver rules only when both surfaces declare video memory. It MUST use the GPU executor only when both participating rectangles are GPU-current. Both executors MUST match the measured stretch, mirror, conversion, key, fill, bounds and overlap results.
 **Verification**: Test
 **Basis**: Windows DirectDraw Blt probe
+
+Unclipped out-of-bounds or inverted rectangles return DDERR_INVALIDRECT for Blt and BltFast and leave the destination intact.
 
 ### GFX-DDRAW-1 Lock and clipper state
 
@@ -29,8 +31,11 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 
 ### GFX-DDRAW-4 Source color keys
 
-**Rule**: SetColorKey MUST store one inclusive raw range per surface and key kind. Blt and BltFast with source keys MUST skip source pixels in range, comparing only color bits of 32-bit pixels.
+**Rule**: GetCaps MUST report only DDCKEYCAPS_SRCBLT in dwCKeyCaps. SetColorKey MUST store a raw point for source Blt and reject range, destination and overlay key values with DDERR_NOCOLORKEYHW. Blt and BltFast MUST compare the selected source pixel under its format mask and follow the measured RGB555 storage-bit behavior.
 **Verification**: Test
+**Basis**: Windows DirectDraw Blt probe
+
+Failed SetColorKey calls retain the previous key. A destination-keyed Blt returns E_INVALIDARG and leaves the destination intact.
 
 ### GFX-DDRAW-5 Vertical blank
 
@@ -46,7 +51,7 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 
 ### GFX-DDRAW-7 Clip lists
 
-**Rule**: A clip list MUST limit Blt and color fills to its rectangles, mapping the source onto the whole destination rectangle. That destination MAY extend past the surface. BltFast to a surface with a clipper MUST return DDERR_BLTFASTCANTCLIP, and window clippers MUST refuse clip lists.
+**Rule**: A clip list MUST limit Blt and color fills to its rectangles and allow a destination that extends past the surface. Clipped Blt MUST round each clipped edge into source space before applying the stretch rule. BltFast to a surface with a clipper MUST return DDERR_BLTFASTCANTCLIP, and window clippers MUST refuse clip lists.
 **Verification**: Test
 **Basis**: Measured on Windows 11
 

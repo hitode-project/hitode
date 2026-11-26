@@ -23,7 +23,7 @@ pub(super) const OVERLAY: u32 = 0x80;
 pub(super) const PRIMARY: u32 = 0x200;
 pub(super) const SYSTEM_MEMORY: u32 = 0x800;
 pub(super) const TEXTURE: u32 = 0x1000;
-const VIDEO_MEMORY: u32 = 0x4000;
+pub(super) const VIDEO_MEMORY: u32 = 0x4000;
 pub(super) const VISIBLE: u32 = 0x8000;
 const WRITE_ONLY: u32 = 0x10000;
 pub(super) const ZBUFFER: u32 = 0x20000;
@@ -177,8 +177,6 @@ pub(super) fn pixel_format(format: PixelFormat) -> [u8; 32] {
 }
 
 /// The storage holding pixels of DDPIXELFORMAT `format`, if supported.
-/// Palettized formats wait for palette objects; like adapters without them,
-/// creation reports an invalid pixel format.
 pub(super) fn storage(format: &[u8; 32]) -> Option<PixelFormat> {
     let (flags, bits) = (word(format, 4), word(format, 12));
     let masks = (word(format, 16), word(format, 20), word(format, 24));
@@ -193,6 +191,7 @@ pub(super) fn storage(format: &[u8; 32]) -> Option<PixelFormat> {
         return None;
     }
     match (bits, masks) {
+        (8, (0, 0, 0)) if flags & DDPF_PALETTEINDEXED8 != 0 => Some(PixelFormat::Indexed8),
         (16, (0xf800, 0x7e0, 0x1f)) => Some(PixelFormat::Rgb565),
         (16, (0x7c00, 0x3e0, 0x1f)) => Some(PixelFormat::Rgb555),
         (24, (0xff_0000, 0xff00, 0xff)) => Some(PixelFormat::Bgr24),

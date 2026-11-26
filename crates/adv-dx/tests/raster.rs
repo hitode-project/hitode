@@ -412,7 +412,7 @@ fn surface_versions_and_clipper_replacement_release_their_retained_objects() {
 }
 
 #[test]
-fn directdraw_scaled_blt_keeps_clipper_phase_and_requires_a_source_color_key() {
+fn directdraw_scaled_blt_remaps_the_clip_and_requires_a_source_color_key() {
     let mut f = Fixture::new();
     let (source, pixels, pitch) = f.surface(5, 4, PixelFormat::Bgra32, false);
     let (primary, _, _) = f.surface(5, 4, PixelFormat::Bgra32, true);
@@ -448,7 +448,7 @@ fn directdraw_scaled_blt_keeps_clipper_phase_and_requires_a_source_color_key() {
     assert_eq!(
         values,
         [
-            3, 3, 4, 0, 0, 8, 8, 9, 0, 0, 8, 8, 9, 0, 0, 13, 13, 14, 0, 0
+            8, 8, 9, 0, 0, 8, 8, 9, 0, 0, 8, 8, 9, 0, 0, 13, 13, 14, 0, 0
         ]
     );
     let before = f.surfaces.presenter.bgra.clone();

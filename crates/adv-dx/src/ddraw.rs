@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use adv_abi::com::{Com as CommonCom, ComIdentity, QueryError};
 use adv_device::surface::{
-    self, BlitOptions, BlitRect, PixelFormat, Presenter, Rect, SurfaceMemory, Surfaces,
+    self, Access, BlitRect, Blt, BltError, BltFailure, BltSurface, MemoryClass, PixelFormat,
+    Presenter, Rect, SurfaceMemory, Surfaces,
 };
 use adv_machine::Objects;
 
@@ -190,6 +191,8 @@ const IID_CLIPPER: [u8; 16] = [
     0x85, 0xdb, 0x14, 0x6c, 0x33, 0xa7, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
 const INVALID: u32 = 0x80070057;
+const INVALID_RECT: u32 = 0x88760096;
+const NO_COLOR_KEY_HW: u32 = 0x887600dc;
 const UNSUPPORTED: u32 = 0x80004001;
 const BUSY: u32 = 0x887601ae;
 const NOT_FOUND: u32 = 0x887600ff;
@@ -305,9 +308,12 @@ impl DirectDraw {
         &mut self,
         surfaces: &mut Surfaces<P>,
         sid: u32,
-        m: &dyn SurfaceMemory,
+        m: &mut dyn SurfaceMemory,
         damage: Rect,
     ) -> Result<(), CallError> {
+        if !damage.empty() {
+            surfaces.cpu_access(sid, damage, Access::Read, m)?;
+        }
         surfaces.present_from(self.context, sid, m, damage)?;
         if !damage.clipped(surfaces[sid].rect()).empty() {
             self.submitted = Some(sid);
@@ -406,6 +412,34 @@ impl DirectDraw {
         self.described
             .get(&sid)
             .map_or([creation::OFFSCREEN_PLAIN, 0, 0, 0], |d| d.caps)
+    }
+
+    fn blt_surface(&self, id: u32, rect: Rect) -> BltSurface {
+        let memory = if self.caps(id)[0] & creation::VIDEO_MEMORY != 0 {
+            MemoryClass::Video
+        } else {
+            MemoryClass::System
+        };
+        BltSurface { id, rect, memory }
+    }
+
+    fn execute_blt<P: Presenter>(
+        surfaces: &mut Surfaces<P>,
+        destination: BltSurface,
+        operation: Blt,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<Result<Rect, u32>, CallError> {
+        match surfaces.blt(destination, operation, m) {
+            Ok(damage) => Ok(Ok(damage)),
+            Err(BltFailure::Storage(error)) => Err(error.into()),
+            Err(BltFailure::Rule(error)) => Ok(Err(match error {
+                BltError::InvalidRect => INVALID_RECT,
+                BltError::UnsupportedConversion => UNSUPPORTED,
+                BltError::ConversionFailed => 0x80004005,
+                BltError::NoColorKeyHardware => NO_COLOR_KEY_HW,
+                BltError::InvalidArgument => INVALID,
+            })),
+        }
     }
 
     /// `front` and the surfaces its flip chain reaches before coming back.
@@ -1001,6 +1035,33 @@ fn written(dr: BlitRect, clip: Rect) -> Rect {
     }
 }
 
+fn clipped_source(sr: Rect, dr: BlitRect, part: Rect, mirror: [bool; 2]) -> Rect {
+    if part.w == dr.w && part.h == dr.h {
+        return sr;
+    }
+    // Windows rounds the clipped edges into source space before stretching
+    // the remaining rectangle. A subpixel source span still samples one pixel.
+    let axis = |origin, size, dest: i64, span, clipped, extent, mirror| {
+        let edge =
+            |offset| ((offset * u64::from(size) + u64::from(span / 2)) / u64::from(span)) as u32;
+        let offset = (i64::from(clipped) - dest) as u64;
+        let start = edge(offset).min(size - 1);
+        let end = edge(offset + u64::from(extent)).max(start + 1);
+        let at = if mirror { size - end } else { start };
+        (origin + at, end - start)
+    };
+    let (x, w) = axis(sr.x, sr.w, dr.x, dr.w, part.x, part.w, mirror[0]);
+    let (y, h) = axis(sr.y, sr.h, dr.y, dr.h, part.y, part.h, mirror[1]);
+    Rect { x, y, w, h }
+}
+
+fn blt_rect_error(error: CallError) -> u32 {
+    match error {
+        CallError::Argument(_) => INVALID,
+        CallError::Fail(_) => INVALID_RECT,
+    }
+}
+
 fn rect<P: Presenter>(
     surfaces: &Surfaces<P>,
     id: u32,
@@ -1264,21 +1325,21 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
-                // DDCKEY_COLORSPACE selects a range; otherwise the high bound is ignored.
                 let kinds = a[1] & !1;
                 if !KEY_KINDS.contains(&kinds) {
                     return Ok(INVALID);
                 }
                 if a[2] == 0 {
+                    if kinds == 4 {
+                        return Ok(0x88760104); // DDERR_NOOVERLAYHW
+                    }
                     self.color_keys.remove(&(sid, kinds));
                 } else {
+                    if kinds != 8 || a[1] & 1 != 0 {
+                        return Ok(NO_COLOR_KEY_HW);
+                    }
                     let low = m.arg_u32(a[2])?;
-                    let high = if a[1] & 1 != 0 {
-                        m.arg_u32(a[2] + 4)?
-                    } else {
-                        low
-                    };
-                    self.color_keys.insert((sid, kinds), (low, high));
+                    self.color_keys.insert((sid, kinds), (low, low));
                 }
                 0
             }
@@ -1286,7 +1347,7 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
-                if !KEY_KINDS.contains(&a[1]) || a[2] == 0 {
+                if !KEY_KINDS.contains(&a[1]) || a[1] == 0x10 || a[2] == 0 {
                     return Ok(INVALID);
                 }
                 let Some(&(low, high)) = self.color_keys.get(&(sid, a[1])) else {
@@ -1399,6 +1460,7 @@ impl DirectDraw {
                         for (offset, value) in [
                             (4usize, 0x00420040u32), // DDCAPS_BLT | DDCAPS_READSCANLINE | DDCAPS_GDI
                             (8, 0x200),
+                            (12, 0x200),            // dwCKeyCaps: DDCKEYCAPS_SRCBLT
                             (60, 64 * 1024 * 1024), // dwVidMemTotal
                             (64, 32 * 1024 * 1024), // dwVidMemFree
                             (0x16c, SURFACE_CAPS | 0x200 | 0x10 | 8),
@@ -1533,9 +1595,17 @@ impl DirectDraw {
                 let Ok(rect) = rect(surfaces, sid, a[1], m) else {
                     return Ok(INVALID);
                 };
-                let p = surfaces[sid].row(rect.x, rect.y);
+                let readonly = a[3] & 0x10 != 0;
+                let access = if readonly {
+                    Access::Read
+                } else {
+                    Access::Write
+                };
+                let p = surfaces
+                    .cpu_access(sid, rect, access, m)?
+                    .row(rect.x, rect.y);
                 m.arg_write(a[2], &self.describe(surfaces, sid, len, p))?;
-                surfaces.get_mut(sid).unwrap().locked = Some((rect, a[3] & 0x10 != 0));
+                surfaces.get_mut(sid).unwrap().locked = Some((rect, readonly));
                 surfaces.stats.locks += 1;
                 0
             }
@@ -1980,15 +2050,16 @@ impl DirectDraw {
                     return Ok(UNSUPPORTED);
                 }
                 let key = if a[5] & 1 != 0 {
-                    let Some(&key) = self.color_keys.get(&(src, 8)) else {
+                    let Some(&(key, _)) = self.color_keys.get(&(src, 8)) else {
                         return Ok(INVALID);
                     };
                     Some(key)
                 } else {
                     None
                 };
-                let Ok(sr) = rect(surfaces, src, a[4], m) else {
-                    return Ok(INVALID);
+                let sr = match rect(surfaces, src, a[4], m) {
+                    Ok(sr) => sr,
+                    Err(error) => return Ok(blt_rect_error(error)),
                 };
                 let dr = Rect {
                     x: a[1],
@@ -1999,7 +2070,7 @@ impl DirectDraw {
                 if dr.x.checked_add(dr.w).is_none_or(|r| r > d.width)
                     || dr.y.checked_add(dr.h).is_none_or(|b| b > d.height)
                 {
-                    return Ok(INVALID);
+                    return Ok(INVALID_RECT);
                 }
                 // Windows validates flags, keys and rectangles first.
                 if self.surface_clippers.contains_key(&dst) {
@@ -2008,23 +2079,29 @@ impl DirectDraw {
                 if d.locked.is_some() || surfaces[src].locked.is_some() {
                     return Ok(BUSY);
                 }
-                let target = BlitRect {
-                    x: i64::from(dr.x),
-                    y: i64::from(dr.y),
-                    w: dr.w,
-                    h: dr.h,
+                let damage = match Self::execute_blt(
+                    surfaces,
+                    self.blt_surface(dst, dr),
+                    Blt::Copy {
+                        source: self.blt_surface(src, sr),
+                        mirror: [false; 2],
+                        key,
+                    },
+                    m,
+                )? {
+                    Ok(damage) => damage,
+                    Err(hr) => return Ok(hr),
                 };
-                let options = BlitOptions {
-                    key,
-                    ..BlitOptions::default()
-                };
-                let damage = surfaces.blit(src, sr, dst, target, options, m)?;
                 if surfaces.primary_id() == Some(dst) {
                     self.present(surfaces, dst, m, damage)?;
                 }
                 0
             }
             api::BLT => {
+                if a[4] & 0x2000 != 0 {
+                    // DDBLT_KEYDEST
+                    return Ok(INVALID);
+                }
                 if a[4] & 0x400 != 0 {
                     let Some(dst) = self.surface_id(objects, a[0]) else {
                         return Ok(INVALID);
@@ -2036,14 +2113,14 @@ impl DirectDraw {
                     let clips = self.clip_list(dst);
                     let dr = if let Some(clips) = &clips {
                         let Some(dr) = unbounded(surfaces, dst, a[1], (0, 0), m)? else {
-                            return Ok(INVALID);
+                            return Ok(INVALID_RECT);
                         };
                         clips.iter().map(|&clip| written(dr, clip)).collect()
                     } else {
-                        let Ok(dr) = rect(surfaces, dst, a[1], m) else {
-                            return Ok(INVALID);
-                        };
-                        vec![dr]
+                        match rect(surfaces, dst, a[1], m) {
+                            Ok(dr) => vec![dr],
+                            Err(error) => return Ok(blt_rect_error(error)),
+                        }
                     };
                     let s = &surfaces[dst];
                     if s.locked.is_some() {
@@ -2054,8 +2131,15 @@ impl DirectDraw {
                     for dr in dr {
                         let dr = dr.clipped(bounds);
                         if !dr.empty() {
-                            surfaces.fill_raw(dst, dr, color, m)?;
-                            damage = damage.union(dr);
+                            match Self::execute_blt(
+                                surfaces,
+                                self.blt_surface(dst, dr),
+                                Blt::Fill(color),
+                                m,
+                            )? {
+                                Ok(part) => damage = damage.union(part),
+                                Err(hr) => return Ok(hr),
+                            }
                         }
                     }
                     if surfaces.primary_id() == Some(dst) {
@@ -2069,8 +2153,8 @@ impl DirectDraw {
                 ) else {
                     return Ok(INVALID);
                 };
-                // DDBLT_KEYSRC, KEYSRCOVERRIDE, ASYNC, WAIT and DONOTWAIT.
-                if a[4] & !(0x8000 | 0x10000 | 0x200 | 0x0100_0000 | 0x0800_0000) != 0 {
+                // DDBLT_DDFX, KEYSRC, KEYSRCOVERRIDE, ASYNC, WAIT and DONOTWAIT.
+                if a[4] & !(0x800 | 0x8000 | 0x10000 | 0x200 | 0x0100_0000 | 0x0800_0000) != 0 {
                     return Ok(UNSUPPORTED);
                 }
                 // An optional DDBLTFX is legal even when no effect flag selects
@@ -2084,14 +2168,26 @@ impl DirectDraw {
                         return Ok(INVALID);
                     }
                 }
+                let mirror = if a[4] & 0x800 != 0 {
+                    if a[5] == 0 {
+                        return Ok(INVALID);
+                    }
+                    let effects = m.arg_u32(a[5] + 4)?;
+                    if effects & !6 != 0 {
+                        return Ok(UNSUPPORTED);
+                    }
+                    [effects & 2 != 0, effects & 4 != 0]
+                } else {
+                    [false; 2]
+                };
                 let key = if a[4] & 0x10000 != 0 {
                     if a[5] == 0 {
                         return Ok(INVALID);
                     }
-                    Some((m.arg_u32(a[5] + 92)?, m.arg_u32(a[5] + 96)?))
+                    Some(m.arg_u32(a[5] + 92)?)
                 } else if a[4] & 0x8000 != 0 {
                     // Like Wine, a source-keyed blit needs a source key.
-                    let Some(&key) = self.color_keys.get(&(src, 8)) else {
+                    let Some(&(key, _)) = self.color_keys.get(&(src, 8)) else {
                         return Ok(INVALID);
                     };
                     Some(key)
@@ -2101,8 +2197,9 @@ impl DirectDraw {
                 if surfaces[dst].locked.is_some() || surfaces[src].locked.is_some() {
                     return Ok(BUSY);
                 }
-                let Ok(sr) = rect(surfaces, src, a[3], m) else {
-                    return Ok(INVALID);
+                let sr = match rect(surfaces, src, a[3], m) {
+                    Ok(sr) => sr,
+                    Err(error) => return Ok(blt_rect_error(error)),
                 };
                 let clips = self.clip_list(dst);
                 let origin = if surfaces.primary_id() == Some(dst) {
@@ -2114,38 +2211,34 @@ impl DirectDraw {
                 } else {
                     None
                 };
-                let dr = if let Some(origin) = origin.or(clips.as_ref().map(|_| (0, 0))) {
-                    let Some(dr) = unbounded(surfaces, dst, a[1], origin, m)? else {
-                        return Ok(INVALID);
-                    };
-                    dr
-                } else {
-                    let Ok(dr) = rect(surfaces, dst, a[1], m) else {
-                        return Ok(INVALID);
-                    };
-                    BlitRect {
-                        x: i64::from(dr.x),
-                        y: i64::from(dr.y),
-                        w: dr.w,
-                        h: dr.h,
-                    }
+                let bounds = surfaces[dst].rect();
+                let Some(dr) = unbounded(surfaces, dst, a[1], origin.unwrap_or_default(), m)?
+                else {
+                    return Ok(INVALID_RECT);
                 };
-                if dr.x + i64::from(dr.w) <= 0
-                    || dr.y + i64::from(dr.h) <= 0
-                    || dr.x >= i64::from(surfaces[dst].width)
-                    || dr.y >= i64::from(surfaces[dst].height)
-                {
-                    return Ok(0);
+                let clipped = written(dr, bounds);
+                if origin.is_none() && clips.is_none() && (clipped.w != dr.w || clipped.h != dr.h) {
+                    return Ok(INVALID_RECT);
                 }
                 let mut damage = Rect::default();
-                for clip in clips.map_or(vec![None], |clips| clips.into_iter().map(Some).collect())
-                {
-                    let options = BlitOptions {
-                        key,
-                        clip,
-                        ..BlitOptions::default()
-                    };
-                    damage = damage.union(surfaces.blit(src, sr, dst, dr, options, m)?);
+                for &clip in clips.as_deref().unwrap_or(std::slice::from_ref(&bounds)) {
+                    let part = written(dr, clip.clipped(bounds));
+                    if part.empty() {
+                        continue;
+                    }
+                    match Self::execute_blt(
+                        surfaces,
+                        self.blt_surface(dst, part),
+                        Blt::Copy {
+                            source: self.blt_surface(src, clipped_source(sr, dr, part, mirror)),
+                            mirror,
+                            key,
+                        },
+                        m,
+                    )? {
+                        Ok(part) => damage = damage.union(part),
+                        Err(hr) => return Ok(hr),
+                    }
                 }
                 if surfaces.primary_id() == Some(dst) {
                     self.present(surfaces, dst, m, damage)?;

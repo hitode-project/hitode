@@ -1,0 +1,36 @@
+# ddraw_blt_extra.c: HRESULT[:row-major hex pixels], or low:high key.
+# Columns: vid-vid, sys-sys, sys-vid, vid-sys. =N repeats column N (zero-based).
+key-mask-8	00000000:0.0.81.ff	=0	=0	=0
+supp-convert-8-to-15	00000000:0.0.4210.7fff	80004001:0.0.0.0	80004005:0.0.0.0	=2
+supp-convert-8-to-16	00000000:0.0.8410.ffff	80004001:0.0.0.0	80004005:0.0.0.0	=2
+supp-convert-8-to-32	00000000:10101.10101.818181.ffffff	80004001:0.0.0.0	80004005:0.0.0.0	=2
+supp-convert-15-to-8	80004005:0.0.0.0	80004001:0.0.0.0	=0	=0
+key-mask-15	00000000:1.1.44df.7fff	00000000:1.0.c4df.ffff	=1	=1
+copy-555-raw	00000000:1.1.44df.7fff	00000000:1.8001.c4df.ffff	=1	=1
+fill-555-raw	00000000:123.123.123.123	00000000:8123.8123.8123.8123	=0	=1
+supp-convert-15-to-16	00000000:1.1.899f.ffff	80004001:0.0.0.0	00000000:1.8001.c4df.ffff	=2
+supp-convert-15-to-32	00000000:8.8.8c31ff.ffffff	80004001:0.0.0.0	=0	80004005:0.0.0.0
+supp-convert-16-to-8	80004005:0.0.0.0	80004001:0.0.0.0	=0	=0
+supp-convert-16-to-15	00000000:1.4001.627f.7fff	80004001:0.0.0.0	00000000:1.8001.c4df.ffff	=2
+key-mask-16	00000000:0.8001.c4df.ffff	=0	=0	=0
+supp-convert-16-to-32	00000000:8.840008.c69aff.ffffff	80004001:0.0.0.0	=0	80004005:0.0.0.0
+supp-convert-32-to-8	80004005:0.0.0.0	80004001:0.0.0.0	=0	=0
+supp-convert-32-to-15	00000000:0.200.5f1b.3fff	80004001:0.0.0.0	80004005:0.0.0.0	=2
+supp-convert-32-to-16	00000000:0.400.be3b.7fff	80004001:0.0.0.0	80004005:0.0.0.0	=2
+key-mask-32	00000000:0.8001.b8c4df.7fffff	=0	=0	=0
+key-api-source-overlay	887600dc:80070057.0000dead.0000beef	=0	=0	=0
+key-api-source-overlay-range	887600dc:80070057.0000dead.0000beef	=0	=0	=0
+key-api-source-overlay-clear	00000000:80070057.0000dead.0000beef	=0	=0	=0
+key-api-dest-overlay	887600dc:887600d7.0000dead.0000beef	=0	=0	=0
+key-api-dest-overlay-range	887600dc:887600d7.0000dead.0000beef	=0	=0	=0
+key-api-dest-overlay-clear	88760104:887600d7.0000dead.0000beef	=0	=0	=0
+key-api-dest-blt-clear	00000000:887600d7.0000dead.0000beef	=0	=0	=0
+key-api-source-blt	00000000:00000000.00000001.00000001	=0	=0	=0
+key-api-source-range-clear	00000000:887600d7.0000dead.0000beef	=0	=0	=0
+keysrcoverride-distinct-bounds	00000000:0.eeeeee.2.3.100.101.102.103	=0	=0	=0
+bltfast-inverted-source	88760096:eeeeee.eeeeee.eeeeee.eeeeee.eeeeee.eeeeee.eeeeee.eeeeee	=0	=0	=0
+bltfast-out-of-bounds-source	88760096:eeeeee.eeeeee.eeeeee.eeeeee.eeeeee.eeeeee.eeeeee.eeeeee	=0	=0	=0
+clipper-dest-past-edge	00000000:1.1.1.2.101.101.101.102	00000000:1.1.2.2.101.101.102.102	=1	=1
+clipper-mirror-past-edge	00000000:1.1.1.2.101.101.101.102	00000000:2.2.1.1.102.102.101.101	=1	=1
+clipper-fill-past-edge	00000000:123456.123456.123456.123456.123456.123456.123456.123456	=0	=0	=0
+key-mask-24	-	00000000:1.0.b8c4df.7fffff	-	-

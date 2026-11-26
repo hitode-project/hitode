@@ -31,17 +31,26 @@ pub struct BltRules {
 #[derive(Clone, Copy)]
 enum ConversionSupport {
     Driver,
-    From565,
+    Upload,
     Unsupported,
-    Fail,
+    Download,
 }
 
 #[derive(Clone, Copy)]
 enum Conversion {
-    Identity = 0,
-    Expand565 = 1,
-    Pack565 = 2,
-    Grayscale = 3,
+    Identity,
+    Rgb {
+        source: Encoding,
+        destination: Encoding,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum Encoding {
+    X888 = 1,
+    Rgb555,
+    Rgb565,
+    Gray,
 }
 
 impl BltRules {
@@ -49,9 +58,9 @@ impl BltRules {
         use MemoryClass::{System, Video};
         let conversion = match (source, destination) {
             (Video, Video) => ConversionSupport::Driver,
-            (System, Video) => ConversionSupport::From565,
+            (System, Video) => ConversionSupport::Upload,
             (System, System) => ConversionSupport::Unsupported,
-            (Video, System) => ConversionSupport::Fail,
+            (Video, System) => ConversionSupport::Download,
         };
         Self { conversion }
     }
@@ -79,18 +88,44 @@ impl BltRules {
         source: PixelFormat,
         destination: PixelFormat,
     ) -> Result<Conversion, BltError> {
-        use Conversion::*;
-        use PixelFormat::{Bgra32, Indexed8, Rgb565};
-        if source == destination {
-            return Ok(Identity);
+        use PixelFormat::{Bgra32, Indexed8, Rgb555, Rgb565};
+        let both_16_bit =
+            matches!(source, Rgb555 | Rgb565) && matches!(destination, Rgb555 | Rgb565);
+        let driver = matches!(self.conversion, ConversionSupport::Driver);
+        if source == destination && !(driver && source == Rgb555) {
+            return Ok(Conversion::Identity);
         }
-        match (self.conversion, source, destination) {
-            (ConversionSupport::Driver | ConversionSupport::From565, Rgb565, Bgra32) => {
-                Ok(Expand565)
+        let convert = |source, destination| Conversion::Rgb {
+            source,
+            destination,
+        };
+        let encode = |format| match format {
+            Bgra32 => Some(Encoding::X888),
+            Rgb555 => Some(Encoding::Rgb555),
+            Rgb565 => Some(Encoding::Rgb565),
+            _ => None,
+        };
+        match self.conversion {
+            ConversionSupport::Driver => {
+                let source = if source == Indexed8 {
+                    Some(Encoding::Gray)
+                } else {
+                    encode(source)
+                };
+                source
+                    .zip(encode(destination))
+                    .map(|(source, destination)| convert(source, destination))
+                    .ok_or(BltError::ConversionFailed)
             }
-            (ConversionSupport::Driver, Bgra32, Rgb565) => Ok(Pack565),
-            (ConversionSupport::Driver, Indexed8, Bgra32) => Ok(Grayscale),
-            (ConversionSupport::Unsupported, _, _) => Err(BltError::UnsupportedConversion),
+            ConversionSupport::Upload | ConversionSupport::Download if both_16_bit => {
+                Ok(Conversion::Identity)
+            }
+            ConversionSupport::Upload
+                if destination == Bgra32 && matches!(source, Rgb555 | Rgb565) =>
+            {
+                Ok(convert(encode(source).unwrap(), Encoding::X888))
+            }
+            ConversionSupport::Unsupported => Err(BltError::UnsupportedConversion),
             _ => Err(BltError::ConversionFailed),
         }
     }
@@ -174,16 +209,42 @@ impl Axis {
 
 impl Conversion {
     fn pixel(self, raw: u32) -> u32 {
-        match self {
-            Self::Identity => raw,
-            Self::Expand565 => {
-                let r = raw >> 11;
+        let Self::Rgb {
+            source,
+            destination,
+        } = self
+        else {
+            return raw;
+        };
+        let expand5 = |n| n << 3 | n >> 2;
+        let [r, g, b] = match source {
+            Encoding::X888 => [(raw >> 16) & 255, (raw >> 8) & 255, raw & 255],
+            Encoding::Rgb555 => [
+                expand5((raw >> 10) & 31),
+                expand5((raw >> 5) & 31),
+                expand5(raw & 31),
+            ],
+            Encoding::Rgb565 => {
                 let g = (raw >> 5) & 63;
-                let b = raw & 31;
-                ((r << 3 | r >> 2) << 16) | ((g << 2 | g >> 4) << 8) | (b << 3 | b >> 2)
+                [expand5(raw >> 11), g << 2 | g >> 4, expand5(raw & 31)]
             }
-            Self::Pack565 => ((raw >> 19) & 31) << 11 | ((raw >> 10) & 63) << 5 | (raw >> 3) & 31,
-            Self::Grayscale => raw * 0x010101,
+            Encoding::Gray => [raw; 3],
+        };
+        match destination {
+            Encoding::Rgb555 => (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3),
+            Encoding::Rgb565 => (r >> 3) << 11 | (g >> 2) << 5 | (b >> 3),
+            _ => r << 16 | g << 8 | b,
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn parameters(self) -> u32 {
+        match self {
+            Self::Identity => 0,
+            Self::Rgb {
+                source,
+                destination,
+            } => source as u32 | (destination as u32) << 4,
         }
     }
 }
@@ -254,6 +315,8 @@ fn check_rect(layout: &Surface, rect: Rect) -> Result<(), BltError> {
 fn raw_mask(format: PixelFormat) -> u32 {
     if format.indexed() {
         (format.colors() - 1) as u32
+    } else if format == PixelFormat::Rgb555 {
+        0xffff
     } else {
         let (r, g, b) = format.masks();
         r | g | b
@@ -274,6 +337,13 @@ impl<P: Presenter> Surfaces<P> {
         match operation {
             Blt::DestinationKey => Err(BltError::InvalidArgument.into()),
             Blt::Fill(value) => {
+                let value = if destination_format == PixelFormat::Rgb555
+                    && destination.memory == MemoryClass::Video
+                {
+                    value & 0x7fff
+                } else {
+                    value
+                };
                 #[cfg(feature = "gpu")]
                 if self.surfaces[&destination.id]
                     .residency
@@ -299,7 +369,15 @@ impl<P: Presenter> Surfaces<P> {
                     x: rules.axis(source.rect.w, destination.rect.w, mirror[0]),
                     y: rules.axis(source.rect.h, destination.rect.h, mirror[1]),
                     key: key.map(|key| key & mask),
-                    mask,
+                    // The driver samples the 555 color without its unused bit,
+                    // but retains that bit in the key itself.
+                    mask: if src.format == PixelFormat::Rgb555
+                        && matches!(rules.conversion, ConversionSupport::Driver)
+                    {
+                        0x7fff
+                    } else {
+                        mask
+                    },
                     conversion: rules.conversion(src.format, destination_format)?,
                 };
                 #[cfg(feature = "gpu")]
@@ -331,7 +409,7 @@ impl<P: Presenter> Surfaces<P> {
         let d = self
             .cpu_access(destination.id, dr, Access::Write, memory)?
             .clone();
-        if params.direct_copy() && s.palette == d.palette {
+        if params.direct_copy() && s.format == d.format && s.palette == d.palette {
             let dr = BlitRect {
                 x: i64::from(dr.x),
                 y: i64::from(dr.y),
