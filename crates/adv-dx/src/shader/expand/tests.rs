@@ -9,7 +9,7 @@ use crate::shader::wgsl;
 use adv_device::gpu::{DrawArguments, ModernColor, ShaderStage, test_support};
 use adv_gpu::encode::{Load, Store};
 use adv_gpu::pipeline::{self, Primitive};
-use adv_gpu::resource::{BufferDesc, BufferUsage, Dimension, ImageDesc, Memory, Usage};
+use adv_gpu::resource::{BufferDesc, BufferUsage, Dimension, ImageDesc, Memory, Usage, ViewDesc};
 use adv_gpu::{Buffer, Extent, Features, Format, Image, Rect};
 use std::time::{Duration, Instant};
 
@@ -295,8 +295,12 @@ fn wait(gpu: &mut Gpu) {
 }
 
 fn pixels(gpu: &mut Gpu, image: &Image) -> Vec<u32> {
+    layer_pixels(gpu, image, 0)
+}
+
+fn layer_pixels(gpu: &mut Gpu, image: &Image, layer: u32) -> Vec<u32> {
     let read = buffer(gpu, &[0; 4096], BufferUsage::COPY_DST, Memory::Readback);
-    gpu.copy_image_to_buffer(image, 0, 0, read.buffer.clone(), 256)
+    gpu.copy_image_to_buffer(image, 0, layer, read.buffer.clone(), 256)
         .unwrap();
     wait(gpu);
     words(&read.buffer)
@@ -1031,14 +1035,44 @@ fn bins_draw_only_matching_primitives_across_chunks() {
     }
     .emit()
     .unwrap();
-    let targets: Vec<_> = (0..3).map(|_| image(&gpu, 1)).collect();
-    let bins = targets
-        .iter()
-        .enumerate()
-        .map(|(i, target)| BinDraw {
-            draw: draw(target, plan.vertex_shader(i).unwrap(), pixel.clone()),
-            fragment: SlotBindings::default(),
-            statistics: None,
+    let target = gpu
+        .device()
+        .create_image(&ImageDesc {
+            size: Extent {
+                width: 64,
+                height: 64,
+                depth_or_layers: 3,
+            },
+            dimension: Dimension::D2,
+            format: Format::Rgba8Unorm,
+            mips: 1,
+            samples: 1,
+            usage: Usage::COLOR | Usage::COPY_SRC,
+            view_formats: &[],
+            label: "expansion layer bins",
+        })
+        .unwrap();
+    let bins = (0..3)
+        .map(|i| {
+            let mut draw = draw(
+                &target,
+                plan.vertex_shader(i as usize).unwrap(),
+                pixel.clone(),
+            );
+            draw.colors[0].view = target
+                .create_view(&ViewDesc {
+                    format: None,
+                    dimension: None,
+                    mips: 0..1,
+                    layers: i..i + 1,
+                    plane: 0,
+                })
+                .unwrap();
+            BinDraw {
+                draw,
+                fragment: SlotBindings::default(),
+                statistics: None,
+            }
         })
         .collect();
     let mut command = plan
@@ -1051,8 +1085,8 @@ fn bins_draw_only_matching_primitives_across_chunks() {
     });
     assert_eq!(command.primitives_per_chunk(&caps.limits).unwrap(), 1);
     gpu.expand(command).unwrap();
-    let first = pixels(&mut gpu, &targets[0]);
-    let second = pixels(&mut gpu, &targets[1]);
+    let first = layer_pixels(&mut gpu, &target, 0);
+    let second = layer_pixels(&mut gpu, &target, 1);
     assert!(
         first
             .iter()
@@ -1060,7 +1094,7 @@ fn bins_draw_only_matching_primitives_across_chunks() {
             .all(|(&a, &b)| (a == 0) != (b == 0))
     );
     assert!(
-        pixels(&mut gpu, &targets[2])
+        layer_pixels(&mut gpu, &target, 2)
             .iter()
             .all(|&pixel| pixel == 0)
     );
@@ -1276,4 +1310,30 @@ fn counted_fragments_obey_early_depth_and_sample_frequency() {
             assert_eq!(stats.ps_invocations, 0);
         }
     }
+}
+
+#[test]
+fn typed_view_formats_specialize_only_declared_uav_slots() {
+    let gpu = gpu();
+    let ir = crate::shader::dxbc::parse(include_bytes!(
+        "../../../tests/fixtures/shader-core/typed_uav.dxbc"
+    ))
+    .unwrap();
+    let reflection = analyze(&ir);
+    let select = |storage_formats| {
+        Variant::select(
+            &reflection,
+            &DrawFacts {
+                storage_formats,
+                ..Default::default()
+            },
+            gpu.device().caps(),
+        )
+    };
+    let format = naga::StorageFormat::R32Uint;
+    let variant = select(&[(7, format), (1, format)]);
+    assert_eq!(variant.storage_formats(), &[(1, format)]);
+    assert_eq!(variant, select(&[(1, format)]));
+    assert_ne!(variant.pipeline_identity(1), variant.pipeline_identity(2));
+    assert_ne!(variant, select(&[(1, naga::StorageFormat::Rgba8Uint)]));
 }
