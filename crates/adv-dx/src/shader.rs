@@ -10,6 +10,7 @@
 //! Instruction/Source/Destination Parameter Token and Relative Addressing specs.
 //! Translation deliberately fails for semantics requiring unavailable host state.
 mod cache;
+pub mod dxbc;
 pub mod interpreter;
 mod parser;
 #[cfg(test)]
