@@ -12,7 +12,10 @@ use crate::translate::front::decode::{Alu, ESP, Op, Src};
 impl Translator<'_> {
     pub(super) fn body_call(&mut self, body: adv_cpu_core::body::DirectBody) {
         self.body_simd(false);
-        crate::translate::lower::body::emit_call(self.asm, body);
+        crate::translate::lower::body::emit_call(self.asm, body, self.features.afp);
+        if !body.fp_clean || body.reads_fp_state() {
+            self.invalidate_fp_state();
+        }
         self.body_simd(true);
     }
 
@@ -611,6 +614,7 @@ mod tests {
                         0
                     },
                 pop: 0,
+                fp_clean: false,
             };
             let mut work = Workspace::default();
             translate(

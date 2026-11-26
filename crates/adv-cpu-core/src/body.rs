@@ -94,11 +94,16 @@ pub enum Input {
 pub const EAX: u8 = 1;
 pub const EDX: u8 = 2;
 pub const ECX: u8 = 4;
+/// Guest MXCSR sticky exception flags (`MXCSR[5:0]`) ORed from
+/// `BodyResult::extra` bits `[MXCSR_FLAGS_SHIFT..MXCSR_FLAGS_SHIFT + 6)`.
+pub const MXCSR: u8 = 8;
 
 /// The body stopped: run the call again on its full path.
 pub const SLOW: u64 = 1 << 32;
 /// The body completed: commit its return and ask the owner to yield.
 pub const YIELD: u64 = 1 << 33;
+/// Bit offset of raised MXCSR sticky flags (`0x3f`) in `BodyResult::extra`.
+pub const MXCSR_FLAGS_SHIFT: u8 = 34;
 
 /// Shared host storage and thread identity, captured before native entry.
 #[repr(C)]
@@ -207,6 +212,29 @@ pub struct DirectBody {
     pub outputs: u8,
     /// Argument bytes the function's return pops.
     pub pop: u16,
+    /// Pure integer/NEON leaf body that touches no FP instructions, MXCSR, or
+    /// host C libraries, so the call site may skip host FPCR restoration and
+    /// FPSR isolation (A64-CALL-3, A64F-FP-5).
+    pub fp_clean: bool,
+}
+
+impl DirectBody {
+    /// Whether any declared input reads MXCSR or combined floating-point control state.
+    pub const fn reads_fp_state(&self) -> bool {
+        let mut i = 0;
+        while i < self.inputs.len() {
+            if matches!(self.inputs[i], Some(Input::Mxcsr | Input::FloatControl)) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Whether this body writes raised sticky exception flags back into guest MXCSR.
+    pub const fn writes_mxcsr(&self) -> bool {
+        self.outputs & MXCSR != 0
+    }
 }
 
 /// Cold preparation of fixed inputs from the bound function's guest bytes.
@@ -225,9 +253,15 @@ pub struct Body {
 #[macro_export]
 macro_rules! body {
     ($vis:vis $name:ident = $body:path, inputs: $inputs:expr, outputs: $outputs:expr, pop: $pop:expr) => {
-        $crate::body!($vis $name = $body, inputs: $inputs, outputs: $outputs, pop: $pop, inline: None);
+        $crate::body!($vis $name = $body, inputs: $inputs, outputs: $outputs, pop: $pop, inline: None, fp_clean: false);
     };
     ($vis:vis $name:ident = $body:path, inputs: $inputs:expr, outputs: $outputs:expr, pop: $pop:expr, inline: $inline:expr) => {
+        $crate::body!($vis $name = $body, inputs: $inputs, outputs: $outputs, pop: $pop, inline: $inline, fp_clean: false);
+    };
+    ($vis:vis $name:ident = $body:path, inputs: $inputs:expr, outputs: $outputs:expr, pop: $pop:expr, fp_clean: $fp_clean:expr) => {
+        $crate::body!($vis $name = $body, inputs: $inputs, outputs: $outputs, pop: $pop, inline: None, fp_clean: $fp_clean);
+    };
+    ($vis:vis $name:ident = $body:path, inputs: $inputs:expr, outputs: $outputs:expr, pop: $pop:expr, inline: $inline:expr, fp_clean: $fp_clean:expr) => {
         $vis const $name: $crate::body::Body = {
             #[allow(clippy::too_many_arguments)]
             unsafe extern "C" fn call(
@@ -242,7 +276,8 @@ macro_rules! body {
             ) -> $crate::body::BodyResult {
                 // SAFETY: generated code passes the owner's live context.
                 let mut window = unsafe { $crate::body::Window::new(&*context) };
-                $body(&mut window, [a, b, c, d, e, f, g]).into()
+                let result = $body(&mut window, [a, b, c, d, e, f, g]);
+                window.finish(result)
             }
             let declared: &[$crate::body::Input] = $inputs;
             let mut inputs = [None; 7];
@@ -258,6 +293,7 @@ macro_rules! body {
                     inputs,
                     outputs: $outputs,
                     pop: $pop,
+                    fp_clean: $fp_clean,
                 },
                 bind: None,
                 full: |memory, inputs| $body(memory, inputs),
@@ -290,6 +326,18 @@ pub trait Mem {
     fn read_page(&mut self, _page: u32) -> Result<Option<*const u8>, Stop> {
         Ok(None)
     }
+
+    /// Grant a writable 4 KiB page whose storage remains live until commit.
+    /// Returns `Ok(Some(ptr))` when reads and writes through `ptr` stay live
+    /// and coherent with other page grants; `Ok(None)` asks the caller to use
+    /// buffered/checked access instead.
+    fn write_page(&mut self, _page: u32) -> Result<Option<*mut u8>, Stop> {
+        Ok(None)
+    }
+
+    /// Record raised x86 SSE sticky exception bits (`MXCSR[5:0]`) to OR into
+    /// guest `MXCSR` when the body succeeds (and declares [`MXCSR`] in `outputs`).
+    fn raise_mxcsr(&mut self, _flags: u32) {}
 
     /// Bases that can reconstruct a page grant from its guest address.
     fn linear_bases(&self) -> [*const u8; 2] {
@@ -347,6 +395,7 @@ pub struct Window {
     classes: *const u8,
     services: Services,
     memory: *const Memory,
+    mxcsr_flags: u32,
 }
 
 impl Window {
@@ -360,6 +409,24 @@ impl Window {
             classes: context.classes,
             services: context.services,
             memory: context.memory,
+            mxcsr_flags: 0,
+        }
+    }
+
+    /// Pack a completed body result with any raised MXCSR sticky flags.
+    #[inline]
+    pub fn finish(&self, result: Result<Ret, Stop>) -> BodyResult {
+        match result {
+            Ok(ret) => BodyResult {
+                value: ret.value,
+                extra: u64::from(ret.ecx)
+                    | if ret.yield_now { YIELD } else { 0 }
+                    | (u64::from(self.mxcsr_flags & 0x3f) << MXCSR_FLAGS_SHIFT),
+            },
+            Err(_) => BodyResult {
+                value: 0,
+                extra: SLOW,
+            },
         }
     }
 
@@ -423,6 +490,22 @@ impl Mem for Window {
         } else {
             Err(Stop::Slow)
         }
+    }
+
+    #[inline]
+    fn write_page(&mut self, page: u32) -> Result<Option<*mut u8>, Stop> {
+        let at = page << PAGE_SHIFT;
+        let class = self.class(page);
+        if class & (READ | WRITE | EXEC | SHARED) == READ | WRITE {
+            self.pointer(at, class).map(Some)
+        } else {
+            Err(Stop::Slow)
+        }
+    }
+
+    #[inline]
+    fn raise_mxcsr(&mut self, flags: u32) {
+        self.mxcsr_flags |= flags & 0x3f;
     }
 
     fn linear_bases(&self) -> [*const u8; 2] {
@@ -539,6 +622,7 @@ pub struct GuestMem<'a> {
     /// Buffers this call holds.
     used: usize,
     services: Services,
+    mxcsr_flags: u32,
 }
 
 /// What the full path reuses from call to call.
@@ -557,6 +641,7 @@ impl<'a> GuestMem<'a> {
             scratch,
             used: 0,
             services: Services::default(),
+            mxcsr_flags: 0,
         }
     }
 
@@ -564,6 +649,11 @@ impl<'a> GuestMem<'a> {
         let mut mem = Self::new(cpu, scratch);
         mem.services = services;
         mem
+    }
+
+    /// Raised x86 SSE sticky exception flags (`MXCSR[5:0]`) recorded by the body.
+    pub fn mxcsr_flags(&self) -> u32 {
+        self.mxcsr_flags
     }
 
     /// The first byte of `[at, at + len)` that `prot` rules out.
@@ -612,6 +702,22 @@ impl Mem for GuestMem<'_> {
             .cpu
             .read_only_file_view(at, len as usize)
             .map(|view| view.as_ptr()))
+    }
+
+    fn write_page(&mut self, page: u32) -> Result<Option<*mut u8>, Stop> {
+        let at = page << PAGE_SHIFT;
+        let len = 1 << PAGE_SHIFT;
+        if !self.cpu.accessible(at, len, Prot::RW) {
+            return Ok(None);
+        }
+        Ok(self
+            .cpu
+            .writable_bytes(at, len as usize)
+            .map(<[u8]>::as_mut_ptr))
+    }
+
+    fn raise_mxcsr(&mut self, flags: u32) {
+        self.mxcsr_flags |= flags & 0x3f;
     }
 
     fn read<const N: usize>(&mut self, at: u32) -> Result<[u8; N], Stop> {
@@ -806,6 +912,7 @@ mod tests {
             classes: table.as_ptr(),
             services: Services::default(),
             memory: std::ptr::null(),
+            mxcsr_flags: 0,
         };
         (window, table)
     }

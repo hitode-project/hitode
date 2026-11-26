@@ -56,6 +56,8 @@ use crate::runtime::{
     field,
 };
 
+use super::fp_state;
+
 /// Byte offsets of the stubs in their code.
 pub struct Stubs {
     pub code: Vec<u32>,
@@ -113,16 +115,22 @@ const SAVED_V: [(u8, u8); 4] = [(8, 9), (10, 11), (12, 13), (14, 15)];
 /// Guest register pairs by `CpuState::regs` index.
 const GUEST: [(u8, u8); 4] = [(19, 20), (21, 22), (23, 24), (25, 26)];
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn stubs() -> Stubs {
+    stubs_for(false)
+}
+
+pub fn stubs_for(afp: bool) -> Stubs {
     let mut asm = Asm::new();
+    let fp_boundary = afp.then(|| asm.label());
     let enter = asm.offset();
-    emit_enter(&mut asm);
+    emit_enter(&mut asm, afp);
     let opt_enter = asm.offset();
-    emit_opt_enter(&mut asm);
+    emit_opt_enter(&mut asm, afp);
     let exit_label = asm.label();
     asm.bind(exit_label);
     let exit = asm.offset();
-    emit_exit(&mut asm);
+    emit_exit(&mut asm, fp_boundary);
     let fault_label = asm.label();
     asm.bind(fault_label);
     let fault = asm.offset();
@@ -134,7 +142,7 @@ pub fn stubs() -> Stubs {
     let dispatch_label = asm.label();
     asm.bind(dispatch_label);
     let dispatch = asm.offset();
-    emit_dispatch(&mut asm, HELPER, exit_label);
+    emit_dispatch(&mut asm, HELPER, exit_label, fp_boundary);
     let (lookup_label, slow_label) = (asm.label(), asm.label());
     asm.bind(lookup_label);
     let lookup = asm.offset();
@@ -142,7 +150,7 @@ pub fn stubs() -> Stubs {
     asm.bind(slow_label);
     let lookup_slow = asm.offset();
     asm.emit_all(&[mov(W, r(1), r(16)), mov(X, r(2), r(4))]);
-    emit_dispatch(&mut asm, LOOKUP_MISS, exit_label);
+    emit_dispatch(&mut asm, LOOKUP_MISS, exit_label, fp_boundary);
     let ret_miss = asm.offset();
     emit_ret_miss(&mut asm, lookup_label);
     let shadow_reset = asm.offset();
@@ -152,14 +160,22 @@ pub fn stubs() -> Stubs {
         br(Reg::LR),
     ]);
     let access = asm.offset();
-    emit_access(&mut asm, fault_label);
+    emit_access(&mut asm, fault_label, afp);
     let call = asm.offset();
-    emit_call(&mut asm);
-    let x87 = super::x87_stubs::emit(&mut asm);
+    emit_call(&mut asm, fp_boundary);
+    let x87 = super::x87_stubs::emit(&mut asm, fp_boundary);
     let opt_exit = asm.offset();
-    emit_opt_exit(&mut asm, Exit::Optimized);
+    emit_opt_exit(&mut asm, Exit::Optimized, afp);
     let resident_exit = asm.offset();
-    emit_opt_exit(&mut asm, Exit::Plan(PlanEvent::ResidentRecovery));
+    emit_opt_exit(&mut asm, Exit::Plan(PlanEvent::ResidentRecovery), afp);
+    if let Some(fp_boundary) = fp_boundary {
+        // Shared fold-FPSR + restore-host-FPCR boundary helper.
+        // Clobbers r(3)..r(5) and LR; preserves r(0)..r(2), r(6).. and NZCV.
+        asm.bind(fp_boundary);
+        fp_state::emit_fold_fpsr(&mut asm, r(3), r(4), r(5));
+        fp_state::emit_restore_host_fpcr(&mut asm, r(3), r(4));
+        asm.emit(ret(Reg::LR));
+    }
     Stubs {
         call,
         x87,
@@ -183,7 +199,7 @@ pub fn stubs() -> Stubs {
 /// x1 its argument and canonical flags. Keeps x7-x9 and x27-x29; the guest
 /// registers and flags are what the owner left in `CpuState`, x0-x6 and
 /// x13-x17 are free.
-fn emit_call(asm: &mut Asm) {
+fn emit_call(asm: &mut Asm, fp_boundary: Option<crate::asm::Label>) {
     asm.emit_all(&[
         stp(X, Pre, r(7), r(8), SP, -32),
         stp(X, Offset, r(9), Reg::LR, SP, 16),
@@ -191,6 +207,9 @@ fn emit_call(asm: &mut Asm) {
         ldr(X, r(0), RUNTIME, CPU),
     ]);
     emit_store_guest(asm, r(0));
+    if let Some(fp_boundary) = fp_boundary {
+        asm.bl(fp_boundary);
+    }
     asm.emit_all(&[
         mov(X, r(0), RUNTIME),
         mov(X, r(1), r(6)),
@@ -271,6 +290,14 @@ pub(crate) fn emit_value_call(
             [a] => vstr(VMem::Q, *a, SP, at as u32),
             _ => unreachable!(),
         });
+    }
+    if matches!(target, ValueTarget::Float(_))
+        && adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP)
+    {
+        // Only Float value calls touch MXCSR/x87/FP; Locked and StackSpan are
+        // pure-integer memory helpers (`FpClean`). Keep r(16) intact.
+        fp_state::emit_fold_fpsr(asm, r(0), r(3), r(4));
+        fp_state::emit_restore_host_fpcr(asm, r(0), r(3));
     }
     let done = access.map(|_| asm.label());
     if let Some(access) = access {
@@ -384,7 +411,7 @@ pub(crate) fn emit_restore_light(asm: &mut Asm) {
 /// wherever translated code accesses memory.
 /// Also preserves v0-v7 temporaries, the v16-v23 cache and v24-v31 x87 pairs;
 /// AAPCS64 keeps the MMX halves of v8-v15.
-fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
+fn emit_access(asm: &mut Asm, fault: crate::asm::Label, afp: bool) {
     emit_save_light(asm);
     asm.emit_all(&[
         stp_v(VSize::Q, Pre, v(0), v(1), SP, -256),
@@ -395,6 +422,14 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
         stp_v(VSize::Q, Offset, v(26), v(27), SP, 160),
         stp_v(VSize::Q, Offset, v(28), v(29), SP, 192),
         stp_v(VSize::Q, Offset, v(30), v(31), SP, 224),
+    ]);
+    if afp {
+        // r(1)..r(4) carry arguments to `access`; r(5), r(6) were saved above.
+        fp_state::emit_restore_host_fpcr(asm, r(5), r(6));
+        fp_state::emit_isolate_fpsr_before(asm, r(5), r(6));
+        asm.emit(stp(X, Pre, r(5), Reg::ZR, SP, -16));
+    }
+    asm.emit_all(&[
         mov(X, r(0), RUNTIME),
         ldr(X, r(16), RUNTIME, ACCESS),
         // The frame chain records the guest return address for samplers.
@@ -403,6 +438,13 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
         blr(r(16)),
         mov(X, r(2), r(1)),
         ldp(X, Post, RUNTIME, Reg::LR, SP, 16),
+    ]);
+    if afp {
+        // r(0) and r(2) hold `AccessResult`; r(3), r(4), r(5), r(6) are free.
+        asm.emit(ldp(X, Post, r(5), r(6), SP, 16));
+        fp_state::emit_isolate_fpsr_after(asm, r(5), r(3), r(4));
+    }
+    asm.emit_all(&[
         ldp_v(VSize::Q, Offset, v(30), v(31), SP, 224),
         ldp_v(VSize::Q, Offset, v(28), v(29), SP, 192),
         ldp_v(VSize::Q, Offset, v(26), v(27), SP, 160),
@@ -471,7 +513,12 @@ fn emit_ret_miss(asm: &mut Asm, lookup: crate::asm::Label) {
 /// `dispatch`: w1 the guest EIP, x2 a link point or 0. Calls the helper with
 /// the runtime, and continues at the unit it returns or leaves with
 /// `Exit::Dispatch` when it returns 0.
-fn emit_dispatch(asm: &mut Asm, helper: u32, exit: crate::asm::Label) {
+fn emit_dispatch(
+    asm: &mut Asm,
+    helper: u32,
+    exit: crate::asm::Label,
+    fp_boundary: Option<crate::asm::Label>,
+) {
     asm.emit_all(&[
         // The helper may empty the shadow stack.
         str(X, r(28), RUNTIME, SHADOW),
@@ -481,6 +528,11 @@ fn emit_dispatch(asm: &mut Asm, helper: u32, exit: crate::asm::Label) {
         stp(X, Offset, r(11), r(12), SP, 48),
         mrs_nzcv(r(17)),
         stp(X, Offset, r(17), Reg::LR, SP, 64),
+    ]);
+    if let Some(fp_boundary) = fp_boundary {
+        asm.bl(fp_boundary);
+    }
+    asm.emit_all(&[
         mov(X, r(0), RUNTIME),
         ldr(X, r(16), RUNTIME, helper),
         blr(r(16)),
@@ -517,8 +569,11 @@ fn emit_enter_frame(asm: &mut Asm) {
 }
 
 /// `enter(runtime: *mut Runtime, target: usize)` in x0 and x1.
-fn emit_enter(asm: &mut Asm) {
+fn emit_enter(asm: &mut Asm, afp: bool) {
     emit_enter_frame(asm);
+    if afp {
+        fp_state::emit_init_fp_boundary(asm, r(16));
+    }
     asm.emit_all(&[
         ldr(X, WINDOW, RUNTIME, WINDOW_BASE),
         ldr(X, r(28), RUNTIME, SHADOW),
@@ -531,8 +586,11 @@ fn emit_enter(asm: &mut Asm) {
 
 /// `opt_enter(runtime: *mut Runtime, target: usize)` for optimized forms,
 /// which load all live state from `opt_params` and need no guest register setup.
-fn emit_opt_enter(asm: &mut Asm) {
+fn emit_opt_enter(asm: &mut Asm, afp: bool) {
     emit_enter_frame(asm);
+    if afp {
+        fp_state::emit_init_fp_boundary(asm, r(16));
+    }
     asm.emit_all(&[
         ldr(X, r(28), RUNTIME, SHADOW),
         ldr(X, r(9), RUNTIME, COUNTDOWN),
@@ -580,9 +638,12 @@ pub(crate) fn emit_load_flags(asm: &mut Asm) {
 }
 
 /// Translated code arrives with the `Exit` in w0 and the guest EIP in w1.
-fn emit_exit(asm: &mut Asm) {
+fn emit_exit(asm: &mut Asm, fp_boundary: Option<crate::asm::Label>) {
     asm.emit_all(&[ldr(X, r(16), RUNTIME, CPU), str(W, r(1), r(16), EIP)]);
     emit_store_guest(asm, r(16));
+    if let Some(fp_boundary) = fp_boundary {
+        asm.bl(fp_boundary);
+    }
     asm.emit_all(&[
         ldr(X, r(1), RUNTIME, COMPLETED),
         sub(X, r(1), r(9), r(1), Lsl, 0),
@@ -601,7 +662,7 @@ fn emit_exit(asm: &mut Asm) {
 }
 
 // spec: A64-OPT-4, A64-OPT-6, A64-OPT-7
-fn emit_opt_exit(asm: &mut Asm, exit: Exit) {
+fn emit_opt_exit(asm: &mut Asm, exit: Exit, afp: bool) {
     let dump = offset_of!(Runtime, recovery.dump) as u32;
     // Capture before borrowing any allocatable register. x16/x17 are emission scratch.
     for n in 0..31 {
@@ -639,6 +700,12 @@ fn emit_opt_exit(asm: &mut Asm, exit: Exit) {
     ]);
     asm.b(copy);
     asm.bind(done);
+    if afp {
+        // Speculative cold recovery MUST discard uncommitted hardware FPSR
+        // rather than folding it into CpuState::mxcsr (A64-OPT-6, A64F-FP-5).
+        fp_state::emit_discard_fpsr(asm);
+        fp_state::emit_restore_host_fpcr(asm, r(16), r(17));
+    }
     asm.emit_all(&[
         movz(W, r(0), exit.word(), 0),
         ldr(X, r(1), RUNTIME, COMPLETED),

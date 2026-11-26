@@ -193,11 +193,20 @@ pub struct X87 {
     pub helper: u8,
     /// The opcode the instruction records, if it records one.
     pub opcode: Option<u16>,
+    /// For `FCOMI`/`FCOMIP`/`FUCOMI`/`FUCOMIP` (lowered with `Fast::Compare`):
+    /// `Some(quiet)` (`true` for `FUCOMI*`, `false` for signaling `FCOMI*`).
+    /// `None` for status-word `FCOM*`/`FUCOM*` and all other forms.
+    pub flag_compare: Option<bool>,
 }
 
 impl X87 {
     pub(crate) fn waits(self) -> bool {
         !matches!(self.fast, Fast::StoreControl | Fast::StoreStatus)
+    }
+
+    /// Returns `Some(quiet)` for `FCOMI`/`FCOMIP`/`FUCOMI`/`FUCOMIP`.
+    pub(crate) fn flag_compare(self) -> Option<bool> {
+        self.flag_compare
     }
 }
 

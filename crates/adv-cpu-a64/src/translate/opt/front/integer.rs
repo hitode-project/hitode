@@ -13,6 +13,23 @@ impl Front<'_> {
         if inst.call.is_some() || inst.locked.is_some() {
             return Err(Reject::Helper(self.index));
         }
+        let eax_before = self.state.regs[0];
+        let is_fnstsw_ax = matches!(
+            inst.op,
+            D::X87(x) if x.fast == adv_cpu_core::floating::fast::Fast::StoreStatus && x.mem.is_none()
+        );
+        let result = self.instruction_body(inst);
+        if result.is_ok() && !is_fnstsw_ax && self.state.regs[0] != eax_before {
+            self.state.ax_x87_cmp = None;
+        }
+        result
+    }
+
+    fn instruction_body(
+        &mut self,
+        inst: crate::translate::front::trace::Inst,
+    ) -> Result<(), Reject> {
+        use decode::Op as D;
         match inst.op {
             D::X87(x) => self.x87(x)?,
             D::Fild64(mem, _, opcode) => self.fild64(mem, opcode)?,
@@ -212,7 +229,31 @@ impl Front<'_> {
                     divisor,
                 });
             }
-            D::Value(_) | D::Body(_) | D::Syscall => return Err(Reject::Helper(self.index)),
+            D::Integer(Integer::Sahf) => {
+                if let Some((a, b, ordered, top)) = self.state.ax_x87_cmp
+                    && self.at.x87.status & 0x8000 == 0
+                {
+                    // Fold `fcom`/`fucom`/`ftst` + `fnstsw ax` + `sahf` directly into
+                    // a floating-point compare recipe. When AX is dead after `sahf`,
+                    // dead-code elimination drops the `fnstsw` status assembly.
+                    let meta = (u8::from(ordered) << 1) | ((top >> 1) & 1);
+                    self.flags(FlagKind::X87CompareFold, meta, a, b);
+                } else {
+                    let eight = self.imm(8);
+                    let ah = self.int(IntOp::Shr, self.state.regs[0], eight);
+                    let mask = self.imm(0xff);
+                    let ah = self.int(IntOp::And, ah, mask);
+                    self.flags(FlagKind::Sahf, 1, ah, ah);
+                }
+            }
+            D::Value(_) => {
+                if let Some(vx) = super::x87::value_x87(self.unit, self.index) {
+                    self.x87_value(vx)?;
+                } else {
+                    return Err(Reject::Helper(self.index));
+                }
+            }
+            D::Body(_) | D::Syscall => return Err(Reject::Helper(self.index)),
             D::Simd(s) => self.simd(s)?,
             _ => return Err(Reject::Unsupported(self.index)),
         }
@@ -244,10 +285,13 @@ impl Front<'_> {
         };
         Ok(self.mask(value, width))
     }
-    fn put_part(&mut self, dst: Part, width: u8, value: Value) -> Result<(), Reject> {
+    pub(super) fn put_part(&mut self, dst: Part, width: u8, value: Value) -> Result<(), Reject> {
         match dst {
             Part::Reg(r) => {
                 let (r, shift) = register(r, width);
+                if r == 0 {
+                    self.state.ax_x87_cmp = None;
+                }
                 let result = if width == 4 {
                     value
                 } else {

@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostFeatures(u32);
 
-const NAMES: [(&str, HostFeatures); 17] = [
+const NAMES: [(&str, HostFeatures); 18] = [
     ("flagm", HostFeatures::FLAGM),
     ("flagm2", HostFeatures::FLAGM2),
     ("afp", HostFeatures::AFP),
@@ -25,6 +25,7 @@ const NAMES: [(&str, HostFeatures); 17] = [
     ("pacg", HostFeatures::PACG),
     ("bti", HostFeatures::BTI),
     ("frintts", HostFeatures::FRINTTS),
+    ("rpres", HostFeatures::RPRES),
 ];
 
 struct Snapshot {
@@ -65,6 +66,8 @@ impl HostFeatures {
     pub const BTI: Self = Self(1 << 15);
     /// FEAT_FRINTTS (ARMv8.5-A `frint32z`/`frint32x`/`frint64z`/`frint64x`).
     pub const FRINTTS: Self = Self(1 << 16);
+    /// FEAT_RPRES (ARMv8.7-A 12-bit reciprocal estimates under `FPCR.AH=1`).
+    pub const RPRES: Self = Self(1 << 17);
 
     /// Effective capabilities, sampled once including the disable-only override.
     pub fn get() -> Self {
@@ -125,6 +128,9 @@ impl HostFeatures {
         if !self.contains(Self::SVE) {
             self.0 &= !Self::SVE2.0;
         }
+        if !self.contains(Self::AFP) {
+            self.0 &= !Self::RPRES.0;
+        }
         self
     }
 }
@@ -172,6 +178,7 @@ fn from_auxv(hwcap: u64, hwcap2: u64) -> HostFeatures {
         (HostFeatures::BF16, 14),   // HWCAP2_BF16
         (HostFeatures::BTI, 17),    // HWCAP2_BTI
         (HostFeatures::AFP, 20),    // HWCAP2_AFP
+        (HostFeatures::RPRES, 21),  // HWCAP2_RPRES
         (HostFeatures::SME, 23),    // HWCAP2_SME
     ] {
         features.insert(feature, hwcap2 & (1 << bit) != 0);
@@ -211,6 +218,7 @@ fn detect() -> HostFeatures {
         (HostFeatures::PAUTH, c"hw.optional.arm.FEAT_PAuth"),
         (HostFeatures::BTI, c"hw.optional.arm.FEAT_BTI"),
         (HostFeatures::FRINTTS, c"hw.optional.arm.FEAT_FRINTTS"),
+        (HostFeatures::RPRES, c"hw.optional.arm.FEAT_RPRES"),
     ] {
         let mut value: libc::c_int = 0;
         let mut len = std::mem::size_of_val(&value);
@@ -252,13 +260,14 @@ mod tests {
         assert_eq!(from_auxv(0, 0), HostFeatures::EMPTY);
         assert!(!from_auxv(1 << 9, 0).contains(HostFeatures::FP16));
         assert!(!from_auxv(1 << 10, 0).contains(HostFeatures::FP16));
-        assert_eq!(from_auxv(u64::MAX, u64::MAX).bits(), 0x1_ffff);
+        assert_eq!(from_auxv(u64::MAX, u64::MAX).bits(), 0x3_ffff);
         for (feature, word, bit) in [
             (HostFeatures::FLAGM, 0, 27),
             (HostFeatures::LSE2, 0, 25),
             (HostFeatures::FLAGM2, 1, 7),
             (HostFeatures::FRINTTS, 1, 8),
             (HostFeatures::AFP, 1, 20),
+            (HostFeatures::RPRES, 1, 21),
             (HostFeatures::SVE2, 1, 1),
             (HostFeatures::SME, 1, 23),
         ] {
@@ -276,6 +285,7 @@ mod tests {
         let limited = all.disable("-AFP,-flagm,-frintts,-sve,-uscat,-paca, +afp, fp16, -unknown");
         for feature in [
             HostFeatures::AFP,
+            HostFeatures::RPRES,
             HostFeatures::FLAGM,
             HostFeatures::FLAGM2,
             HostFeatures::FRINTTS,
@@ -287,6 +297,9 @@ mod tests {
             assert!(!limited.contains(feature));
         }
         assert!(limited.contains(HostFeatures::FP16));
+        let no_rpres = all.disable("-rpres");
+        assert!(no_rpres.contains(HostFeatures::AFP));
+        assert!(!no_rpres.contains(HostFeatures::RPRES));
         assert_eq!(
             HostFeatures::EMPTY.disable("+afp,flagm,all"),
             HostFeatures::EMPTY
@@ -299,6 +312,10 @@ mod tests {
     fn stable_display() {
         assert_eq!(HostFeatures::EMPTY.to_string(), "none");
         assert_eq!(from_auxv(1 << 27, 1 << 20).to_string(), "flagm,afp");
+        assert_eq!(
+            from_auxv(1 << 27, (1 << 20) | (1 << 21)).to_string(),
+            "flagm,afp,rpres"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
@@ -328,8 +345,9 @@ mod tests {
         compare!(BTI, "bti");
         #[cfg(not(target_os = "macos"))]
         compare!(PACG, "pacg");
-        // AFP has no Rust detection name; FlagM2 and SME detection macros are
-        // still unstable. Their kernel bit mappings are tested independently.
+        // AFP and RPRES have no Rust detection name; FlagM2 and SME detection
+        // macros are still unstable. Their kernel bit mappings are tested
+        // independently.
         println!(
             "host_features detected={features} enabled={}",
             HostFeatures::get()

@@ -1,8 +1,9 @@
 //! Propagation removes frame traffic and mode tests; liveness keeps only values
 //! read by execution or recovery. Floating operations remain until validation.
-mod fp_range;
+pub(in crate::translate::opt) mod fp_range;
 mod head_flags;
-mod slp;
+pub(in crate::translate::opt) mod slp;
+
 use super::{
     BTreeMap, Block, ESP, End, Facts, FlagKind, Func, Head, IntOp, IntUnary, IrRecord, Location, M,
     MAX_PLAIN_FACTS, Op, Recipe, RecordId, Source, Target, Type, Value, VecOp, VecUnary,
@@ -11,6 +12,7 @@ use super::{
 use crate::translate::front::flags::FlagSet;
 use adv_cpu_core::integer::{self, CF, OF};
 use adv_cpu_core::memory::PAGE_SIZE;
+pub(crate) use fp_range::{exact_integer_facts, exhaustive_budget_exceeded};
 
 pub(super) struct Resident<'a> {
     pub refused: &'a dyn Fn(u32) -> bool,
@@ -127,6 +129,11 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
     let f = |v: &mut Value| *v = resolve(*v, aliases);
     match op {
         Op::Constant(..) | Op::Validate | Op::ScopeWritten(_) => {}
+        Op::FpValidate { values, .. } => {
+            for v in values.iter_mut().flatten() {
+                f(v);
+            }
+        }
         Op::SseInput { a, b, .. } => {
             f(a);
             if let Some(b) = b {
@@ -147,6 +154,12 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::IntUnary(_, a)
         | Op::Bits { value: a, .. }
         | Op::FpUnary(_, a)
+        | Op::X87Sqrt { value: a, .. }
+        | Op::X87Round { value: a, .. }
+        | Op::X87Exam(a)
+        | Op::SseSqrt { a, .. }
+        | Op::SseConvert { a, .. }
+        | Op::SseScalarToInt { value: a, .. }
         | Op::VecUnary(_, a)
         | Op::VecToInt(_, a)
         | Op::VecFpToInt { value: a, .. }
@@ -155,6 +168,8 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         | Op::SsePackedToInt { value: a, .. }
         | Op::X87Store { value: a, .. }
         | Op::Load { addr: a, .. }
+        | Op::VecDeintLoad { addr: a, .. }
+        | Op::VecLoadBcast { addr: a, .. }
         | Op::PlainPage { addr: a, .. }
         | Op::PageCross { addr: a, .. }
         | Op::Host(a)
@@ -164,10 +179,20 @@ fn map_op(op: &mut Op, aliases: &[Value]) {
         Op::Int(_, a, b)
         | Op::Fp(_, a, b, _)
         | Op::X87Single(_, a, b, _)
+        | Op::X87Arith { a, b, .. }
+        | Op::X87Compare { a, b, .. }
+        | Op::X87RoundC1 { a, b, .. }
+        | Op::X87SqrtC1 {
+            input: a,
+            result: b,
+        }
+        | Op::SsePackedFp { a, b, .. }
+        | Op::SseMinMax { a, b, .. }
         | Op::Fp32(_, a, b)
         | Op::SseFp64(_, a, b)
         | Op::Vec(_, a, b)
         | Op::VecFp { a, b, .. }
+        | Op::VecFpMulElem { a, b, .. }
         | Op::X87StoreC1 {
             value: a,
             stored: b,
@@ -487,6 +512,7 @@ fn kept(kind: FlagKind) -> FlagSet {
         FlagKind::MulSigned | FlagKind::MulUnsigned | FlagKind::Rol | FlagKind::Ror => {
             FlagSet::ALL.minus(FlagSet::CF.or(FlagSet::OF))
         }
+        FlagKind::Sahf | FlagKind::X87CompareFold => FlagSet::OF,
         _ => FlagSet::NONE,
     }
 }
@@ -1180,10 +1206,11 @@ fn sse_inputs(func: &mut Func) {
     }
 
     let n = func.types.len();
+    let range_clean_f64 = fp_range::non_subnormal_f64(func);
     let mut clean_f64 = vec![3u8; n];
     let mut clean_f32 = vec![true; n];
     for &p in &func.blocks[0].params {
-        clean_f64[p.0 as usize] = 0;
+        clean_f64[p.0 as usize] = if range_clean_f64[p.0 as usize] { 1 } else { 0 };
         clean_f32[p.0 as usize] = false;
     }
     let mut is_from_int = vec![false; n];
@@ -1214,13 +1241,23 @@ fn sse_inputs(func: &mut Func) {
                 let Some(result) = result else { continue };
                 let lanes = |v: Value| clean_f64[v.0 as usize];
                 let f32_clean = |v: Value| clean_f32[v.0 as usize];
-                let mask = match op {
+                let mut mask = match op {
                     Op::Fp(..)
                     | Op::SseFp64(..)
+                    | Op::SsePackedFp { double: true, .. }
+                    | Op::SseSqrt { double: true, .. }
+                    | Op::SseConvert {
+                        kind:
+                            super::SseConvertKind::WidenScalar | super::SseConvertKind::WidenPacked,
+                        ..
+                    }
                     | Op::FromInt(_)
                     | Op::Vec(VecOp::LessF64, ..)
                     | Op::X87Load { single: true, .. }
                     | Op::X87Load { denormal: true, .. } => 3,
+                    Op::SseMinMax {
+                        double: true, a, b, ..
+                    } => lanes(a) & lanes(b),
                     Op::Constant(_, bits) => {
                         let clean = |shift| !f64::from_bits((bits >> shift) as u64).is_subnormal();
                         u8::from(clean(0)) | u8::from(clean(64)) << 1
@@ -1244,6 +1281,9 @@ fn sse_inputs(func: &mut Func) {
                     Op::Select { a, b, .. } => lanes(a) & lanes(b),
                     _ => 0,
                 };
+                if range_clean_f64[result.0 as usize] {
+                    mask |= 1;
+                }
                 let known = &mut clean_f64[result.0 as usize];
                 changed |= *known != mask;
                 *known = mask;
@@ -1251,6 +1291,19 @@ fn sse_inputs(func: &mut Func) {
                 let s_clean = match op {
                     Op::VecUnary(VecUnary::NarrowScalar, a) => is_from_int[a.0 as usize],
                     Op::VecUnary(VecUnary::FromInt4s, _) => true,
+                    Op::SsePackedFp { double: false, .. }
+                    | Op::SseSqrt { double: false, .. }
+                    | Op::SseConvert {
+                        kind:
+                            super::SseConvertKind::NarrowScalar | super::SseConvertKind::NarrowPacked,
+                        ..
+                    } => true,
+                    Op::SseMinMax {
+                        double: false,
+                        a,
+                        b,
+                        ..
+                    } => f32_clean(a) && f32_clean(b),
                     Op::Constant(_, bits) => !f32::from_bits(bits as u32).is_subnormal(),
                     Op::Vec(VecOp::MoveLow32, _, b) => f32_clean(b),
                     Op::Vec(VecOp::Insert64(true, _), a, _) => f32_clean(a),
@@ -1338,6 +1391,147 @@ fn sse_inputs(func: &mut Func) {
 }
 
 fn validations(func: &mut Func) {
+    // Pass 1 (A64-OPT-5): Decouple pure `+ − ×` `Op::Fp` DAG segments of size >= 2
+    // into explicit SSA `Op::FpValidate` ops placed before effect points and
+    // non-DAG FP consumers, validating DAG sinks and unproved multiplications
+    // instead of every intermediate addition/subtraction.
+    let mut total_uses = vec![0usize; func.types.len()];
+    for block in &func.blocks {
+        for &(_, op) in &block.insts {
+            for v in op.uses() {
+                total_uses[v.0 as usize] += 1;
+            }
+        }
+        if let End::Branch { cond, .. } = block.end {
+            total_uses[cond.0 as usize] += 1;
+        }
+        for t in block.end.targets() {
+            for &v in &t.args {
+                total_uses[v.0 as usize] += 1;
+            }
+        }
+    }
+    for record in &func.records {
+        for v in record.uses() {
+            total_uses[v.0 as usize] += 1;
+        }
+    }
+
+    let is_deferred_fp = |op: Op| {
+        matches!(
+            op,
+            Op::Fp(
+                super::FpOp::Add | super::FpOp::Sub | super::FpOp::Mul,
+                _,
+                _,
+                false
+            )
+        )
+    };
+    let is_barrier = |op: Op| {
+        matches!(
+            op,
+            Op::Store { .. }
+                | Op::FrameStore { .. }
+                | Op::Validate
+                | Op::FpValidate { .. }
+                | Op::Div { .. }
+                | Op::Fp(super::FpOp::Div, ..)
+                | Op::ToInt { .. }
+                | Op::SseScalarToInt { .. }
+                | Op::SsePackedToInt { .. }
+                | Op::VecFpToInt { .. }
+                | Op::X87Store { .. }
+                | Op::X87StoreC1 { .. }
+                | Op::X87Arith { .. }
+                | Op::X87Sqrt { .. }
+                | Op::X87Round { .. }
+                | Op::X87Compare { .. }
+                | Op::X87Exam { .. }
+                | Op::X87RoundC1 { .. }
+                | Op::X87SqrtC1 { .. }
+                | Op::SsePackedFp { .. }
+                | Op::SseMinMax { .. }
+                | Op::SseSqrt { .. }
+                | Op::SseConvert { .. }
+        ) || op.region_guard().is_some()
+            || matches!(op, Op::Flags { kind, .. } if kind.floating())
+    };
+
+    let flush_segment = |segment: &mut Vec<(Value, super::FpOp, Value, Value)>,
+                         out: &mut Vec<(Option<Value>, Op)>,
+                         deferred: &mut std::collections::BTreeSet<Value>,
+                         total_uses: &[usize]| {
+        let add_subs = segment
+            .iter()
+            .filter(|&&(_, op, ..)| matches!(op, super::FpOp::Add | super::FpOp::Sub))
+            .count();
+        if segment.len() < 3 && add_subs < 2 {
+            segment.clear();
+            return;
+        }
+        let in_seg: std::collections::BTreeSet<Value> = segment.iter().map(|&(v, ..)| v).collect();
+        let mut internal_uses = BTreeMap::<Value, usize>::new();
+        for &(_, _, a, b) in segment.iter() {
+            if in_seg.contains(&a) {
+                *internal_uses.entry(a).or_default() += 1;
+            }
+            if in_seg.contains(&b) {
+                *internal_uses.entry(b).or_default() += 1;
+            }
+        }
+        let mut to_validate: Vec<(Value, bool)> = Vec::new();
+        for &(v, fp_op, _, _) in segment.iter() {
+            deferred.insert(v);
+            let int_u = internal_uses.get(&v).copied().unwrap_or(0);
+            let is_mul = fp_op == super::FpOp::Mul;
+            let is_sink = total_uses[v.0 as usize] > int_u || int_u == 0;
+            if is_mul || is_sink {
+                to_validate.push((v, is_mul));
+            }
+        }
+        for chunk in to_validate.chunks(4) {
+            let mut values = [None; 4];
+            let mut strict = 0u8;
+            for (i, &(v, is_strict)) in chunk.iter().enumerate() {
+                values[i] = Some(v);
+                if is_strict {
+                    strict |= 1 << i;
+                }
+            }
+            out.push((None, Op::FpValidate { values, strict }));
+        }
+        segment.clear();
+    };
+
+    func.deferred_fp.clear();
+    for block in &mut func.blocks {
+        let mut segment: Vec<(Value, super::FpOp, Value, Value)> = Vec::new();
+        let mut out = Vec::with_capacity(block.insts.len());
+        for inst in std::mem::take(&mut block.insts) {
+            let (r, op) = inst;
+            if is_deferred_fp(op)
+                && let (Some(v), Op::Fp(fp_op, a, b, false)) = (r, op)
+            {
+                segment.push((v, fp_op, a, b));
+                out.push(inst);
+                continue;
+            }
+            let uses_segment =
+                !segment.is_empty() && op.uses().any(|u| segment.iter().any(|&(v, ..)| v == u));
+            if !segment.is_empty() && (is_barrier(op) || uses_segment) {
+                flush_segment(&mut segment, &mut out, &mut func.deferred_fp, &total_uses);
+            }
+            out.push(inst);
+        }
+        if !segment.is_empty() {
+            flush_segment(&mut segment, &mut out, &mut func.deferred_fp, &total_uses);
+        }
+        block.insts = out;
+    }
+
+    // Pass 2: Ensure remaining non-deferred floating ops are validated before
+    // any effect point, exit, or loop head (A64-OPT-5).
     let heads: Vec<bool> = func.blocks.iter().map(|b| b.head.is_some()).collect();
     let end_validates =
         |end: &End| matches!(end, End::Exit(_)) || end.targets().any(|t| heads[t.block.0 as usize]);
@@ -1347,8 +1541,10 @@ fn validations(func: &mut Func) {
         for (b, block) in func.blocks.iter().enumerate() {
             let mut p = pending[b];
             for (_, op) in &block.insts {
-                p = if matches!(op, Op::Validate | Op::Store { .. } | Op::FrameStore { .. })
-                    || op.region_guard().is_some()
+                p = if matches!(
+                    op,
+                    Op::Validate | Op::FpValidate { .. } | Op::Store { .. } | Op::FrameStore { .. }
+                ) || op.region_guard().is_some()
                 {
                     false
                 } else {
@@ -1379,7 +1575,11 @@ fn validations(func: &mut Func) {
                 insts.push((None, Op::Validate));
                 p = false;
             }
-            p |= inst.1.floating();
+            if matches!(inst.1, Op::Validate | Op::FpValidate { .. }) {
+                p = false;
+            } else {
+                p |= inst.1.floating();
+            }
             insts.push(inst);
         }
         if p && end_validates(&block.end) {
@@ -2273,6 +2473,7 @@ fn group_stores(
                     Op::Div { .. }
                     | Op::SseInput { .. }
                     | Op::Validate
+                    | Op::FpValidate { .. }
                     | Op::FrameStore { .. }
                     | Op::PageCross { .. },
                 ) => false,

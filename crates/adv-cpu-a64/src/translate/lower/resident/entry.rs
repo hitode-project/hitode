@@ -8,7 +8,7 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::policy::proved::RowPrice;
 use crate::runtime::{self, Exit, PlanEvent};
-use crate::translate::lower::stubs;
+use crate::translate::lower::{fp_state, stubs};
 
 /// These counters are private to one version and written only by the owner.
 #[derive(Default)]
@@ -339,6 +339,11 @@ fn observe(asm: &mut Asm, head: u32, version: usize, kind: u16) {
     stubs::emit_save_light(asm);
     asm.emit(ldr(X, r(0), RT, runtime::CPU_STATE));
     stubs::emit_store_guest(asm, r(0));
+    if adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP) {
+        // r(14) may carry the sampled edge; r(3)..r(5) are free.
+        fp_state::emit_fold_fpsr(asm, r(3), r(4), r(5));
+        fp_state::emit_restore_host_fpcr(asm, r(3), r(4));
+    }
     constant(asm, r(1), u64::from(head));
     asm.emit_all(&[
         mov(X, r(0), RT),
@@ -639,6 +644,10 @@ fn sample_offer(
     }
     asm.bind(leave);
     stubs::emit_save_light(asm);
+    if adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::AFP) {
+        fp_state::emit_fold_fpsr(asm, r(3), r(4), r(5));
+        fp_state::emit_restore_host_fpcr(asm, r(3), r(4));
+    }
     constant(asm, r(1), u64::from(head));
     asm.emit_all(&[
         mov(X, r(0), RT),

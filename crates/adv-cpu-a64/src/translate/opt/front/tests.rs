@@ -951,7 +951,7 @@ fn rejects_unproved_modes_escaping_frames_and_unsupported_forms() {
             a.fstp(qword_ptr(edi)).unwrap();
         })
     });
-    for control in [0x037f, 0x067f] {
+    for control in [0x027e, 0x017f] {
         let mut at = initial();
         at.x87.control = control;
         assert!(matches!(rejected(&arithmetic, &at), Reject::Mode(_)));
@@ -1356,7 +1356,7 @@ fn a_refused_instruction_on_a_cold_path_leaves_there() {
         });
         a.jmp(done).unwrap();
         a.set_label(&mut cold).unwrap();
-        a.cvtss2si(eax, xmm0).unwrap();
+        a.movapd(xmm0, xmmword_ptr(esi)).unwrap();
         a.jmp(back).unwrap();
         a.set_label(&mut done).unwrap();
         a.nop().unwrap();
@@ -4069,4 +4069,740 @@ fn phase1_domain_guard_recognizes_dec_jne_countdown_loop() {
             "no unproved Op::X87Store should remain for DEC/JNE pc={pc_ctrl:#x}"
         );
     }
+}
+
+// spec: A64-OPT-4, A64-OPT-5, A64-OPT-6
+#[test]
+fn track_d_ssa_fp_validate_and_direct_extract32_store() {
+    // 1) Pure `+ −` DAG decouples validation into `Op::FpValidate` at the sink,
+    // handles normal values, exact `±0.0` cancellation, and fails cleanly on overflow/NaN.
+    let dag = assemble(|a| {
+        row(a, |a| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fadd(qword_ptr(esi + 8)).unwrap();
+            a.fsub(qword_ptr(esi + 16)).unwrap();
+            a.fadd(qword_ptr(esi + 24)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    for (vals, expect_fail) in [
+        ([1.25f64, 2.5, 0.75, 4.0], false),
+        ([3.0, 2.0, 5.0, 0.0], false),    // exact 0.0 sink
+        ([1e308, 1e308, 0.0, 1.0], true), // overflow in intermediate Add propagates to sink
+    ] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = compare(
+            &dag,
+            &at,
+            |m| {
+                for (i, v) in vals.iter().enumerate() {
+                    m.write(DATA + i as u32 * 8, &v.to_le_bytes()).unwrap();
+                }
+            },
+            expect_fail,
+        );
+        assert!(
+            count(&built, |op| matches!(op, Op::FpValidate { .. })) >= 1,
+            "pure Add/Sub DAG must emit explicit SSA Op::FpValidate"
+        );
+        assert!(
+            !built.func.deferred_fp.is_empty(),
+            "pure Add/Sub DAG must mark intermediate/sink Op::Fp as deferred"
+        );
+    }
+
+    // 2) `movss [edi], xmm0` stores directly from V register (no GPR round-trip).
+    let store_ss = assemble(|a| {
+        row(a, |a| {
+            a.movss(xmm0, dword_ptr(esi)).unwrap();
+            a.addss(xmm0, dword_ptr(esi + 4)).unwrap();
+            a.movss(dword_ptr(edi), xmm0).unwrap();
+        })
+    });
+    let mut at = initial();
+    at.regs[1] = 1;
+    at.mxcsr = 0x1fa0;
+    let built = differential(&store_ss, &at, |m| {
+        m.write(DATA, &1.5f32.to_le_bytes()).unwrap();
+        m.write(DATA + 4, &2.25f32.to_le_bytes()).unwrap();
+    });
+    let lowered = super::super::back::lower(&built.func);
+    // `vstr_reg(VMem::S, ...)` has top bits 0xBC20_6800 (size=10, V=1, opc=00).
+    assert!(
+        lowered
+            .words
+            .iter()
+            .any(|&w| (w & 0xffe0_fc00) == 0xbc20_6800 || (w & 0xffe0_fc00) == 0xbc20_4800),
+        "expected direct VMem::S store for single-use Extract32"
+    );
+}
+
+// spec: A64-OPT-4, A64-OPT-5, A64F-FP-5
+#[test]
+fn track_d_admits_x87_pc64_directed_rounding_sqrt_round_and_merge_c1() {
+    // 1) PC64 (0x037f): exact f64 arithmetic stays in opt; inexact bails cleanly.
+    let pc64 = assemble(|a| {
+        row(a, |a| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fadd(qword_ptr(esi + 8)).unwrap();
+            a.fmul(qword_ptr(esi + 16)).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    for (vals, expect_fail) in [
+        ([1.5f64, 2.25, 4.0], false),         // exact
+        ([1.0, 2.0f64.powi(-53), 1.0], true), // inexact -> bails to 80-bit
+    ] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = 0x037f;
+        at.x87.status = 0x20;
+        let built = compare(
+            &pc64,
+            &at,
+            |m| {
+                for (i, v) in vals.iter().enumerate() {
+                    m.write(DATA + i as u32 * 8, &v.to_le_bytes()).unwrap();
+                }
+            },
+            expect_fail,
+        );
+        assert!(count(&built, |op| matches!(op, Op::X87Arith { pc: 3, .. })) >= 2);
+    }
+
+    // 2) Directed rounding (RD=0x067f, RU=0x0a7f, RZ=0x0e7f) for PC53, PC24, and f32 store.
+    let directed = assemble(|a| {
+        row(a, |a| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fadd(qword_ptr(esi + 8)).unwrap();
+            a.fstp(dword_ptr(edi)).unwrap();
+        })
+    });
+    for (control, rhs, expect_fail) in [
+        (0x067fu16, -0.3f64, false),
+        (0x0a7f, -0.3f64, false),
+        (0x0e7f, -0.3f64, false),
+        (0x047f, f64::from(-0.3f32), false),
+        (0x087f, f64::from(-0.3f32), false),
+        (0x0c7f, f64::from(-0.3f32), false),
+        (0x047f, -0.3f64, true), // non-binary32 operand under PC24 bails cleanly
+    ] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = control;
+        at.x87.status = 0x20;
+        compare(
+            &directed,
+            &at,
+            |m| {
+                m.write(DATA, &1.0f64.to_le_bytes()).unwrap();
+                m.write(DATA + 8, &rhs.to_le_bytes()).unwrap();
+            },
+            expect_fail,
+        );
+    }
+
+    // 3) `fsqrt` and `frndint` across rounding modes (resident path; synthetic
+    // range proof does not model `fsqrt`/`frndint`).
+    let sqrt_rnd = assemble(|a| {
+        row(a, |a| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fsqrt().unwrap();
+            a.frndint().unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    for control in [0x027fu16, 0x067f, 0x0a7f, 0x0e7f] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.control = control;
+        at.x87.status = 0x20;
+        let mut mem_opt = memory(&sqrt_rnd);
+        mem_opt.write(DATA, &2.0f64.to_le_bytes()).unwrap();
+        let unit = resident_unit(&sqrt_rnd);
+        let built = build_with(&unit, None, &at, &|_| false, &|_| false).unwrap();
+        assert_eq!(verify::verify(&built.func), Ok(()));
+        super::super::back::lower_resident(&built.func, &built.assumed, &built.func.entry, false);
+        let run = eval::run(
+            &built.func,
+            &params(&built.func, &at, &mut mem_opt),
+            &mut mem_opt,
+            1000,
+        );
+        assert!(matches!(run.outcome, eval::Outcome::Exit(_)));
+        let mut mem_ref = memory(&sqrt_rnd);
+        mem_ref.write(DATA, &2.0f64.to_le_bytes()).unwrap();
+        let mut ref_cpu = at.clone();
+        let stop = CODE + sqrt_rnd.len() as u32;
+        let mut interp = Interpreter::new();
+        while ref_cpu.eip != stop {
+            assert_eq!(interp.step(&mut ref_cpu, &mut mem_ref), Step::Executed);
+        }
+        let mut opt_out = [0u8; 8];
+        let mut ref_out = [0u8; 8];
+        mem_opt.read_into(DATA + 256, &mut opt_out).unwrap();
+        mem_ref.read_into(DATA + 256, &mut ref_out).unwrap();
+        assert_eq!(opt_out, ref_out, "control={control:#06x}");
+        assert_eq!(count(&built, |op| matches!(op, Op::X87Sqrt { .. })), 1);
+        assert_eq!(count(&built, |op| matches!(op, Op::X87Round { .. })), 1);
+    }
+
+    // 4) `merge_c1` joins two distinct `C1::Round` recipes (Add vs Mul) without Reject::StaticX87.
+    let merge_round = assemble(|a| {
+        row(a, |a| {
+            let mut mul_arm = a.create_label();
+            let mut join = a.create_label();
+            a.mov(eax, dword_ptr(esi + 16)).unwrap();
+            a.fld(qword_ptr(esi)).unwrap();
+            a.test(eax, eax).unwrap();
+            a.jnz(mul_arm).unwrap();
+            a.fadd(qword_ptr(esi + 8)).unwrap();
+            a.jmp(join).unwrap();
+            a.set_label(&mut mul_arm).unwrap();
+            a.fmul(qword_ptr(esi + 8)).unwrap();
+            a.set_label(&mut join).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+        })
+    });
+    for selector in [0u32, 1] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        differential(&merge_round, &at, |m| {
+            m.write(DATA, &1.5f64.to_le_bytes()).unwrap();
+            m.write(DATA + 8, &(1.0 + f64::EPSILON * 0.75).to_le_bytes())
+                .unwrap();
+            m.write(DATA + 16, &selector.to_le_bytes()).unwrap();
+        });
+    }
+}
+
+// spec: A64-OPT-4, A64-OPT-6
+#[test]
+fn track_d_admits_x87_compares_sahf_fold_fcomi_fcmov_ftst_fxam() {
+    let run_resident = |code: &[u8], at: &CpuState, init: &dyn Fn(&mut Memory)| -> Built {
+        let mut mem_opt = memory(code);
+        init(&mut mem_opt);
+        let unit = resident_unit(code);
+        let built = build_with(&unit, None, at, &|_| false, &|_| false).unwrap();
+        assert_eq!(verify::verify(&built.func), Ok(()));
+        super::super::back::lower_resident(&built.func, &built.assumed, &built.func.entry, false);
+        let run = eval::run(
+            &built.func,
+            &params(&built.func, at, &mut mem_opt),
+            &mut mem_opt,
+            1000,
+        );
+        let eval::Outcome::Exit(id) = run.outcome else {
+            panic!("expected normal exit, got {:?}", run.outcome);
+        };
+        let mut mem_ref = memory(code);
+        init(&mut mem_ref);
+        let mut ref_cpu = at.clone();
+        let stop = CODE + code.len() as u32;
+        let mut interp = Interpreter::new();
+        while ref_cpu.eip != stop {
+            assert_eq!(interp.step(&mut ref_cpu, &mut mem_ref), Step::Executed);
+        }
+        let mut opt_out = [0u8; 32];
+        let mut ref_out = [0u8; 32];
+        mem_opt.read_into(DATA + 256, &mut opt_out).unwrap();
+        mem_ref.read_into(DATA + 256, &mut ref_out).unwrap();
+        assert_eq!(opt_out, ref_out, "output memory mismatch for exit {id:?}");
+        built
+    };
+
+    // 1) `fcom` + `fnstsw ax` + `sahf` folds to `FlagKind::X87CompareFold` when AX is dead.
+    let fcom_sahf = assemble(|a| {
+        row(a, |a| {
+            let mut less = a.create_label();
+            let mut done = a.create_label();
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fcomp(qword_ptr(esi + 8)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.sahf().unwrap();
+            a.jb(less).unwrap();
+            a.mov(eax, 0).unwrap();
+            a.jmp(done).unwrap();
+            a.set_label(&mut less).unwrap();
+            a.mov(eax, 1).unwrap();
+            a.set_label(&mut done).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+        })
+    });
+    for (x, y) in [(1.0f64, 2.0f64), (2.0, 2.0), (3.0, 2.0)] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = run_resident(&fcom_sahf, &at, &|m| {
+            m.write(DATA, &x.to_le_bytes()).unwrap();
+            m.write(DATA + 8, &y.to_le_bytes()).unwrap();
+        });
+        assert!(
+            count(&built, |op| matches!(
+                op,
+                Op::Flags {
+                    kind: FlagKind::X87CompareFold,
+                    ..
+                }
+            )) >= 1,
+            "expected fcom+fnstsw+sahf fold"
+        );
+    }
+
+    // 2) `fcomi` + `fcmovb` + `ftst` + `fxam` + `fucomip` (via `Fast::Compare` with `flag_compare`).
+    let x87_misc = assemble(|a| {
+        row(a, |a| {
+            a.fld(qword_ptr(esi + 8)).unwrap();
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fcomi(st0, st1).unwrap();
+            a.fcmovb(st0, st1).unwrap();
+            a.ftst().unwrap();
+            a.fxam().unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(dword_ptr(edi), eax).unwrap();
+            a.fucomip(st0, st1).unwrap();
+            a.setb(al).unwrap();
+            a.movzx(eax, al).unwrap();
+            a.mov(dword_ptr(edi + 16), eax).unwrap();
+            a.fstp(qword_ptr(edi + 8)).unwrap();
+        })
+    });
+    for (x, y) in [(1.5f64, 3.5f64), (4.5, 2.0), (-0.0, -2.5), (0.0, 0.0)] {
+        let mut at = initial();
+        at.regs[1] = 1;
+        at.x87.status = 0x20;
+        let built = run_resident(&x87_misc, &at, &|m| {
+            m.write(DATA, &x.to_le_bytes()).unwrap();
+            m.write(DATA + 8, &y.to_le_bytes()).unwrap();
+        });
+        assert!(count(&built, |op| matches!(op, Op::X87Exam(_))) >= 1);
+        assert!(
+            count(&built, |op| matches!(
+                op,
+                Op::Flags {
+                    kind: FlagKind::OrderedCompare,
+                    width: 10,
+                    ..
+                }
+            )) >= 1
+        );
+        assert!(
+            count(&built, |op| matches!(
+                op,
+                Op::Flags {
+                    kind: FlagKind::UnorderedCompare,
+                    width: 10,
+                    ..
+                }
+            )) >= 1
+        );
+    }
+}
+
+// spec: A64-OPT-4, A64F-FP-5
+#[test]
+fn track_d_admits_sse_compares_packed_fp_minmax_sqrt_and_cvt() {
+    let sse_suite = assemble(|a| {
+        row(a, |a| {
+            a.movups(xmm0, xmmword_ptr(esi)).unwrap();
+            a.movups(xmm1, xmmword_ptr(esi + 16)).unwrap();
+            a.addps(xmm2, xmm0).unwrap();
+            a.mulps(xmm2, xmm1).unwrap();
+            a.minps(xmm2, xmm1).unwrap();
+            a.maxps(xmm2, xmm0).unwrap();
+            a.sqrtps(xmm2, xmm2).unwrap();
+            a.cvtps2pd(xmm3, xmm2).unwrap();
+            a.addpd(xmm3, xmm3).unwrap();
+            a.minsd(xmm3, xmm3).unwrap();
+            a.sqrtsd(xmm3, xmm3).unwrap();
+            a.cvtpd2ps(xmm4, xmm3).unwrap();
+            a.cvtss2sd(xmm5, xmm4).unwrap();
+            a.cvtsd2ss(xmm5, xmm5).unwrap();
+            a.ucomiss(xmm0, xmm1).unwrap();
+            a.setb(al).unwrap();
+            a.comiss(xmm1, xmm0).unwrap();
+            a.seta(bl).unwrap();
+            a.cvtss2si(edx, xmm4).unwrap();
+            a.cvtsd2si(ebp, xmm3).unwrap();
+            a.movups(xmmword_ptr(edi), xmm2).unwrap();
+            a.mov(dword_ptr(edi + 16), edx).unwrap();
+            a.mov(dword_ptr(edi + 20), ebp).unwrap();
+        })
+    });
+    let mut at = initial();
+    at.regs[1] = 1;
+    at.mxcsr = 0x1fa0;
+    at.xmm[2] = [0u8; 16];
+    let init = |m: &mut Memory| {
+        for (i, v) in [1.0f32, 4.0, 9.0, 16.0].iter().enumerate() {
+            m.write(DATA + i as u32 * 4, &v.to_le_bytes()).unwrap();
+        }
+        for (i, v) in [2.0f32, 3.0, 5.0, 7.0].iter().enumerate() {
+            m.write(DATA + 16 + i as u32 * 4, &v.to_le_bytes()).unwrap();
+        }
+    };
+    let mut mem_opt = memory(&sse_suite);
+    init(&mut mem_opt);
+    let mut unit = Unit::default();
+    unit.build(
+        &mut mem_opt,
+        CODE,
+        &[CODE + sse_suite.len() as u32],
+        &|_, _| None,
+        &|_| None,
+        true,
+    );
+    let built = build_with(&unit, None, &at, &|_| false, &|_| false).unwrap();
+    assert_eq!(verify::verify(&built.func), Ok(()));
+    super::super::back::lower_resident(&built.func, &built.assumed, &built.func.entry, false);
+    let run = eval::run(
+        &built.func,
+        &params(&built.func, &at, &mut mem_opt),
+        &mut mem_opt,
+        1000,
+    );
+    assert!(matches!(run.outcome, eval::Outcome::Exit(_)));
+    let mut mem_ref = memory(&sse_suite);
+    init(&mut mem_ref);
+    let mut ref_cpu = at.clone();
+    let stop = CODE + sse_suite.len() as u32;
+    let mut interp = Interpreter::new();
+    while ref_cpu.eip != stop {
+        assert_eq!(interp.step(&mut ref_cpu, &mut mem_ref), Step::Executed);
+    }
+    let mut opt_out = [0u8; 24];
+    let mut ref_out = [0u8; 24];
+    mem_opt.read_into(DATA + 256, &mut opt_out).unwrap();
+    mem_ref.read_into(DATA + 256, &mut ref_out).unwrap();
+    assert_eq!(opt_out, ref_out);
+    assert!(count(&built, |op| matches!(op, Op::SsePackedFp { .. })) >= 3);
+    assert!(count(&built, |op| matches!(op, Op::SseMinMax { .. })) >= 3);
+    assert!(count(&built, |op| matches!(op, Op::SseSqrt { .. })) >= 2);
+    assert!(count(&built, |op| matches!(op, Op::SseConvert { .. })) >= 4);
+    assert!(count(&built, |op| matches!(op, Op::SseScalarToInt { .. })) >= 2);
+}
+
+fn wave2c_compile_resident(
+    body: impl FnOnce(&mut CodeAssembler, CodeLabel),
+    at: &CpuState,
+) -> (Built, super::super::back::Lowered) {
+    let code = assemble(|a| {
+        let mut head = a.create_label();
+        a.set_label(&mut head).unwrap();
+        body(a, head);
+    });
+    let unit = resident_unit(&code);
+    let mut at = at.clone();
+    at.eip = CODE;
+    let built = build_with_domains(&unit, None, &at, &|_| false, &|_| false, &|_| false)
+        .expect("resident form builds");
+    assert_eq!(verify::verify(&built.func), Ok(()));
+    let lowered =
+        super::super::back::lower_resident(&built.func, &built.assumed, &built.func.entry, false);
+    (built, lowered)
+}
+
+fn wave2c_fp_state(control: u16) -> CpuState {
+    let mut at = initial();
+    at.regs = [
+        0,
+        32,
+        0,
+        DATA + 0x800,
+        FRAME,
+        DATA + 0x80,
+        DATA,
+        DATA + 0x400,
+    ];
+    at.x87.control = control;
+    at.x87.status = 0x20;
+    at
+}
+
+// spec: A64-MEM-1, A64-OPT-4, A64-OPT-5, A64-OPT-6
+#[test]
+fn wave2c_hoisted_fp_neg_abs_masks_unroll2_ldp_stp_ld1r_fmul_elem_and_fcmp_zero() {
+    use super::super::loops;
+
+    // 1) f32 strip with fabs + fchs + * st(1) (by-element FMUL) + [ebx] (stride==0 LD1R)
+    let mut at = wave2c_fp_state(0x003f);
+    at.x87
+        .push(adv_cpu_core::floating::fast::extended(f64::from(1.25f32)));
+    let (built, lowered) = wave2c_compile_resident(
+        |a, head| {
+            a.fld(dword_ptr(esi)).unwrap();
+            a.fabs().unwrap();
+            a.fchs().unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fadd(dword_ptr(ebx)).unwrap();
+            a.fstp(dword_ptr(edi)).unwrap();
+            a.add(esi, 4).unwrap();
+            a.add(edi, 4).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at,
+    );
+    let batches = loops::plan(&built.func, &[&loops::vector::Vector]);
+    assert_eq!(batches.len(), 1, "expected FP vector strip plan");
+    assert!(
+        batches[0].plan.body.has_unroll2(),
+        "expected 2x unrolled FP strip body"
+    );
+
+    let is_ldp_q = |w: u32| (w & 0xffc0_0000) == 0xad40_0000;
+    let is_stp_q = |w: u32| (w & 0xffc0_0000) == 0xad00_0000;
+    let is_vld1r = |w: u32| (w & 0xbfff_f000) == 0x0d40_c000;
+    let is_vfmul_elem = |w: u32| (w & 0xbf80_f400) == 0x0f80_9000;
+    let is_sign_mask_movz =
+        |w: u32| (w & 0xffe0_0000) == 0x52a0_0000 && matches!((w >> 5) & 0xffff, 0x8000 | 0x7fff);
+
+    let first_ldp_q = lowered
+        .words
+        .iter()
+        .position(|&w| is_ldp_q(w))
+        .expect("expected 2x unroll LDP Q load");
+    let last_stp_q = lowered
+        .words
+        .iter()
+        .rposition(|&w| is_stp_q(w))
+        .expect("expected 2x unroll STP Q store");
+    assert!(
+        lowered.words.iter().any(|&w| is_vld1r(w)),
+        "expected LD1R for stride==0 broadcast load"
+    );
+    assert!(
+        lowered.words.iter().any(|&w| is_vfmul_elem(w)),
+        "expected by-element FMUL for vector * loop-invariant scalar"
+    );
+    let mask_positions: Vec<usize> = lowered
+        .words
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &w)| is_sign_mask_movz(w).then_some(idx))
+        .collect();
+    assert!(
+        !mask_positions.is_empty(),
+        "expected sign-mask MOVZ materialization for fabs/fchs"
+    );
+    assert!(
+        mask_positions.iter().all(|&pos| pos < first_ldp_q),
+        "sign-mask MOVZ must be hoisted into preheader before the inner loop (masks={mask_positions:?}, first_ldp_q={first_ldp_q})"
+    );
+    assert!(
+        !lowered.words[first_ldp_q..=last_stp_q]
+            .iter()
+            .any(|&w| is_sign_mask_movz(w)),
+        "sign-mask MOVZ must not appear inside the unrolled strip loop"
+    );
+
+    // 2) AoS 2-, 3- (out-of-order channels), and 4-channel float strip loads emit LD2/LD3/LD4.
+    let at_aos = wave2c_fp_state(0x003f);
+    for (channels, offsets, expected_op) in [
+        (2u32, vec![0i32, 4], 0x8000u32),
+        (3u32, vec![8, 0, 4], 0x4000u32),
+        (4u32, vec![0, 4, 8, 12], 0x0000u32),
+    ] {
+        let stride = (channels * 4) as i32;
+        let (_, lowered_aos) = wave2c_compile_resident(
+            |a, head| {
+                a.fld(dword_ptr(esi + offsets[0])).unwrap();
+                for &off in &offsets[1..] {
+                    a.fadd(dword_ptr(esi + off)).unwrap();
+                }
+                a.fstp(dword_ptr(edi)).unwrap();
+                a.add(esi, stride).unwrap();
+                a.add(edi, 4).unwrap();
+                a.dec(ecx).unwrap();
+                a.jne(head).unwrap();
+            },
+            &at_aos,
+        );
+        assert!(
+            lowered_aos
+                .words
+                .iter()
+                .any(|&w| (w & 0xbfff_f000) == (0x0c40_0000 | expected_op)),
+            "expected LD{channels} interleaved load for {channels}-channel AoS offsets {offsets:?}"
+        );
+    }
+
+    // 3) Zero comparison (`ftst`) lowers via `FCMP #0.0` / `FCMPE #0.0`.
+    let at_cmp = wave2c_fp_state(0x023f);
+    let (_, lowered_cmp) = wave2c_compile_resident(
+        |a, head| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.ftst().unwrap();
+            a.fnstsw(ax).unwrap();
+            a.fstp(st0).unwrap();
+            a.mov(word_ptr(edi), ax).unwrap();
+            a.add(esi, 8).unwrap();
+            a.add(edi, 2).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at_cmp,
+    );
+    assert!(
+        lowered_cmp
+            .words
+            .iter()
+            .any(|&w| (w & 0xffbf_fc0f) == 0x1e20_2008),
+        "expected FCMP/FCMPE #0.0 for floating zero comparison"
+    );
+}
+
+// spec: A64-MEM-1, A64-OPT-4, A64-OPT-5, A64-OPT-6
+#[test]
+fn wave2c_pow2_div_to_mul_loop_reduction_and_a64_mem1_guard_band_vs_compact() {
+    use super::super::loops;
+
+    // 1) Proved power-of-2 division on bounded integer-converted f64 -> Mul by 2^-k,
+    // while unproved general f64 division stays Div.
+    let at = wave2c_fp_state(0x023f);
+    let (built_proved, _) = wave2c_compile_resident(
+        |a, head| {
+            a.movzx(eax, byte_ptr(esi)).unwrap();
+            a.mov(dword_ptr(esp + 0x10), eax).unwrap();
+            a.fild(dword_ptr(esp + 0x10)).unwrap();
+            a.fld1().unwrap();
+            a.fadd_2(st0, st0).unwrap(); // 2.0
+            a.fadd_2(st0, st0).unwrap(); // 4.0
+            a.fdivp(st1, st0).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+            a.inc(esi).unwrap();
+            a.add(edi, 8).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at,
+    );
+    assert_eq!(
+        count(&built_proved, |op| matches!(
+            op,
+            Op::Fp(FpOp::Div, ..) | Op::X87Single(FpOp::Div, ..) | Op::SseFp64(FpOp::Div, ..)
+        )),
+        0,
+        "proved bounded u8 / 4.0 must eliminate Op::Fp(Div)"
+    );
+    assert!(
+        count(&built_proved, |op| matches!(op, Op::Fp(FpOp::Mul, ..))) >= 1,
+        "proved bounded u8 / 4.0 must rewrite to Op::Fp(Mul) by 0.25"
+    );
+
+    let (built_unproved, _) = wave2c_compile_resident(
+        |a, head| {
+            a.fld(qword_ptr(esi)).unwrap();
+            a.fld1().unwrap();
+            a.fadd_2(st0, st0).unwrap(); // 2.0
+            a.fdivp(st1, st0).unwrap();
+            a.fstp(qword_ptr(edi)).unwrap();
+            a.add(esi, 8).unwrap();
+            a.add(edi, 8).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at,
+    );
+    assert!(
+        count(&built_unproved, |op| matches!(op, Op::Fp(FpOp::Div, ..))) >= 1,
+        "unproved general f64 / 2.0 must NOT rewrite to Mul"
+    );
+
+    // 2) Loop exact-integer reduction vectorizes (`sfaddp`), while general float loop
+    // reduction is strictly REJECTED.
+    let mut at_red = wave2c_fp_state(0x023f);
+    at_red.x87.push(adv_cpu_core::floating::fast::extended(0.0));
+    let (built_int_red, lowered_int_red) = wave2c_compile_resident(
+        |a, head| {
+            a.fild(dword_ptr(esi)).unwrap();
+            a.faddp(st1, st0).unwrap();
+            a.add(esi, 4).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at_red,
+    );
+    assert_eq!(
+        loops::plan(&built_int_red.func, &[&loops::vector::Vector]).len(),
+        1,
+        "exact-integer i32->f64 loop reduction must vectorize"
+    );
+    let is_sfaddp = |w: u32| (w & 0xffbf_fc00) == 0x7e30_d800;
+    assert!(
+        lowered_int_red.words.iter().any(|&w| is_sfaddp(w)),
+        "expected scalar pairwise FADDP in exact-integer reduction epilogue"
+    );
+
+    let (built_float_red, _) = wave2c_compile_resident(
+        |a, head| {
+            a.fadd(qword_ptr(esi)).unwrap();
+            a.add(esi, 8).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(head).unwrap();
+        },
+        &at_red,
+    );
+    assert!(
+        loops::plan(&built_float_red.func, &[&loops::vector::Vector]).is_empty(),
+        "general float loop reduction MUST NOT be vectorized/reassociated"
+    );
+
+    // 3) A64-MEM-1 guard-band immediate folding & LDP/STP on non-compact vs compact layout.
+    let at_mem = wave2c_fp_state(0x023f);
+    let build_mem_loop = || {
+        wave2c_compile_resident(
+            |a, head| {
+                a.mov(eax, dword_ptr(esi)).unwrap();
+                a.mov(edx, dword_ptr(esi + 4)).unwrap();
+                a.add(eax, dword_ptr(esi + 16)).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+                a.mov(dword_ptr(edi + 4), edx).unwrap();
+                a.mov(dword_ptr(edi + 8), eax).unwrap();
+                a.mov(dword_ptr(edi + 12), edx).unwrap();
+                a.add(esi, 20).unwrap();
+                a.add(edi, 16).unwrap();
+                a.dec(ecx).unwrap();
+                a.jne(head).unwrap();
+            },
+            &at_mem,
+        )
+    };
+
+    let is_guest_ldp_w = |w: u32| (w & 0xffc0_03e0) == (0x2940_0000 | (17 << 5));
+    let is_guest_stp_w = |w: u32| (w & 0xffc0_03e0) == (0x2900_0000 | (17 << 5));
+    let is_ldr_w_u_16 = |w: u32| (w & 0xffff_ffe0) == (0xb940_0000 | (4 << 10) | (17 << 5));
+
+    if !adv_cpu_core::virtual_memory::GuestWindow::compact() {
+        let (_, lowered_guard) = build_mem_loop();
+        assert!(
+            lowered_guard.words.iter().any(|&w| is_guest_ldp_w(w)),
+            "non-compact A64-MEM-1 must pair adjacent [esi]/[esi+4] loads into LDP W"
+        );
+        assert!(
+            lowered_guard.words.iter().any(|&w| is_guest_stp_w(w)),
+            "non-compact A64-MEM-1 must pair adjacent [edi+8]/[edi+12] stores into STP W"
+        );
+        assert!(
+            lowered_guard.words.iter().any(|&w| is_ldr_w_u_16(w)),
+            "non-compact A64-MEM-1 must fold [esi+16] into direct immediate LDR W [x17, #16]"
+        );
+    }
+
+    let (_, lowered_compact) = super::super::back::with_compact_window(true, build_mem_loop);
+    assert!(
+        !lowered_compact.words.iter().any(|&w| is_guest_ldp_w(w)),
+        "compact window MUST NOT emit unguarded guest LDP W"
+    );
+    assert!(
+        !lowered_compact.words.iter().any(|&w| is_guest_stp_w(w)),
+        "compact window MUST NOT emit unguarded guest STP W"
+    );
+    assert!(
+        !lowered_compact.words.iter().any(|&w| is_ldr_w_u_16(w)),
+        "compact window MUST NOT fold [esi+16] into immediate LDR W [x17, #16]"
+    );
 }

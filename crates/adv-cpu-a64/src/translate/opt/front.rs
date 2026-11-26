@@ -20,7 +20,7 @@ use integer::part;
 mod integer;
 mod live;
 mod model;
-mod passes;
+pub(crate) mod passes;
 mod simd;
 #[cfg(test)]
 mod tests;
@@ -83,6 +83,12 @@ struct State {
     top: u8,
     control: u16,
     c1: Option<Location<Value>>,
+    /// Dynamic x87 status condition codes (`C3|C2|C0` bits `0x4500`) after `fcom`/`ftst`/`fxam`.
+    x87_cc: Option<Value>,
+    /// Most recent `fcom`/`fucom`/`ftst` operands `(a, b, ordered, top)` for `fnstsw ax` + `sahf` folding.
+    x87_last_cmp: Option<(Value, Value, bool, u8)>,
+    /// Set by `fnstsw ax` when AX mirrors `x87_last_cmp`, cleared on any subsequent write to EAX.
+    ax_x87_cmp: Option<(Value, Value, bool, u8)>,
     ip: Location<Value>,
     opcode: Location<Value>,
     floats: BTreeMap<i32, Value>,
@@ -209,10 +215,11 @@ fn build_form(
     let mut cut = vec![false; unit.trace.len()];
     let mut pending_wait = false;
     if at.x87.status & 0x80 != 0 {
-        for (cut, inst) in cut.iter_mut().zip(&unit.trace.insts) {
+        for (idx, (cut, inst)) in cut.iter_mut().zip(&unit.trace.insts).enumerate() {
             *cut = match inst.op {
                 decode::Op::X87(x) => x.waits(),
                 decode::Op::Fild64(..) => true,
+                decode::Op::Value(_) => x87::value_x87(unit, idx).is_some(),
                 _ => false,
             };
         }
@@ -283,16 +290,21 @@ fn build_trace(
     if primary_mmx
         && let Some(i) = insts[unit.trace.primary..]
             .iter()
-            .position(|i| matches!(i.op, decode::Op::X87(_) | decode::Op::Fild64(..)))
+            .enumerate()
+            .position(|(off, i)| {
+                matches!(i.op, decode::Op::X87(_) | decode::Op::Fild64(..))
+                    || x87::value_x87(unit, unit.trace.primary + off).is_some()
+            })
     {
         return Err(Reject::Unsupported(unit.trace.primary + i));
     }
     // The cut form still needs the entry guard when all its x87
     // instructions were removed. Clear status must select the uncut form.
     let x87 = pending_wait
-        || insts
-            .iter()
-            .any(|i| matches!(i.op, decode::Op::X87(_) | decode::Op::Fild64(..)));
+        || insts.iter().enumerate().any(|(idx, i)| {
+            matches!(i.op, decode::Op::X87(_) | decode::Op::Fild64(..))
+                || x87::value_x87(unit, idx).is_some()
+        });
     let mmx_index = insts
         .iter()
         .position(|i| matches!(i.op, decode::Op::Simd(s) if s.mmx()));
@@ -571,6 +583,9 @@ fn build_trace(
         top: assumed.top,
         control: assumed.control,
         c1: Some(Location::Constant(u64::from(at.x87.status & 0x200 != 0))),
+        x87_cc: None,
+        x87_last_cmp: None,
+        ax_x87_cmp: None,
         ip: metadata.map_or(Location::Constant(u64::from(at.x87.ip)), |[ip, _]| {
             Location::At(ip)
         }),
@@ -629,6 +644,14 @@ fn build_trace(
                 })),
                 model::C1::Value => Some(Location::At(func.param(block, Type::I32))),
             };
+            let x87_cc = if model.has_cc {
+                match c1 {
+                    Some(Location::At(v)) => Some(v),
+                    _ => unreachable!("has_cc forces C1::Value"),
+                }
+            } else {
+                None
+            };
             let mmx_meta = if !assumed.mmx {
                 unused[0]
             } else if model.mmx_meta.1 == u32::MAX {
@@ -651,6 +674,9 @@ fn build_trace(
                 top: model.top,
                 control: model.control.ok_or(Reject::Mode(i))?,
                 c1,
+                x87_cc,
+                x87_last_cmp: None,
+                ax_x87_cmp: None,
                 ip,
                 opcode,
             })
@@ -706,6 +732,8 @@ fn build_trace(
     let mut store_regions = BTreeMap::new();
     let mut frame_guards = std::collections::BTreeSet::new();
     let mut regions: Vec<Option<RecordId>> = vec![None; unit.trace.len()];
+    let mut last_cmps: Vec<Option<(Value, Value, bool, u8)>> = vec![None; unit.trace.len()];
+    let mut ax_cmps: Vec<Option<(Value, Value, bool, u8)>> = vec![None; unit.trace.len()];
     for (i, state) in states.into_iter().enumerate() {
         if !model_reachable[i] {
             continue;
@@ -732,6 +760,13 @@ fn build_trace(
             let record = f.record(inst.pc, unit.trace.owed(i), Start::Entry(i));
             f.func.blocks[i + 1].head = Some(Head { record });
             region = Some(record);
+        } else if let &[p] = from.as_slice()
+            && p < i
+        {
+            // Single dominating straight-line predecessor in the same region:
+            // preserve compare / `fnstsw ax` provenance for `fcom+fnstsw+sahf` folding.
+            f.state.x87_last_cmp = last_cmps[p];
+            f.state.ax_x87_cmp = ax_cmps[p];
         }
         f.instruction()?;
         if let Some((width, addr, value)) = f.pending_store.take() {
@@ -805,6 +840,8 @@ fn build_trace(
         };
         f.func.end(f.block, end);
         regions[i] = region;
+        last_cmps[i] = f.state.x87_last_cmp;
+        ax_cmps[i] = f.state.ax_x87_cmp;
     }
     let mut frame_reads = BTreeMap::<u32, Vec<(i32, u8)>>::new();
     if write_through && let Some(accesses) = &accesses {
@@ -1270,9 +1307,13 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
                         | Fast::Arith {
                             source: Source::F64,
                             ..
+                        }
+                        | Fast::Compare {
+                            source: Source::F64,
+                            ..
                         } => 8,
                         Fast::Store { width, .. } => width,
-                        Fast::LoadControl | Fast::StoreControl => 2,
+                        Fast::LoadControl | Fast::StoreControl | Fast::StoreStatus => 2,
                         _ => 4,
                     };
                     access(mem, width);
@@ -1483,6 +1524,11 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
                     _ => {}
                 }
             }
+            decode::Op::X87(x)
+                if x.fast == adv_cpu_core::floating::fast::Fast::StoreStatus && x.mem.is_none() =>
+            {
+                regs[0] = None;
+            }
             _ => {}
         }
         let overwritten = match inst.op {
@@ -1490,7 +1536,7 @@ fn layout(unit: &Unit, esp_low: u8, ebp: Option<i32>, resident: bool) -> Result<
                 use adv_cpu_core::floating::fast::Fast;
                 match x.fast {
                     Fast::Store { width, .. } => x.mem.map(|m| (m, width)),
-                    Fast::StoreControl => x.mem.map(|m| (m, 2)),
+                    Fast::StoreControl | Fast::StoreStatus => x.mem.map(|m| (m, 2)),
                     _ => None,
                 }
             }

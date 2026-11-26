@@ -697,6 +697,31 @@ impl Translator<'_> {
             self.emit(str(W, X16, RUNTIME, runtime::BODY_STACK));
         }
         let base = if bound.entry { 4 } else { 0 };
+        let stage_stack = self.checking || self.computation;
+        if stage_stack {
+            // Checked and computation stack loads clobber x1–x4 (and x6 as the
+            // load destination) across checked_base and Cold::Access, while
+            // emit_access saves and restores v0–v7. Stage all checked stack
+            // arguments into v0.s[0..3] / v1.s[0..2] before populating w1–w7.
+            for (n, &input) in body.inputs.iter().flatten().enumerate() {
+                if n == 2 && inline.is_some() {
+                    continue;
+                }
+                if let Input::Stack(k) = input
+                    && pushes.get(usize::from(k)).is_none()
+                {
+                    let disp = base + 4 * u32::from(k);
+                    self.emit(add_imm(W, X16, host(ESP), disp, false));
+                    self.load(Addr::Window(X16), X6);
+                    self.emit(vins_general(
+                        2,
+                        VReg::new((n / 4) as u8),
+                        (n % 4) as u32,
+                        X6,
+                    ));
+                }
+            }
+        }
         for (n, &input) in body.inputs.iter().flatten().enumerate() {
             let rd = Reg::new(1 + n as u8);
             if n == 2 && inline.is_some() {
@@ -713,10 +738,8 @@ impl Translator<'_> {
                             }
                             Src::Reg(reg) => self.emit(mov(W, rd, host(reg))),
                         }
-                    } else if self.checking {
-                        self.emit(add_imm(W, X16, host(ESP), disp, false));
-                        self.load(Addr::Window(X16), X6);
-                        self.emit(mov(W, rd, X6));
+                    } else if stage_stack {
+                        self.emit(vumov(2, rd, VReg::new((n / 4) as u8), (n % 4) as u32));
                     } else {
                         self.load(Addr::Biased(host(ESP), disp as i32), rd);
                     }
@@ -817,6 +840,21 @@ impl Translator<'_> {
         if body.outputs & ECX != 0 {
             self.clobber(Operand::Guest(1));
             self.emit(mov(W, host(1), X1));
+        }
+        if body.outputs & adv_cpu_core::body::MXCSR != 0 {
+            self.emit_all(&[
+                ubfx(
+                    X,
+                    X16,
+                    X1,
+                    u32::from(adv_cpu_core::body::MXCSR_FLAGS_SHIFT),
+                    6,
+                ),
+                ldr(X, X17, RUNTIME, runtime::CPU_STATE),
+                ldr(W, X6, X17, runtime::MXCSR),
+                orr(W, X6, X6, X16, Lsl, 0),
+                str(W, X6, X17, runtime::MXCSR),
+            ]);
         }
         if !bound.entry && body.pop != 0 {
             self.emit(add_imm(X, host(ESP), host(ESP), u32::from(body.pop), false));

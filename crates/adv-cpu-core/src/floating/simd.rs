@@ -669,6 +669,45 @@ fn sse_minmax_qnan_raises_ie_and_float_to_int_skips_de() {
             i32::MIN
         );
     }
+
+    // On x86 (and ARM FPCR.AH=1), a NaN operand suppresses DE on a denormal peer
+    // when DAZ=0, while DAZ=1 still flushes the denormal operand to signed zero.
+    let mut sub_d = [0u8; 16];
+    sub_d[..4].copy_from_slice(&0x0040_0000u32.to_le_bytes());
+    let mut snan32 = [0u8; 16];
+    snan32[..4].copy_from_slice(&0x7f80_0001u32.to_le_bytes());
+    // addss(D, QNaN) and addss(QNaN, D): no DE, returns QNaN.
+    let (step, st) = run(&[0xf3, 0x0f, 0x58, 0xc1], 0x1f80, sub_d, q32);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x00);
+    let (step, st) = run(&[0xf3, 0x0f, 0x58, 0xc1], 0x1f80, q32, sub_d);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x00);
+    // addss(D, SNaN): IE only (no DE).
+    let (step, st) = run(&[0xf3, 0x0f, 0x58, 0xc1], 0x1f80, sub_d, snan32);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x01);
+    // ucomiss(D, QNaN): no DE, no IE; comiss(D, QNaN): IE only (no DE).
+    let (step, st) = run(&[0x0f, 0x2e, 0xc1], 0x1f80, sub_d, q32);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x00);
+    let (step, st) = run(&[0x0f, 0x2f, 0xc1], 0x1f80, sub_d, q32);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x01);
+    // minss(QNaN, D): DAZ=0 returns D with IE only (no DE); DAZ=1 returns +0 with IE.
+    let (step, st) = run(&[0xf3, 0x0f, 0x5d, 0xc1], 0x1f80, q32, sub_d);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x01);
+    assert_eq!(&st.xmm[0][..4], &0x0040_0000u32.to_le_bytes());
+    let (step, st) = run(&[0xf3, 0x0f, 0x5d, 0xc1], 0x1fc0, q32, sub_d);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x01);
+    assert_eq!(&st.xmm[0][..4], &0u32.to_le_bytes());
+    // minss(D, 1.0) under FTZ=1, DAZ=0 preserves subnormal output with DE only (no UE|PE).
+    let (step, st) = run(&[0xf3, 0x0f, 0x5d, 0xc1], 0x9f80, sub_d, one32);
+    assert_eq!(step, Step::Executed);
+    assert_eq!(st.mxcsr & 0x3f, 0x02);
+    assert_eq!(&st.xmm[0][..4], &0x0040_0000u32.to_le_bytes());
 }
 fn nan(a: u64, width: usize) -> bool {
     if width == 4 {
@@ -687,15 +726,30 @@ fn denormal(a: u64, width: usize) -> bool {
         a & 0x7ff0_0000_0000_0000 == 0 && a & 0x000f_ffff_ffff_ffff != 0
     }
 }
-fn input(tx: &mut Transaction, mut a: u64, width: usize) -> u64 {
+fn input_checked(tx: &mut Transaction, mut a: u64, width: usize, report_de: bool) -> u64 {
     if denormal(a, width) {
         if *tx.state.mxcsr & 0x40 != 0 {
             a &= if width == 4 { 1 << 31 } else { 1 << 63 };
-        } else {
+        } else if report_de {
             finish(tx, 2);
         }
     }
     a
+}
+/// [`input_checked`] for arithmetic that commits its flags itself: returns
+/// the operand and the `DE` it raises.
+fn input_flags(tx: &Transaction, mut a: u64, width: usize, report_de: bool) -> (u64, u16) {
+    if denormal(a, width) {
+        if *tx.state.mxcsr & 0x40 != 0 {
+            a &= if width == 4 { 1 << 31 } else { 1 << 63 };
+        } else if report_de {
+            return (a, 2);
+        }
+    }
+    (a, 0)
+}
+fn input(tx: &mut Transaction, a: u64, width: usize) -> u64 {
+    input_checked(tx, a, width, true)
 }
 /// Denormal handling for SSE float-to-integer conversions: `DAZ = 1` flushes
 /// subnormals to signed zero (`PE = 0`), while `DAZ = 0` converts subnormals
@@ -839,20 +893,36 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
     let source = read(i, 1, tx, memory, if packed { 16 } else { width })?;
     let slot = xmm(i.op0_register()).ok_or(tx.unsupported(i))?;
     let destination = tx.state.xmm[slot];
+    let masks = (*tx.state.mxcsr >> 7) as u16 & 0x3f;
+    // Pre-computation (IE/DE/ZE) and post-computation (OE/UE/PE) flags of
+    // every lane, committed together after the last lane.
+    let (mut pre, mut post) = (0u16, 0u16);
     for lane in 0..count {
+        sf::configure_sse(*tx.state.mxcsr);
         let offset = lane * width;
-        let a = if matches!(m, M::Sqrtss | M::Sqrtsd | M::Sqrtps | M::Sqrtpd) {
+        let unary_sqrt = matches!(m, M::Sqrtss | M::Sqrtsd | M::Sqrtps | M::Sqrtpd);
+        let raw_a = if unary_sqrt {
             0
         } else {
-            input(tx, bits(&destination[offset..offset + width]), width)
+            bits(&destination[offset..offset + width])
         };
-        let b = input(tx, bits(&source[offset..offset + width]), width);
+        let raw_b = bits(&source[offset..offset + width]);
+        // On x86, a NaN operand suppresses DE on a denormal peer when DAZ=0,
+        // while DAZ=1 still flushes the denormal operand to signed zero.
+        let report_de = !(nan(raw_a, width) || nan(raw_b, width));
+        let (a, a_flags) = if unary_sqrt {
+            (0, 0)
+        } else {
+            input_flags(tx, raw_a, width, report_de)
+        };
+        let (b, b_flags) = input_flags(tx, raw_b, width, report_de);
+        pre |= a_flags | b_flags;
         if matches!(m, M::Comiss | M::Comisd | M::Ucomiss | M::Ucomisd) {
             if signaling(a, width)
                 || signaling(b, width)
                 || matches!(m, M::Comiss | M::Comisd) && (nan(a, width) || nan(b, width))
             {
-                finish(tx, 1);
+                pre |= 1;
             }
             let c = comparison(a, b, width);
             *tx.state.eflags = (*tx.state.eflags & !0x8d5)
@@ -871,7 +941,7 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
                 || signaling(b, width)
                 || matches!(predicate, 1 | 2 | 5 | 6) && c == 3
             {
-                finish(tx, 1);
+                pre |= 1;
             }
             let yes = match predicate {
                 0 => c == 0,
@@ -889,7 +959,7 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
             M::Minss | M::Minsd | M::Minps | M::Minpd | M::Maxss | M::Maxsd | M::Maxps | M::Maxpd
         ) {
             if nan(a, width) || nan(b, width) {
-                finish(tx, 1);
+                pre |= 1;
             }
             let c = comparison(a, b, width);
             if matches!(m, M::Minss | M::Minsd | M::Minps | M::Minpd) && c == 1
@@ -913,15 +983,34 @@ fn floating(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Resu
             };
             sf::sse_binary(a, b, op, width as u8)
         };
-        finish(tx, sf::flags());
+        let mut flags = sf::flags();
         let mut result = result;
-        if *tx.state.mxcsr & 0x8000 != 0 && denormal(result, width) {
-            finish(tx, 0x30);
+        // MIN*/MAX* select an operand directly and do not apply FTZ or underflow.
+        if !matches!(
+            m,
+            M::Minss | M::Minsd | M::Minps | M::Minpd | M::Maxss | M::Maxsd | M::Maxps | M::Maxpd
+        ) && *tx.state.mxcsr & 0x8000 != 0
+            && denormal(result, width)
+        {
+            flags |= 0x30;
             result &= if width == 4 { 1 << 31 } else { 1 << 63 };
         }
+        // An unmasked overflow does not also report PE (measured on Intel:
+        // `mulps` overflow under MXCSR 0x1b80 commits OE alone).
+        if flags & 0x08 != 0 && masks & 0x08 == 0 {
+            flags &= !0x20;
+        }
+        pre |= flags & 0x07;
+        post |= flags & 0x38;
         tx.state.xmm[slot][offset..offset + width].copy_from_slice(&result.to_le_bytes()[..width]);
     }
-    finish(tx, sf::flags());
+    // Intel SDM Vol. 1 11.5.3.2: an unmasked pre-computation exception in any
+    // lane commits pre-computation flags alone before #XM.
+    if pre & !masks != 0 {
+        finish(tx, pre);
+    } else {
+        finish(tx, pre | post);
+    }
     Ok(())
 }
 fn signed(value: u64, width: usize) -> i64 {
@@ -1003,6 +1092,54 @@ fn packed_conversion(
     };
     write(i, tx, memory, &out, width)
 }
+/// Exact 12-bit reciprocal estimate matching x86 `rcpss`/`rcpps` and ARMv8.7
+/// `FEAT_RPRES` `frecpe` (under `FPCR.AH=1`) across all 2^32 binary32 inputs.
+pub(crate) fn rcp_estimate(u: u32) -> u32 {
+    let sign = u & 0x8000_0000;
+    let exp = (u >> 23) & 0xff;
+    let frac = u & 0x007f_ffff;
+    if exp == 255 {
+        return if frac != 0 { u | 0x0040_0000 } else { sign };
+    }
+    if exp == 0 {
+        return sign | 0x7f80_0000;
+    }
+    if exp >= 253 {
+        return sign;
+    }
+    let i = (u >> 12) & 0x7ff;
+    let a = 4096 + 2 * i + 1;
+    let sig = (((1u32 << 26) / a) + 1) >> 1;
+    sign | ((253 - exp) << 23) | ((sig & 0xfff) << 11)
+}
+
+/// Exact 12-bit reciprocal square-root estimate matching x86 `rsqrtss`/`rsqrtps`
+/// and ARMv8.7 `FEAT_RPRES` `frsqrte` (under `FPCR.AH=1`) across all 2^32 inputs.
+pub(crate) fn rsqrt_estimate(u: u32) -> u32 {
+    let sign = u & 0x8000_0000;
+    let exp = (u >> 23) & 0xff;
+    let frac = u & 0x007f_ffff;
+    if exp == 255 && frac != 0 {
+        return u | 0x0040_0000;
+    }
+    if exp == 0 {
+        return sign | 0x7f80_0000;
+    }
+    if sign != 0 {
+        return 0xffc0_0000;
+    }
+    if exp == 255 {
+        return 0;
+    }
+    let i = u64::from((u >> 13) & 0x3ff);
+    let b = (2048 + 2 * i + 1) << ((exp & 1) ^ 1);
+    // Unique s in 4096..=8191 with b*(2s - 1)^2 <= 2^39 < b*(2s + 1)^2:
+    // with r = isqrt(2^39 / b), 2s - 1 <= r <= 2s gives s = (r + 1) >> 1.
+    let r = ((1u64 << 39) / b).isqrt();
+    let sig = ((r + 1) >> 1) as u32;
+    (((380 - exp) >> 1) << 23) | ((sig & 0xfff) << 11)
+}
+
 fn approximate(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> Result<(), Step> {
     let m = i.mnemonic();
     let count = if matches!(m, M::Rcpps | M::Rsqrtps) {
@@ -1010,38 +1147,16 @@ fn approximate(i: &Instruction, tx: &mut Transaction, memory: Operands<'_>) -> R
     } else {
         1
     };
+    let square_root = matches!(m, M::Rsqrtps | M::Rsqrtss);
     let source = read(i, 1, tx, memory, count * 4)?;
     let slot = xmm(i.op0_register()).ok_or(tx.unsupported(i))?;
     for (lane, bytes) in source[..count * 4].as_chunks::<4>().0.iter().enumerate() {
         let a = u32::from_le_bytes(*bytes);
-        let sign = a & 0x8000_0000;
-        let magnitude = a & 0x7fff_ffff;
-        let square_root = matches!(m, M::Rsqrtps | M::Rsqrtss);
-        let result = if nan(a as u64, 4) {
-            a | 0x0040_0000
-        } else if magnitude < 0x0080_0000 {
-            sign | 0x7f80_0000
-        } else if square_root && sign != 0 {
-            0xffc0_0000
-        } else if magnitude == 0x7f80_0000 {
-            sign
+        // These ISA approximations ignore MXCSR/RC and never raise exceptions.
+        let result = if square_root {
+            rsqrt_estimate(a)
         } else {
-            // These ISA approximations ignore RC and never raise exceptions.
-            // Rounding an exact SoftFloat reciprocal to 12 significant bits
-            // satisfies the SDM relative error bound (1.5 * 2^-12).
-            sf::configure_sse(0x1f80);
-            let denominator = if square_root {
-                sf::sse_binary(0, a as u64, 4, 4)
-            } else {
-                a as u64
-            };
-            let exact = sf::sse_binary(0x3f80_0000, denominator, 3, 4) as u32;
-            let rounded = exact.wrapping_add(0x800) & !0xfff;
-            if rounded & 0x7f80_0000 == 0 {
-                sign
-            } else {
-                rounded
-            }
+            rcp_estimate(a)
         };
         tx.state.xmm[slot][lane * 4..lane * 4 + 4].copy_from_slice(&result.to_le_bytes());
     }
@@ -1225,4 +1340,100 @@ fn integer(
     }
 
     write(i, tx, memory, &out, width)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rcp_estimate, rsqrt_estimate};
+
+    #[test]
+    fn rcp_and_rsqrt_edge_cases_match_x86_and_rpres() {
+        // NaNs keep sign and payload with quiet bit set.
+        for nan in [0x7fc0_0001u32, 0xffc0_0001, 0x7f80_0001, 0xff80_0001] {
+            assert_eq!(rcp_estimate(nan), nan | 0x0040_0000);
+            assert_eq!(rsqrt_estimate(nan), nan | 0x0040_0000);
+        }
+
+        // Zeros and subnormals (exp == 0) yield signed infinity for both,
+        // including negative subnormals in rsqrt (checked before sign).
+        for zero_or_sub in [
+            0x0000_0000u32,
+            0x8000_0000,
+            0x0000_0001,
+            0x8040_0000,
+            0x007f_ffff,
+            0x807f_ffff,
+        ] {
+            let expected = (zero_or_sub & 0x8000_0000) | 0x7f80_0000;
+            assert_eq!(rcp_estimate(zero_or_sub), expected);
+            assert_eq!(rsqrt_estimate(zero_or_sub), expected);
+        }
+
+        // Infinities and large exponents (exp >= 253) for rcp.
+        assert_eq!(rcp_estimate(0x7f80_0000), 0x0000_0000);
+        assert_eq!(rcp_estimate(0xff80_0000), 0x8000_0000);
+        assert_eq!(rcp_estimate(0x7e00_0000), 0x00ff_f000);
+        assert_eq!(rcp_estimate(0xfe00_0000), 0x80ff_f000);
+        assert_eq!(rcp_estimate(0x7e80_0000), 0x0000_0000);
+        assert_eq!(rcp_estimate(0xfe80_0000), 0x8000_0000);
+        assert_eq!(rcp_estimate(0x7f7f_ffff), 0x0000_0000);
+        assert_eq!(rcp_estimate(0xff7f_ffff), 0x8000_0000);
+
+        // Negative normals and -Inf yield -QNaN indefinite in rsqrt; +Inf yields +0.
+        for neg in [0x8080_0000u32, 0xbf80_0000, 0xff7f_ffff, 0xff80_0000] {
+            assert_eq!(rsqrt_estimate(neg), 0xffc0_0000);
+        }
+        assert_eq!(rsqrt_estimate(0x7f80_0000), 0x0000_0000);
+
+        // Hardware spot checks (Intel rcpps/rsqrtps and Apple/ARM RPRES AH=1).
+        assert_eq!(rcp_estimate(1.0f32.to_bits()), 0x3f7f_f000);
+        assert_eq!(rcp_estimate((-1.0f32).to_bits()), 0xbf7f_f000);
+        assert_eq!(rcp_estimate(2.5f32.to_bits()), 0x3ecc_c000);
+        assert_eq!(rcp_estimate((-3.5f32).to_bits()), 0xbe92_4000);
+        assert_eq!(rsqrt_estimate(1.0f32.to_bits()), 0x3f7f_f000);
+        assert_eq!(rsqrt_estimate(0x7f7f_ffff), 0x1f80_0800);
+    }
+
+    #[test]
+    fn rcp_and_rsqrt_all_buckets_satisfy_closed_form_and_reference_hashes() {
+        let mut h_rcp = 1469598103934665603u64;
+        for i in 0..2048u32 {
+            let u = (127u32 << 23) | (i << 12);
+            let out = rcp_estimate(u);
+            // Low 11 bits of the 12-bit estimate are always zero.
+            assert_eq!(out & 0x7ff, 0);
+            let x = f32::from_bits(u) as f64;
+            let exact = 1.0 / x;
+            let got = f32::from_bits(out) as f64;
+            assert!((got - exact).abs() / exact <= 1.5 / 4096.0);
+            // Result depends only on sign, exponent, and top 11 fraction bits.
+            assert_eq!(rcp_estimate(u | 0xfff), out);
+            h_rcp = (h_rcp ^ u64::from(out)).wrapping_mul(1099511628211);
+        }
+        assert_eq!(h_rcp, 0xc1d4_1477_5da7_e383);
+
+        let mut h_rsq = 1469598103934665603u64;
+        for parity in 0..2u32 {
+            let exp = if parity != 0 { 127u32 } else { 128u32 };
+            for i in 0..1024u32 {
+                let u = (exp << 23) | (i << 13);
+                let out = rsqrt_estimate(u);
+                assert_eq!(out & 0x7ff, 0);
+                // Verify the exact defining inequality:
+                // b*(2s - 1)^2 <= 2^39 < b*(2s + 1)^2 (guards against off-by-1).
+                let s = 4096u64 + u64::from((out >> 11) & 0xfff);
+                let b = (2048u64 + 2 * u64::from(i) + 1) << ((exp & 1) ^ 1);
+                assert!(b * (2 * s - 1) * (2 * s - 1) <= (1u64 << 39));
+                assert!((1u64 << 39) < b * (2 * s + 1) * (2 * s + 1));
+                let x = f32::from_bits(u) as f64;
+                let exact = 1.0 / x.sqrt();
+                let got = f32::from_bits(out) as f64;
+                assert!((got - exact).abs() / exact <= 1.5 / 4096.0);
+                // Result depends only on sign, exponent, and top 10 fraction bits.
+                assert_eq!(rsqrt_estimate(u | 0x1fff), out);
+                h_rsq = (h_rsq ^ u64::from(out)).wrapping_mul(1099511628211);
+            }
+        }
+        assert_eq!(h_rsq, 0x9f44_85fd_687f_0b83);
+    }
 }

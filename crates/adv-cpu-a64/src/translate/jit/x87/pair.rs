@@ -31,6 +31,7 @@ use crate::encode::*;
 use crate::runtime;
 
 use super::super::{Translator, X0, X1, X2, X3, X5, X13, X16, X17};
+use super::cache::StatusRecipe;
 use super::{C0, C1, C2, C3, V0, V1, V2, V3, V4, V5, X7, X8, X87};
 
 const V6: VReg = VReg::new(6);
@@ -81,14 +82,20 @@ pub(in super::super) struct Generic {
     to: u8,
     /// Whether the run takes the result as narrow.
     narrow: bool,
+    /// Whether the run takes the result as 24-bit single-exact.
+    single_exact: bool,
+    /// Whether the run takes the result as an exact binary32 zero/normal.
+    f32_normal: bool,
 }
 
-/// An operand: its high lane, and whether its low lane is zero.
+/// An operand: its high lane, and statically tracked exactness facts.
 #[derive(Clone, Copy)]
 struct Operand {
     high: VReg,
     reg: Option<u8>,
     narrow: bool,
+    single_exact: bool,
+    f32_normal: bool,
 }
 
 /// Register use as in `x87`, with v0 to v6 scratch.
@@ -97,10 +104,22 @@ impl Translator<'_> {
         self.x87.model.narrow & (1 << n) != 0
     }
 
-    /// Records host register `n` as holding a new value.
-    fn x87_written(&mut self, n: u8, narrow: bool) {
+    fn x87_single_exact(&self, n: u8) -> bool {
+        self.x87.model.single_exact & (1 << n) != 0
+    }
+
+    fn x87_f32_normal(&self, n: u8) -> bool {
+        self.x87.model.f32_normal & (1 << n) != 0
+    }
+
+    /// Records host register `n` as holding a new value and updates its
+    /// static exactness facts.
+    fn x87_written(&mut self, n: u8, narrow: bool, single_exact: bool, f32_normal: bool) {
         let model = &mut self.x87.model;
-        model.narrow = model.narrow & !(1 << n) | u8::from(narrow) << n;
+        let bit = 1u8 << n;
+        model.narrow = model.narrow & !bit | u8::from(narrow) << n;
+        model.single_exact = model.single_exact & !bit | u8::from(single_exact) << n;
+        model.f32_normal = model.f32_normal & !bit | u8::from(f32_normal) << n;
     }
 
     fn operand(&self, i: u8) -> Operand {
@@ -109,6 +128,114 @@ impl Translator<'_> {
             high: v(n),
             reg: Some(n),
             narrow: self.x87_narrow(n),
+            single_exact: self.x87_single_exact(n),
+            f32_normal: self.x87_f32_normal(n),
+        }
+    }
+
+    /// Defers clearing C1 (`status_recipe = C1Zero`).
+    fn set_c1_zero(&mut self) {
+        self.x87.model.status_recipe = StatusRecipe::C1Zero;
+    }
+
+    /// Materializes a lazy C1 / C0–C3 recipe into `status` (`w13` or `w14`).
+    ///
+    /// Preserves `X4`, `X5`, `X6`, `X7`, `X8`, `X9`, `X10`, `X11`, `X12`,
+    /// `X15`, `V1`, `V7`, `V16–V23`, and `V24–V31` so it is safe in hot code,
+    /// reconciles, exits, and fault stubs.
+    pub(super) fn emit_materialize_status_recipe(&mut self, recipe: StatusRecipe, status: Reg) {
+        match recipe {
+            StatusRecipe::Materialized => {}
+            StatusRecipe::C1Zero => {
+                self.emit(and_imm(W, status, status, u64::from(!C1)));
+            }
+            StatusRecipe::C1Round {
+                op,
+                single,
+                a,
+                b,
+                r,
+            } => {
+                let (va, vb, vr) = (v(a), v(b), v(r));
+                // Compute an exact-sign/exact-zero error term in x16: exact(op(a, b)) - r.
+                match op {
+                    Arith::Add | Arith::Sub => {
+                        let rhs = if op == Arith::Sub {
+                            self.emit(unary(Unary::Fneg, V5, vb));
+                            V5
+                        } else {
+                            vb
+                        };
+                        if single {
+                            self.emit(dfloat(Float::Fadd, V4, va, rhs));
+                            self.two_sum(va, rhs, V4, V3);
+                            self.emit_all(&[
+                                dfloat(Float::Fsub, V2, V4, vr),
+                                dfloat(Float::Fadd, V3, V2, V3),
+                                fmov_from_v(X, X16, V3),
+                            ]);
+                        } else {
+                            self.two_sum(va, rhs, vr, V3);
+                            self.emit(fmov_from_v(X, X16, V3));
+                        }
+                    }
+                    Arith::Mul => {
+                        self.emit_all(&[fnmsub(V3, va, vb, vr), fmov_from_v(X, X16, V3)]);
+                    }
+                    Arith::Div => {
+                        self.emit_all(&[
+                            fmsub(V3, vr, vb, va),
+                            fmov_from_v(X, X16, V3),
+                            fmov_from_v(X, X17, vb),
+                            and_imm(X, X17, X17, 1 << 63),
+                            eor(X, X16, X16, X17, Lsl, 0),
+                        ]);
+                    }
+                }
+                // Branchless C1 = (error != 0) && (sign(r) != sign(error)).
+                self.emit_all(&[
+                    lsl_imm(X, X17, X16, 1),
+                    cmp_imm(X, X17, 0, false),
+                    cset(W, X0, Cond::Ne),
+                    fmov_from_v(X, X17, vr),
+                    eor(X, X17, X17, X16, Lsl, 0),
+                    lsr_imm(X, X17, X17, 63),
+                    and(W, X17, X17, X0, Lsl, 0),
+                    bfi(W, status, X17, 9, 1),
+                ]);
+            }
+            StatusRecipe::Compare {
+                a,
+                b,
+                a_narrow,
+                b_narrow,
+            } => {
+                self.emit(fcmp(v(a), v(b)));
+                if !(a_narrow && b_narrow) {
+                    let decided = self.asm.label();
+                    self.asm.b_cond(Cond::Ne, decided);
+                    if !a_narrow {
+                        self.emit(dup_high(V2, v(a)));
+                    } else {
+                        self.emit(vzero(false, V2));
+                    }
+                    if !b_narrow {
+                        self.emit(dup_high(V3, v(b)));
+                    } else {
+                        self.emit(vzero(false, V3));
+                    }
+                    self.emit(fcmp(V2, V3));
+                    self.asm.bind(decided);
+                }
+                self.emit_all(&[
+                    cset(W, X16, Cond::Eq),
+                    cset(W, X17, Cond::Mi),
+                    movz(W, X2, (C0 | C1 | C2 | C3) as u16, 0),
+                    bic(W, status, status, X2, Lsl, 0),
+                    orr(W, status, status, X16, Lsl, 14),
+                    orr(W, status, status, X17, Lsl, 8),
+                ]);
+            }
         }
     }
 
@@ -121,6 +248,7 @@ impl Translator<'_> {
         x: X87,
         bail: Label,
         c1_dead: bool,
+        can_keep_nzcv: bool,
     ) -> (bool, Option<Generic>) {
         let mut generic = None;
         match x.fast {
@@ -136,14 +264,14 @@ impl Translator<'_> {
                 self.pair_zero(X1, to, bail);
                 self.asm.bind(done);
                 self.x87.model.push();
-                self.x87_set(0, to, false);
-                self.clear_c1();
+                self.x87_set(0, to, false, false, false);
+                self.set_c1_zero();
             }
             Fast::Store80 => {
                 self.pair_to_extended(self.x87.model.reg(0), X0, X1);
                 self.pair_m80(true, bail);
                 self.x87_pop();
-                self.clear_c1();
+                self.set_c1_zero();
             }
             Fast::Wait | Fast::LoadControl | Fast::StoreControl | Fast::StoreStatus => {
                 if x.fast == Fast::StoreStatus {
@@ -158,14 +286,15 @@ impl Translator<'_> {
             }
             Fast::Load(Source::St(index)) => {
                 self.x87_push_copy(index);
-                self.clear_c1();
+                self.set_c1_zero();
             }
             Fast::Load(source) => {
                 let to = self.x87_alloc();
                 self.memory_bounded(source, v(to), (LOW, SPAN), bail);
                 self.x87.model.push();
-                self.x87_set(0, to, true);
-                self.clear_c1();
+                let f32_exact = matches!(source, Source::F32 | Source::I16);
+                self.x87_set(0, to, true, f32_exact, f32_exact);
+                self.set_c1_zero();
             }
             Fast::Constant(one) => {
                 let to = self.x87_alloc();
@@ -175,8 +304,8 @@ impl Translator<'_> {
                     self.emit(vzero(false, v(to)));
                 }
                 self.x87.model.push();
-                self.x87_set(0, to, true);
-                self.clear_c1();
+                self.x87_set(0, to, true, true, true);
+                self.set_c1_zero();
             }
             Fast::Store {
                 width,
@@ -185,7 +314,7 @@ impl Translator<'_> {
             } => self.pair_store(width, integer, pop, bail, c1_dead && self.x87.pe),
             Fast::StoreSt { index, pop } => {
                 self.x87_copy(index, 0);
-                self.clear_c1();
+                self.set_c1_zero();
                 if pop {
                     self.x87_pop();
                 }
@@ -197,15 +326,25 @@ impl Translator<'_> {
                 reverse,
                 pop,
             } => generic = Some(self.pair_arith(op, dest, source, reverse, pop, bail, c1_dead)),
-            Fast::Compare { source, pops } => self.pair_compare(source, pops, bail),
+            Fast::Compare { source, pops } => {
+                if x.flag_compare().is_some() {
+                    self.pair_fcomi(source, pops, can_keep_nzcv);
+                } else {
+                    self.pair_compare(source, pops, bail);
+                }
+            }
             Fast::Exchange(index) => {
                 self.x87_exchange(index);
-                self.clear_c1();
+                self.set_c1_zero();
             }
             Fast::Negate | Fast::Absolute => {
                 let from = self.x87.model.reg(0);
                 let to = self.x87_alloc();
                 if x.fast == Fast::Negate {
+                    // Pair slots hold only finite zeros and normals (exponents in
+                    // [64..2045]; `pair_from_extended` and `memory_operand` reject
+                    // NaNs), so `fneg v.2d` matches x86 `fchs` even under FPCR.AH=1.
+                    // Switch to bitwise EOR if NaNs are ever admitted to pair slots.
                     self.emit(vfneg2d(v(to), v(from)));
                 } else {
                     // Both lanes take the sign of the high one off.
@@ -217,8 +356,10 @@ impl Translator<'_> {
                     ]);
                 }
                 let narrow = self.x87_narrow(from);
-                self.x87_set(0, to, narrow);
-                self.clear_c1();
+                let single_exact = self.x87_single_exact(from);
+                let f32_normal = self.x87_f32_normal(from);
+                self.x87_set(0, to, narrow, single_exact, f32_normal);
+                self.set_c1_zero();
             }
             Fast::Round | Fast::Sqrt | Fast::Scale | Fast::Examine => unreachable!("not cached"),
         }
@@ -344,13 +485,28 @@ impl Translator<'_> {
     }
 
     /// ST(i) = the new value in host register `n`.
-    fn x87_set(&mut self, i: u8, n: u8, narrow: bool) {
+    fn x87_set(&mut self, i: u8, n: u8, narrow: bool, single_exact: bool, f32_normal: bool) {
         self.x87.model.set(i, super::cache::Slot::Dirty(n));
-        self.x87_written(n, narrow);
+        self.x87_written(n, narrow, single_exact, f32_normal);
     }
 
     fn pair_store(&mut self, width: u8, integer: bool, pop: bool, bail: Label, skip: bool) {
         let n = self.x87.model.reg(0);
+        if width == 4 && !integer && self.x87_f32_normal(n) {
+            // Known exact binary32 zero or normal: narrowing is exact under every
+            // rounding mode and never raises PE, UE, or OE.
+            self.emit_all(&[unary(Unary::Narrow, V0, v(n)), fmov_from_v(W, X2, V0)]);
+            if !skip {
+                self.set_c1_zero();
+            } else {
+                self.x87.model.status_recipe = StatusRecipe::Materialized;
+            }
+            self.x87_store_access(width);
+            if pop {
+                self.x87_pop();
+            }
+            return;
+        }
         if skip && (width != 8 || integer || !self.x87_narrow(n)) {
             // Even sticky PE must be masked; for floats the fast result
             // also needs round-to-nearest when the store can lose bits.
@@ -376,8 +532,11 @@ impl Translator<'_> {
                 ]);
                 self.store_rounding(width);
                 self.store_flags(bail);
+                self.x87.model.status_recipe = StatusRecipe::Materialized;
             } else if !skip {
-                self.clear_c1();
+                self.set_c1_zero();
+            } else {
+                self.x87.model.status_recipe = StatusRecipe::Materialized;
             }
         } else {
             // The sticky double: the top 53 bits of the value, the lowest
@@ -405,6 +564,7 @@ impl Translator<'_> {
             if !skip {
                 self.store_flags(bail);
             }
+            self.x87.model.status_recipe = StatusRecipe::Materialized;
         }
         self.x87_store_access(width);
         if pop {
@@ -414,16 +574,29 @@ impl Translator<'_> {
 
     fn pair_compare(&mut self, source: Source, pops: u8, bail: Label) {
         let a = self.operand(0);
-        let b = match source {
-            Source::St(i) => self.operand(i),
-            source => {
-                self.memory_operand(source, V1, None, bail);
-                Operand {
-                    high: V1,
-                    reg: None,
-                    narrow: true,
-                }
+        if let Source::St(i) = source {
+            let b = self.operand(i);
+            self.x87.model.status_recipe = StatusRecipe::Compare {
+                a: a.reg.expect("ST(0) is resident"),
+                b: b.reg.expect("ST(i) is resident"),
+                a_narrow: a.narrow,
+                b_narrow: b.narrow,
+            };
+            if pops == 2 {
+                self.x87_free(1);
             }
+            for _ in 0..pops {
+                self.x87_pop();
+            }
+            return;
+        }
+        self.memory_operand(source, V1, None, bail);
+        let b = Operand {
+            high: V1,
+            reg: None,
+            narrow: true,
+            single_exact: matches!(source, Source::F32 | Source::I16),
+            f32_normal: matches!(source, Source::F32 | Source::I16),
         };
         // The high lanes order the values unless equal; the low ones then.
         self.emit(fcmp(a.high, b.high));
@@ -443,10 +616,52 @@ impl Translator<'_> {
             orr(W, X13, X13, X16, Lsl, 14),
             orr(W, X13, X13, X17, Lsl, 8),
         ]);
+        self.x87.model.status_recipe = StatusRecipe::Materialized;
         if pops == 2 {
             self.x87_free(1);
         }
         for _ in 0..pops {
+            self.x87_pop();
+        }
+    }
+
+    /// Native `fcomi`/`fucomi`/`fcomip`/`fucomip` inside an x87 run (A64-FLAG-6).
+    ///
+    /// Resident pair slots hold only finite zeros and normals, so comparisons
+    /// are always ordered, clear `OF`/`SF`/`AF`/`PF`, and preserve `SW.C1`.
+    fn pair_fcomi(&mut self, source: Source, pops: u8, can_keep_nzcv: bool) {
+        let Source::St(i) = source else {
+            unreachable!("fcomi only compares registers");
+        };
+        let a = self.operand(0);
+        let b = self.operand(i);
+        self.emit(fcmp(a.high, b.high));
+        if !(a.narrow && b.narrow) {
+            let decided = self.asm.label();
+            self.asm.b_cond(Cond::Ne, decided);
+            self.low(a, V2);
+            self.low(b, V3);
+            self.emit(fcmp(V2, V3));
+            self.asm.bind(decided);
+        }
+        self.emit_all(&[
+            movz(W, super::super::X10, 1, 0),
+            movz(W, super::super::X11, 0, 0),
+        ]);
+        if self.features.flagm2 {
+            self.emit(AXFLAG);
+            if can_keep_nzcv {
+                self.x87.nzcv_in_host = true;
+            } else {
+                self.emit(mrs_nzcv(super::X4));
+            }
+        } else {
+            self.emit_all(&[
+                mrs_nzcv(super::X4),
+                and_imm(W, super::X4, super::X4, 0x7fff_ffff),
+            ]);
+        }
+        if pops == 1 {
             self.x87_pop();
         }
     }
@@ -511,10 +726,13 @@ impl Translator<'_> {
             Source::St(i) => self.operand(i),
             source => {
                 self.memory_operand(source, V1, None, bail);
+                let f32_exact = matches!(source, Source::F32 | Source::I16);
                 Operand {
                     high: V1,
                     reg: None,
                     narrow: true,
+                    single_exact: f32_exact,
+                    f32_normal: f32_exact,
                 }
             }
         };
@@ -522,15 +740,24 @@ impl Translator<'_> {
         let (label, join) = (self.asm.label(), self.asm.label());
         let (a, b) = if reverse { (s, d) } else { (d, s) };
         let precision = self.facts.control().and_then(precision);
-        match precision {
+        let f32_normal = match precision {
             Some(Precision::Single) => self.pair_double(op, a, b, to, label, c1_dead, true),
             Some(Precision::Double) => self.pair_double(op, a, b, to, label, c1_dead, false),
-            Some(Precision::Extended) => self.pair_extended(op, a, b, to, label, c1_dead),
-            None => self.asm.b(label),
-        }
+            Some(Precision::Extended) => {
+                self.pair_extended(op, a, b, to, label, c1_dead);
+                self.x87.model.status_recipe = StatusRecipe::Materialized;
+                false
+            }
+            None => {
+                self.x87.model.status_recipe = StatusRecipe::Materialized;
+                self.asm.b(label);
+                false
+            }
+        };
         self.asm.bind(join);
         let narrow = matches!(precision, Some(Precision::Single | Precision::Double));
-        self.x87_set(dest, to, narrow);
+        let single_exact = precision == Some(Precision::Single);
+        self.x87_set(dest, to, narrow, single_exact, f32_normal);
         if pop {
             self.x87_pop();
         }
@@ -543,12 +770,18 @@ impl Translator<'_> {
             source: s.reg,
             to,
             narrow,
+            single_exact,
+            f32_normal,
         }
     }
 
     /// Precision 53, or 24 when `single`: narrow operands, one rounding,
     /// the error from the residual, then for 24 the significand rounded.
-    /// Falls through to the join.
+    /// When `single` and both operands are exact binary32 zeros/normals,
+    /// executes directly in single precision with an exponent guard so x87's
+    /// 15-bit exponent and subnormal boundary stay exact.
+    /// Returns whether the result is statically guaranteed to be an exact
+    /// binary32 zero or normal (`f32_normal`). Falls through to the join.
     #[allow(clippy::too_many_arguments)]
     fn pair_double(
         &mut self,
@@ -559,8 +792,64 @@ impl Translator<'_> {
         generic: Label,
         c1_dead: bool,
         single: bool,
-    ) {
+    ) -> bool {
         self.pair_guard(generic);
+        let float = match op {
+            Arith::Add => Float::Fadd,
+            Arith::Sub => Float::Fsub,
+            Arith::Mul => Float::Fmul,
+            Arith::Div => Float::Fdiv,
+        };
+        let r = v(to);
+        let skip = c1_dead && self.x87.pe;
+        let can_defer_c1 = !skip
+            && self.x87.pe
+            && self.x87.control_stable
+            && a.reg.is_some()
+            && b.reg.is_some()
+            && a.narrow
+            && b.narrow
+            && (!single || (a.single_exact && b.single_exact));
+        if single && a.f32_normal && b.f32_normal && (skip || can_defer_c1) {
+            // Exact binary32 operands under PC24 with PE already set: compute
+            // in single precision and guard biased f32 exponent in [2..=254]
+            // (rejecting subnormal/min-normal boundary {0, 1} and Inf/NaN 255
+            // to `generic`, preserving x87's 15-bit extended exponent).
+            let (zero, join) = (self.asm.label(), self.asm.label());
+            self.emit_all(&[
+                unary(Unary::Narrow, V0, a.high),
+                unary(Unary::Narrow, V1, b.high),
+                sfloat(float, r, V0, V1),
+                fmov_from_v(W, X16, r),
+                lsl_imm(W, X17, X16, 1),
+            ]);
+            self.asm.cbz(W, false, X17, zero);
+            self.emit_all(&[
+                ubfx(W, X17, X16, 23, 8),
+                sub_imm(W, X17, X17, 2, false),
+                cmp_imm(W, X17, 252, false),
+            ]);
+            self.asm.b_cond(Cond::Hi, generic);
+            // Scalar FCVT Dd, Sn clears d[1] under FPCR.NEP = 0.
+            self.emit(unary(Unary::Widen, r, r));
+            self.asm.b(join);
+            self.asm.bind(zero);
+            self.exact_zero(op, a, b, generic);
+            self.emit(unary(Unary::Widen, r, r));
+            self.asm.bind(join);
+            self.x87.model.status_recipe = if can_defer_c1 {
+                StatusRecipe::C1Round {
+                    op,
+                    single: true,
+                    a: a.reg.expect("resident operand"),
+                    b: b.reg.expect("resident operand"),
+                    r: to,
+                }
+            } else {
+                StatusRecipe::Materialized
+            };
+            return true;
+        }
         match (a.narrow, b.narrow) {
             (true, true) => {}
             (false, true) => self.emit(vumov(3, X16, a.high, 1)),
@@ -576,38 +865,61 @@ impl Translator<'_> {
             self.asm.cbz(X, true, X16, generic);
         }
         if single {
-            self.emit_all(&[
-                fmov_from_v(X, X16, a.high),
-                fmov_from_v(X, X17, b.high),
-                orr(X, X16, X16, X17, Lsl, 0),
-                and_imm(X, X16, X16, SINGLE_TAIL),
-            ]);
-            self.asm.cbz(X, true, X16, generic);
+            match (a.single_exact, b.single_exact) {
+                (true, true) => {}
+                (false, true) => {
+                    self.emit_all(&[
+                        fmov_from_v(X, X16, a.high),
+                        and_imm(X, X16, X16, SINGLE_TAIL),
+                    ]);
+                    self.asm.cbz(X, true, X16, generic);
+                }
+                (true, false) => {
+                    self.emit_all(&[
+                        fmov_from_v(X, X16, b.high),
+                        and_imm(X, X16, X16, SINGLE_TAIL),
+                    ]);
+                    self.asm.cbz(X, true, X16, generic);
+                }
+                (false, false) => {
+                    self.emit_all(&[
+                        fmov_from_v(X, X16, a.high),
+                        fmov_from_v(X, X17, b.high),
+                        orr(X, X16, X16, X17, Lsl, 0),
+                        and_imm(X, X16, X16, SINGLE_TAIL),
+                    ]);
+                    self.asm.cbz(X, true, X16, generic);
+                }
+            }
         }
-        let float = match op {
-            Arith::Add => Float::Fadd,
-            Arith::Sub => Float::Fsub,
-            Arith::Mul => Float::Fmul,
-            Arith::Div => Float::Fdiv,
-        };
-        let r = v(to);
         let (zero, exact, join) = (self.asm.label(), self.asm.label(), self.asm.label());
         let round = if single { self.asm.label() } else { join };
         self.emit(dfloat(float, r, a.high, b.high));
         // Rounding to 24 bits may carry into the next binade.
         let span = if single { SPAN - 1 } else { SPAN };
         self.pair_range(r, zero, (LOW, span), generic);
-        let skip = c1_dead && self.x87.pe;
-        if skip {
+        if skip || can_defer_c1 {
             if single {
-                self.pair_single(r, join, c1_dead, true);
+                self.pair_single(r, join, true, true);
             }
             self.asm.b(join);
             self.asm.bind(zero);
             self.exact_zero(op, a, b, generic);
             self.asm.bind(join);
-            return;
+            self.x87.model.status_recipe = if can_defer_c1 {
+                StatusRecipe::C1Round {
+                    op,
+                    single,
+                    a: a.reg.expect("resident operand"),
+                    b: b.reg.expect("resident operand"),
+                    r: to,
+                }
+            } else {
+                StatusRecipe::Materialized
+            };
+            return false;
         }
+        self.x87.model.status_recipe = StatusRecipe::Materialized;
         if c1_dead {
             self.asm.tbz(true, X13, 5, round);
         }
@@ -651,6 +963,7 @@ impl Translator<'_> {
             self.clear_c1();
         }
         self.asm.bind(join);
+        false
     }
 
     /// Rounds the significand of the double in `r` to 24 bits, to nearest
@@ -940,6 +1253,23 @@ impl Translator<'_> {
             .then(|| self.facts.control())
             .flatten();
         self.wide_ops(g.op, g.reverse, bail, known);
+        if g.single_exact {
+            self.emit(tst_imm(X, X0, (1 << 40) - 1));
+            self.asm.b_cond(Cond::Ne, bail);
+        }
+        if g.f32_normal {
+            let f32_ok = self.asm.label();
+            self.asm.cbz(X, false, X0, f32_ok);
+            let below = 0x3fff - 126;
+            self.emit_all(&[
+                and_imm(W, X17, X1, 0x7fff),
+                sub_imm(W, X17, X17, below >> 12, true),
+                sub_imm(W, X17, X17, below & 0xfff, false),
+                cmp_imm(W, X17, 253, false),
+            ]);
+            self.asm.b_cond(Cond::Hi, bail);
+            self.asm.bind(f32_ok);
+        }
         if let Some(x87) = self.x87_stubs() {
             self.emit(movz(W, X2, u16::from(g.narrow), 0));
             self.far_call(x87.pair_from_extended);

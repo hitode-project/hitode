@@ -1749,6 +1749,8 @@ pub(super) struct Faults {
 pub(super) struct FaultCapture {
     /// The site that faulted, written in signal context.
     pub(super) pc: Cell<usize>,
+    /// Whether the fault landed on the second access of a paired `LDP`/`STP`.
+    pub(super) second_lane: Cell<bool>,
     /// v8-v23 captured before the fault stub restores host SIMD.
     pub(super) registers: Cell<runtime::FaultRegisters>,
 }
@@ -1799,6 +1801,7 @@ impl FaultCapture {
         &self,
         site: Site,
         pc: usize,
+        address: usize,
         stub: usize,
         snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
     ) -> usize {
@@ -1807,6 +1810,10 @@ impl FaultCapture {
             temps: [snapshot.gpr[7], snapshot.gpr[8]],
         });
         self.pc.set(pc);
+        let second = site.pair_second.is_some_and(|(_, split)| {
+            (address as u64) >= snapshot.gpr[17].wrapping_add_signed(i64::from(split))
+        });
+        self.second_lane.set(second);
         if site.resume != 0 {
             // The unit publishes its cached x87 state, then faults.
             pc.wrapping_add_signed(site.resume as isize)
@@ -1847,7 +1854,7 @@ pub(super) unsafe fn on_fault(
                     // SAFETY: the worker keeps its private capture and unit
                     // side table alive while its entry is active on this thread.
                     let faults = unsafe { &*faults };
-                    return faults.record(pc, snapshot);
+                    return faults.record(pc, address, snapshot);
                 }
                 Active::Owner(faults) => faults,
             };
@@ -1867,7 +1874,9 @@ pub(super) unsafe fn on_fault(
             let Some(site) = faults.site(pc) else {
                 return 0;
             };
-            faults.capture.record(site, pc, faults.stub, snapshot)
+            faults
+                .capture
+                .record(site, pc, address, faults.stub, snapshot)
         })
         .unwrap_or(0)
 }
@@ -1882,13 +1891,15 @@ impl WorkerFaults<'_> {
     pub(super) fn record(
         &self,
         pc: usize,
+        address: usize,
         snapshot: &adv_cpu_core::execution_abi::HostContextSnapshot,
     ) -> usize {
         if !(self.code.entry..self.code.end).contains(&pc) {
             return 0;
         }
-        site_at(&self.code.sites, pc)
-            .map_or(0, |site| self.capture.record(site, pc, self.stub, snapshot))
+        site_at(&self.code.sites, pc).map_or(0, |site| {
+            self.capture.record(site, pc, address, self.stub, snapshot)
+        })
     }
 }
 

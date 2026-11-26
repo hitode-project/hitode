@@ -190,6 +190,7 @@ struct Cases {
 impl BatchBody for Cases {
     fn lower(&self, emitter: &mut BatchEmitter<'_, '_>) {
         let test_start = emitter.asm().offset();
+        self.tests.lower_preheader(emitter);
         self.tests.lower(emitter);
         let test_words = ((emitter.asm().offset() - test_start) / 4) as u32;
         let count = self.paths.len();
@@ -209,6 +210,7 @@ impl BatchBody for Cases {
                 emitter.asm().bind(choices[right]);
                 emitter.count_class((left * count + right) as u8);
                 let body_start = emitter.asm().offset();
+                program.lower_preheader(emitter);
                 program.lower(emitter);
                 emitter.asm().b(exit);
                 let body = ((emitter.asm().offset() - body_start) / 4) as u32;
@@ -303,6 +305,7 @@ pub(super) fn recognize(
         loop_: lp,
         paths: &paths,
         stable,
+        reduction: None,
     };
     let shape = Shape::Packed(8);
     let backwards = first.stride < 0;
@@ -319,12 +322,18 @@ pub(super) fn recognize(
         };
         b.read_inputs(groups)?;
         build(&mut b)?;
-        let code = b.live_code()?;
+        let allocated = b.live_code()?;
         inputs.extend(b.insts.iter().filter_map(|i| match i.op {
             OpCode::Broadcast(v) => Some(v),
             _ => None,
         }));
-        Some(Program { shape, code })
+        Some(Program {
+            shape,
+            preheader: allocated.preheader,
+            code: allocated.body,
+            unroll2: None,
+            epilogue: Vec::new(),
+        })
     };
     let tests = program(&mut |b| {
         let loads = b.mapped.clone();

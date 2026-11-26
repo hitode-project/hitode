@@ -221,26 +221,68 @@ fn typed(func: &Func, op: &Op) -> bool {
             dividend,
             divisor,
         } => is(quotient, Type::I32) && is(dividend, Type::I64) && is(divisor, Type::I32),
-        Op::Flags { a, prior, .. } => {
-            (int(a) || is(a, Type::F64)) && prior.is_none_or(|p| is(p, Type::Flags))
+        Op::Flags {
+            kind,
+            width,
+            a,
+            b,
+            prior,
+        } => {
+            let ok_operands = if kind.floating() {
+                if kind == super::ir::FlagKind::X87CompareFold {
+                    is(a, Type::F64) && is(b, Type::F64)
+                } else if width == 32 {
+                    is(a, Type::V128) && is(b, Type::V128)
+                } else {
+                    is(a, Type::F64) && is(b, Type::F64)
+                }
+            } else {
+                int(a)
+            };
+            ok_operands && prior.is_none_or(|p| is(p, Type::Flags))
         }
         Op::Test { flags, .. } => is(flags, Type::Flags),
         Op::Select { cond, a, b } => is(cond, Type::I32) && func.ty(a) == func.ty(b),
-        Op::Fp32(_, a, b) => is(a, Type::V128) && is(b, Type::V128),
-        Op::Fp(_, a, b, _) | Op::X87Single(_, a, b, _) | Op::SseFp64(_, a, b) => {
-            is(a, Type::F64) && is(b, Type::F64)
+        Op::Fp32(_, a, b) | Op::SsePackedFp { a, b, .. } | Op::SseMinMax { a, b, .. } => {
+            is(a, Type::V128) && is(b, Type::V128)
         }
+        Op::Fp(_, a, b, _)
+        | Op::X87Single(_, a, b, _)
+        | Op::X87Arith { a, b, .. }
+        | Op::X87Compare { a, b, .. }
+        | Op::X87RoundC1 { a, b, .. }
+        | Op::X87SqrtC1 {
+            input: a,
+            result: b,
+        }
+        | Op::SseFp64(_, a, b) => is(a, Type::F64) && is(b, Type::F64),
         Op::Fma { a, b, c, .. } => is(a, Type::F64) && is(b, Type::F64) && is(c, Type::F64),
-        Op::FpUnary(_, a) | Op::ToInt { value: a, .. } | Op::X87Store { value: a, .. } => {
-            is(a, Type::F64)
-        }
+        Op::FpUnary(_, a)
+        | Op::ToInt { value: a, .. }
+        | Op::X87Store { value: a, .. }
+        | Op::X87Sqrt { value: a, .. }
+        | Op::X87Round { value: a, .. }
+        | Op::X87Exam(a) => is(a, Type::F64),
         Op::X87StoreC1 { value, stored, .. } => is(value, Type::F64) && int(stored),
-        Op::Vec(_, a, b) | Op::VecFp { a, b, .. } => is(a, Type::V128) && is(b, Type::V128),
+        Op::Vec(_, a, b) | Op::VecFp { a, b, .. } | Op::VecFpMulElem { a, b, .. } => {
+            is(a, Type::V128) && is(b, Type::V128)
+        }
+        Op::VecDeintLoad {
+            addr,
+            channels,
+            channel,
+            ..
+        } => is(addr, Type::I32) && (2..=4).contains(&channels) && channel < channels,
+        Op::VecLoadBcast { addr, .. } => is(addr, Type::I32),
         Op::VecFma { a, b, c, .. } => is(a, Type::V128) && is(b, Type::V128) && is(c, Type::V128),
         Op::VecUnary(_, a)
         | Op::VecToInt(_, a)
         | Op::VecFpToInt { value: a, .. }
-        | Op::SsePackedToInt { value: a, .. } => is(a, Type::V128),
+        | Op::SsePackedToInt { value: a, .. }
+        | Op::SseScalarToInt { value: a, .. }
+        | Op::SseSqrt { a, .. }
+        | Op::SseConvert { a, .. } => is(a, Type::V128),
+        Op::FpValidate { values, .. } => values.into_iter().flatten().all(|v| is(v, Type::F64)),
         Op::Load { addr, .. } | Op::Store { addr, .. } | Op::Host(addr) => is(addr, Type::I32),
         Op::FrameLoad { ty, base, .. } => (int_ty(ty) || ty == Type::F64) && is(base, Type::I64),
         Op::FrameStore { base, value, .. } => {
@@ -311,7 +353,7 @@ fn effects(func: &Func) -> Result<(), Error> {
                 return Err(Error::Commit(Block(b as u32)));
             }
             pending = match op {
-                Op::Validate => false,
+                Op::Validate | Op::FpValidate { .. } => false,
                 op => pending || op.floating(),
             };
         }

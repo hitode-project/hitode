@@ -11,9 +11,10 @@ use crate::runtime::{self, Exit};
 use flags::{Carry, Operand, Overflow, Recipe, Sense};
 
 pub(crate) mod access;
-pub(super) mod body;
+pub(crate) mod body;
 pub(crate) mod flags;
 pub(super) mod fp_class;
+pub(crate) mod fp_state;
 pub(crate) mod resident;
 pub(crate) mod stubs;
 pub(crate) mod x87_stubs;
@@ -58,6 +59,9 @@ pub struct Site {
     pub resume: i32,
     /// Optimized region record, when this access belongs to an optimized form.
     pub opt_record: Option<u32>,
+    /// Second guest instruction and base-relative byte offset (`disp + width`
+    /// from `x17`) when a paired `LDP`/`STP` merges two distinct guest PCs.
+    pub pair_second: Option<(u32, i32)>,
 }
 
 /// Offsets of the body and the patchable miss branch in a checked unit.

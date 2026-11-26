@@ -163,20 +163,29 @@ pub(crate) enum FlagKind {
     Shr,
     Sar,
     MulSigned,
-    /// `ucomisd`: ZF, PF and CF from an unordered comparison.
+    /// `ucomisd`/`ucomiss`/`fucomi`: ZF, PF and CF from an unordered comparison.
     UnorderedCompare,
-    /// `comisd`: the same flags, but a quiet NaN also raises invalid.
+    /// `comisd`/`comiss`/`fcomi`: the same flags, but a quiet NaN also raises invalid.
     OrderedCompare,
     CarryBit,
     MulUnsigned,
     Rol,
     Ror,
+    /// `sahf`: loads SF, ZF, AF, PF, CF from `a` (bits 7:0 = AH), preserving OF.
+    Sahf,
+    /// Folded `fcom`/`fucom`/`ftst` + `fnstsw ax` + `sahf` (AX dead): compares F64
+    /// `a` and `b`, preserves OF from `prior`, sets AF from `width & 1` (TOP[1]),
+    /// clears SF (`ES == 0`), and raises invalid on QNaN when `width & 2 != 0`.
+    X87CompareFold,
 }
 
 impl FlagKind {
-    /// Whether it compares F64 operands.
+    /// Whether it compares floating-point operands.
     pub(crate) fn floating(self) -> bool {
-        matches!(self, FlagKind::UnorderedCompare | FlagKind::OrderedCompare)
+        matches!(
+            self,
+            FlagKind::UnorderedCompare | FlagKind::OrderedCompare | FlagKind::X87CompareFold
+        )
     }
 
     /// Whether the flags depend on operand `b`: a logical result's flags,
@@ -190,8 +199,22 @@ impl FlagKind {
                 | FlagKind::Negate
                 | FlagKind::CarryBit
                 | FlagKind::MulUnsigned
+                | FlagKind::Sahf
         )
     }
+}
+
+/// SSE floating-point width conversions (`cvtss2sd`, `cvtps2pd`, `cvtsd2ss`, `cvtpd2ps`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SseConvertKind {
+    /// `cvtss2sd`: low f32 -> low f64.
+    WidenScalar,
+    /// `cvtps2pd`: low 2 f32 -> 2 f64.
+    WidenPacked,
+    /// `cvtsd2ss`: low f64 -> low f32.
+    NarrowScalar,
+    /// `cvtpd2ps`: 2 f64 -> low 2 f32 (upper 64 bits zeroed).
+    NarrowPacked,
 }
 
 /// Predicates for `Block(0)` entry domain guards (`Op::DomainGuard`).
@@ -345,6 +368,27 @@ pub(crate) enum Op {
         a: Value,
         b: Value,
     },
+    /// Proved-safe by-element `.2d` or `.4s` FP multiply: `a * b[lane]`.
+    VecFpMulElem {
+        double: bool,
+        a: Value,
+        b: Value,
+        lane: u8,
+    },
+    /// Proved-safe de-interleaving AoS load (`LD2`/`LD3`/`LD4`), returning `channel` of `channels`.
+    VecDeintLoad {
+        addr: Value,
+        channels: u8,
+        channel: u8,
+        double: bool,
+        pc: u32,
+    },
+    /// Proved-safe broadcast-from-memory load (`LD1R`) into `.4s` or `.2d`.
+    VecLoadBcast {
+        addr: Value,
+        double: bool,
+        pc: u32,
+    },
     /// Proved-safe lane-wise `.2d` or `.4s` fused multiply-add/sub: `c + a * b` or `c - a * b`.
     VecFma {
         sub: bool,
@@ -452,21 +496,111 @@ pub(crate) enum Op {
     },
     /// Accumulate actual writes for the owner's scoped GPR join.
     ScopeWritten(u32),
+    /// x87 arithmetic with directed rounding (`rounding != 0`) or PC64 (`pc == 3`).
+    /// `pc`: 0 = PC24, 2 = PC53, 3 = PC64. `rounding`: 0..=3 (RN, RD, RU, RZ).
+    X87Arith {
+        op: FpOp,
+        a: Value,
+        b: Value,
+        pc: u8,
+        rounding: u8,
+        proved: bool,
+    },
+    /// x87 `fsqrt` under precision `pc` (0/2/3) and rounding `rounding` (0..=3).
+    X87Sqrt {
+        value: Value,
+        pc: u8,
+        rounding: u8,
+        proved: bool,
+    },
+    /// x87 `frndint` under rounding `rounding` (0..=3).
+    X87Round {
+        value: Value,
+        rounding: u8,
+        denormal: bool,
+        proved: bool,
+    },
+    /// x87 `fcom`/`fucom`/`ftst`: returns status CC mask `(C3<<14 | C2<<10 | C0<<8)`.
+    X87Compare {
+        a: Value,
+        b: Value,
+        ordered: bool,
+    },
+    /// x87 `fxam`: returns status mask `(C3<<14 | C2<<10 | C1<<9 | C0<<8)`.
+    X87Exam(Value),
+    /// Evaluates x87 C1 (0 or 1) for an arithmetic rounding operation (used on
+    /// `merge_c1` joins and directed/PC64 arithmetic).
+    X87RoundC1 {
+        op: FpOp,
+        a: Value,
+        b: Value,
+        pc: u8,
+        rounding: u8,
+    },
+    /// Evaluates x87 C1 (0 or 1) for `fsqrt`: `result * result > input`.
+    X87SqrtC1 {
+        input: Value,
+        result: Value,
+    },
+    /// Packed SSE FP arithmetic (`addps`/`subps`/`mulps`/`divps`, `addpd`..`divpd`).
+    SsePackedFp {
+        op: FpOp,
+        double: bool,
+        a: Value,
+        b: Value,
+        proved: bool,
+    },
+    /// Scalar or packed SSE `min`/`max` (`minss`/`maxss`/`minsd`/`maxsd`/`minps`/`maxps`/`minpd`/`maxpd`).
+    SseMinMax {
+        max: bool,
+        scalar: bool,
+        double: bool,
+        a: Value,
+        b: Value,
+        proved: bool,
+    },
+    /// Scalar or packed SSE `sqrt` (`sqrtss`/`sqrtsd`/`sqrtps`/`sqrtpd`).
+    SseSqrt {
+        scalar: bool,
+        double: bool,
+        a: Value,
+        proved: bool,
+    },
+    /// SSE floating-point conversions (`cvtss2sd`, `cvtps2pd`, `cvtsd2ss`, `cvtpd2ps`).
+    SseConvert {
+        kind: SseConvertKind,
+        a: Value,
+        proved: bool,
+    },
+    /// Scalar SSE float-to-int32 conversion (`cvtss2si`, `cvttss2si`, `cvtsd2si`, `cvttsd2si`).
+    SseScalarToInt {
+        value: Value,
+        double: bool,
+        truncate: bool,
+    },
+    /// Explicit SSA floating-point validation of up to 4 `F64` values placed
+    /// before an effect point or barrier (A64-OPT-4, A64-OPT-5).
+    /// Bit `i` in `strict` excludes the `2^-1022` binade and unproved zeros (for `Mul`).
+    FpValidate {
+        values: [Option<Value>; 4],
+        strict: u8,
+    },
     /// Effect boundary for floating-point checks.
     Validate,
 }
 
 impl Op {
     pub(crate) fn uses(&self) -> impl Iterator<Item = Value> {
-        let list: [Option<Value>; 3] = match *self {
-            Op::Constant(..) | Op::Validate | Op::ScopeWritten(_) => [None; 3],
-            Op::SseInput { a, b, .. } => [Some(a), b, None],
+        let list: [Option<Value>; 4] = match *self {
+            Op::Constant(..) | Op::Validate | Op::ScopeWritten(_) => [None; 4],
+            Op::FpValidate { values, .. } => values,
+            Op::SseInput { a, b, .. } => [Some(a), b, None, None],
             Op::DomainGuard { kind, .. } => match kind {
                 DomainGuardKind::FpWindow { value: a, .. }
                 | DomainGuardKind::FpLe { value: a, .. }
                 | DomainGuardKind::U32Le { value: a, .. }
-                | DomainGuardKind::ExactF32 { value: a } => [Some(a), None, None],
-                DomainGuardKind::SameSign { a, b } => [Some(a), Some(b), None],
+                | DomainGuardKind::ExactF32 { value: a } => [Some(a), None, None, None],
+                DomainGuardKind::SameSign { a, b } => [Some(a), Some(b), None, None],
             },
             Op::Snapshot(a)
             | Op::IntUnary(_, a)
@@ -478,21 +612,39 @@ impl Op {
             | Op::FromInt(a)
             | Op::ToInt { value: a, .. }
             | Op::SsePackedToInt { value: a, .. }
+            | Op::SseScalarToInt { value: a, .. }
             | Op::X87Store { value: a, .. }
+            | Op::X87Sqrt { value: a, .. }
+            | Op::X87Round { value: a, .. }
+            | Op::X87Exam(a)
+            | Op::SseSqrt { a, .. }
+            | Op::SseConvert { a, .. }
             | Op::Load { addr: a, .. }
+            | Op::VecDeintLoad { addr: a, .. }
+            | Op::VecLoadBcast { addr: a, .. }
             | Op::PlainPage { addr: a, .. }
             | Op::PageCross { addr: a, .. }
             | Op::Host(a)
             | Op::FrameLoad { base: a, .. }
             | Op::X87Load { bits: a, .. }
-            | Op::Test { flags: a, .. } => [Some(a), None, None],
+            | Op::Test { flags: a, .. } => [Some(a), None, None, None],
             Op::Int(_, a, b)
             | Op::Fp(_, a, b, _)
             | Op::X87Single(_, a, b, _)
+            | Op::X87Arith { a, b, .. }
+            | Op::X87Compare { a, b, .. }
+            | Op::X87RoundC1 { a, b, .. }
+            | Op::X87SqrtC1 {
+                input: a,
+                result: b,
+            }
             | Op::Fp32(_, a, b)
             | Op::SseFp64(_, a, b)
+            | Op::SsePackedFp { a, b, .. }
+            | Op::SseMinMax { a, b, .. }
             | Op::Vec(_, a, b)
             | Op::VecFp { a, b, .. }
+            | Op::VecFpMulElem { a, b, .. }
             | Op::X87StoreC1 {
                 value: a,
                 stored: b,
@@ -511,8 +663,8 @@ impl Op {
             }
             | Op::FrameDisjoint {
                 addr: a, base: b, ..
-            } => [Some(a), Some(b), None],
-            Op::Flags { a, b, prior, .. } => [Some(a), Some(b), prior],
+            } => [Some(a), Some(b), None, None],
+            Op::Flags { a, b, prior, .. } => [Some(a), Some(b), prior, None],
             Op::Select { cond, a, b }
             | Op::Fma {
                 a: cond,
@@ -530,7 +682,7 @@ impl Op {
                 quotient: cond,
                 dividend: a,
                 divisor: b,
-            } => [Some(cond), Some(a), Some(b)],
+            } => [Some(cond), Some(a), Some(b), None],
         };
         list.into_iter().flatten()
     }
@@ -538,7 +690,14 @@ impl Op {
     /// Whether the operation requires validation before an effect point.
     pub(crate) fn floating(&self) -> bool {
         match *self {
-            Op::Fp(_, _, _, proved) => !proved,
+            Op::Fp(_, _, _, proved)
+            | Op::X87Arith { proved, .. }
+            | Op::X87Sqrt { proved, .. }
+            | Op::X87Round { proved, .. }
+            | Op::SsePackedFp { proved, .. }
+            | Op::SseMinMax { proved, .. }
+            | Op::SseSqrt { proved, .. }
+            | Op::SseConvert { proved, .. } => !proved,
             Op::X87Single(_, _, _, proved) => {
                 proved & SINGLE_EXACT == 0
                     && proved & (SINGLE_A | SINGLE_B | SINGLE_RESULT)
@@ -556,6 +715,8 @@ impl Op {
             Op::Fp32(..)
             | Op::SseFp64(..)
             | Op::ToInt { .. }
+            | Op::SseScalarToInt { .. }
+            | Op::X87Compare { .. }
             | Op::X87Store { proved: false, .. }
             | Op::Vec(VecOp::LessF64, ..) => true,
             Op::Flags { kind, .. } => kind.floating(),
@@ -573,10 +734,13 @@ impl Op {
                     | Op::PageCross { .. }
                     | Op::FrameDisjoint { .. }
                     | Op::Load { .. }
+                    | Op::VecDeintLoad { .. }
+                    | Op::VecLoadBcast { .. }
                     | Op::Store { .. }
                     | Op::X87Load { proved: false, .. }
                     | Op::SseInput { .. }
                     | Op::SsePackedToInt { .. }
+                    | Op::FpValidate { .. }
                     | Op::DomainGuard { .. }
             )
     }
@@ -593,7 +757,11 @@ impl Op {
         self.can_fail()
             || matches!(
                 self,
-                Op::FrameStore { .. } | Op::Validate | Op::PlainPage { .. } | Op::ScopeWritten(_)
+                Op::FrameStore { .. }
+                    | Op::Validate
+                    | Op::FpValidate { .. }
+                    | Op::PlainPage { .. }
+                    | Op::ScopeWritten(_)
             )
     }
 
@@ -728,6 +896,9 @@ pub(crate) struct Func {
     pub domain_guards: Vec<u32>,
     /// Marginal host instruction words saved per loop iteration, parallel to `domain_guards`.
     pub domain_saved_per_iter: Vec<u32>,
+    /// `Op::Fp` results whose runtime validation is decoupled into explicit
+    /// `Op::FpValidate` SSA ops before effect points (A64-OPT-4, A64-OPT-5).
+    pub deferred_fp: BTreeSet<Value>,
 }
 
 impl Func {
@@ -795,13 +966,21 @@ impl Func {
             | Op::Snapshot(_)
             | Op::Test { .. }
             | Op::ToInt { wide: false, .. }
+            | Op::SseScalarToInt { .. }
             | Op::X87Store { width: 2 | 4, .. }
             | Op::X87StoreC1 { .. }
+            | Op::X87Compare { .. }
+            | Op::X87Exam(_)
+            | Op::X87RoundC1 { .. }
+            | Op::X87SqrtC1 { .. }
             | Op::VecToInt(..) => Type::I32,
             Op::ToInt { wide: true, .. } | Op::X87Store { .. } => Type::I64,
             Op::Flags { .. } => Type::Flags,
             Op::Fp(..)
             | Op::X87Single(..)
+            | Op::X87Arith { .. }
+            | Op::X87Sqrt { .. }
+            | Op::X87Round { .. }
             | Op::Fma { .. }
             | Op::SseFp64(..)
             | Op::FpUnary(..)
@@ -810,13 +989,21 @@ impl Func {
             Op::Vec(..)
             | Op::VecUnary(..)
             | Op::VecFp { .. }
+            | Op::VecFpMulElem { .. }
+            | Op::VecDeintLoad { .. }
+            | Op::VecLoadBcast { .. }
             | Op::VecFma { .. }
             | Op::VecFpToInt { .. }
             | Op::Fp32(..)
+            | Op::SsePackedFp { .. }
+            | Op::SseMinMax { .. }
+            | Op::SseSqrt { .. }
+            | Op::SseConvert { .. }
             | Op::SsePackedToInt { .. } => Type::V128,
             Op::Store { .. }
             | Op::FrameStore { .. }
             | Op::SseInput { .. }
+            | Op::FpValidate { .. }
             | Op::Validate
             | Op::ScopeWritten(_)
             | Op::PlainPage { .. }

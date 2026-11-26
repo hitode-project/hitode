@@ -18,6 +18,10 @@ pub(super) struct Allocation {
     pub locations: Vec<Host>,
     pub regions: Vec<RecordId>,
     pub spill_cells: usize,
+    /// Values spilled due to register pressure (excludes `Op::Snapshot`).
+    pub spills: usize,
+    /// Vector/FP (`F64`/`V128`) values spilled due to register pressure.
+    pub vector_spills: usize,
     pub defs: Vec<Option<Op>>,
 }
 
@@ -45,8 +49,19 @@ pub(super) fn allocate(
     for data in &func.blocks {
         for &(result, op) in &data.insts {
             match op {
-                Op::SseInput { packed: true, .. } => vectors = vectors.min(F.number() as u8),
-                Op::Vec(VecOp::LessF64, ..) => vectors = vectors.min(D.number() as u8),
+                Op::SseInput { packed: true, .. }
+                | Op::SsePackedFp { .. }
+                | Op::SseMinMax { .. }
+                | Op::SseSqrt { .. }
+                | Op::SseConvert { .. } => vectors = vectors.min(F.number() as u8),
+                Op::FpValidate { .. } | Op::X87Arith { .. } | Op::X87RoundC1 { .. } => {
+                    vectors = vectors.min(E.number() as u8);
+                }
+                Op::Vec(VecOp::LessF64, ..)
+                | Op::SsePackedToInt { .. }
+                | Op::VecDeintLoad { .. } => {
+                    vectors = vectors.min(D.number() as u8);
+                }
                 _ => {}
             }
             if let Some(v) = result {
@@ -152,11 +167,26 @@ pub(super) fn allocate(
                 for v in op.uses() {
                     // Scalar SSE cold checks still need the original inputs.
                     let position = position + usize::from(resident && matches!(op, Op::Fp32(..)));
+                    let is_fp_zero_imm = constants[v.0 as usize].is_some_and(|bits| match *op {
+                        Op::Flags { kind, width, b, .. } if kind.floating() && b == v => {
+                            let single = kind != super::FlagKind::X87CompareFold && width == 32;
+                            if single {
+                                ((bits as u32) & 0x7fff_ffff) == 0
+                            } else {
+                                ((bits as u64) & 0x7fff_ffff_ffff_ffff) == 0
+                            }
+                        }
+                        Op::X87Compare { b, .. } if b == v => {
+                            ((bits as u64) & 0x7fff_ffff_ffff_ffff) == 0
+                        }
+                        _ => false,
+                    });
                     read(
                         v,
                         position,
                         true,
-                        constants[v.0 as usize].is_some_and(|bits| matches!(*op, Op::Int(kind, _, b) if b == v && int_immediate(kind, if func.ty(v) == Type::I64 { X } else { W }, T, T, bits as u64).is_some())),
+                        is_fp_zero_imm
+                            || constants[v.0 as usize].is_some_and(|bits| matches!(*op, Op::Int(kind, _, b) if b == v && int_immediate(kind, if func.ty(v) == Type::I64 { X } else { W }, T, T, bits as u64).is_some())),
                     );
                 }
             }
@@ -244,6 +274,8 @@ pub(super) fn allocate(
     let mut cells: Vec<(usize, u32)> = Vec::new();
     let mut locations = vec![Host::Constant(0); n];
     let mut slots = 0;
+    let mut spills = 0usize;
+    let mut vector_spills = 0usize;
     let mut spill = |i: usize, cells: &mut Vec<(usize, u32)>| {
         let cell = match cells.iter().position(|&(end, _)| end < starts[i]) {
             Some(k) => cells.swap_remove(k).1,
@@ -310,10 +342,16 @@ pub(super) fn allocate(
             Some(k) if (weight[active[k].2], ends[i]) < (weight[i], active[k].0) => {
                 let (_, loc, held) = active.swap_remove(k);
                 locations[held] = spill(held, &mut cells);
+                spills += 1;
+                vector_spills += usize::from(vector);
                 locations[i] = loc;
                 active.push((ends[i], loc, i));
             }
-            _ => locations[i] = spill(i, &mut cells),
+            _ => {
+                locations[i] = spill(i, &mut cells);
+                spills += 1;
+                vector_spills += usize::from(vector);
+            }
         }
     }
     // An integer constant takes a register only where one stays free for its
@@ -349,6 +387,8 @@ pub(super) fn allocate(
         locations,
         regions,
         spill_cells: slots as usize,
+        spills,
+        vector_spills,
         defs: operations,
     }
 }

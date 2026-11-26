@@ -241,6 +241,10 @@ impl Executor {
     }
 
     pub fn save_context(&self) -> Result<ExecutionContext, String> {
+        #[cfg(native)]
+        if let Some(native) = &self.native {
+            native.assert_fp_boundary_clean();
+        }
         let mut cpu = self.state.clone();
         cpu.refresh_mmx();
         Ok(ExecutionContext {
@@ -260,6 +264,7 @@ impl Executor {
     pub fn restore_context(&mut self, context: &ExecutionContext) -> Result<(), String> {
         #[cfg(native)]
         if let Some(native) = &mut self.native {
+            native.assert_fp_boundary_clean();
             native.restore_shadow(context.shadow.as_ref())?;
         }
         self.state = context.cpu.clone();

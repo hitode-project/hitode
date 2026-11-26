@@ -12,6 +12,7 @@ use super::{
     offset_of, orr, orr_imm, runtime, shiftv, stp, str, str_narrow, str_reg, strh, stur, sub, ubfx,
     unary, vfneg2d, vldr, vldur, vstur,
 };
+use crate::translate::lower::fp_state;
 use crate::translate::lower::stubs;
 use crate::translate::lower::{emit_link_point, emit_link_transition};
 
@@ -57,6 +58,10 @@ impl Emitter<'_> {
         );
         self.asm.emit(ldr(W, T, RT, REP_PENDING));
         self.asm.cbz(W, true, T, cold);
+        if self.has_afp && (key.mxcsr_bits().1 & 0x3f != 0 || entry.contains(&Source::Mxcsr)) {
+            self.uses_fp_state = true;
+            fp_state::emit_fold_fpsr(&mut self.asm, T, U, S2);
+        }
         key.guard_resident(&mut self.asm, CPU, miss);
         self.body = self.asm.offset();
         if let Some((domain, offer)) = self.domain {
@@ -513,6 +518,12 @@ impl Emitter<'_> {
             }
         }
         self.write_mmx(&record, assumed.mmx);
+        if self.func_uses_afp_sse {
+            fp_state::emit_fold_fpsr(&mut self.asm, T, U, S2);
+        }
+        if self.modifies_fpcr {
+            fp_state::emit_restore_host_fpcr(&mut self.asm, T, U);
+        }
         // The optimized IR keeps MXCSR sticky bits in CpuState. An SSE
         // arithmetic form admits only with precision already set.
 
@@ -808,6 +819,16 @@ impl Emitter<'_> {
                 }
                 other => self.gp_at(numeric(other), T),
             };
+            // When bit 16 is set, `value` also carries dynamic C3|C2|C0 bits (0x4500).
+            let only_c1 = self.asm.label();
+            self.asm.tbz(false, value, 16, only_c1);
+            self.imm(U, 0x4500);
+            self.asm.emit_all(&[
+                bic(W, S5, S5, U, Lsl, 0),
+                and(W, U, value, U, Lsl, 0),
+                orr(W, S5, S5, U, Lsl, 0),
+            ]);
+            self.asm.bind(only_c1);
             self.asm.emit(bfi(W, S5, value, 9, 1));
         }
         self.asm.emit(strh(S5, CPU, runtime::X87_STATUS));
@@ -869,7 +890,7 @@ impl Emitter<'_> {
     }
 
     /// Recomputes the rounding direction used by recovery::materialize.
-    fn c1(&mut self, op: FpOp, a: Host, b: Host, single: bool) {
+    pub(super) fn c1(&mut self, op: FpOp, a: Host, b: Host, single: bool) {
         use Float::*;
         let a = self.v_at(a, A);
         let mut b = self.v_at(b, B);

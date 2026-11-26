@@ -459,6 +459,7 @@ fn frintts_packed_float_to_int_matches_interpreter_and_fallback() {
                         Features {
                             flagm: false,
                             frintts,
+                            ..Features::default()
                         },
                         false,
                         Checks::Adaptive,
@@ -509,6 +510,7 @@ fn frintts_packed_float_to_int_matches_interpreter_and_fallback() {
                         Features {
                             flagm: false,
                             frintts,
+                            ..Features::default()
                         },
                         false,
                         Checks::Adaptive,

@@ -213,6 +213,16 @@ impl Native {
         self.runtime.cpu = std::ptr::null_mut();
         self.runtime.owner = 0;
         self.runtime.body.memory = std::ptr::null();
+        debug_assert_eq!(
+            self.runtime.fpsr_owner,
+            crate::runtime::FPSR_CLEAN,
+            "root exit must fold or discard hardware FPSR (A64F-FP-5)"
+        );
+        debug_assert_eq!(
+            self.runtime.active_fpcr, self.runtime.host_fpcr,
+            "root exit must restore host FPCR (A64F-FP-5)"
+        );
+        self.flush_fp_runtime();
         if returned.reason as u32 != Exit::Optimized.raw() {
             self.runtime.shadow = returned.shadow;
         }
@@ -407,6 +417,7 @@ impl Native {
             (word.as_ptr(), self.pending_mask)
         });
         self.code.faults.capture.pc.set(0);
+        self.code.faults.capture.second_lane.set(false);
         let runtime = &mut *self.runtime;
         if self.count_resident_entries {
             runtime.resident_entry_counter = (&raw mut self.diagnostics.resident_entries) as u64;
@@ -466,7 +477,11 @@ impl Native {
         if let Some((site, reason)) = ResidentCold::decode(recovery.detail) {
             (refund, site, reason, false)
         } else if let Some(site) = fault {
-            (refund, site.eip, ResidentCold::HostFault, site.checked)
+            let eip = match site.pair_second {
+                Some((pc2, _)) if self.code.faults.capture.second_lane.get() => pc2,
+                _ => site.eip,
+            };
+            (refund, eip, ResidentCold::HostFault, site.checked)
         } else {
             (refund, record.eip, ResidentCold::Other, false)
         }
@@ -507,7 +522,12 @@ impl Native {
             &mut self.offload,
             (retired, &mut self.retired_forms),
             Notifications { pending, wake },
-            (self.pace.get(), &mut self.diagnostics.split),
+            (
+                self.pace.get(),
+                &mut self.diagnostics.split,
+                &mut self.diagnostics.fp,
+                &mut self.region_speculation,
+            ),
         ) {
             visit(&mut session);
             updates = session.take_scope_updates();
@@ -612,6 +632,15 @@ impl Native {
             .resident_cold_exits_by_reason
             .entry(reason)
             .or_default() += 1;
+        self.record_region_speculation(
+            eip,
+            super::RegionSpeculation {
+                failures: 1,
+                replays: 1,
+                replayed_instructions: u64::from(refund),
+                validation_failures: u64::from(reason == ResidentCold::Validation),
+            },
+        );
         let Some(head) = self.plans.resident_mut(eip) else {
             return;
         };
@@ -1002,10 +1031,11 @@ impl Native {
             };
             self.code.set_tier1(eip, entry, table_target, chain);
             self.code.repoint_resident_fallback(eip, entry.unit);
-            if mask != 0
-                && let Some(stats) = &mut self.code.version_stats
-            {
-                stats.get_mut(&eip).unwrap().built += 1;
+            if mask != 0 {
+                self.diagnostics.fp.fp_versions += 1;
+                if let Some(stats) = &mut self.code.version_stats {
+                    stats.get_mut(&eip).unwrap().built += 1;
+                }
             }
         } else {
             self.tier1_scratch = Some(unit);
@@ -1064,6 +1094,7 @@ impl Native {
                 .map(|entry| entry.unit);
         };
         let action = plan::tier1_miss(chain, observed);
+        self.diagnostics.fp.fp_version_misses += 1;
         if let Some(stats) = &mut self.code.version_stats {
             stats.get_mut(&eip).unwrap().misses += 1;
         }
@@ -1105,6 +1136,8 @@ impl Native {
         if joining {
             self.repoint_tier1(eip, self.code.tier1(eip).unwrap().unit);
         }
+        self.diagnostics.fp.fp_versions += 1;
+        self.diagnostics.fp.fp_version_joins += u64::from(joining);
         if let Some(stats) = &mut self.code.version_stats {
             let stats = stats.get_mut(&eip).unwrap();
             stats.built += 1;
@@ -1324,6 +1357,15 @@ impl Native {
 
     pub(super) fn domain_guard_miss(&mut self, eip: u32, index: usize, ordinal: usize) {
         self.diagnostics.resident_domain_guard_misses += 1;
+        self.record_region_speculation(
+            eip,
+            super::RegionSpeculation {
+                failures: 1,
+                replays: 0,
+                replayed_instructions: 0,
+                validation_failures: 0,
+            },
+        );
         let Some((guard_id, misses, pays)) = self.domain_guard_verdict(eip, index, ordinal) else {
             return;
         };
@@ -1618,6 +1660,8 @@ impl Native {
             mmx: form.built.assumed.mmx,
         };
         let spill_cells = form.lowered.spill_cells;
+        let spills = form.lowered.spills;
+        let vector_spills = form.lowered.vector_spills;
         // Entry domain guards are priced on the probation window's counts even
         // when Tier-1 gives the version itself no price.
         let measured = probation.is_some()
@@ -1657,6 +1701,8 @@ impl Native {
             return Err(Decline::CacheFull);
         }
         crate::jit_map::optimized(eip, format_args!("work\t{}\t{}", work.0, work.1));
+        self.diagnostics.fp.fp_versions += 1;
+        self.record_opt_spills(spills, vector_spills, spill_cells);
         self.remove_scoped_job(eip, index as u8);
         if self.inline_saved.len() < spill_cells {
             self.inline_saved.resize(spill_cells, 0);
@@ -2029,7 +2075,15 @@ impl Native {
                 entry_registers,
             };
             if let Some(form) = job.form {
-                worker.install(&mut self.code, eip, form.built, form.lowered);
+                let (spills, vector_spills, spill_cells) = (
+                    form.lowered.spills,
+                    form.lowered.vector_spills,
+                    form.lowered.spill_cells,
+                );
+                if worker.install(&mut self.code, eip, form.built, form.lowered) {
+                    self.diagnostics.fp.fp_versions += 1;
+                    self.record_opt_spills(spills, vector_spills, spill_cells);
+                }
             }
             if let Some(version) = version {
                 let mut policy = JobPlan::new(iterates, splits);
@@ -2111,11 +2165,19 @@ impl Native {
     }
 
     fn install_job(&mut self, eip: u32, form: compile::JobForm) {
-        self.worker_jobs.get_mut(&eip).unwrap().install(
+        let (spills, vector_spills, spill_cells) = (
+            form.lowered.spills,
+            form.lowered.vector_spills,
+            form.lowered.spill_cells,
+        );
+        if self.worker_jobs.get_mut(&eip).unwrap().install(
             &mut self.code,
             eip,
             form.built,
             form.lowered,
-        );
+        ) {
+            self.diagnostics.fp.fp_versions += 1;
+            self.record_opt_spills(spills, vector_spills, spill_cells);
+        }
     }
 }

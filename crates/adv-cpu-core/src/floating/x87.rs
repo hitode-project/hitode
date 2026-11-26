@@ -149,12 +149,22 @@ fn operand(tx: &mut Transaction, logical: usize) -> Ext {
         return INDEFINITE;
     }
     if exp == 0 && v.significand() != 0 {
+        // A pseudo-denormal is a denormal operand too, read as exponent 1.
+        exceptions(tx, DE);
         if v.significand() >> 63 != 0 {
             return Ext::from_parts(v.significand(), v.sign_exponent() | 1);
         }
-        exceptions(tx, DE);
     }
     v
+}
+/// `ST(logical)` as stored, for `FSTP m80`, which copies unsupported and
+/// pseudo-denormal encodings unchanged (measured on Intel).
+fn raw_operand(tx: &mut Transaction, logical: usize) -> Ext {
+    let slot = tx.state.x87.physical_index(logical);
+    if tx.state.x87.physical_tag(slot) == 3 {
+        return operand(tx, logical);
+    }
+    tx.state.x87.regs[slot]
 }
 fn rounded(tx: &mut Transaction) {
     let flags = sf::flags();
@@ -179,6 +189,15 @@ fn push(tx: &mut Transaction, mut value: Ext) {
         value = INDEFINITE;
     } else {
         tx.state.x87.status &= !C1;
+    }
+    tx.state.x87.push(value);
+}
+fn push_preserving_c1(tx: &mut Transaction, mut value: Ext) {
+    let slot = tx.state.x87.top().wrapping_sub(1) & 7;
+    if tx.state.x87.physical_tag(slot) != 3 {
+        exceptions(tx, IE | 0x40);
+        tx.state.x87.status |= C1;
+        value = INDEFINITE;
     }
     tx.state.x87.push(value);
 }
@@ -365,11 +384,15 @@ pub(super) fn execute(
             } else {
                 None
             };
-            let value = operand(tx, 0);
+            let width = i.memory_size().size();
+            let integer = matches!(m, M::Fist | M::Fistp | M::Fisttp);
+            let value = if address.is_some() && !integer && width == 10 {
+                raw_operand(tx, 0)
+            } else {
+                operand(tx, 0)
+            };
             tx.state.x87.status &= !C1;
             if let Some(addr) = address {
-                let width = i.memory_size().size();
-                let integer = matches!(m, M::Fist | M::Fistp | M::Fisttp);
                 let rc = if m == M::Fisttp {
                     1
                 } else {
@@ -956,12 +979,22 @@ fn remainder(a: Ext, b: Ext, nearest: bool, control: u16) -> (Ext, u16, Option<u
     (result, 0, if partial { None } else { Some(quotient) })
 }
 
+fn apply_rounded(tx: &mut Transaction, flags: u16, rounded_up: bool) {
+    exceptions(tx, flags);
+    tx.state.x87.status = (tx.state.x87.status & !C1)
+        | if flags & 0x20 != 0 && flags & IE == 0 && rounded_up {
+            C1
+        } else {
+            0
+        };
+}
+
 /// Shared by instruction transactions and the run's AAPCS64 leaf.
 pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<(), Step> {
     let m = i.mnemonic();
-    sf::configure(tx.state.x87.control);
     match m {
         M::Fscale => {
+            sf::configure(tx.state.x87.control);
             metadata(tx);
             let a = operand(tx, 0);
             let b = operand(tx, 1);
@@ -971,6 +1004,7 @@ pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<()
             set(tx, 0, result);
         }
         M::Fprem | M::Fprem1 => {
+            sf::configure(tx.state.x87.control);
             metadata(tx);
             let a = operand(tx, 0);
             let b = operand(tx, 1);
@@ -990,49 +1024,76 @@ pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<()
             metadata(tx);
             let x = operand(tx, 0);
             let y = operand(tx, 1);
-            let (result, flags) = if m == M::Fpatan {
+            let (result, flags, rounded_up) = if m == M::Fpatan {
                 super::transcendental::atan2(y, x, tx.state.x87.control)
             } else {
                 super::transcendental::log_product(x, y, m == M::Fyl2xp1, tx.state.x87.control)
             };
-            exceptions(tx, flags);
-            rounded(tx);
+            apply_rounded(tx, flags, rounded_up);
             set(tx, 1, result);
             pop(tx);
         }
         M::F2xm1 => {
             metadata(tx);
             let x = operand(tx, 0);
-            let Some((result, flags)) =
+            let Some((result, flags, rounded_up)) =
                 super::transcendental::exp2_minus_one(x, tx.state.x87.control)
             else {
                 return Err(tx.unsupported(i));
             };
-            exceptions(tx, flags);
-            rounded(tx);
+            apply_rounded(tx, flags, rounded_up);
             set(tx, 0, result);
         }
-        M::Fsin | M::Fcos | M::Fsincos | M::Fptan => {
+        M::Fsin => {
             metadata(tx);
             let x = operand(tx, 0);
-            if let Some(((sine, cosine), flags)) =
+            if let Some((sine, flags, rounded_up)) =
+                super::transcendental::sin(x, tx.state.x87.control)
+            {
+                apply_rounded(tx, flags, rounded_up);
+                tx.state.x87.status &= !C2;
+                set(tx, 0, sine);
+            } else {
+                tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
+            }
+        }
+        M::Fcos => {
+            metadata(tx);
+            let x = operand(tx, 0);
+            if let Some((cosine, flags, rounded_up)) =
+                super::transcendental::cos(x, tx.state.x87.control)
+            {
+                apply_rounded(tx, flags, rounded_up);
+                tx.state.x87.status &= !C2;
+                set(tx, 0, cosine);
+            } else {
+                tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
+            }
+        }
+        M::Fsincos => {
+            metadata(tx);
+            let x = operand(tx, 0);
+            if let Some(((sine, cosine), flags, rounded_up)) =
                 super::transcendental::sin_cos(x, tx.state.x87.control)
             {
-                exceptions(tx, flags);
-                rounded(tx);
+                apply_rounded(tx, flags, rounded_up);
                 tx.state.x87.status &= !C2;
-                if m == M::Fptan {
-                    sf::configure(tx.state.x87.control | 0x300);
-                    let result = sf::binary(sine, cosine, 3);
-                    rounded(tx);
-                    set(tx, 0, result);
-                    push(tx, Ext::from_parts(1 << 63, 0x3fff));
-                } else {
-                    set(tx, 0, if m == M::Fcos { cosine } else { sine });
-                    if m == M::Fsincos {
-                        push(tx, cosine);
-                    }
-                }
+                set(tx, 0, sine);
+                push_preserving_c1(tx, cosine);
+            } else {
+                tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
+            }
+        }
+        M::Fptan => {
+            metadata(tx);
+            let x = operand(tx, 0);
+            if let Some((tangent, flags, rounded_up)) =
+                super::transcendental::tan(x, tx.state.x87.control)
+            {
+                apply_rounded(tx, flags, rounded_up);
+                tx.state.x87.status &= !C2;
+                set(tx, 0, tangent);
+                push_preserving_c1(tx, Ext::from_parts(1 << 63, 0x3fff));
             } else {
                 tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
             }
@@ -1040,4 +1101,111 @@ pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<()
         _ => unreachable!("transcendental leaf"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CpuState, Memory, backend::x87::encode_f64};
+    use iced_x86::Code;
+
+    fn run_x87(code: Code, state: &mut CpuState) {
+        let mut memory = Memory::new(0x10000, 4096).unwrap();
+        let mut instruction = Instruction::default();
+        instruction.set_code(code);
+        instruction.set_next_ip(0x10002);
+        assert_eq!(
+            super::super::execute(&instruction, Operation::X87, None, state, &mut memory, true),
+            Step::Executed
+        );
+    }
+
+    // spec: A64F-FP-10
+    #[test]
+    fn fsincos_and_fptan_preserve_c1_on_push_and_report_stack_overflow() {
+        // FSINCOS(2^-47) under RN: cos rounds up to 1.0 -> C1 = 1, PE = 1, TOP = 6 -> SW = 0x3220.
+        let mut state = CpuState::default();
+        state.x87.control = 0x037f;
+        state.x87.push(Ext::from_parts(1u64 << 63, 0x3fff - 47));
+        run_x87(Code::Fsincos, &mut state);
+        assert_eq!(state.x87.status, 0x3220);
+        assert_eq!(
+            state.x87.regs[state.x87.physical_index(0)],
+            Ext::from_parts(1 << 63, 0x3fff)
+        );
+
+        // FSINCOS(2^-47) under RD: cos rounds down -> C1 = 0, PE = 1, TOP = 6 -> SW = 0x3020.
+        let mut state = CpuState::default();
+        state.x87.control = 0x077f;
+        state.x87.push(Ext::from_parts(1u64 << 63, 0x3fff - 47));
+        run_x87(Code::Fsincos, &mut state);
+        assert_eq!(state.x87.status, 0x3020);
+
+        // FPTAN(1.0) under RU: tan(1.0) > 0 rounds up -> C1 = 1, PE = 1, TOP = 6 -> SW = 0x3220.
+        let mut state = CpuState::default();
+        state.x87.control = 0x0b7f;
+        state.x87.push(Ext(encode_f64(1.0)));
+        run_x87(Code::Fptan, &mut state);
+        assert_eq!(state.x87.status, 0x3220);
+        assert_eq!(
+            state.x87.regs[state.x87.physical_index(0)],
+            Ext::from_parts(1 << 63, 0x3fff)
+        );
+
+        // FPTAN(1.0) under RD: tan(1.0) > 0 rounds down -> C1 = 0, PE = 1, TOP = 6 -> SW = 0x3020.
+        let mut state = CpuState::default();
+        state.x87.control = 0x077f;
+        state.x87.push(Ext(encode_f64(1.0)));
+        run_x87(Code::Fptan, &mut state);
+        assert_eq!(state.x87.status, 0x3020);
+
+        // FPTAN(0.5) under RN: tan(0.5) rounds up in extended80 -> C1 = 1, PE = 1, SW = 0x3220.
+        let mut state = CpuState::default();
+        state.x87.control = 0x037f;
+        state.x87.push(Ext(encode_f64(0.5)));
+        run_x87(Code::Fptan, &mut state);
+        assert_eq!(state.x87.status, 0x3220);
+
+        // FPTAN(1.0) under RN: tan(1.0) rounds down in extended80 -> C1 = 0, PE = 1, SW = 0x3020.
+        let mut state = CpuState::default();
+        state.x87.control = 0x037f;
+        state.x87.push(Ext(encode_f64(1.0)));
+        run_x87(Code::Fptan, &mut state);
+        assert_eq!(state.x87.status, 0x3020);
+
+        // Stack overflow on FSINCOS and FPTAN (all 8 stack slots occupied) sets SF | IE | C1.
+        for code in [Code::Fsincos, Code::Fptan] {
+            let mut state = CpuState::default();
+            state.x87.control = 0x077f; // RD so arithmetic alone clears C1
+            for _ in 0..8 {
+                state.x87.push(Ext(encode_f64(0.5)));
+            }
+            run_x87(code, &mut state);
+            assert_eq!(
+                state.x87.status & (IE | 0x40 | C1),
+                IE | 0x40 | C1,
+                "{code:?}"
+            );
+            assert_eq!(
+                state.x87.regs[state.x87.physical_index(0)],
+                INDEFINITE,
+                "{code:?}"
+            );
+        }
+    }
+
+    // spec: A64F-FP-10
+    #[test]
+    fn fpatan_one_one_sets_c1_under_rn() {
+        let mut state = CpuState::default();
+        state.x87.control = 0x037f;
+        state.x87.push(Ext(encode_f64(1.0))); // ST(1) = y
+        state.x87.push(Ext(encode_f64(1.0))); // ST(0) = x
+        run_x87(Code::Fpatan, &mut state);
+        assert_eq!(state.x87.status, 0x3a20);
+        assert_eq!(
+            state.x87.regs[state.x87.physical_index(0)],
+            Ext::from_parts(0xc90f_daa2_2168_c235, 0x3ffe)
+        );
+    }
 }

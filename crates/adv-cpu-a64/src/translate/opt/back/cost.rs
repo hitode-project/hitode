@@ -1,6 +1,144 @@
-//! Static resident loop costs for the owner's probation decision.
+//! Static resident loop costs for the owner's probation decision and
+//! microarchitecture-aware FP validation strategy selection (A64-OPT-4/5).
 
 use super::{Block, Func};
+use std::sync::OnceLock;
+
+/// Host AArch64 core class for FP validation cost modeling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoreClass {
+    /// Apple Silicon (M1–M4) / Qualcomm Oryon: expensive `mrs/msr fpsr` (41–57 cyc),
+    /// cheap vector witness (0–3 cyc per 4–8 ops).
+    AppleOryon,
+    /// Arm Cortex-X / Cortex-A7xx big cores: cheap `mrs/msr fpsr` (1–13 cyc).
+    CortexBig,
+    /// Arm Cortex-A5xx little cores: moderate `mrs/msr fpsr` and narrower SIMD.
+    CortexLittle,
+}
+
+/// Relative cycle estimates used to pick between FP validation strategies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ValidationCost {
+    pub mrs_fpsr: u32,
+    pub mrs_msr_fpsr: u32,
+    pub vec_witness_4: u32,
+    pub scalar_witness: u32,
+}
+
+/// Concrete validation lowering strategy selected for an `Op::FpValidate` node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ValidationStrategy {
+    /// Statically proved in-range by `fp_range` (0 runtime instructions).
+    StaticProof,
+    /// Batched NEON `.4s` exponent-window witness (`ins` + shifts + `uqsub` + `umaxv`).
+    VectorWitness,
+    /// Hardware `FPSR` mask (`0x8f` including `IDC`), masked exceptions only.
+    FpsrMask,
+    /// Scalar GPR exponent-window witness (`fmov` + `ubfx` + `sub` + `cmp`).
+    ScalarWitness,
+}
+
+impl CoreClass {
+    /// Detects the host core class once per process.
+    pub(crate) fn detect() -> Self {
+        static CLASS: OnceLock<CoreClass> = OnceLock::new();
+        *CLASS.get_or_init(detect_core_class)
+    }
+
+    pub(crate) const fn validation_cost(self) -> ValidationCost {
+        match self {
+            Self::AppleOryon => ValidationCost {
+                mrs_fpsr: 12,
+                mrs_msr_fpsr: 49,
+                vec_witness_4: 3,
+                scalar_witness: 2,
+            },
+            Self::CortexBig => ValidationCost {
+                mrs_fpsr: 3,
+                mrs_msr_fpsr: 8,
+                vec_witness_4: 4,
+                scalar_witness: 3,
+            },
+            Self::CortexLittle => ValidationCost {
+                mrs_fpsr: 6,
+                mrs_msr_fpsr: 14,
+                vec_witness_4: 6,
+                scalar_witness: 4,
+            },
+        }
+    }
+}
+
+fn detect_core_class() -> CoreClass {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        CoreClass::AppleOryon
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        #[cfg(target_os = "linux")]
+        if let Ok(text) =
+            std::fs::read_to_string("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1")
+            && let Some(hex) = text.trim().strip_prefix("0x")
+            && let Ok(midr) = u64::from_str_radix(hex, 16)
+        {
+            let implementer = ((midr >> 24) & 0xff) as u8;
+            let part = ((midr >> 4) & 0xfff) as u16;
+            return match implementer {
+                0x61 | 0x51 => CoreClass::AppleOryon,
+                0x41 if matches!(part, 0xd03 | 0xd04 | 0xd05 | 0xd46 | 0xd80) => {
+                    CoreClass::CortexLittle
+                }
+                _ => CoreClass::CortexBig,
+            };
+        }
+        if adv_cpu_core::HostFeatures::get().contains(adv_cpu_core::HostFeatures::RPRES) {
+            CoreClass::AppleOryon
+        } else {
+            CoreClass::CortexBig
+        }
+    }
+}
+
+/// Selects the lowest-cost sound FP validation strategy for `count` validated
+/// values (of which `strict_muls` are unproved multiplications).
+///
+/// `fpsr_eligible` must be true only when all exceptions are masked and the
+/// hardware FPCR tininess rule matches the validated operations (e.g. `AH=0` for
+/// x87 tininess-before-rounding or `AH=1` for SSE).
+pub(crate) fn select_validation(
+    class: CoreClass,
+    count: usize,
+    strict_muls: usize,
+    fpsr_eligible: bool,
+    sse_live: bool,
+) -> ValidationStrategy {
+    if count == 0 {
+        return ValidationStrategy::StaticProof;
+    }
+    let cost = class.validation_cost();
+    let fpsr_cost = if sse_live {
+        cost.mrs_msr_fpsr + cost.mrs_fpsr
+    } else {
+        cost.mrs_msr_fpsr
+    };
+    let non_strict = count.saturating_sub(strict_muls);
+    let witness_cost = if non_strict == 0 {
+        (strict_muls as u32) * cost.scalar_witness
+    } else if non_strict == 1 {
+        cost.scalar_witness + (strict_muls as u32) * cost.scalar_witness
+    } else {
+        (non_strict as u32).div_ceil(4) * cost.vec_witness_4
+            + (strict_muls as u32) * cost.scalar_witness
+    };
+    if fpsr_eligible && fpsr_cost < witness_cost {
+        ValidationStrategy::FpsrMask
+    } else if count >= 2 {
+        ValidationStrategy::VectorWitness
+    } else {
+        ValidationStrategy::ScalarWitness
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct BlockCost {
@@ -134,5 +272,38 @@ pub(super) fn batch_savings(
     } else {
         let scalar = cheapest(func, costs, &batch.loop_) * u32::from(batch.plan.lanes);
         scalar.saturating_sub(words)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // spec: A64-OPT-4, A64-OPT-5
+    #[test]
+    fn validation_strategy_tracks_core_class_costs() {
+        assert_eq!(
+            select_validation(CoreClass::AppleOryon, 0, 0, true, false),
+            ValidationStrategy::StaticProof
+        );
+        // Short/medium DAGs on Apple/Oryon avoid expensive mrs+msr and use vector witness.
+        assert_eq!(
+            select_validation(CoreClass::AppleOryon, 4, 0, true, false),
+            ValidationStrategy::VectorWitness
+        );
+        assert_eq!(
+            select_validation(CoreClass::AppleOryon, 1, 0, true, false),
+            ValidationStrategy::ScalarWitness
+        );
+        // Cortex big cores switch to FPSR mask once witness cost exceeds mrs+msr.
+        assert_eq!(
+            select_validation(CoreClass::CortexBig, 4, 3, true, false),
+            ValidationStrategy::FpsrMask
+        );
+        // Unmasked / ineligible contexts never select FpsrMask.
+        assert_eq!(
+            select_validation(CoreClass::CortexBig, 4, 3, false, false),
+            ValidationStrategy::VectorWitness
+        );
     }
 }

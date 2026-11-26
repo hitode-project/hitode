@@ -472,10 +472,173 @@ fn available_before(
 }
 
 struct PriceCtx<'a> {
+    func: &'a Func,
     block_idx: usize,
     def_block: &'a [Option<usize>],
     const_f64: &'a [Option<u64>],
     loop_uses: &'a [u32],
+    def_op: &'a [Option<Op>],
+    def_pos_in_block: &'a BTreeMap<Value, usize>,
+    last_store_before: &'a [Option<usize>],
+}
+
+#[derive(Clone, Copy)]
+struct MemLane {
+    addr: Value,
+    base: Value,
+    offset: i32,
+    pc: u32,
+    load_idx: usize,
+}
+
+fn decompose_addr(def_op: &[Option<Op>], mut addr: Value) -> (Value, i32) {
+    let mut offset = 0i32;
+    for _ in 0..4 {
+        match def_op.get(addr.0 as usize).copied().flatten() {
+            Some(Op::Int(op @ (IntOp::Add | IntOp::Sub), a, b)) => {
+                if let Some(Op::Constant(Type::I32, c)) =
+                    def_op.get(b.0 as usize).copied().flatten()
+                {
+                    let delta = c as u32 as i32;
+                    offset = offset.wrapping_add(if op == IntOp::Add {
+                        delta
+                    } else {
+                        delta.wrapping_neg()
+                    });
+                    addr = a;
+                    continue;
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    (addr, offset)
+}
+
+/// If `v` is a proved `Op::X87Load` of an unchecked same-block `Op::Load` at
+/// width `elem` (4 for single, 8 for double) with no intervening store before
+/// `insert_at`, returns its decomposed memory lane.
+fn mem_lane_of(
+    v: Value,
+    is_single: bool,
+    insert_at: usize,
+    def_op: &[Option<Op>],
+    def_pos_in_block: &BTreeMap<Value, usize>,
+    last_store_before: &[Option<usize>],
+) -> Option<MemLane> {
+    let Op::X87Load {
+        mut bits,
+        single,
+        proved: true,
+        ..
+    } = def_op.get(v.0 as usize).copied().flatten()?
+    else {
+        return None;
+    };
+    if single != is_single {
+        return None;
+    }
+    while let Some(Op::Bits {
+        to: Type::I32 | Type::I64,
+        value,
+    }) = def_op.get(bits.0 as usize).copied().flatten()
+    {
+        bits = value;
+    }
+    let expected_w = if is_single { 4 } else { 8 };
+    let Op::Load {
+        width,
+        addr,
+        checked: false,
+        scope: None,
+        clock: false,
+        pc,
+        ..
+    } = def_op.get(bits.0 as usize).copied().flatten()?
+    else {
+        return None;
+    };
+    if width != expected_w {
+        return None;
+    }
+    let &load_idx = def_pos_in_block.get(&bits)?;
+    if load_idx >= insert_at {
+        return None;
+    }
+    if last_store_before
+        .get(insert_at)
+        .copied()
+        .flatten()
+        .is_some_and(|st| st > load_idx)
+    {
+        return None;
+    }
+    let (base, offset) = decompose_addr(def_op, addr);
+    Some(MemLane {
+        addr,
+        base,
+        offset,
+        pc,
+        load_idx,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct StridedSlot {
+    base: Value,
+    offset: i32,
+    channels: u8,
+    addr: Value,
+    pc: u32,
+}
+
+/// Checks whether `lanes` are strided memory loads with stride `k * elem` (`k in 1..=4`).
+fn detect_strided_slot(
+    lanes: &[Value],
+    is_single: bool,
+    insert_at: usize,
+    def_op: &[Option<Op>],
+    def_pos_in_block: &BTreeMap<Value, usize>,
+    last_store_before: &[Option<usize>],
+) -> Option<StridedSlot> {
+    if lanes.len() < 2 {
+        return None;
+    }
+    let mut mems = Vec::with_capacity(lanes.len());
+    for &v in lanes {
+        mems.push(mem_lane_of(
+            v,
+            is_single,
+            insert_at,
+            def_op,
+            def_pos_in_block,
+            last_store_before,
+        )?);
+    }
+    let base = mems[0].base;
+    let first_off = mems[0].offset;
+    let elem = if is_single { 4i32 } else { 8i32 };
+    let stride = mems[1].offset.checked_sub(first_off)?;
+    if stride <= 0 || stride % elem != 0 {
+        return None;
+    }
+    let channels = stride / elem;
+    if !(1..=4).contains(&channels) {
+        return None;
+    }
+    for (i, m) in mems.iter().enumerate() {
+        if m.base != base || m.offset != first_off + (i as i32) * stride {
+            return None;
+        }
+    }
+    Some(StridedSlot {
+        base,
+        offset: first_off,
+        channels: channels as u8,
+        addr: mems[0].addr,
+        pc: mems[0].pc,
+    })
 }
 
 /// Pricing for one operand slot (2 or 4 lanes) of a packed group.
@@ -483,6 +646,7 @@ struct PriceCtx<'a> {
 fn price_slot(
     lanes: &[Value],
     is_single: bool,
+    insert_at: usize,
     ctx: &PriceCtx<'_>,
     shared_bcasts: &mut BTreeSet<(bool, Value)>,
 ) -> (u32, u32, i32) {
@@ -521,6 +685,20 @@ fn price_slot(
         if !shared_bcasts.insert(key) {
             return (0, 0, 0);
         }
+        if !invariant
+            && mem_lane_of(
+                lanes[0],
+                is_single,
+                insert_at,
+                ctx.def_op,
+                ctx.def_pos_in_block,
+                ctx.last_store_before,
+            )
+            .is_some()
+        {
+            // Single `LD1R` broadcast load.
+            return (1, 0, 0);
+        }
         // Single: NarrowScalar (1) + Dup32 (1) = 2; Double: Dup64 (1).
         let w = if is_single { 2 } else { 1 };
         if invariant {
@@ -528,6 +706,21 @@ fn price_slot(
         } else {
             (w, 0, 0)
         }
+    } else if !invariant
+        && ctx.func.resident
+        && !crate::translate::opt::back::is_compact_window()
+        && detect_strided_slot(
+            lanes,
+            is_single,
+            insert_at,
+            ctx.def_op,
+            ctx.def_pos_in_block,
+            ctx.last_store_before,
+        )
+        .is_some()
+    {
+        // Contiguous `LDR Q` (channels == 1) or AoS `LD2/3/4` (channels in 2..=4).
+        (1, 0, 0)
     } else if is_single {
         // 4× NarrowScalar (4) + 3× Insert32 (3..6, conservatively 4) = 8 words.
         let w = 8;
@@ -550,6 +743,7 @@ fn price_slot(
 fn price_group(
     key: ChannelKey,
     channels: &[Channel],
+    insert_at: usize,
     ctx: &PriceCtx<'_>,
     live_vregs: &mut i32,
     shared_bcasts: &mut BTreeSet<(bool, Value)>,
@@ -562,7 +756,7 @@ fn price_group(
 
     for s in 0..n_slots {
         let lanes: Vec<Value> = channels.iter().map(|c| c.inputs[s]).collect();
-        let (bw, hw, dv) = price_slot(&lanes, is_single, ctx, shared_bcasts);
+        let (bw, hw, dv) = price_slot(&lanes, is_single, insert_at, ctx, shared_bcasts);
         vec_body_words += bw;
         header_words += hw;
         *live_vregs += dv;
@@ -731,7 +925,7 @@ struct FunctionTables {
 }
 
 /// Run intra-iteration cross-channel SLP across all blocks of `func`.
-pub(super) fn run(func: &mut Func) -> bool {
+pub(in crate::translate::opt) fn run(func: &mut Func) -> bool {
     let mut any_changed = false;
     let mut tables: Option<FunctionTables> = None;
 
@@ -774,9 +968,31 @@ pub(super) fn run(func: &mut Func) -> bool {
         let const_f64: &[Option<u64>] = &cached.const_f64;
 
         let mut def_pos_in_block = BTreeMap::<Value, usize>::new();
-        for (idx, &(res, _)) in func.blocks[block_idx].insts.iter().enumerate() {
+        let mut last_store_before = vec![None; func.blocks[block_idx].insts.len() + 1];
+        let mut cur_store = None;
+        for (idx, &(res, op)) in func.blocks[block_idx].insts.iter().enumerate() {
+            last_store_before[idx] = cur_store;
+            if matches!(
+                op,
+                Op::Store { .. }
+                    | Op::FrameStore { .. }
+                    | Op::ScopeWritten(_)
+                    | Op::PageCross { .. }
+                    | Op::FrameDisjoint { .. }
+            ) {
+                cur_store = Some(idx);
+            }
             if let Some(v) = res {
                 def_pos_in_block.insert(v, idx);
+            }
+        }
+        last_store_before[func.blocks[block_idx].insts.len()] = cur_store;
+        let mut def_op = vec![None; n];
+        for b in &func.blocks {
+            for &(res, op) in &b.insts {
+                if let Some(v) = res {
+                    def_op[v.0 as usize] = Some(op);
+                }
             }
         }
 
@@ -860,10 +1076,14 @@ pub(super) fn run(func: &mut Func) -> bool {
         // case where a shared broadcast (e.g. Dup64 on a loop induction value)
         // only breaks even when amortized across >= 2 groups of the same key.
         let price_ctx = PriceCtx {
+            func,
             block_idx,
             def_block,
             const_f64,
             loop_uses: &loop_uses,
+            def_op: &def_op,
+            def_pos_in_block: &def_pos_in_block,
+            last_store_before: &last_store_before,
         };
         let mut shared_bcasts = BTreeSet::<(bool, Value)>::new();
         let mut accepted: Vec<GroupPlan> = Vec::new();
@@ -871,8 +1091,14 @@ pub(super) fn run(func: &mut Func) -> bool {
         for (key, chs, insert_at) in tentative {
             let mut trial_bcasts = shared_bcasts.clone();
             let mut trial_vregs = live_vregs;
-            let (scalar_words, vec_body_words, header_words) =
-                price_group(key, &chs, &price_ctx, &mut trial_vregs, &mut trial_bcasts);
+            let (scalar_words, vec_body_words, header_words) = price_group(
+                key,
+                &chs,
+                insert_at,
+                &price_ctx,
+                &mut trial_vregs,
+                &mut trial_bcasts,
+            );
             if slp_profitable(scalar_words, vec_body_words, header_words, min_trips) {
                 shared_bcasts = trial_bcasts;
                 live_vregs = trial_vregs;
@@ -894,8 +1120,14 @@ pub(super) fn run(func: &mut Func) -> bool {
             let mut plans = Vec::with_capacity(groups.len());
             let (mut tot_scalar, mut tot_body, mut tot_header) = (0u32, 0u32, 0u32);
             for (chs, insert_at) in groups {
-                let (sw, bw, hw) =
-                    price_group(key, &chs, &price_ctx, &mut trial_vregs, &mut trial_bcasts);
+                let (sw, bw, hw) = price_group(
+                    key,
+                    &chs,
+                    insert_at,
+                    &price_ctx,
+                    &mut trial_vregs,
+                    &mut trial_bcasts,
+                );
                 tot_scalar += sw;
                 tot_body += bw;
                 tot_header += hw;
@@ -1087,29 +1319,190 @@ pub(super) fn run(func: &mut Func) -> bool {
         // Sort accepted groups by `insert_at` so shared body broadcasts dominate
         // all later groups in the same block!
         accepted.sort_by_key(|g| g.insert_at);
+        let allow_wide_mem = func.resident && !crate::translate::opt::back::is_compact_window();
         for group in accepted {
             let is_single = group.key.is_single();
             let double = !is_single;
             let n_slots = group.channels[0].inputs.len();
             let body_out = body_inserts.entry(group.insert_at).or_default();
 
-            let mut vec_inputs = Vec::with_capacity(n_slots);
-            for s in 0..n_slots {
-                let lanes: Vec<Value> = group.channels.iter().map(|c| c.inputs[s]).collect();
-                let v = build_slot(
-                    func,
-                    &lanes,
-                    is_single,
-                    block_idx,
-                    def_block,
-                    const_f64,
-                    &mut header_insts,
-                    body_out,
-                    &mut header_bcasts,
-                    &mut body_bcasts,
-                );
-                vec_inputs.push(v);
+            let mut vec_inputs = vec![None; n_slots];
+            let slot_lanes: Vec<Vec<Value>> = (0..n_slots)
+                .map(|s| group.channels.iter().map(|c| c.inputs[s]).collect())
+                .collect();
+
+            // Detect 2/3/4-channel AoS strided loads (`LD2`/`LD3`/`LD4`), contiguous
+            // 16-byte vector loads (`LDR Q`), and broadcast-from-memory (`LD1R`).
+            if allow_wide_mem {
+                let elem = if is_single { 4i32 } else { 8i32 };
+                let strided: Vec<Option<StridedSlot>> = slot_lanes
+                    .iter()
+                    .map(|lanes| {
+                        let invariant =
+                            block_idx != 0 && all_in_block0(lanes, def_block, const_f64);
+                        if invariant || lanes.iter().all(|&v| v == lanes[0]) {
+                            return None;
+                        }
+                        detect_strided_slot(
+                            lanes,
+                            is_single,
+                            group.insert_at,
+                            &def_op,
+                            &def_pos_in_block,
+                            &last_store_before,
+                        )
+                    })
+                    .collect();
+
+                // First match AoS groups sharing `(base, channels in 2..=4)` at
+                // offsets `base_off + ch * elem`.
+                for s in 0..n_slots {
+                    if vec_inputs[s].is_some() {
+                        continue;
+                    }
+                    let Some(StridedSlot {
+                        base,
+                        offset: off0,
+                        channels,
+                        addr: addr0,
+                        pc,
+                    }) = strided[s]
+                    else {
+                        continue;
+                    };
+                    if channels == 1 {
+                        let v = alloc(func, Type::V128);
+                        body_out.push((
+                            Some(v),
+                            Op::Load {
+                                ty: Type::V128,
+                                width: 16,
+                                addr: addr0,
+                                checked: false,
+                                pc,
+                                scope: None,
+                                clock: false,
+                            },
+                        ));
+                        vec_inputs[s] = Some(v);
+                    } else if (2..=4).contains(&channels) {
+                        // Look for sibling slots belonging to the same AoS struct.
+                        let mut members: Vec<(usize, i32, Value, u32)> = vec![(s, off0, addr0, pc)];
+                        for other in s + 1..n_slots {
+                            if vec_inputs[other].is_none()
+                                && let Some(StridedSlot {
+                                    base: ob,
+                                    offset: ooff,
+                                    channels: och,
+                                    addr: oaddr,
+                                    pc: opc,
+                                }) = strided[other]
+                                && ob == base
+                                && och == channels
+                                && (ooff - off0).abs() < i32::from(channels) * elem
+                                && (ooff - off0) % elem == 0
+                            {
+                                members.push((other, ooff, oaddr, opc));
+                            }
+                        }
+                        members.sort_by_key(|&(_, off, ..)| off);
+                        let min_off = members[0].1;
+                        let first_addr = members[0].2;
+                        let first_pc = members[0].3;
+                        let mut unique_offs: Vec<i32> =
+                            members.iter().map(|&(_, off, ..)| off).collect();
+                        unique_offs.dedup();
+                        // Require every channel `0..channels` to be referenced by the guest
+                        // so `LD2`/`LD3`/`LD4` never over-reads unreferenced adjacent bytes.
+                        let all_channels_covered = unique_offs.len() == usize::from(channels)
+                            && unique_offs
+                                .iter()
+                                .enumerate()
+                                .all(|(ch, &off)| off == min_off + (ch as i32) * elem);
+                        if all_channels_covered {
+                            // Emit consecutive `Op::VecDeintLoad` for channels 0..channels
+                            // so `opt/back.rs` fuses them into a single `LD2`/`LD3`/`LD4`.
+                            let mut ch_vals = Vec::with_capacity(usize::from(channels));
+                            for ch in 0..channels {
+                                let v = alloc(func, Type::V128);
+                                body_out.push((
+                                    Some(v),
+                                    Op::VecDeintLoad {
+                                        addr: first_addr,
+                                        channels,
+                                        channel: ch,
+                                        double,
+                                        pc: first_pc,
+                                    },
+                                ));
+                                ch_vals.push(v);
+                            }
+                            for (slot_idx, off, ..) in members {
+                                let ch = ((off - min_off) / elem) as usize;
+                                vec_inputs[slot_idx] = Some(ch_vals[ch]);
+                            }
+                        }
+                    }
+                }
             }
+
+            // Broadcast-from-memory (`LD1R`) for non-invariant all-same memory slots.
+            for s in 0..n_slots {
+                if vec_inputs[s].is_some() {
+                    continue;
+                }
+                let lanes = &slot_lanes[s];
+                let invariant = block_idx != 0 && all_in_block0(lanes, def_block, const_f64);
+                if !invariant
+                    && lanes.iter().all(|&v| v == lanes[0])
+                    && let Some(ml) = mem_lane_of(
+                        lanes[0],
+                        is_single,
+                        group.insert_at,
+                        &def_op,
+                        &def_pos_in_block,
+                        &last_store_before,
+                    )
+                {
+                    let key = (is_single, lanes[0]);
+                    if let Some(&cached) = body_bcasts.get(&key) {
+                        vec_inputs[s] = Some(cached);
+                    } else {
+                        let v = alloc(func, Type::V128);
+                        body_out.push((
+                            Some(v),
+                            Op::VecLoadBcast {
+                                addr: ml.addr,
+                                double,
+                                pc: ml.pc,
+                            },
+                        ));
+                        body_bcasts.insert(key, v);
+                        vec_inputs[s] = Some(v);
+                    }
+                }
+            }
+
+            let vec_inputs: Vec<Value> = (0..n_slots)
+                .map(|s| {
+                    if let Some(v) = vec_inputs[s] {
+                        v
+                    } else {
+                        build_slot(
+                            func,
+                            &slot_lanes[s],
+                            is_single,
+                            block_idx,
+                            def_block,
+                            const_f64,
+                            &mut header_insts,
+                            body_out,
+                            &mut header_bcasts,
+                            &mut body_bcasts,
+                        )
+                    }
+                })
+                .collect();
 
             let (mid_vec, vec_res, store_kind) = match group.key {
                 ChannelKey::Single2(op1, op2, sk) => {

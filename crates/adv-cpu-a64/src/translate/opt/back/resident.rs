@@ -7,7 +7,7 @@ use super::{
     ldr_narrow, lsr_imm, mov, mov_sp, movk, movz, mrs_nzcv, msr_nzcv, offset_of, page_crossing,
     ret, runtime, stp, stp_v, str, sub, sub_imm, vldr, vstr, vumov,
 };
-use crate::translate::lower::{X0, X1, X2, X3, X4, X5};
+use crate::translate::lower::{X0, X1, X2, X3, X4, X5, fp_state};
 use adv_cpu_core::memory::{LINEAR, READ, SHARED, WRITE};
 
 const RESIDENT_ACCESS: u32 = offset_of!(Runtime, resident_access) as u32;
@@ -250,15 +250,20 @@ impl Emitter<'_> {
 /// so keep those registers and return the refusal bit to the form.
 #[cfg(any(native, test))]
 pub(crate) fn access_stub(helper: u64) -> Vec<u32> {
+    access_stub_for(helper, false)
+}
+
+#[cfg(any(native, test))]
+pub(crate) fn access_stub_for(helper: u64, afp: bool) -> Vec<u32> {
     let mut asm = Asm::new();
     asm.emit(mov(X, X0, RT));
-    preserve_call(&mut asm, helper);
+    preserve_call(&mut asm, helper, afp);
     asm.finish()
 }
 
 /// Calls a helper with arguments in x0-x5, preserving all allocated values.
-pub(super) fn preserve_call(asm: &mut Asm, helper: u64) {
-    let frame = 96 + 28 * 16;
+pub(super) fn preserve_call(asm: &mut Asm, helper: u64, afp: bool) {
+    let frame = 96 + 28 * 16 + if afp { 16 } else { 0 };
     asm.emit_all(&[
         sub_imm(X, SP, SP, frame, false),
         mrs_nzcv(T),
@@ -284,6 +289,12 @@ pub(super) fn preserve_call(asm: &mut Asm, helper: u64) {
             96 + 16 * i32::from(n),
         ));
     }
+    if afp {
+        // x0..x5 hold arguments to `helper`; x6 and x7 were saved above.
+        fp_state::emit_restore_host_fpcr(asm, Reg::new(6), Reg::new(7));
+        fp_state::emit_isolate_fpsr_before(asm, Reg::new(6), Reg::new(7));
+        asm.emit(str(X, Reg::new(6), SP, frame - 16));
+    }
     asm.emit(movz(X, T, helper as u16, 0));
     for shift in [16, 32, 48] {
         asm.emit(movk(X, T, (helper >> shift) as u16, shift));
@@ -294,6 +305,11 @@ pub(super) fn preserve_call(asm: &mut Asm, helper: u64) {
         blr(T),
         ldp(X, Index::Post, RT, Reg::LR, SP, 16),
     ]);
+    if afp {
+        // x0 holds the return value; x6..x8 are restored below.
+        asm.emit(ldr(X, Reg::new(6), SP, frame - 16));
+        fp_state::emit_isolate_fpsr_after(asm, Reg::new(6), Reg::new(7), Reg::new(8));
+    }
     for n in (0..27).step_by(2) {
         asm.emit(ldp_v(
             VSize::Q,

@@ -188,6 +188,12 @@ impl Translator<'_> {
         let slow = self.asm.label();
         let done = self.asm.label();
         self.x87_state(x.waits(), slow);
+        if !matches!(
+            x.fast,
+            Fast::Wait | Fast::LoadControl | Fast::StoreControl | Fast::StoreStatus | Fast::Examine
+        ) {
+            self.x87_prepare_fp_state();
+        }
         if x.fast != Fast::Wait {
             self.emit_all(&[
                 ubfx(W, X15, X13, 11, 3),
@@ -268,17 +274,24 @@ impl Translator<'_> {
         if flags.read_gpr & 1 != 0 && memory.is_none() {
             self.emit(str(W, super::host(0), RUNTIME, runtime::VALUE_REGS));
         }
+        let restore_eflags_on_exc = flags.read_flags && flags.write_flags;
         if flags.read_flags {
             self.canonicalize();
             self.cpu();
             self.emit(mov(X, X0, X5));
             stubs::emit_read_flags(self.asm, X0);
             self.emit(str(W, X4, RUNTIME, runtime::VALUE_EFLAGS));
+            if restore_eflags_on_exc {
+                self.emit(stp(X, Index::Pre, X4, Reg::ZR, Reg::new(31), -16));
+            }
             self.vector.cpu = false;
         }
         if operands.access.is_some() {
             let refused = self.leave_for_event(runtime::Event::CheckedAccess);
             self.call_prepared_value(index, stubs::ValueTarget::Float(operands.access), pairs);
+            if restore_eflags_on_exc {
+                self.emit(ldp(X, Index::Post, X4, X16, Reg::new(31), 16));
+            }
             self.asm.tbz(
                 true,
                 X0,
@@ -287,6 +300,9 @@ impl Translator<'_> {
             );
         } else {
             self.call_prepared_value(index, stubs::ValueTarget::Float(None), pairs);
+            if restore_eflags_on_exc {
+                self.emit(ldp(X, Index::Post, X4, X16, Reg::new(31), 16));
+            }
         }
         let unsupported = self.leave_for_event(runtime::Event::Unsupported(form));
         self.asm.tbz(
@@ -303,6 +319,15 @@ impl Translator<'_> {
         }
         if flags.write_flags {
             self.emit(ldr(W, X1, RUNTIME, runtime::VALUE_EFLAGS));
+            if restore_eflags_on_exc {
+                // Unmasked x87 exceptions (ES=1) suppress EFLAGS modification on FCOMI*.
+                self.emit_all(&[
+                    ldr(X, X16, RUNTIME, runtime::CPU_STATE),
+                    ldrh(X16, X16, runtime::X87_STATUS),
+                    tst_imm(W, X16, 0x80),
+                    csel(W, X1, X4, X1, Cond::Ne),
+                ]);
+            }
             stubs::emit_load_flags(self.asm);
             self.state = super::State::CANONICAL;
         }
@@ -311,6 +336,30 @@ impl Translator<'_> {
         }
         self.invalidate_mmx();
         self.cpu();
+    }
+
+    /// Folds any live SSE hardware FPSR sticky bits into `CpuState::mxcsr`
+    /// (including `IDC`/DE) and ensures RN/no-FZ/no-FIZ/no-NEP FPCR before
+    /// executing x87 hardware floating-point instructions (A64F-FP-5).
+    ///
+    /// Preserves guest NZCV, `X4`–`X15`, and all vector registers; uses only
+    /// `X0`, `X16`, and `X17`.
+    pub(super) fn x87_prepare_fp_state(&mut self) {
+        if !self.features.afp {
+            return;
+        }
+        use crate::translate::lower::fp_state;
+        fp_state::emit_fold_fpsr(self.asm, X0, X16, X17);
+        let ok = self.asm.label();
+        // Both `active_fpcr == 0` (initial host) and `FPCR_AH` (default SSE
+        // under FEAT_AFP) satisfy RN/no-FZ/no-FIZ/no-DN/no-NEP.
+        self.emit_all(&[
+            ldr(W, X16, RUNTIME, runtime::ACTIVE_FPCR),
+            and_imm(W, X16, X16, u64::from(!fp_state::FPCR_AH)),
+        ]);
+        self.asm.cbz(W, false, X16, ok);
+        fp_state::emit_sync_fpcr_imm(self.asm, fp_state::FPCR_X87_DEFAULT, X16, X17);
+        self.asm.bind(ok);
     }
 
     /// Load canonical state for an instruction outside the cache.
@@ -392,7 +441,13 @@ impl Translator<'_> {
                 reverse,
                 pop,
             } => self.x87_arith(op, dest, source, reverse, pop, slow),
-            Fast::Compare { source, pops } => self.x87_compare(source, pops, slow),
+            Fast::Compare { source, pops } => {
+                if let Some(quiet) = x.flag_compare() {
+                    self.x87_fcomi(source, pops, quiet, slow);
+                } else {
+                    self.x87_compare(source, pops, slow);
+                }
+            }
             Fast::Exchange(index) => {
                 self.read(0, X0, X1, slow);
                 self.ordinary(X0, X1, slow);
@@ -743,11 +798,15 @@ impl Translator<'_> {
     /// inexact and w7 whether rounding grew the magnitude.
     fn store_sticky(&mut self, width: u8, integer: bool, slow: Label, track: bool, sticky: bool) {
         if integer {
+            let frintts_chop = self.features.frintts && self.x87_store_rounding() == Some(3);
             if width == 8 {
                 // A 64-bit destination cannot distinguish a saturating
-                // conversion. An operand with a sticky tail also needs its
-                // integer rounding boundary below the sticky bit.
-                self.emit_all(&[fmov_from_v(X, X16, V0), ubfx(X, X16, X16, 52, 11)]);
+                // conversion without FEAT_FRINTTS. An operand with a sticky
+                // tail also needs its integer rounding boundary below the
+                // sticky bit.
+                if sticky || !frintts_chop {
+                    self.emit_all(&[fmov_from_v(X, X16, V0), ubfx(X, X16, X16, 52, 11)]);
+                }
                 if sticky {
                     let whole = self.asm.label();
                     self.asm.cbz(W, false, X3, whole);
@@ -755,8 +814,10 @@ impl Translator<'_> {
                     self.asm.b_cond(Cond::Hi, slow);
                     self.asm.bind(whole);
                 }
-                self.emit(cmp_imm(W, X16, 1023 + 62, false));
-                self.asm.b_cond(Cond::Hi, slow);
+                if !frintts_chop {
+                    self.emit(cmp_imm(W, X16, 1023 + 62, false));
+                    self.asm.b_cond(Cond::Hi, slow);
+                }
             }
             self.round_integer(width, V0, slow, track);
         } else {
@@ -785,6 +846,29 @@ impl Translator<'_> {
     /// at or above 2^63 and narrower destinations check the full result.
     fn round_integer(&mut self, width: u8, value: VReg, slow: Label, track: bool) {
         let rounding = self.x87_store_rounding();
+        if self.features.frintts && rounding == Some(3) {
+            // FEAT_FRINTTS: frint32z/frint64z truncate independently of FPCR.RMode
+            // and saturate out-of-range inputs to -2^31 / -2^63, which take `slow`.
+            let bits64 = width == 8;
+            self.emit(sfrint_ts(bits64, true, true, V1, value));
+            if bits64 {
+                self.emit_all(&[fcvt_int(X, true, X2, V1), eor_imm(X, X16, X2, 1 << 63)]);
+                self.asm.cbz(X, false, X16, slow);
+            } else {
+                self.emit(fcvt_int(W, true, X2, V1));
+                if width == 2 {
+                    self.emit_all(&[sbfx(W, X16, X2, 0, 16), cmp(W, X16, X2, Lsl, 0)]);
+                    self.asm.b_cond(Cond::Ne, slow);
+                } else {
+                    self.emit(eor_imm(W, X16, X2, 0x8000_0000));
+                    self.asm.cbz(W, false, X16, slow);
+                }
+            }
+            if track {
+                self.emit_all(&[fcmp(V1, value), cset(W, X3, Cond::Ne), movz(W, X7, 0, 0)]);
+            }
+            return;
+        }
         if let Some(rc) = rounding {
             let op = [Unary::Frintn, Unary::Frintm, Unary::Frintp, Unary::Frintz][usize::from(rc)];
             if rc != 3 || track {
@@ -1554,6 +1638,148 @@ impl Translator<'_> {
         }
     }
 
+    /// Uncached `fcomi`/`fucomi`/`fcomip`/`fucomip` (A64-FLAG-6).
+    ///
+    /// Handles zeros, normals in binary64 range, `±Inf`, QNaNs, and SNaNs
+    /// natively (setting `SW.IE` on signaling QNaN or any SNaN; when `CW.IM=0`
+    /// sets `SW.ES|B` without modifying EFLAGS or popping, matching x86
+    /// unmasked `#IA`), preserves `SW.C1`, and writes exact canonical EFLAGS
+    /// (`ZF`/`PF`/`CF`, clearing `OF`/`SF`/`AF`). Denormal, empty-slot, and
+    /// extreme-exponent cases take `slow`.
+    fn x87_fcomi(&mut self, source: Source, pops: u8, quiet: bool, slow: Label) {
+        let Source::St(index) = source else {
+            unreachable!("fcomi only compares registers");
+        };
+        // w2 accumulates NaN kinds (bit 0 = QNaN, bit 1 = SNaN); w3 and w7
+        // record whether ST(0) or ST(index) lost low significand bits.
+        self.emit(movz(W, X2, 0, 0));
+        self.read(0, X0, X1, slow);
+        self.fcomi_double(X0, X1, V0, X3, X2, slow);
+        self.read(index, X0, X1, slow);
+        self.fcomi_double(X0, X1, V1, X7, X2, slow);
+        let unmasked_done = self.asm.label();
+        let no_invalid = self.asm.label();
+        if quiet {
+            // Quiet FUCOMI/FUCOMIP raises IE only on SNaN (bit 1 of w2).
+            self.asm.tbz(false, X2, 1, no_invalid);
+        } else {
+            // Signaling FCOMI/FCOMIP raises IE on any QNaN or SNaN.
+            self.asm.cbz(W, false, X2, no_invalid);
+        }
+        self.emit(orr_imm(W, X13, X13, 1));
+        self.asm.tbz(true, X8, 0, no_invalid);
+        // Unmasked IE: record ES|B pending #MF without modifying EFLAGS or popping.
+        self.emit_all(&[movz(W, X16, 0x8080, 0), orr(W, X13, X13, X16, Lsl, 0)]);
+        self.asm.b(unmasked_done);
+        self.asm.bind(no_invalid);
+        let (convert, tie, done) = (self.asm.label(), self.asm.label(), self.asm.label());
+        self.emit_all(&[orr(W, X16, X3, X7, Lsl, 0), fcmp(V0, V1)]);
+        self.asm.b_cond(Cond::Ne, convert);
+        self.asm.cbz(W, true, X16, tie);
+        self.asm.bind(convert);
+        self.emit_all(&[cset(W, super::X10, Cond::Vc), movz(W, super::X11, 0, 0)]);
+        if self.features.flagm2 {
+            self.emit_all(&[AXFLAG, mrs_nzcv(X4)]);
+        } else {
+            self.emit_all(&[
+                mrs_nzcv(X4),
+                and_imm(W, X4, X4, 0x7fff_ffff),
+                movz(W, X16, 0x4000, 16),
+                csel(W, X4, X16, X4, Cond::Vs),
+            ]);
+        }
+        self.asm.b(done);
+        // Equal sticky doubles share sign and exponent: compare full 64-bit significands.
+        self.asm.bind(tie);
+        self.read(0, X0, X1, slow);
+        self.read(index, X2, X3, slow);
+        self.emit_all(&[
+            cmp(X, X0, X2, Lsl, 0),
+            cset(W, X16, Cond::Eq),
+            cset(W, X17, Cond::Lo),
+            cset(W, X2, Cond::Hi),
+            tst_imm(W, X1, 0x8000),
+            csel(W, X17, X2, X17, Cond::Ne),
+            eor_imm(W, X17, X17, 1),
+            lsl_imm(W, X4, X16, 30),
+            orr(W, X4, X4, X17, Lsl, 29),
+            movz(W, super::X10, 1, 0),
+            movz(W, super::X11, 0, 0),
+        ]);
+        self.asm.bind(done);
+        if pops == 1 {
+            self.pop();
+        }
+        self.asm.bind(unmasked_done);
+    }
+
+    /// Converts an extended value in `(sig, sexp)` to a sticky binary64 in `d`
+    /// for `x87_fcomi`, admitting zeros, in-range normals, `±Inf`, QNaNs
+    /// (ORing bit 0 into `nan_kind`), and SNaNs (ORing bit 1 into `nan_kind`),
+    /// while branching to `slow` for denormals, unsupported encodings, and
+    /// out-of-binary64-range normals.
+    fn fcomi_double(
+        &mut self,
+        sig: Reg,
+        sexp: Reg,
+        d: VReg,
+        lost: Reg,
+        nan_kind: Reg,
+        slow: Label,
+    ) {
+        let (zero, special, is_qnan, is_snan, join) = (
+            self.asm.label(),
+            self.asm.label(),
+            self.asm.label(),
+            self.asm.label(),
+            self.asm.label(),
+        );
+        self.emit_all(&[
+            lsr_imm(W, X16, sexp, 15),
+            lsl_imm(X, X16, X16, 63),
+            movz(W, lost, 0, 0),
+        ]);
+        self.asm.cbz(X, false, sig, zero);
+        self.asm.tbz(false, sig, 63, slow);
+        self.emit(and_imm(W, X17, sexp, 0x7fff));
+        self.asm.cbz(W, false, X17, slow);
+        self.emit(add_imm(W, X17, X17, 1, false));
+        self.asm.tbz(true, X17, 15, special);
+        self.emit_all(&[
+            sub_imm(W, X17, X17, 1, false),
+            tst_imm(X, sig, 0x7ff),
+            cset(W, lost, Cond::Ne),
+        ]);
+        self.unbias(X17, 1022);
+        self.emit(cmp_imm(W, X17, 1022 + 1023, false));
+        self.asm.b_cond(Cond::Hi, slow);
+        self.emit_all(&[
+            add_imm(W, X17, X17, 1, false),
+            orr(X, X16, X16, X17, Lsl, 52),
+            ubfx(X, X17, sig, 11, 52),
+            orr(X, X16, X16, X17, Lsl, 0),
+            orr(X, X16, X16, lost, Lsl, 0),
+        ]);
+        self.asm.b(join);
+        self.asm.bind(special);
+        self.asm.tbz(true, sig, 62, is_qnan);
+        self.emit(eor_imm(X, X17, sig, 1 << 63));
+        self.asm.cbz(X, true, X17, is_snan);
+        self.emit_all(&[movz(X, X17, 0x7ff0, 48), orr(X, X16, X16, X17, Lsl, 0)]);
+        self.asm.b(join);
+        self.asm.bind(is_snan);
+        self.emit_all(&[movz(X, X16, 0x7ff8, 48), orr_imm(W, nan_kind, nan_kind, 2)]);
+        self.asm.b(join);
+        self.asm.bind(is_qnan);
+        self.emit_all(&[movz(X, X16, 0x7ff8, 48), orr_imm(W, nan_kind, nan_kind, 1)]);
+        self.asm.b(join);
+        self.asm.bind(zero);
+        self.emit(and_imm(W, X17, sexp, 0x7fff));
+        self.asm.cbz(W, true, X17, slow);
+        self.asm.bind(join);
+        self.emit(fmov_to_v(X, d, X16));
+    }
+
     /// The memory operand as a double in `d`, rejecting encodings other
     /// than zeros and normals and doubles outside `2^±range`. Uses x16
     /// and x17.
@@ -1887,6 +2113,28 @@ mod tests {
         assert_eq!(
             plan(&decode(|a| a.fsqrt().unwrap()), 0, None).unwrap().fast,
             Fast::Sqrt
+        );
+        let fcomi = plan(&decode(|a| a.fcomi(st0, st1).unwrap()), 0, None).unwrap();
+        assert_eq!(
+            (fcomi.fast, fcomi.flag_compare()),
+            (
+                Fast::Compare {
+                    source: Source::St(1),
+                    pops: 0,
+                },
+                Some(false)
+            )
+        );
+        let fucomip = plan(&decode(|a| a.fucomip(st0, st2).unwrap()), 0, None).unwrap();
+        assert_eq!(
+            (fucomip.fast, fucomip.flag_compare()),
+            (
+                Fast::Compare {
+                    source: Source::St(2),
+                    pops: 1,
+                },
+                Some(true)
+            )
         );
     }
 }

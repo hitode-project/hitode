@@ -133,6 +133,18 @@ pub(super) fn can_drop_after(
     true
 }
 
+/// How an instruction affects the SIMD cache during residency analysis.
+#[derive(Clone, Copy)]
+enum SimdStep {
+    /// Reads and writes the given MMX/XMM register bitmasks.
+    Rw(u16, u16),
+    /// Tier-1 non-leaf x87 instruction: preserves live XMM registers (`0xff00`)
+    /// and MXCSR guards, while dropping MMX (`0x00ff`) and `guards.ready`.
+    X87KeepXmm,
+    /// Drops all cached SIMD registers and guards.
+    DropAll,
+}
+
 /// The entry of each instruction; only merges' are used.
 pub(super) fn entries(
     trace: &Trace,
@@ -141,9 +153,26 @@ pub(super) fn entries(
 ) -> Vec<Entry> {
     let len = trace.len();
     let footprints: Vec<_> = (0..len)
-        .map(|n| match trace.insts[n].op {
-            Op::Simd(simd) if key.is_some_and(|key| simd.control_helper(key)) => None,
-            _ => footprint(trace, n, checked),
+        .map(|n| {
+            let inst = trace.insts[n];
+            match inst.op {
+                Op::Simd(simd) if key.is_some_and(|key| simd.control_helper(key)) => {
+                    SimdStep::DropAll
+                }
+                Op::X87(x)
+                    if key.is_some()
+                        && inst.call.is_none()
+                        && inst.locked.is_none()
+                        && inst.mode != Mode::Real
+                        && !matches!(x.fast, adv_cpu_core::floating::fast::Fast::Leaf(_)) =>
+                {
+                    SimdStep::X87KeepXmm
+                }
+                _ => match footprint(trace, n, checked) {
+                    Some((reads, writes)) => SimdStep::Rw(reads, writes),
+                    None => SimdStep::DropAll,
+                },
+            }
         })
         .collect();
     // Backward: registers every path reads first. Exits and backward
@@ -164,8 +193,9 @@ pub(super) fn entries(
             out &= after(inst.taken);
         }
         need[index] = match footprints[index] {
-            Some((reads, writes)) => reads | (out & !writes),
-            None => 0,
+            SimdStep::Rw(reads, writes) => reads | (out & !writes),
+            SimdStep::X87KeepXmm => out & 0xff00,
+            SimdStep::DropAll => 0,
         };
     }
     // Single-path loop heads also hold what their bodies write, and merges
@@ -182,9 +212,16 @@ pub(super) fn entries(
                 && head <= index
                 && !(head < trace.primary && index >= trace.primary)
                 && (head..index).all(|n| trace.insts[n].next == Next::Fall)
-                && let Some(writes) =
-                    (head..=index).try_fold(0, |writes, n| footprints[n].map(|(_, w)| writes | w))
+                && let Some((writes, keep_mmx)) =
+                    (head..=index).try_fold((0u16, true), |(writes, keep_mmx), n| match footprints
+                        [n]
+                    {
+                        SimdStep::Rw(_, w) => Some((writes | w, keep_mmx)),
+                        SimdStep::X87KeepXmm => Some((writes & 0xff00, false)),
+                        SimdStep::DropAll => None,
+                    })
             {
+                let writes = if keep_mmx { writes } else { writes & 0xff00 };
                 need[head] |= writes;
                 bodies.push((head, index));
             }
@@ -232,8 +269,16 @@ pub(super) fn entries(
             }
             let inst = trace.insts[index];
             state = match (footprints[index], inst.op) {
-                (None, _) => Entry::default(),
-                (Some((reads, writes)), op) => Entry {
+                (SimdStep::DropAll, _) => Entry::default(),
+                (SimdStep::X87KeepXmm, _) => Entry {
+                    regs: state.regs & 0xff00,
+                    dirty: 0,
+                    guards: Guards {
+                        ready: false,
+                        ..state.guards
+                    },
+                },
+                (SimdStep::Rw(reads, writes), op) => Entry {
                     regs: state.regs | reads | writes,
                     dirty: 0,
                     guards: match op {
@@ -296,7 +341,11 @@ pub(super) fn entries(
                 dirty = entry[index].dirty;
             }
             let inst = trace.insts[index];
-            dirty = footprints[index].map_or(0, |(_, writes)| dirty | writes);
+            dirty = match footprints[index] {
+                SimdStep::DropAll => 0,
+                SimdStep::X87KeepXmm => dirty & 0xff00,
+                SimdStep::Rw(_, writes) => dirty | writes,
+            };
             if matches!(inst.op, Op::Simd(simd) if simd.kind == crate::translate::front::forms::SimdKind::Emms)
             {
                 dirty &= !mmx;
