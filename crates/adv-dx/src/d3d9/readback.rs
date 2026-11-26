@@ -245,13 +245,8 @@ pub(super) fn lock_internal(
     if state.sender.is_none() || state.wake.is_none() {
         return Outcome::Return(UNAVAILABLE);
     }
-    let Some(image) = r
-        .surface
-        .and_then(|s| (state.provider.target)(env.ext, s))
-        .map(|t| t.image)
-    else {
-        return Outcome::Return(INVALID);
-    };
+    let provider = state.provider;
+    let surface = r.surface;
     let Some(length) = format::length(format, r.desc.Width, r.desc.Height) else {
         return Outcome::Return(INVALID);
     };
@@ -261,6 +256,11 @@ pub(super) fn lock_internal(
             lock_internal(env, this, output, rect, flags)
         });
     }
+    let Some(CpuReadback { image, regions }) =
+        surface.and_then(|id| (provider.cpu_access)(env.ext, id, rectangle))
+    else {
+        return Outcome::Return(INVALID);
+    };
     // This is explicit guest staging owned by the same Resource, allocated on
     // the first CPU lock and reused. Creation/Present never read GPU pixels.
     let storage = if storage == 0 {
@@ -289,7 +289,7 @@ pub(super) fn lock_internal(
             event,
             owner,
             destination: id,
-            regions: vec![full(&image)],
+            regions,
             tracked: None,
             image,
             storage,
@@ -410,9 +410,7 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
         return Outcome::Return(INVALID);
     }
     let provider = env.ext.get::<State>().provider;
-    let Some(target) = r.surface.and_then(|s| (provider.target)(env.ext, s)) else {
-        return Outcome::Return(INVALID);
-    };
+    let surface = r.surface;
     let pitch = format::pitch(r.desc.Format, r.desc.Width).unwrap();
     let row = format::pitch(r.desc.Format, lock.rectangle.w).unwrap();
     let size = (lock.rectangle.h - 1) * pitch + row;
@@ -421,6 +419,11 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
     if adv_abi::guest::check_range(env.cpu, address, size, Prot::READ).is_err() {
         return Outcome::Return(INVALID);
     }
+    let Some(target) =
+        surface.and_then(|id| (provider.gpu_access)(env, id, Some(lock.rectangle), Access::Write))
+    else {
+        return Outcome::Return(INVALID);
+    };
     let state = env.ext.get_mut::<State>();
     let Some(gpu) = state.gpu.as_mut() else {
         return Outcome::Return(UNAVAILABLE);
@@ -553,10 +556,10 @@ fn read_target(
     let Some(storage) = resources::storage(env, dst) else {
         return Outcome::Return(INVALID);
     };
-    let state = env.ext.get::<State>();
-    let Some(image) = src
-        .surface
-        .and_then(|id| (state.provider.target)(env.ext, id))
+    let provider = env.ext.get::<State>().provider;
+    let surface = src.surface;
+    let Some(image) = surface
+        .and_then(|id| (provider.gpu_access)(env, id, None, Access::Read))
         .map(|t| t.image)
     else {
         return Outcome::Return(INVALID);
@@ -1004,12 +1007,14 @@ fn read_front(
     let Some(storage) = resources::storage(env, dst) else {
         return Outcome::Return(INVALID);
     };
-    let state = env.ext.get::<State>();
-    let Some(image) = (state.provider.target)(env.ext, front_surface).map(|t| t.image) else {
+    let provider = env.ext.get::<State>().provider;
+    let Some(image) =
+        (provider.gpu_access)(env, front_surface, None, Access::Read).map(|t| t.image)
+    else {
         return Outcome::Return(INVALID);
     };
     if (dst_width, dst_height) != (image.width(), image.height()) {
-        let (display_w, display_h, _) = (state.provider.display)(env.ext);
+        let (display_w, display_h, _) = (provider.display)(env.ext);
         if (dst_width, dst_height) == (display_w, display_h) {
             adv_abi::warn_unavailable(
                 env,

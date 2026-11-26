@@ -1,4 +1,4 @@
-//! Explicit GDI access borrows the existing lock/readback and upload paths.
+//! GDI leases use the surface CPU mapping and ordered upload paths.
 //! A lease owns its controlling resource and device, including across waits.
 use super::*;
 use crate::interop::DcSurface;
