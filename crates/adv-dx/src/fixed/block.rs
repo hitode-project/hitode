@@ -155,6 +155,7 @@ impl Block {
             viewport: source.viewport,
             scissor: source.scissor,
             transforms: source.transforms,
+            extra_transforms: source.extra_transforms.clone(),
             clip_planes: source.clip_planes,
             material: source.material,
             default_light: source.default_light,
@@ -215,7 +216,7 @@ fn copy(target: &mut State, source: &State, members: &Members) {
         target.scissor = source.scissor;
     }
     for i in &members.transforms {
-        target.transforms[i] = source.transforms[i];
+        *target.transform_mut(i) = *source.transform(i);
     }
     for i in &members.clip_planes {
         target.clip_planes[i] = source.clip_planes[i];

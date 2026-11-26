@@ -217,6 +217,10 @@ pub struct DirectDraw {
     submitted: Option<u32>,
     com: Option<CommonCom>,
     pending_guest: Vec<ComIdentity<ComState>>,
+    #[cfg(feature = "gpu")]
+    d3d: Option<d3d::State>,
+    #[cfg(feature = "gpu")]
+    d3d_surface_devices: BTreeMap<u32, d3d::object::Device>,
     /// Non-owning index; all payload and reference ownership lives in Objects.
     surface_objects: BTreeMap<u32, ComIdentity<ComState>>,
     /// Non-owning index from device_id to live device identity for GetDDInterface.
@@ -276,6 +280,10 @@ impl DirectDraw {
             submitted: None,
             com: None,
             pending_guest: Vec::new(),
+            #[cfg(feature = "gpu")]
+            d3d: None,
+            #[cfg(feature = "gpu")]
+            d3d_surface_devices: BTreeMap::new(),
             surface_objects: BTreeMap::new(),
             device_objects: BTreeMap::new(),
             surface_dcs: BTreeMap::new(),
@@ -391,12 +399,18 @@ impl DirectDraw {
         let mut parent = root;
         for (w, h, member) in levels {
             let sid = surfaces.create(w, h, false, format, m)?;
-            let Some(p) = self.com_version(objects, surfaces, Kind::Surface(sid), version, m)?
-            else {
+            #[cfg(feature = "gpu")]
+            if self.d3d.is_some() {
+                surfaces.set_packed_color(sid, member.packed_render_masks());
+            }
+            self.described.insert(sid, member);
+            let result = self.com_version(objects, surfaces, Kind::Surface(sid), version, m);
+            let Ok(Some(p)) = result else {
+                self.described.remove(&sid);
                 surfaces.delete(sid);
+                result?;
                 return Ok(false);
             };
-            self.described.insert(sid, member);
             self.surface_owners.insert(sid, owner);
             self.members.insert(sid, (root, p));
             self.complex.entry(parent).or_default().push(sid);
@@ -527,6 +541,8 @@ struct ComState {
     cooperative: bool,
     old: u32,
     modern: u32,
+    #[cfg(feature = "gpu")]
+    d3d_device_faces: [u32; 2],
     /// Each interface version's pointer, oldest first.
     versions: Vec<(u8, u32)>,
 }
@@ -781,6 +797,8 @@ impl DirectDraw {
             cooperative: false,
             old,
             modern,
+            #[cfg(feature = "gpu")]
+            d3d_device_faces: [0; 2],
             versions: layouts.iter().map(|&(v, _, p)| (v, p)).collect(),
         };
         let Some(identity) = com.create(objects, canonical, initial_iid, value) else {
@@ -799,6 +817,24 @@ impl DirectDraw {
                 surfaces.release(p, 16);
             }
             return Ok(None);
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(state) = &self.d3d {
+            let caps = match kind {
+                Kind::Surface(sid) => self.caps(sid)[0],
+                Kind::Device | Kind::Clipper => 0,
+            };
+            match d3d::attach_faces(state, com, objects, identity, surfaces, m, caps) {
+                Ok(true) => (),
+                result => {
+                    com.release_identity(objects, identity);
+                    for pointer in pointers {
+                        surfaces.release(pointer, 16);
+                    }
+                    result?;
+                    return Ok(None);
+                }
+            }
         }
         match kind {
             Kind::Device => {
@@ -894,6 +930,16 @@ impl DirectDraw {
             return 0;
         };
         if let Some(destroyed) = released.destroyed {
+            #[cfg(feature = "gpu")]
+            if self.d3d.is_some() && matches!(destroyed.value.kind, Kind::Surface(_)) {
+                d3d::release_surface(
+                    self,
+                    objects,
+                    surfaces,
+                    destroyed.value.d3d_device_faces,
+                    &destroyed.interfaces,
+                );
+            }
             for pointer in destroyed.interfaces {
                 surfaces.release(pointer, 16);
                 self.clipper_windows.remove(&pointer);
@@ -910,6 +956,10 @@ impl DirectDraw {
                 }
             }
             if let Kind::Surface(sid) = destroyed.value.kind {
+                #[cfg(feature = "gpu")]
+                if let Some(d3d) = &mut self.d3d {
+                    d3d.forget_surface(sid);
+                }
                 self.lost.remove(&sid);
                 self.surface_objects.remove(&sid);
                 self.surface_owners.remove(&sid);
@@ -1100,6 +1150,10 @@ impl DirectDraw {
         objects: &mut adv_machine::Objects,
         m: &mut dyn SurfaceMemory,
     ) -> Result<u32, CallError> {
+        #[cfg(feature = "gpu")]
+        if let Some(d3d) = &mut self.d3d {
+            d3d.flush()?;
+        }
         if id == api::UNIMPLEMENTED_COM {
             return Err("unimplemented DirectDraw COM method".into());
         }
@@ -1175,6 +1229,16 @@ impl DirectDraw {
             api::QUERY => {
                 m.arg_put_u32(a[2], 0)?;
                 let iid: [u8; 16] = m.arg_read(a[1], 16)?.as_ref().try_into().unwrap();
+                #[cfg(feature = "gpu")]
+                if self.d3d.is_some() {
+                    return match d3d::query(self, objects, a[0], iid) {
+                        Ok(pointer) => {
+                            m.arg_put_u32(a[2], pointer)?;
+                            Ok(0)
+                        }
+                        Err(hr) => Ok(hr),
+                    };
+                }
                 match com.query::<ComState>(objects, a[0], iid) {
                     Ok(pointer) => {
                         m.arg_put_u32(a[2], pointer)?;
@@ -1326,6 +1390,10 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
+                #[cfg(feature = "gpu")]
+                if self.d3d.is_some() && self.caps(sid)[1] & creation::MIPMAP_SUBLEVEL != 0 {
+                    return Ok(0x8876025b); // DDERR_NOTONMIPMAPSUBLEVEL
+                }
                 let kinds = a[1] & !1;
                 if !KEY_KINDS.contains(&kinds) {
                     return Ok(INVALID);
@@ -1494,7 +1562,14 @@ impl DirectDraw {
                 }
                 let exclusive = self.exclusive_owner == Some(object.device_id);
                 let mode = (surfaces.width, surfaces.height, surfaces.display_format);
-                if let Err(hr) = validate(&mut d, a[3], version, exclusive, mode) {
+                let texture_storage = storage;
+                #[cfg(feature = "gpu")]
+                let texture_storage = if self.d3d.is_some() {
+                    d3d_storage
+                } else {
+                    texture_storage
+                };
+                if let Err(hr) = validate(&mut d, a[3], version, exclusive, mode, texture_storage) {
                     return Ok(hr);
                 }
                 let primary = d.caps[0] & PRIMARY != 0;
@@ -1506,7 +1581,12 @@ impl DirectDraw {
                 let owner_device_id = object.device_id;
                 let owner_modern = object.modern;
                 let surface_version = surface_version(version);
-                let format = storage(&d.format).expect("validated format");
+                let format = (if d.caps[0] & (TEXTURE | THREE_D_DEVICE) != 0 {
+                    texture_storage
+                } else {
+                    storage
+                })(&d.format)
+                .expect("validated format");
                 let sid = if primary {
                     let primary = surfaces.primary(m)?;
                     if flip && self.complex.contains_key(&primary) {
@@ -1535,12 +1615,19 @@ impl DirectDraw {
                 };
                 // Like Windows, the kept descriptor has no client address.
                 d.flags &= !DDSD_LPSURFACE;
-                let Some(p) =
-                    self.com_version(objects, surfaces, Kind::Surface(sid), surface_version, m)?
-                else {
+                #[cfg(feature = "gpu")]
+                if self.d3d.is_some() {
+                    surfaces.set_packed_color(sid, d.packed_render_masks());
+                }
+                self.described.insert(sid, d);
+                let result =
+                    self.com_version(objects, surfaces, Kind::Surface(sid), surface_version, m);
+                let Ok(Some(p)) = result else {
+                    self.described.remove(&sid);
                     if surfaces.primary_id() != Some(sid) {
                         surfaces.delete(sid);
                     }
+                    result?;
                     return Ok(0x8007000e);
                 };
                 for (i, &(flag, key)) in KEYS.iter().enumerate() {
@@ -1548,7 +1635,6 @@ impl DirectDraw {
                         self.color_keys.insert((sid, key), d.keys[i]);
                     }
                 }
-                self.described.insert(sid, d);
                 self.surface_owners.insert(sid, owner_device_id);
                 // Surfaces from DirectDraw4 and 7 keep their creator alive.
                 if version >= 4 {

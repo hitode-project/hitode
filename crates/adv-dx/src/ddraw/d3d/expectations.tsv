@@ -1,0 +1,397 @@
+px	hal	quad-int-1-1-5-5	0	000000000000000000000000000000000000000000
+px	hal	quad-int-1-1-5-5	1	000000ffffffffffffffffffffffff000000000000
+px	hal	quad-int-1-1-5-5	2	000000ffffffffffffffffffffffff000000000000
+px	hal	quad-int-1-1-5-5	3	000000ffffffffffffffffffffffff000000000000
+px	hal	quad-int-1-1-5-5	4	000000ffffffffffffffffffffffff000000000000
+px	hal	quad-int-1-1-5-5	5	000000000000000000000000000000000000000000
+px	hal	quad-int-1-1-5-5	6	000000000000000000000000000000000000000000
+px	hal	quad-half-1.5-1.5-5.5-5.5	0	000000000000000000000000000000000000000000
+px	hal	quad-half-1.5-1.5-5.5-5.5	1	000000000000000000000000000000000000000000
+px	hal	quad-half-1.5-1.5-5.5-5.5	2	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-half-1.5-1.5-5.5-5.5	3	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-half-1.5-1.5-5.5-5.5	4	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-half-1.5-1.5-5.5-5.5	5	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-half-1.5-1.5-5.5-5.5	6	000000000000000000000000000000000000000000
+px	hal	quad-0.49-0.49-4.49-4.49	0	000000000000000000000000000000000000000000
+px	hal	quad-0.49-0.49-4.49-4.49	1	000000000000000000000000000000000000000000
+px	hal	quad-0.49-0.49-4.49-4.49	2	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-0.49-0.49-4.49-4.49	3	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-0.49-0.49-4.49-4.49	4	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-0.49-0.49-4.49-4.49	5	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-0.49-0.49-4.49-4.49	6	000000000000000000000000000000000000000000
+px	hal	quad-0.51-0.51-4.51-4.51	0	000000000000000000000000000000000000000000
+px	hal	quad-0.51-0.51-4.51-4.51	1	000000000000000000000000000000000000000000
+px	hal	quad-0.51-0.51-4.51-4.51	2	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-0.51-0.51-4.51-4.51	3	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-0.51-0.51-4.51-4.51	4	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-0.51-0.51-4.51-4.51	5	000000000000ffffffffffffffffffffffff000000
+px	hal	quad-0.51-0.51-4.51-4.51	6	000000000000000000000000000000000000000000
+px	hal	quad-thin-1-1-5-1.4	0	000000000000000000000000000000000000000000
+px	hal	quad-thin-1-1-5-1.4	1	000000ffffffffffffffffffffffff000000000000
+px	hal	quad-thin-1-1-5-1.4	2	000000000000000000000000000000000000000000
+px	hal	quad-thin-1-1-5-1.4	3	000000000000000000000000000000000000000000
+px	hal	quad-thin-1-1-5-1.4	4	000000000000000000000000000000000000000000
+px	hal	quad-thin-1-1-5-1.4	5	000000000000000000000000000000000000000000
+px	hal	quad-thin-1-1-5-1.4	6	000000000000000000000000000000000000000000
+px	hal	shared-edge-additive-0x40	0	404040404040404040404040404040404040404040404040000000
+px	hal	shared-edge-additive-0x40	1	404040404040404040404040404040404040404040404040000000
+px	hal	shared-edge-additive-0x40	2	404040404040404040404040404040404040404040404040000000
+px	hal	shared-edge-additive-0x40	3	404040404040404040404040404040404040404040404040000000
+px	hal	shared-edge-additive-0x40	4	404040404040404040404040404040404040404040404040000000
+px	hal	shared-edge-additive-0x40	5	404040404040404040404040404040404040404040404040000000
+px	hal	shared-edge-additive-0x40	6	404040404040404040404040404040404040404040404040000000
+px	hal	shared-edge-additive-0x40	7	404040404040404040404040404040404040404040404040000000
+px	hal	shared-edge-additive-0x40	8	000000000000000000000000000000000000000000000000000000
+px	hal	line-1,1-6,4-points-1.5,6.5-3,6	0	000000000000000000000000000000000000000000000000
+px	hal	line-1,1-6,4-points-1.5,6.5-3,6	1	000000ffffff000000000000000000000000000000000000
+px	hal	line-1,1-6,4-points-1.5,6.5-3,6	2	000000000000ffffffffffff000000000000000000000000
+px	hal	line-1,1-6,4-points-1.5,6.5-3,6	3	000000000000000000000000ffffffffffff000000000000
+px	hal	line-1,1-6,4-points-1.5,6.5-3,6	4	000000000000000000000000000000000000000000000000
+px	hal	line-1,1-6,4-points-1.5,6.5-3,6	5	000000000000000000000000000000000000000000000000
+px	hal	line-1,1-6,4-points-1.5,6.5-3,6	6	000000ffffff000000ffffff000000000000000000000000
+px	hal	line-1,1-6,4-points-1.5,6.5-3,6	7	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-int-point	0	101000501000901000d01000000000000000000000000000
+px	hal	tex-1to1-int-point	1	105000505000905000d05000000000000000000000000000
+px	hal	tex-1to1-int-point	2	109000509000909000d09000000000000000000000000000
+px	hal	tex-1to1-int-point	3	10d00050d00090d000d0d000000000000000000000000000
+px	hal	tex-1to1-int-point	4	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-int-point	5	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-int-point	6	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-int-point	7	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-minus-half-point	0	101000501000901000d01000000000000000000000000000
+px	hal	tex-1to1-minus-half-point	1	105000505000905000d05000000000000000000000000000
+px	hal	tex-1to1-minus-half-point	2	109000509000909000d09000000000000000000000000000
+px	hal	tex-1to1-minus-half-point	3	10d00050d00090d000d0d000000000000000000000000000
+px	hal	tex-1to1-minus-half-point	4	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-minus-half-point	5	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-minus-half-point	6	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-minus-half-point	7	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-int-linear	0	101000301000701000b01000000000000000000000000000
+px	hal	tex-1to1-int-linear	1	103000303000703000b03000000000000000000000000000
+px	hal	tex-1to1-int-linear	2	107000307000707000b07000000000000000000000000000
+px	hal	tex-1to1-int-linear	3	10b00030b00070b000b0b000000000000000000000000000
+px	hal	tex-1to1-int-linear	4	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-int-linear	5	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-int-linear	6	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-int-linear	7	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-minus-half-linear	0	101000501000901000d01000000000000000000000000000
+px	hal	tex-1to1-minus-half-linear	1	105000505000905000d05000000000000000000000000000
+px	hal	tex-1to1-minus-half-linear	2	109000509000909000d09000000000000000000000000000
+px	hal	tex-1to1-minus-half-linear	3	10d00050d00090d000d0d000000000000000000000000000
+px	hal	tex-1to1-minus-half-linear	4	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-minus-half-linear	5	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-minus-half-linear	6	000000000000000000000000000000000000000000000000
+px	hal	tex-1to1-minus-half-linear	7	000000000000000000000000000000000000000000000000
+px	hal	tex-2x-int-linear	0	101000101000301000501000701000901000b01000d01000
+px	hal	tex-2x-int-linear	1	101000101000301000501000701000901000b01000d01000
+px	hal	tex-2x-int-linear	2	103000103000303000503000703000903000b03000d03000
+px	hal	tex-2x-int-linear	3	105000105000305000505000705000905000b05000d05000
+px	hal	tex-2x-int-linear	4	107000107000307000507000707000907000b07000d07000
+px	hal	tex-2x-int-linear	5	109000109000309000509000709000909000b09000d09000
+px	hal	tex-2x-int-linear	6	10b00010b00030b00050b00070b00090b000b0b000d0b000
+px	hal	tex-2x-int-linear	7	10d00010d00030d00050d00070d00090d000b0d000d0d000
+px	hal	tex-wrap-uv-minus-0.5-1.5	0	909000d09000109000509000909000d09000109000509000
+px	hal	tex-wrap-uv-minus-0.5-1.5	1	90d000d0d00010d00050d00090d000d0d00010d00050d000
+px	hal	tex-wrap-uv-minus-0.5-1.5	2	901000d01000101000501000901000d01000101000501000
+px	hal	tex-wrap-uv-minus-0.5-1.5	3	905000d05000105000505000905000d05000105000505000
+px	hal	tex-wrap-uv-minus-0.5-1.5	4	909000d09000109000509000909000d09000109000509000
+px	hal	tex-wrap-uv-minus-0.5-1.5	5	90d000d0d00010d00050d00090d000d0d00010d00050d000
+px	hal	tex-wrap-uv-minus-0.5-1.5	6	901000d01000101000501000901000d01000101000501000
+px	hal	tex-wrap-uv-minus-0.5-1.5	7	905000d05000105000505000905000d05000105000505000
+px	hal	modulate-white-tex-white-diffuse	0	ffffff
+px	hal	modulate-half-half	0	404040
+px	hal	modulate2x-half-half	0	808080
+px	hal	modulate4x-half-half	0	ffffff
+px	hal	add-half-half	0	ffffff
+px	hal	addsigned-half-half	0	808080
+px	hal	subtract-half-0x40	0	404040
+px	hal	blenddiffusealpha-a40	0	404040
+px	hal	selectarg2-diffuse-0x7f	0	7f7f7f
+px	hal	blend-srcalpha-a80-white-over-0x404040	0	a0a0a0
+px	hal	blend-srcalpha-a7f-white-over-0x404040	0	9f9f9f
+px	hal	blend-srcalpha-a01-white-over-0x404040	0	414141
+px	hal	blend-one-one-0xc0-over-0x404040	0	ffffff
+px	hal	blend-destcolor-zero-0x80-over-0x404040	0	202020
+px	hal	blend-bothsrcalpha-a40-white-over-0x404040	0	707070
+px	hal	alphatest-a80-gequal-ref7f	0	ffffff
+px	hal	alphatest-a80-gequal-ref80	0	ffffff
+px	hal	alphatest-a80-gequal-ref81	0	000000
+packed	hal	rt16-gouraud-dither0	0	00001000200030004000500060007000780088009800a800b800c800d800e800
+packed	hal	rt16-gouraud-dither0	1	00021002200230024002500260027002780288029802a802b802c802d802e802
+packed	hal	rt16-gouraud-dither0	2	00041004200430044004500460047004780488049804a804b804c804d804d882
+packed	hal	rt16-gouraud-dither0	3	00061006200630064006500660067006780688069806a806b806c806c884c902
+packed	hal	rt16-gouraud-dither0	4	00081008200830084008500860087008780888089808a808b808b886b904b982
+packed	hal	rt16-gouraud-dither0	5	000a100a200a300a400a500a600a700a780a880a980aa80aa888a906a984aa02
+packed	hal	rt16-gouraud-dither0	6	000c100c200c300c400c500c600c700c780c880c980c988a990899869a049a82
+packed	hal	rt16-gouraud-dither0	7	000e100e200e300e400e500e600e700e780e880e888c890a89888a068a848b02
+packed	hal	rt16-gouraud-dither0	8	000f100f200f300f400f500f600f700f780f788e790c798a7a087a867b047b82
+packed	hal	rt16-gouraud-dither0	9	00111011201130114011501160117011708f710e718c720a72887306738473e2
+packed	hal	rt16-gouraud-dither0	10	00131013201330134013501360136091610f618e620c628a6308638663e46462
+packed	hal	rt16-gouraud-dither0	11	00151015201530154015501550935111518f520e528c530a538853e6546454e2
+packed	hal	rt16-gouraud-dither0	12	00171017201730174017409541134191420f428e430c438a43e8446644e44562
+packed	hal	rt16-gouraud-dither0	13	00191019201930193097311531933211328f330e338c33ea346834e6356435e2
+packed	hal	rt16-gouraud-dither0	14	001b101b201b20992117219522132291230f238e23ec246a24e8256625e42662
+packed	hal	rt16-gouraud-dither0	15	001d101d109b11191197121512931311138f13ee146c14ea156815e6166416e2
+packed	hal	rt16-flat-dither0	0	0000000000000000000000000000000000000000000000000000000000000000
+packed	hal	rt16-flat-dither0	1	000000000000000000000000000000000000000000000000000000000000f800
+packed	hal	rt16-flat-dither0	2	00000000000000000000000000000000000000000000000000000000f800f800
+packed	hal	rt16-flat-dither0	3	0000000000000000000000000000000000000000000000000000f800f800f800
+packed	hal	rt16-flat-dither0	4	000000000000000000000000000000000000000000000000f800f800f800f800
+packed	hal	rt16-flat-dither0	5	00000000000000000000000000000000000000000000f800f800f800f800f800
+packed	hal	rt16-flat-dither0	6	0000000000000000000000000000000000000000f800f800f800f800f800f800
+packed	hal	rt16-flat-dither0	7	000000000000000000000000000000000000f800f800f800f800f800f800f800
+packed	hal	rt16-flat-dither0	8	00000000000000000000000000000000f800f800f800f800f800f800f800f800
+packed	hal	rt16-flat-dither0	9	0000000000000000000000000000f800f800f800f800f800f800f800f800f800
+packed	hal	rt16-flat-dither0	10	000000000000000000000000f800f800f800f800f800f800f800f800f800f800
+packed	hal	rt16-flat-dither0	11	00000000000000000000f800f800f800f800f800f800f800f800f800f800f800
+packed	hal	rt16-flat-dither0	12	0000000000000000f800f800f800f800f800f800f800f800f800f800f800f800
+packed	hal	rt16-flat-dither0	13	000000000000f800f800f800f800f800f800f800f800f800f800f800f800f800
+packed	hal	rt16-flat-dither0	14	00000000f800f800f800f800f800f800f800f800f800f800f800f800f800f800
+packed	hal	rt16-flat-dither0	15	0000f800f800f800f800f800f800f800f800f800f800f800f800f800f800f800
+px	rgb	line-1,1-6,4-points-1.5,6.5-3,6	0	000000000000000000000000000000000000000000000000
+px	rgb	line-1,1-6,4-points-1.5,6.5-3,6	1	000000ffffff000000000000000000000000000000000000
+px	rgb	line-1,1-6,4-points-1.5,6.5-3,6	2	000000000000ffffffffffff000000000000000000000000
+px	rgb	line-1,1-6,4-points-1.5,6.5-3,6	3	000000000000000000000000ffffffffffff000000000000
+px	rgb	line-1,1-6,4-points-1.5,6.5-3,6	4	000000000000000000000000000000000000ffffff000000
+px	rgb	line-1,1-6,4-points-1.5,6.5-3,6	5	000000000000000000000000000000000000000000000000
+px	rgb	line-1,1-6,4-points-1.5,6.5-3,6	6	000000000000000000ffffff000000000000000000000000
+px	rgb	line-1,1-6,4-points-1.5,6.5-3,6	7	000000000000ffffff000000000000000000000000000000
+px	rgb	subtract-half-0x40	0	c0c0c0
+vx	hal	directional-diffuse-6deg-steps	fffffffefefef9f9f9f3f3f3e9e9e9ddddddcececebebebeababab9696967f7f7f6868684f4f4f3535351b1b1b000000
+vx	hal	directional-normal-length-0.5	8080807f7f7f7d7d7d7979797474746e6e6e6767675f5f5f5555554b4b4b4040403434342727271b1b1b0d0d0d000000
+vx	hal	directional-normal-length-0.5-normalized	fffffffefefef9f9f9f3f3f3e9e9e9ddddddcececebebebeababab9696967f7f7f6868684f4f4f3535351b1b1b000000
+vx	hal	ambient-global40-mat0.5-light0.25-diffuse0.5	bfbfbfbfbfbfbdbdbdb9b9b9b4b4b4aeaeaea7a7a79f9f9f9595958b8b8b8080807474746767675a5a5a4d4d4d404040
+vx	hal	specular-power10-localviewer	1010100b0b0b050505020202010101000000000000000000000000000000000000000000000000000000000000000000
+vx	hal	specular-power10-nonlocal	fffffffffffff1f1f1e1e1e1ccccccb4b4b49a9a9a8080806767675050503d3d3d2c2c2c1f1f1f1414140d0d0d080808
+vx	hal	point-light-16,5,-4-att0=1-att1=0.05	2727272e2e2e383838464646585858737373979797bfbfbfcfcfcfb6b6b68d8d8d6c6c6c5353534242423535352c2c2c
+vx	hal	spot-light-16,6,-8-theta0.3-phi0.9	0000000000000000000000000000000000001919199b9b9bb3b3b3808080000000000000000000000000000000000000
+vx	hal	colorvertex-diffuse-source-emissive0.125	20ffa031ffa042fda053eca064dba075caa086b9a097a8a0a897a0b986a0ca75a0db64a0ec53a0fd42a0ff31a0ff20a0
+vx	hal	unlit-passthrough	0000ff1110fc2220f93330f64440f35550f06660ed7770ea8880e79990e4aaa0e1bbb0deccc0dbddd0d8eee0d5fff0d2
+vx	hal	vertex-fog-linear-0.2-0.8	0000ff0000ff0000ff0000ff1c00e33900c65500aa71008e8e0071aa0055c60039e3001cff0000ff0000ff0000ff0000
+vx	hal	vertex-fog-exp-2	0000ff2000df3c00c35400ab6900967c00838c00739b0064a70058b2004dbc0043c4003bcc0033d2002dd80027dc0023
+vx	hal	vertex-fog-exp2-2	0000ff0400fb1200ed2600d93f00c05b00a479008694006bad0052c3003cd4002be1001eeb0014f2000df70008fa0005
+vx	hal	vertex-fog-linear-range	ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000
+vx	hal	table-fog-linear-0.2-0.8	0000ff0000ff0000ff0000ff1c00e33900c65500aa71008e8e0071aa0055c60039e3001cff0000ff0000ff0000ff0000
+vx	hal	table-fog-exp-2	0000ff2000df3c00c35400ab6900967c00838c00739b0064a70058b2004dbc0043c4003bcc0033d2002dd80027dc0022
+vx	hal	table-fog-exp2-2	0000ff0400fa1100ed2600d93f00c05b00a379008694006bad0052c3003cd4002be1001eeb0014f2000df70008fa0005
+stage	hal	texgen-cameraspaceposition-u=x/32	0	080040180040280040380040480040580040680040780040880040980040a80040b80040c80040d80040e80040f80040
+vx	hal	vertex-blend-1weight-draw	80004005
+vx	hal	vertex-blend-1weight-row-of-point-c=0..4	-1	-1	-1	-1	-1
+stage	hal	z-coplanar-lessequal	0	ff0000
+stage	hal	z-coplanar-less	0	00ff00
+stage	hal	z-coplanar-less-zbias1	0	ff0000
+stage	hal	z-coplanar-less-zbias16	0	ff0000
+stage	hal	z-0.5-then-0.5001-less-zbias1	0	00ff00
+stage	hal	stencil-incr-twice-equal-ref1	0	202020
+stage	hal	stencil-incr-twice-equal-ref2	0	0000ff
+stage	hal	stencil-incr-twice-equal-ref3	0	202020
+stage	hal	stencil-incr-from-ff-then-equal-ff	0	202020
+stage	hal	stage0-565-0x8410-stage1-add-tfactor-204060	0	a4c2e4
+stage	hal	texture-565-0x8410-expanded	0	848284
+stage	hal	stage0-selectarg1-tfactor	0	204060	validate	00000000	1
+stage	hal	stage0-add-texture-tfactor	0	a4c2e4	validate	00000000	1
+stage	hal	stage1-selectarg1-current	0	848284	validate	00000000	1
+stage	hal	stage1-selectarg2-tfactor	0	204060	validate	00000000	1
+stage	hal	stage1-add-current-tfactor-texture1-bound	0	a4c2e4	validate	00000000	1
+stage	hal	stage1-modulate-current-texture1	0	444244	validate	00000000	1
+stage	hal	stage1-add-current-diffuse-0x204060	0	a4c2e4	validate	00000000	1
+stage	hal	texture-565-0xffff-expanded	0	ffffff
+stage	hal	texture-4444-0x8fff-srcalpha-over-404040	0	a6a6a6
+stage	hal	texture-1555-0x4210-expanded	0	848484
+stage	hal	texture-1555-alpha0-alphatest-greater0	0	404040
+vx	tnlhal	directional-diffuse-6deg-steps	fffffffefefef9f9f9f2f2f2e9e9e9ddddddcececebdbdbdababab9696967f7f7f6868684f4f4f3535351b1b1b000000
+vx	tnlhal	directional-normal-length-0.5	7f7f7f7f7f7f7d7d7d7979797474746e6e6e6767675f5f5f5555554b4b4b4040403434342727271a1a1a0d0d0d000000
+vx	tnlhal	directional-normal-length-0.5-normalized	fffffffefefef9f9f9f2f2f2e9e9e9ddddddcececebdbdbdababab9696967f7f7f6868684f4f4f3535351b1b1b000000
+vx	tnlhal	ambient-global40-mat0.5-light0.25-diffuse0.5	bfbfbfbfbfbfbdbdbdb9b9b9b4b4b4aeaeaea7a7a79f9f9f9595958b8b8b8080807474746767675a5a5a4d4d4d404040
+vx	tnlhal	specular-power10-localviewer	1010100b0b0b050505020202010101000000000000000000000000000000000000000000000000000000000000000000
+vx	tnlhal	specular-power10-nonlocal	fffffffcfcfcf1f1f1e1e1e1ccccccb4b4b49a9a9a8080806767675050503d3d3d2c2c2c1f1f1f1414140d0d0d080808
+vx	tnlhal	point-light-16,5,-4-att0=1-att1=0.05	2626262e2e2e383838454545585858737373979797bfbfbfcfcfcfb6b6b68d8d8d6b6b6b5353534242423535352c2c2c
+vx	tnlhal	spot-light-16,6,-8-theta0.3-phi0.9	0000000000000000000000000000000000001919199b9b9bc8c8c8808080000000000000000000000000000000000000
+vx	tnlhal	colorvertex-diffuse-source-emissive0.125	20ffa031ffa042fda053eca064dba075caa086b9a097a8a0a897a0b986a0ca75a0db64a0ec53a0fd42a0ff31a0ff20a0
+vx	tnlhal	unlit-passthrough	0000ff1110fc2220f93330f64440f35550f06660ed7770ea8880e79990e4aaa0e1bbb0deccc0dbddd0d8eee0d5fff0d2
+vx	tnlhal	vertex-fog-linear-0.2-0.8	0000ff0000ff0000ff0000ff1c00e33900c65500aa71008e8e0071aa0055c60039e3001cff0000ff0000ff0000ff0000
+vx	tnlhal	vertex-fog-exp-2	0000ff2000df3c00c35400ab6900967c00838c00739b0064a70058b2004dbc0043c4003bcc0033d2002dd80027dc0022
+vx	tnlhal	vertex-fog-exp2-2	0000ff0400fa1100ed2600d93f00c05b00a379008694006bad0052c3003cd4002be1001eeb0014f2000df70008fa0005
+vx	tnlhal	vertex-fog-linear-range	ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000
+vx	tnlhal	table-fog-linear-0.2-0.8	0000ff0000ff0000ff0000ff1c00e33900c65500aa71008e8e0071aa0055c60039e3001cff0000ff0000ff0000ff0000
+vx	tnlhal	table-fog-exp-2	0000ff2000df3c00c35400ab6900967c00838c00739b0064a70058b2004dbc0043c4003bcc0033d2002dd80027dc0022
+vx	tnlhal	table-fog-exp2-2	0000ff0400fa1100ed2600d93f00c05b00a379008694006bad0052c3003cd4002be1001eeb0014f2000df70008fa0005
+vx	tnlhal	texgen-cameraspaceposition-u=x/32	080040180040280040380040480040580040680040780040880040980040a80040b80040c80040d80040e80040f80040
+vx	tnlhal	vertex-blend-1weight-draw	00000000
+vx	tnlhal	vertex-blend-1weight-row-of-point-c=0..4	22	21	20	19	18
+stage	tnlhal	z-coplanar-lessequal	0	ff0000
+stage	tnlhal	z-coplanar-less	0	00ff00
+stage	tnlhal	z-coplanar-less-zbias1	0	ff0000
+stage	tnlhal	z-coplanar-less-zbias16	0	ff0000
+stage	tnlhal	z-0.5-then-0.5001-less-zbias1	0	00ff00
+stage	tnlhal	stencil-incr-twice-equal-ref1	0	202020
+stage	tnlhal	stencil-incr-twice-equal-ref2	0	0000ff
+stage	tnlhal	stencil-incr-twice-equal-ref3	0	202020
+stage	tnlhal	stencil-incr-from-ff-then-equal-ff	0	202020
+stage	tnlhal	stage0-565-0x8410-stage1-add-tfactor-204060	0	a4c2e4
+stage	tnlhal	texture-565-0x8410-expanded	0	848284
+stage	tnlhal	stage0-selectarg1-tfactor	0	204060	validate	00000000	1
+stage	tnlhal	stage0-add-texture-tfactor	0	a4c2e4	validate	00000000	1
+stage	tnlhal	stage1-selectarg1-current	0	848284	validate	00000000	1
+stage	tnlhal	stage1-selectarg2-tfactor	0	204060	validate	00000000	1
+stage	tnlhal	stage1-add-current-tfactor-texture1-bound	0	a4c2e4	validate	00000000	1
+stage	tnlhal	stage1-modulate-current-texture1	0	444244	validate	00000000	1
+stage	tnlhal	stage1-add-current-diffuse-0x204060	0	a4c2e4	validate	00000000	1
+stage	tnlhal	texture-565-0xffff-expanded	0	ffffff
+stage	tnlhal	texture-4444-0x8fff-srcalpha-over-404040	0	a6a6a6
+stage	tnlhal	texture-1555-0x4210-expanded	0	848484
+stage	tnlhal	texture-1555-alpha0-alphatest-greater0	0	404040
+vx	rgb	directional-diffuse-6deg-steps	fffffffefefef9f9f9f3f3f3e9e9e9ddddddcececebebebeababab9696967f7f7f6868684f4f4f3535351b1b1b000000
+vx	rgb	directional-normal-length-0.5	8080807f7f7f7d7d7d7979797474746e6e6e6767675f5f5f5555554b4b4b4040403434342727271b1b1b0d0d0d000000
+vx	rgb	directional-normal-length-0.5-normalized	fffffffefefef9f9f9f3f3f3e9e9e9ddddddcececebebebeababab9696967f7f7f6868684f4f4f3535351b1b1b000000
+vx	rgb	ambient-global40-mat0.5-light0.25-diffuse0.5	bfbfbfbfbfbfbdbdbdb9b9b9b4b4b4aeaeaea7a7a79f9f9f9595958b8b8b8080807474746767675a5a5a4d4d4d404040
+vx	rgb	specular-power10-localviewer	1010100b0b0b050505020202010101000000000000000000000000000000000000000000000000000000000000000000
+vx	rgb	specular-power10-nonlocal	fffffffffffff1f1f1e1e1e1ccccccb4b4b49a9a9a8080806767675050503d3d3d2c2c2c1f1f1f1414140d0d0d080808
+vx	rgb	point-light-16,5,-4-att0=1-att1=0.05	2727272e2e2e383838464646585858737373979797bfbfbfcfcfcfb6b6b68d8d8d6c6c6c5353534242423535352c2c2c
+vx	rgb	spot-light-16,6,-8-theta0.3-phi0.9	0000000000000000000000000000000000001919199b9b9bb3b3b3808080000000000000000000000000000000000000
+vx	rgb	colorvertex-diffuse-source-emissive0.125	20ffa031ffa042fda053eca064dba075caa086b9a097a8a0a897a0b986a0ca75a0db64a0ec53a0fd42a0ff31a0ff20a0
+vx	rgb	unlit-passthrough	0000ff1110fc2220f93330f64440f35550f06660ed7770ea8880e79990e4aaa0e1bbb0deccc0dbddd0d8eee0d5fff0d2
+vx	rgb	vertex-fog-linear-0.2-0.8	0000fe0000fe0000fe0000fe1b00e23800c55400a970008d8d0070a90054c50038e2001bfe0000fe0000fe0000fe0000
+vx	rgb	vertex-fog-exp-2	0000fe1f00de3b00c25300aa6800957b00828b00729a0063a60057b1004cbb0042c3003acb0032d1002cd70026db0022
+vx	rgb	vertex-fog-exp2-2	0000fe0300fa1100ec2500d83e00bf5a00a378008593006aac0051c2003bd3002ae0001dea0013f1000cf60007f90004
+vx	rgb	vertex-fog-linear-range	fe0000fe0000fe0000fe0000fe0000fe0000fe0000fe0000fe0000fe0000fe0000fe0000fe0000fe0000fe0000fe0000
+vx	rgb	table-fog-linear-0.2-0.8	0000fe0000fe0000fe0000fe1b00e23700c65400a970008d8d0070a90054c60037e2001bfe0000fe0000fe0000fe0000
+vx	rgb	table-fog-exp-2	0000fe1e00df3a00c35300aa6800957b00828b00729a0063a60057b1004cbb0042c3003acb0032d1002cd70026dc0021
+vx	rgb	table-fog-exp2-2	0000fe0300fa1000ed2400d93e00bf5a00a378008593006aac0051c2003bd3002ae1001ceb0012f2000bf70006fa0003
+vx	rgb	texgen-cameraspaceposition-u=x/32	080040180040280040380040480040580040680040780040880040980040a80040b80040c80040d80040e80040f80040
+vx	rgb	vertex-blend-1weight-draw	80004005
+vx	rgb	vertex-blend-1weight-row-of-point-c=0..4	-1	-1	-1	-1	-1
+stage	rgb	z-coplanar-lessequal	0	ff0000
+stage	rgb	z-coplanar-less	0	00ff00
+stage	rgb	z-coplanar-less-zbias1	0	00ff00
+stage	rgb	z-coplanar-less-zbias16	0	00ff00
+stage	rgb	z-0.5-then-0.5001-less-zbias1	0	00ff00
+stage	rgb	stencil-incr-twice-equal-ref1	0	202020
+stage	rgb	stencil-incr-twice-equal-ref2	0	0000ff
+stage	rgb	stencil-incr-twice-equal-ref3	0	202020
+stage	rgb	stencil-incr-from-ff-then-equal-ff	0	202020
+stage	rgb	stage0-565-0x8410-stage1-add-tfactor-204060	0	ffffff
+stage	rgb	texture-565-0x8410-expanded	0	808080
+stage	rgb	stage0-selectarg1-tfactor	0	204060	validate	8876081a	1
+stage	rgb	stage0-add-texture-tfactor	0	a0c0e0	validate	00000000	1
+stage	rgb	stage1-selectarg1-current	0	204060	validate	8876081a	1
+stage	rgb	stage1-selectarg2-tfactor	0	204060	validate	8876081a	1
+stage	rgb	stage1-add-current-tfactor-texture1-bound	0	204060	validate	8876081a	1
+stage	rgb	stage1-modulate-current-texture1	0	204060	validate	8876081a	1
+stage	rgb	stage1-add-current-diffuse-0x204060	0	204060	validate	8876081a	1
+stage	rgb	texture-565-0xffff-expanded	0	204060
+stage	rgb	texture-4444-0x8fff-srcalpha-over-404040	0	9d9d9d
+stage	rgb	texture-1555-0x4210-expanded	0	808080
+stage	rgb	texture-1555-alpha0-alphatest-greater0	0	404040
+setkey	hal	xrgb32-nomip	top	00000000
+ck	hal	xrgb32-nomip	level0-left-key	ggggWWWW
+setkey	hal	argb32-nomip	top	00000000
+ck	hal	argb32-nomip	level0-left-key	MMMMWWWW
+setkey	hal	rgb565-nomip	top	00000000
+ck	hal	rgb565-nomip	level0-left-key	ggggWWWW
+setkey	hal	argb1555-nomip-key-color-bits	top	00000000
+ck	hal	argb1555-nomip-key-color-bits	level0-left-key	MMMMWWWW
+setkey	hal	argb1555-nomip-key-with-alpha	top	00000000
+ck	hal	argb1555-nomip-key-with-alpha	level0-left-key	ggggWWWW
+setkey	hal	argb32-nomip-key-with-alpha	top	00000000
+ck	hal	argb32-nomip-key-with-alpha	level0-left-key	ggggWWWW
+setkey	hal	xrgb32-mip-key-top	top	00000000
+ck	hal	xrgb32-mip-key-top	level0-left-key	ggggWWWW
+ck	hal	xrgb32-mip-key-top	level1-all-key	gggggggg
+setkey	hal	xrgb32-mip-key-every-level	top	00000000
+setkey	hal	xrgb32-mip-key-every-level	sublevel	8876025b
+setkey	hal	xrgb32-mip-key-every-level	sublevel	8876025b
+ck	hal	xrgb32-mip-key-every-level	level0-left-key	ggggWWWW
+ck	hal	xrgb32-mip-key-every-level	level1-all-key	gggggggg
+setkey	hal	argb32-mip-key-top	top	00000000
+ck	hal	argb32-mip-key-top	level0-left-key	MMMMWWWW
+ck	hal	argb32-mip-key-top	level1-all-key	MMMMgggg
+setkey	hal	argb32-mip-key-with-alpha	top	00000000
+ck	hal	argb32-mip-key-with-alpha	level0-left-key	ggggWWWW
+ck	hal	argb32-mip-key-with-alpha	level1-all-key	gggggggg
+setkey	hal	rgb565-mip-key-top	top	00000000
+ck	hal	rgb565-mip-key-top	level0-left-key	ggggWWWW
+ck	hal	rgb565-mip-key-top	level1-all-key	gggggggg
+setkey	rgb	xrgb32-nomip	top	00000000
+ck	rgb	xrgb32-nomip	level0-left-key	MMMMMWWW
+setkey	rgb	argb32-nomip	top	00000000
+ck	rgb	argb32-nomip	level0-left-key	MMMMMWWW
+setkey	rgb	rgb565-nomip	top	00000000
+ck	rgb	rgb565-nomip	level0-left-key	gggggWWW
+setkey	rgb	argb1555-nomip-key-color-bits	top	00000000
+ck	rgb	argb1555-nomip-key-color-bits	level0-left-key	MMMMMWWW
+setkey	rgb	argb1555-nomip-key-with-alpha	top	00000000
+ck	rgb	argb1555-nomip-key-with-alpha	level0-left-key	gggggWWW
+setkey	rgb	argb32-nomip-key-with-alpha	top	00000000
+ck	rgb	argb32-nomip-key-with-alpha	level0-left-key	gggggWWW
+setkey	rgb	xrgb32-mip-key-top	top	00000000
+ck	rgb	xrgb32-mip-key-top	level0-left-key	MMMMMWWW
+ck	rgb	xrgb32-mip-key-top	level1-all-key	MMMMMggg
+setkey	rgb	xrgb32-mip-key-every-level	top	00000000
+setkey	rgb	xrgb32-mip-key-every-level	sublevel	8876025b
+setkey	rgb	xrgb32-mip-key-every-level	sublevel	8876025b
+ck	rgb	xrgb32-mip-key-every-level	level0-left-key	MMMMMWWW
+ck	rgb	xrgb32-mip-key-every-level	level1-all-key	MMMMMggg
+setkey	rgb	argb32-mip-key-top	top	00000000
+ck	rgb	argb32-mip-key-top	level0-left-key	MMMMMWWW
+ck	rgb	argb32-mip-key-top	level1-all-key	MMMMMggg
+setkey	rgb	argb32-mip-key-with-alpha	top	00000000
+ck	rgb	argb32-mip-key-with-alpha	level0-left-key	gggggWWW
+ck	rgb	argb32-mip-key-with-alpha	level1-all-key	gggggggg
+setkey	rgb	rgb565-mip-key-top	top	00000000
+ck	rgb	rgb565-mip-key-top	level0-left-key	gggggWWW
+ck	rgb	rgb565-mip-key-top	level1-all-key	gggggggg
+device7	RGB Emulation	Microsoft Direct3D RGB Software Emulation	a4665c60-2673-11cf-a31a	devcaps	00000551	texcaps	000000df	filter	0303033f	blendsrc	00001fff	blenddst	000007ff	raster	002121f7	zcmp	000000ff	alphacmp	000000ff	shade	000c528a	texblend	000000cf	maxtex	1024	1024	stages	8	textures	8	fvfcaps	00000008	texop	000078ff	lights	4294967295	vpcaps	0000003f
+device7	Direct3D HAL	Microsoft Direct3D Hardware acceleration through Direct3D HAL	84e63de0-46aa-11cf-816f	devcaps	021abef1	texcaps	00000ccd	filter	0303073f	blendsrc	00001fff	blenddst	00001fff	raster	003379b1	zcmp	000000ff	alphacmp	000000ff	shade	000c528f	texblend	000000cf	maxtex	16384	16384	stages	8	textures	8	fvfcaps	00180008	texop	03feffff	lights	4294967295	vpcaps	0000003f
+device7	Direct3D T&L HAL	Microsoft Direct3D Hardware Transform and Lighting acceleration capable device	f5049e78-4861-11d2-a407	devcaps	021bbef1	texcaps	00000ccd	filter	0303073f	blendsrc	00001fff	blenddst	00001fff	raster	003379b1	zcmp	000000ff	alphacmp	000000ff	shade	000c528f	texblend	000000cf	maxtex	16384	16384	stages	8	textures	8	fvfcaps	00180008	texop	03feffff	lights	8	vpcaps	0000003f
+zformat	hal	flags	00000400	bits	16	stencil	0	zmask	0000ffff
+zformat	hal	flags	00000400	bits	32	stencil	0	zmask	ffffff00
+zformat	hal	flags	00004400	bits	32	stencil	8	zmask	ffffff00
+zformat	hal	flags	00004400	bits	32	stencil	8	zmask	00ffffff
+zformat	hal	flags	00000400	bits	32	stencil	0	zmask	00ffffff
+zformat	hal	flags	00000400	bits	24	stencil	0	zmask	00ffffff
+zformat	tnlhal	flags	00000400	bits	16	stencil	0	zmask	0000ffff
+zformat	tnlhal	flags	00000400	bits	32	stencil	0	zmask	ffffff00
+zformat	tnlhal	flags	00004400	bits	32	stencil	8	zmask	ffffff00
+zformat	tnlhal	flags	00004400	bits	32	stencil	8	zmask	00ffffff
+zformat	tnlhal	flags	00000400	bits	32	stencil	0	zmask	00ffffff
+zformat	tnlhal	flags	00000400	bits	24	stencil	0	zmask	00ffffff
+zformat	rgb	flags	00000400	bits	16	stencil	0	zmask	0000ffff
+zformat	rgb	flags	00004400	bits	32	stencil	8	zmask	ffffff00
+texformat	flags	00000040	fourcc	00000000	bits	16	masks	00007c00	000003e0	0000001f	00000000
+texformat	flags	00000041	fourcc	00000000	bits	16	masks	00007c00	000003e0	0000001f	00008000
+texformat	flags	00000041	fourcc	00000000	bits	16	masks	00000f00	000000f0	0000000f	0000f000
+texformat	flags	00000040	fourcc	00000000	bits	16	masks	0000f800	000007e0	0000001f	00000000
+texformat	flags	00000040	fourcc	00000000	bits	32	masks	00ff0000	0000ff00	000000ff	00000000
+texformat	flags	00000041	fourcc	00000000	bits	32	masks	00ff0000	0000ff00	000000ff	ff000000
+texformat	flags	00080000	fourcc	00000000	bits	16	masks	000000ff	0000ff00	00000000	00000000
+texformat	flags	000c0000	fourcc	00000000	bits	32	masks	000000ff	0000ff00	00ff0000	00000000
+texformat	flags	00000004	fourcc	31545844	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	32545844	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	33545844	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	34545844	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	35545844	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	5343564e	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	5548564e	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	5348564e	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00020000	fourcc	00000000	bits	8	masks	000000ff	00000000	00000000	00000000
+texformat	flags	00000002	fourcc	00000000	bits	8	masks	00000000	00000000	00000000	00000000
+texformat	flags	00020001	fourcc	00000000	bits	16	masks	000000ff	00000000	00000000	0000ff00
+texformat	flags	00000004	fourcc	4c4c554e	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	31495441	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	32495441	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	5a544e49	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	31317833	bits	0	masks	00000000	00000000	00000000	00000000
+texformat	flags	00000004	fourcc	36317833	bits	0	masks	00000000	00000000	00000000	00000000
+colorkey	hal	mode0	draw	00000000	00ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+colorkey	hal	mode1	draw	00000000	00ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+colorkey	hal	mode2	draw	00000000	00ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+colorkey	hal	mode3	draw	00000000	ff00ffff00ffff00ffff00ffff00ffff00ffff00ffff00ffff00ffff00ffff00ffff00ffff00ffff20ffff40ffff60ffff7fffff9fffffbfffffdfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+colorkey	hal	mode4	draw	00000000	00ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+colorkey	hal	mode5	draw	00000000	00ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff0000ff00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+colorkey	rgb	mode0	draw	00000000	fe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
+colorkey	rgb	mode1	draw	00000000	fe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe1efefe3efefe5efefe7efefe9efefebefefedefefefdfefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
+colorkey	rgb	mode2	draw	00000000	fd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd1dfdfd3dfdfd5dfdfd7dfdfd9dfdfdbdfdfdddfdfdfcfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfd
+colorkey	rgb	mode3	draw	00000000	fe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe1efefe3efefe5efefe7efefe9efefebefefedefefefdfefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
+colorkey	rgb	mode4	draw	00000000	fd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfd00fdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfd
+colorkey	rgb	mode5	draw	00000000	fe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe00fefe1efefe3efefe5efefe7efefe9efefebefefedefefefdfefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe

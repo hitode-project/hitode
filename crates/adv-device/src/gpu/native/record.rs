@@ -213,6 +213,7 @@ pub(super) enum WorkerItem {
         draw: Arc<ProgrammableDraw>,
         state: DrawState,
         clips: Clips,
+        line_ranges: Option<Arc<[std::ops::Range<u32>]>>,
     },
     DrawModern {
         facade: u64,
@@ -892,12 +893,20 @@ impl WorkerState {
                 draw,
                 state,
                 clips,
+                line_ranges,
             } => {
                 if self.facade_failure(facade).is_some() {
                     return Ok(());
                 }
-                self.execute_draw_programmable(facade, &target, &draw, &state, &clips)
-                    .map_err(|error| (facade, error))?;
+                self.execute_draw_programmable(
+                    facade,
+                    &target,
+                    &draw,
+                    &state,
+                    &clips,
+                    line_ranges.as_deref().unwrap_or_default(),
+                )
+                .map_err(|error| (facade, error))?;
             }
             WorkerItem::DrawModern {
                 facade,
@@ -1463,6 +1472,7 @@ impl WorkerState {
         draw: &ProgrammableDraw,
         state: &DrawState,
         clips: &Clips,
+        line_ranges: &[std::ops::Range<u32>],
     ) -> Result<(), Error> {
         let areas = clips.areas(target, state, None);
         let areas = areas.as_slice();
@@ -1476,22 +1486,21 @@ impl WorkerState {
         self.select(facade, target);
         let sampling: arrayvec::ArrayVec<_, 20> =
             draw.textures.iter().map(program_sampling_flags).collect();
-        let pipeline = self
-            .facades
-            .get_mut(&facade)
-            .unwrap()
-            .pipelines
-            .programmable(
-                &self.device,
-                draw,
-                state,
-                &[color_format(&target.image)],
-                target
-                    .depth
-                    .as_ref()
-                    .map(|d| backing::depth_format(d.format())),
-                &sampling,
-            )?;
+        let depth = target
+            .depth
+            .as_ref()
+            .map(|d| backing::depth_format(d.format()));
+        let colors = [color_format(&target.image)];
+        let pipelines = &mut self.facades.get_mut(&facade).unwrap().pipelines;
+        let pipeline =
+            pipelines.programmable(&self.device, draw, state, &colors, depth, &sampling)?;
+        let endpoint = if line_ranges.iter().any(|range| range.len() == 1) {
+            let mut point = *state;
+            point.topology = gpu::Topology::Points;
+            Some(pipelines.programmable(&self.device, draw, &point, &colors, depth, &sampling)?)
+        } else {
+            None
+        };
         let alignment = self.data_alignment() as usize;
         let parameters_offset = CONSTANT_SIZE;
         let pixel_offset = (CONSTANT_SIZE + 640).next_multiple_of(alignment);
@@ -1503,8 +1512,9 @@ impl WorkerState {
         }
         let index_offset = cursor;
         cursor += draw.indices.as_ref().map_or(0, |i| i.len() * 4);
-        // Ensure all K clip draws stay in the same chunk as their shared ring span.
-        self.stream.ensure_room(areas.len());
+        // Keep draw ranges and clips with their shared ring span.
+        let draws = areas.len() * line_ranges.len().max(1);
+        self.stream.ensure_room(draws);
         let data = self
             .stream
             .bytes(cursor as u32, alignment as u32, |bytes| {
@@ -1581,10 +1591,16 @@ impl WorkerState {
                 adv_gpu::encode::IndexFormat::U32,
             )
         });
-        self.stream.draw_clips(command, bindings, areas);
+        self.stream
+            .draw_ranges(command, bindings, areas, line_ranges, endpoint.as_ref());
         let f = self.facades.get_mut(&facade).unwrap();
-        f.stats.draws += areas.len() as u64;
-        f.stats.vertices += count as u64 * areas.len() as u64;
+        f.stats.draws += draws as u64;
+        let vertices = if line_ranges.is_empty() {
+            count
+        } else {
+            line_ranges.iter().map(std::ops::Range::len).sum()
+        };
+        f.stats.vertices += (vertices * areas.len()) as u64;
         Ok(())
     }
 
@@ -2105,7 +2121,7 @@ impl Gpu {
         draw: &ProgrammableDraw,
         state: &DrawState,
     ) -> Result<(), Error> {
-        self.draw_programmable_inner(target, draw, None, state, None)
+        self.draw_programmable_inner(target, draw, None, state, None, None)
     }
     /// Programmable draw taking a shared `Arc<ProgrammableDraw>` and optional
     /// disjoint damage clips (deduplicating ring packing & bindings across all clips).
@@ -2116,9 +2132,22 @@ impl Gpu {
         state: &DrawState,
         clips: Option<&[Rect]>,
     ) -> Result<(), Error> {
-        let draw_ref = draw.clone();
-        self.draw_programmable_inner(target, &draw_ref, Some(draw), state, clips)
+        self.draw_programmable_line_ranges(target, draw, state, clips, None)
     }
+
+    /// Encode inclusive line ranges and their endpoint points from one upload.
+    pub fn draw_programmable_line_ranges(
+        &mut self,
+        target: &Target,
+        draw: Arc<ProgrammableDraw>,
+        state: &DrawState,
+        clips: Option<&[Rect]>,
+        line_ranges: Option<Arc<[std::ops::Range<u32>]>>,
+    ) -> Result<(), Error> {
+        let draw_ref = draw.clone();
+        self.draw_programmable_inner(target, &draw_ref, Some(draw), state, clips, line_ranges)
+    }
+
     fn draw_programmable_inner(
         &mut self,
         target: &Target,
@@ -2126,6 +2155,7 @@ impl Gpu {
         shared: Option<Arc<ProgrammableDraw>>,
         state: &DrawState,
         clips: Option<&[Rect]>,
+        line_ranges: Option<Arc<[std::ops::Range<u32>]>>,
     ) -> Result<(), Error> {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
@@ -2238,6 +2268,7 @@ impl Gpu {
                 draw,
                 state,
                 clips,
+                line_ranges,
             },
             payload_bytes,
         );
