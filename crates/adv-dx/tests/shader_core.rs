@@ -25,9 +25,35 @@ const CORPUS: &[&str] = &[
     "discard_pixel",
     "typed_uav",
     "doubles",
+    "encoded_dmov",
     "atomics",
     "raw",
     "texture_ops",
+    "buffer_views",
+    "counters",
+    "texture_atomic",
+    "texture_atomic_return",
+    "raster_queries",
+    "raster_samples",
+    "dynamic_gather",
+    "dynamic_gather_compare",
+    "level_query",
+    "derivative_queries",
+    "multisample_queries",
+    "integer_ops",
+    "atomic_modes",
+    "sample_modes",
+    "coverage",
+    "early_depth",
+    "vertex_sample",
+    "packed_buffer",
+    "float_ops",
+    "bit_ops",
+    "branches",
+    "indexed_inputs",
+    "derivatives_4_0",
+    "residency",
+    "linkage",
 ];
 
 fn fixture(name: &str, extension: &str) -> Vec<u8> {
@@ -45,8 +71,23 @@ fn module(name: &str) -> ir::Module {
 
 #[test]
 fn windows_containers_round_trip_and_disassemble() {
-    for &name in CORPUS {
+    let mut mismatches = Vec::new();
+    for entry in std::fs::read_dir(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/shader-core"
+    ))
+    .unwrap()
+    {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "asm") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_str().unwrap();
         let bytes = fixture(name, "dxbc");
+        if name == "diagnostic_pixel" {
+            assert_eq!(dxbc::parse(&bytes), Err(dxbc::ParseError::Checksum));
+            continue;
+        }
         let container =
             dxbc::Container::decode(&bytes).unwrap_or_else(|error| panic!("{name}: {error:?}"));
         assert_eq!(container.encode().unwrap(), bytes, "{name}");
@@ -56,10 +97,13 @@ fn windows_containers_round_trip_and_disassemble() {
         let actual: Vec<_> = actual.lines().map(str::trim_end).collect();
         let expected: Vec<_> = expected.lines().collect();
         for (index, (used, wanted)) in actual.iter().zip(&expected).enumerate() {
-            assert_eq!(used, wanted, "{name}: line {}", index + 1);
+            if used != wanted {
+                mismatches.push(format!("{name}:{}: {used:?} != {wanted:?}", index + 1));
+            }
         }
         assert_eq!(actual.len(), expected.len(), "{name}");
     }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     let mut bytes = fixture("vs_5_0", "dxbc");
     bytes[4] ^= 1;
     assert_eq!(dxbc::parse(&bytes), Err(dxbc::ParseError::Checksum));
@@ -104,7 +148,7 @@ fn profile_metadata_and_semantic_passes_verify() {
 fn programmable_corpus_emits_valid_wgsl() {
     for &name in CORPUS {
         let module = module(name);
-        if name == "doubles" {
+        if matches!(name, "doubles" | "encoded_dmov") {
             assert!(analyze(&module).doubles);
             assert!(matches!(
                 wgsl::emit(&module, wgsl::Options::default()),
@@ -119,6 +163,19 @@ fn programmable_corpus_emits_valid_wgsl() {
                 ),
                 Err(ir::Error::DoublePrecision)
             ));
+        } else if let Some(error) = match name {
+            "residency" => Some(ir::Error::UnsupportedOpcode(ir::Opcode::LdMsFeedback)),
+            "linkage" => Some(ir::Error::UnsupportedRegister(ir::Register::Interface)),
+            _ => None,
+        } {
+            let options = wgsl::Options {
+                storage_formats: &[(1, naga::StorageFormat::R32Uint)],
+                ..Default::default()
+            };
+            assert!(
+                matches!(wgsl::emit(&module, options), Err(actual) if actual == error),
+                "{name}"
+            );
         } else if name == "typed_uav" {
             assert!(matches!(
                 wgsl::emit(&module, wgsl::Options::default()),
@@ -128,6 +185,7 @@ fn programmable_corpus_emits_valid_wgsl() {
                 &module,
                 wgsl::Options {
                     storage_formats: &[(1, naga::StorageFormat::R32Uint)],
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -141,8 +199,35 @@ fn programmable_corpus_emits_valid_wgsl() {
                 Err(ir::Error::UnsupportedStage(_))
             ));
         } else {
-            let translation = wgsl::emit(&module, wgsl::Options::default())
-                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let options = match name {
+                "buffer_views" => wgsl::Options {
+                    storage_formats: &[(0, naga::StorageFormat::R32Uint)],
+                    buffer_formats: &[(0, naga::StorageFormat::Rg32Uint)],
+                    ..Default::default()
+                },
+                "packed_buffer" => wgsl::Options {
+                    storage_formats: &[(0, naga::StorageFormat::R8Uint)],
+                    buffer_formats: &[(0, naga::StorageFormat::R8Uint)],
+                    buffer_elements: &[
+                        (ir::Register::Resource, 0, 2),
+                        (ir::Register::UnorderedAccessView, 0, 2),
+                    ],
+                    ..Default::default()
+                },
+                "texture_atomic" => wgsl::Options {
+                    storage_formats: &[(1, naga::StorageFormat::R32Uint)],
+                    image_atomics: true,
+                    ..Default::default()
+                },
+                "texture_atomic_return" => wgsl::Options {
+                    storage_formats: &[(1, naga::StorageFormat::R32Uint)],
+                    storage_extents: &[(1, [8, 1, 1])],
+                    ..Default::default()
+                },
+                _ => Default::default(),
+            };
+            let translation =
+                wgsl::emit(&module, options).unwrap_or_else(|error| panic!("{name}: {error:?}"));
             Shader::validate_wgsl(&translation.source)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
         }

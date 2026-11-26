@@ -1,17 +1,16 @@
-//! D3D9 fixed state supplies raster state, raw vertex layouts and generated
-//! shader inputs. Damage can read bounded positions from the retained streams.
-//! Fixed lines using the neutral rasterizer still decode positions on the CPU
-//! for its inclusive endpoint and LASTPIXEL rules.
+//! D3D9 fixed-function calls and guest stream capture.
 use super::*;
+use crate::fixed::{self as core_fixed, Setting};
+pub(in crate::d3d9) use crate::fixed::{State as Fixed, VertexLayout as Layout};
 use adv_abi::types::D3DVIEWPORT9;
-use adv_device::gpu::{
-    Address, Blend, BlendOp, Compare, Cull, DrawState, Factor, Filter, Image, Stencil, StencilFace,
-    StencilOp, TextureOp, Topology, Vertex, Viewport,
-};
-use adv_device::surface::Rect;
+use adv_device::gpu::{DrawState, Image, Topology, Vertex};
 pub(super) mod lighting;
-mod state_map;
-use state_map::StateMap;
+pub(super) mod state_map;
+pub(in crate::d3d9) use state_map::{
+    apply_render, apply_sampler, apply_scissor, apply_stage, apply_viewport, sampler_value,
+    stage_value, transform_slot,
+};
+use state_map::{to_scissor, to_viewport};
 
 pub(super) type CapturedSpans = Vec<CapturedSpan>;
 
@@ -37,24 +36,14 @@ impl CapturedSpan {
 
 pub(super) struct CachedFixed {
     state: Fixed,
-    key: std::cell::Cell<Option<u128>>,
     pub(super) captures: std::cell::RefCell<Option<CapturedSpans>>,
 }
 impl CachedFixed {
     pub(super) fn new(width: u32, height: u32) -> Self {
         Self {
-            state: Fixed::new(width, height),
-            key: std::cell::Cell::new(None),
+            state: state_map::defaults(width, height),
             captures: Default::default(),
         }
-    }
-    pub(super) fn key(&self) -> u128 {
-        if let Some(key) = self.key.get() {
-            return key;
-        }
-        let key = super::recording::fixed_key(&self.state);
-        self.key.set(Some(key));
-        key
     }
     pub(super) fn capture_stream(
         &self,
@@ -92,11 +81,17 @@ impl CachedFixed {
         }
         Ok(bytes)
     }
+    pub(super) fn auto_depth(&mut self, enabled: bool) {
+        self.state.apply(Setting::Render(
+            core_fixed::Render::DepthEnable,
+            u32::from(enabled),
+        ));
+    }
+    pub(super) fn clear_fvf(&mut self) {
+        self.state.apply(Setting::Fvf(0));
+    }
     pub(super) fn state_mut(&mut self) -> &mut Fixed {
         &mut self.state
-    }
-    pub(super) fn invalidate_key(&self) {
-        self.key.set(None);
     }
 }
 impl std::ops::Deref for CachedFixed {
@@ -107,79 +102,11 @@ impl std::ops::Deref for CachedFixed {
 }
 impl std::ops::DerefMut for CachedFixed {
     fn deref_mut(&mut self) -> &mut Fixed {
-        self.key.set(None);
+        self.state.invalidate_key();
         &mut self.state
     }
 }
 
-#[derive(Clone)]
-pub(super) struct Fixed {
-    pub(super) fvf: u32,
-    pub(super) render: StateMap,
-    pub(super) stage: StateMap,
-    pub(super) stage_slots: [StateMap; 8],
-    pub(super) sampler: StateMap,
-    pub(super) sampler_slots: [StateMap; 20],
-    pub(super) viewport: D3DVIEWPORT9,
-    pub(super) scissor: RECT,
-    pub(super) transforms: [[f32; 16]; 3],
-    pub(super) clip_planes: [[f32; 4]; 6],
-    pub(super) material: [f32; 17],
-    pub(super) lights: BTreeMap<u32, lighting::Light>,
-}
-/// Byte offsets and source streams of the FVF-equivalent fixed inputs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct Layout {
-    pub transformed: bool,
-    pub position: u32,
-    pub color: Option<u32>,
-    pub normal: Option<(u16, u32)>,
-    pub specular: Option<(u16, u32)>,
-    pub texcoords: [Option<(u16, u32, u8)>; 8],
-    /// POSITION/POSITIONT and COLOR0 source stream numbers.
-    pub streams: [u16; 2],
-    /// Largest per-stream extent, also the vertex size for interleaved inputs.
-    pub size: u32,
-}
-impl Layout {
-    pub(super) fn from_fvf(fvf: u32) -> Option<Self> {
-        if !valid_fvf(fvf) {
-            return None;
-        }
-        let transformed = fvf & 0x0e == 4;
-        let mut size = if transformed { 16 } else { 12 };
-        let mut field = |present: bool, bytes: u32| {
-            present.then(|| {
-                size += bytes;
-                size - bytes
-            })
-        };
-        let normal = field(fvf & 0x10 != 0, 12).map(|at| (0, at));
-        let color = field(fvf & 0x40 != 0, 4);
-        let specular = field(fvf & 0x80 != 0, 4).map(|at| (0, at));
-        let mut texcoords = [None; 8];
-        for (n, coordinate) in texcoords
-            .iter_mut()
-            .enumerate()
-            .take(((fvf >> 8) & 15) as usize)
-        {
-            let dimensions = [2, 3, 4, 1][((fvf >> (16 + n * 2)) & 3) as usize];
-            let offset = size;
-            size += u32::from(dimensions) * 4;
-            *coordinate = Some((0, offset, dimensions));
-        }
-        Some(Self {
-            transformed,
-            position: 0,
-            color,
-            normal,
-            specular,
-            texcoords,
-            streams: [0; 2],
-            size,
-        })
-    }
-}
 #[derive(Clone)]
 pub(super) struct VertexBounds {
     pub transforms: Option<[[f32; 16]; 3]>,
@@ -215,266 +142,6 @@ impl From<u32> for Rejected {
 fn rejected(code: u32, reason: &'static str) -> Rejected {
     Rejected { code, reason }
 }
-impl Fixed {
-    pub(super) fn program_sampler(&self, slot: usize) -> Result<adv_device::gpu::Sampler, u32> {
-        let s = if slot == 0 {
-            &self.sampler
-        } else {
-            self.sampler_slots.get(slot).ok_or(INVALID)?
-        };
-        Ok(adv_device::gpu::Sampler {
-            u: address(s[&1]).ok_or(INVALID)?,
-            v: address(s[&2]).ok_or(INVALID)?,
-            min: if s[&6] == 2 {
-                Filter::Linear
-            } else {
-                Filter::Nearest
-            },
-            mag: if s[&5] == 2 {
-                Filter::Linear
-            } else {
-                Filter::Nearest
-            },
-            mip: match s[&7] {
-                0 => None,
-                1 => Some(Filter::Nearest),
-                _ => Some(Filter::Linear),
-            },
-            first_level: s[&9],
-            border_color: rgba(s[&4]),
-        })
-    }
-    pub(super) fn viewport_rect(&self) -> Rect {
-        Rect {
-            x: self.viewport.X,
-            y: self.viewport.Y,
-            w: self.viewport.Width,
-            h: self.viewport.Height,
-        }
-    }
-    pub(super) fn clear_rect(&self) -> Rect {
-        let viewport = self.viewport_rect();
-        if self.render[&174] == 0 {
-            return viewport;
-        }
-        let left = viewport.x.max(self.scissor.left as u32);
-        let top = viewport.y.max(self.scissor.top as u32);
-        let right = (viewport.x + viewport.w).min(self.scissor.right as u32);
-        let bottom = (viewport.y + viewport.h).min(self.scissor.bottom as u32);
-        if left >= right || top >= bottom {
-            return Rect {
-                x: viewport.x,
-                y: viewport.y,
-                w: 0,
-                h: 0,
-            };
-        }
-        Rect {
-            x: left,
-            y: top,
-            w: right - left,
-            h: bottom - top,
-        }
-    }
-    pub(super) fn clear_fvf(&mut self) {
-        self.fvf = 0;
-    }
-    pub(super) fn auto_depth(&mut self, enabled: bool) {
-        self.render.insert(7, u32::from(enabled));
-    }
-    pub(super) fn target_changed(&mut self, width: u32, height: u32) -> [bool; 2] {
-        let scissor = self.scissor;
-        let viewport = self.viewport;
-        self.scissor = RECT {
-            left: 0,
-            top: 0,
-            right: width as i32,
-            bottom: height as i32,
-        };
-        self.viewport = D3DVIEWPORT9 {
-            X: 0,
-            Y: 0,
-            Width: width,
-            Height: height,
-            MinZ: 0.,
-            MaxZ: 1.,
-        };
-        [
-            viewport.X != 0
-                || viewport.Y != 0
-                || viewport.Width != width
-                || viewport.Height != height
-                || viewport.MinZ.to_bits() != 0
-                || viewport.MaxZ.to_bits() != 1f32.to_bits(),
-            scissor.left != 0
-                || scissor.top != 0
-                || scissor.right != width as i32
-                || scissor.bottom != height as i32,
-        ]
-    }
-    pub fn new(width: u32, height: u32) -> Self {
-        let sampler = BTreeMap::from([
-            (1, 1),
-            (2, 1),
-            (3, 1),
-            (4, 0),
-            (5, 1),
-            (6, 1),
-            (7, 0),
-            (8, 0),
-            (9, 0),
-            (10, 1),
-            (11, 0),
-            (12, 0),
-            (13, 0),
-        ]);
-        let identity = [
-            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-        ];
-        Self {
-            fvf: 0,
-            render: StateMap::from(BTreeMap::from([
-                (7, 0),
-                (8, 3), // FILLMODE: only solid rasterization is implemented.
-                (9, 2), // SHADEMODE: GOURAUD.
-                (14, 1),
-                (15, 0),
-                (16, 1), // LASTPIXEL: consumed by the shared line rasterizer.
-                (19, 2),
-                (20, 1),
-                (22, 3),
-                (23, 4),
-                (24, 0),
-                (25, 8),
-                (27, 0),
-                (28, 0),
-                (34, 0),
-                (35, 0),
-                (36, 0f32.to_bits()),
-                (37, 1f32.to_bits()),
-                (38, 1f32.to_bits()),
-                (140, 0),
-                (48, 0),        // RANGEFOGENABLE.
-                (60, u32::MAX), // TEXTUREFACTOR.
-                (142, 1),       // LOCALVIEWER.
-                (143, 0),       // NORMALIZENORMALS.
-                (157, 0),
-                (158, 1f32.to_bits()),
-                (159, 0),
-                (160, 0),
-                (162, u32::MAX),
-                (165, 0),
-                (170, 0),
-                (172, 3),
-                (173, 1),
-                (175, 0),
-                (176, 0),
-                (193, u32::MAX),
-                (194, 0),
-                (195, 0),
-                (154, 1f32.to_bits()),
-                (155, 1f32.to_bits()),
-                (156, 0),
-                (166, 64f32.to_bits()),
-                (29, 0), // SPECULARENABLE.
-                (26, 0), // DITHERENABLE: the renderer does not dither.
-                (52, 0),
-                (53, 1),
-                (54, 1),
-                (55, 1),
-                (56, 8),
-                (57, 0),
-                (58, u32::MAX),
-                (59, u32::MAX),
-                (128, 0), // WRAP0–WRAP7: texture coordinate wrapping is disabled.
-                (129, 0),
-                (130, 0),
-                (131, 0),
-                (132, 0),
-                (133, 0),
-                (134, 0),
-                (135, 0),
-                (136, 1), // CLIPPING: GPU primitive clipping remains enabled.
-                (137, 1),
-                (139, 0), // AMBIENT.
-                (141, 1), // COLORVERTEX: only relevant when lighting is enabled.
-                (145, 1), // Material sources: COLOR1, COLOR2, MATERIAL, MATERIAL.
-                (146, 2),
-                (147, 0),
-                (148, 0),
-                (151, 0), // VERTEXBLEND: one world matrix without blending.
-                (152, 0), // CLIPPLANEENABLE: no user clipping planes.
-                (161, 1), // Inert on the supported single-sample render targets.
-                (167, 0), // INDEXEDVERTEXBLENDENABLE: no matrix indices.
-                (168, 15),
-                (190, 15),
-                (191, 15),
-                (192, 15),
-                (198, 0),
-                (199, 0),
-                (200, 0),
-                (201, 0),
-                (202, 0),
-                (203, 0),
-                (204, 0),
-                (205, 0),
-                (171, 1),
-                (174, 0),
-                (185, 0),
-                (186, 1),
-                (187, 1),
-                (188, 1),
-                (189, 8),
-                (206, 0),
-                (207, 2),
-                (208, 1),
-                (209, 1),
-            ])),
-            stage_slots: std::array::from_fn(|stage| {
-                let mut states =
-                    BTreeMap::from([(7, 0), (8, 0), (9, 0), (10, 0), (22, 0), (23, 0)]);
-                if stage != 0 {
-                    states.extend([(1, 1), (2, 2), (3, 1), (4, 1), (5, 2), (6, 1)]);
-                    // TEXCOORDINDEX defaults to the stage's own coordinate set.
-                    states.insert(11, stage as u32);
-                }
-                states.into()
-            }),
-            stage: StateMap::from(BTreeMap::from([
-                (1, 4),
-                (2, 2),
-                (3, 1),
-                (4, 2),
-                (5, 2),
-                (6, 1),
-                (11, 0), // TEXCOORDINDEX: pass through the first FVF coordinate set.
-                (24, 0), // TEXTURETRANSFORMFLAGS: no texture coordinate transform.
-            ])),
-            sampler: sampler.clone().into(),
-            sampler_slots: std::array::from_fn(|_| sampler.clone().into()),
-            viewport: D3DVIEWPORT9 {
-                X: 0,
-                Y: 0,
-                Width: width,
-                Height: height,
-                MinZ: 0.,
-                MaxZ: 1.,
-            },
-            scissor: RECT {
-                left: 0,
-                top: 0,
-                right: width as i32,
-                bottom: height as i32,
-            },
-            transforms: [identity; 3],
-            clip_planes: [[0.; 4]; 6],
-            material: [
-                1., 1., 1., 1., 1., 1., 1., 1., 0., 0., 0., 0., 0., 0., 0., 0., 0.,
-            ],
-            lights: BTreeMap::new(),
-        }
-    }
-}
 pub(super) fn register(registry: &mut Registry) {
     lighting::register(registry);
     for api in [
@@ -498,72 +165,37 @@ pub(super) fn register(registry: &mut Registry) {
         registry.register(api);
     }
 }
-fn update_fixed(
-    env: &mut Env<'_>,
-    pointer: u32,
-    apply: impl FnOnce(&mut Fixed) -> Result<(super::shaders::stateblocks::FixedKey, bool), u32>,
-) -> u32 {
+pub(super) fn update_fixed(env: &mut Env<'_>, pointer: u32, setting: Result<Setting, u32>) -> u32 {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)
     else {
         return INVALID;
     };
-    if let Some(recording) = &mut d.recording {
-        return match apply(&mut recording.fixed) {
-            Ok((key, _)) => {
-                super::shaders::stateblocks::record_fixed_key(recording, key);
-                0
-            }
-            Err(code) => code,
-        };
-    }
-    let mut hot = d.hot.borrow_mut();
-    match apply(hot.fixed.state_mut()) {
-        Ok((key, changed)) => {
-            if changed {
-                hot.fixed.invalidate_key();
-                hot.touch(key.class());
-            }
+    match setting {
+        Ok(setting) => {
+            apply_fixed(d, setting, false);
             0
         }
         Err(code) => code,
     }
 }
-pub(super) fn mutate_fixed_raw(
-    env: &mut Env<'_>,
-    pointer: u32,
-    key: super::shaders::stateblocks::FixedKey,
-    mutate: impl FnOnce(&mut Fixed) -> bool,
-) -> bool {
-    let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)
-    else {
-        return false;
-    };
+
+fn apply_fixed(d: &mut Device, setting: Setting, force: bool) {
     if let Some(recording) = &mut d.recording {
-        let _ = mutate(&mut recording.fixed);
-        super::shaders::stateblocks::record_fixed_key(recording, key);
-        return true;
+        recording.fixed.record(setting);
+    } else {
+        let mut hot = d.hot.borrow_mut();
+        let change = hot.fixed.state_mut().apply(setting);
+        if change.changed || force {
+            hot.touch(change.slot.class());
+        }
     }
-    let mut hot = d.hot.borrow_mut();
-    if mutate(hot.fixed.state_mut()) {
-        hot.fixed.invalidate_key();
-        hot.touch(key.class());
-    }
-    true
 }
+
 fn current<'a>(env: &'a Env<'_>, pointer: u32) -> Option<std::cell::Ref<'a, Fixed>> {
     Some(std::cell::Ref::map(
         device(env, pointer)?.hot.borrow(),
         |h| &*h.fixed,
     ))
-}
-fn valid_fvf(fvf: u32) -> bool {
-    let count = (fvf >> 8) & 15;
-    let sizes = fvf >> 16;
-    matches!(fvf & 0x0e, 2 | 4)
-        && fvf & !(0x0e | 0x10 | 0x40 | 0x80 | 0xf00 | 0xffff0000) == 0
-        && !(fvf & 0x0e == 4 && fvf & 0x10 != 0)
-        && count <= 8
-        && (count == 8 || sizes >> (count * 2) == 0)
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetFVF",level=state)]
 pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
@@ -583,16 +215,11 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
         hot.buffers.declaration.is_some()
     };
     let set_raw = |env: &mut Env<'_>, force: bool| {
-        mutate_fixed_raw(
-            env,
-            this.addr(),
-            super::shaders::stateblocks::FixedKey::Fvf,
-            |f| {
-                let changed = force || f.fvf != fvf;
-                f.fvf = fvf;
-                changed
-            },
-        );
+        if let Some(Payload::Device(d)) =
+            com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
+        {
+            apply_fixed(d, Setting::Fvf(fvf), force);
+        }
     };
     set_raw(env, false);
     let device = com(env)
@@ -636,138 +263,9 @@ pub(super) fn get_fvf(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u3
         INVALID
     }
 }
-fn factor(value: u32) -> Option<Factor> {
-    Some(match value {
-        1 => Factor::Zero,
-        2 => Factor::One,
-        3 => Factor::SourceColor,
-        4 => Factor::OneMinusSourceColor,
-        5 => Factor::SourceAlpha,
-        6 => Factor::OneMinusSourceAlpha,
-        7 => Factor::DestinationAlpha,
-        8 => Factor::OneMinusDestinationAlpha,
-        9 => Factor::DestinationColor,
-        10 => Factor::OneMinusDestinationColor,
-        11 => Factor::SourceAlphaSaturated,
-        12 => Factor::SourceAlpha,
-        13 => Factor::OneMinusSourceAlpha,
-        14 => Factor::Constant,
-        15 => Factor::OneMinusConstant,
-        _ => return None,
-    })
-}
-fn operation(value: u32) -> Option<BlendOp> {
-    Some(match value {
-        1 => BlendOp::Add,
-        2 => BlendOp::Subtract,
-        3 => BlendOp::ReverseSubtract,
-        4 => BlendOp::Minimum,
-        5 => BlendOp::Maximum,
-        _ => return None,
-    })
-}
-fn compare(value: u32) -> Option<Compare> {
-    Some(match value {
-        1 => Compare::Never,
-        2 => Compare::Less,
-        3 => Compare::Equal,
-        4 => Compare::LessEqual,
-        5 => Compare::Greater,
-        6 => Compare::NotEqual,
-        7 => Compare::GreaterEqual,
-        8 => Compare::Always,
-        _ => return None,
-    })
-}
-fn stencil_op(value: u32) -> Option<StencilOp> {
-    Some(match value {
-        1 => StencilOp::Keep,
-        2 => StencilOp::Zero,
-        3 => StencilOp::Replace,
-        4 => StencilOp::IncrementClamp,
-        5 => StencilOp::DecrementClamp,
-        6 => StencilOp::Invert,
-        7 => StencilOp::IncrementWrap,
-        8 => StencilOp::DecrementWrap,
-        _ => return None,
-    })
-}
-pub(super) fn apply_render_raw(f: &mut Fixed, state: i32, value: u32) -> Result<bool, u32> {
-    let valid = match state {
-        8 => match value {
-            3 => true,
-            1 | 2 => return Err(UNAVAILABLE),
-            _ => false,
-        },
-        9 => match value {
-            1 | 2 => true,
-            3 => return Err(UNAVAILABLE),
-            _ => false,
-        },
-        7 | 14 | 15 | 16 | 27 | 29 | 52 | 137 | 141 | 142 | 143 | 48 | 157 | 161 | 174 | 176
-        | 194 | 185 | 206 => value <= 1,
-        26 => match value {
-            0 => true,
-            1 => return Err(UNAVAILABLE),
-            _ => false,
-        },
-        28 | 156 => value <= 1,
-        34 | 60 | 139 | 162 | 193 => true,
-        165 => value <= 1,
-        170 => f32::from_bits(value).is_finite(),
-        158..=160 | 175 | 195 => f32::from_bits(value).is_finite(),
-        172 | 173 => (1..=3).contains(&value),
-        190..=192 => value <= 15,
-        35 | 140 => value <= 3,
-        36..=38 => f32::from_bits(value).is_finite(),
-        154 | 155 | 166 => f32::from_bits(value).is_finite() && f32::from_bits(value) > 0.0,
-        167 => match value {
-            0 => true,
-            1 => return Err(UNAVAILABLE),
-            _ => false,
-        },
-        136 => value <= 1,
-        145..=148 => value <= 2,
-        151 => match value {
-            0 => true,
-            1..=3 | 255 | 256 => return Err(UNAVAILABLE),
-            _ => false,
-        },
-        152 => value & !63 == 0,
-        19 | 20 | 207 | 208 => factor(value).is_some(),
-        22 => (1..=3).contains(&value),
-        23 | 25 | 56 | 189 => compare(value).is_some(),
-        53..=55 | 186..=188 => stencil_op(value).is_some(),
-        24 | 57..=59 => true,
-        168 => value <= 15,
-        128..=135 | 198..=205 => match value {
-            0 => true,
-            1..=15 => return Err(UNAVAILABLE),
-            _ => false,
-        },
-        171 | 209 => operation(value).is_some(),
-        _ => return Err(UNAVAILABLE),
-    };
-    if !valid {
-        return Err(INVALID);
-    }
-    Ok(f.render.insert(state, value) != Some(value))
-}
-pub(super) fn apply_render(f: &mut CachedFixed, state: i32, value: u32) -> Result<bool, u32> {
-    let changed = apply_render_raw(f.state_mut(), state, value)?;
-    if changed {
-        f.invalidate_key();
-    }
-    Ok(changed)
-}
 #[win32(d3d9,name="IDirect3DDevice9::SetRenderState",level=state)]
 pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> u32 {
-    update_fixed(env, this.addr(), |f| {
-        Ok((
-            super::shaders::stateblocks::FixedKey::Render(state),
-            apply_render_raw(f, state, value)?,
-        ))
-    })
+    update_fixed(env, this.addr(), state_map::render(state, value))
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetRenderState",level=implement)]
 fn get_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, output: GuestPtr<u32>) -> u32 {
@@ -780,109 +278,6 @@ fn get_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, output: GuestPt
         INVALID
     }
 }
-pub(super) fn apply_stage_raw(
-    f: &mut Fixed,
-    stage: u32,
-    kind: i32,
-    value: u32,
-) -> Result<(super::shaders::stateblocks::FixedKey, bool), u32> {
-    if stage >= 8 {
-        return Err(INVALID);
-    }
-    if matches!(kind, 7..=10 | 22 | 23) {
-        let changed = f.stage_slots[stage as usize].insert(kind, value) != Some(value);
-        return Ok((
-            super::shaders::stateblocks::FixedKey::StageSlot(stage as usize, kind),
-            changed,
-        ));
-    }
-    if stage != 0 {
-        // Stage one combines like stage zero; later stages stay disabled.
-        // Arguments are stored for Get and state blocks and checked at draw.
-        let valid = match kind {
-            1 | 4 => match value {
-                1 => true,
-                2..=7 | 10 if stage == 1 => true,
-                2..=26 => return Err(UNAVAILABLE),
-                _ => false,
-            },
-            2 | 3 | 5 | 6 => value & !0x3f == 0 && value & 0xf <= 6,
-            11 => match (value & 0xffff, value >> 16) {
-                (0..=7, 0) => true,
-                (0..=7, 1..=4) => return Err(UNAVAILABLE),
-                _ => false,
-            },
-            _ => return Err(UNAVAILABLE),
-        };
-        if !valid {
-            return Err(INVALID);
-        }
-        let changed = f.stage_slots[stage as usize].insert(kind, value) != Some(value);
-        return Ok((
-            super::shaders::stateblocks::FixedKey::StageSlot(stage as usize, kind),
-            changed,
-        ));
-    }
-    // Legal SDK operations and arguments this stage does not combine are
-    // unavailable rather than invalid, so callers see them reported.
-    let valid = match kind {
-        1 | 4 => match value {
-            1..=7 | 10 => true,
-            8..=26 => return Err(UNAVAILABLE),
-            _ => false,
-        },
-        2 | 3 | 5 | 6 => match (value & !0x3f, value & 0xf) {
-            (0, 0..=3) => true,
-            (0, 4..=6) => return Err(UNAVAILABLE),
-            _ => false,
-        },
-        11 => {
-            // Up to eight FVF coordinate sets and the SDK's four automatic
-            // generation modes are legal; this decoder supplies set zero only.
-            if value & 0xffff > 7 || value >> 16 > 4 {
-                false
-            } else if value != 0 {
-                return Err(UNAVAILABLE);
-            } else {
-                true
-            }
-        }
-        24 => match value {
-            0 => true,
-            1..=4 | 256..=260 => return Err(UNAVAILABLE),
-            _ => false,
-        },
-        _ => return Err(UNAVAILABLE),
-    };
-    if !valid {
-        return Err(INVALID);
-    }
-    let changed = f.stage.insert(kind, value) != Some(value);
-    Ok((super::shaders::stateblocks::FixedKey::Stage(kind), changed))
-}
-pub(super) fn apply_stage(
-    f: &mut CachedFixed,
-    stage: u32,
-    kind: i32,
-    value: u32,
-) -> Result<bool, u32> {
-    let (_, changed) = apply_stage_raw(f.state_mut(), stage, kind, value)?;
-    if changed {
-        f.invalidate_key();
-    }
-    Ok(changed)
-}
-pub(super) fn stage_value(f: &Fixed, stage: u32, kind: i32) -> Option<u32> {
-    if stage >= 8 {
-        return None;
-    }
-    let states = if stage != 0 || matches!(kind, 7..=10 | 22 | 23) {
-        &f.stage_slots[stage as usize]
-    } else {
-        &f.stage
-    };
-    states.get(&kind).copied()
-}
 #[win32(d3d9,name="IDirect3DDevice9::SetTextureStageState",level=state)]
 pub(super) fn set_stage(
     env: &mut Env<'_>,
@@ -891,7 +286,7 @@ pub(super) fn set_stage(
     kind: i32,
     value: u32,
 ) -> u32 {
-    update_fixed(env, this.addr(), |f| apply_stage_raw(f, stage, kind, value))
+    update_fixed(env, this.addr(), state_map::stage(stage, kind, value))
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetTextureStageState",level=implement)]
 fn get_stage(
@@ -910,76 +305,6 @@ fn get_stage(
         INVALID
     }
 }
-fn address(value: u32) -> Option<Address> {
-    Some(match value {
-        1 => Address::Repeat,
-        2 => Address::Mirror,
-        3 => Address::Clamp,
-        4 => Address::Border,
-        _ => return None,
-    })
-}
-/// Neutral packed RGBA keeps red in the low byte; D3DCOLOR is packed ARGB.
-fn rgba(argb: u32) -> u32 {
-    (argb & 0xff00_ff00) | ((argb >> 16) & 0xff) | ((argb & 0xff) << 16)
-}
-pub(super) fn apply_sampler_raw(
-    f: &mut Fixed,
-    sampler: u32,
-    kind: i32,
-    value: u32,
-) -> Result<(super::shaders::stateblocks::FixedKey, bool), u32> {
-    let Some(slot) = super::programmable::sampler_slot(sampler) else {
-        return Err(INVALID);
-    };
-    let valid = match kind {
-        1..=3 => address(value).is_some(),
-        5 | 6 => matches!(value, 1 | 2),
-        7 => value <= 2,
-        4 | 9 => true,
-        // These neutral values require no additional sampling operation. Keep
-        // exact DWORDs (including signed zero); nonneutral requests stay explicit.
-        8 if f32::from_bits(value) == 0. => true,
-        10 if value == 1 => true,
-        11..=13 if value == 0 => true,
-        _ => return Err(UNAVAILABLE),
-    };
-    if !valid {
-        return Err(INVALID);
-    }
-    let changed = if slot == 0 {
-        f.sampler.insert(kind, value)
-    } else {
-        f.sampler_slots[slot].insert(kind, value)
-    } != Some(value);
-    let key = if slot == 0 {
-        super::shaders::stateblocks::FixedKey::Sampler(kind)
-    } else {
-        super::shaders::stateblocks::FixedKey::SamplerSlot(slot, kind)
-    };
-    Ok((key, changed))
-}
-pub(super) fn apply_sampler(
-    f: &mut CachedFixed,
-    sampler: u32,
-    kind: i32,
-    value: u32,
-) -> Result<bool, u32> {
-    let (_, changed) = apply_sampler_raw(f.state_mut(), sampler, kind, value)?;
-    if changed {
-        f.invalidate_key();
-    }
-    Ok(changed)
-}
-pub(super) fn sampler_value(f: &Fixed, sampler: u32, kind: i32) -> Option<u32> {
-    let slot = super::programmable::sampler_slot(sampler)?;
-    if slot == 0 {
-        f.sampler.get(&kind)
-    } else {
-        f.sampler_slots[slot].get(&kind)
-    }
-    .copied()
-}
 #[win32(d3d9,name="IDirect3DDevice9::SetSamplerState",level=state)]
 pub(super) fn set_sampler(
     env: &mut Env<'_>,
@@ -988,9 +313,7 @@ pub(super) fn set_sampler(
     kind: i32,
     value: u32,
 ) -> u32 {
-    update_fixed(env, this.addr(), |f| {
-        apply_sampler_raw(f, sampler, kind, value)
-    })
+    update_fixed(env, this.addr(), state_map::sampler(sampler, kind, value))
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetSamplerState",level=implement)]
 fn get_sampler(
@@ -1010,53 +333,6 @@ fn get_sampler(
         INVALID
     }
 }
-pub(super) fn apply_viewport_raw(
-    f: &mut Fixed,
-    v: D3DVIEWPORT9,
-    target: (u32, u32),
-) -> Result<bool, u32> {
-    if v.Width == 0
-        || v.Height == 0
-        || v.X.checked_add(v.Width).is_none_or(|x| x > target.0)
-        || v.Y.checked_add(v.Height).is_none_or(|y| y > target.1)
-        || !v.MinZ.is_finite()
-        || !v.MaxZ.is_finite()
-        || v.MinZ < 0.
-        || v.MaxZ > 1.
-        || v.MinZ > v.MaxZ
-    {
-        return Err(INVALID);
-    }
-    let old = f.viewport;
-    let changed = (
-        old.X,
-        old.Y,
-        old.Width,
-        old.Height,
-        old.MinZ.to_bits(),
-        old.MaxZ.to_bits(),
-    ) != (
-        v.X,
-        v.Y,
-        v.Width,
-        v.Height,
-        v.MinZ.to_bits(),
-        v.MaxZ.to_bits(),
-    );
-    f.viewport = v;
-    Ok(changed)
-}
-pub(super) fn apply_viewport(
-    f: &mut CachedFixed,
-    v: D3DVIEWPORT9,
-    target: (u32, u32),
-) -> Result<bool, u32> {
-    let changed = apply_viewport_raw(f.state_mut(), v, target)?;
-    if changed {
-        f.invalidate_key();
-    }
-    Ok(changed)
-}
 #[win32(d3d9,name="IDirect3DDevice9::SetViewport",level=state)]
 fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIEWPORT9>) -> u32 {
     let Ok(v) = viewport.read(env.cpu) else {
@@ -1066,16 +342,11 @@ fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIE
         return INVALID;
     };
     let size = (target.image.width(), target.image.height());
-    update_fixed(env, this.addr(), |f| {
-        Ok((
-            super::shaders::stateblocks::FixedKey::Viewport,
-            apply_viewport_raw(f, v, size)?,
-        ))
-    })
+    update_fixed(env, this.addr(), state_map::viewport(v, size))
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetViewport",level=implement)]
 fn get_viewport(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<D3DVIEWPORT9>) -> u32 {
-    let Some(v) = current(env, this.addr()).map(|f| f.viewport) else {
+    let Some(v) = current(env, this.addr()).map(|f| to_viewport(f.viewport)) else {
         return INVALID;
     };
     if output.write(env.cpu, v).is_ok() {
@@ -1083,39 +354,17 @@ fn get_viewport(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<D3DVIEWP
     } else {
         INVALID
     }
-}
-pub(super) fn apply_scissor_raw(f: &mut Fixed, rect: RECT) -> Result<bool, u32> {
-    if rect.left < 0 || rect.top < 0 || rect.right <= rect.left || rect.bottom <= rect.top {
-        return Err(INVALID);
-    }
-    let old = f.scissor;
-    let changed = (old.left, old.top, old.right, old.bottom)
-        != (rect.left, rect.top, rect.right, rect.bottom);
-    f.scissor = rect;
-    Ok(changed)
-}
-pub(super) fn apply_scissor(f: &mut CachedFixed, rect: RECT) -> Result<bool, u32> {
-    let changed = apply_scissor_raw(f.state_mut(), rect)?;
-    if changed {
-        f.invalidate_key();
-    }
-    Ok(changed)
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetScissorRect",level=state)]
 fn set_scissor(env: &mut Env<'_>, this: GuestPtr<()>, rect: GuestPtr<RECT>) -> u32 {
     let Ok(rect) = rect.read(env.cpu) else {
         return INVALID;
     };
-    update_fixed(env, this.addr(), |f| {
-        Ok((
-            super::shaders::stateblocks::FixedKey::Scissor,
-            apply_scissor_raw(f, rect)?,
-        ))
-    })
+    update_fixed(env, this.addr(), state_map::scissor(rect))
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetScissorRect",level=implement)]
 fn get_scissor(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<RECT>) -> u32 {
-    let Some(v) = current(env, this.addr()).map(|f| f.scissor) else {
+    let Some(v) = current(env, this.addr()).map(|f| to_scissor(f.scissor)) else {
         return INVALID;
     };
     if output.write(env.cpu, v).is_ok() {
@@ -1123,48 +372,6 @@ fn get_scissor(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<RECT>) ->
     } else {
         INVALID
     }
-}
-pub(super) fn transform_slot(kind: i32) -> Option<usize> {
-    Some(match kind {
-        256 => 0,
-        2 => 1,
-        3 => 2,
-        _ => return None,
-    })
-}
-pub(super) fn apply_transform_raw(f: &mut Fixed, slot: usize, matrix: [f32; 16]) -> bool {
-    let changed = f.transforms[slot].map(f32::to_bits) != matrix.map(f32::to_bits);
-    f.transforms[slot] = matrix;
-    changed
-}
-pub(super) fn apply_transform(f: &mut CachedFixed, slot: usize, matrix: [f32; 16]) -> bool {
-    let changed = apply_transform_raw(f.state_mut(), slot, matrix);
-    if changed {
-        f.invalidate_key();
-    }
-    changed
-}
-pub(super) fn multiply_transform_raw(f: &mut Fixed, slot: usize, matrix: [f32; 16]) -> bool {
-    let result = std::array::from_fn(|n| {
-        row(
-            matrix[n / 4 * 4..n / 4 * 4 + 4].try_into().unwrap(),
-            &f.transforms[slot],
-        )[n % 4]
-    });
-    let changed = f.transforms[slot].map(f32::to_bits) != result.map(f32::to_bits);
-    f.transforms[slot] = result;
-    changed
-}
-pub(super) fn multiply_transform_cached(
-    f: &mut CachedFixed,
-    slot: usize,
-    matrix: [f32; 16],
-) -> bool {
-    let changed = multiply_transform_raw(f.state_mut(), slot, matrix);
-    if changed {
-        f.invalidate_key();
-    }
-    changed
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetTransform",level=state)]
 fn set_transform(
@@ -1182,12 +389,7 @@ fn set_transform(
     if matrix.iter().any(|v| !v.is_finite()) {
         return INVALID;
     }
-    update_fixed(env, this.addr(), |f| {
-        Ok((
-            super::shaders::stateblocks::FixedKey::Transform(slot),
-            apply_transform_raw(f, slot, matrix),
-        ))
-    })
+    update_fixed(env, this.addr(), Ok(Setting::Transform(slot, matrix)))
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetTransform",level=implement)]
 fn get_transform(
@@ -1199,7 +401,7 @@ fn get_transform(
     let Some(slot) = transform_slot(kind) else {
         return INVALID;
     };
-    let Some(matrix) = current(env, this.addr()).map(|f| f.transforms[slot]) else {
+    let Some(matrix) = current(env, this.addr()).map(|f| f.transforms[slot as usize]) else {
         return INVALID;
     };
     if output.write(env.cpu, matrix).is_ok() {
@@ -1229,71 +431,11 @@ fn multiply_transform(
     if matrix.iter().any(|v| !v.is_finite()) {
         return INVALID;
     }
-    update_fixed(env, this.addr(), |f| {
-        Ok((
-            super::shaders::stateblocks::FixedKey::Transform(slot),
-            multiply_transform_raw(f, slot, matrix),
-        ))
-    })
-}
-pub(super) fn stage_enabled(stage: &StateMap, has_texture: bool) -> bool {
-    stage[&1] != 1 && (has_texture || stage[&2] & 0xf != 2)
-}
-
-/// The enabled second stage as `[color op, color arguments, alpha op and
-/// arguments, coordinate set]`, each argument a byte.
-pub(super) fn second_stage(
-    f: &Fixed,
-    has_texture: [bool; 2],
-) -> Result<Option<[u32; 4]>, Rejected> {
-    let s = &f.stage_slots[1];
-    if !stage_enabled(&f.stage, has_texture[0]) || !stage_enabled(s, has_texture[1]) {
-        return Ok(None);
-    }
-    // Diffuse, current, texture and texture factor, including argument modifiers.
-    if [2, 3, 5, 6].iter().any(|k| s[k] & 0xf > 3) {
-        return Err(rejected(
-            UNAVAILABLE,
-            "texture stage 1 argument source is unavailable",
-        ));
-    }
-    Ok(Some([
-        s[&1],
-        s[&2] | s[&3] << 8,
-        s[&4] | s[&5] << 8 | s[&6] << 16,
-        s[&11],
-    ]))
-}
-pub(super) fn compact_stage_ops(f: &Fixed) -> Option<(TextureOp, TextureOp)> {
-    Some((
-        combine(f.stage[&1], f.stage[&2], f.stage[&3])?,
-        combine(f.stage[&4], f.stage[&5], f.stage[&6])?,
-    ))
-}
-
-pub(super) fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
-    let arg = |v| match v {
-        0 | 1 | 3..=0x3f => Some(TextureOp::Color),
-        2 => Some(TextureOp::Texture),
-        _ => None,
-    };
-    Some(match op {
-        1 => TextureOp::Color,
-        2 => arg(arg1)?,
-        3 => arg(arg2)?,
-        4..=7 if (arg1 == 2) != (arg2 == 2) => match op {
-            4 => TextureOp::Multiply,
-            5 => TextureOp::Multiply2x,
-            6 => TextureOp::Multiply4x,
-            _ => TextureOp::Add,
-        },
-        10 if arg1 <= 1 && arg2 == 2 => TextureOp::Subtract,
-        _ if arg1 > 2 || arg2 > 2 => TextureOp::Color,
-        _ => return None,
-    })
-}
-pub(super) fn row(vector: [f32; 4], matrix: &[f32; 16]) -> [f32; 4] {
-    std::array::from_fn(|column| (0..4).map(|i| vector[i] * matrix[i * 4 + column]).sum())
+    update_fixed(
+        env,
+        this.addr(),
+        Ok(Setting::MultiplyTransform(slot, matrix)),
+    )
 }
 /// Draw-bound buffers supply every declared input stream. UP callers still
 /// supply only their explicit stream-zero pointer through prepare_checked.
@@ -1362,12 +504,12 @@ pub(super) fn prepare_lines(
         let viewport = draw.state.viewport;
         if let Some(transforms) = &bounds.transforms {
             for matrix in transforms {
-                position = row(position, matrix);
+                position = core_fixed::tnl::row(position, matrix);
             }
             position[0] += position[3] / viewport.width;
             position[1] -= position[3] / viewport.height;
         } else {
-            position = programmable::transformed::position(position, viewport).ok_or(INVALID)?;
+            position = core_fixed::tnl::pretransformed(position, viewport).ok_or(INVALID)?;
         }
         vertices.push(Vertex {
             position,
@@ -1382,20 +524,12 @@ pub(super) fn prepare_lines(
 pub(super) fn prepare_state(
     env: &Env<'_>,
     pointer: u32,
-    kind: i32,
-    shader_stage_arguments: bool,
-) -> Result<(Target, Option<Image>, DrawState), Rejected> {
+    topology: Topology,
+    vertex: Option<core_fixed::VertexProgram>,
+) -> Result<(Target, Option<Image>, core_fixed::Lowered), Rejected> {
     let d = device(env, pointer).ok_or(INVALID)?;
     let hot = d.hot.borrow();
     let f = &hot.fixed;
-    let topology = match kind {
-        1 => Topology::Points,
-        2 => Topology::Lines,
-        3 => Topology::LineStrip,
-        4 | 6 => Topology::Triangles,
-        5 => Topology::TriangleStrip,
-        _ => return Err(INVALID.into()),
-    };
     let provider = env.ext.get::<State>().provider;
     let target = super::targets::draw_target(env, pointer)
         .map_err(|code| rejected(code, "render target is missing, locked or unavailable"))?;
@@ -1436,137 +570,49 @@ pub(super) fn prepare_state(
     } else {
         (None, 0)
     };
-    let mut state = DrawState::new(target.image.width(), target.image.height());
-    state.last_pixel = f.render[&16] != 0;
-    state.topology = topology;
-    state.cull = match f.render[&22] {
-        1 => Cull::None,
-        2 => Cull::Clockwise,
-        _ => Cull::CounterClockwise,
+    let layout = core_fixed::Layout {
+        topology,
+        vertex,
+        extent: (target.image.width(), target.image.height()),
+        depth: target.depth().is_some(),
+        stencil: target.depth().is_some()
+            && f.render[&core_fixed::Render::StencilEnable] != 0
+            && super::depth::has_stencil(env, pointer),
+        texture: image.as_ref().map(|image| (image.mip_levels(), lod)),
+        stage_zero_bound: hot.texture.is_some(),
     };
-    if target.depth().is_some() {
-        if f.render[&7] != 0 {
-            state.depth = Some(compare(f.render[&23]).ok_or(INVALID)?);
-            state.depth_write = f.render[&14] != 0;
-        }
-        // Native D3D9 ignores stencil state when the bound depth format has
-        // no stencil component (D16/D24X8), even STENCILFUNC=NEVER. Keep the
-        // requested state observable and preserve the independent depth test.
-        if f.render[&52] != 0 && super::depth::has_stencil(env, pointer) {
-            let front = StencilFace {
-                compare: compare(f.render[&56]).ok_or(INVALID)?,
-                fail: stencil_op(f.render[&53]).ok_or(INVALID)?,
-                depth_fail: stencil_op(f.render[&54]).ok_or(INVALID)?,
-                pass: stencil_op(f.render[&55]).ok_or(INVALID)?,
-            };
-            let back = if f.render[&185] != 0 {
-                StencilFace {
-                    compare: compare(f.render[&189]).ok_or(INVALID)?,
-                    fail: stencil_op(f.render[&186]).ok_or(INVALID)?,
-                    depth_fail: stencil_op(f.render[&187]).ok_or(INVALID)?,
-                    pass: stencil_op(f.render[&188]).ok_or(INVALID)?,
-                }
-            } else {
-                front
-            };
-            // D3D's clockwise screen-space face maps to the GPU back face
-            // after our Y projection. CCW override therefore selects GPU front.
-            state.stencil = Some(Stencil {
-                front: back,
-                back: front,
-                read_mask: f.render[&58],
-                write_mask: f.render[&59],
-            });
-            state.stencil_reference = f.render[&57];
-        }
-    }
-    if f.render[&27] != 0 {
-        state.blend = Some(Blend {
-            source: factor(f.render[&19]).ok_or(INVALID)?,
-            destination: factor(f.render[&20]).ok_or(INVALID)?,
-            operation: operation(f.render[&171]).ok_or(INVALID)?,
-        });
-        match f.render[&19] {
-            12 => state.blend.as_mut().unwrap().destination = Factor::OneMinusSourceAlpha,
-            13 => state.blend.as_mut().unwrap().destination = Factor::SourceAlpha,
-            _ => {}
-        }
-        if [19, 20, 207, 208]
-            .iter()
-            .any(|k| matches!(f.render[k], 14 | 15))
-        {
-            state.blend_constant = Some(rgba(f.render[&193]));
-        }
-        if f.render[&206] != 0 {
-            state.alpha_blend = Some(Blend {
-                source: factor(f.render[&207]).ok_or(INVALID)?,
-                destination: factor(f.render[&208]).ok_or(INVALID)?,
-                operation: operation(f.render[&209]).ok_or(INVALID)?,
-            });
+    let lowered = core_fixed::lower(f, &layout, state_map::RULES)?;
+    Ok((target, image, lowered))
+}
+
+pub(super) fn topology(kind: i32) -> Result<Topology, u32> {
+    Ok(match kind {
+        1 => Topology::Points,
+        2 => Topology::Lines,
+        3 => Topology::LineStrip,
+        4 | 6 => Topology::Triangles,
+        5 => Topology::TriangleStrip,
+        _ => return Err(INVALID),
+    })
+}
+
+impl From<core_fixed::LowerError> for Rejected {
+    fn from(error: core_fixed::LowerError) -> Self {
+        use core_fixed::LowerError::*;
+        match error {
+            InvalidValue => INVALID.into(),
+            EmptyScissor => rejected(INVALID, "scissor rectangle is empty outside render target"),
+            TextureOperation => UNAVAILABLE.into(),
+            TextureArgument => rejected(
+                UNAVAILABLE,
+                "texture stage 1 argument source is unavailable",
+            ),
+            TooManyLights => rejected(
+                UNAVAILABLE,
+                "more than MaxActiveLights=8 lights are enabled",
+            ),
         }
     }
-    state.color_write = f.render[&168] as u8;
-    state.alpha_test = if f.render[&15] != 0 {
-        compare(f.render[&25]).ok_or(INVALID)?
-    } else {
-        Compare::Always
-    };
-    state.alpha_reference = (f.render[&24] & 255) as f32 / 255.;
-    state.viewport = Viewport {
-        x: f.viewport.X as f32,
-        y: f.viewport.Y as f32,
-        width: f.viewport.Width as f32,
-        height: f.viewport.Height as f32,
-        minimum_depth: f.viewport.MinZ,
-        maximum_depth: f.viewport.MaxZ,
-    };
-    if f.render[&174] != 0 {
-        let r = f.scissor;
-        let right = (r.right as u32).min(target.image.width());
-        let bottom = (r.bottom as u32).min(target.image.height());
-        if right <= r.left as u32 || bottom <= r.top as u32 {
-            return Err(rejected(
-                INVALID,
-                "scissor rectangle is empty outside render target",
-            ));
-        }
-        state.scissor = Some(Rect {
-            x: r.left as u32,
-            y: r.top as u32,
-            w: right - r.left as u32,
-            h: bottom - r.top as u32,
-        });
-    }
-    state.sampler.u = address(f.sampler[&1]).ok_or(INVALID)?;
-    state.sampler.v = address(f.sampler[&2]).ok_or(INVALID)?;
-    state.sampler.border_color = rgba(f.sampler[&4]);
-    state.sampler.min = if f.sampler[&6] == 2 {
-        Filter::Linear
-    } else {
-        Filter::Nearest
-    };
-    state.sampler.mag = if f.sampler[&5] == 2 {
-        Filter::Linear
-    } else {
-        Filter::Nearest
-    };
-    state.sampler.mip = match f.sampler[&7] {
-        0 => None,
-        1 => Some(Filter::Nearest),
-        _ => Some(Filter::Linear),
-    };
-    // Native D3D ignores MAXMIPLEVEL when MIPFILTER is NONE, but managed
-    // texture residency LOD still selects its most detailed permitted level.
-    let first = if state.sampler.mip.is_none() {
-        lod
-    } else {
-        lod.max(f.sampler[&9])
-    };
-    state.sampler.first_level = first.min(image.as_ref().map_or(1, Image::mip_levels) - 1);
-    if image.is_some() && !shader_stage_arguments {
-        (state.texture_op, state.alpha_texture_op) = compact_stage_ops(f).ok_or(UNAVAILABLE)?;
-    }
-    Ok((target, image, state))
 }
 
 #[win32(d3d9,name="IDirect3DDevice9::DrawPrimitiveUP",level=implement)]
@@ -1644,7 +690,7 @@ fn warn_rejected(
         || "device unavailable".to_owned(),
         |d| {
             let hot = d.hot.borrow();
-            let v = hot.fixed.viewport;
+            let v = to_viewport(hot.fixed.viewport);
             let declaration = hot
                 .buffers
                 .declaration
@@ -1666,6 +712,30 @@ fn warn_rejected(
             data.addr(),
         ),
     );
+}
+
+pub(super) fn apply_transform(
+    f: &mut CachedFixed,
+    slot: core_fixed::Transform,
+    matrix: [f32; 16],
+) -> bool {
+    f.state_mut()
+        .apply(Setting::Transform(slot, matrix))
+        .changed
+}
+
+pub(super) fn multiply_transform_cached(
+    f: &mut CachedFixed,
+    slot: core_fixed::Transform,
+    matrix: [f32; 16],
+) -> bool {
+    f.state_mut()
+        .apply(Setting::MultiplyTransform(slot, matrix))
+        .changed
+}
+
+pub(super) fn second_stage(f: &Fixed, textures: [bool; 2]) -> Result<Option<[u32; 4]>, Rejected> {
+    core_fixed::second_stage(f, textures, state_map::RULES).map_err(Into::into)
 }
 
 #[cfg(test)]

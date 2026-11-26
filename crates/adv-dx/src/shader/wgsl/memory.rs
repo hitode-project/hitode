@@ -1,7 +1,9 @@
+mod typed_buffer;
+
 use super::*;
 use crate::shader::dxbc::fields::{
-    D3D11_SB_SYNC_THREAD_GROUP_SHARED_MEMORY, D3D11_SB_SYNC_THREADS_IN_GROUP,
-    D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GLOBAL,
+    D3D10_SB_INSTRUCTION_RETURN_UINT, D3D11_SB_SYNC_THREAD_GROUP_SHARED_MEMORY,
+    D3D11_SB_SYNC_THREADS_IN_GROUP, D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GLOBAL,
     D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GROUP,
 };
 use naga::common::wgsl::ToWgsl;
@@ -19,6 +21,14 @@ impl Writer<'_> {
             .map(|b| b.slot + 1)
             .max()
             .unwrap_or(0);
+        if self
+            .options
+            .storage_formats
+            .iter()
+            .any(|&(_, format)| format == naga::StorageFormat::Rg11b10Ufloat)
+        {
+            self.source.push_str(typed_buffer::PACK_UFLOAT);
+        }
         for binding in &reflection.bindings {
             let slot = binding.slot;
             self.bindings.insert((binding.register, slot), binding.kind);
@@ -44,10 +54,32 @@ impl Writer<'_> {
                     (2, slot)
                 }
                 BindingKind::Typed {
+                    dimension: ResourceDimension::Buffer,
+                    returns,
+                    ..
+                } => {
+                    let writable = binding.register == Register::UnorderedAccessView;
+                    let format = self.buffer_format(binding.register, slot)?;
+                    self.check_typed_format(returns[0], format)?;
+                    let physical_slot = if writable {
+                        slot
+                    } else {
+                        let current = storage_slot;
+                        storage_slot += 1;
+                        current
+                    };
+                    self.declare_buffer(
+                        &name,
+                        physical_slot,
+                        writable,
+                        self.atomic_bindings.contains(&(binding.register, slot))
+                            || (writable && typed_buffer::Layout::new(format)?.bits < 32),
+                    );
+                    (3, physical_slot)
+                }
+                BindingKind::Typed {
                     dimension, returns, ..
-                } if binding.register == Register::Resource
-                    && dimension != ResourceDimension::Buffer =>
-                {
+                } if binding.register == Register::Resource => {
                     let dimension = match dimension {
                         ResourceDimension::Texture1D => "1d",
                         ResourceDimension::Texture2D => "2d",
@@ -77,7 +109,6 @@ impl Writer<'_> {
                 }
                 BindingKind::Raw { .. } | BindingKind::Structured { .. } => {
                     let writable = binding.register == Register::UnorderedAccessView;
-                    let mode = if writable { "read_write" } else { "read" };
                     let physical_slot = if writable {
                         slot
                     } else {
@@ -86,35 +117,51 @@ impl Writer<'_> {
                         current
                     };
                     let atomic = self.atomic_bindings.contains(&(binding.register, slot));
-                    let element = if atomic { "atomic<u32>" } else { "u32" };
-                    self.line(&format!("@group(3) @binding({physical_slot}) var<storage, {mode}> {name}: array<{element}>;"));
-                    self.buffer_functions(
-                        &name,
-                        &format!("arrayLength(&{name})"),
-                        writable,
-                        atomic,
-                    );
+                    self.declare_buffer(&name, physical_slot, writable, atomic);
                     (3, physical_slot)
                 }
                 BindingKind::Typed {
                     dimension, returns, ..
                 } if binding.register == Register::UnorderedAccessView => {
                     let format = self.storage_format(slot)?;
+                    self.check_typed_format(returns[0], format)?;
+                    let atomic = self.atomic_bindings.contains(&(binding.register, slot));
+                    if self.storage_extent(slot).is_some() {
+                        if !matches!(
+                            format,
+                            naga::StorageFormat::R32Uint
+                                | naga::StorageFormat::R32Sint
+                                | naga::StorageFormat::R32Float
+                        ) {
+                            return Err(Error::Invalid("buffer-backed UAV format"));
+                        }
+                        self.declare_buffer(&name, slot, true, atomic);
+                        self.locations.push(BindingLocation {
+                            register: binding.register,
+                            slot,
+                            group: 3,
+                            binding: slot,
+                        });
+                        continue;
+                    }
+                    if atomic
+                        && (!self.options.image_atomics
+                            || dimension != ResourceDimension::Texture2D)
+                    {
+                        return Err(Error::MissingStorageExtent(slot));
+                    }
                     let dimension = storage_dimension(dimension)
                         .ok_or(Error::UnsupportedRegister(binding.register))?;
-                    if scalar(returns[0])? != scalar_name(format) {
-                        return Err(Error::Invalid(
-                            "typed UAV format disagrees with declaration",
-                        ));
-                    }
                     let key = (binding.register, Some(slot));
                     let access = match (
+                        atomic,
                         reflection.reads.contains_key(&key),
                         reflection.writes.contains_key(&key),
                     ) {
-                        (true, true) => "read_write",
-                        (true, false) => "read",
-                        (false, _) => "write",
+                        (true, _, _) => "atomic",
+                        (false, true, true) => "read_write",
+                        (false, true, false) => "read",
+                        (false, false, _) => "write",
                     };
                     self.line(&format!("@group(3) @binding({slot}) var {name}: texture_storage_{dimension}<{}, {access}>;", format.to_wgsl()));
                     (3, slot)
@@ -129,6 +176,16 @@ impl Writer<'_> {
                 group,
                 binding: physical_slot,
             });
+        }
+        for binding in &reflection.bindings {
+            let slot = binding.slot;
+            if binding.register == Register::UnorderedAccessView
+                && reflection.counter_bindings.contains(&slot)
+            {
+                self.line(&format!("@group(3) @binding({storage_slot}) var<storage, read_write> dx_counter{slot}: atomic<u32>;"));
+                self.counters.push((slot, storage_slot));
+                storage_slot += 1;
+            }
         }
         for statement in &module.body {
             match statement {
@@ -171,6 +228,28 @@ impl Writer<'_> {
                 | Statement::Switch { .. }
                 | Statement::CustomData { .. } => {}
             }
+        }
+        Ok(())
+    }
+
+    fn declare_buffer(&mut self, name: &str, slot: u32, writable: bool, atomic: bool) {
+        let mode = if writable { "read_write" } else { "read" };
+        let element = if atomic { "atomic<u32>" } else { "u32" };
+        self.line(&format!(
+            "@group(3) @binding({slot}) var<storage, {mode}> {name}: array<{element}>;"
+        ));
+        self.buffer_functions(name, &format!("arrayLength(&{name})"), writable, atomic);
+    }
+
+    fn check_typed_format(
+        &self,
+        ty: ResourceType,
+        format: naga::StorageFormat,
+    ) -> Result<(), Error> {
+        if scalar(ty)? != scalar_name(format) {
+            return Err(Error::Invalid(
+                "typed view format disagrees with declaration",
+            ));
         }
         Ok(())
     }
@@ -245,28 +324,44 @@ impl Writer<'_> {
             }
         }
         let (register, slot) = resource.ok_or(Error::UnsupportedOpcode(op.opcode))?;
-        let name = resource_name(register, slot)?;
-        let binding = *self
-            .bindings
-            .get(&(register, slot))
-            .ok_or(Error::Invalid("undeclared resource"))?;
-        let expression = match binding {
-            BindingKind::Raw { .. } | BindingKind::Structured { .. } => {
-                if op.opcode.is_atomic() {
-                    self.atomic_buffer_instruction(op, args, &name, binding)?
-                } else {
-                    self.buffer_instruction(op, args, &name, binding, mask)?
+        let expression = if register == Register::Rasterizer {
+            Some(self.sample_query(op, &format!("{}u", self.options.raster_samples), args)?)
+        } else if op.opcode.is_counter() {
+            let counter = format!("&dx_counter{slot}");
+            Some(if op.opcode == Opcode::ImmAtomicAlloc {
+                format!("vec4<u32>(atomicAdd({counter}, 1u))")
+            } else {
+                format!("vec4<u32>(atomicSub({counter}, 1u) - 1u)")
+            })
+        } else {
+            let name = resource_name(register, slot)?;
+            let binding = *self
+                .bindings
+                .get(&(register, slot))
+                .ok_or(Error::Invalid("undeclared resource"))?;
+            match binding {
+                BindingKind::Raw { .. } | BindingKind::Structured { .. } => {
+                    if op.opcode.is_atomic() {
+                        self.atomic_buffer_instruction(op, args, &name, binding)?
+                    } else {
+                        self.buffer_instruction(op, args, &name, binding, mask)?
+                    }
                 }
-            }
-            BindingKind::Typed { dimension, .. } => {
-                if register == Register::UnorderedAccessView {
-                    self.storage_instruction(op, args, &name, dimension, slot)?
-                } else {
-                    Some(self.texture_instruction(op, args, &name, sampler, dimension)?)
+                BindingKind::Typed { dimension, .. } => {
+                    if dimension == ResourceDimension::Buffer
+                        || (register == Register::UnorderedAccessView
+                            && self.storage_extent(slot).is_some())
+                    {
+                        self.typed_buffer_instruction(op, args, &name, register, slot, dimension)?
+                    } else if register == Register::UnorderedAccessView {
+                        self.storage_instruction(op, args, &name, dimension, slot)?
+                    } else {
+                        Some(self.texture_instruction(op, args, &name, sampler, dimension)?)
+                    }
                 }
-            }
-            BindingKind::Sampler(_) | BindingKind::ConstantBuffer { .. } => {
-                return Err(Error::UnsupportedOpcode(op.opcode));
+                BindingKind::Sampler(_) | BindingKind::ConstantBuffer { .. } => {
+                    return Err(Error::UnsupportedOpcode(op.opcode));
+                }
             }
         };
         let lanes: String = swizzle
@@ -346,12 +441,6 @@ impl Writer<'_> {
         name: &str,
         kind: BindingKind,
     ) -> Result<Option<String>, Error> {
-        use Opcode::*;
-        let result = format!("atomic_result_{}", self.serial);
-        let returning = op.destinations.len() > 1;
-        if returning {
-            self.line(&format!("var {result} = 0u;"));
-        }
         let (address, bounds) = if let BindingKind::Structured { stride, .. } = kind {
             let words = stride / 4;
             (
@@ -367,6 +456,23 @@ impl Writer<'_> {
                 format!("{}.x / 4u < dx_size_{name}()", args[0]),
             )
         };
+        self.atomic_at(op, args, name, &address, &bounds)
+    }
+
+    fn atomic_at(
+        &mut self,
+        op: &Instruction,
+        args: &[String],
+        name: &str,
+        address: &str,
+        bounds: &str,
+    ) -> Result<Option<String>, Error> {
+        use Opcode::*;
+        let result = format!("atomic_result_{}", self.serial);
+        let returning = op.destinations.len() > 1;
+        if returning {
+            self.line(&format!("var {result} = 0u;"));
+        }
         self.open(&format!("if {bounds}"));
         self.line(&format!("let atomic_address = &{name}[{address}];"));
         let value = format!("{}.x", args[1]);
@@ -414,10 +520,18 @@ impl Writer<'_> {
     }
 
     fn storage_format(&self, slot: u32) -> Result<naga::StorageFormat, Error> {
-        self.storage_formats
+        self.options
+            .storage_formats
             .iter()
             .find_map(|&(binding, format)| (binding == slot).then_some(format))
             .ok_or(Error::MissingStorageFormat(slot))
+    }
+
+    fn storage_extent(&self, slot: u32) -> Option<[u32; 3]> {
+        self.options
+            .storage_extents
+            .iter()
+            .find_map(|&(index, extent)| (slot == index).then_some(extent))
     }
 
     fn storage_instruction(
@@ -481,6 +595,28 @@ impl Writer<'_> {
             ));
             self.close();
             Ok(Some(result))
+        } else if op.opcode.is_atomic() {
+            use Opcode::*;
+            let format = self.storage_format(slot)?;
+            let builtin = match op.opcode {
+                AtomicAnd => "And",
+                AtomicOr => "Or",
+                AtomicXor => "Xor",
+                AtomicIadd => "Add",
+                AtomicImax if format == naga::StorageFormat::R32Sint => "Max",
+                AtomicImin if format == naga::StorageFormat::R32Sint => "Min",
+                AtomicUmax if format == naga::StorageFormat::R32Uint => "Max",
+                AtomicUmin if format == naga::StorageFormat::R32Uint => "Min",
+                _ => return Err(Error::MissingStorageExtent(slot)),
+            };
+            let scalar = scalar_name(format);
+            self.open(&format!("if {condition}"));
+            self.line(&format!(
+                "textureAtomic{builtin}({name}, {coordinate}{layer}, bitcast<{scalar}>({}.x));",
+                args[1]
+            ));
+            self.close();
+            Ok(None)
         } else {
             Err(Error::UnsupportedOpcode(op.opcode))
         }
@@ -534,15 +670,10 @@ impl Writer<'_> {
         if op.opcode == Resinfo {
             return Ok(self.resource_info(op, args, texture, dimension));
         }
-        if op.opcode == SampleInfo && dimension == ResourceDimension::Texture2DMs {
-            let samples = format!("textureNumSamples({texture})");
-            let value =
-                if crate::shader::dxbc::fields::decode_instruction_return_type(op.controls) == 2 {
-                    samples
-                } else {
-                    format!("bitcast<u32>(f32({samples}))")
-                };
-            return Ok(format!("vec4<u32>({value}, 0u, 0u, 0u)"));
+        if matches!(op.opcode, SampleInfo | SamplePos)
+            && dimension == ResourceDimension::Texture2DMs
+        {
+            return self.sample_query(op, &format!("textureNumSamples({texture})"), args);
         }
         if matches!(op.opcode, Ld | LdMs) {
             let xy = if offset.is_empty() {
@@ -596,7 +727,7 @@ impl Writer<'_> {
             return Ok(result);
         }
         let (sampler, component) = sampler.ok_or(Error::UnsupportedOpcode(op.opcode))?;
-        let coord = cast(&args[0], "f32");
+        let mut coord = cast(&args[0], "f32");
         let suffix = if array.is_empty() {
             String::new()
         } else {
@@ -605,13 +736,22 @@ impl Writer<'_> {
                 args[0]
             )
         };
-        if matches!(op.opcode, Gather4 | Gather4C) {
-            let call = if op.opcode == Gather4 {
+        if op.opcode == Lod {
+            return Ok(self.lod_query(texture, sampler, dimension, width, &coord));
+        }
+        if matches!(op.opcode, Gather4 | Gather4C | Gather4Po | Gather4PoC) {
+            if matches!(op.opcode, Gather4Po | Gather4PoC) {
+                let dynamic = &args[1];
+                coord = format!(
+                    "({coord} + vec2<f32>(bitcast<vec2<i32>>({dynamic}.xy << vec2<u32>(26u)) >> vec2<u32>(26u)) / vec2<f32>(textureDimensions({texture}, 0u)))"
+                );
+            }
+            let call = if matches!(op.opcode, Gather4 | Gather4Po) {
                 format!(
                     "textureGather({component}i, {texture}, s{sampler}, {coord}{suffix}{offset})"
                 )
             } else {
-                let reference = &args[1];
+                let reference = args.last().unwrap();
                 format!(
                     "textureGatherCompare({texture}, s{sampler}, {coord}{suffix}, bitcast<f32>({reference}.x){offset})"
                 )
@@ -640,6 +780,102 @@ impl Writer<'_> {
             format!("bitcast<vec4<u32>>({sample})")
         })
     }
+    fn sample_query(
+        &self,
+        op: &Instruction,
+        count: &str,
+        args: &[String],
+    ) -> Result<String, Error> {
+        if op.opcode == Opcode::SamplePos {
+            Ok(format!(
+                "vec4<u32>(bitcast<vec2<u32>>(dx_sample_position({count}, {}.x)), 0u, 0u)",
+                args[0]
+            ))
+        } else if op.opcode == Opcode::SampleInfo {
+            let value = if crate::shader::dxbc::fields::decode_instruction_return_type(op.controls)
+                == D3D10_SB_INSTRUCTION_RETURN_UINT
+            {
+                count.to_owned()
+            } else {
+                format!("bitcast<u32>(f32({count}))")
+            };
+            Ok(format!("vec4<u32>({value}, 0u, 0u, 0u)"))
+        } else {
+            Err(Error::UnsupportedOpcode(op.opcode))
+        }
+    }
+
+    fn lod_query(
+        &mut self,
+        texture: &str,
+        slot: u32,
+        dimension: ResourceDimension,
+        width: usize,
+        coordinate: &str,
+    ) -> String {
+        let sampler = self
+            .options
+            .lod_samplers
+            .iter()
+            .find_map(|&(index, sampler)| (slot == index).then_some(sampler))
+            .unwrap_or(LodSampler {
+                bias: 0.0,
+                min: 0.0,
+                max: f32::MAX,
+                max_anisotropy: 1,
+            });
+        let c = format!("lod_coord_{}", self.serial);
+        self.line(&format!("let {c} = {coordinate};"));
+        let scalar = width == 1;
+        let cube = matches!(
+            dimension,
+            ResourceDimension::TextureCube | ResourceDimension::TextureCubeArray
+        );
+        let scale = if scalar {
+            "f32".to_owned()
+        } else {
+            format!("vec{}<f32>", if cube { 2 } else { width })
+        };
+        let footprint = |axis| {
+            let delta = format!("dpd{axis}Coarse({c})");
+            let delta = if cube {
+                format!("dx_cube_gradient({c}, {delta})")
+            } else {
+                delta
+            };
+            format!("{delta} * {scale}(textureDimensions({texture}, 0u))")
+        };
+        let dx = format!("lod_dx_{}", self.serial);
+        let dy = format!("lod_dy_{}", self.serial);
+        let raw = format!("lod_raw_{}", self.serial);
+        self.line(&format!("let {dx} = {};", footprint('x')));
+        self.line(&format!("let {dy} = {};", footprint('y')));
+        let rho = if scalar {
+            format!("max(abs({dx}), abs({dy}))")
+        } else if sampler.max_anisotropy > 1 {
+            // The squared ellipse axes are the eigenvalues of the gradient Gram matrix.
+            format!(
+                "dx_anisotropic_extent(dot({dx}, {dx}), dot({dx}, {dy}), dot({dy}, {dy}), {}.0)",
+                sampler.max_anisotropy
+            )
+        } else {
+            format!("max(length({dx}), length({dy}))")
+        };
+        self.line(&format!(
+            "let {raw} = bitcast<f32>(dx_log(bitcast<u32>({rho}))) + bitcast<f32>({}u);",
+            sampler.bias.to_bits()
+        ));
+        let lower = format!(
+            "clamp(bitcast<f32>({}u), 0.0, f32(textureNumLevels({texture}) - 1u))",
+            sampler.min.to_bits()
+        );
+        let upper = format!(
+            "clamp(bitcast<f32>({}u), 0.0, f32(textureNumLevels({texture}) - 1u))",
+            sampler.max.to_bits()
+        );
+        format!("bitcast<vec4<u32>>(vec4<f32>(clamp({raw}, {lower}, {upper}), {raw}, 0.0, 0.0))")
+    }
+
     fn resource_info(
         &mut self,
         op: &Instruction,
@@ -747,6 +983,9 @@ fn resource_name(register: Register, slot: u32) -> Result<String, Error> {
 }
 
 fn binding(operand: &Operand) -> Result<(Register, u32), Error> {
+    if matches!(operand.register(), Some((Register::Rasterizer, []))) {
+        return Ok((Register::Rasterizer, 0));
+    }
     if let Some((register, [slot])) = operand.register()
         && let Some(slot) = slot.direct()
     {
@@ -760,7 +999,7 @@ fn comparison_sample(block: &Block, slot: u32) -> bool {
         Statement::Execute(op) => {
             matches!(
                 op.opcode,
-                Opcode::SampleC | Opcode::SampleCLz | Opcode::Gather4C
+                Opcode::SampleC | Opcode::SampleCLz | Opcode::Gather4C | Opcode::Gather4PoC
             ) && op
                 .sources
                 .iter()
@@ -781,3 +1020,26 @@ fn comparison_sample(block: &Block, slot: u32) -> bool {
         }
     })
 }
+
+pub(super) const LOD_HELPERS: &str = "
+fn dx_anisotropic_extent(a: f32, b: f32, c: f32, anisotropy: f32) -> f32 {
+    let span = length(vec2<f32>(a - c, 2.0 * b));
+    let minor = (a + c - span) * 0.5;
+    let major = (a + c + span) * 0.5;
+    return sqrt(max(minor, major / (anisotropy * anisotropy)));
+}
+
+fn dx_cube_gradient(coord: vec3<f32>, dcoord: vec3<f32>) -> vec2<f32> {
+    var c = coord;
+    var d = dcoord;
+    let a = abs(coord);
+    if a.x >= a.y && a.x >= a.z {
+        c = coord.yzx;
+        d = dcoord.yzx;
+    } else if a.y >= a.z {
+        c = coord.xzy;
+        d = dcoord.xzy;
+    }
+    return (d.xy - c.xy * (d.z / c.z)) * (0.5 / abs(c.z));
+}
+";

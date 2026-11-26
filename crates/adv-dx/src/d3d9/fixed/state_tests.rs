@@ -181,7 +181,7 @@ mod state_tests {
         {
             let d = device(&env, pointer).unwrap();
             let hot = d.hot.borrow();
-            assert_eq!(hot.fixed.key.get(), Some(key));
+            assert_eq!(hot.fixed.cached_key(), Some(key));
             assert_eq!(hot.shaders.vertex_constants.floats[0], [0.; 4]);
         }
         assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 1]), 0);
@@ -192,7 +192,7 @@ mod state_tests {
         );
         let d = device(&env, pointer).unwrap();
         let hot = d.hot.borrow();
-        assert_eq!(hot.fixed.key.get(), None);
+        assert_eq!(hot.fixed.cached_key(), None);
         assert_eq!(hot.fixed.key(), key);
     }
 
@@ -619,9 +619,10 @@ mod state_tests {
 }
 
 mod fixed_completion {
-    use super::lighting::*;
-    use super::*;
+    use super::{lighting::*, *};
     use crate::d3d9::shaders::stateblocks;
+    use crate::fixed::tnl::*;
+    use adv_device::surface::Rect;
 
     fn env(m: &mut Machine<adv_cpu::JitCpu>) -> Env<'_> {
         Env {
@@ -727,7 +728,7 @@ mod fixed_completion {
         };
     }
     fn light(e: &mut Env<'_>, pointer: u32, kind: u32, diffuse: [f32; 3]) -> GuestPtr<[u32; 26]> {
-        let mut value = Light::default().value;
+        let mut value = state_map::default_light().words();
         value[0] = kind;
         value[1..4].copy_from_slice(&diffuse.map(f32::to_bits));
         value[19] = 10f32.to_bits();
@@ -914,7 +915,7 @@ mod fixed_completion {
                         position[1] -= position[3] / v.height;
                         (position, eye)
                     };
-                    let diffuse = lighting::color(color);
+                    let diffuse = crate::fixed::tnl::color(color);
                     let color = if lit {
                         illuminate(
                             &f,
@@ -923,7 +924,7 @@ mod fixed_completion {
                             [0., 0., -1.],
                             &normal_matrix,
                             Some(diffuse),
-                            Some(lighting::color(highlight)),
+                            Some(crate::fixed::tnl::color(highlight)),
                         )
                         .0
                     } else {
@@ -1229,8 +1230,8 @@ mod fixed_completion {
         assert_eq!(get_light(&mut e, this, 12345, out), INVALID);
         assert_eq!(light_enable(&mut e, this, 12345, 1), 0);
         assert_eq!(get_light(&mut e, this, 12345, out), 0);
-        assert_eq!(out.read(e.cpu).unwrap(), Light::default().value);
-        let mut custom = Light::default().value;
+        assert_eq!(out.read(e.cpu).unwrap(), state_map::default_light().words());
+        let mut custom = state_map::default_light().words();
         custom[1] = 0.5f32.to_bits();
         let input = store(&mut e, custom);
         assert_eq!(set_light(&mut e, this, 12345, input), 0);
@@ -1263,7 +1264,7 @@ mod fixed_completion {
         assert!(active(&current(&e, p).unwrap()).is_ok());
         assert_eq!(light_enable(&mut e, this, u32::MAX, 1), 0);
         assert_eq!(
-            active(&current(&e, p).unwrap()).err().unwrap().code,
+            Rejected::from(active(&current(&e, p).unwrap()).unwrap_err()).code,
             UNAVAILABLE
         );
     }
@@ -1341,7 +1342,7 @@ mod fixed_completion {
         l[5..8].fill(1f32.to_bits());
         lp.write(e.cpu, l).unwrap();
         assert_eq!(set_light(&mut e, this, 0xffff_fffe, lp), 0);
-        let mut material = current(&e, p).unwrap().material;
+        let mut material = state_map::material_words(current(&e, p).unwrap().material);
         material[3] = 0.5;
         material[8..11].copy_from_slice(&[0.5, 0.25, 0.125]);
         material[16] = 2.;
@@ -1585,21 +1586,21 @@ mod fixed_completion {
 
 mod fixed_completion_lighting {
     use super::*;
-    use lighting::*;
+    use crate::fixed::{Light, tnl::*};
     // spec: GFX-FIXED-1
     #[test]
     fn spot_falloff_and_range() {
-        let mut f = Fixed::new(16, 12);
+        let mut f = state_map::defaults(16, 12);
         let mut l = Light {
             enabled: true,
-            ..Default::default()
+            value: state_map::default_light(),
         };
-        l.value[0] = 2;
-        l.value[19] = 4f32.to_bits();
-        l.value[20] = 2f32.to_bits();
-        l.value[21] = 1f32.to_bits();
-        l.value[24] = 0f32.to_bits();
-        l.value[25] = (std::f32::consts::PI * 2. / 3.).to_bits();
+        l.value.kind = crate::fixed::LightKind::Spot;
+        l.value.components[18] = 4f32.to_bits();
+        l.value.components[19] = 2f32.to_bits();
+        l.value.components[20] = 1f32.to_bits();
+        l.value.components[23] = 0f32.to_bits();
+        l.value.components[24] = (std::f32::consts::PI * 2. / 3.).to_bits();
         f.lights.insert(99, l);
         let lights = active(&f).ok().unwrap();
         let matrix = normal_matrix(&f);
@@ -1616,10 +1617,10 @@ mod fixed_completion_lighting {
     // spec: GFX-FIXED-1
     #[test]
     fn normal_inverse_transpose_and_normalization() {
-        let mut f = Fixed::new(16, 12);
+        let mut f = state_map::defaults(16, 12);
         let l = Light {
             enabled: true,
-            ..Default::default()
+            value: state_map::default_light(),
         };
         f.lights.insert(0, l);
         f.transforms[0][10] = 2.;
@@ -1641,28 +1642,28 @@ mod fixed_completion_lighting {
     #[test]
     fn material_sources_and_colorvertex() {
         for state in 145..=148 {
-            let mut f = Fixed::new(16, 12);
-            f.material = [0.; 17];
+            let mut f = state_map::defaults(16, 12);
+            f.material = state_map::material([0.; 17]);
             for state in 145..=148 {
                 f.render.insert(state, 0);
             }
             let offset = match state {
                 145 => 0,
-                146 => 8,
-                147 => 4,
-                _ => 12,
+                146 => 2,
+                147 => 1,
+                _ => 3,
             };
-            f.material[offset..offset + 4].fill(0.25);
-            f.material[16] = 1.;
+            f.material.colors[offset].fill(0.25);
+            f.material.power = 1.;
             f.render.insert(29, 1);
             f.render.insert(142, 0);
             f.render.insert(139, u32::MAX);
             let mut l = Light {
                 enabled: true,
-                ..Default::default()
+                value: state_map::default_light(),
             };
             if state == 146 {
-                l.value[5..8].fill(1f32.to_bits());
+                l.value.components[4..7].fill(1f32.to_bits());
             }
             f.lights.insert(0, l);
             let lights = active(&f).ok().unwrap();
@@ -1696,16 +1697,16 @@ mod fixed_completion_lighting {
     // spec: GFX-FIXED-1
     #[test]
     fn specular_local_viewer() {
-        let mut f = Fixed::new(16, 12);
-        f.material[8..11].fill(1.);
-        f.material[16] = 2.;
+        let mut f = state_map::defaults(16, 12);
+        f.material.colors[2][..3].fill(1.);
+        f.material.power = 2.;
         f.render.insert(29, 1);
         f.render.insert(142, 0);
         let mut l = Light {
             enabled: true,
-            ..Default::default()
+            value: state_map::default_light(),
         };
-        l.value[5..8].fill(1f32.to_bits());
+        l.value.components[4..7].fill(1f32.to_bits());
         f.lights.insert(0, l);
         let lights = active(&f).ok().unwrap();
         let matrix = normal_matrix(&f);
@@ -1730,7 +1731,7 @@ mod fixed_completion_lighting {
     // spec: GFX-FIXED-2
     #[test]
     fn range_fog_and_supplied_factor() {
-        let mut f = Fixed::new(16, 12);
+        let mut f = state_map::defaults(16, 12);
         f.render.insert(140, 3);
         f.render.insert(37, 10f32.to_bits());
         assert_eq!(fog(&f, false, 0., [3., 0., 4., 1.], 0.25), 0.6);

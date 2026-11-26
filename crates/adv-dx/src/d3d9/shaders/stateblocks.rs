@@ -4,8 +4,7 @@
 //! borrows an immutable snapshot across device updates without copying maps.
 //! An unchanged captured subset retains its snapshot, including exact float bits.
 use super::*;
-mod slots;
-use slots::Slots;
+use crate::fixed::{Block, Members, Setting, slots::Slots};
 use std::rc::Rc;
 
 const IID_BLOCK: Iid = [
@@ -36,60 +35,34 @@ impl ConstantMask {
 #[derive(Clone, Default)]
 struct Mask {
     dirty: u16,
-    material: bool,
-    lights: std::collections::BTreeSet<u32>,
-    light_enable: std::collections::BTreeSet<u32>,
     vertex: bool,
     pixel: bool,
     vertex_constants: ConstantMask,
     pixel_constants: ConstantMask,
-    fvf: bool,
     declaration: bool,
     streams: Slots<usize, 1>,
     frequencies: Slots<usize, 1>,
     indices: bool,
     texture: bool,
     textures: Slots<usize, 1>,
-    render: Slots<i32, 4>,
-    stage: Slots<i32, 1>,
-    stage_slots: Slots<(usize, i32), 10>,
-    sampler: Slots<i32, 1>,
-    sampler_slots: Slots<(usize, i32), 10>,
-    viewport: bool,
-    scissor: bool,
-    transforms: Slots<usize, 1>,
-    clip_planes: Slots<usize, 1>,
 }
 #[cfg(feature = "d3d9-counters")]
 impl Mask {
     fn items(&self) -> u64 {
         let constants = |m: &ConstantMask| m.floats.len() + m.integers.len() + m.booleans.len();
         ([
-            self.material,
             self.vertex,
             self.pixel,
-            self.fvf,
             self.declaration,
             self.indices,
             self.texture,
-            self.viewport,
-            self.scissor,
         ]
         .into_iter()
         .filter(|v| *v)
         .count()
-            + self.lights.len()
-            + self.light_enable.len()
             + self.streams.len()
             + self.frequencies.len()
             + self.textures.len()
-            + self.render.len()
-            + self.stage.len()
-            + self.stage_slots.len()
-            + self.sampler.len()
-            + self.sampler_slots.len()
-            + self.transforms.len()
-            + self.clip_planes.len()
             + constants(&self.vertex_constants)
             + constants(&self.pixel_constants)) as u64
     }
@@ -101,17 +74,7 @@ impl Mask {
             !(m.floats.is_empty() && m.integers.is_empty() && m.booleans.is_empty())
         };
         [
-            !self.render.is_empty()
-                || self.material
-                || !self.lights.is_empty()
-                || !self.light_enable.is_empty(),
-            !(self.stage.is_empty() && self.stage_slots.is_empty()),
-            !(self.sampler.is_empty() && self.sampler_slots.is_empty()),
-            self.viewport,
-            self.scissor,
-            !self.transforms.is_empty(),
-            !self.clip_planes.is_empty(),
-            self.fvf || self.declaration,
+            self.declaration,
             self.vertex,
             self.pixel,
             !self.streams.is_empty() || !self.frequencies.is_empty(),
@@ -123,12 +86,12 @@ impl Mask {
         .into_iter()
         .enumerate()
         .fold(0, |bits, (class, member)| {
-            bits | (u16::from(member) << class)
+            bits | (u16::from(member) << (class + 7))
         })
     }
 }
 pub(in crate::d3d9) struct Snapshot {
-    pub(in crate::d3d9) fixed: fixed::Fixed,
+    pub(in crate::d3d9) fixed: Block,
     pub(in crate::d3d9) shaders: Bindings,
     buffers: buffers::Bindings,
     texture: Option<Id>,
@@ -156,36 +119,16 @@ impl StateBlock {
     fn current(&self, d: &super::super::HotDevice) -> bool {
         self.hot.borrow().current(d)
     }
-    fn members(&self, d: &super::super::HotDevice) -> Mask {
-        let mut m = self.snapshot.as_ref().unwrap().mask.clone();
+    fn members(&self, d: &super::super::HotDevice) -> (Mask, Members) {
+        let snapshot = self.snapshot.as_ref().unwrap();
+        let mut m = snapshot.mask.clone();
+        let mut fixed = snapshot.fixed.members.clone();
         let fingerprints = self.hot.borrow().fingerprints;
         let classes = self.hot.borrow().classes;
         let changed = |class| fingerprints[class] != d.fingerprints[class];
         // Classes without members never transfer, so they stay clean.
         m.dirty = (0..15).fold(0, |bits, c| bits | (u16::from(changed(c)) << c)) & classes;
-        if !changed(0) {
-            m.render = Default::default();
-            m.material = false;
-            m.lights.clear();
-            m.light_enable.clear();
-        }
-        if !changed(1) {
-            m.stage = Default::default();
-            m.stage_slots = Default::default();
-        }
-        if !changed(2) {
-            m.sampler = Default::default();
-            m.sampler_slots = Default::default();
-        }
-        m.viewport &= changed(3);
-        m.scissor &= changed(4);
-        if !changed(5) {
-            m.transforms = Default::default();
-        }
-        if !changed(6) {
-            m.clip_planes = Default::default();
-        }
-        m.fvf &= changed(7);
+        fixed.retain_classes(m.dirty);
         m.declaration &= changed(7);
         m.vertex &= changed(8);
         m.pixel &= changed(9);
@@ -204,46 +147,17 @@ impl StateBlock {
         if !changed(14) {
             m.pixel_constants = Default::default();
         }
-        m
+        (m, fixed)
     }
 }
 impl Snapshot {
-    fn current(env: &Env<'_>, id: Id, mask: Mask) -> Option<Self> {
+    fn current(env: &Env<'_>, id: Id, (mask, fixed): (Mask, Members)) -> Option<Self> {
         let Payload::Device(d) = com(env).get_identity(&env.sys.objects, id)? else {
             return None;
         };
         let hot = d.hot.borrow();
         Some(Self {
-            fixed: fixed::Fixed {
-                fvf: hot.fixed.fvf,
-                render: hot.fixed.render.capture(mask.render.iter()),
-                stage: hot.fixed.stage.capture(mask.stage.iter()),
-                stage_slots: std::array::from_fn(|slot| {
-                    let keys: Slots<i32, 4> = mask
-                        .stage_slots
-                        .iter()
-                        .filter(|&(n, _)| n == slot)
-                        .map(|(_, i)| i)
-                        .collect();
-                    hot.fixed.stage_slots[slot].capture(keys.iter())
-                }),
-                sampler: hot.fixed.sampler.capture(mask.sampler.iter()),
-                sampler_slots: std::array::from_fn(|slot| {
-                    let keys: Slots<i32, 4> = mask
-                        .sampler_slots
-                        .iter()
-                        .filter(|&(n, _)| n == slot)
-                        .map(|(_, i)| i)
-                        .collect();
-                    hot.fixed.sampler_slots[slot].capture(keys.iter())
-                }),
-                viewport: hot.fixed.viewport,
-                scissor: hot.fixed.scissor,
-                transforms: hot.fixed.transforms,
-                clip_planes: hot.fixed.clip_planes,
-                material: hot.fixed.material,
-                lights: hot.fixed.lights.clone(),
-            },
+            fixed: Block::new(&hot.fixed, fixed),
             shaders: hot.shaders.clone(),
             buffers: hot.buffers.clone(),
             texture: hot.texture,
@@ -302,70 +216,6 @@ pub(in crate::d3d9) fn unchanged(env: &mut Env<'_>, pointer: u32, _capture: bool
         count_apply(env, 0);
     }
     unchanged
-}
-pub(in crate::d3d9) enum FixedKey {
-    Fvf,
-    Material,
-    Light(u32),
-    LightEnable(u32),
-    Render(i32),
-    Stage(i32),
-    StageSlot(usize, i32),
-    Sampler(i32),
-    SamplerSlot(usize, i32),
-    Viewport,
-    Scissor,
-    Transform(usize),
-    ClipPlane(usize),
-}
-impl FixedKey {
-    pub(in crate::d3d9) fn class(&self) -> usize {
-        match self {
-            Self::Fvf => 7,
-            Self::Render(_) | Self::Material | Self::Light(_) | Self::LightEnable(_) => 0,
-            Self::Stage(_) | Self::StageSlot(_, _) => 1,
-            Self::Sampler(_) | Self::SamplerSlot(_, _) => 2,
-            Self::Viewport => 3,
-            Self::Scissor => 4,
-            Self::Transform(_) => 5,
-            Self::ClipPlane(_) => 6,
-        }
-    }
-}
-pub(in crate::d3d9) fn record_fixed_key(r: &mut Snapshot, key: FixedKey) {
-    match key {
-        FixedKey::Fvf => r.mask.fvf = true,
-        FixedKey::Material => r.mask.material = true,
-        FixedKey::Light(i) => {
-            r.mask.lights.insert(i);
-        }
-        FixedKey::LightEnable(i) => {
-            r.mask.light_enable.insert(i);
-        }
-        FixedKey::Render(i) => {
-            r.mask.render.insert(i);
-        }
-        FixedKey::Stage(i) => {
-            r.mask.stage.insert(i);
-        }
-        FixedKey::StageSlot(slot, i) => {
-            r.mask.stage_slots.insert((slot, i));
-        }
-        FixedKey::Sampler(i) => {
-            r.mask.sampler.insert(i);
-        }
-        FixedKey::SamplerSlot(slot, i) => {
-            r.mask.sampler_slots.insert((slot, i));
-        }
-        FixedKey::Viewport => r.mask.viewport = true,
-        FixedKey::Scissor => r.mask.scissor = true,
-        FixedKey::Transform(i) => {
-            r.mask.transforms.insert(i);
-        }
-        FixedKey::ClipPlane(i) => {
-            r.mask.clip_planes.insert(i);
-        }
-    }
 }
 pub(in crate::d3d9) fn register(registry: &mut Registry) {
     for api in [
@@ -502,7 +352,7 @@ pub(in crate::d3d9) fn has_outstanding(env: &Env<'_>, device: Id) -> bool {
         )
     })
 }
-fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
+fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<(Mask, Members)> {
     let Payload::Device(d) = com(env).get_identity(&env.sys.objects, device)? else {
         return None;
     };
@@ -519,109 +369,115 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
         148, 151, 152, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 166, 167, 170, 172, 173,
         178, 179, 180, 181, 182, 183, 184,
     ];
-    Some(Mask {
-        dirty: 0,
-        material: vertex,
-        lights: if vertex {
-            hot.fixed.lights.keys().copied().collect()
-        } else {
-            Default::default()
+    Some((
+        Mask {
+            dirty: 0,
+            vertex,
+            pixel,
+            vertex_constants: if vertex {
+                ConstantMask::all(Stage::Vertex)
+            } else {
+                ConstantMask::default()
+            },
+            pixel_constants: if pixel {
+                ConstantMask::all(Stage::Pixel)
+            } else {
+                ConstantMask::default()
+            },
+            declaration: vertex,
+            streams: if all {
+                (0..16).collect()
+            } else {
+                Slots::default()
+            },
+            frequencies: if vertex {
+                (0..16).collect()
+            } else {
+                Slots::default()
+            },
+            indices: all,
+            texture: all,
+            textures: if all {
+                (1..20).collect()
+            } else {
+                Slots::default()
+            },
         },
-        light_enable: if vertex {
-            hot.fixed.lights.keys().copied().collect()
-        } else {
-            Default::default()
+        Members {
+            material: vertex,
+            lights: if vertex {
+                hot.fixed.lights.keys().copied().collect()
+            } else {
+                Default::default()
+            },
+            light_enable: if vertex {
+                hot.fixed.lights.keys().copied().collect()
+            } else {
+                Default::default()
+            },
+            fvf: vertex,
+            render: hot
+                .fixed
+                .render
+                .keys()
+                .copied()
+                .filter(|i| {
+                    all || (vertex && vertex_render.contains(i))
+                        || (pixel && (matches!(*i, 9 | 36 | 37 | 38) || !vertex_render.contains(i)))
+                })
+                .collect(),
+            stage: hot
+                .fixed
+                .stage
+                .keys()
+                .copied()
+                .filter(|i| {
+                    all || (vertex && matches!(i, 11 | 24)) || (pixel && !matches!(i, 11 | 24))
+                })
+                .collect(),
+            stage_slots: hot
+                .fixed
+                .stage_slots
+                .iter()
+                .enumerate()
+                .flat_map(|(i, map)| {
+                    map.keys()
+                        .copied()
+                        .filter(move |key| {
+                            all || (vertex && matches!(key, 11 | 24))
+                                || (pixel && !matches!(key, 11 | 24))
+                        })
+                        .map(move |key| (i, key))
+                })
+                .collect(),
+            sampler: if pixel {
+                hot.fixed.sampler.keys().copied().collect()
+            } else {
+                Slots::default()
+            },
+            sampler_slots: hot
+                .fixed
+                .sampler_slots
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter(|(i, _)| all || (pixel && *i < 16) || (vertex && *i >= 16))
+                .flat_map(|(i, map)| map.keys().map(move |&key| (i, key)))
+                .collect(),
+            viewport: all,
+            scissor: all,
+            transforms: if all {
+                (0..3).collect()
+            } else {
+                Slots::default()
+            },
+            clip_planes: if vertex {
+                (0..6).collect()
+            } else {
+                Slots::default()
+            },
         },
-        vertex,
-        pixel,
-        vertex_constants: if vertex {
-            ConstantMask::all(Stage::Vertex)
-        } else {
-            ConstantMask::default()
-        },
-        pixel_constants: if pixel {
-            ConstantMask::all(Stage::Pixel)
-        } else {
-            ConstantMask::default()
-        },
-        fvf: vertex,
-        declaration: vertex,
-        streams: if all {
-            (0..16).collect()
-        } else {
-            Slots::default()
-        },
-        frequencies: if vertex {
-            (0..16).collect()
-        } else {
-            Slots::default()
-        },
-        indices: all,
-        texture: all,
-        textures: if all {
-            (1..20).collect()
-        } else {
-            Slots::default()
-        },
-        render: hot
-            .fixed
-            .render
-            .keys()
-            .copied()
-            .filter(|i| {
-                all || (vertex && vertex_render.contains(i))
-                    || (pixel && (matches!(*i, 9 | 36 | 37 | 38) || !vertex_render.contains(i)))
-            })
-            .collect(),
-        stage: hot
-            .fixed
-            .stage
-            .keys()
-            .copied()
-            .filter(|i| all || (vertex && matches!(i, 11 | 24)) || (pixel && !matches!(i, 11 | 24)))
-            .collect(),
-        stage_slots: hot
-            .fixed
-            .stage_slots
-            .iter()
-            .enumerate()
-            .flat_map(|(i, map)| {
-                map.keys()
-                    .copied()
-                    .filter(move |key| {
-                        all || (vertex && matches!(key, 11 | 24))
-                            || (pixel && !matches!(key, 11 | 24))
-                    })
-                    .map(move |key| (i, key))
-            })
-            .collect(),
-        sampler: if pixel {
-            hot.fixed.sampler.keys().copied().collect()
-        } else {
-            Slots::default()
-        },
-        sampler_slots: hot
-            .fixed
-            .sampler_slots
-            .iter()
-            .enumerate()
-            .skip(1)
-            .filter(|(i, _)| all || (pixel && *i < 16) || (vertex && *i >= 16))
-            .flat_map(|(i, map)| map.keys().map(move |&key| (i, key)))
-            .collect(),
-        viewport: all,
-        scissor: all,
-        transforms: if all {
-            (0..3).collect()
-        } else {
-            Slots::default()
-        },
-        clip_planes: if vertex {
-            (0..6).collect()
-        } else {
-            Slots::default()
-        },
-    })
+    ))
 }
 fn make(
     env: &mut Env<'_>,
@@ -650,7 +506,7 @@ fn make(
     let retained = snapshot.identities();
     let hot = Rc::new(std::cell::RefCell::new(HotStateBlock {
         device: hot_device,
-        classes: snapshot.mask.classes(),
+        classes: snapshot.mask.classes() | snapshot.fixed.members.classes(),
         fingerprints,
     }));
     let Some((pointer, id)) = object(
@@ -718,7 +574,7 @@ pub(in crate::d3d9) fn begin(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if device(env, this.addr()).unwrap().recording.is_some() {
         return INVALID;
     }
-    let snapshot = Snapshot::current(env, id, Mask::default()).unwrap();
+    let snapshot = Snapshot::current(env, id, (Mask::default(), Members::default())).unwrap();
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return INVALID;
     };
@@ -777,10 +633,10 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if d.recording.is_some() {
         return INVALID;
     }
-    let (unchanged, mask, fingerprints) = {
+    let (unchanged, (mask, fixed), fingerprints) = {
         let hot = d.hot.borrow();
         if b.current(&hot) {
-            (true, Mask::default(), [0; 15])
+            (true, (Mask::default(), Members::default()), [0; 15])
         } else {
             (false, b.members(&hot), hot.fingerprints)
         }
@@ -822,14 +678,10 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     };
     {
         let hot = d.hot.borrow();
+        old.fixed.capture(&hot.fixed, &fixed);
         transfer(
-            (
-                || &mut old.fixed,
-                &mut old.shaders,
-                &mut old.buffers,
-                &mut old.texture,
-            ),
-            (&hot.fixed, &hot.shaders, &hot.buffers, hot.texture),
+            (&mut old.shaders, &mut old.buffers, &mut old.texture),
+            (&hot.shaders, &hot.buffers, hot.texture),
             &mask,
         );
     }
@@ -867,10 +719,10 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if d.recording.is_some() {
         return INVALID;
     }
-    let (unchanged, mask, fingerprints) = {
+    let (unchanged, (mask, fixed), fingerprints) = {
         let hot = d.hot.borrow();
         if b.current(&hot) {
-            (true, Mask::default(), [0; 15])
+            (true, (Mask::default(), Members::default()), [0; 15])
         } else {
             (false, b.members(&hot), hot.fingerprints)
         }
@@ -911,19 +763,10 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     let fingerprints = {
         let mut hot = d.hot.borrow_mut();
         let hot = &mut *hot;
+        snapshot.fixed.apply(hot.fixed.state_mut(), &fixed);
         transfer(
-            (
-                || &mut *hot.fixed,
-                &mut hot.shaders,
-                &mut hot.buffers,
-                &mut hot.texture,
-            ),
-            (
-                &snapshot.fixed,
-                &snapshot.shaders,
-                &snapshot.buffers,
-                snapshot.texture,
-            ),
+            (&mut hot.shaders, &mut hot.buffers, &mut hot.texture),
+            (&snapshot.shaders, &snapshot.buffers, snapshot.texture),
             &mask,
         );
         // Other blocks must observe the restored classes; this block now matches.
@@ -945,7 +788,7 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     };
     b.hot.borrow_mut().fingerprints = fingerprints;
     #[cfg(feature = "d3d9-counters")]
-    count_apply(env, mask.items());
+    count_apply(env, mask.items() + fixed.len() as u64);
     release_changes(env, &changes);
     0
 }
@@ -955,18 +798,13 @@ fn count_apply(env: &mut Env<'_>, items: u64) {
     count.stateblock_applies += 1;
     count.stateblock_items += items;
 }
-fn transfer<'a>(
-    target: (
-        impl FnOnce() -> &'a mut fixed::Fixed,
-        &mut Bindings,
-        &mut buffers::Bindings,
-        &mut Option<Id>,
-    ),
-    source: (&fixed::Fixed, &Bindings, &buffers::Bindings, Option<Id>),
+fn transfer(
+    target: (&mut Bindings, &mut buffers::Bindings, &mut Option<Id>),
+    source: (&Bindings, &buffers::Bindings, Option<Id>),
     mask: &Mask,
 ) {
-    let (fixed, shaders, buffers, texture) = target;
-    let (source_fixed, source_shaders, source_buffers, source_texture) = source;
+    let (shaders, buffers, texture) = target;
+    let (source_shaders, source_buffers, source_texture) = source;
     if mask.vertex {
         shaders.vertex = source_shaders.vertex;
     }
@@ -1000,61 +838,6 @@ fn transfer<'a>(
     }
     for slot in &mask.textures {
         shaders.textures[slot] = source_shaders.textures[slot];
-    }
-    if mask.material
-        || !mask.lights.is_empty()
-        || !mask.light_enable.is_empty()
-        || mask.fvf
-        || mask.viewport
-        || mask.scissor
-        || !mask.render.is_empty()
-        || !mask.stage.is_empty()
-        || !mask.stage_slots.is_empty()
-        || !mask.sampler.is_empty()
-        || !mask.sampler_slots.is_empty()
-        || !mask.transforms.is_empty()
-        || !mask.clip_planes.is_empty()
-    {
-        let fixed = fixed();
-        if mask.material {
-            fixed.material = source_fixed.material;
-        }
-        for &i in &mask.lights {
-            fixed.lights.entry(i).or_default().value = source_fixed.lights[&i].value;
-        }
-        for &i in &mask.light_enable {
-            fixed.lights.entry(i).or_default().enabled = source_fixed.lights[&i].enabled;
-        }
-        if mask.fvf {
-            fixed.fvf = source_fixed.fvf;
-        }
-        for i in &mask.render {
-            fixed.render.insert(i, source_fixed.render[&i]);
-        }
-        for i in &mask.stage {
-            fixed.stage.insert(i, source_fixed.stage[&i]);
-        }
-        for (slot, i) in &mask.stage_slots {
-            fixed.stage_slots[slot].insert(i, source_fixed.stage_slots[slot][&i]);
-        }
-        for i in &mask.sampler {
-            fixed.sampler.insert(i, source_fixed.sampler[&i]);
-        }
-        for (slot, i) in &mask.sampler_slots {
-            fixed.sampler_slots[slot].insert(i, source_fixed.sampler_slots[slot][&i]);
-        }
-        if mask.viewport {
-            fixed.viewport = source_fixed.viewport;
-        }
-        if mask.scissor {
-            fixed.scissor = source_fixed.scissor;
-        }
-        for i in &mask.transforms {
-            fixed.transforms[i] = source_fixed.transforms[i];
-        }
-        for i in &mask.clip_planes {
-            fixed.clip_planes[i] = source_fixed.clip_planes[i];
-        }
     }
 }
 #[derive(Clone, Copy)]
@@ -1108,9 +891,8 @@ fn record(env: &mut Env<'_>, device: Id, key: Slot, new: Option<Id>) -> Option<u
         }
         Slot::Declaration => {
             r.mask.declaration = true;
-            r.mask.fvf = true;
             r.buffers.declaration = new;
-            r.fixed.fvf = 0;
+            r.fixed.record(Setting::Fvf(0));
         }
         Slot::Indices => {
             r.mask.indices = true;
@@ -1237,7 +1019,8 @@ mod tests {
                 .snapshot
                 .as_ref()
                 .unwrap()
-                .mask;
+                .fixed
+                .members;
             (mask.render.len()
                 + usize::from(mask.material)
                 + mask.lights.len()
@@ -1364,7 +1147,7 @@ mod tests {
     fn fingerprint(d: &super::super::super::Device) -> u128 {
         let hot = d.hot.borrow();
         super::super::super::recording::hash((
-            super::super::super::recording::fixed_key(&hot.fixed),
+            hot.fixed.fingerprint(),
             hot.shaders
                 .vertex_constants
                 .floats
@@ -1410,9 +1193,9 @@ mod tests {
         }
         let b = block(&env, this.addr()).unwrap();
         let d = device(&env, pointer).unwrap();
-        let members = b.members(&d.hot.borrow());
+        let (mask, members) = b.members(&d.hot.borrow());
         assert!(members.render.contains(&7));
-        assert_eq!(members.dirty, 1);
+        assert_eq!(mask.dirty, 1);
         assert_eq!(capture(&mut env, this), 0);
         assert_eq!(
             Rc::as_ptr(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap()),
@@ -1438,8 +1221,9 @@ mod tests {
                 }
             }
             fixed.fvf ^= 4;
-            fixed.viewport.MinZ = -0.;
-            fixed.scissor.left = 1;
+            fixed.viewport.min_depth = -0.;
+            fixed.scissor.x = 1;
+            fixed.scissor.w -= 1;
             fixed.transforms.fill([2.; 16]);
             fixed.clip_planes.fill([3.; 4]);
             let shaders = &mut hot.shaders;
@@ -1477,19 +1261,12 @@ mod tests {
         {
             let mut hot = d.hot.borrow_mut();
             let hot = &mut *hot;
+            snapshot
+                .fixed
+                .apply(hot.fixed.state_mut(), &snapshot.fixed.members);
             transfer(
-                (
-                    || &mut *hot.fixed,
-                    &mut hot.shaders,
-                    &mut hot.buffers,
-                    &mut hot.texture,
-                ),
-                (
-                    &snapshot.fixed,
-                    &snapshot.shaders,
-                    &snapshot.buffers,
-                    snapshot.texture,
-                ),
+                (&mut hot.shaders, &mut hot.buffers, &mut hot.texture),
+                (&snapshot.shaders, &snapshot.buffers, snapshot.texture),
                 &snapshot.mask,
             );
         }

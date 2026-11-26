@@ -73,43 +73,6 @@ pub(super) fn raster(s: DrawState) -> u128 {
     ));
     blend_constant.map_or(key, |color| hash((key, color)))
 }
-pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
-    let fixed::Fixed {
-        fvf,
-        render,
-        stage,
-        stage_slots,
-        sampler,
-        sampler_slots,
-        viewport,
-        scissor,
-        transforms,
-        clip_planes,
-        material,
-        lights,
-    } = f;
-    hash((
-        fvf,
-        render,
-        stage,
-        stage_slots,
-        sampler,
-        sampler_slots,
-        (
-            viewport.X,
-            viewport.Y,
-            viewport.Width,
-            viewport.Height,
-            viewport.MinZ.to_bits(),
-            viewport.MaxZ.to_bits(),
-        ),
-        (scissor.left, scissor.top, scissor.right, scissor.bottom),
-        transforms.map(|m| m.map(f32::to_bits)),
-        clip_planes.map(|m| m.map(f32::to_bits)),
-        material.map(f32::to_bits),
-        lights,
-    ))
-}
 struct ResourceIdentity {
     owner: Id,
     level: u32,

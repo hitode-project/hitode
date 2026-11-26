@@ -535,7 +535,7 @@ fn fixed_key_cache_tracks_setters_stateblock_apply_and_reset_between_draws() {
         let e = env(f);
         let d = device(&e, pointer).unwrap();
         let hot = d.hot.borrow();
-        let fresh = fixed_key(&hot.fixed);
+        let fresh = hot.fixed.fingerprint();
         assert_eq!(hot.fixed.key(), fresh);
         let empty = xxhash_rust::xxh3::Xxh3::new().digest128();
         let expected = hash((
@@ -629,13 +629,13 @@ fn fixed_key_cache_tracks_setters_stateblock_apply_and_reset_between_draws() {
 // spec: GFX-REC-2
 #[test]
 fn fingerprints_cover_every_fixed_and_raster_field_including_float_bits() {
-    let fixed = fixed::Fixed::new(16, 12);
-    let original = fixed_key(&fixed);
+    let fixed = fixed::state_map::defaults(16, 12);
+    let original = fixed.fingerprint();
     macro_rules! fixed_change {
         ($body:expr) => {{
             let mut changed = fixed.clone();
             ($body)(&mut changed);
-            assert_ne!(fixed_key(&changed), original);
+            assert_ne!(changed.fingerprint(), original);
         }};
     }
     fixed_change!(|f: &mut fixed::Fixed| f.fvf ^= 1);
@@ -658,16 +658,22 @@ fn fingerprints_cover_every_fixed_and_raster_field_including_float_bits() {
             fixed_change!(|f: &mut fixed::Fixed| *f.sampler_slots[slot].get_mut(n).unwrap() ^= 1);
         }
     }
-    fixed_change!(|f: &mut fixed::Fixed| f.viewport.X += 1);
-    fixed_change!(|f: &mut fixed::Fixed| f.viewport.Y += 1);
-    fixed_change!(|f: &mut fixed::Fixed| f.viewport.Width += 1);
-    fixed_change!(|f: &mut fixed::Fixed| f.viewport.Height += 1);
-    fixed_change!(|f: &mut fixed::Fixed| f.viewport.MinZ = -0.0);
-    fixed_change!(|f: &mut fixed::Fixed| f.viewport.MaxZ = 0.5);
-    fixed_change!(|f: &mut fixed::Fixed| f.scissor.left += 1);
-    fixed_change!(|f: &mut fixed::Fixed| f.scissor.top += 1);
-    fixed_change!(|f: &mut fixed::Fixed| f.scissor.right += 1);
-    fixed_change!(|f: &mut fixed::Fixed| f.scissor.bottom += 1);
+    fixed_change!(|f: &mut fixed::Fixed| f.viewport.rect.x += 1);
+    fixed_change!(|f: &mut fixed::Fixed| f.viewport.rect.y += 1);
+    fixed_change!(|f: &mut fixed::Fixed| f.viewport.rect.w += 1);
+    fixed_change!(|f: &mut fixed::Fixed| f.viewport.rect.h += 1);
+    fixed_change!(|f: &mut fixed::Fixed| f.viewport.min_depth = -0.0);
+    fixed_change!(|f: &mut fixed::Fixed| f.viewport.max_depth = 0.5);
+    fixed_change!(|f: &mut fixed::Fixed| {
+        f.scissor.x += 1;
+        f.scissor.w -= 1;
+    });
+    fixed_change!(|f: &mut fixed::Fixed| {
+        f.scissor.y += 1;
+        f.scissor.h -= 1;
+    });
+    fixed_change!(|f: &mut fixed::Fixed| f.scissor.w += 1);
+    fixed_change!(|f: &mut fixed::Fixed| f.scissor.h += 1);
     for m in 0..3 {
         for n in 0..16 {
             fixed_change!(|f: &mut fixed::Fixed| f.transforms[m][n] =

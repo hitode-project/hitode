@@ -112,25 +112,7 @@ impl HotDevice {
         use recording::hash;
         let f = &self.fixed;
         match class {
-            0 => hash((&f.render, f.material.map(f32::to_bits), &f.lights)),
-            1 => hash((&f.stage, &f.stage_slots)),
-            2 => hash((&f.sampler, &f.sampler_slots)),
-            3 => hash((
-                f.viewport.X,
-                f.viewport.Y,
-                f.viewport.Width,
-                f.viewport.Height,
-                f.viewport.MinZ.to_bits(),
-                f.viewport.MaxZ.to_bits(),
-            )),
-            4 => hash((
-                f.scissor.left,
-                f.scissor.top,
-                f.scissor.right,
-                f.scissor.bottom,
-            )),
-            5 => hash(f.transforms.map(|v| v.map(f32::to_bits))),
-            6 => hash(f.clip_planes.map(|v| v.map(f32::to_bits))),
+            0..=6 => f.class_key(class),
             7 => hash((f.fvf, self.buffers.declaration)),
             8 => hash(self.shaders.vertex),
             9 => hash(self.shaders.pixel),
@@ -376,8 +358,7 @@ fn set_fvf<M: Mem>(mem: &mut M, [this, fvf, ..]: [u32; 7]) -> Result<Ret, Stop> 
         if hot.fixed.fvf == fvf {
             return Ok((0u32.into(), false));
         }
-        hot.fixed.state_mut().fvf = fvf;
-        hot.fixed.invalidate_key();
+        hot.fixed.state_mut().apply(crate::fixed::Setting::Fvf(fvf));
         hot.touch(7);
         Ok((0u32.into(), true))
     })
@@ -420,7 +401,9 @@ fn set_viewport<M: Mem>(mem: &mut M, [this, ptr, ..]: [u32; 7]) -> Result<Ret, S
 
 body!(pub(super) GET_VIEWPORT = get_viewport, inputs: &[Input::Stack(0), Input::Stack(1)], outputs: EAX, pop: 8);
 fn get_viewport<M: Mem>(mem: &mut M, [this, output, ..]: [u32; 7]) -> Result<Ret, Stop> {
-    let v = with_device(mem, this, |hot| Ok(hot.fixed.viewport))?;
+    let v = with_device(mem, this, |hot| {
+        Ok(fixed::state_map::to_viewport(hot.fixed.viewport))
+    })?;
     let out = mem.output(output, 24).map_err(|_| Stop::Slow)?;
     // SAFETY: `mem.output(output, 24)` checked 24 writable bytes.
     let dst = unsafe { std::slice::from_raw_parts_mut(out, 24) };
@@ -467,7 +450,9 @@ fn set_scissor<M: Mem>(mem: &mut M, [this, ptr, ..]: [u32; 7]) -> Result<Ret, St
 
 body!(pub(super) GET_SCISSOR = get_scissor, inputs: &[Input::Stack(0), Input::Stack(1)], outputs: EAX, pop: 8);
 fn get_scissor<M: Mem>(mem: &mut M, [this, output, ..]: [u32; 7]) -> Result<Ret, Stop> {
-    let r = with_device(mem, this, |hot| Ok(hot.fixed.scissor))?;
+    let r = with_device(mem, this, |hot| {
+        Ok(fixed::state_map::to_scissor(hot.fixed.scissor))
+    })?;
     let out = mem.output(output, 16).map_err(|_| Stop::Slow)?;
     // SAFETY: `mem.output(output, 16)` checked 16 writable bytes.
     let dst = unsafe { std::slice::from_raw_parts_mut(out, 16) };
@@ -504,7 +489,7 @@ fn get_transform<M: Mem>(mem: &mut M, [this, kind, output, ..]: [u32; 7]) -> Res
     let Some(slot) = fixed::transform_slot(kind as i32) else {
         return Ok(INVALID.into());
     };
-    let matrix = with_device(mem, this, |hot| Ok(hot.fixed.transforms[slot]))?;
+    let matrix = with_device(mem, this, |hot| Ok(hot.fixed.transforms[slot as usize]))?;
     write_f32s(mem, output, &matrix)
 }
 

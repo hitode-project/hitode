@@ -1,6 +1,10 @@
 use super::module;
 #[path = "gpu/alu.rs"]
 mod alu;
+#[path = "gpu/raster.rs"]
+mod raster;
+#[path = "gpu/resources.rs"]
+mod resources;
 use adv_device::gpu::{ConstantBlock, DrawState, Program, ProgrammableDraw};
 use adv_dx::shader::{
     ir::{self, BindingKind, Opcode, Register, Vector, interpreter::*},
@@ -153,18 +157,24 @@ impl Compute {
 struct Buffers<'a> {
     input: &'a [u32],
     output: Vec<u32>,
+    shared: [u32; 4],
 }
 
 impl Resources for Buffers<'_> {
     fn read(&mut self, access: ResourceAccess, arguments: &[Vector]) -> Result<Vector, ir::Error> {
-        assert_eq!(access.binding, (Register::Resource, 0));
+        let data = match access.binding {
+            (Register::Resource, 0) => self.input,
+            (Register::UnorderedAccessView, 0) => &self.output,
+            (Register::ThreadGroupSharedMemory, 0) => &self.shared,
+            binding => panic!("unexpected read binding {binding:?}"),
+        };
         let base = match access.instruction {
             Opcode::LdStructured => arguments[0][0] + arguments[1][0] / 4,
             Opcode::LdRaw => arguments[0][0] / 4,
             other => return Err(ir::Error::UnsupportedOpcode(other)),
         } as usize;
         Ok(std::array::from_fn(|lane| {
-            self.input.get(base + lane).copied().unwrap_or(0)
+            data.get(base + lane).copied().unwrap_or(0)
         }))
     }
 
@@ -192,7 +202,11 @@ impl Resources for Buffers<'_> {
         mask: u8,
         arguments: &[Vector],
     ) -> Result<(), ir::Error> {
-        assert_eq!(access.binding, (Register::UnorderedAccessView, 0));
+        let data: &mut [u32] = match access.binding {
+            (Register::UnorderedAccessView, 0) => &mut self.output,
+            (Register::ThreadGroupSharedMemory, 0) => &mut self.shared,
+            binding => panic!("unexpected write binding {binding:?}"),
+        };
         let (base, value) = match access.instruction {
             Opcode::StoreStructured => (arguments[0][0] + arguments[1][0] / 4, arguments[2]),
             Opcode::StoreRaw => (arguments[0][0] / 4, arguments[1]),
@@ -200,7 +214,7 @@ impl Resources for Buffers<'_> {
         };
         for (lane, word) in value.into_iter().enumerate() {
             if mask & (1 << lane) != 0
-                && let Some(slot) = self.output.get_mut(base as usize + lane)
+                && let Some(slot) = data.get_mut(base as usize + lane)
             {
                 *slot = word;
             }
@@ -218,10 +232,12 @@ fn interpret_compute(
     let mut buffers = Buffers {
         input: data,
         output: vec![0; output_count],
+        shared: [0; 4],
     };
     let constants = Constants::new();
     let mut inputs = Inputs::default();
     for invocation in 0..invocations {
+        buffers.shared = [0; 4];
         inputs
             .registers
             .insert((Register::InputThreadId, 0), [invocation, 0, 0, 0]);
@@ -242,6 +258,7 @@ fn native_compute_matches_scalar_ir() {
     for (name, data, outputs) in [
         ("arithmetic", arithmetic.as_slice(), 32),
         ("control", control.as_slice(), 8),
+        ("branches", control.as_slice(), 8),
         ("atomics", control.as_slice(), 16),
         ("raw", arithmetic.as_slice().split_at(8).0, 8),
     ] {
@@ -329,120 +346,47 @@ fn programmable_pixels_match_scalar_ir() {
 }
 
 #[test]
-fn typed_uav_uses_the_bound_storage_format() {
-    use adv_gpu::{
-        Extent, Format,
-        encode::{BufferCopy, ImageCopy},
-        resource::{Dimension, ImageDesc, Usage},
-    };
+// spec: GFX-SHADER-5
+fn opcode_fixtures_match_windows_and_scalar_ir() {
     let mut gpu = Compute::open();
-    let module = module("typed_uav");
-    let translation = wgsl::emit(
-        &module,
-        wgsl::Options {
-            storage_formats: &[(1, naga::StorageFormat::R32Uint)],
-        },
-    )
-    .unwrap();
-    let shader = gpu
-        .device
-        .create_shader(ShaderDesc {
-            source: Source::Wgsl(&translation.source),
-            identity: 1,
-            label: "typed UAV",
-        })
-        .unwrap();
-    let pipeline = gpu
-        .device
-        .create_compute_pipeline(
-            &ComputePipelineDesc {
-                entry: shader
-                    .entry(translation.entry_point, Stage::Compute)
-                    .unwrap(),
-                bindings: vec![Binding {
-                    slot: translation.locations[0].binding,
-                    kind: GpuBinding::StorageImage {
-                        format: Format::R32Uint,
-                        writable: true,
-                    },
-                    stages: Stages::COMPUTE,
-                }],
-                label: "typed UAV",
-            },
-            None,
-        )
-        .unwrap();
-    let size = Extent {
-        width: 8,
-        height: 1,
-        depth_or_layers: 1,
-    };
-    let image = gpu
-        .device
-        .create_image(&ImageDesc {
-            dimension: Dimension::D2,
-            size,
-            format: Format::R32Uint,
-            mips: 1,
-            samples: 1,
-            usage: Usage::STORAGE | Usage::COPY_SRC | Usage::COPY_DST,
-            view_formats: &[],
-            label: "typed UAV",
-        })
-        .unwrap();
-    let upload = gpu.buffer(32, BufferUsage::COPY_SRC, Memory::Upload);
-    let readback = gpu.buffer(32, BufferUsage::COPY_DST, Memory::Readback);
-    let initial: [u32; 8] = [1, 3, 11, 53, 17, 19, 21, u32::MAX];
-    // No submission references this upload mapping.
-    let upload_bytes = unsafe { &mut *upload.mapped().unwrap().as_ptr() };
-    upload_bytes.copy_from_slice(bytemuck::cast_slice(&initial));
-    let mut encoder = gpu.queue.encoder("typed UAV");
-    let source = || ImageCopy {
-        image: &image,
-        mip: 0,
-        layer: 0,
-        origin: (0, 0, 0),
-    };
-    encoder.copy_buffer_to_image(
-        BufferCopy {
-            buffer: &upload,
-            offset: 0,
-            row_pitch: 0,
-            rows: 0,
-        },
-        source(),
-        size,
-    );
-    {
-        let mut pass = encoder.compute_pass(&ComputePassDesc {
-            timestamps: None,
-            label: "typed UAV",
-        });
-        pass.set_pipeline(&pipeline);
-        pass.bind(1, Bind::StorageImage(image.view()));
-        pass.dispatch(1, 1, 1);
+    let input = [
+        0, 0, 1, 0, 2, 1, 1, 2, 0xffffffff, 1, 1, 0xffffffff, 0x80000000, 2, 0xffffffff, 0xffffffff,
+    ];
+    let rows = include_str!("../fixtures/shader-core/encoded-values.tsv");
+    for (name, outputs) in [
+        ("encoded_alu", 56),
+        ("encoded_call", 8),
+        ("encoded_callc", 8),
+        ("encoded_empty_opcode", 8),
+        ("encoded_empty_operand", 8),
+        ("encoded_flow", 8),
+        ("encoded_min10", 8),
+        ("encoded_non_uniform", 8),
+        ("encoded_shared_raw", 8),
+        ("min_precision", 24),
+        ("swap_values", 16),
+    ] {
+        let module = module(name);
+        let native = gpu.run(name, &module, &input, outputs, 8);
+        let scalar = interpret_compute(&module, &input, outputs, 8);
+        assert_eq!(native, scalar, "{name}");
+        let mut measured = 0;
+        for line in rows.lines() {
+            let mut columns = line.split('\t');
+            let (kind, driver, fixture) = (
+                columns.next().unwrap(),
+                columns.next().unwrap(),
+                columns.next().unwrap(),
+            );
+            if kind != "encoded" || name != fixture {
+                continue;
+            }
+            let expected: Vec<_> = columns
+                .map(|value| u32::from_str_radix(value, 16).unwrap())
+                .collect();
+            assert_eq!(native, expected, "{name} ({driver})");
+            measured += 1;
+        }
+        assert_ne!(measured, 0, "{name} has no Windows readback");
     }
-    encoder.copy_image_to_buffer(
-        source(),
-        BufferCopy {
-            buffer: &readback,
-            offset: 0,
-            row_pitch: 0,
-            rows: 0,
-        },
-        size,
-    );
-    let token = gpu.queue.submit(encoder).unwrap();
-    assert!(gpu.queue.wait(token, Duration::from_secs(20)).unwrap());
-    // The readback copy has completed.
-    let bytes = unsafe { &*readback.mapped().unwrap().as_ptr() };
-    let actual: Vec<_> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .copied()
-        .map(u32::from_le_bytes)
-        .collect();
-    let expected = std::array::from_fn::<_, 8, _>(|i| initial[i].wrapping_add(i as u32));
-    assert_eq!(actual, expected);
 }

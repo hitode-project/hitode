@@ -26,11 +26,27 @@ pub struct ResourceAccess {
     /// Sampler slot and channel selection.
     pub sampler: Option<(u32, u8)>,
     pub operands: ResourceOperands,
+    pub controls: u32,
 }
 
 pub trait Resources {
     fn read(&mut self, access: ResourceAccess, arguments: &[Vector]) -> Result<Vector, Error>;
     fn atomic(&mut self, access: ResourceAccess, arguments: &[Vector]) -> Result<Vector, Error>;
+    /// Evaluate an input using the rasterizer state of this invocation.
+    /// Supplies the derivative of a source across the caller's pixel quad.
+    fn derivative(&mut self, instruction: &Instruction, _: Vector) -> Result<Vector, Error> {
+        Err(Error::UnsupportedOpcode(instruction.opcode))
+    }
+
+    fn interpolate(
+        &mut self,
+        instruction: Opcode,
+        _input: u32,
+        _swizzle: [u8; 4],
+        _arguments: &[Vector],
+    ) -> Result<Vector, Error> {
+        Err(Error::UnsupportedOpcode(instruction))
+    }
     fn write(
         &mut self,
         access: ResourceAccess,
@@ -209,12 +225,25 @@ impl<'a, R: Resources> Machine<'a, R> {
             .filter(|&(_, ty)| *ty != ValueType::Binding)
             .map(|(source, ty)| self.read(source, *ty, op.flush_inputs))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut values =
-            if src_types.contains(&ValueType::Binding) || dst_types.contains(&ValueType::Binding) {
-                self.resource(op, &args)?
-            } else {
-                alu::evaluate(op, &args)?
-            };
+        let mut values = if matches!(
+            op.opcode,
+            DerivRtx | DerivRty | DerivRtxCoarse | DerivRtyCoarse | DerivRtxFine | DerivRtyFine
+        ) {
+            [self.resources.derivative(op, args[0])?, [0; 4]]
+        } else if op.opcode.is_interpolation() {
+            let value = self.resources.interpolate(
+                op.opcode,
+                self.location(&op.sources[0])?.1,
+                op.sources[0].components.swizzle(),
+                &args,
+            )?;
+            [value, [0; 4]]
+        } else if src_types.contains(&ValueType::Binding) || dst_types.contains(&ValueType::Binding)
+        {
+            self.resource(op, &args)?
+        } else {
+            alu::evaluate(op, &args)?
+        };
         for (((destination, value), ty), index) in op
             .destinations
             .iter()
@@ -270,9 +299,10 @@ impl<'a, R: Resources> Machine<'a, R> {
             binding: binding.ok_or(Error::Invalid("resource operand"))?,
             sampler,
             operands: op.resource,
+            controls: op.controls,
         };
         let mut result = [[0; 4]; 2];
-        if op.opcode.is_atomic() {
+        if op.opcode.is_atomic() || op.opcode.is_counter() {
             result[0] = self.resources.atomic(access, args)?;
         } else if let Some((operand, _)) = output {
             if !matches!(

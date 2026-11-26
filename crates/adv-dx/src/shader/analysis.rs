@@ -13,6 +13,10 @@ pub struct Reflection {
     pub reads: HashMap<(Register, Option<u32>), u8>,
     pub writes: HashMap<(Register, Option<u32>), u8>,
     pub atomic_bindings: HashSet<(Register, u32)>,
+    pub counter_bindings: HashSet<u32>,
+    pub interpolation_queries: bool,
+    pub sample_positions: bool,
+    pub lod_queries: bool,
     pub global_flags: u32,
     pub feature_flags: u64,
     pub workgroup_size: Option<[u32; 3]>,
@@ -28,6 +32,10 @@ pub fn analyze(module: &Module) -> Reflection {
         reads: HashMap::new(),
         writes: HashMap::new(),
         atomic_bindings: HashSet::new(),
+        counter_bindings: HashSet::new(),
+        interpolation_queries: false,
+        sample_positions: false,
+        lod_queries: false,
         global_flags: 0,
         feature_flags: module.feature_flags,
         workgroup_size: None,
@@ -85,6 +93,9 @@ impl Reflection {
     }
 
     fn instruction(&mut self, op: &Instruction) {
+        self.interpolation_queries |= op.opcode.is_interpolation();
+        self.sample_positions |= op.opcode == Opcode::SamplePos;
+        self.lod_queries |= op.opcode == Opcode::Lod;
         let (destinations, sources) = op.opcode.types();
         self.doubles |=
             destinations.contains(&ValueType::Double) || sources.contains(&ValueType::Double);
@@ -115,6 +126,12 @@ impl Reflection {
             lanes
         };
         for operand in &op.sources {
+            if op.opcode.is_counter()
+                && let Some((Register::UnorderedAccessView, [slot])) = operand.register()
+                && let Some(slot) = slot.direct()
+            {
+                self.counter_bindings.insert(slot);
+            }
             let selected = operand
                 .components
                 .swizzle()

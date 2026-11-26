@@ -272,3 +272,6 @@ fn take_words<'a>(words: &mut &'a [u32], count: usize) -> Result<&'a [u32], Erro
 fn take_word(words: &mut &[u32]) -> Result<u32, Error> {
     Ok(take_words(words, 1)?[0])
 }
+
+#[cfg(test)]
+mod coverage;

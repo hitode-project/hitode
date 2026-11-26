@@ -100,7 +100,7 @@ opcodes! {
     Itof = D3D10_SB_OPCODE_ITOF, "itof", Operation, [Float], [Int];
     Label = D3D10_SB_OPCODE_LABEL, "label", Operation, [], [Opaque];
     Ld = D3D10_SB_OPCODE_LD, "ld", Operation, [Uint], [Int, Binding];
-    LdMs = D3D10_SB_OPCODE_LD_MS, "ld_ms", Operation, [Uint], [Int, Binding, Int];
+    LdMs = D3D10_SB_OPCODE_LD_MS, "ldms", Operation, [Uint], [Int, Binding, Int];
     Log = D3D10_SB_OPCODE_LOG, "log", Operation, [Float], [Float];
     Loop = D3D10_SB_OPCODE_LOOP, "loop", Flow, [], [];
     Lt = D3D10_SB_OPCODE_LT, "lt", Operation, [Uint], [Float, Float];
@@ -164,8 +164,8 @@ opcodes! {
     Reserved107 = D3D10_SB_OPCODE_RESERVED0, "reserved0", Reserved, [], [];
     Lod = D3D10_1_SB_OPCODE_LOD, "lod", Operation, [Float], [Float, Binding, Binding];
     Gather4 = D3D10_1_SB_OPCODE_GATHER4, "gather4", Operation, [Uint], [Float, Binding, Binding];
-    SamplePos = D3D10_1_SB_OPCODE_SAMPLE_POS, "sample_pos", Operation, [Float], [Binding, Uint];
-    SampleInfo = D3D10_1_SB_OPCODE_SAMPLE_INFO, "sample_info", Operation, [Float], [Binding];
+    SamplePos = D3D10_1_SB_OPCODE_SAMPLE_POS, "samplepos", Operation, [Float], [Binding, Uint];
+    SampleInfo = D3D10_1_SB_OPCODE_SAMPLE_INFO, "sampleinfo", Operation, [Float], [Binding];
     Reserved112 = D3D10_1_SB_OPCODE_RESERVED1, "reserved1", Reserved, [], [];
     HsDecls = D3D11_SB_OPCODE_HS_DECLS, "hs_decls", Operation, [], [];
     HsControlPointPhase = D3D11_SB_OPCODE_HS_CONTROL_POINT_PHASE, "hs_control_point_phase", Operation, [], [];
@@ -174,7 +174,7 @@ opcodes! {
     EmitStream = D3D11_SB_OPCODE_EMIT_STREAM, "emit_stream", Operation, [], [Binding];
     CutStream = D3D11_SB_OPCODE_CUT_STREAM, "cut_stream", Operation, [], [Binding];
     EmitthencutStream = D3D11_SB_OPCODE_EMITTHENCUT_STREAM, "emitthencut_stream", Operation, [], [Binding];
-    InterfaceCall = D3D11_SB_OPCODE_INTERFACE_CALL, "interface_call", Operation, [], [Opaque];
+    InterfaceCall = D3D11_SB_OPCODE_INTERFACE_CALL, "fcall", Operation, [], [Opaque];
     Bufinfo = D3D11_SB_OPCODE_BUFINFO, "bufinfo", Operation, [Int], [Binding];
     DerivRtxCoarse = D3D11_SB_OPCODE_DERIV_RTX_COARSE, "deriv_rtx_coarse", Operation, [Float], [Float];
     DerivRtxFine = D3D11_SB_OPCODE_DERIV_RTX_FINE, "deriv_rtx_fine", Operation, [Float], [Float];
@@ -273,26 +273,37 @@ opcodes! {
     Itod = D3D11_1_SB_OPCODE_ITOD, "itod", Operation, [Double], [Int];
     Utod = D3D11_1_SB_OPCODE_UTOD, "utod", Operation, [Double], [Uint];
     Reserved218 = D3D11_1_SB_OPCODE_RESERVED0, "reserved0", Reserved, [], [];
-    Gather4Feedback = D3DWDDM1_3_SB_OPCODE_GATHER4_FEEDBACK, "gather4_feedback", Operation, [Uint, Uint], [Float, Binding, Binding];
-    Gather4CFeedback = D3DWDDM1_3_SB_OPCODE_GATHER4_C_FEEDBACK, "gather4_c_feedback", Operation, [Float, Uint], [Float, Binding, Binding, Float];
-    Gather4PoFeedback = D3DWDDM1_3_SB_OPCODE_GATHER4_PO_FEEDBACK, "gather4_po_feedback", Operation, [Float, Uint], [Float, Int, Binding, Binding];
-    Gather4PoCFeedback = D3DWDDM1_3_SB_OPCODE_GATHER4_PO_C_FEEDBACK, "gather4_po_c_feedback", Operation, [Float, Uint], [Float, Int, Binding, Binding, Float];
-    LdFeedback = D3DWDDM1_3_SB_OPCODE_LD_FEEDBACK, "ld_feedback", Operation, [Uint, Uint], [Int, Binding];
-    LdMsFeedback = D3DWDDM1_3_SB_OPCODE_LD_MS_FEEDBACK, "ld_ms_feedback", Operation, [Uint, Uint], [Int, Binding, Int];
-    LdUavTypedFeedback = D3DWDDM1_3_SB_OPCODE_LD_UAV_TYPED_FEEDBACK, "ld_uav_typed_feedback", Operation, [Uint, Uint], [Int, Binding];
-    LdRawFeedback = D3DWDDM1_3_SB_OPCODE_LD_RAW_FEEDBACK, "ld_raw_feedback", Operation, [Uint, Uint], [Int, Binding];
-    LdStructuredFeedback = D3DWDDM1_3_SB_OPCODE_LD_STRUCTURED_FEEDBACK, "ld_structured_feedback", Operation, [Uint, Uint], [Int, Int, Binding];
-    SampleLFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_L_FEEDBACK, "sample_l_feedback", Operation, [Uint, Uint], [Float, Binding, Binding, Float];
-    SampleCLzFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_C_LZ_FEEDBACK, "sample_c_lz_feedback", Operation, [Float, Uint], [Float, Binding, Binding, Float];
-    SampleClampFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_CLAMP_FEEDBACK, "sample_clamp_feedback", Operation, [Uint, Uint], [Float, Binding, Binding, Float];
-    SampleBClampFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_B_CLAMP_FEEDBACK, "sample_b_clamp_feedback", Operation, [Uint, Uint], [Float, Binding, Binding, Float, Float];
-    SampleDClampFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_D_CLAMP_FEEDBACK, "sample_d_clamp_feedback", Operation, [Uint, Uint], [Float, Binding, Binding, Float, Float, Float];
-    SampleCClampFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_C_CLAMP_FEEDBACK, "sample_c_clamp_feedback", Operation, [Float, Uint], [Float, Binding, Binding, Float, Float];
+    Gather4Feedback = D3DWDDM1_3_SB_OPCODE_GATHER4_FEEDBACK, "gather4_s", Operation, [Uint, Uint], [Float, Binding, Binding];
+    Gather4CFeedback = D3DWDDM1_3_SB_OPCODE_GATHER4_C_FEEDBACK, "gather4_c_s", Operation, [Float, Uint], [Float, Binding, Binding, Float];
+    Gather4PoFeedback = D3DWDDM1_3_SB_OPCODE_GATHER4_PO_FEEDBACK, "gather4_po_s", Operation, [Float, Uint], [Float, Int, Binding, Binding];
+    Gather4PoCFeedback = D3DWDDM1_3_SB_OPCODE_GATHER4_PO_C_FEEDBACK, "gather4_po_c_s", Operation, [Float, Uint], [Float, Int, Binding, Binding, Float];
+    LdFeedback = D3DWDDM1_3_SB_OPCODE_LD_FEEDBACK, "ld_s", Operation, [Uint, Uint], [Int, Binding];
+    LdMsFeedback = D3DWDDM1_3_SB_OPCODE_LD_MS_FEEDBACK, "ldms_s", Operation, [Uint, Uint], [Int, Binding, Int];
+    LdUavTypedFeedback = D3DWDDM1_3_SB_OPCODE_LD_UAV_TYPED_FEEDBACK, "ld_uav_typed_s", Operation, [Uint, Uint], [Int, Binding];
+    LdRawFeedback = D3DWDDM1_3_SB_OPCODE_LD_RAW_FEEDBACK, "ld_raw_s", Operation, [Uint, Uint], [Int, Binding];
+    LdStructuredFeedback = D3DWDDM1_3_SB_OPCODE_LD_STRUCTURED_FEEDBACK, "ld_structured_s", Operation, [Uint, Uint], [Int, Int, Binding];
+    SampleLFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_L_FEEDBACK, "sample_l_s", Operation, [Uint, Uint], [Float, Binding, Binding, Float];
+    SampleCLzFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_C_LZ_FEEDBACK, "sample_c_lz_s", Operation, [Float, Uint], [Float, Binding, Binding, Float];
+    SampleClampFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_CLAMP_FEEDBACK, "sample_cl_s", Operation, [Uint, Uint], [Float, Binding, Binding, Float];
+    SampleBClampFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_B_CLAMP_FEEDBACK, "sample_b_cl_s", Operation, [Uint, Uint], [Float, Binding, Binding, Float, Float];
+    SampleDClampFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_D_CLAMP_FEEDBACK, "sample_d_cl_s", Operation, [Uint, Uint], [Float, Binding, Binding, Float, Float, Float];
+    SampleCClampFeedback = D3DWDDM1_3_SB_OPCODE_SAMPLE_C_CLAMP_FEEDBACK, "sample_c_cl_s", Operation, [Float, Uint], [Float, Binding, Binding, Float, Float];
     CheckAccessFullyMapped = D3DWDDM1_3_SB_OPCODE_CHECK_ACCESS_FULLY_MAPPED, "check_access_fully_mapped", Operation, [Uint], [Uint];
     Reserved235 = D3DWDDM1_3_SB_OPCODE_RESERVED0, "reserved0", Reserved, [], [];
 }
 
 impl Opcode {
+    pub(crate) fn is_counter(self) -> bool {
+        matches!(self, Self::ImmAtomicAlloc | Self::ImmAtomicConsume)
+    }
+
+    pub(crate) fn is_interpolation(self) -> bool {
+        matches!(
+            self,
+            Self::EvalCentroid | Self::EvalSampleIndex | Self::EvalSnapped
+        )
+    }
+
     pub(crate) fn is_atomic(self) -> bool {
         use Opcode::*;
         matches!(

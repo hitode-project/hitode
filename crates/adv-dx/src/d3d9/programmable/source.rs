@@ -53,7 +53,7 @@ pub(super) fn build_with_fixed(
     inputs: &[Input],
     slots: &[(bool, u8)],
     features: (bool, u32, bool, u32),
-    fixed_vertex: Option<&fixed_vertex::Variant>,
+    fixed_vertex: Option<&VertexProgram>,
 ) -> Result<String, u32> {
     let (second, clip, fog, fixed) = features;
     let specular = ps.is_none() && fixed & 2 != 0;
@@ -118,7 +118,7 @@ pub(super) fn build_with_fixed(
         s.push_str(&t.source);
     }
     if fixed_vertex.is_some() {
-        s.push_str(fixed_vertex::HELPERS);
+        s.push_str(fixed_core::HELPERS);
     }
     s.push_str("@vertex fn vertex_main(@builtin(vertex_index) ordinal:u32,");
     let transformed = vs.is_none() && inputs.iter().any(|i| i.register == 0);
