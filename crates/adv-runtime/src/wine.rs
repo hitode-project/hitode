@@ -352,7 +352,17 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
         fast_forward: |_| false,
         guest_frame_wait: winmm::frame_timer::take,
         insert: |ext, target| ext.get_mut::<Surfaces<Snapshot>>().insert_native(target),
-        target: |ext, id| ext.get::<Surfaces<Snapshot>>().native_target(id).cloned(),
+        target: |ext, id| ext.get::<Surfaces<Snapshot>>().native_target(id),
+        cpu_access: |ext, id, rect| ext.get::<Surfaces<Snapshot>>().cpu_readback(id, rect),
+        gpu_access: |env, id, rect, access| {
+            let store = env.ext.get_mut::<Surfaces<Snapshot>>();
+            let mut target = store.native_target(id)?;
+            let rect = rect.unwrap_or_else(|| store[id].rect());
+            target.image = store
+                .gpu_access(id, rect, access, &guest_memory(env.cpu))
+                .ok()?;
+            Some(target)
+        },
         remove: |ext, _, id| {
             if ext.get_mut::<Surfaces<Snapshot>>().delete(id) {
                 Ok(())

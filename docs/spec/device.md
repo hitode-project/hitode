@@ -33,6 +33,11 @@ If device loss cancels an explicit flush completion, the owner wakes and closes 
 **Rule**: Each consumer MUST accumulate history since its last converted serial, preserve undamaged BGRA pixels, and fully convert when history is missing. Damage MUST be a region of 8x8-pixel cells covering every changed pixel, so distant changes stay apart and no layer merges them into bounds. Bottom-up storage and indexed palettes MUST preserve exact pixels.
 **Verification**: Test
 
+### DEV-FRAME-13 Surface residency
+
+**Rule**: Dual copies MUST have disjoint stale regions on the DEV-FRAME-5 cell grid, with empty stale regions for single copies. Access MUST synchronize only stale cells touched by the rectangle. A write MUST mark the other copy stale across its conservative bounds.
+**Verification**: Test
+
 ### DEV-FRAME-6 Full-frame transitions
 
 **Rule**: Writable DirectDraw Unlock MUST damage its locked rectangle, while read-only Unlock MUST NOT publish. Unrestricted locks, palette changes, storage flips, and size/format changes MUST damage the whole surface. Video composition and removal MUST rebuild the full base before unchanged composition.
