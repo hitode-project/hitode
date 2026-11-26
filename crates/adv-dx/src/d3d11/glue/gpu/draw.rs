@@ -11,7 +11,8 @@ use crate::{
         wgsl::{
             self, Options, Translation,
             pulled::{
-                self, InputStep, VERTEX_STREAM_BASE, VertexComponent, VertexFetch, VertexFormat,
+                self, DRAW_ARGUMENTS_SLOT, DrawStart, InputStep, VERTEX_STREAM_BASE,
+                VertexComponent, VertexFetch, VertexFormat,
             },
         },
     },
@@ -37,7 +38,7 @@ enum DrawRange {
         instances: Range<u32>,
         base_vertex: i32,
     },
-    Indirect(BufferRange),
+    Indirect(BufferRange, ResourceKey),
 }
 
 impl DrawRange {
@@ -69,14 +70,28 @@ impl DrawRange {
                 instances: instances.clone(),
                 base_vertex: *base_vertex,
             },
-            Self::Indirect(buffer) => DrawArguments::Indirect(buffer.clone()),
+            Self::Indirect(buffer, _) => DrawArguments::Indirect(buffer.clone()),
         }
     }
 
-    fn instance_start(&self) -> u32 {
+    fn start(&self, indexed: bool) -> DrawStart {
         match self {
-            Self::Direct { instances, .. } => instances.start,
-            Self::Indirect(_) => 0,
+            Self::Direct {
+                vertices,
+                instances,
+                base_vertex,
+            } => DrawStart::Direct {
+                vertex: if indexed {
+                    *base_vertex as u32
+                } else {
+                    vertices.start
+                },
+                instance: instances.start,
+            },
+            Self::Indirect(args, _) => DrawStart::Indirect {
+                first_word: (args.range.start / 4) as u32,
+                indexed,
+            },
         }
     }
 }
@@ -120,18 +135,18 @@ pub(in crate::d3d11::glue) fn draw_indirect(env: &mut Env<'_>) -> Result<(), Err
     if null_device(env)? {
         return Ok(());
     }
-    let args = indirect(env, 16)?;
-    render(env, false, DrawRange::Indirect(args))
+    let (args, resource) = indirect(env, 16)?;
+    render(env, false, DrawRange::Indirect(args, resource))
 }
 pub(in crate::d3d11::glue) fn draw_indexed_indirect(env: &mut Env<'_>) -> Result<(), Error> {
     if null_device(env)? {
         return Ok(());
     }
-    let args = indirect(env, 20)?;
-    render(env, true, DrawRange::Indirect(args))
+    let (args, resource) = indirect(env, 20)?;
+    render(env, true, DrawRange::Indirect(args, resource))
 }
 
-fn indirect(env: &mut Env<'_>, length: u32) -> Result<BufferRange, Error> {
+fn indirect(env: &mut Env<'_>, length: u32) -> Result<(BufferRange, ResourceKey), Error> {
     let (pointer, offset) = (env.arg(1), env.arg(2));
     let desc = description(env, pointer)?;
     let Resource::Buffer(buffer) = desc else {
@@ -148,10 +163,13 @@ fn indirect(env: &mut Env<'_>, length: u32) -> Result<BufferRange, Error> {
     let Backing::Buffer(buffer) = backing(env, pointer, desc)? else {
         unreachable!()
     };
-    Ok(BufferRange {
-        buffer,
-        range: u64::from(offset)..u64::from(offset + length),
-    })
+    Ok((
+        BufferRange {
+            buffer,
+            range: u64::from(offset)..u64::from(offset + length),
+        },
+        key(env, pointer, 0),
+    ))
 }
 
 fn pipeline<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a PipelineState> {
@@ -812,7 +830,7 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
             pixel_reflection.map(|(_, reflection)| reflection),
             options,
             &fetches,
-            args.instance_start(),
+            args.start(indexed),
         )
         .map_err(shader_error)?;
         let vertex = modern_shader(&vertex_code, adv_gpu::shader::Stage::Vertex)?;
@@ -831,6 +849,17 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
     };
     let mut reads = Vec::new();
     let mut vertex_bindings = slots_for(env, &snapshot, Stage::Vertex, &vertex_code, &mut reads)?;
+    if let DrawRange::Indirect(args, resource) = &args {
+        reads.push(*resource);
+        set_slot(
+            &mut vertex_bindings.storage,
+            DRAW_ARGUMENTS_SLOT as usize,
+            StorageBinding::Buffer(BufferRange {
+                buffer: args.buffer.clone(),
+                range: 0..args.buffer.desc().size,
+            }),
+        );
+    }
     let fragment_bindings = pixel_code
         .as_ref()
         .map(|code| slots_for(env, &snapshot, Stage::Pixel, code, &mut reads))
@@ -880,7 +909,7 @@ fn render(env: &mut Env<'_>, indexed: bool, args: DrawRange) -> Result<(), Error
             };
             (count * instances, primitives * instances)
         }
-        DrawRange::Indirect(_) => (0, 0),
+        DrawRange::Indirect(..) => (0, 0),
     };
     let (occlusion, statistics) = queries::draw_slots(env, vertices, primitives)?;
     let predicate = queries::predicate(
@@ -979,17 +1008,22 @@ pub(in crate::d3d11::glue) fn dispatch(env: &mut Env<'_>) -> Result<(), Error> {
     compute(
         env,
         DispatchArguments::Direct([env.arg(1), env.arg(2), env.arg(3)]),
+        None,
     )
 }
 pub(in crate::d3d11::glue) fn dispatch_indirect(env: &mut Env<'_>) -> Result<(), Error> {
     if null_device(env)? {
         return Ok(());
     }
-    let arguments = indirect(env, 12)?;
-    compute(env, DispatchArguments::Indirect(arguments))
+    let (arguments, resource) = indirect(env, 12)?;
+    compute(env, DispatchArguments::Indirect(arguments), Some(resource))
 }
 
-fn compute(env: &mut Env<'_>, arguments: DispatchArguments) -> Result<(), Error> {
+fn compute(
+    env: &mut Env<'_>,
+    arguments: DispatchArguments,
+    indirect_read: Option<ResourceKey>,
+) -> Result<(), Error> {
     if null_device(env)? {
         return Ok(());
     }
@@ -1063,6 +1097,7 @@ fn compute(env: &mut Env<'_>, arguments: DispatchArguments) -> Result<(), Error>
     )
     .map_err(shader_error)?;
     let mut reads = Vec::new();
+    reads.extend(indirect_read);
     let bindings = slots_for(env, &snapshot, Stage::Compute, &code, &mut reads)?;
     let execution = execution(env.ext)?;
     let pipeline = Arc::new(

@@ -33,7 +33,7 @@ impl Backing {
                 usage |= BufferUsage::STORAGE;
             }
             if resource.misc().contains(Misc::INDIRECT) {
-                usage |= BufferUsage::INDIRECT;
+                usage |= BufferUsage::INDIRECT | BufferUsage::STORAGE;
             }
             return Ok(Self::Buffer(gpu.device().create_buffer(&BufferDesc {
                 size: u64::from(buffer.size()).next_multiple_of(4),

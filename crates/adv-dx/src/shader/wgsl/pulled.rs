@@ -197,6 +197,13 @@ pub(crate) fn raster(
 
 /// Storage slots above the shader-resource and expansion bindings.
 pub const VERTEX_STREAM_BASE: u32 = 192;
+pub const DRAW_ARGUMENTS_SLOT: u32 = 224;
+
+#[derive(Clone, Copy, Debug)]
+pub enum DrawStart {
+    Direct { vertex: u32, instance: u32 },
+    Indirect { first_word: u32, indexed: bool },
+}
 
 #[derive(Clone, Copy, Debug, Hash)]
 pub enum InputStep {
@@ -237,7 +244,7 @@ pub fn vertex(
     fragment: Option<&Reflection>,
     options: Options<'_>,
     fetches: &[VertexFetch],
-    instance_start: u32,
+    start: DrawStart,
 ) -> Result<Translation, Error> {
     use std::collections::BTreeSet;
     let pulled = emit(module, &variant.pull_input(), Invocation::Vertex, options)?;
@@ -268,24 +275,45 @@ pub fn vertex(
         ));
         writer.close();
     }
+    let (vertex_start, instance_start) = match start {
+        DrawStart::Direct { vertex, instance } => (format!("{vertex}u"), format!("{instance}u")),
+        DrawStart::Indirect {
+            first_word,
+            indexed,
+        } => {
+            writer.line(&format!(
+                "@group(3) @binding({DRAW_ARGUMENTS_SLOT}) var<storage, read> dx_draw: array<u32>;"
+            ));
+            let vertex_word = first_word + if indexed { 3 } else { 2 };
+            (
+                format!("dx_draw[{vertex_word}u]"),
+                format!("dx_draw[{}u]", vertex_word + 1),
+            )
+        }
+    };
     writer.open("struct DxPulledVertex");
     writer.line("@builtin(position) position: vec4<f32>,");
     writer.varying_fields(&interface);
     writer.clip_field(&interface);
     writer.close();
     writer.open("@vertex fn vertex_main(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> DxPulledVertex");
+    writer.line(&format!("let instance_start = {instance_start};"));
     writer.line(&format!("var v: array<vec4<u32>, {}>;", pulled.inputs));
     for input in &reflection.signatures.input {
         match input.system_value {
-            SystemValue::VertexId => writer.line(&format!("v[{}].x = vertex_id;", input.register)),
-            SystemValue::InstanceId => {
-                writer.line(&format!("v[{}].x = instance_id;", input.register))
-            }
+            SystemValue::VertexId => writer.line(&format!(
+                "v[{}].x = vertex_id - {vertex_start};",
+                input.register
+            )),
+            SystemValue::InstanceId => writer.line(&format!(
+                "v[{}].x = instance_id - instance_start;",
+                input.register
+            )),
             _ => (),
         }
     }
     for (index, fetch) in fetches.iter().enumerate() {
-        emit_fetch(&mut writer, index, *fetch, instance_start)?;
+        emit_fetch(&mut writer, index, *fetch)?;
     }
     writer.line("let o = dx_run(v);");
     let mut outputs = vec![format!("bitcast<vec4<f32>>(o[{position}])")];
@@ -301,12 +329,7 @@ pub fn vertex(
     })
 }
 
-fn emit_fetch(
-    writer: &mut Writer<'_>,
-    index: usize,
-    fetch: VertexFetch,
-    instance_start: u32,
-) -> Result<(), Error> {
+fn emit_fetch(writer: &mut Writer<'_>, index: usize, fetch: VertexFetch) -> Result<(), Error> {
     use VertexComponent::*;
     let VertexFetch {
         register,
@@ -319,9 +342,9 @@ fn emit_fetch(
     } = fetch;
     let index_expr = match step {
         InputStep::Vertex => "vertex_id".into(),
-        InputStep::Instance(0) => format!("{instance_start}u"),
+        InputStep::Instance(0) => "instance_start".into(),
         InputStep::Instance(rate) => {
-            format!("{instance_start}u + (instance_id - {instance_start}u) / {rate}u")
+            format!("instance_start + (instance_id - instance_start) / {rate}u")
         }
     };
     let address = format!("dx_address_{index}");

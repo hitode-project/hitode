@@ -1,4 +1,5 @@
 use super::*;
+use crate::d3d11::desc::Misc;
 use adv_abi::types::{D3D11_INPUT_ELEMENT_DESC, D3D11_SUBRESOURCE_DATA};
 use adv_device::gpu::Gpu;
 
@@ -408,6 +409,104 @@ fn windows_fill_and_sampling_rows_through_guest_vtables() {
         assert_eq!(method(&mut machine, context, 47, &[staging, target]), 0);
         // The D3D11 filtering precision allowance covers one 8-bit output code.
         assert_rows(&mut machine, context, staging, name, u8::from(filter != 0));
+    }
+
+    machine
+        .cpu
+        .write(ARRAY + 64, b"POSITION\0TEXCOORD\0")
+        .unwrap();
+    let mut elements = elements;
+    elements[0].SemanticName = ARRAY + 64;
+    elements[1].SemanticName = ARRAY + 73;
+    elements[1].InputSlot = 1;
+    elements[1].AlignedByteOffset = 0;
+    elements[1].InputSlotClass = 1;
+    elements[1].InstanceDataStepRate = 2;
+    machine
+        .cpu
+        .write(DESCRIPTOR, bytemuck::cast_slice(&elements))
+        .unwrap();
+    let layout = create_object(
+        &mut machine,
+        device,
+        11,
+        &[DESCRIPTOR, 2, CODE_BYTES, vs_bytes.len() as u32],
+    );
+    assert_eq!(method(&mut machine, context, 17, &[layout]), 0);
+    let uv = buffer(&mut machine, device, Bind::VERTEX, 32);
+    update_dynamic(
+        &mut machine,
+        context,
+        uv,
+        &[
+            [0.125f32, 0.125],
+            [0.375, 0.125],
+            [0.625, 0.125],
+            [0.875, 0.125],
+        ],
+    );
+    update_dynamic(&mut machine, context, vb, &vertices);
+    write_value(&mut machine, ARRAY + 80, [vb, uv, 24, 8, 0, 0]);
+    assert_eq!(
+        method(
+            &mut machine,
+            context,
+            18,
+            &[0, 2, ARRAY + 80, ARRAY + 88, ARRAY + 96]
+        ),
+        0
+    );
+
+    write_value(
+        &mut machine,
+        DESCRIPTOR,
+        D3D11_SAMPLER_DESC {
+            AddressU: 3,
+            AddressV: 3,
+            AddressW: 3,
+            ComparisonFunc: 1,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        },
+    );
+    let sampler = create_object(&mut machine, device, 23, &[DESCRIPTOR]);
+    write_value(&mut machine, ARRAY + 28, sampler);
+    assert_eq!(method(&mut machine, context, 10, &[0, 1, ARRAY + 28]), 0);
+
+    for (slot, args) in [(40, [0, 6, 2, 1, 3, 0]), (39, [0, 6, 2, 1, 0, 3])] {
+        write_value(&mut machine, ARRAY + 104, args);
+        write_value(
+            &mut machine,
+            INIT,
+            D3D11_SUBRESOURCE_DATA {
+                pSysMem: ARRAY + 104,
+                ..Default::default()
+            },
+        );
+        write_value(
+            &mut machine,
+            DESCRIPTOR,
+            D3D11_BUFFER_DESC {
+                ByteWidth: 24,
+                MiscFlags: Misc::INDIRECT,
+                ..Default::default()
+            },
+        );
+        let indirect = create_object(&mut machine, device, 3, &[DESCRIPTOR, INIT]);
+        write_value(&mut machine, DESCRIPTOR, [0.0f32; 4]);
+        assert_eq!(method(&mut machine, context, 50, &[rtv, DESCRIPTOR]), 0);
+        assert_eq!(method(&mut machine, context, slot, &[indirect, 4]), 0);
+        assert_eq!(method(&mut machine, context, 47, &[staging, target]), 0);
+        let mapped = map(&mut machine, context, staging, 1);
+        assert_eq!(
+            machine
+                .cpu
+                .read_u32(mapped.pData + mapped.RowPitch + 4)
+                .unwrap(),
+            texels[3],
+            "slot {slot}"
+        );
+        assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
     }
 }
 
