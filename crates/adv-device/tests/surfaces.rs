@@ -1793,7 +1793,6 @@ fn declared_damage_shrinks_to_changed_tiles_against_the_last_publication() {
 }
 
 #[test]
-// spec: GFX-DDRAW-4
 fn source_color_keys_skip_keyed_pixels_when_copying_and_scaling() {
     let mut m = Memory::new(false);
     let mut s = store();
