@@ -33,6 +33,32 @@ pub fn set_game_mode(app: &AppHandle, active: bool) -> tauri::Result<()> {
     set_activity_flag(app, "setGameMode", active)
 }
 
+/// Runs `prepare` on the activity UI thread and enters game mode if it returns
+/// `true`. Used when a hidden script shows a window so audio-focus gating is
+/// armed right before `setGameMode(true)` requests focus.
+pub fn enter_game_mode_if(
+    app: &AppHandle,
+    prepare: impl FnOnce() -> bool + Send + 'static,
+) -> tauri::Result<()> {
+    app.get_webview_window("main")
+        .ok_or(tauri::Error::WebviewNotFound)?
+        .with_webview(move |webview| {
+            webview.jni_handle().exec(move |env, activity, _| {
+                if !prepare() {
+                    return;
+                }
+                if let Err(error) = env.call_method(
+                    activity,
+                    "setGameMode",
+                    "(Z)V",
+                    &[JValue::Bool(true.into())],
+                ) {
+                    log::error!("setGameMode: {error}");
+                }
+            });
+        })
+}
+
 #[tauri::command]
 pub fn set_launcher_back(app: AppHandle, enabled: bool) -> Result<(), String> {
     set_activity_flag(&app, "setLauncherBack", enabled).map_err(|error| error.to_string())
