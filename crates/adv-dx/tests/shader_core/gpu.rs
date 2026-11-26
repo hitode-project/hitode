@@ -1,6 +1,10 @@
 use super::module;
 #[path = "gpu/alu.rs"]
 mod alu;
+#[path = "gpu/raster.rs"]
+mod raster;
+#[path = "gpu/resources.rs"]
+mod resources;
 use adv_device::gpu::{ConstantBlock, DrawState, Program, ProgrammableDraw};
 use adv_dx::shader::{
     ir::{self, BindingKind, Opcode, Register, Vector, interpreter::*},
@@ -326,123 +330,4 @@ fn programmable_pixels_match_scalar_ir() {
             );
         }
     }
-}
-
-#[test]
-fn typed_uav_uses_the_bound_storage_format() {
-    use adv_gpu::{
-        Extent, Format,
-        encode::{BufferCopy, ImageCopy},
-        resource::{Dimension, ImageDesc, Usage},
-    };
-    let mut gpu = Compute::open();
-    let module = module("typed_uav");
-    let translation = wgsl::emit(
-        &module,
-        wgsl::Options {
-            storage_formats: &[(1, naga::StorageFormat::R32Uint)],
-        },
-    )
-    .unwrap();
-    let shader = gpu
-        .device
-        .create_shader(ShaderDesc {
-            source: Source::Wgsl(&translation.source),
-            identity: 1,
-            label: "typed UAV",
-        })
-        .unwrap();
-    let pipeline = gpu
-        .device
-        .create_compute_pipeline(
-            &ComputePipelineDesc {
-                entry: shader
-                    .entry(translation.entry_point, Stage::Compute)
-                    .unwrap(),
-                bindings: vec![Binding {
-                    slot: translation.locations[0].binding,
-                    kind: GpuBinding::StorageImage {
-                        format: Format::R32Uint,
-                        writable: true,
-                    },
-                    stages: Stages::COMPUTE,
-                }],
-                label: "typed UAV",
-            },
-            None,
-        )
-        .unwrap();
-    let size = Extent {
-        width: 8,
-        height: 1,
-        depth_or_layers: 1,
-    };
-    let image = gpu
-        .device
-        .create_image(&ImageDesc {
-            dimension: Dimension::D2,
-            size,
-            format: Format::R32Uint,
-            mips: 1,
-            samples: 1,
-            usage: Usage::STORAGE | Usage::COPY_SRC | Usage::COPY_DST,
-            view_formats: &[],
-            label: "typed UAV",
-        })
-        .unwrap();
-    let upload = gpu.buffer(32, BufferUsage::COPY_SRC, Memory::Upload);
-    let readback = gpu.buffer(32, BufferUsage::COPY_DST, Memory::Readback);
-    let initial: [u32; 8] = [1, 3, 11, 53, 17, 19, 21, u32::MAX];
-    // No submission references this upload mapping.
-    let upload_bytes = unsafe { &mut *upload.mapped().unwrap().as_ptr() };
-    upload_bytes.copy_from_slice(bytemuck::cast_slice(&initial));
-    let mut encoder = gpu.queue.encoder("typed UAV");
-    let source = || ImageCopy {
-        image: &image,
-        mip: 0,
-        layer: 0,
-        origin: (0, 0, 0),
-    };
-    encoder.copy_buffer_to_image(
-        BufferCopy {
-            buffer: &upload,
-            offset: 0,
-            row_pitch: 0,
-            rows: 0,
-        },
-        source(),
-        size,
-    );
-    {
-        let mut pass = encoder.compute_pass(&ComputePassDesc {
-            timestamps: None,
-            label: "typed UAV",
-        });
-        pass.set_pipeline(&pipeline);
-        pass.bind(1, Bind::StorageImage(image.view()));
-        pass.dispatch(1, 1, 1);
-    }
-    encoder.copy_image_to_buffer(
-        source(),
-        BufferCopy {
-            buffer: &readback,
-            offset: 0,
-            row_pitch: 0,
-            rows: 0,
-        },
-        size,
-    );
-    let token = gpu.queue.submit(encoder).unwrap();
-    assert!(gpu.queue.wait(token, Duration::from_secs(20)).unwrap());
-    // The readback copy has completed.
-    let bytes = unsafe { &*readback.mapped().unwrap().as_ptr() };
-    let actual: Vec<_> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .copied()
-        .map(u32::from_le_bytes)
-        .collect();
-    let expected = std::array::from_fn::<_, 8, _>(|i| initial[i].wrapping_add(i as u32));
-    assert_eq!(actual, expected);
 }

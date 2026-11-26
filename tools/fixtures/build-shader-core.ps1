@@ -60,9 +60,20 @@ foreach ($level in @('9_1', '9_3')) {
     Compile dxbc.hlsl ps "ps_4_0_level_$level" "ps_4_0_level_$level"
 }
 
-foreach ($entry in @('arithmetic', 'control', 'typed_uav', 'doubles', 'atomics', 'raw')) {
+foreach ($entry in @(
+    'arithmetic', 'control', 'typed_uav', 'doubles', 'atomics', 'raw',
+    'buffer_views', 'packed_buffer', 'counters', 'texture_atomic', 'texture_atomic_return',
+    'integer_ops', 'atomic_modes', 'float_ops', 'bit_ops', 'branches'
+)) {
     Compile shader-core.hlsl $entry cs_5_0 $entry
 }
-foreach ($entry in @('color', 'discard_pixel', 'texture_ops')) {
+foreach ($entry in @(
+    'color', 'discard_pixel', 'texture_ops', 'raster_queries', 'raster_samples', 'dynamic_gather',
+    'dynamic_gather_compare', 'level_query', 'derivative_queries', 'multisample_queries',
+    'sample_modes', 'coverage', 'early_depth', 'indexed_inputs',
+    'residency', 'linkage'
+)) {
     Compile shader-core.hlsl $entry ps_5_0 $entry
 }
+Compile shader-core.hlsl vertex_sample vs_5_0 vertex_sample
+Compile shader-core.hlsl derivatives_4_0 ps_4_0 derivatives_4_0

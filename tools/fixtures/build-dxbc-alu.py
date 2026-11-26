@@ -17,12 +17,13 @@ FLOAT_BINARY = {
     "dp2-(a,b)(b,a)",
 }
 FLOAT_UNARY = {
-    "mov-sat", "neg-abs", "rcp", "rsq", "sqrt", "exp", "log", "sin", "cos", "frc",
+    "mov-sat", "neg-abs", "abs", "neg", "mov", "rcp", "rsq", "sqrt", "exp", "log", "sin", "cos", "frc",
     "round_ne", "round_ni", "round_pi", "round_z", "ftoi", "ftou", "f32tof16",
 }
 INT_BINARY = {
     "ishl", "ishr", "ushr", "imul", "udiv", "urem", "imin", "umax", "ilt", "ult",
-    "iadd", "bfi-8-at-4",
+    "iadd", "bfi-8-at-4", "and", "or", "xor", "ieq", "ine", "ige", "uge",
+    "imax", "umin", "imad-7", "movc-7",
 }
 INT_UNARY = {
     "itof", "utof", "f16tof32", "countbits", "firstbit_hi", "firstbit_lo", "firstbit_shi",
@@ -59,12 +60,12 @@ def cases(rows, floats, integers):
 
 def vectors(rows, floats, integers):
     float_output = (FLOAT_BINARY - {"eq", "ne", "lt", "ge"}) | {
-        "mov-sat", "neg-abs", "rcp", "rsq", "sqrt", "exp", "log", "sin", "cos", "frc",
+        "mov-sat", "neg-abs", "abs", "neg", "rcp", "rsq", "sqrt", "exp", "log", "sin", "cos", "frc",
         "round_ne", "round_ni", "round_pi", "round_z", "itof", "utof", "f16tof32",
     }
     for name, args, hardware, warp in cases(rows, floats, integers):
         mode = "bits"
-        if name in {"eq", "ne", "lt", "ge", "ilt", "ult"}:
+        if name in {"eq", "ne", "lt", "ge", "ilt", "ult", "ieq", "ine", "ige", "uge"}:
             hardware = 0xFFFFFFFF if hardware else 0
             warp = 0xFFFFFFFF if warp else 0
         if name in {"firstbit_hi", "firstbit_shi"} and hardware != 0xFFFFFFFF:
@@ -89,6 +90,9 @@ def vectors(rows, floats, integers):
             mode = "half_nan"
         if name in float_output and math.isnan(bits_float(hardware)) and math.isnan(bits_float(warp)):
             mode = "nan"
+        if name in {"imad-7", "movc-7"}:
+            name = name.removesuffix("-7")
+            args.append(7)
         yield [name, mode, f"{hardware:08x}", f"{warp:08x}", *(f"{word:08x}" for word in args)]
 
 
@@ -97,18 +101,31 @@ def main():
     parser.add_argument("dump", type=Path)
     parser.add_argument("probe", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--raster-output", type=Path)
     args = parser.parse_args()
     source = args.probe.read_text()
     rows = {"hw": {}, "warp": {}}
+    raster = {"hw": {}, "warp": {}}
     with args.dump.open() as stream:
         for tag, *fields in csv.reader(stream, delimiter="\t"):
             if tag == "op" and not fields[1].startswith("d:"):
                 driver, name, _, row, *results = fields
                 rows[driver].setdefault(name, {})[int(row)] = [int(value, 16) for value in results]
+            if tag == "raster":
+                driver, name, row, *results = fields
+                raster[driver][name, row] = results
     with args.output.open("w", newline="") as stream:
         csv.writer(stream, delimiter="\t", lineterminator="\n").writerows(
             vectors(rows, probe_values(source, "fvals"), probe_values(source, "ivals"))
         )
+    if args.raster_output:
+        if not raster["hw"] or raster["hw"].keys() != raster["warp"].keys():
+            raise ValueError("the raster oracle requires paired hardware and WARP rows")
+        with args.raster_output.open("w", newline="") as stream:
+            csv.writer(stream, delimiter="\t", lineterminator="\n").writerows(
+                [name, row, *hardware, *raster["warp"][name, row]]
+                for (name, row), hardware in raster["hw"].items()
+            )
 
 
 if __name__ == "__main__":
