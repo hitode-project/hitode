@@ -220,7 +220,7 @@ impl<P: Presenter> Surfaces<P> {
                 ticket.take_completion_job().unwrap()();
                 let pixels = ticket.poll().unwrap().map_err(gpu_error)?;
                 let bytes = layout.format.bytes() as usize;
-                let mut rows = pixels.chunks_exact(4);
+                let mut rows = pixels.as_chunks::<4>().0.iter();
                 let mut row = Vec::new();
                 for part in parts {
                     for y in part.y..part.y + part.h {
