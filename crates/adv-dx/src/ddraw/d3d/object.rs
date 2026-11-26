@@ -8,6 +8,12 @@ use std::collections::BTreeMap;
 
 pub(super) enum Object {
     Device(Box<Device>),
+    VertexBuffer {
+        desc: adv_abi::types::D3DVERTEXBUFFERDESC,
+        data: u32,
+        size: u32,
+        locked: bool,
+    },
     Material([u32; 20]),
     Viewport {
         device: Option<u32>,
@@ -21,6 +27,7 @@ pub(super) enum Object {
 }
 
 pub(in crate::ddraw) struct Device {
+    pub kind: super::caps::Device,
     pub parent: u32,
     pub target: u32,
     pub viewports: Vec<u32>,
@@ -32,8 +39,9 @@ pub(in crate::ddraw) struct Device {
 }
 
 impl Device {
-    pub fn new(parent: u32, target: u32) -> Self {
+    pub fn new(kind: super::caps::Device, parent: u32, target: u32) -> Self {
         Self {
+            kind,
             parent,
             target,
             viewports: Vec::new(),
@@ -148,6 +156,30 @@ pub(super) fn attachment<P: Presenter>(
         return INVALID;
     };
     let child = com.canonical(objects, identity).unwrap();
+    let parent = if viewport {
+        if let Some(identity) = com.identity::<Object>(objects, parent) {
+            let canonical = com.canonical(objects, identity).unwrap();
+            if !matches!(
+                com.get::<Object>(objects, canonical),
+                Some(Object::Device(_))
+            ) {
+                return INVALID;
+            }
+            canonical
+        } else if !draw.d3d_surface_devices.contains_key(&parent) {
+            return INVALID;
+        } else {
+            parent
+        }
+    } else {
+        if !matches!(
+            com.get::<Object>(objects, parent),
+            Some(Object::Viewport { .. })
+        ) {
+            return INVALID;
+        }
+        parent
+    };
     let children = if viewport {
         let Some(Object::Viewport { device, .. }) = com.get_mut::<Object>(objects, child) else {
             return INVALID;
@@ -156,10 +188,7 @@ pub(super) fn attachment<P: Presenter>(
             return INVALID;
         }
         *device = add.then_some(parent);
-        let Some(device) = super::device_mut(draw, objects, parent) else {
-            return INVALID;
-        };
-        &mut device.viewports
+        &mut super::device_mut(draw, objects, parent).unwrap().viewports
     } else {
         let Some(Object::Light { viewport, .. }) = com.get_mut::<Object>(objects, child) else {
             return INVALID;

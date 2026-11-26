@@ -1,4 +1,10 @@
-use super::*;
+//! Assemble shared fixed-function and translated legacy stages.
+use super::{Input, STAGE_ARGUMENTS, VertexProgram};
+use crate::shader::{Shader, Translation};
+use adv_device::gpu::AttributeFormat;
+
+const INVALID: u32 = 0x8876086c;
+const UNAVAILABLE: u32 = 0x8876086a;
 use std::fmt::Write;
 
 const TYPES: &str = r#"
@@ -33,7 +39,7 @@ struct Interpolated {
  @location(10) clip0:vec4<f32>, @location(11) clip1:vec2<f32>, @location(12) fog:f32,
 }
 "#;
-pub(super) fn build(
+pub(crate) fn build(
     vs: Option<&Shader>,
     ps: Option<&Shader>,
     vt: Option<&Translation>,
@@ -42,25 +48,70 @@ pub(super) fn build(
     slots: &[(bool, u8)],
     features: (bool, u32, bool, u32),
 ) -> Result<String, u32> {
-    build_with_fixed(vs, ps, vt, pt, inputs, slots, features, None)
+    build_with_fixed([vs, ps], [vt, pt], inputs, slots, features, None)
 }
-#[allow(clippy::too_many_arguments)]
-pub(super) fn build_with_fixed(
-    vs: Option<&Shader>,
-    ps: Option<&Shader>,
-    vt: Option<&Translation>,
-    pt: Option<&Translation>,
+pub(crate) fn build_with_fixed(
+    shaders: [Option<&Shader>; 2],
+    translations: [Option<&Translation>; 2],
     inputs: &[Input],
     slots: &[(bool, u8)],
     features: (bool, u32, bool, u32),
     fixed_vertex: Option<&VertexProgram>,
+) -> Result<String, u32> {
+    build_program(
+        shaders,
+        translations,
+        inputs,
+        slots,
+        features,
+        fixed_vertex,
+        None,
+    )
+}
+
+pub(crate) fn build_legacy(
+    vertex: &VertexProgram,
+    inputs: &[Input],
+    features: (u32, bool, u32),
+    legacy: Legacy,
+) -> Result<String, u32> {
+    let slots = (0..legacy.stages)
+        .map(|slot| (false, slot))
+        .collect::<Vec<_>>();
+    build_program(
+        [None; 2],
+        [None; 2],
+        inputs,
+        &slots,
+        (false, features.0, features.1, features.2),
+        Some(vertex),
+        Some(legacy),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Legacy {
+    pub stages: u8,
+    pub point_rounding: Option<bool>,
+    pub blend_weights: u8,
+    pub perspective: bool,
+}
+
+fn build_program(
+    [vs, ps]: [Option<&Shader>; 2],
+    [vt, pt]: [Option<&Translation>; 2],
+    inputs: &[Input],
+    slots: &[(bool, u8)],
+    features: (bool, u32, bool, u32),
+    fixed_vertex: Option<&VertexProgram>,
+    legacy: Option<Legacy>,
 ) -> Result<String, u32> {
     let (second, clip, fog, fixed) = features;
     let specular = ps.is_none() && fixed & 2 != 0;
     let flat = fixed & 4 != 0;
     let stage_arguments = ps.is_none() && fixed & STAGE_ARGUMENTS != 0;
     let vertex_fog = vs.is_none() && fixed & 32 != 0;
-    let mut used = varyings(ps, second);
+    let mut used = varyings(ps, second || legacy.is_some());
     used[1] |= specular;
     let mut s = TYPES.replace("struct Interpolated", "struct Varyings");
     for n in 0..13 {
@@ -72,6 +123,8 @@ pub(super) fn build_with_fixed(
         if used[n] {
             let interpolation = if flat && n < 2 {
                 "@interpolate(flat, first) "
+            } else if n >= 2 && legacy.is_some_and(|legacy| !legacy.perspective) {
+                "@interpolate(linear, center) "
             } else {
                 ""
             };
@@ -88,13 +141,33 @@ pub(super) fn build_with_fixed(
         s.push_str("@location(12) fog:f32,\n");
     }
     s.push_str("}\n");
-    if stage_arguments || (second && fixed != 0) {
+    if stage_arguments || (second && fixed != 0) || legacy.is_some() {
         s = s.replace("switch a {case 0u:{return diffuse;}case 1u:{return current;}default:{return texel;}}", "var v=texel;switch (a&15u) {case 0u:{v=diffuse;}case 1u:{v=current;}case 3u:{v=bitcast<vec4<f32>>(draw_parameters.values[36]);}default:{}}if (a&32u)!=0u {v=vec4<f32>(v.a);}if (a&16u)!=0u {v=vec4<f32>(1.0)-v;}return v;");
     }
-    s.push_str(adv_device::gpu::BORDER_WGSL);
+    if legacy.is_some() {
+        // Keep the addressing helper shared. The taps below specialize the
+        // resource per binding, as the portable border path does.
+        let (address, _) = adv_device::gpu::BORDER_WGSL
+            .split_once("fn adv_border_texel")
+            .unwrap();
+        s.push_str(address);
+        s.push_str(include_str!("legacy.wgsl"));
+    } else {
+        s.push_str(adv_device::gpu::BORDER_WGSL);
+    }
     for (ordinal, &(vertex, index)) in slots.iter().enumerate() {
         let p = if vertex { "vs" } else { "ps" };
         writeln!(s,"@group(1) @binding({}) var {p}_image_{index}:texture_2d<f32>;\n@group(1) @binding({}) var {p}_sampler_{index}:sampler;",ordinal*2,ordinal*2+1).unwrap();
+        if legacy.is_some() {
+            let sample = include_str!("legacy_sample.wgsl")
+                .replace("legacy_tap(", &format!("legacy_tap_{index}("))
+                .replace("legacy_level(", &format!("legacy_level_{index}("))
+                .replace("legacy_sample(", &format!("legacy_sample_{index}("))
+                .replace("(image,", &format!("({p}_image_{index},"))
+                .replace("(image)", &format!("({p}_image_{index})"));
+            s.push_str(&sample);
+            continue;
+        }
         writeln!(s,"fn {p}_alpha_{index}(value:vec4<f32>)->vec4<f32> {{if (draw_parameters.values[14].x&{}u)!=0u {{return vec4<f32>(value.rgb,1.0);}}return value;}}",1u32<<ordinal).unwrap();
         writeln!(
             s,
@@ -118,7 +191,7 @@ pub(super) fn build_with_fixed(
         s.push_str(&t.source);
     }
     if fixed_vertex.is_some() {
-        s.push_str(fixed_core::HELPERS);
+        s.push_str(super::HELPERS);
     }
     s.push_str("@vertex fn vertex_main(@builtin(vertex_index) ordinal:u32,");
     let transformed = vs.is_none() && inputs.iter().any(|i| i.register == 0);
@@ -197,7 +270,11 @@ pub(super) fn build_with_fixed(
             }
         }
     } else if let Some(vertex) = fixed_vertex {
-        vertex.emit(&mut s, inputs);
+        if let Some(legacy) = legacy {
+            vertex.emit_legacy(&mut s, inputs, legacy);
+        } else {
+            vertex.emit(&mut s, inputs);
+        }
     } else if transformed {
         s.push_str("let viewport=bitcast<vec4<f32>>(draw_parameters.values[0]);\n");
         if inputs[0].format == AttributeFormat::Float3 {
@@ -343,6 +420,13 @@ pub(super) fn build_with_fixed(
             }
         }
         s.push_str("let result=ps_run(registers);var color=result.colors[0];\n");
+    } else if let Some(legacy) = legacy {
+        s.push_str("var color=input.c0;\n");
+        for stage in 0..legacy.stages {
+            writeln!(s, "{{let stage=draw_parameters.values[{}];", 24 + stage).unwrap();
+            writeln!(s, "let texel=legacy_sample_{stage}(input.t{stage}.xy,draw_parameters.values[{}],bitcast<vec4<u32>>(ps_constants.f[{}]),bitcast<vec4<u32>>(ps_constants.f[{}]));", 16 + stage, stage * 2, stage * 2 + 1).unwrap();
+            s.push_str("let a=adv_argument(stage.y&255u,input.c0,color,texel);let b=adv_argument(stage.y>>8u,input.c0,color,texel);let c=adv_argument(stage.w&255u,input.c0,color,texel);let d=adv_argument(stage.w>>8u,input.c0,color,texel);let rgb=legacy_stage(stage.x,a,b,color,input.c0,texel).rgb;let alpha=legacy_stage(stage.z,c,d,color,input.c0,texel).a;color=vec4<f32>(rgb,alpha);}\n");
+        }
     } else {
         s.push_str("var texel=ps_sample_0(input.t0,0u);if draw_parameters.values[2].x!=0u {texel.a=1.0;}\nlet rgb=adv_combine(draw_parameters.values[1].x,input.c0,texel).rgb;let alpha=adv_combine(draw_parameters.values[1].y,input.c0,texel).a;var color=vec4<f32>(rgb,alpha);\n");
         if stage_arguments {
@@ -361,6 +445,9 @@ pub(super) fn build_with_fixed(
         s.push_str("color=vec4<f32>(mix(bitcast<vec4<f32>>(draw_parameters.values[10]).rgb,color.rgb,clamp(input.fog,0.0,1.0)),color.a);\n");
     } else if fog && ps.is_none_or(|p| p.version.major < 3) {
         s.push_str("if draw_parameters.values[3].y!=0u {var factor=input.fog;let mode=draw_parameters.values[3].z;let values=bitcast<vec4<f32>>(draw_parameters.values[11]);let distance=input.position.z;if mode==1u {factor=exp(-values.z*distance);}else if mode==2u {factor=exp(-pow(values.z*distance,2.0));}else if mode==3u {factor=(values.y-distance)/(values.y-values.x);}color=vec4<f32>(mix(bitcast<vec4<f32>>(draw_parameters.values[10]).rgb,color.rgb,clamp(factor,0.0,1.0)),color.a);}\n");
+    }
+    if legacy.is_some() {
+        s.push_str("color=legacy_pack(color,draw_parameters.values[39]);\n");
     }
     if fixed & 16 != 0 {
         s.push_str("let linear=clamp(color.rgb,vec3<f32>(0.0),vec3<f32>(1.0));color=vec4<f32>(select(1.055*pow(linear,vec3<f32>(1.0/2.4))-0.055,12.92*linear,linear<=vec3<f32>(0.0031308)),color.a);\n");

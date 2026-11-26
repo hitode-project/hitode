@@ -15,7 +15,7 @@ pub(super) use legacy::*;
 
 #[cfg(feature = "gpu")]
 mod legacy {
-    use super::object::Object;
+    use super::{caps, object::Object};
     use crate::argument::CallError;
     use crate::ddraw::{ComState, DirectDraw, Kind, creation};
     use adv_abi::{
@@ -47,10 +47,11 @@ mod legacy {
         Light,
         Texture1,
         Texture2,
+        VertexBuffer7,
     }
 
     impl Face {
-        pub const ALL: [Self; 15] = [
+        pub const ALL: [Self; 16] = [
             Self::Direct3D,
             Self::Direct3D2,
             Self::Direct3D3,
@@ -66,6 +67,7 @@ mod legacy {
             Self::Light,
             Self::Texture1,
             Self::Texture2,
+            Self::VertexBuffer7,
         ];
         pub const fn name(self) -> &'static str {
             match self {
@@ -84,6 +86,7 @@ mod legacy {
                 Self::Light => "IDirect3DLight",
                 Self::Texture1 => "IDirect3DTexture",
                 Self::Texture2 => "IDirect3DTexture2",
+                Self::VertexBuffer7 => "IDirect3DVertexBuffer7",
             }
         }
         pub const fn iid(self) -> Iid {
@@ -103,6 +106,7 @@ mod legacy {
                 Self::Light => IID_IDIRECT3DLIGHT,
                 Self::Texture1 => IID_IDIRECT3DTEXTURE,
                 Self::Texture2 => IID_IDIRECT3DTEXTURE2,
+                Self::VertexBuffer7 => IID_IDIRECT3DVERTEXBUFFER7,
             }
         }
     }
@@ -110,6 +114,26 @@ mod legacy {
     pub(in crate::ddraw) struct State {
         pub tables: BTreeMap<Face, u32>,
         pub devices: Vec<u32>,
+        pub gpu: adv_device::gpu::Gpu,
+        pub(super) programs: std::collections::HashMap<u128, adv_device::gpu::Program>,
+        pub(super) queue: super::recording::Queue,
+        pub(super) depths: BTreeMap<u32, adv_device::gpu::Depth>,
+    }
+
+    impl State {
+        pub fn forget_surface(&mut self, id: u32) {
+            self.depths.remove(&id);
+            self.queue.forget((u64::from(id), 0));
+        }
+
+        pub fn flush(&mut self) -> Result<(), CallError> {
+            super::recording::flush(
+                &mut self.queue,
+                &mut self.gpu,
+                super::recording::Boundary::SurfaceAccess,
+            )
+            .map_err(|error| error.to_string().into())
+        }
     }
 
     pub(in crate::ddraw) fn allocate_face(
@@ -219,6 +243,11 @@ mod legacy {
                 && faces.contains(&pointer)
                 && !draw.d3d_surface_devices.contains_key(&pointer)
             {
+                let kind = if pointer == faces[0] {
+                    caps::Device::Hal
+                } else {
+                    caps::Device::Rgb
+                };
                 let parent = draw
                     .surface_owners
                     .get(&sid)
@@ -227,7 +256,7 @@ mod legacy {
                     .unwrap_or(0);
                 let target = com.get::<ComState>(objects, this).unwrap().old;
                 draw.d3d_surface_devices
-                    .insert(pointer, super::object::Device::new(parent, target));
+                    .insert(pointer, super::object::Device::new(kind, parent, target));
             }
             Ok(pointer)
         } else {
@@ -280,6 +309,11 @@ mod legacy {
                         }
                         release(draw, surfaces, objects, viewport);
                     }
+                    if let Some(state) = &device.state {
+                        for pointer in state.texture_references() {
+                            draw.release_com(objects, surfaces, pointer);
+                        }
+                    }
                     draw.release_com(objects, surfaces, device.target);
                     draw.release_com(objects, surfaces, device.parent);
                     device.dispose(surfaces);
@@ -298,6 +332,7 @@ mod legacy {
                     forget(draw, objects, &destroyed.interfaces, true);
                 }
                 Object::Light { .. } => (),
+                Object::VertexBuffer { data, size, .. } => surfaces.release(data, size),
             }
             for pointer in destroyed.interfaces {
                 surfaces.release(pointer, 16);
@@ -366,3 +401,9 @@ mod tests;
 mod desc;
 #[cfg(feature = "gpu")]
 mod state;
+
+#[cfg(feature = "gpu")]
+mod recording;
+
+#[cfg(feature = "gpu")]
+mod report;

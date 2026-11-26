@@ -400,10 +400,11 @@ impl DirectDraw {
         for (w, h, member) in levels {
             let sid = surfaces.create(w, h, false, format, m)?;
             self.described.insert(sid, member);
-            let Some(p) = self.com_version(objects, surfaces, Kind::Surface(sid), version, m)?
-            else {
+            let result = self.com_version(objects, surfaces, Kind::Surface(sid), version, m);
+            let Ok(Some(p)) = result else {
                 self.described.remove(&sid);
                 surfaces.delete(sid);
+                result?;
                 return Ok(false);
             };
             self.surface_owners.insert(sid, owner);
@@ -951,6 +952,10 @@ impl DirectDraw {
                 }
             }
             if let Kind::Surface(sid) = destroyed.value.kind {
+                #[cfg(feature = "gpu")]
+                if let Some(d3d) = &mut self.d3d {
+                    d3d.forget_surface(sid);
+                }
                 self.lost.remove(&sid);
                 self.surface_objects.remove(&sid);
                 self.surface_owners.remove(&sid);
@@ -1141,6 +1146,10 @@ impl DirectDraw {
         objects: &mut adv_machine::Objects,
         m: &mut dyn SurfaceMemory,
     ) -> Result<u32, CallError> {
+        #[cfg(feature = "gpu")]
+        if let Some(d3d) = &mut self.d3d {
+            d3d.flush()?;
+        }
         if id == api::UNIMPLEMENTED_COM {
             return Err("unimplemented DirectDraw COM method".into());
         }
@@ -1377,6 +1386,10 @@ impl DirectDraw {
                 let Some(sid) = self.surface_id(objects, a[0]) else {
                     return Ok(INVALID);
                 };
+                #[cfg(feature = "gpu")]
+                if self.d3d.is_some() && self.caps(sid)[1] & creation::MIPMAP_SUBLEVEL != 0 {
+                    return Ok(0x8876025b); // DDERR_NOTONMIPMAPSUBLEVEL
+                }
                 let kinds = a[1] & !1;
                 if !KEY_KINDS.contains(&kinds) {
                     return Ok(INVALID);
@@ -1545,7 +1558,14 @@ impl DirectDraw {
                 }
                 let exclusive = self.exclusive_owner == Some(object.device_id);
                 let mode = (surfaces.width, surfaces.height, surfaces.display_format);
-                if let Err(hr) = validate(&mut d, a[3], version, exclusive, mode) {
+                let texture_storage = storage;
+                #[cfg(feature = "gpu")]
+                let texture_storage = if self.d3d.is_some() {
+                    d3d_storage
+                } else {
+                    texture_storage
+                };
+                if let Err(hr) = validate(&mut d, a[3], version, exclusive, mode, texture_storage) {
                     return Ok(hr);
                 }
                 let primary = d.caps[0] & PRIMARY != 0;
@@ -1557,7 +1577,12 @@ impl DirectDraw {
                 let owner_device_id = object.device_id;
                 let owner_modern = object.modern;
                 let surface_version = surface_version(version);
-                let format = storage(&d.format).expect("validated format");
+                let format = (if d.caps[0] & TEXTURE != 0 {
+                    texture_storage
+                } else {
+                    storage
+                })(&d.format)
+                .expect("validated format");
                 let sid = if primary {
                     let primary = surfaces.primary(m)?;
                     if flip && self.complex.contains_key(&primary) {
@@ -1587,13 +1612,14 @@ impl DirectDraw {
                 // Like Windows, the kept descriptor has no client address.
                 d.flags &= !DDSD_LPSURFACE;
                 self.described.insert(sid, d);
-                let Some(p) =
-                    self.com_version(objects, surfaces, Kind::Surface(sid), surface_version, m)?
-                else {
+                let result =
+                    self.com_version(objects, surfaces, Kind::Surface(sid), surface_version, m);
+                let Ok(Some(p)) = result else {
                     self.described.remove(&sid);
                     if surfaces.primary_id() != Some(sid) {
                         surfaces.delete(sid);
                     }
+                    result?;
                     return Ok(0x8007000e);
                 };
                 for (i, &(flag, key)) in KEYS.iter().enumerate() {

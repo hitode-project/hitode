@@ -6,6 +6,7 @@ use std::{cell::Cell, collections::BTreeMap};
 mod block;
 pub(crate) mod defaults;
 mod lower;
+pub(crate) mod program;
 mod registers;
 pub(crate) mod slots;
 pub(crate) mod tnl;

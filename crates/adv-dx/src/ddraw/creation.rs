@@ -200,6 +200,18 @@ pub(super) fn storage(format: &[u8; 32]) -> Option<PixelFormat> {
     }
 }
 
+#[cfg(feature = "gpu")]
+pub(super) fn d3d_storage(format: &[u8; 32]) -> Option<PixelFormat> {
+    if let Some(storage) = storage(format) {
+        return Some(storage);
+    }
+    match (word(format, 4), word(format, 12), word(format, 16)) {
+        (0x41, 16, 0xf00) | (0x20001, 16, 0xff) => Some(PixelFormat::Rgb555),
+        (2, 8, _) | (0x20000, 8, 0xff) => Some(PixelFormat::Indexed8),
+        _ => None,
+    }
+}
+
 /// Check `d` as Windows does for a DirectDraw `version` object, completing
 /// what the caller left out from the display mode.
 pub(super) fn validate(
@@ -208,6 +220,7 @@ pub(super) fn validate(
     version: u8,
     exclusive: bool,
     (width, height, display): (u32, u32, PixelFormat),
+    texture_storage: fn(&[u8; 32]) -> Option<PixelFormat>,
 ) -> Result<(), u32> {
     let [caps, caps2, ..] = d.caps;
     let has = |bits: u32| caps & bits != 0;
@@ -322,7 +335,13 @@ pub(super) fn validate(
     {
         return Err(NO_COLOR_KEY_HW);
     }
-    if storage(&d.format).is_none() {
+    if (if has(TEXTURE) {
+        texture_storage
+    } else {
+        storage
+    })(&d.format)
+    .is_none()
+    {
         return Err(INVALID_PIXEL_FORMAT);
     }
     Ok(())
@@ -342,7 +361,7 @@ mod tests {
         }
     }
     fn check(d: &mut Described, exclusive: bool) -> Result<(), u32> {
-        validate(d, 0, 7, exclusive, (640, 480, PixelFormat::Bgra32))
+        validate(d, 0, 7, exclusive, (640, 480, PixelFormat::Bgra32), storage)
     }
 
     // spec: GFX-DDRAW-15
@@ -376,7 +395,7 @@ mod tests {
         // Outer unknowns fail before anything else.
         let mut d = request(0, COMPLEX);
         assert_eq!(
-            validate(&mut d, 1, 7, true, (640, 480, PixelFormat::Bgra32)),
+            validate(&mut d, 1, 7, true, (640, 480, PixelFormat::Bgra32), storage),
             Err(NO_AGGREGATION)
         );
 
@@ -403,7 +422,14 @@ mod tests {
         assert_eq!(d.mipmaps, 7);
         let mut d = request(wh, TEXTURE | MIPMAP | COMPLEX);
         assert_eq!(
-            validate(&mut d, 0, 4, false, (640, 480, PixelFormat::Bgra32)),
+            validate(
+                &mut d,
+                0,
+                4,
+                false,
+                (640, 480, PixelFormat::Bgra32),
+                storage
+            ),
             Ok(())
         );
         assert_eq!(d.mipmaps, 6);

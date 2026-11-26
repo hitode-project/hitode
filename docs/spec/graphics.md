@@ -117,10 +117,33 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 **Verification**: Test
 **Basis**: Windows Direct3D legacy and Direct3D7 semantics probes
 
+### GFX-D3D7-2 Device classes
+
+**Rule**: Device7 MUST enumerate RGB, HAL and T&L HAL in that order, and legacy Direct3D MUST enumerate RGB then HAL. The RGB device MUST retain its texture limit, point rounding, terminal line pixel and combiner decisions while sharing HAL rasterization.
+**Verification**: Test
+**Basis**: Windows Direct3D7 semantics and pixel probes
+
 ### GFX-D3D7-3 Fixed-function state
 
 **Rule**: Device7 MUST translate its API state into the shared fixed-function registers and return its API values from getters. A state block MUST capture and apply only its member slots, including recorded changes to stage samplers and texture matrices.
 **Verification**: Test
+
+### GFX-D3D7-4 Texture color keys
+
+**Rule**: Enabled color keying MUST discard a fragment when a contributing filter tap matches the raw source key. HAL MUST compare the bits in the texture's format masks. RGB MUST compare all stored bits.
+**Verification**: Test
+**Basis**: Windows Direct3D7 color-key probe
+
+### GFX-D3D7-5 Shared surface access
+
+**Rule**: Device7 MUST admit immutable draw inputs and use shared surface residency for the textures it reads and render targets it writes. DirectDraw locks MUST see the results of the recorded GPU writes.
+**Verification**: Test
+
+### GFX-D3D7-7 Device limits
+
+**Rule**: HAL and T&L HAL creation MUST reject render targets with any dimension over 2048. The texture extent MUST be capped by the device class limit of 1024 for RGB and 16384 for HAL and T&L HAL.
+**Verification**: Test
+**Basis**: Windows DirectDraw desktop and Direct3D7 semantics probes
 
 ## Native programmable execution
 

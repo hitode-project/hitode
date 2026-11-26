@@ -88,6 +88,15 @@ impl Fixture {
     }
 
     fn call(&mut self, name: &str, args: &[u32]) -> u32 {
+        self.invoke(name, args, |_, _| panic!("{name}: unexpected callback"))
+    }
+
+    fn invoke(
+        &mut self,
+        name: &str,
+        args: &[u32],
+        mut callback: impl FnMut(&dyn Guest, &[u32]) -> u32,
+    ) -> u32 {
         let m = &mut self.machine;
         m.sys.thunks.publish(&mut m.cpu, "ddraw.dll", name).unwrap();
         let thunk = m.sys.thunks.published_index("ddraw.dll", name).unwrap();
@@ -104,10 +113,17 @@ impl Fixture {
             ext: &mut m.ext,
             thunk,
         };
-        match (f.handler)(&mut env) {
-            Outcome::Return(hr) => hr,
-            Outcome::Fail(error) => panic!("{name}: {error}"),
-            _ => panic!("{name}: unexpected continuation"),
+        let mut outcome = (f.handler)(&mut env);
+        loop {
+            match outcome {
+                Outcome::Return(hr) => break hr,
+                Outcome::Call { args, then, .. } => {
+                    let returned = callback(env.cpu, &args);
+                    outcome = then(&mut env, adv_machine::Resume::Returned(returned));
+                }
+                Outcome::Fail(error) => panic!("{name}: {error}"),
+                _ => panic!("{name}: unexpected continuation"),
+            }
         }
     }
 
@@ -170,13 +186,61 @@ impl Fixture {
         self.word(OUT)
     }
 
+    fn device_call(&mut self, device: u32, name: &str, args: &[u32]) -> u32 {
+        let args = [device]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>();
+        self.call(&format!("IDirect3DDevice7::{name}"), &args)
+    }
+
+    fn lock(&mut self, surface: u32, flags: u32) -> (u32, u32) {
+        self.write(DATA + 0x100, &124u32.to_le_bytes());
+        assert_eq!(
+            self.call(
+                "IDirectDrawSurface7::Lock",
+                &[surface, 0, DATA + 0x100, flags, 0]
+            ),
+            0
+        );
+        (self.word(DATA + 0x100 + 36), self.word(DATA + 0x100 + 16))
+    }
+
+    fn unlock(&mut self, surface: u32) {
+        assert_eq!(self.call("IDirectDrawSurface7::Unlock", &[surface, 0]), 0);
+    }
+
+    fn pixels(&mut self, surface: u32, width: u32, height: u32) -> Vec<u32> {
+        let (address, pitch) = self.lock(surface, 0x10);
+        let mut pixels = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                pixels.push(self.word(address + y * pitch + x * 4) & 0xffffff);
+            }
+        }
+        self.unlock(surface);
+        if let Some(d3d) = &self.machine.ext.get::<front::State>().draw.d3d {
+            d3d.gpu.check().unwrap();
+        }
+        pixels
+    }
+
     fn device(&mut self, d3d: u32, face: Face, surface: u32) -> u32 {
-        self.write(DATA, &IID_IDIRECT3DHALDEVICE);
+        self.device_kind(d3d, face, surface, caps::Device::Hal)
+    }
+
+    fn device_kind(&mut self, d3d: u32, face: Face, surface: u32, kind: caps::Device) -> u32 {
+        self.write(DATA, &kind.guid());
         let mut args = vec![d3d, DATA, surface, OUT];
         if face == Face::Direct3D3 {
             args.push(0);
         }
         self.output(&format!("{}::CreateDevice", face.name()), &args)
+    }
+
+    fn described_surface(&mut self, dd: u32, desc: creation::Described) -> u32 {
+        self.write(DATA + 0x100, &desc.bytes(124, 0, 0));
+        self.output("IDirectDraw7::CreateSurface", &[dd, DATA + 0x100, OUT, 0])
     }
 }
 
@@ -400,4 +464,895 @@ fn device7_state_blocks_capture_neutral_registers_and_matrices() {
     assert_eq!(f.word(OUT), 0);
     assert_eq!(w(&mut f, "DeleteStateBlock", &[block]), 0);
     assert_eq!(w(&mut f, "ApplyStateBlock", &[block]), 0x88760834);
+}
+
+const EXPECTATIONS: &str = include_str!("expectations.tsv");
+
+fn pixel_row(label: &str, device: &str, case: &str, row: &str) -> Vec<u32> {
+    let raw = EXPECTATIONS
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split('\t');
+            (fields.next()? == label
+                && fields.next()? == device
+                && fields.next()? == case
+                && fields.next()? == row)
+                .then(|| fields.next().unwrap())
+        })
+        .unwrap();
+    (0..raw.len())
+        .step_by(6)
+        .map(|i| u32::from_str_radix(&raw[i..i + 6], 16).unwrap())
+        .collect()
+}
+
+fn quad(x: f32, y: f32, right: f32, bottom: f32, color: u32) -> [[u32; 8]; 4] {
+    std::array::from_fn(|i| {
+        let [x, y] = [
+            if i & 1 == 0 { x } else { right },
+            if i & 2 == 0 { y } else { bottom },
+        ];
+        [
+            x.to_bits(),
+            y.to_bits(),
+            0.5f32.to_bits(),
+            1f32.to_bits(),
+            color,
+            0,
+            ((i & 1) as f32).to_bits(),
+            ((i >> 1) as f32).to_bits(),
+        ]
+    })
+}
+
+fn draw_tl(f: &mut Fixture, device: u32, primitive: u32, vertices: &[[u32; 8]]) {
+    f.write(DATA + 0x200, bytemuck::cast_slice(vertices));
+    assert_eq!(f.device_call(device, "BeginScene", &[]), 0);
+    assert_eq!(
+        f.device_call(
+            device,
+            "DrawPrimitive",
+            &[primitive, 0x1c4, DATA + 0x200, vertices.len() as u32, 0]
+        ),
+        0
+    );
+    assert_eq!(f.device_call(device, "EndScene", &[]), 0);
+}
+
+// spec: GFX-D3D7-3, GFX-D3D7-5
+#[test]
+fn device7_draws_transformed_vertices_into_a_lockable_surface() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    assert_eq!(f.device_call(dev, "EndScene", &[]), 0x887602f9);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+    for (case, p) in [
+        ("quad-int-1-1-5-5", [1., 1., 5., 5.]),
+        ("quad-half-1.5-1.5-5.5-5.5", [1.5, 1.5, 5.5, 5.5]),
+        ("quad-0.49-0.49-4.49-4.49", [1.49, 1.49, 5.49, 5.49]),
+        ("quad-0.51-0.51-4.51-4.51", [1.51, 1.51, 5.51, 5.51]),
+        ("quad-thin-1-1-5-1.4", [1., 1., 5., 1.4]),
+    ] {
+        assert_eq!(
+            f.device_call(dev, "Clear", &[0, 0, 1, 0, 1f32.to_bits(), 0]),
+            0
+        );
+        draw_tl(&mut f, dev, 5, &quad(p[0], p[1], p[2], p[3], u32::MAX));
+        let pixels = f.pixels(rt, 7, 7);
+        let expected = (0..7)
+            .flat_map(|y| pixel_row("px", "hal", case, &y.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(pixels, expected, "{case}");
+    }
+}
+
+// spec: GFX-D3D7-4, GFX-D3D7-5
+#[test]
+fn device7_color_key_tests_raw_bits_before_filtering() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        64,
+        4,
+    );
+    let tex = f.surface(dd, true, creation::TEXTURE, 4, 1);
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    let (address, _) = f.lock(tex, 0);
+    f.write(
+        address,
+        bytemuck::cast_slice(&[0xffff00ffu32, 0xffff00ff, u32::MAX, u32::MAX]),
+    );
+    f.unlock(tex);
+    f.write(DATA + 0x180, bytemuck::bytes_of(&[0xff00ffu32; 2]));
+    assert_eq!(
+        f.call("IDirectDrawSurface7::SetColorKey", &[tex, 8, DATA + 0x180]),
+        0
+    );
+    assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[19, 5]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[20, 6]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[24, 0x80]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[25, 7]), 0);
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, tex]), 0);
+    assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 12, 3]), 0);
+    for i in 0..6 {
+        let mode = format!("mode{i}");
+        let filter = if matches!(i, 0 | 4) { 1 } else { 2 };
+        assert_eq!(
+            f.device_call(dev, "SetRenderState", &[41, u32::from(i != 3)]),
+            0
+        );
+        assert_eq!(
+            f.device_call(dev, "SetRenderState", &[27, u32::from(matches!(i, 2 | 4))]),
+            0
+        );
+        assert_eq!(
+            f.device_call(dev, "SetRenderState", &[15, u32::from(i == 5)]),
+            0
+        );
+        assert_eq!(
+            f.device_call(dev, "SetTextureStageState", &[0, 16, filter]),
+            0
+        );
+        assert_eq!(
+            f.device_call(dev, "SetTextureStageState", &[0, 17, filter]),
+            0
+        );
+        assert_eq!(
+            f.device_call(dev, "Clear", &[0, 0, 1, 0xff00ff00, 1f32.to_bits(), 0]),
+            0
+        );
+        draw_tl(&mut f, dev, 5, &quad(0., 0., 64., 4., u32::MAX));
+        let expected = EXPECTATIONS
+            .lines()
+            .find_map(|line| {
+                let prefix = format!("colorkey\thal\t{mode}\tdraw\t00000000\t");
+                line.strip_prefix(&prefix)
+            })
+            .unwrap();
+        let expected = (0..expected.len())
+            .step_by(6)
+            .map(|i| u32::from_str_radix(&expected[i..i + 6], 16).unwrap())
+            .collect::<Vec<_>>();
+        let actual = f
+            .pixels(rt, 64, 3)
+            .into_iter()
+            .skip(128)
+            .step_by(2)
+            .collect::<Vec<_>>();
+        if i == 3 {
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                for shift in [0, 8, 16] {
+                    assert!(((actual >> shift) & 255).abs_diff((expected >> shift) & 255) <= 1);
+                }
+            }
+        } else {
+            assert_eq!(actual, expected, "{mode}");
+        }
+    }
+}
+
+fn tl(x: f32, y: f32, z: f32, color: u32) -> [u32; 8] {
+    [
+        x.to_bits(),
+        y.to_bits(),
+        z.to_bits(),
+        1f32.to_bits(),
+        color,
+        0,
+        0,
+        0,
+    ]
+}
+
+// spec: GFX-D3D7-2, GFX-D3D7-3
+#[test]
+fn rgb_value_rules_share_the_hal_raster_path() {
+    use adv_abi::types::D3DDEVICEDESC7;
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let texture = f.surface(dd, true, creation::TEXTURE, 4, 4);
+    let (address, pitch) = f.lock(texture, 0);
+    for y in 0..4 {
+        f.write(
+            address + y * pitch,
+            bytemuck::cast_slice(&[0x80808080u32; 4]),
+        );
+    }
+    f.unlock(texture);
+    for (kind, label, ops, max) in [
+        (caps::Device::Hal, "hal", 0x039effff, 16384),
+        (caps::Device::Rgb, "rgb", 0x78ff, 1024),
+    ] {
+        let dev = f.device_kind(d3d, Face::Direct3D7, rt, kind);
+        assert_eq!(f.device_call(dev, "GetCaps", &[DATA + 0x600]), 0);
+        let desc: D3DDEVICEDESC7 = adv_abi::GuestPtr::new(DATA + 0x600)
+            .read(&f.machine.cpu)
+            .unwrap();
+        assert_eq!(
+            desc.dwMaxTextureWidth,
+            max.min(
+                f.machine
+                    .ext
+                    .get::<SurfaceStore>()
+                    .device()
+                    .caps()
+                    .limits
+                    .max_image_2d
+            )
+        );
+        assert_eq!(desc.dwTextureOpCaps, ops);
+        assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+        assert_eq!(
+            f.device_call(dev, "Clear", &[0, 0, 1, 0, 1f32.to_bits(), 0]),
+            0
+        );
+        draw_tl(
+            &mut f,
+            dev,
+            2,
+            &[tl(1., 1., 0.5, u32::MAX), tl(6., 4., 0.5, u32::MAX)],
+        );
+        draw_tl(
+            &mut f,
+            dev,
+            1,
+            &[tl(1.5, 6.5, 0.5, u32::MAX), tl(3., 6., 0.5, u32::MAX)],
+        );
+        let fixture = "line-1,1-6,4-points-1.5,6.5-3,6";
+        let expected = (0..8)
+            .flat_map(|y| pixel_row("px", label, fixture, &y.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            f.pixels(rt, 8, 8),
+            expected,
+            "{label} line and point coverage"
+        );
+        assert_eq!(f.device_call(dev, "SetTexture", &[0, texture]), 0);
+        assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 1, 10]), 0);
+        assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 3, 0]), 0);
+        assert_eq!(f.device_call(dev, "ValidateDevice", &[OUT]), 0);
+        assert_eq!(f.word(OUT), 1);
+        draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., 0x40404040));
+        assert_eq!(
+            f.pixels(rt, 1, 1),
+            pixel_row("px", label, "subtract-half-0x40", "0")
+        );
+        assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 2, 3]), 0);
+        if kind == caps::Device::Rgb {
+            assert_eq!(f.device_call(dev, "ValidateDevice", &[OUT]), 0x8876081a);
+            draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., 0xff123456));
+            assert_eq!(f.pixels(rt, 1, 1), [0x123456]);
+        } else {
+            assert_eq!(f.device_call(dev, "ValidateDevice", &[OUT]), 0);
+        }
+    }
+}
+
+fn pixel_format(flags: u32, bits: u32, masks: [u32; 4]) -> [u8; 32] {
+    bytemuck::cast([32, flags, 0, bits, masks[0], masks[1], masks[2], masks[3]])
+}
+
+// spec: GFX-D3D7-4, GFX-D3D7-5
+#[test]
+fn packed_texture_keys_and_mip_levels_share_the_surface_store() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        16,
+        16,
+    );
+    for (kind, label) in [(caps::Device::Hal, "hal"), (caps::Device::Rgb, "rgb")] {
+        let dev = f.device_kind(d3d, Face::Direct3D7, rt, kind);
+        assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+        assert_eq!(f.device_call(dev, "SetRenderState", &[41, 1]), 0);
+        assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 1, 2]), 0);
+        for (name, bits, alpha, mips, key) in [
+            ("xrgb32-nomip", 32, false, false, 0x00ff00ff),
+            ("argb32-nomip", 32, true, false, 0x00ff00ff),
+            ("rgb565-nomip", 16, false, false, 0xf81f),
+            ("argb1555-nomip-key-color-bits", 16, true, false, 0x7c1f),
+            ("argb1555-nomip-key-with-alpha", 16, true, false, 0xfc1f),
+            (
+                "argb32-nomip-key-with-alpha",
+                32,
+                true,
+                false,
+                0xffff00ffu32,
+            ),
+            ("xrgb32-mip-key-top", 32, false, true, 0x00ff00ff),
+            ("xrgb32-mip-key-every-level", 32, false, true, 0x00ff00ff),
+            ("argb32-mip-key-top", 32, true, true, 0x00ff00ff),
+            ("argb32-mip-key-with-alpha", 32, true, true, 0xffff00ffu32),
+            ("rgb565-mip-key-top", 16, false, true, 0xf81f),
+        ] {
+            let flags = 0x40 | u32::from(alpha);
+            let (masks, magenta) = match (bits, alpha) {
+                (16, false) => ([0xf800, 0x7e0, 0x1f, 0], 0xf81fu32),
+                (16, true) => ([0x7c00, 0x3e0, 0x1f, 0x8000], 0xfc1f),
+                (_, false) => ([0xff0000, 0xff00, 0xff, 0], 0xffff00ff),
+                (_, true) => ([0xff0000, 0xff00, 0xff, 0xff000000], 0xffff00ff),
+            };
+            let mip_flags = if mips {
+                creation::MIPMAP | creation::COMPLEX
+            } else {
+                0
+            };
+            let tex = f.described_surface(
+                dd,
+                creation::Described {
+                    flags: 0x1007 | if mips { creation::DDSD_MIPMAPCOUNT } else { 0 },
+                    width: 8,
+                    height: 8,
+                    mipmaps: 3,
+                    caps: [creation::TEXTURE | mip_flags, 0, 0, 0],
+                    format: pixel_format(flags, bits, masks),
+                    ..Default::default()
+                },
+            );
+            let mut level = tex;
+            let count = if mips { 3 } else { 1 };
+            let step = bits / 8;
+            for n in 0..count {
+                let (address, pitch) = f.lock(level, 0);
+                let side = 8 >> n;
+                for y in 0..side {
+                    for x in 0..side {
+                        let color = if n != 0 || x < side / 2 {
+                            magenta
+                        } else {
+                            u32::MAX
+                        };
+                        f.write(
+                            address + pitch * y + x * step,
+                            &color.to_le_bytes()[..step as usize],
+                        );
+                    }
+                }
+                f.unlock(level);
+                if n == 0 || name.ends_with("every-level") {
+                    f.write(DATA + 0x180, bytemuck::bytes_of(&[key; 2]));
+                    let hr = f.call(
+                        "IDirectDrawSurface7::SetColorKey",
+                        &[level, 8, DATA + 0x180],
+                    );
+                    let position = if n == 0 { "top" } else { "sublevel" };
+                    let prefix = format!("setkey\t{label}\t{name}\t{position}\t");
+                    let expected = EXPECTATIONS
+                        .lines()
+                        .find_map(|line| line.strip_prefix(&prefix))
+                        .unwrap();
+                    assert_eq!(hr, u32::from_str_radix(expected, 16).unwrap());
+                }
+                if n < count - 1 {
+                    f.write(
+                        DATA + 0x180,
+                        bytemuck::bytes_of(&[creation::TEXTURE | creation::MIPMAP, 0, 0, 0]),
+                    );
+                    let next = f.output(
+                        "IDirectDrawSurface7::GetAttachedSurface",
+                        &[level, DATA + 0x180, OUT],
+                    );
+                    if level != tex {
+                        f.call("IDirectDrawSurface7::Release", &[level]);
+                    }
+                    level = next;
+                }
+            }
+            if level != tex {
+                f.call("IDirectDrawSurface7::Release", &[level]);
+            }
+            assert_eq!(f.device_call(dev, "SetTexture", &[0, tex]), 0);
+            assert_eq!(
+                f.device_call(
+                    dev,
+                    "SetTextureStageState",
+                    &[0, 18, if mips { 2 } else { 1 }]
+                ),
+                0
+            );
+            for pass in 0..if mips { 2 } else { 1 } {
+                assert_eq!(
+                    f.device_call(dev, "Clear", &[0, 0, 1, 0xff00ff00, 1f32.to_bits(), 0]),
+                    0
+                );
+                let size = if pass == 0 { 8. } else { 4. };
+                draw_tl(&mut f, dev, 5, &quad(0., 0., size, size, u32::MAX));
+                let values = f
+                    .pixels(rt, 8, 2)
+                    .into_iter()
+                    .skip(8)
+                    .map(|px| {
+                        if px == 0x00ff00 {
+                            b'g'
+                        } else if px & 0xff00 != 0 {
+                            b'W'
+                        } else {
+                            b'M'
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let row = if pass == 0 {
+                    "level0-left-key"
+                } else {
+                    "level1-all-key"
+                };
+                let prefix = format!("ck\t{label}\t{name}\t{row}\t");
+                let expected = EXPECTATIONS
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&prefix))
+                    .unwrap()
+                    .as_bytes();
+                for x in 0..8 {
+                    if kind == caps::Device::Rgb && x == 4 {
+                        // Windows RGB includes the far edge. This front uses HAL coverage.
+                        continue;
+                    }
+                    assert_eq!(values[x], expected[x], "{label} {name} {row} at x={x}");
+                }
+            }
+            assert_eq!(f.device_call(dev, "SetTexture", &[0, 0]), 0);
+            assert_eq!(f.call("IDirectDrawSurface7::Release", &[tex]), 0);
+        }
+    }
+}
+
+// spec: GFX-D3D7-3
+#[test]
+fn fixed_vertex_lighting_matches_windows_and_the_scalar_stage() {
+    use super::object::Object;
+    use crate::fixed::tnl;
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    let p: [f32; 16] = [
+        1. / 16.,
+        0.,
+        0.,
+        0.,
+        0.,
+        -1. / 16.,
+        0.,
+        0.,
+        0.,
+        0.,
+        1.,
+        0.,
+        -1.,
+        1.,
+        0.,
+        1.,
+    ];
+    f.write(DATA + 0x200, bytemuck::bytes_of(&p));
+    assert_eq!(f.device_call(dev, "SetTransform", &[3, DATA + 0x200]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[141, 0]), 0);
+    let mut material = [0f32; 17];
+    material[..4].fill(1.);
+    f.write(DATA + 0x200, bytemuck::bytes_of(&material));
+    assert_eq!(f.device_call(dev, "SetMaterial", &[DATA + 0x200]), 0);
+    let mut light = [0f32; 26];
+    light[0] = f32::from_bits(3);
+    light[1..5].fill(1.);
+    light[18] = 1.;
+    f.write(DATA + 0x200, bytemuck::bytes_of(&light));
+    assert_eq!(f.device_call(dev, "SetLight", &[0, DATA + 0x200]), 0);
+    assert_eq!(f.device_call(dev, "LightEnable", &[0, 1]), 0);
+    let vertices = std::array::from_fn::<_, 16, _>(|i| {
+        let angle = (i as f32 * 6.).to_radians();
+        [
+            2. * i as f32 + 0.25,
+            0.25,
+            0.5,
+            angle.sin(),
+            0.,
+            -angle.cos(),
+            f32::from_bits(u32::MAX),
+            0.,
+            0.,
+        ]
+    });
+    f.write(DATA + 0x200, bytemuck::cast_slice(&vertices));
+    assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+    assert_eq!(
+        f.device_call(dev, "DrawPrimitive", &[1, 0x152, DATA + 0x200, 16, 0]),
+        0
+    );
+    assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+    let pixels = f
+        .pixels(rt, 32, 1)
+        .into_iter()
+        .step_by(2)
+        .collect::<Vec<_>>();
+    let prefix = "vx\thal\tdirectional-diffuse-6deg-steps\t";
+    let expected = EXPECTATIONS
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap();
+    let expected = (0..expected.len())
+        .step_by(6)
+        .map(|i| u32::from_str_radix(&expected[i..i + 6], 16).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(pixels, expected);
+    let draw = &f.machine.ext.get::<front::State>().draw;
+    let Some(Object::Device(device)) = draw.com.unwrap().get::<Object>(&f.machine.sys.objects, dev)
+    else {
+        panic!()
+    };
+    let state = &device.state.as_ref().unwrap().fixed;
+    let active = tnl::active(state).unwrap();
+    let normal = tnl::normal_matrix(state);
+    for (v, px) in vertices.iter().zip(pixels) {
+        let (color, _) = tnl::illuminate(
+            state,
+            &active,
+            [v[0], v[1], v[2], 1.],
+            [v[3], v[4], v[5]],
+            &normal,
+            None,
+            None,
+        );
+        assert_eq!((color[0] * 255.).round() as u32, px & 255);
+    }
+}
+
+// spec: GFX-D3D7-2, GFX-D3D7-7
+#[test]
+fn registry_enumerates_device_classes_and_depth_formats_in_measured_order() {
+    use adv_abi::types::{D3DDEVICEDESC7, DDPIXELFORMAT};
+    let mut f = Fixture::new(true);
+    let callback = DATA + 0xf00;
+    f.machine.cpu.protect(DATA, 4096, Prot::RWX).unwrap();
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        2049,
+        16,
+    );
+    let mut devices = Vec::new();
+    assert_eq!(
+        f.invoke(
+            "IDirect3D7::EnumDevices",
+            &[d3d, callback, DATA],
+            |cpu, args| {
+                assert_eq!(args[3], DATA);
+                let name = cpu.read_cstr(args[1], 40).unwrap();
+                let desc: D3DDEVICEDESC7 = adv_abi::GuestPtr::new(args[2]).read(cpu).unwrap();
+                devices.push((
+                    String::from_utf8(name).unwrap(),
+                    bytemuck::cast::<_, [u8; 16]>(desc.deviceGUID),
+                ));
+                1
+            }
+        ),
+        0
+    );
+    let expected = [caps::Device::Rgb, caps::Device::Hal, caps::Device::TnlHal];
+    assert_eq!(
+        devices,
+        expected.map(|device| (device.name().0.to_owned(), device.guid()))
+    );
+    for (device, label) in [
+        (caps::Device::Rgb, "rgb"),
+        (caps::Device::Hal, "hal"),
+        (caps::Device::TnlHal, "tnlhal"),
+    ] {
+        f.write(DATA, &device.guid());
+        let mut formats = Vec::new();
+        assert_eq!(
+            f.invoke(
+                "IDirect3D7::EnumZBufferFormats",
+                &[d3d, DATA, callback, DATA],
+                |cpu, args| {
+                    let desc: DDPIXELFORMAT = adv_abi::GuestPtr::new(args[0]).read(cpu).unwrap();
+                    formats.push(format!(
+                        "zformat\t{label}\tflags\t{:08x}\tbits\t{}\tstencil\t{}\tzmask\t{:08x}",
+                        desc.dwFlags,
+                        desc.dwRGBBitCount,
+                        desc.dwRBitMask,
+                        u32::from_le_bytes(desc.Anonymous3)
+                    ));
+                    1
+                }
+            ),
+            0
+        );
+        let prefix = format!("zformat\t{label}\t");
+        assert_eq!(
+            formats,
+            EXPECTATIONS
+                .lines()
+                .filter(|line| line.starts_with(&prefix))
+                .collect::<Vec<_>>()
+        );
+        if device != caps::Device::Rgb {
+            assert_eq!(
+                f.call("IDirect3D7::CreateDevice", &[d3d, DATA, rt, OUT]),
+                0x88760082
+            );
+        }
+    }
+}
+
+// spec: GFX-D3D7-3, GFX-D3D7-5
+#[test]
+fn indexed_strided_and_vertex_buffer_draws_capture_their_input() {
+    use adv_abi::types::{D3DDP_PTRSTRIDE, D3DDRAWPRIMITIVESTRIDEDDATA, D3DVERTEXBUFFERDESC};
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        16,
+        16,
+    );
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    let v = quad(1., 1., 5., 5., 0xff123456);
+    let data = DATA + 0x200;
+    let indices = DATA + 0x300;
+    let desc = DATA + 0x400;
+    f.write(data, bytemuck::cast_slice(&v));
+    f.write(indices, bytemuck::cast_slice(&[0u16, 1, 2, 3]));
+    let stride = |offset| D3DDP_PTRSTRIDE {
+        lpvData: data + offset,
+        dwStride: 32,
+    };
+    let strided = D3DDRAWPRIMITIVESTRIDEDDATA {
+        position: stride(0),
+        diffuse: stride(16),
+        specular: stride(20),
+        textureCoords: std::array::from_fn(|_| stride(24)),
+        ..Default::default()
+    };
+    f.write(desc, bytemuck::bytes_of(&strided));
+    assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+    assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+    assert_eq!(
+        f.device_call(
+            dev,
+            "DrawIndexedPrimitiveStrided",
+            &[5, 0x1c4, desc, 4, indices, 4, 0]
+        ),
+        0
+    );
+    f.write(data, &[0; 128]);
+    assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+    assert_eq!(f.pixels(rt, 2, 2), [0, 0, 0, 0x123456]);
+    let buffer = D3DVERTEXBUFFERDESC {
+        dwSize: 16,
+        dwCaps: 0x800,
+        dwFVF: 0x1c4,
+        dwNumVertices: 4,
+    };
+    f.write(desc, bytemuck::bytes_of(&buffer));
+    let vb = f.output("IDirect3D7::CreateVertexBuffer", &[d3d, desc, OUT, 0]);
+    let vertex = f.output("IDirect3DVertexBuffer7::Lock", &[vb, 0, OUT, OUT + 4]);
+    assert_eq!(f.word(OUT + 4), 128);
+    assert_eq!(
+        f.call("IDirect3DVertexBuffer7::Lock", &[vb, 0, OUT, 0]),
+        0x8876080e
+    );
+    let v = quad(2., 2., 6., 6., 0xffabcdef);
+    f.write(vertex, bytemuck::cast_slice(&v));
+    assert_eq!(f.call("IDirect3DVertexBuffer7::Unlock", &[vb]), 0);
+    assert_eq!(
+        f.device_call(dev, "Clear", &[0, 0, 1, 0, 1f32.to_bits(), 0]),
+        0
+    );
+    assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+    assert_eq!(
+        f.device_call(dev, "DrawIndexedPrimitiveVB", &[5, vb, 0, 4, indices, 4, 0]),
+        0
+    );
+    assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+    let pixels = f.pixels(rt, 3, 3);
+    assert_eq!(&pixels[..8], &[0; 8]);
+    assert_eq!(pixels[8], 0xabcdef);
+    assert_eq!(f.call("IDirect3DVertexBuffer7::Release", &[vb]), 0);
+}
+
+// spec: GFX-D3D7-3, GFX-D3D7-5
+#[test]
+fn render_target_and_texture_state_blocks_retain_surfaces() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let caps = creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE;
+    let first = f.surface(dd, true, caps, 16, 16);
+    let second = f.surface(dd, true, caps, 16, 16);
+    let texture = f.surface(dd, true, creation::TEXTURE, 4, 4);
+    let dev = f.device(d3d, Face::Direct3D7, first);
+    assert_eq!(f.device_call(dev, "SetRenderTarget", &[second, 0]), 0);
+    assert_eq!(f.call("IDirectDrawSurface7::Release", &[first]), 0);
+    assert_eq!(f.device_call(dev, "GetRenderTarget", &[OUT]), 0);
+    assert_eq!(f.word(OUT), second);
+    assert_eq!(f.call("IDirectDrawSurface7::Release", &[second]), 2);
+    assert_eq!(f.device_call(dev, "BeginStateBlock", &[]), 0);
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, texture]), 0);
+    assert_eq!(f.device_call(dev, "GetTexture", &[0, OUT]), 0);
+    assert_eq!(f.word(OUT), 0);
+    assert_eq!(f.device_call(dev, "EndStateBlock", &[OUT]), 0);
+    let block = f.word(OUT);
+    assert_eq!(f.call("IDirectDrawSurface7::Release", &[texture]), 1);
+    assert_eq!(f.device_call(dev, "ApplyStateBlock", &[block]), 0);
+    assert_eq!(f.device_call(dev, "GetTexture", &[0, OUT]), 0);
+    assert_eq!(f.word(OUT), texture);
+    assert_eq!(f.call("IDirectDrawSurface7::Release", &[texture]), 2);
+    assert_eq!(f.device_call(dev, "DeleteStateBlock", &[block]), 0);
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, 0]), 0);
+    assert_eq!(f.query(texture, IID_SURFACE).0, INVALID);
+}
+
+// spec: GFX-D3D7-3, GFX-D3D7-5
+#[test]
+fn hal_integer_bias_and_stencil_use_the_attached_depth_surface() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let z = f.described_surface(
+        dd,
+        creation::Described {
+            flags: 0x1007,
+            width: 32,
+            height: 32,
+            caps: [creation::ZBUFFER, 0, 0, 0],
+            format: pixel_format(0x4400, 32, [8, 0xffffff00, 0xff, 0]),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        f.call("IDirectDrawSurface7::AddAttachedSurface", &[rt, z]),
+        0
+    );
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[23, 2]), 0);
+    for (name, bias) in [
+        ("z-coplanar-less", 0),
+        ("z-coplanar-less-zbias1", 1),
+        ("z-coplanar-less-zbias16", 16),
+    ] {
+        assert_eq!(
+            f.device_call(dev, "Clear", &[0, 0, 7, 0xff202020, 1f32.to_bits(), 0]),
+            0
+        );
+        assert_eq!(f.device_call(dev, "SetRenderState", &[47, 0]), 0);
+        draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., 0xff00ff00));
+        assert_eq!(f.device_call(dev, "SetRenderState", &[47, bias]), 0);
+        draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., 0xffff0000));
+        assert_eq!(f.pixels(rt, 1, 1), pixel_row("stage", "hal", name, "0"));
+    }
+    assert_eq!(
+        f.device_call(dev, "Clear", &[0, 0, 7, 0xff202020, 1f32.to_bits(), 255]),
+        0
+    );
+    assert_eq!(f.device_call(dev, "SetRenderState", &[7, 0]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[52, 1]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[55, 7]), 0);
+    draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., 0xff00ff00));
+    assert_eq!(f.device_call(dev, "SetRenderState", &[57, 0]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[55, 1]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[56, 3]), 0);
+    draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., 0xff0000ff));
+    assert_eq!(f.pixels(rt, 1, 1), [0x0000ff]);
+}
+
+// spec: GFX-D3D7-3, GFX-D3D7-5
+#[test]
+fn hal_texel_centers_and_shared_triangle_edges_match_windows() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let tex = f.surface(dd, true, creation::TEXTURE, 4, 4);
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    let (address, pitch) = f.lock(tex, 0);
+    for y in 0..4 {
+        let pixels = std::array::from_fn::<_, 4, _>(|x| {
+            0xff000000u32 | ((x as u32 * 0x40 + 0x10) << 16) | ((y * 0x40 + 0x10) << 8)
+        });
+        f.write(address + y * pitch, bytemuck::cast_slice(&pixels));
+    }
+    f.unlock(tex);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[27, 1]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[19, 2]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[20, 2]), 0);
+    draw_tl(&mut f, dev, 5, &quad(0., 0., 8., 8., 0xff404040));
+    let expected = (0..9)
+        .flat_map(|y| pixel_row("px", "hal", "shared-edge-additive-0x40", &y.to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(f.pixels(rt, 9, 9), expected);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[27, 0]), 0);
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, tex]), 0);
+    assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 1, 2]), 0);
+    for (case, a, b, filter, wrap) in [
+        ("tex-1to1-int-point", 0., 4., 1, false),
+        ("tex-1to1-minus-half-point", -0.5, 3.5, 1, false),
+        ("tex-1to1-int-linear", 0., 4., 2, false),
+        ("tex-1to1-minus-half-linear", -0.5, 3.5, 2, false),
+        ("tex-2x-int-linear", 0., 8., 2, false),
+        ("tex-wrap-uv-minus-0.5-1.5", 0., 8., 1, true),
+    ] {
+        assert_eq!(
+            f.device_call(dev, "Clear", &[0, 0, 1, 0, 1f32.to_bits(), 0]),
+            0
+        );
+        for stage in [16, 17] {
+            assert_eq!(
+                f.device_call(dev, "SetTextureStageState", &[0, stage, filter]),
+                0
+            );
+        }
+        assert_eq!(
+            f.device_call(
+                dev,
+                "SetTextureStageState",
+                &[0, 12, if wrap { 1 } else { 3 }]
+            ),
+            0
+        );
+        let mut vertices = quad(a, a, b, b, u32::MAX);
+        if wrap {
+            for (i, vertex) in vertices.iter_mut().enumerate() {
+                vertex[6] = (if i & 1 != 0 { 1.5f32 } else { -0.5 }).to_bits();
+                vertex[7] = (if i & 2 != 0 { 1.5f32 } else { -0.5 }).to_bits();
+            }
+        }
+        draw_tl(&mut f, dev, 5, &vertices);
+        let expected = (0..8)
+            .flat_map(|y| pixel_row("px", "hal", case, &y.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(f.pixels(rt, 8, 8), expected, "{case}");
+    }
 }

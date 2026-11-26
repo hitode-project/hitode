@@ -1,6 +1,8 @@
 //! Direct3D COM bindings. The installed DirectDraw personality does not
 //! register these entry points; the test assembly installs their tables.
 use super::desc::state as decode;
+#[path = "render.rs"]
+mod render;
 use super::{
     Face, INVALID, NO_INTERFACE, OUT_OF_MEMORY, State, caps,
     object::{self, Object},
@@ -18,14 +20,16 @@ use adv_machine::{Machine, Objects};
 macro_rules! bind {
     ($registry:ident, $face:ident, $interface:literal, $($method:ident),+ $(,)?) => {
         $(
-            let sig = signature::lookup_com($interface, stringify!($method)).unwrap();
+            let signatures = signature::com_signatures();
+            let index = signatures.iter().position(|sig| sig.module == $interface && sig.name == stringify!($method)).unwrap();
+            let sig = &signatures[index];
             $registry.register_with_data(Api {
                 module: "ddraw.dll",
                 name: concat!($interface, "::", stringify!($method)),
                 conv: sig.conv.unwrap(),
                 handler: dispatch,
                 level: ImplementationLevel::Implement,
-            }, (Face::$face as u64) << 16 | u64::from(sig.com_slot.unwrap()));
+            }, (Face::$face as u64) << 32 | index as u64);
         )+
     };
 }
@@ -221,6 +225,62 @@ pub fn register(registry: &mut Registry) {
         ApplyStateBlock,
         DeleteStateBlock
     );
+    bind!(registry, Direct3D7, "IDirect3D7", CreateVertexBuffer);
+    bind!(
+        registry,
+        VertexBuffer7,
+        "IDirect3DVertexBuffer7",
+        QueryInterface,
+        AddRef,
+        Release,
+        Lock,
+        Unlock,
+        GetVertexBufferDesc,
+        Optimize
+    );
+    bind!(
+        registry,
+        Device7,
+        "IDirect3DDevice7",
+        BeginScene,
+        EndScene,
+        Clear,
+        SetRenderTarget,
+        GetRenderTarget,
+        SetTexture,
+        GetTexture,
+        PreLoad,
+        DrawPrimitive,
+        DrawIndexedPrimitive,
+        DrawPrimitiveStrided,
+        DrawIndexedPrimitiveStrided,
+        DrawPrimitiveVB,
+        DrawIndexedPrimitiveVB,
+        ValidateDevice
+    );
+    bind!(registry, Direct3D, "IDirect3D", EnumDevices);
+    bind!(registry, Direct3D2, "IDirect3D2", EnumDevices);
+    bind!(
+        registry,
+        Direct3D3,
+        "IDirect3D3",
+        EnumDevices,
+        EnumZBufferFormats
+    );
+    bind!(
+        registry,
+        Direct3D7,
+        "IDirect3D7",
+        EnumDevices,
+        EnumZBufferFormats
+    );
+    bind!(
+        registry,
+        Device7,
+        "IDirect3DDevice7",
+        GetCaps,
+        EnumTextureFormats
+    );
 }
 
 /// Install the Direct3D registry tables after installing DirectDraw and the surface store.
@@ -231,6 +291,10 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) -> Result<(), String> {
     let mut d3d = State {
         tables: Default::default(),
         devices: Vec::new(),
+        gpu: store.fork_gpu().map_err(|e| e.to_string())?,
+        queue: Default::default(),
+        depths: Default::default(),
+        programs: Default::default(),
     };
     for face in Face::ALL {
         let slots = signature::com_signatures()
@@ -259,18 +323,19 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) -> Result<(), String> {
 
 fn dispatch(env: &mut Env<'_>) -> Outcome {
     let binding = env.sys.thunks.get(env.thunk).f;
-    let face = Face::ALL[(binding.data >> 16) as usize];
-    let slot = binding.data as u16;
+    let face = Face::ALL[(binding.data >> 32) as usize];
     let mut args = [0; 8];
     let args = &mut args[..usize::from(binding.conv.argc())];
     for (i, word) in args.iter_mut().enumerate() {
         *word = env.arg(i as u32);
     }
-    let method = signature::com_signatures()
-        .iter()
-        .find(|sig| sig.module == face.name() && sig.com_slot == Some(slot))
-        .unwrap()
-        .name;
+    let method = signature::com_signatures()[binding.data as u32 as usize].name;
+    if matches!(
+        method,
+        "EnumDevices" | "EnumZBufferFormats" | "EnumTextureFormats"
+    ) {
+        return super::report::enumerate(env, face, method, args);
+    }
     let result = {
         let (state, store) = env.ext.get2_installed_mut::<front::State, SurfaceStore>();
         let mut memory = (state.provider.memory)(env.cpu);
@@ -342,8 +407,40 @@ impl Calls<'_> {
                 }
             }
             "AddRef" => super::add_ref(self.draw, self.objects, this),
-            "Release" => super::release(self.draw, self.store, self.objects, this),
+            "Release" => {
+                self.draw.d3d.as_mut().unwrap().flush()?;
+                super::release(self.draw, self.store, self.objects, this)
+            }
             "CreateDevice" => return self.create_device(face, args),
+            "GetCaps" => {
+                let Some(Object::Device(device)) = self
+                    .draw
+                    .com
+                    .and_then(|com| com.get::<Object>(self.objects, this))
+                else {
+                    return Ok(INVALID);
+                };
+                write(
+                    self.memory,
+                    args[1],
+                    &super::report::derive(self.store, device.kind).device,
+                )?;
+                0
+            }
+            "CreateVertexBuffer" => return self.create_vertex_buffer(args),
+            "Lock" | "Unlock" | "GetVertexBufferDesc" | "Optimize" => {
+                return self.vertex_buffer(method, args);
+            }
+            "BeginScene" | "EndScene" | "Clear" | "SetRenderTarget" | "GetRenderTarget"
+            | "SetTexture" | "GetTexture" | "PreLoad" | "ValidateDevice" => {
+                return self.render_method(method, args);
+            }
+            "DrawPrimitive"
+            | "DrawIndexedPrimitive"
+            | "DrawPrimitiveStrided"
+            | "DrawIndexedPrimitiveStrided"
+            | "DrawPrimitiveVB"
+            | "DrawIndexedPrimitiveVB" => return self.draw_primitive(method, args),
             "CreateLight" | "CreateMaterial" | "CreateViewport" => {
                 return self.create_child(face, method, args);
             }
@@ -364,7 +461,12 @@ impl Calls<'_> {
                 let iid = if face == Face::Device7 {
                     IID_IDIRECT3D7
                 } else {
-                    IID_IDIRECT3D3
+                    match face {
+                        Face::Device1 => IID_IDIRECT3D,
+                        Face::Device2 => IID_IDIRECT3D2,
+                        Face::Device3 => IID_IDIRECT3D3,
+                        _ => unreachable!(),
+                    }
                 };
                 match super::query(self.draw, self.objects, parent, iid) {
                     Ok(pointer) => {
@@ -393,7 +495,7 @@ impl Calls<'_> {
                         }
                         &mut value[..count as usize]
                     }
-                    Object::Device(_) => return Ok(INVALID),
+                    Object::Device(_) | Object::VertexBuffer { .. } => return Ok(INVALID),
                 };
                 if self.memory.arg_u32(args[1])? != words.len() as u32 * 4 {
                     return Ok(INVALID);
@@ -446,14 +548,14 @@ impl Calls<'_> {
         let kind = [caps::Device::Rgb, caps::Device::Hal, caps::Device::TnlHal]
             .into_iter()
             .find(|device| device.guid() == guid);
-        let Some(_) = kind else { return Ok(INVALID) };
+        let Some(kind) = kind else { return Ok(INVALID) };
         let faces: &[Face] = match face {
             Face::Direct3D2 => &[Face::Device2, Face::Device1],
             Face::Direct3D3 => &[Face::Device3, Face::Device2, Face::Device1],
             Face::Direct3D7 => &[Face::Device7],
             _ => return Ok(NO_INTERFACE),
         };
-        let mut device = object::Device::new(parent, target);
+        let mut device = object::Device::new(kind, parent, target);
         if face == Face::Direct3D7 {
             let depth = self
                 .draw
@@ -492,6 +594,7 @@ impl Calls<'_> {
             return Ok(INVALID);
         };
         let memory = &mut *self.memory;
+        let mut references = [(0, 0); 8];
         let result = (|| -> Result<Result<(), u32>, CallError> {
             macro_rules! validated {
                 ($value:expr) => {
@@ -587,17 +690,31 @@ impl Calls<'_> {
                     memory.arg_put_u32(args[1], handle)?;
                 }
                 "CreateStateBlock" => {
-                    let handle = validated!(state.create(args[1]));
+                    let (handle, changes) = validated!(state.create(args[1]));
+                    references = changes;
                     memory.arg_put_u32(args[2], handle)?;
                 }
-                "CaptureStateBlock" => validated!(state.capture(args[1])),
-                "ApplyStateBlock" => validated!(state.apply(args[1])),
-                "DeleteStateBlock" => validated!(state.delete(args[1])),
+                "CaptureStateBlock" => references = validated!(state.capture(args[1])),
+                "ApplyStateBlock" => references = validated!(state.apply(args[1])),
+                "DeleteStateBlock" => references = validated!(state.delete(args[1])),
                 _ => unreachable!(),
             }
             Ok(Ok(()))
-        })()?;
-        Ok(result.err().unwrap_or(0))
+        })();
+        let changed = references
+            .into_iter()
+            .filter(|(previous, next)| previous != next);
+        for (_, next) in changed.clone() {
+            if next != 0 {
+                super::add_ref(self.draw, self.objects, next);
+            }
+        }
+        for (previous, _) in changed {
+            if previous != 0 {
+                self.draw.release_com(self.objects, self.store, previous);
+            }
+        }
+        Ok(result?.err().unwrap_or(0))
     }
 
     fn make(&mut self, faces: &[Face], aliases: &[Iid], value: Object) -> Result<u32, CallError> {

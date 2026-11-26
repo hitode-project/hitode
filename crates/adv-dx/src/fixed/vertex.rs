@@ -167,9 +167,44 @@ impl VertexProgram {
     }
 
     pub fn emit(&self, s: &mut String, inputs: &[Input]) {
+        self.emit_vertex(s, inputs, None);
+    }
+
+    pub fn emit_legacy(&self, s: &mut String, inputs: &[Input], legacy: super::program::Legacy) {
+        self.emit_vertex(s, inputs, Some(legacy));
+    }
+
+    fn emit_vertex(
+        &self,
+        s: &mut String,
+        inputs: &[Input],
+        legacy: Option<super::program::Legacy>,
+    ) {
         s.push_str("let viewport=bitcast<vec4<f32>>(draw_parameters.values[0]);\n");
         if self.layout.transformed {
             s.push_str("let w=1.0/a0.w;out.position=vec4<f32>((((a0.x+0.5-viewport.z)/viewport.x)*2.0-1.0)*w,(1.0-((a0.y+0.5-viewport.w)/viewport.y)*2.0)*w,a0.z*w,w);let clip_position=out.position;\n");
+        } else if let Some(legacy) = legacy.filter(|legacy| legacy.blend_weights != 0) {
+            s.push_str("let p=vec4<f32>(a0,1.0);var world=vec4<f32>(0.0);var remainder=1.0;\n");
+            for i in 0..legacy.blend_weights {
+                let weight = if legacy.blend_weights == 1 {
+                    "a12"
+                } else {
+                    ["a12.x", "a12.y", "a12.z"][i as usize]
+                };
+                let matrix = if i == 0 { 0 } else { 102 + (i - 1) * 4 };
+                writeln!(
+                    s,
+                    "world+=fixed_row(p,{matrix}u)*{weight};remainder-={weight};"
+                )
+                .unwrap();
+            }
+            writeln!(
+                s,
+                "world+=fixed_row(p,{}u)*remainder;",
+                102 + (legacy.blend_weights - 1) * 4
+            )
+            .unwrap();
+            s.push_str("let eye=fixed_row(world,4u);let clip_position=fixed_row(eye,8u);out.position=clip_position;out.position.x+=out.position.w/viewport.x;out.position.y-=out.position.w/viewport.y;\n");
         } else {
             s.push_str("let eye=fixed_row(fixed_row(vec4<f32>(a0,1.0),0u),4u);let clip_position=fixed_row(eye,8u);out.position=clip_position;out.position.x+=out.position.w/viewport.x;out.position.y-=out.position.w/viewport.y;\n");
         }
@@ -209,6 +244,34 @@ impl VertexProgram {
         for n in 0..8 {
             let value = attribute(n + 2, "vec4<f32>(0.0,0.0,0.0,1.0)");
             writeln!(s, "out.t{n}={value};").unwrap();
+        }
+        if let Some(legacy) = legacy {
+            if let Some(round) = legacy.point_rounding {
+                let rounding = if round {
+                    "floor(screen+vec2<f32>(0.5))"
+                } else {
+                    "floor(screen)"
+                };
+                writeln!(s, "let ndc=out.position.xy/out.position.w;let screen=(vec2<f32>(ndc.x,-ndc.y)+1.0)*viewport.xy*0.5+viewport.zw-0.5;let snapped={rounding};let screen_clip=(snapped+0.5-viewport.zw)/viewport.xy*2.0-1.0;out.position.x=screen_clip.x*out.position.w;out.position.y=-screen_clip.y*out.position.w;").unwrap();
+            }
+            if legacy.stages != 0 {
+                s.push_str("var coords=array<vec4<f32>,8>(out.t0,out.t1,out.t2,out.t3,out.t4,out.t5,out.t6,out.t7);\n");
+            }
+            for n in 0..legacy.stages {
+                writeln!(
+                    s,
+                    "{{let cfg=bitcast<vec4<u32>>(vs_constants.f[{}]);var uv=coords[cfg.x&7u];",
+                    114 + n
+                )
+                .unwrap();
+                if !self.layout.transformed {
+                    s.push_str("if cfg.x>>16u==2u {uv=eye;}\n");
+                    if self.layout.normal.is_some() {
+                        s.push_str("let generated_normal=fixed_row(fixed_row(vec4<f32>(a11,0.0),0u),4u).xyz;if cfg.x>>16u==1u {uv=vec4<f32>(generated_normal,1.0);}if cfg.x>>16u==3u {uv=vec4<f32>(reflect(fixed_normalize(eye.xyz),fixed_normalize(generated_normal)),1.0);}\n");
+                    }
+                }
+                writeln!(s, "if (cfg.y&255u)!=0u {{uv=fixed_row(uv,{}u);if (cfg.y&256u)!=0u {{uv=uv/uv[(cfg.y&255u)-1u];}}}}out.t{n}=uv;}}", 70 + n * 4).unwrap();
+            }
         }
         if self.scaled {
             s.push_str("let scale=vs_constants.f[12];let point_distance=length(eye.xyz);let fixed_point_size=viewport.y*scale.w/sqrt(scale.x+scale.y*point_distance+scale.z*point_distance*point_distance);\n");
