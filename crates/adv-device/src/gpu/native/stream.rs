@@ -111,6 +111,8 @@ pub(crate) enum Command {
         row_pitch: u32,
         extent: adv_gpu::Extent,
     },
+    ModernTransfer(Box<super::modern::ModernTransfer>),
+    Complete(std::sync::mpsc::Sender<()>),
     Timestamp(super::modern::QuerySlot),
     ReadQuery {
         slot: super::modern::QuerySlot,
@@ -283,6 +285,7 @@ impl Producer {
             Command::Present { .. }
                 | Command::PresentSwap { .. }
                 | Command::Readback { .. }
+                | Command::Complete(_)
                 | Command::Submit
         );
         let target = matches!(command, Command::Target { .. });

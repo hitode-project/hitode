@@ -698,7 +698,7 @@ pub(super) fn program_sampling_flags(texture: &gpu::ProgramTexture) -> u8 {
 pub(super) fn fixed_sampling_flags(image: Option<&super::Image>) -> u8 {
     image.map_or(0, |image| {
         u8::from(image.alpha_mode() == gpu::AlphaMode::Opaque)
-            | (u8::from(image.texel_format() == gpu::TexelFormat::A8) << 1)
+            | (u8::from(super::record::color_format(image) == Format::R8Unorm) << 1)
     })
 }
 fn sampling_expression(flags: u8) -> &'static str {

@@ -560,3 +560,100 @@ impl Gpu {
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone)]
+pub struct ImageRegion {
+    pub image: adv_gpu::Image,
+    pub mip: u32,
+    pub layer: u32,
+    pub origin: (u32, u32, u32),
+    pub extent: adv_gpu::Extent,
+}
+
+impl ImageRegion {
+    pub(super) fn copy(&self) -> adv_gpu::encode::ImageCopy<'_> {
+        adv_gpu::encode::ImageCopy {
+            image: &self.image,
+            mip: self.mip,
+            layer: self.layer,
+            origin: self.origin,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TransferBuffer {
+    pub buffer: Buffer,
+    pub offset: u64,
+    pub row_pitch: u32,
+    pub rows: u32,
+}
+
+impl TransferBuffer {
+    pub(super) fn copy(&self) -> adv_gpu::encode::BufferCopy<'_> {
+        adv_gpu::encode::BufferCopy {
+            buffer: &self.buffer,
+            offset: self.offset,
+            row_pitch: self.row_pitch,
+            rows: self.rows,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum ModernTransfer {
+    CopyImage {
+        source: ImageRegion,
+        destination: ImageRegion,
+    },
+    Upload {
+        source: TransferBuffer,
+        destination: ImageRegion,
+    },
+    Download {
+        source: ImageRegion,
+        destination: TransferBuffer,
+    },
+    CopyBuffer {
+        source: BufferRange,
+        destination: Buffer,
+        offset: u64,
+    },
+    FillBuffer {
+        destination: BufferRange,
+        value: u32,
+    },
+    ClearColor {
+        view: ImageView,
+        value: [f64; 4],
+        area: Option<Rect>,
+    },
+    ClearDepth {
+        view: ImageView,
+        depth: Option<f32>,
+        stencil: Option<u32>,
+    },
+}
+
+impl Gpu {
+    pub fn transfer(&self, transfer: ModernTransfer) -> Result<(), Error> {
+        self.enqueue_modern(super::record::WorkerItem::TransferImage {
+            facade: self.facade_id,
+            command: Box::new(super::stream::Command::ModernTransfer(Box::new(transfer))),
+        })
+    }
+
+    pub fn completion(&self) -> Result<std::sync::mpsc::Receiver<()>, Error> {
+        let (send, receive) = std::sync::mpsc::channel();
+        self.check()?;
+        self.execution.worker.admit_cmd(0, self.wake.get())?;
+        self.execution.worker.push_boundary(
+            super::record::WorkerItem::TransferImage {
+                facade: self.facade_id,
+                command: Box::new(super::stream::Command::Complete(send)),
+            },
+            0,
+        );
+        Ok(receive)
+    }
+}

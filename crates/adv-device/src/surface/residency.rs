@@ -56,6 +56,15 @@ impl<I> Residency<I> {
         self.gpu_stale = Region::whole(size);
     }
 
+    /// Replace every cell on the GPU without preserving the CPU copy.
+    pub fn gpu_overwrite(&mut self) {
+        if self.gpu.is_some() && self.cpu {
+            let size = self.gpu_stale.size();
+            self.gpu_stale = Region::empty(size);
+            self.cpu_stale = Region::whole(size);
+        }
+    }
+
     pub fn cpu_access<E>(
         &mut self,
         rect: Rect,
