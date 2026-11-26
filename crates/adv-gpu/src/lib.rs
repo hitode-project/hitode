@@ -70,6 +70,9 @@
 //!   | extended dynamic state 1/2, color write enable | the state joins the pipeline key |
 //!   | load/store op none | load and store |
 //!
+//!   Pipelines whose heap indices exceed the push-constant budget bind
+//!   through cached descriptor sets.
+//!
 //!   Optional fast paths: cooperative matrices, int8 dot products, tile-local
 //!   reads (`dynamic_rendering_local_read`, `shader_tile_image`), descriptor
 //!   buffers, host image copy, pipeline binaries, EDS3, Qualcomm tile

@@ -97,18 +97,35 @@ impl Device {
                     });
                 }
             };
-            let mut capabilities = naga::valid::Capabilities::default()
-                | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
-                | naga::valid::Capabilities::EARLY_DEPTH_TEST;
+            use naga::valid::Capabilities as Caps;
+            let version = version();
+            let mac = self.0.raw.supportsFamily(MTLGPUFamily::Mac2);
+            let mut capabilities = Caps::SHADER_FLOAT16_IN_FLOAT32
+                | Caps::EARLY_DEPTH_TEST
+                | Caps::CLIP_DISTANCES
+                | Caps::MULTISAMPLED_SHADING
+                | Caps::DUAL_SOURCE_BLENDING
+                | Caps::CUBE_ARRAY_TEXTURES
+                | Caps::STORAGE_TEXTURE_16BIT_NORM_FORMATS;
+            if version >= (2, 3) && (mac || self.0.raw.supportsFamily(MTLGPUFamily::Apple7)) {
+                capabilities |= Caps::PRIMITIVE_INDEX;
+            }
+            if mac || self.0.raw.supportsFamily(MTLGPUFamily::Apple6) {
+                if version >= (3, 1) {
+                    capabilities |= Caps::TEXTURE_ATOMIC;
+                }
+                if version >= (3, 2) {
+                    capabilities |= Caps::MEMORY_DECORATION_COHERENT;
+                }
+            }
             if self.caps().features.contains(Features::SHADER_F16) {
-                capabilities |= naga::valid::Capabilities::SHADER_FLOAT16;
+                capabilities |= Caps::SHADER_FLOAT16;
             }
             if self.caps().features.contains(Features::SUBGROUP) {
-                capabilities |= naga::valid::Capabilities::SUBGROUP
-                    | naga::valid::Capabilities::SUBGROUP_BARRIER;
+                capabilities |= Caps::SUBGROUP | Caps::SUBGROUP_BARRIER;
             }
             if self.caps().features.contains(Features::MATRIX_F16_8X8) {
-                capabilities |= naga::valid::Capabilities::COOPERATIVE_MATRIX;
+                capabilities |= Caps::COOPERATIVE_MATRIX;
             }
             let info =
                 naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
@@ -134,7 +151,7 @@ impl Device {
                     &info,
                     None,
                     crate::shader::compile::Options {
-                        version: version(),
+                        version,
                         textures: self.caps().limits.max_sampled_images,
                         bounds: naga::proc::BoundsCheckPolicies {
                             index: naga::proc::BoundsCheckPolicy::Restrict,
