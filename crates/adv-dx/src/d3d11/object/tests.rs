@@ -54,7 +54,7 @@ fn device_references_follow_visible_children() {
     );
     let view = View::new(ViewKind::RenderTarget, texture, None, report).unwrap();
     table
-        .attach_resource(&mut objects, TEXTURE, DEVICE, texture)
+        .attach_resource(&mut objects, TEXTURE, DEVICE, texture, None)
         .unwrap();
     assert_eq!((refs(&objects, DEVICE), refs(&objects, TEXTURE)), (3, 1));
     assert_eq!(
@@ -76,14 +76,14 @@ fn device_references_follow_visible_children() {
 
     let released = table.release(&mut objects, VIEW);
     assert_eq!(released.references, 0);
-    assert!(released.headers.is_empty());
+    assert!(released.allocations.is_empty());
     assert_eq!((refs(&objects, DEVICE), refs(&objects, TEXTURE)), (3, 1));
     assert_eq!(table.add_ref(&mut objects, VIEW), Ok(1));
     assert_eq!((refs(&objects, DEVICE), refs(&objects, VIEW)), (4, 1));
 
     let released = table.release(&mut objects, TEXTURE);
     assert_eq!(released.references, 0);
-    assert!(released.headers.is_empty());
+    assert!(released.allocations.is_empty());
     assert_eq!(refs(&objects, DEVICE), 3);
     let resource = table.get(&objects, VIEW).unwrap().view().unwrap().0;
     assert_eq!(resource, TEXTURE);
@@ -100,11 +100,11 @@ fn device_references_follow_visible_children() {
     table.release(&mut objects, TEXTURE);
     table.release(&mut objects, VIEW);
     assert_eq!(
-        table.release_bound(&mut objects, VIEW).headers,
+        table.release_bound(&mut objects, VIEW).allocations,
         [VIEW, TEXTURE]
     );
-    assert_eq!(table.release(&mut objects, CONTEXT).headers, [CONTEXT]);
-    assert_eq!(table.release(&mut objects, DEVICE).headers, [DEVICE]);
+    assert_eq!(table.release(&mut objects, CONTEXT).allocations, [CONTEXT]);
+    assert_eq!(table.release(&mut objects, DEVICE).allocations, [DEVICE]);
 }
 
 // spec: GFX-RES-1
@@ -129,7 +129,7 @@ fn immutable_state_identity_uses_the_normalized_description() {
     );
     assert_eq!(table.references(&objects, 20), Some(2));
     assert_eq!(table.release(&mut objects, 20).references, 1);
-    assert_eq!(table.release(&mut objects, 20).headers, [20]);
+    assert_eq!(table.release(&mut objects, 20).allocations, [20]);
     assert_eq!(
         table.find_pipeline(&mut objects, DEVICE, &equivalent),
         Ok(None)

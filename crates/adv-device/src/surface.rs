@@ -15,10 +15,10 @@ mod packed;
 mod planes;
 mod residency;
 pub use planes::Plane;
-pub use residency::Access;
 #[cfg(feature = "gpu")]
 pub use residency::CpuReadback;
 use residency::Entry;
+pub use residency::{Access, Residency};
 #[cfg(feature = "gpu")]
 pub(crate) mod slots;
 pub use composite::{Composite, CompositeError, GradientVertex};

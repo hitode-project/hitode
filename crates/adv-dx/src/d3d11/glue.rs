@@ -1,15 +1,15 @@
 //! Marshal generated device-child COM signatures onto the object table.
 use super::{
     abi::*,
-    desc::{PipelineState, Resource, TextureKind, View, ViewKind},
-    object::{Error as ObjectError, Object, PrivateData, Release, Table},
+    desc::{PipelineState, Resource, TextureKind, Usage, View, ViewKind},
+    object::{Error as ObjectError, Object, PrivateData, Release, Table, map},
     ops::{self, Error},
 };
 use adv_abi::{Api, Env, GuestPtr, ImplementationLevel, Outcome, Registry, com::Iid, signature};
 use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_machine::Machine;
 use bytemuck::Pod;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroU32};
 
 const DLL: &str = "d3d11.dll";
 type Slot = (&'static str, adv_abi::Handler, ImplementationLevel);
@@ -147,9 +147,36 @@ pub fn attach_resource(
             TextureKind::D3 => "ID3D11Texture3D",
         },
     };
+    let layouts = if matches!(resource.usage(), Usage::Dynamic | Usage::Staging) {
+        let alignment = NonZeroU32::new(128).unwrap();
+        Some(map::Layouts::new(resource, alignment).ok_or(ObjectError::Exhausted)?)
+    } else {
+        None
+    };
     let pointer = alloc(env, face)?;
-    let result = table(env).attach_resource(&mut env.sys.objects, pointer, device, resource);
+    let (storage, mapping) = match layouts {
+        Some(layouts) => {
+            let heaps = env.ext.get_mut::<adv_os::Heaps>();
+            let Some(storage) = heaps.alloc(
+                env.cpu,
+                &mut env.sys.vm,
+                heaps.process_heap,
+                layouts.size(),
+                true,
+            ) else {
+                free(env, pointer);
+                return Err(ObjectError::Exhausted);
+            };
+            (Some(storage), Some(layouts.attach(storage)))
+        }
+        None => (None, None),
+    };
+    let result =
+        table(env).attach_resource(&mut env.sys.objects, pointer, device, resource, mapping);
     if result.is_err() {
+        if let Some(storage) = storage {
+            free(env, storage);
+        }
         free(env, pointer);
     }
     result.map(|()| pointer)
@@ -242,7 +269,7 @@ fn release(env: &mut Env<'_>) -> Outcome {
 }
 
 fn retire(env: &mut Env<'_>, released: Release) -> Outcome {
-    for pointer in released.headers {
+    for pointer in released.allocations {
         free(env, pointer);
     }
     drop_private(env, released.private_interfaces, released.references)

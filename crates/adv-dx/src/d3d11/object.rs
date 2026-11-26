@@ -43,8 +43,15 @@ pub struct Object {
 enum Kind {
     Device(Device),
     ImmediateContext,
-    Resource { desc: Resource, priority: u32 },
-    View { desc: Arc<View>, resource: u32 },
+    Resource {
+        desc: Resource,
+        priority: u32,
+        mapping: Option<map::Storage>,
+    },
+    View {
+        desc: Arc<View>,
+        resource: u32,
+    },
     Pipeline(Box<PipelineState>),
 }
 
@@ -112,6 +119,13 @@ impl Object {
         }
     }
 
+    pub fn mapping(&mut self) -> Option<&mut map::Storage> {
+        match &mut self.kind {
+            Kind::Resource { mapping, .. } => mapping.as_mut(),
+            _ => None,
+        }
+    }
+
     pub fn pipeline(&self) -> Option<&PipelineState> {
         match &self.kind {
             Kind::Pipeline(pipeline) => Some(pipeline),
@@ -160,7 +174,7 @@ impl Object {
 #[derive(Default)]
 pub struct Release {
     pub references: u32,
-    pub headers: Vec<u32>,
+    pub allocations: Vec<u32>,
     pub private_interfaces: Vec<u32>,
 }
 
@@ -216,6 +230,7 @@ impl Table {
         pointer: u32,
         device: u32,
         desc: Resource,
+        mapping: Option<map::Storage>,
     ) -> Result<(), Error> {
         self.attach(
             objects,
@@ -224,6 +239,7 @@ impl Table {
             Kind::Resource {
                 desc,
                 priority: 0x78000000,
+                mapping,
             },
         )
     }
@@ -422,7 +438,7 @@ impl Table {
             kind,
             private,
         } = destroyed.value;
-        result.headers.extend(destroyed.interfaces);
+        result.allocations.extend(destroyed.interfaces);
         result
             .private_interfaces
             .extend(private.into_values().filter_map(|value| match value {
@@ -439,7 +455,13 @@ impl Table {
                     owner.states[class].remove(state.descriptor_bytes());
                 }
             }
-            Kind::Device(_) | Kind::ImmediateContext | Kind::Resource { .. } => (),
+            Kind::Resource {
+                mapping: Some(mapping),
+                ..
+            } => {
+                result.allocations.push(mapping.pointer());
+            }
+            Kind::Device(_) | Kind::ImmediateContext | Kind::Resource { mapping: None, .. } => (),
         }
     }
 }

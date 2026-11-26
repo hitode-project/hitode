@@ -1,8 +1,6 @@
 //! CPU stores and GPU images share the same surface identity and cell grid.
-use super::{Rect, Surface};
+use super::{Rect, Region, Surface, rects};
 
-#[cfg(feature = "gpu")]
-use super::{Region, rects};
 #[cfg(feature = "gpu")]
 use crate::gpu::{Depth, Image, Target};
 
@@ -13,71 +11,79 @@ pub enum Access {
     Write,
 }
 
-/// Guest storage described by the entry's layout.
-struct Store;
-
-pub(super) struct Residency {
-    cpu: Option<Store>,
-    #[cfg(feature = "gpu")]
-    pub(super) gpu: Option<Image>,
-    #[cfg(feature = "gpu")]
+/// Coherent copies of one subresource. Coordinates use the transfer layout's
+/// units, such as blocks for compressed images. The owner supplies pitches,
+/// slices and the transfer function for its CPU layout and GPU backing.
+pub struct Residency<I> {
+    cpu: bool,
+    pub(super) gpu: Option<I>,
     cpu_stale: Region,
-    #[cfg(feature = "gpu")]
     gpu_stale: Region,
 }
 
-impl Residency {
-    pub(super) fn cpu() -> Self {
+impl<I> Residency<I> {
+    pub fn cpu() -> Self {
         Self {
-            cpu: Some(Store),
-            #[cfg(feature = "gpu")]
+            cpu: true,
             gpu: None,
-            #[cfg(feature = "gpu")]
             cpu_stale: Region::default(),
-            #[cfg(feature = "gpu")]
             gpu_stale: Region::default(),
         }
     }
 
-    pub(super) fn has_cpu(&self) -> bool {
-        self.cpu.is_some()
+    pub fn has_cpu(&self) -> bool {
+        self.cpu
     }
 
-    #[cfg(feature = "gpu")]
-    fn native(gpu: Image) -> Self {
+    pub fn native(gpu: I) -> Self {
         Self {
-            cpu: None,
+            cpu: false,
             gpu: Some(gpu),
             cpu_stale: Region::default(),
             gpu_stale: Region::default(),
         }
     }
 
-    #[cfg(feature = "gpu")]
-    fn attach_cpu(&mut self, size: (u32, u32)) {
-        self.cpu = Some(Store);
+    pub fn attach_cpu(&mut self, size: (u32, u32)) {
+        self.cpu = true;
         self.cpu_stale = Region::whole(size);
         self.gpu_stale = Region::empty(size);
     }
 
-    #[cfg(feature = "gpu")]
-    fn attach_gpu(&mut self, size: (u32, u32), image: Image) {
+    pub fn attach_gpu(&mut self, size: (u32, u32), image: I) {
         self.gpu = Some(image);
         self.cpu_stale = Region::empty(size);
         self.gpu_stale = Region::whole(size);
     }
 
-    #[cfg(feature = "gpu")]
+    pub fn cpu_access<E>(
+        &mut self,
+        rect: Rect,
+        mode: Access,
+        transfer: impl FnOnce(&I, &[Rect]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.access(Side::Cpu, rect, mode, transfer)
+    }
+
+    pub fn gpu_access<E>(
+        &mut self,
+        rect: Rect,
+        mode: Access,
+        transfer: impl FnOnce(&I, &[Rect]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.access(Side::Gpu, rect, mode, transfer)
+    }
+
     fn access<E>(
         &mut self,
         side: Side,
         rect: Rect,
         mode: Access,
-        transfer: impl FnOnce(&Image, &[Rect]) -> Result<(), E>,
+        transfer: impl FnOnce(&I, &[Rect]) -> Result<(), E>,
     ) -> Result<(), E> {
-        if self.cpu.is_none() || self.gpu.is_none() {
+        let Some(gpu) = self.gpu.as_ref().filter(|_| self.cpu) else {
             return Ok(());
-        }
+        };
         let (stale, other) = match side {
             Side::Cpu => (&mut self.cpu_stale, &mut self.gpu_stale),
             Side::Gpu => (&mut self.gpu_stale, &mut self.cpu_stale),
@@ -86,7 +92,7 @@ impl Residency {
             let mut needed = Region::empty(stale.size());
             needed.union_clipped(stale, rect.into());
             let parts = rects(&needed);
-            transfer(self.gpu.as_ref().unwrap(), &parts)?;
+            transfer(gpu, &parts)?;
             stale.remove(rect.into());
         }
         if mode == Access::Write {
@@ -101,16 +107,20 @@ impl Residency {
     }
 }
 
-#[cfg(feature = "gpu")]
 #[derive(Clone, Copy)]
 enum Side {
     Cpu,
     Gpu,
 }
 
+#[cfg(feature = "gpu")]
+type LegacyImage = Image;
+#[cfg(not(feature = "gpu"))]
+type LegacyImage = ();
+
 pub(super) struct Entry {
     pub(super) layout: Surface,
-    pub(super) residency: Residency,
+    pub(super) residency: Residency<LegacyImage>,
     #[cfg(feature = "gpu")]
     depth: Option<Depth>,
 }
@@ -189,33 +199,31 @@ impl<P: Presenter> Surfaces<P> {
         {
             let layout = &mut entry.layout;
             let size = (layout.width, layout.height);
-            if entry.residency.cpu.is_none() {
+            if !entry.residency.has_cpu() {
                 layout.pixels = self.arena.alloc(layout.pitch * layout.height, memory)?;
                 entry.residency.attach_cpu(size);
             }
-            entry
-                .residency
-                .access(Side::Cpu, rect, access, |image, parts| {
-                    let mut ticket = self
-                        .gpu
-                        .readback_regions(image, parts, None)
-                        .map_err(gpu_error)?;
-                    ticket.take_completion_job().unwrap()();
-                    let pixels = ticket.poll().unwrap().map_err(gpu_error)?;
-                    let bytes = layout.format.bytes() as usize;
-                    let mut rows = pixels.chunks_exact(4);
-                    let mut row = Vec::new();
-                    for part in parts {
-                        for y in part.y..part.y + part.h {
-                            row.clear();
-                            for pixel in rows.by_ref().take(part.w as usize) {
-                                row.extend_from_slice(&pixel[..bytes]);
-                            }
-                            layout.write_pixels(memory, part.x, y, &row)?;
+            entry.residency.cpu_access(rect, access, |image, parts| {
+                let mut ticket = self
+                    .gpu
+                    .readback_regions(image, parts, None)
+                    .map_err(gpu_error)?;
+                ticket.take_completion_job().unwrap()();
+                let pixels = ticket.poll().unwrap().map_err(gpu_error)?;
+                let bytes = layout.format.bytes() as usize;
+                let mut rows = pixels.chunks_exact(4);
+                let mut row = Vec::new();
+                for part in parts {
+                    for y in part.y..part.y + part.h {
+                        row.clear();
+                        for pixel in rows.by_ref().take(part.w as usize) {
+                            row.extend_from_slice(&pixel[..bytes]);
                         }
+                        layout.write_pixels(memory, part.x, y, &row)?;
                     }
-                    Ok::<(), String>(())
-                })?;
+                }
+                Ok::<(), String>(())
+            })?;
         }
         #[cfg(not(feature = "gpu"))]
         let _ = (rect, access, memory);
@@ -244,26 +252,24 @@ impl<P: Presenter> Surfaces<P> {
                 .residency
                 .attach_gpu((layout.width, layout.height), image);
         }
-        entry
-            .residency
-            .access(Side::Gpu, rect, access, |image, parts| {
-                let bytes = layout.format.bytes() as usize;
-                let mut pixels = Vec::new();
-                for part in parts {
-                    pixels.clear();
-                    for y in part.y..part.y + part.h {
-                        let row = layout.read_pixels(memory, part.x, y, part.w)?;
-                        for pixel in row.chunks_exact(bytes) {
-                            pixels.extend_from_slice(pixel);
-                            pixels.resize(pixels.len() + 4 - bytes, 0);
-                        }
+        entry.residency.gpu_access(rect, access, |image, parts| {
+            let bytes = layout.format.bytes() as usize;
+            let mut pixels = Vec::new();
+            for part in parts {
+                pixels.clear();
+                for y in part.y..part.y + part.h {
+                    let row = layout.read_pixels(memory, part.x, y, part.w)?;
+                    for pixel in row.chunks_exact(bytes) {
+                        pixels.extend_from_slice(pixel);
+                        pixels.resize(pixels.len() + 4 - bytes, 0);
                     }
-                    self.gpu
-                        .upload(image, *part, part.w * 4, &pixels)
-                        .map_err(gpu_error)?;
                 }
-                Ok::<(), String>(())
-            })?;
+                self.gpu
+                    .upload(image, *part, part.w * 4, &pixels)
+                    .map_err(gpu_error)?;
+            }
+            Ok::<(), String>(())
+        })?;
         Ok(entry.residency.gpu.as_ref().unwrap().clone())
     }
 }

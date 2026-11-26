@@ -1,4 +1,7 @@
 //! Map admission before synchronization or guest allocation.
+mod storage;
+pub use storage::{Layout, Layouts, Storage};
+
 use super::super::desc::{Resource, Usage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

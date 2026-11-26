@@ -102,3 +102,57 @@ fn windows_map_admission() {
         }
     }
 }
+
+// spec: GFX-REC-1 GFX-CAP-4
+#[test]
+fn dynamic_maps_share_one_guest_shadow_and_staging_transfers_only_stale_data() {
+    use adv_device::surface::Access as SurfaceAccess;
+    use std::num::NonZeroU32;
+    let report = fixture_report(FeatureLevel::L11_0);
+    let alignment = NonZeroU32::new(128).unwrap();
+    let mut dynamic = Layouts::new(resource("dynamic-vb", &report).unwrap(), alignment)
+        .unwrap()
+        .attach(0x20000);
+    for mode in [4, 4, 5, 4] {
+        let result = dynamic
+            .map(0, mode, 0, true, |_, _, _| unreachable!())
+            .unwrap();
+        assert_eq!(
+            (result.pData, result.RowPitch, result.DepthPitch),
+            (0x20000, 64, 64)
+        );
+    }
+
+    let layouts = Layouts::new(resource("staging-both", &report).unwrap(), alignment).unwrap();
+    assert_eq!(layouts.size(), 128 * 16);
+    let mut staging = layouts.attach(0x30000);
+    staging.attach_staging_gpu(0);
+    let mut uploaded = Vec::new();
+    staging
+        .staging_gpu_access(0, SurfaceAccess::Write, |layout, slice, parts| {
+            assert_eq!(layout.slice(0x30000, slice), 0x30000);
+            uploaded.extend_from_slice(parts);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(uploaded.len(), 1);
+    let nonblocking = staging.map(0, 1, 0x100000, true, |_, _, _| unreachable!());
+    assert_eq!(nonblocking.unwrap_err(), Error::StillDrawing);
+    let mut downloaded = Vec::new();
+    let result = staging
+        .map(0, 1, 0, false, |layout, slice, parts| {
+            assert_eq!(layout.row_pitch(), 128);
+            assert_eq!(slice, 0);
+            downloaded.extend_from_slice(parts);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        (result.pData, result.RowPitch, result.DepthPitch),
+        (0x30000, 128, 2048)
+    );
+    assert_eq!(downloaded, uploaded);
+    staging
+        .map(0, 1, 0x100000, false, |_, _, _| unreachable!())
+        .unwrap();
+}
