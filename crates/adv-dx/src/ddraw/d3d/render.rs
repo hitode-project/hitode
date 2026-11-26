@@ -254,10 +254,10 @@ impl Calls<'_> {
                 self.render_texture(texture, true)?;
             }
             "ValidateDevice" => {
+                self.memory.arg_put_u32(args[1], 1)?;
                 if rejects_rgb(device.kind, &state.fixed) {
                     return Ok(UNSUPPORTED_COLOR_ARGUMENT);
                 }
-                self.memory.arg_put_u32(args[1], 1)?;
             }
             "Clear" => {
                 if lost {

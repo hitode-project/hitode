@@ -177,12 +177,28 @@ vx	hal	table-fog-exp2-2	0000ff0400fa1100ed2600d93f00c05b00a379008694006bad0052c3
 stage	hal	texgen-cameraspaceposition-u=x/32	0	080040180040280040380040480040580040680040780040880040980040a80040b80040c80040d80040e80040f80040
 vx	hal	vertex-blend-1weight-draw	80004005
 vx	hal	vertex-blend-1weight-row-of-point-c=0..4	-1	-1	-1	-1	-1
+stage	hal	z-coplanar-lessequal	0	ff0000
 stage	hal	z-coplanar-less	0	00ff00
 stage	hal	z-coplanar-less-zbias1	0	ff0000
 stage	hal	z-coplanar-less-zbias16	0	ff0000
+stage	hal	z-0.5-then-0.5001-less-zbias1	0	00ff00
+stage	hal	stencil-incr-twice-equal-ref1	0	202020
+stage	hal	stencil-incr-twice-equal-ref2	0	0000ff
+stage	hal	stencil-incr-twice-equal-ref3	0	202020
+stage	hal	stencil-incr-from-ff-then-equal-ff	0	202020
+stage	hal	stage0-565-0x8410-stage1-add-tfactor-204060	0	a4c2e4
 stage	hal	texture-565-0x8410-expanded	0	848284
+stage	hal	stage0-selectarg1-tfactor	0	204060	validate	00000000	1
+stage	hal	stage0-add-texture-tfactor	0	a4c2e4	validate	00000000	1
+stage	hal	stage1-selectarg1-current	0	848284	validate	00000000	1
+stage	hal	stage1-selectarg2-tfactor	0	204060	validate	00000000	1
+stage	hal	stage1-add-current-tfactor-texture1-bound	0	a4c2e4	validate	00000000	1
+stage	hal	stage1-modulate-current-texture1	0	444244	validate	00000000	1
+stage	hal	stage1-add-current-diffuse-0x204060	0	a4c2e4	validate	00000000	1
+stage	hal	texture-565-0xffff-expanded	0	ffffff
 stage	hal	texture-4444-0x8fff-srcalpha-over-404040	0	a6a6a6
 stage	hal	texture-1555-0x4210-expanded	0	848484
+stage	hal	texture-1555-alpha0-alphatest-greater0	0	404040
 vx	tnlhal	directional-diffuse-6deg-steps	fffffffefefef9f9f9f2f2f2e9e9e9ddddddcececebdbdbdababab9696967f7f7f6868684f4f4f3535351b1b1b000000
 vx	tnlhal	directional-normal-length-0.5	7f7f7f7f7f7f7d7d7d7979797474746e6e6e6767675f5f5f5555554b4b4b4040403434342727271a1a1a0d0d0d000000
 vx	tnlhal	directional-normal-length-0.5-normalized	fffffffefefef9f9f9f2f2f2e9e9e9ddddddcececebdbdbdababab9696967f7f7f6868684f4f4f3535351b1b1b000000
@@ -203,6 +219,28 @@ vx	tnlhal	table-fog-exp2-2	0000ff0400fa1100ed2600d93f00c05b00a379008694006bad005
 vx	tnlhal	texgen-cameraspaceposition-u=x/32	080040180040280040380040480040580040680040780040880040980040a80040b80040c80040d80040e80040f80040
 vx	tnlhal	vertex-blend-1weight-draw	00000000
 vx	tnlhal	vertex-blend-1weight-row-of-point-c=0..4	22	21	20	19	18
+stage	tnlhal	z-coplanar-lessequal	0	ff0000
+stage	tnlhal	z-coplanar-less	0	00ff00
+stage	tnlhal	z-coplanar-less-zbias1	0	ff0000
+stage	tnlhal	z-coplanar-less-zbias16	0	ff0000
+stage	tnlhal	z-0.5-then-0.5001-less-zbias1	0	00ff00
+stage	tnlhal	stencil-incr-twice-equal-ref1	0	202020
+stage	tnlhal	stencil-incr-twice-equal-ref2	0	0000ff
+stage	tnlhal	stencil-incr-twice-equal-ref3	0	202020
+stage	tnlhal	stencil-incr-from-ff-then-equal-ff	0	202020
+stage	tnlhal	stage0-565-0x8410-stage1-add-tfactor-204060	0	a4c2e4
+stage	tnlhal	texture-565-0x8410-expanded	0	848284
+stage	tnlhal	stage0-selectarg1-tfactor	0	204060	validate	00000000	1
+stage	tnlhal	stage0-add-texture-tfactor	0	a4c2e4	validate	00000000	1
+stage	tnlhal	stage1-selectarg1-current	0	848284	validate	00000000	1
+stage	tnlhal	stage1-selectarg2-tfactor	0	204060	validate	00000000	1
+stage	tnlhal	stage1-add-current-tfactor-texture1-bound	0	a4c2e4	validate	00000000	1
+stage	tnlhal	stage1-modulate-current-texture1	0	444244	validate	00000000	1
+stage	tnlhal	stage1-add-current-diffuse-0x204060	0	a4c2e4	validate	00000000	1
+stage	tnlhal	texture-565-0xffff-expanded	0	ffffff
+stage	tnlhal	texture-4444-0x8fff-srcalpha-over-404040	0	a6a6a6
+stage	tnlhal	texture-1555-0x4210-expanded	0	848484
+stage	tnlhal	texture-1555-alpha0-alphatest-greater0	0	404040
 vx	rgb	directional-diffuse-6deg-steps	fffffffefefef9f9f9f3f3f3e9e9e9ddddddcececebebebeababab9696967f7f7f6868684f4f4f3535351b1b1b000000
 vx	rgb	directional-normal-length-0.5	8080807f7f7f7d7d7d7979797474746e6e6e6767675f5f5f5555554b4b4b4040403434342727271b1b1b0d0d0d000000
 vx	rgb	directional-normal-length-0.5-normalized	fffffffefefef9f9f9f3f3f3e9e9e9ddddddcececebebebeababab9696967f7f7f6868684f4f4f3535351b1b1b000000
@@ -223,6 +261,28 @@ vx	rgb	table-fog-exp2-2	0000fe0300fa1000ed2400d93e00bf5a00a378008593006aac0051c2
 vx	rgb	texgen-cameraspaceposition-u=x/32	080040180040280040380040480040580040680040780040880040980040a80040b80040c80040d80040e80040f80040
 vx	rgb	vertex-blend-1weight-draw	80004005
 vx	rgb	vertex-blend-1weight-row-of-point-c=0..4	-1	-1	-1	-1	-1
+stage	rgb	z-coplanar-lessequal	0	ff0000
+stage	rgb	z-coplanar-less	0	00ff00
+stage	rgb	z-coplanar-less-zbias1	0	00ff00
+stage	rgb	z-coplanar-less-zbias16	0	00ff00
+stage	rgb	z-0.5-then-0.5001-less-zbias1	0	00ff00
+stage	rgb	stencil-incr-twice-equal-ref1	0	202020
+stage	rgb	stencil-incr-twice-equal-ref2	0	0000ff
+stage	rgb	stencil-incr-twice-equal-ref3	0	202020
+stage	rgb	stencil-incr-from-ff-then-equal-ff	0	202020
+stage	rgb	stage0-565-0x8410-stage1-add-tfactor-204060	0	ffffff
+stage	rgb	texture-565-0x8410-expanded	0	808080
+stage	rgb	stage0-selectarg1-tfactor	0	204060	validate	8876081a	1
+stage	rgb	stage0-add-texture-tfactor	0	a0c0e0	validate	00000000	1
+stage	rgb	stage1-selectarg1-current	0	204060	validate	8876081a	1
+stage	rgb	stage1-selectarg2-tfactor	0	204060	validate	8876081a	1
+stage	rgb	stage1-add-current-tfactor-texture1-bound	0	204060	validate	8876081a	1
+stage	rgb	stage1-modulate-current-texture1	0	204060	validate	8876081a	1
+stage	rgb	stage1-add-current-diffuse-0x204060	0	204060	validate	8876081a	1
+stage	rgb	texture-565-0xffff-expanded	0	204060
+stage	rgb	texture-4444-0x8fff-srcalpha-over-404040	0	9d9d9d
+stage	rgb	texture-1555-0x4210-expanded	0	808080
+stage	rgb	texture-1555-alpha0-alphatest-greater0	0	404040
 setkey	hal	xrgb32-nomip	top	00000000
 ck	hal	xrgb32-nomip	level0-left-key	ggggWWWW
 setkey	hal	argb32-nomip	top	00000000

@@ -2468,3 +2468,113 @@ fn device7_vertex_material_light_and_fog_rows_match_the_capture() {
         compare(&mut f, case, input, u8::from(matches!(table, 1 | 2)));
     }
 }
+
+// spec: GFX-D3D7-2, GFX-D3D7-3
+#[test]
+fn device7_validates_and_draws_the_captured_texture_cascades() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        16,
+        16,
+    );
+    let texture = f.described_surface(
+        dd,
+        creation::Described {
+            flags: 0x1007,
+            width: 1,
+            height: 1,
+            caps: [creation::TEXTURE, 0, 0, 0],
+            format: pixel_format(0x40, 16, [0xf800, 0x7e0, 0x1f, 0]),
+            ..Default::default()
+        },
+    );
+    let (at, _) = f.lock(texture, 0);
+    f.write(at, &0x8410u16.to_le_bytes());
+    f.unlock(texture);
+    for (kind, device) in [
+        (caps::Device::Hal, "hal"),
+        (caps::Device::TnlHal, "tnlhal"),
+        (caps::Device::Rgb, "rgb"),
+    ] {
+        let dev = f.device_kind(d3d, Face::Direct3D7, rt, kind);
+        for (slot, value) in [(22, 1), (60, 0x00204060)] {
+            assert_eq!(f.device_call(dev, "SetRenderState", &[slot, value]), 0);
+        }
+        assert_eq!(f.device_call(dev, "SetTexture", &[0, texture]), 0);
+        for (case, stage0, stage1, bound) in [
+            ("stage0-selectarg1-tfactor", [2, 3, 0], [1, 0, 0], false),
+            ("stage0-add-texture-tfactor", [7, 2, 3], [1, 0, 0], false),
+            ("stage1-selectarg1-current", [2, 2, 0], [2, 1, 3], false),
+            ("stage1-selectarg2-tfactor", [2, 2, 0], [3, 1, 3], false),
+            (
+                "stage1-add-current-tfactor-texture1-bound",
+                [2, 2, 0],
+                [7, 1, 3],
+                true,
+            ),
+            (
+                "stage1-modulate-current-texture1",
+                [2, 2, 0],
+                [4, 1, 2],
+                true,
+            ),
+            (
+                "stage1-add-current-diffuse-0x204060",
+                [2, 2, 0],
+                [7, 1, 0],
+                false,
+            ),
+        ] {
+            for (stage, values) in [stage0, stage1].into_iter().enumerate() {
+                for (slot, value) in values.into_iter().enumerate() {
+                    assert_eq!(
+                        f.device_call(
+                            dev,
+                            "SetTextureStageState",
+                            &[stage as u32, slot as u32 + 1, value]
+                        ),
+                        0
+                    );
+                }
+            }
+            assert_eq!(
+                f.device_call(dev, "SetTexture", &[1, if bound { texture } else { 0 }]),
+                0
+            );
+            f.write(OUT, &0u32.to_le_bytes());
+            let prefix = format!("stage\t{device}\t{case}\t0\t");
+            let captured = EXPECTATIONS
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .unwrap();
+            let fields = captured.split('\t').collect::<Vec<_>>();
+            assert_eq!(
+                f.device_call(dev, "ValidateDevice", &[OUT]),
+                u32::from_str_radix(fields[2], 16).unwrap(),
+                "{device} {case}"
+            );
+            assert_eq!(
+                f.word(OUT),
+                fields[3].parse::<u32>().unwrap(),
+                "{device} {case}"
+            );
+            draw_tl(&mut f, dev, 5, &quad(0., 0., 8., 8., 0xff204060));
+            let color_device = if device == "rgb" && case == "stage0-add-texture-tfactor" {
+                // RGB's truncated 565 expansion is replaced by HAL bit replication.
+                "hal"
+            } else {
+                device
+            };
+            assert_eq!(
+                f.pixels(rt, 1, 1),
+                pixel_row("stage", color_device, case, "0"),
+                "{device} {case}"
+            );
+        }
+    }
+}

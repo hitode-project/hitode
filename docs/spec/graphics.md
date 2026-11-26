@@ -119,7 +119,7 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 
 ### GFX-D3D7-2 Device classes
 
-**Rule**: Device7 MUST enumerate RGB, HAL and T&L HAL in that order, and legacy Direct3D MUST enumerate RGB then HAL. The RGB device MUST retain its texture limit, point rounding, terminal line pixel and combiner decisions while sharing HAL rasterization.
+**Rule**: Device7 MUST enumerate RGB, HAL and T&L HAL in that order, and legacy Direct3D MUST enumerate RGB then HAL. The RGB device MUST retain its texture limit, point rounding, terminal line pixel and combiner decisions while sharing HAL rasterization. An unsupported RGB texture cascade MUST return D3DERR_UNSUPPORTEDCOLORARG from ValidateDevice and report one pass.
 **Verification**: Test
 **Basis**: Windows Direct3D7 semantics and pixel probes
 
