@@ -10,12 +10,13 @@ mod glue;
 mod object;
 mod ops;
 mod state;
+pub mod swap;
 
 pub use glue::{create_device_factory, install, register};
 pub use state::{DeviceCall, DeviceOperation, Devices, Provider, shared_display};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Error {
+pub enum Error {
     InvalidArgument,
     InvalidCall,
     NoInterface,
