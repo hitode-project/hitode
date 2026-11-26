@@ -1,0 +1,67 @@
+buffer	default-no-bind	b000,a000,9100	00000000	64 0 0 0 0 0 0	0
+buffer	zero-width	b000,a000,9100	80070057	0 0 0 0 0 0 0
+buffer	default-cpu-write	b000,a000,9100	80070057	64 0 0 65536 0 0 0
+buffer	immutable-no-init	b000,a000,9100	80070057	64 1 0 0 0 0 0
+buffer	immutable-no-bind	b000,a000,9100	80070057	64 1 0 0 0 0 1
+buffer	dynamic-no-bind	b000,a000,9100	80070057	64 2 0 65536 0 0 0
+buffer	dynamic-no-access	b000,a000,9100	80070057	64 2 1 0 0 0 0
+buffer	dynamic-index-srv	b000,a000	00000000	64 2 10 65536 0 0 0	0
+buffer	staging-no-access	b000,a000,9100	80070057	64 3 0 0 0 0 0
+buffer	staging-with-bind	b000,a000,9100	80070057	64 3 1 131072 0 0 0
+buffer	cb-unaligned	b000,a000,9100	80070057	63 0 4 0 0 0 0
+buffer	cb-oversize	b000,a000,9100	00000000	65552 0 4 0 0 0 0	0
+buffer	cb-extra-bind	b000,a000,9100	80070057	64 0 5 0 0 0 0
+buffer	ignored-stride	b000,a000,9100	00000000	64 0 0 0 0 7 0	0
+buffer	structured-zero-stride	b000,a000,9100	80070057	64 0 8 0 64 0 0
+buffer	structured-odd-stride	b000,a000,9100	80070057	63 0 8 0 64 7 0
+buffer	structured-misaligned-width	b000,a000,9100	80070057	64 0 8 0 64 12 0
+buffer	structured-vertex	b000,a000,9100	80070057	64 0 9 0 64 16 0
+buffer	raw-no-bind	b000,a000,9100	80070057	64 0 0 0 32 0 0
+buffer	raw-unaligned	b000,a000	00000000	63 0 8 0 32 0 0	0
+buffer	raw-structured	b000,a000,9100	80070057	64 0 8 0 96 16 0
+buffer	rt-uav	b000	00000000	64 0 160 0 0 0 0	0
+buffer	depth-bind	b000,a000,9100	80070057	64 0 64 0 0 0 0
+buffer	indirect-unaligned	b000	00000000	63 0 0 0 16 0 0	0
+buffer	indirect-small	b000,a000,9100	80070057	4 0 0 0 16 0 0
+texture	default-no-bind	b000,a000,9100	00000000	16 16 1 1 28 1 0 0 0 0 0 0	1
+texture	full-mips	b000,a000,9100	00000000	16 16 0 1 28 1 0 0 0 0 0 0	5
+texture	long-mips	b000,a000,9100	80070057	16 16 6 1 28 1 0 0 0 0 0 0
+texture	default-cpu-read	b000,a000,9100	00000000	16 16 1 1 28 1 0 0 0 131072 0 0	1
+texture	dynamic-array	b000,a000,9100	80070057	16 16 1 2 28 1 0 2 8 65536 0 0
+texture	dynamic-mips	b000,a000,9100	80070057	16 16 2 1 28 1 0 2 8 65536 0 0
+texture	dynamic-no-bind	b000,a000,9100	80070057	16 16 1 1 28 1 0 2 0 65536 0 0
+texture	staging-no-access	b000,a000,9100	80070057	16 16 1 1 28 1 0 3 0 0 0 0
+texture	staging-msaa	b000,a000,9100	80070057	16 16 1 1 28 4 0 3 0 131072 0 0
+texture	msaa-no-bind	b000,a000,9100	80070057	16 16 1 1 28 4 0 0 0 0 0 0
+texture	msaa-srv	b000,a000	00000000	16 16 1 1 28 4 0 0 8 0 0 0	1
+texture	msaa-full-mips	b000,a000,9100	80070057	16 16 0 1 28 4 0 0 32 0 0 0
+texture	msaa-init	b000,a000,9100	80070057	16 16 1 1 28 4 0 0 32 0 0 1
+texture	mips-srv-only	b000,a000,9100	80070057	16 16 0 1 28 1 0 0 8 0 1 0
+texture	mips-single	b000,a000,9100	00000000	16 16 1 1 28 1 0 0 40 0 1 0	1
+texture	cube-non-square	b000,a000,9100	80070057	16 8 1 6 28 1 0 0 8 0 4 0
+texture	cube-plain-array	b000	00000000	16 16 1 7 28 1 0 0 8 0 4 0	1
+texture	cube-no-bind	b000,a000,9100	00000000	16 16 1 6 28 1 0 0 0 0 4 0	1
+texture	bc-unaligned	b000,a000,9100	80070057	5 16 1 1 71 1 0 0 8 0 0 0
+texture	bc-small	b000,a000,9100	80070057	2 2 1 1 71 1 0 0 8 0 0 0
+texture	gdi-rgba	b000,a000,9100	80070057	16 16 1 1 28 1 0 0 32 0 512 0
+texture	gdi-bgra	b000,a000,9100	00000000	16 16 1 1 87 1 0 0 32 0 512 0	1
+texture	gdi-bgra-mips	b000,a000,9100	80070057	16 16 2 1 87 1 0 0 32 0 512 0
+view	srv-null	b000	00000000	0 0 0 0 0 0 0	28 5 0 3 0 2
+view	srv-unknown	b000	00000000	0 0 5 0 1 0 2	28 5 0 1 0 2
+view	srv-non-array-dimension	b000	00000000	0 28 4 0 1 0 0	28 4 0 1
+view	srv-other-typed-format	b000	80070057	0 29 5 0 1 0 2
+view	srv-all-remaining	b000	00000000	0 28 5 0 4294967295 1 4294967295	28 5 0 3 1 1
+view	srv-zero-mips	b000	80070057	0 28 5 0 0 0 2
+view	rtv-null	b000	00000000	1 0 0 0 0 0 0	28 5 0 0 2
+view	rtv-unknown	b000	00000000	1 0 5 0 0 2 0	28 5 0 0 2
+view	rtv-non-array-dimension	b000	00000000	1 28 4 0 0 0 0	28 4 0
+view	rtv-all-remaining	b000	00000000	1 28 5 0 0 4294967295 0	28 5 0 0 2
+view	uav-null	b000	00000000	2 0 0 0 0 0 0	28 5 0 0 2
+view	uav-unknown	b000	00000000	2 0 5 0 0 2 0	28 5 0 0 2
+view	uav-all-remaining	b000	00000000	2 28 5 0 0 4294967295 0	28 5 0 0 2
+buffer	rt-uav	a000,9100	80070057	64 0 160 0 0 0 0
+buffer	indirect-unaligned	a000,9100	80070057	63 0 0 0 16 0 0
+texture	cube-plain-array	a000,9100	80070057	16 16 1 7 28 1 0 0 8 0 4 0
+buffer	dynamic-index-srv	9100	80070057	64 2 10 65536 0 0 0
+buffer	raw-unaligned	9100	80070057	63 0 8 0 32 0 0
+texture	msaa-srv	9100	80070057	16 16 1 1 28 4 0 0 8 0 0 0

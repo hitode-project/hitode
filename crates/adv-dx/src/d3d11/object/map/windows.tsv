@@ -1,0 +1,9 @@
+dynamic-vb	b000,a000,9100	1200
+dynamic-cb	b000,a000,9100	1200
+dynamic-srv	b000,a000	1200
+dynamic-tex	b000,a000,9100	0200
+staging-read	b000,a000,9100	0003
+staging-write	b000,a000,9100	0018
+staging-both	b000,a000,9100	00db
+default-vb	b000,a000,9100	0000
+dynamic-srv	9100	-

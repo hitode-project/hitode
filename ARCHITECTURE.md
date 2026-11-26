@@ -73,6 +73,11 @@ The shared `adv-dx` modules, including frame recording, shader translation and
 pacing, depend on no API front. `tools/layering/check_modules.py` also applies
 this rule to shared fixed-function code.
 
+The Direct3D 11 core validates creation requests against the derived feature
+level and format table. Resources and immutable state use the shared COM
+identity table. Context snapshots share individual state groups and each
+context indexes its bound views by resource and subresource.
+
 For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe` and calls their imports through the machine. `adv-unix::builtin` installs those images in the prefix before process startup. `adv-runtime::wine` assembles the graphics fronts on that stack: our DirectDraw as such an image, with memory DCs from Wine's GDI. `adv-drv` holds the driver modules win32u loads, such as the user driver whose window reports give the fronts their geometry.
 
 ## A frame, from start to screen
