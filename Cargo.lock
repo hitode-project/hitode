@@ -157,6 +157,7 @@ dependencies = [
  "adv-os",
  "adv-sync",
  "bytemuck",
+ "half",
  "iced-x86",
  "log",
  "naga",
