@@ -141,6 +141,7 @@ struct Key {
 #[derive(PartialEq, Eq, Hash)]
 struct ModernKey {
     state: [u64; 4],
+    topology: p::Topology,
     vertex: u64,
     fragment: Option<u64>,
     colors: arrayvec::ArrayVec<Format, { p::MAX_COLOR_TARGETS }>,
@@ -261,6 +262,7 @@ impl Pipelines {
     ) -> Result<RenderPipeline, Error> {
         let key = ModernKey {
             state: draw.state_ids,
+            topology: draw.primitive.topology,
             vertex: draw.vertex.identity(),
             fragment: draw.fragment.as_ref().map(|f| f.identity()),
             colors: draw

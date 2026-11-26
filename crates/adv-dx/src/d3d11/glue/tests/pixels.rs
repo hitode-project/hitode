@@ -626,6 +626,35 @@ fn windows_fill_and_sampling_rows_through_guest_vtables() {
         "shared-edges-additive-quarter",
         0,
     );
+    assert_eq!(method(&mut machine, context, 35, &[0, 0, u32::MAX]), 0);
+    update_dynamic(
+        &mut machine,
+        context,
+        ps_constant,
+        &[0.0f32, 0., 0., 0., 1., 1., 1., 1.],
+    );
+    for (name, topology, vertices) in [
+        (
+            "points-1.5,1.5-3,3-5.25,5.75",
+            1,
+            vec![p(1.5, 1.5), p(3., 3.), p(5.25, 5.75)],
+        ),
+        (
+            "lines-1,1-6,4-and-1.5,6.5-6.5,1.5",
+            2,
+            vec![p(1., 1.), p(6., 4.), p(1.5, 6.5), p(6.5, 1.5)],
+        ),
+    ] {
+        update_dynamic(&mut machine, context, vb, &vertices);
+        assert_eq!(method(&mut machine, context, 50, &[rtv, DESCRIPTOR]), 0);
+        assert_eq!(method(&mut machine, context, 24, &[topology]), 0);
+        assert_eq!(
+            method(&mut machine, context, 13, &[vertices.len() as u32, 0]),
+            0
+        );
+        assert_eq!(method(&mut machine, context, 47, &[staging, target]), 0);
+        assert_rows(&mut machine, context, staging, name, 0);
+    }
 }
 
 fn assert_rows(
