@@ -266,7 +266,7 @@ The decoder reads input, code tables and ring history in place, so output can
 alias those inputs. It publishes zlib's stream and bit state, including error
 messages and block ends; error-message addresses resolve when the module binds.
 
-- **Graphics:** GDI, DirectDraw and Direct3D 9 share neutral surfaces and drawing services. Direct3D 9 shaders are translated within the limits in [docs/spec/graphics.md](docs/spec/graphics.md). Device services follow [docs/spec/device.md](docs/spec/device.md).
+- **Graphics:** GDI, DirectDraw and Direct3D 9 share neutral surfaces and drawing services. Direct3D 9 shaders are translated within the limits in [docs/spec/graphics.md](docs/spec/graphics.md). The DXBC core in `adv-dx::shader` verifies and reflects SM4–5 register programs, then lowers shared arithmetic rules for scalar execution and WGSL emission. Device services follow [docs/spec/device.md](docs/spec/device.md).
 - **Audio:** one mixer resamples with rubato and decodes with Symphonia. Wine MIDI output synthesizes through OxiSynth with the bundled General MIDI bank. Shared PCM buffers are read through stable views, so a device never reads storage that the guest has freed.
 - **Video:** DirectShow, MCI and wmvcore decode through FFmpeg when built with the `media` feature. See [docs/spec/media.md](docs/spec/media.md).
 - **Fonts:** `adv-runtime::wine::fonts` owns GDI data, layout, DIB composition and DirectWrite glyph services over `adv-device::text` (fontdb, skrifa and zeno). Required native bodies serve interpreted and translated calls; Wine's font backend stays dormant. Fonts that the guest supplies take priority.
