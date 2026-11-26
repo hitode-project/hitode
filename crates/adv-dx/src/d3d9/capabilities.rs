@@ -184,13 +184,13 @@ fn check_format(
         && matches!(check, 21 | 22)
         && env.ext.get::<State>().shader_caps.sm3;
     let supported = vertex_texture_query
-        || (matches!(check, 21 | 22)
+        || (matches!(check, 21..=23)
             && match resource {
                 1 => usage == 0 || usage == 1,
                 3 => matches!(usage, 0 | 1 | 0x200),
                 _ => false,
             })
-        || (matches!(check, 23 | 26)
+        || (check == 26
             && match resource {
                 1 => usage == 0,
                 3 => matches!(usage, 0 | 0x200),
@@ -201,7 +201,7 @@ fn check_format(
     let supported = supported
         && (!filter || resource == 3 && usage & 0x100000 == 0)
         && (!post_ps_blend
-            || matches!(check, 21 | 22) && matches!(resource, 1 | 3) && matches!(usage, 0 | 1));
+            || matches!(check, 21..=23) && matches!(resource, 1 | 3) && matches!(usage, 0 | 1));
     if available(env) && format == 22 && supported {
         0
     } else {
@@ -226,7 +226,7 @@ fn check_multisample(
         return 0x8876086b;
     } // D3DERR_INVALIDDEVICE
     if !available(env)
-        || !(matches!(format, 21 | 22) || depth::format(format).is_some())
+        || !(matches!(format, 21..=23) || depth::format(format).is_some())
         || samples != 0
     {
         return UNAVAILABLE;
@@ -251,7 +251,7 @@ fn check_depth(
         INVALID
     } else if available(env)
         && format == 22
-        && matches!(target, 21 | 22)
+        && matches!(target, 21..=23)
         && depth::format(depth).is_some()
     {
         0
@@ -271,7 +271,10 @@ fn check_conversion(
     if !factory(env, this.addr(), adapter) || kind != 1 {
         return INVALID;
     }
-    if available(env) && matches!(source, 21 | 22) && matches!(target, 21 | 22) {
+    if available(env)
+        && ((matches!(source, 21 | 22) && matches!(target, 21 | 22))
+            || (source == 23 && target == 23))
+    {
         0
     } else {
         UNAVAILABLE
@@ -546,6 +549,8 @@ mod tests {
             (0x200, 3, 26),
             (0, 1, 26),
             (0, 3, 23),
+            (1, 3, 23),
+            (1, 1, 23),
             (0x200, 3, 23),
             (0x200, 3, 22),
             (0, 1, 21),
@@ -556,13 +561,17 @@ mod tests {
             (2, 1, 80),
             (0x20000, 3, 21),
             (0x20000, 3, 22),
+            (0x20000, 3, 23),
             (0x20200, 3, 26),
             (0x20000, 3, 28),
             (0x20000, 3, super::super::format::L8),
             (0x80000, 3, 21),
             (0x80000, 3, 22),
+            (0x80000, 3, 23),
             (0x80000, 1, 21),
+            (0x80000, 1, 23),
             (0x80001, 3, 21),
+            (0x80001, 3, 23),
             (0xa0000, 3, 21),
         ] {
             assert_eq!(
@@ -574,14 +583,12 @@ mod tests {
             (2, 3, 75),
             (1, 3, 26),
             (1, 1, 26),
-            (1, 3, 23),
             (2, 1, 70),
             (0x400, 3, 21),
             (0, 4, 21),
             (0, 5, 21),
             (0x20000, 1, 22),
             (0x20001, 3, 26),
-            (0x80000, 3, 23),
             (0x80000, 3, 26),
             (0x80000, 3, 28),
             (0x80200, 3, 21),
@@ -593,6 +600,13 @@ mod tests {
             );
         }
         assert_eq!(check_depth(&mut env, this, 0, 1, 22, 21, 75), 0);
+        assert_eq!(check_depth(&mut env, this, 0, 1, 22, 23, 75), 0);
+        assert_eq!(check_conversion(&mut env, this, 0, 1, 23, 23), 0);
+        assert_eq!(check_conversion(&mut env, this, 0, 1, 23, 21), UNAVAILABLE);
+        assert_eq!(
+            check_multisample(&mut env, this, 0, 1, 23, 1, 0, GuestPtr::new(0)),
+            0
+        );
         assert_eq!(check_type(&mut env, this, 0, 1, 22, 21, 0), 0);
         assert_eq!(check_type(&mut env, this, 0, 1, 99, 21, 0), UNAVAILABLE);
         assert_eq!(check_type(&mut env, this, 0, 1, 22, 26, 1), UNAVAILABLE);

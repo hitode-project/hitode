@@ -614,12 +614,12 @@ pub(super) fn create_texture(
         || usage & !(1 | 0x200) != 0
         || (pool != 0 && usage != 0)
         || (usage & 1 != 0 && usage & 0x200 != 0)
-        || (matches!(format, 23 | 26 | 28 | format::L8) && usage & 1 != 0)
+        || (matches!(format, 26 | 28 | format::L8) && usage & 1 != 0)
     {
         let reason = if format::bytes(format).is_none() {
             "pixel format is unsupported (supported: 21/22/23/26/28/50)"
-        } else if matches!(format, 23 | 26 | 28 | format::L8) && usage & 1 != 0 {
-            "formats 23/26/28/50 support sampled textures"
+        } else if matches!(format, 26 | 28 | format::L8) && usage & 1 != 0 {
+            "formats 26/28/50 support sampled textures"
         } else {
             "usage/pool or shared-handle combination is unsupported"
         };

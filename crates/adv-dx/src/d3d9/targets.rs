@@ -4,7 +4,7 @@ use adv_abi::types::D3DSURFACE_DESC;
 use resources::{Kind, Resource};
 
 pub(super) fn alpha_mode(format: u32) -> adv_device::gpu::AlphaMode {
-    if matches!(format, 22 | super::format::L8) {
+    if matches!(format, 22 | 23 | super::format::L8) {
         adv_device::gpu::AlphaMode::Opaque
     } else {
         adv_device::gpu::AlphaMode::Stored
@@ -92,7 +92,7 @@ fn create(
     {
         return Outcome::Return(INVALID);
     }
-    if !matches!(format, 21 | 22) || samples != 0 || quality != 0 || !shared.is_null() {
+    if !matches!(format, 21..=23) || samples != 0 || quality != 0 || !shared.is_null() {
         return Outcome::Return(UNAVAILABLE);
     }
     let target = match env.ext.get::<State>().gpu.as_ref() {
