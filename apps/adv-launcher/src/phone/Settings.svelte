@@ -4,6 +4,7 @@
   import AndroidStorageSetting from "../components/AndroidStorageSetting.svelte";
   import GamepadSettingRow from "../components/GamepadSettingRow.svelte";
   import GameStorageSetting from "../components/GameStorageSetting.svelte";
+  import WineEnvironmentSetting from "../components/WineEnvironmentSetting.svelte";
   import ClearCacheSetting from "../components/ClearCacheSetting.svelte";
   import StorageUsage from "../components/StorageUsage.svelte";
   import { preview } from "../lib/bridge";
@@ -18,7 +19,6 @@
   import { reportContents } from "../lib/fake-settings";
   import { nav } from "../lib/nav.svelte";
   import { prefs } from "../lib/prefs.svelte";
-  import { revealC } from "../lib/reveal";
   import { general, setPref as set } from "../lib/settings-form.svelte";
 
   let contentsOpen = $state(false);
@@ -173,12 +173,7 @@
       <StorageUsage />
       <AndroidStorageSetting />
       <GameStorageSetting />
-      {#if device.gameView || preview}
-        <div class="row">
-          <span class="t">{t("Windows C 盘")}</span>
-          <button class="quiet" onclick={revealC}>{t("打开")}</button>
-        </div>
-      {/if}
+      <WineEnvironmentSetting />
       <ClearCacheSetting />
     </section>
 

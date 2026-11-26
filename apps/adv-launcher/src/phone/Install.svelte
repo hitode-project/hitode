@@ -1,9 +1,9 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
+  import Icon from "../components/Icon.svelte";
   import PhoneImportEncoding from "../components/PhoneImportEncoding.svelte";
   import PhoneImportFooter from "../components/PhoneImportFooter.svelte";
   import PhoneImportHeader from "../components/PhoneImportHeader.svelte";
-  import PhoneImportMini from "../components/PhoneImportMini.svelte";
   import PhoneImportPage from "../components/PhoneImportPage.svelte";
   import PhoneImportSwitch from "../components/PhoneImportSwitch.svelte";
   import { InstallFlow } from "../lib/import-flow.svelte";
@@ -36,12 +36,19 @@
       <section class="list" aria-label={t("安装选项")}>
         <div class="rw">
           <span class="k" id="p-i-setup">{t("安装程序")}</span>
-          <PhoneImportMini options={flow.programs.map((p) => ({ value: p, label: p }))} value={flow.setup} labelledby="p-i-setup" mono dense onpick={(v) => (flow.setup = v)} />
+          <span class="selw">
+            <select class="mono-sel" aria-labelledby="p-i-setup" value={flow.setup} onchange={(e) => (flow.setup = e.currentTarget.value)}>
+              {#each flow.programs as p (p)}
+                <option value={p} selected={p === flow.setup}>{p}</option>
+              {/each}
+            </select>
+            <Icon name="chevron-down" size={12} stroke={1.6} />
+          </span>
         </div>
         <div class="rw">
-          <span class="k" style="flex: 0 0 auto">{t("光盘")}</span>
+          <span class="k">{t("光盘")}</span>
           <span class="v mono ell" style="flex: 1 1 auto; min-width: 0; text-align: right">{[flow.disc, ...flow.more].map((p) => p.split(/[\\/]/).pop()).join(" · ")}</span>
-          {#if flow.canAddDisc}<button class="quiet" style="margin-right: -12px" onclick={() => void flow.addDisc()}>{t("添加…")}</button>{/if}
+          {#if flow.canAddDisc}<button class="quiet" style="margin-right: -12px; flex: 0 0 auto" onclick={() => void flow.addDisc()}>{t("添加…")}</button>{/if}
         </div>
         <div class="rw">
           <span class="k">{t("游玩时保留光盘")}</span>
@@ -58,7 +65,14 @@
         <section class="list" aria-label={t("游戏信息")}>
           <div class="rw">
             <span class="k" id="p-i-exe">{t("主程序")}</span>
-            <PhoneImportMini options={flow.exes} value={flow.exe} labelledby="p-i-exe" mono dense onpick={(v) => flow.pickExe(v)} />
+            <span class="selw">
+              <select class="mono-sel" aria-labelledby="p-i-exe" value={flow.exe} onchange={(e) => flow.pickExe(e.currentTarget.value)}>
+                {#each flow.exes as item (item.value)}
+                  <option value={item.value} selected={item.value === flow.exe}>{item.label}</option>
+                {/each}
+              </select>
+              <Icon name="chevron-down" size={12} stroke={1.6} />
+            </span>
           </div>
         </section>
         <PhoneImportEncoding choices={flow.encs} value={flow.enc} compact onpick={(v) => flow.pickEnc(v)} />
@@ -135,6 +149,7 @@
   .rw {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 12px;
     min-height: 56px;
     padding: 6px 0;
@@ -142,8 +157,53 @@
     border-bottom: 1px solid var(--line);
   }
   .rw .k {
-    flex: 1 1 auto;
+    flex: 0 0 auto;
     font-size: 15px;
+    white-space: nowrap;
+  }
+  .rw .v {
+    font-size: 13px;
+    color: var(--fg2);
+  }
+  .selw {
+    position: relative;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 68%;
+    display: inline-flex;
+    align-items: center;
+  }
+  .selw select {
+    appearance: none;
+    -webkit-appearance: none;
+    box-sizing: border-box;
+    width: 100%;
+    height: 40px;
+    min-width: 128px;
+    max-width: 100%;
+    padding: 0 30px 0 12px;
+    border: 0;
+    border-radius: 10px;
+    background: var(--field);
+    color: var(--fg);
+    font-size: 13px;
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .selw select.mono-sel {
+    font-family: var(--font-mono);
+  }
+  .selw select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .selw :global(svg) {
+    position: absolute;
+    right: 11px;
+    pointer-events: none;
+    color: var(--fg3);
   }
   .ell {
     white-space: nowrap;

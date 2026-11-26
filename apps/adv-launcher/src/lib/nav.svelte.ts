@@ -16,6 +16,7 @@ export type Route =
   | { name: "settings" }
   | { name: "gamepad" }
   | { name: "game-storage" }
+  | { name: "wine-env" }
   | { name: "game-files"; gameId: string }
   | { name: "game-run"; gameId: string }
   | { name: "game-settings"; gameId: string }
@@ -25,7 +26,7 @@ export type Route =
 
 const HOME: Route = { name: "library", filter: "all" };
 const FILTERS = ["all", "recent", "favorite", "unstarted"];
-const PLAIN = ["stats", "import", "scan", "settings", "gamepad", "game-storage"];
+const PLAIN = ["stats", "import", "scan", "settings", "gamepad", "game-storage", "wine-env"];
 const PER_GAME = ["game-settings", "game-run", "game-files", "report", "launch", "game", "install"];
 
 /** The screen a location hash names: `#/settings`, `#/library/recent`, `#/launch/g1`. */

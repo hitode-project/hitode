@@ -24,8 +24,41 @@
 {/if}
 
 <style>
-  .row { min-height: 38px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-  .state { margin-left: auto; color: var(--fg3); font-size: 13px; }
-  .t { flex: 1; font-size: 14px; color: var(--fg); }
-  :global(:root[data-device="phone"]) .row { min-height: 48px; }
+  .row {
+    min-height: 56px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .state {
+    margin-left: auto;
+    color: var(--fg3);
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .t {
+    flex: 1;
+    min-width: 0;
+    font-size: 14px;
+    color: var(--fg);
+  }
+  .quiet {
+    box-sizing: border-box;
+    height: 32px;
+    padding: 0 12px;
+    display: flex;
+    align-items: center;
+    border-radius: 16px;
+    white-space: nowrap;
+  }
+  :global(:root[data-device="phone"]) .t {
+    font-size: 15px;
+  }
+  :global(:root[data-device="phone"]) .quiet {
+    height: 36px;
+    border-radius: 18px;
+    font-size: 14px;
+  }
 </style>

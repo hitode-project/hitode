@@ -28,6 +28,7 @@
   import Scan from "./pages/Scan.svelte";
   import Settings from "./pages/Settings.svelte";
   import Stats from "./pages/Stats.svelte";
+  import WineEnvironment from "./pages/WineEnvironment.svelte";
   import PhoneGameSettings from "./phone/GameSettings.svelte";
   import PhoneImport from "./phone/Import.svelte";
   import PhoneInstall from "./phone/Install.svelte";
@@ -149,6 +150,8 @@
         <Gamepad />
       {:else if route.name === "game-storage" || route.name === "game-files"}
         <GameStorage gameId={route.name === "game-files" ? route.gameId : undefined} />
+      {:else if route.name === "wine-env"}
+        <WineEnvironment />
       {:else if route.name === "game-run"}
         <GameRun gameId={route.gameId} />
       {:else if route.name === "game-settings"}

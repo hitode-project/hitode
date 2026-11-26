@@ -301,6 +301,12 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 **Applies to**: Launcher
 **Verification**: Test
 
+### HOST-LIB-12 Wine environment maintenance
+
+**Rule**: Wine environment cleanup MUST measure and remove selected prefix areas without following symbolic links or double-counting temporary directories. Non-temporary resets while the Wine server has started MUST be deferred to the next launch before server startup.
+**Applies to**: Launcher
+**Verification**: Test
+
 ### HOST-RUN-1 Presentation controls
 
 **Rule**: Host volume MUST scale device output without modifying source samples. Fit, integer, stretch and custom modes MUST use the same physical-pixel rectangle for presentation and pointer mapping. Integer mode and the command-line window MUST show each game pixel as the most whole device pixels that fit, else shrink proportionally.

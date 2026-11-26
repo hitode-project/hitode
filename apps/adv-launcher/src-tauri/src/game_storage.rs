@@ -116,6 +116,10 @@ fn clear_legacy_gpu_caches(games: &Path) -> io::Result<()> {
         if real_directory(&artifacts)? && real_directory(&gpu)? {
             fs::remove_dir_all(gpu)?;
         }
+        let debug = game.path().join("debug");
+        if real_directory(&debug)? {
+            fs::remove_dir_all(debug)?;
+        }
     }
     Ok(())
 }
@@ -295,8 +299,10 @@ fn single_game_cache_bytes(data_dir: &Path, cache_dir: &Path, game_id: &str) -> 
         return Ok(0);
     }
     let current = real_dir_bytes(&cache_dir.join("gpu").join(game_id))?;
-    let legacy = real_dir_bytes(&data_dir.join("games").join(game_id).join("artifacts/gpu"))?;
-    Ok(current.saturating_add(legacy))
+    let game_dir = data_dir.join("games").join(game_id);
+    let legacy = real_dir_bytes(&game_dir.join("artifacts/gpu"))?;
+    let debug = real_dir_bytes(&game_dir.join("debug"))?;
+    Ok(current.saturating_add(legacy).saturating_add(debug))
 }
 
 fn clear_one_game_cache(data_dir: &Path, cache_dir: &Path, game_id: &str) -> io::Result<()> {
@@ -307,12 +313,79 @@ fn clear_one_game_cache(data_dir: &Path, cache_dir: &Path, game_id: &str) -> io:
     if real_directory(&current)? {
         fs::remove_dir_all(current)?;
     }
-    let artifacts = data_dir.join("games").join(game_id).join("artifacts");
+    let game_dir = data_dir.join("games").join(game_id);
+    let artifacts = game_dir.join("artifacts");
     let legacy = artifacts.join("gpu");
     if real_directory(&artifacts)? && real_directory(&legacy)? {
         fs::remove_dir_all(legacy)?;
     }
+    let debug = game_dir.join("debug");
+    if real_directory(&debug)? {
+        fs::remove_dir_all(debug)?;
+    }
     Ok(())
+}
+
+fn measure_games_dir(games_root: &Path) -> io::Result<(u64, u64)> {
+    let mut env_bytes = 0u64;
+    let mut cache_bytes = 0u64;
+    if !real_directory(games_root)? {
+        return Ok((0, 0));
+    }
+    for game in fs::read_dir(games_root)? {
+        let game = game?;
+        let kind = game.file_type()?;
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_file() {
+            env_bytes = env_bytes.saturating_add(game.metadata()?.len());
+            continue;
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        for child in fs::read_dir(game.path())? {
+            let child = child?;
+            let child_kind = child.file_type()?;
+            if child_kind.is_symlink() {
+                continue;
+            }
+            if child_kind.is_file() {
+                env_bytes = env_bytes.saturating_add(child.metadata()?.len());
+                continue;
+            }
+            if !child_kind.is_dir() {
+                continue;
+            }
+            if child.file_name().to_str() == Some("artifacts") {
+                for artifact in fs::read_dir(child.path())? {
+                    let artifact = artifact?;
+                    let a_kind = artifact.file_type()?;
+                    if a_kind.is_symlink() {
+                        continue;
+                    }
+                    let bytes = if a_kind.is_dir() {
+                        folder_bytes(&artifact.path())?
+                    } else if a_kind.is_file() {
+                        artifact.metadata()?.len()
+                    } else {
+                        0
+                    };
+                    if a_kind.is_dir() && artifact.file_name().to_str() == Some("gpu") {
+                        cache_bytes = cache_bytes.saturating_add(bytes);
+                    } else {
+                        env_bytes = env_bytes.saturating_add(bytes);
+                    }
+                }
+            } else if child.file_name().to_str() == Some("debug") {
+                cache_bytes = cache_bytes.saturating_add(folder_bytes(&child.path())?);
+            } else {
+                env_bytes = env_bytes.saturating_add(folder_bytes(&child.path())?);
+            }
+        }
+    }
+    Ok((env_bytes, cache_bytes))
 }
 
 fn measure_storage(
@@ -321,103 +394,151 @@ fn measure_storage(
     ios_drive: Option<&Path>,
     current_runtime_id: Option<&str>,
 ) -> io::Result<StorageSummary> {
-    let mut game_files_bytes = real_dir_bytes(&data_dir.join("files"))?;
-    let mut env_bytes = real_dir_bytes(&data_dir.join(crate::covers::DIR))?;
+    let mut game_files_bytes = 0u64;
+    let mut env_bytes = 0u64;
     let mut cache_bytes = real_dir_bytes(&cache_dir.join("gpu"))?;
 
-    if let Ok(meta) = fs::symlink_metadata(data_dir.join("library.json"))
-        && meta.is_file()
-    {
-        env_bytes = env_bytes.saturating_add(meta.len());
-    }
-
-    let imports_root = data_dir.join("imports");
-    if real_directory(&imports_root)? {
-        for entry in fs::read_dir(&imports_root)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_symlink() || !kind.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name.starts_with('.') {
-                cache_bytes = cache_bytes.saturating_add(folder_bytes(&entry.path())?);
-            } else if copy_id(name) {
-                game_files_bytes = game_files_bytes.saturating_add(folder_bytes(&entry.path())?);
-            }
-        }
-    }
-
-    let wine_root = data_dir.join("wine");
-    if real_directory(&wine_root)? {
-        for entry in fs::read_dir(&wine_root)? {
+    let cache_canon = fs::canonicalize(cache_dir).ok();
+    let gpu_cache_canon = fs::canonicalize(cache_dir.join("gpu")).ok();
+    if real_directory(cache_dir)? {
+        for entry in fs::read_dir(cache_dir)? {
             let entry = entry?;
             let kind = entry.file_type()?;
             if kind.is_symlink() {
                 continue;
             }
-            let name = entry.file_name();
-            let is_mount_temp = name.to_string_lossy().starts_with(".hitode-files-");
+            if kind.is_dir() && entry.file_name().to_str() == Some("gpu") {
+                continue;
+            }
+            if gpu_cache_canon.is_some() && fs::canonicalize(entry.path()).ok() == gpu_cache_canon {
+                continue;
+            }
             let bytes = if kind.is_dir() {
-                folder_bytes(&entry.path())?
+                folder_bytes(&entry.path()).unwrap_or(0)
             } else if kind.is_file() {
-                entry.metadata()?.len()
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
             } else {
                 0
             };
-            if is_mount_temp && kind.is_dir() {
-                cache_bytes = cache_bytes.saturating_add(bytes);
-            } else {
-                env_bytes = env_bytes.saturating_add(bytes);
+            env_bytes = env_bytes.saturating_add(bytes);
+        }
+    }
+
+    if real_directory(data_dir)? {
+        for entry in fs::read_dir(data_dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            // On Android `cache_dir` lives inside `data_dir`; avoid double-counting it.
+            if cache_canon.is_some() && fs::canonicalize(&path).ok() == cache_canon {
+                continue;
+            }
+            let name = entry.file_name();
+            match name.to_str() {
+                Some("files") if kind.is_dir() => {
+                    game_files_bytes = game_files_bytes.saturating_add(folder_bytes(&path)?);
+                }
+                Some("installed") if kind.is_dir() => {
+                    game_files_bytes = game_files_bytes.saturating_add(folder_bytes(&path)?);
+                }
+                Some("imports") if kind.is_dir() => {
+                    for child in fs::read_dir(&path)? {
+                        let child = child?;
+                        let c_kind = child.file_type()?;
+                        if c_kind.is_symlink() {
+                            continue;
+                        }
+                        let c_name = child.file_name();
+                        let is_staging =
+                            c_kind.is_dir() && c_name.to_str().is_some_and(|n| n.starts_with('.'));
+                        let bytes = if c_kind.is_dir() {
+                            folder_bytes(&child.path())?
+                        } else if c_kind.is_file() {
+                            child.metadata()?.len()
+                        } else {
+                            0
+                        };
+                        if is_staging {
+                            cache_bytes = cache_bytes.saturating_add(bytes);
+                        } else {
+                            game_files_bytes = game_files_bytes.saturating_add(bytes);
+                        }
+                    }
+                }
+                Some("wine") if kind.is_dir() => {
+                    for child in fs::read_dir(&path)? {
+                        let child = child?;
+                        let c_kind = child.file_type()?;
+                        if c_kind.is_symlink() {
+                            continue;
+                        }
+                        let is_mount_temp = c_kind.is_dir()
+                            && child
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(".hitode-files-");
+                        let bytes = if c_kind.is_dir() {
+                            folder_bytes(&child.path())?
+                        } else if c_kind.is_file() {
+                            child.metadata()?.len()
+                        } else {
+                            0
+                        };
+                        if is_mount_temp {
+                            cache_bytes = cache_bytes.saturating_add(bytes);
+                        } else {
+                            env_bytes = env_bytes.saturating_add(bytes);
+                        }
+                    }
+                }
+                Some("runtime") if kind.is_dir() => {
+                    for child in fs::read_dir(&path)? {
+                        let child = child?;
+                        let c_kind = child.file_type()?;
+                        if c_kind.is_symlink() {
+                            continue;
+                        }
+                        let bytes = if c_kind.is_dir() {
+                            folder_bytes(&child.path())?
+                        } else if c_kind.is_file() {
+                            child.metadata()?.len()
+                        } else {
+                            0
+                        };
+                        let is_current = current_runtime_id.is_none_or(|keep| {
+                            child.file_name().to_str() == Some(keep) && c_kind.is_dir()
+                        });
+                        if is_current {
+                            env_bytes = env_bytes.saturating_add(bytes);
+                        } else {
+                            cache_bytes = cache_bytes.saturating_add(bytes);
+                        }
+                    }
+                }
+                Some("games") if kind.is_dir() => {
+                    let (games_env, games_cache) = measure_games_dir(&path)?;
+                    env_bytes = env_bytes.saturating_add(games_env);
+                    cache_bytes = cache_bytes.saturating_add(games_cache);
+                }
+                _ => {
+                    let bytes = if kind.is_dir() {
+                        folder_bytes(&path).unwrap_or(0)
+                    } else if kind.is_file() {
+                        entry.metadata().map(|m| m.len()).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    env_bytes = env_bytes.saturating_add(bytes);
+                }
             }
         }
     }
 
     if let Some(drive) = ios_drive {
         env_bytes = env_bytes.saturating_add(real_dir_bytes(drive)?);
-    }
-
-    let runtime_root = data_dir.join("runtime");
-    if real_directory(&runtime_root)? {
-        for entry in fs::read_dir(&runtime_root)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_symlink() {
-                continue;
-            }
-            let bytes = if kind.is_dir() {
-                folder_bytes(&entry.path())?
-            } else if kind.is_file() {
-                entry.metadata()?.len()
-            } else {
-                0
-            };
-            let is_current = current_runtime_id
-                .is_none_or(|keep| entry.file_name().to_str() == Some(keep) && kind.is_dir());
-            if is_current {
-                env_bytes = env_bytes.saturating_add(bytes);
-            } else {
-                cache_bytes = cache_bytes.saturating_add(bytes);
-            }
-        }
-    }
-
-    let games_root = data_dir.join("games");
-    if real_directory(&games_root)? {
-        for game in fs::read_dir(&games_root)? {
-            let game = game?;
-            if !game.file_type()?.is_dir() {
-                continue;
-            }
-            let artifacts = game.path().join("artifacts");
-            let gpu = artifacts.join("gpu");
-            if real_directory(&artifacts)? && real_directory(&gpu)? {
-                cache_bytes = cache_bytes.saturating_add(folder_bytes(&gpu)?);
-            }
-        }
     }
 
     Ok(StorageSummary {
@@ -917,24 +1038,58 @@ fn use_copy(library: &mut Library, source: &Path, destination: &Path) -> io::Res
         let Ok(relative) = game.folder.strip_prefix(source) else {
             continue;
         };
-        let relative = source.join(relative);
-        let relative = relative.strip_prefix(&payload).map_err(io::Error::other)?;
-        let target = destination.join(relative).canonicalize()?;
-        let exe = target.join(&game.exe).canonicalize()?;
+        let folder = source.join(relative);
+        let (target, next_exe) = if let Ok(rel) = folder.strip_prefix(&payload) {
+            (destination.join(rel).canonicalize()?, game.exe.clone())
+        } else if let Ok(prefix) = payload.strip_prefix(&folder) {
+            let stripped = Path::new(&game.exe)
+                .strip_prefix(prefix)
+                .map_err(io::Error::other)?;
+            (
+                destination.clone(),
+                stripped.to_string_lossy().replace('\\', "/"),
+            )
+        } else {
+            return Err(io::Error::other(
+                "The exported copy does not match this game folder",
+            ));
+        };
+        let exe = target.join(&next_exe).canonicalize()?;
         if !target.starts_with(&destination) || !exe.starts_with(&target) || !exe.is_file() {
             return Err(io::Error::other(
                 "The exported copy is missing a game executable",
             ));
         }
-        changes.push((i, target));
+        let next_program_files = match &game.program_files {
+            Some(pf) if pf == source => {
+                if payload == source {
+                    Some(destination.clone())
+                } else {
+                    destination.parent().map(Path::to_path_buf)
+                }
+            }
+            Some(pf) if pf.starts_with(&payload) => pf
+                .strip_prefix(&payload)
+                .ok()
+                .map(|rel| destination.join(rel)),
+            other => other.clone(),
+        };
+        changes.push((i, target, next_exe, next_program_files));
     }
     let old: Vec<_> = changes
         .into_iter()
-        .map(|(i, path)| (i, std::mem::replace(&mut library.games[i].folder, path)))
+        .map(|(i, path, exe, program_files)| {
+            let prev_folder = std::mem::replace(&mut library.games[i].folder, path);
+            let prev_exe = std::mem::replace(&mut library.games[i].exe, exe);
+            let prev_pf = std::mem::replace(&mut library.games[i].program_files, program_files);
+            (i, prev_folder, prev_exe, prev_pf)
+        })
         .collect();
     if let Err(error) = library.save() {
-        for (i, path) in old {
+        for (i, path, exe, program_files) in old {
             library.games[i].folder = path;
+            library.games[i].exe = exe;
+            library.games[i].program_files = program_files;
         }
         return Err(error);
     }
@@ -1098,20 +1253,47 @@ mod tests {
         fs::write(data.join("runtime/old/ntdll.dll"), vec![0u8; 70]).unwrap();
         fs::write(data.join("covers/v1-0123456789abcdef.jpg"), vec![0u8; 20]).unwrap();
         fs::write(data.join("library.json"), vec![0u8; 10]).unwrap();
+        fs::write(data.join("gamepad.json"), vec![0u8; 12]).unwrap();
+        fs::create_dir_all(data.join("games/g1/debug")).unwrap();
+        fs::create_dir_all(data.join("games/g1/artifacts/gpu")).unwrap();
+        fs::write(data.join("games/g1/debug/snap.txt"), vec![0u8; 25]).unwrap();
+        fs::write(data.join("games/g1/artifacts/trace"), vec![0u8; 13]).unwrap();
+        fs::write(
+            data.join("games/g1/artifacts/gpu/legacy.bin"),
+            vec![0u8; 17],
+        )
+        .unwrap();
         fs::write(cache.join("gpu/g1/a.native"), vec![0u8; 80]).unwrap();
         fs::write(cache.join("gpu/g2/b.native"), vec![0u8; 90]).unwrap();
         fs::write(cache.join("gpu/vulkan-health.bin"), vec![0u8; 15]).unwrap();
+        fs::create_dir_all(cache.join("webview")).unwrap();
+        fs::write(cache.join("webview/index"), vec![0u8; 11]).unwrap();
 
         let summary = measure_storage(&data, &cache, None, Some("current")).unwrap();
         assert_eq!(summary.game_files_bytes, 100 + 200 + 30);
-        assert_eq!(summary.env_bytes, 40 + 60 + 20 + 10);
-        assert_eq!(summary.cache_bytes, 50 + 70 + 80 + 90 + 15);
+        assert_eq!(summary.env_bytes, 40 + 60 + 20 + 10 + 12 + 13 + 11);
+        assert_eq!(summary.cache_bytes, 50 + 70 + 17 + 25 + 80 + 90 + 15);
 
-        assert_eq!(single_game_cache_bytes(&data, &cache, "g1").unwrap(), 80);
+        // Android layout: cache_dir sits inside data_dir and must not be double-counted.
+        let nested_cache = data.join("cache");
+        fs::create_dir_all(nested_cache.join("gpu/g1")).unwrap();
+        fs::write(nested_cache.join("gpu/g1/s.bin"), vec![0u8; 33]).unwrap();
+        let nested = measure_storage(&data, &nested_cache, None, Some("current")).unwrap();
+        assert_eq!(nested.game_files_bytes, 100 + 200 + 30);
+        assert_eq!(nested.env_bytes, 40 + 60 + 20 + 10 + 12 + 13);
+        assert_eq!(nested.cache_bytes, 50 + 70 + 17 + 25 + 33);
+        fs::remove_dir_all(&nested_cache).unwrap();
+
+        assert_eq!(
+            single_game_cache_bytes(&data, &cache, "g1").unwrap(),
+            80 + 17 + 25
+        );
         clear_one_game_cache(&data, &cache, "g1").unwrap();
         assert_eq!(single_game_cache_bytes(&data, &cache, "g1").unwrap(), 0);
         assert_eq!(single_game_cache_bytes(&data, &cache, "g2").unwrap(), 90);
         assert!(cache.join("gpu/vulkan-health.bin").is_file());
+        assert!(!data.join("games/g1/debug").exists());
+        assert!(data.join("games/g1/artifacts/trace").is_file());
 
         let files = list_files(&data.join("files")).unwrap();
         assert_eq!(files.len(), 2);
@@ -1200,6 +1382,40 @@ mod tests {
         assert!(!spare.exists());
         assert!(save.is_file());
         assert!(external.join("game.exe").is_file());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    // spec: HOST-LIB-7
+    #[test]
+    fn use_copy_relinks_disc_installed_root_folder_and_program_files() {
+        let base = std::env::temp_dir().join(format!("hitode-inst-copy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir(&base).unwrap();
+        let base = base.canonicalize().unwrap();
+        let app = base.join("app");
+        let root = app.join("imports");
+        let source = root.join("0123456789abcdef");
+        let external = base.join("external");
+        fs::create_dir_all(source.join("Brand/Title")).unwrap();
+        fs::write(source.join("Brand/Title/game.exe"), b"exe").unwrap();
+        fs::create_dir(&external).unwrap();
+
+        let mut library = Library::load(app.clone()).unwrap();
+        library.games.push(LibraryGame {
+            id: "0123456789abcdef".into(),
+            title: "Installed".into(),
+            folder: source.clone(),
+            exe: "Brand/Title/game.exe".into(),
+            program_files: Some(source.clone()),
+            ..LibraryGame::default()
+        });
+        library.save().unwrap();
+
+        let exported = copy_out(&export_source(&source).unwrap(), &external, "Brand").unwrap();
+        use_copy(&mut library, &source, &exported).unwrap();
+        assert_eq!(library.games[0].folder, exported);
+        assert_eq!(library.games[0].exe, "Title/game.exe");
+        assert_eq!(library.games[0].program_files, Some(external.clone()));
         fs::remove_dir_all(base).unwrap();
     }
 }

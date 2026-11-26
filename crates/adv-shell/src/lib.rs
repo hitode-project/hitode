@@ -12,7 +12,10 @@ mod panic_report;
 #[cfg(host_view)]
 pub use adv_runtime::system_font_families;
 #[cfg(host_view)]
-pub use adv_runtime::wine::session::RegistryReport;
+pub use adv_runtime::wine::session::{
+    RegistryReport, notify_names_changed as wine_names_changed,
+    server_started as wine_server_started,
+};
 #[cfg(host_view)]
 pub use execution::Execution;
 pub use heap::CountingAllocator;

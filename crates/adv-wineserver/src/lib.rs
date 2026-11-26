@@ -274,6 +274,11 @@ pub fn key_state(tid: u32, key: u32) -> Option<u8> {
     u8::try_from(unsafe { hitode_server_key_state(tid, key) }).ok()
 }
 
+/// Whether the in-process Wine server has been started in this process.
+pub fn started() -> bool {
+    STARTED.load(Ordering::Acquire)
+}
+
 impl Server {
     /// Keep this prefix available between guest sessions.
     pub fn keep_alive(&mut self) {

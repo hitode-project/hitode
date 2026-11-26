@@ -21,6 +21,16 @@ pub use host::Host;
 pub use installed::Installed;
 pub use registry::{RegistryReport, RegistryWatch};
 
+/// Whether the in-process Wine server has been started in this process.
+pub fn server_started() -> bool {
+    adv_wineserver::started()
+}
+
+/// Invalidates cached server directory listings after host-side prefix edits.
+pub fn notify_names_changed() {
+    adv_wineserver::names_changed();
+}
+
 use adv_drv::user::project;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -409,6 +419,8 @@ pub(super) fn link(source: &Path, target: &Path) -> Result<(), String> {
     adv_wineserver::names_changed();
     if target.symlink_metadata().is_ok() {
         std::fs::remove_file(target).map_err(|e| format!("{}: {e}", target.display()))?;
+    } else if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     std::os::unix::fs::symlink(source, target).map_err(|e| format!("{}: {e}", target.display()))
 }
@@ -439,8 +451,24 @@ fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
                 .map_err(|e| format!("{}: {e}", prefix.join(file).display()))?;
         }
     }
-    if !drive.join("windows").exists() {
-        copy_tree(&template.join("drive_c"), &drive)?;
+    std::fs::create_dir_all(&drive).map_err(|e| format!("{}: {e}", drive.display()))?;
+    let template_drive = template.join("drive_c");
+    if template_drive.is_dir() {
+        let entries = std::fs::read_dir(&template_drive)
+            .map_err(|e| format!("{}: {e}", template_drive.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let target = drive.join(entry.file_name());
+            if target.exists() {
+                continue;
+            }
+            if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+                copy_tree(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), &target)
+                    .map_err(|e| format!("{}: {e}", target.display()))?;
+            }
+        }
     }
     let windows = drive.join("windows");
     for directory in [
