@@ -110,7 +110,7 @@ pub struct Recording {
     verification: Option<Arc<Verification>>,
     verification_serial: u64,
     #[cfg(feature = "d3d9-counters")]
-    counters: record::Counters,
+    pub(super) counters: record::Counters,
 }
 
 #[derive(Default)]
@@ -289,6 +289,7 @@ impl Recording {
             c.flushes[0] += u64::from(_submitted);
             c.eliminated_frames += u64::from(_pixels == 0 && !_submitted);
             c.changed_pixels += _pixels;
+            c.damage_pixels += _pixels;
             if let Some(verification) = &self.verification {
                 c.verification_mismatches = verification
                     .mismatches

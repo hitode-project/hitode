@@ -102,7 +102,12 @@ pub(super) fn create_and_swap(env: &mut Env<'_>) -> Outcome {
 
 pub(super) fn create_core(env: &mut Env<'_>) -> Outcome {
     let arguments = std::array::from_fn(|i| if i == 9 { 0 } else { env.arg(i as u32 + 1) });
-    if arguments[0] == 0 && arguments[1] == 0 && arguments[4] != 0 && arguments[5] != 0 {
+    if !env.ext.get::<State>().force_d3d9
+        && arguments[0] == 0
+        && arguments[1] == 0
+        && arguments[4] != 0
+        && arguments[5] != 0
+    {
         return super::super::exports::access_violation(env);
     }
     create_device(env, arguments, None, true)
@@ -144,6 +149,10 @@ fn create_device(
         if level_out != 0 {
             write(env, level_out, 0u32)?;
         }
+        let state = env.ext.get::<State>();
+        if state.force_d3d9 {
+            return Err(crate::d3d11::caps::Error::Unsupported.into());
+        }
         let driver = match driver {
             0 => Driver::Unknown,
             1 => Driver::Hardware,
@@ -167,7 +176,7 @@ fn create_device(
             wants_device: device_out != 0 || swap.is_some_and(|(_, out)| out != 0),
             wants_context: context_out != 0,
         };
-        let devices = &env.ext.get::<State>().devices;
+        let devices = &state.devices;
         let maximum = devices
             .reports
             .iter()

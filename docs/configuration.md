@@ -79,6 +79,7 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_FIXTURE_OTHER_83F2` | Fixture | Deliberately undefined variable read by the fixture |
 | `ADV_FONT_DIR` | Feature | System font folders only |
 | `ADV_FONT_PROFILE` | Fixture | No controlled font profile |
+| `ADV_FORCE_D3D9` | Diagnostic | Off. Set to `1` to refuse D3D10 and D3D11 device creation so titles with a D3D9 fallback use it. |
 | `ADV_VERIFY_SOFTWARE_FRAMES` | Diagnostic | Off; any value compares incremental software storage and conversion against full-frame references |
 | `ADV_HOST_FEATURES` | Diagnostic | Every detected feature; can only turn features off |
 | `ADV_HOST_FEATURES_REPORT` | Diagnostic | Off |
@@ -119,6 +120,14 @@ Apply, and eliminated dead frames/passes. It is diagnostic only. Builds without
 the feature compile out the instrumentation. Lookup counts cover resource
 identity resolutions and current/base content-version table probes in recording;
 they exclude backend work and damage-history bookkeeping.
+
+Build `adv-run` with `--features adv-shell/gpu,adv-shell/graphics-counters`
+for the `graphics_parity` JSON report. Compare the same interval of a
+title with and without `ADV_FORCE_D3D9=1`. The report counts guest GPU queue
+submissions, bytes written into GPU-visible upload storage, and readback
+payload bytes. Each front reports presents, published damage area in pixels,
+and successful map or lock operations. `constant_time_maps` counts the
+fixed-work paths that neither wait on GPU work nor copy or walk the resource.
 
 `adv-device/test-support` is a fixture feature enabled by the graphics crates'
 dev-dependencies. It provides frame capture, submission pauses and simulated

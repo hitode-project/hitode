@@ -853,7 +853,7 @@ fn guest_swap_chain_presents_the_back_buffer_and_resizes_after_release() {
     assert_eq!(method(&mut machine, device, 2, &[]), 0);
 }
 
-// spec: GFX-RES-1
+// spec: GFX-RES-1 GFX-REC-8
 #[test]
 fn guest_staging_write_uploads_before_the_recorded_copy() {
     let mut machine = machine();
@@ -863,6 +863,8 @@ fn guest_staging_write_uploads_before_the_recorded_copy() {
     let target = texture(&mut machine, device, 0, Bind::RENDER_TARGET, 0, 0, 2);
     let upload = texture(&mut machine, device, 3, 0, 0x10000, 0, 2);
     let readback = texture(&mut machine, device, 3, 0, 0x20000, 0, 2);
+    #[cfg(feature = "d3d9-counters")]
+    let before = gpu::traffic(&machine.ext).unwrap();
     let mapped = map(&mut machine, context, upload, 2);
     write_value(&mut machine, mapped.pData, [0xff12_3456u32, 0xffab_cdef]);
     write_value(
@@ -882,6 +884,15 @@ fn guest_staging_write_uploads_before_the_recorded_copy() {
     assert_eq!(row(0), [0xff12_3456, 0xffab_cdef]);
     assert_eq!(row(1), [0xffde_bc9a, 0xff78_5634]);
     assert_eq!(method(&mut machine, context, 15, &[readback, 0]), 0);
+    #[cfg(feature = "d3d9-counters")]
+    {
+        let traffic = gpu::traffic(&machine.ext).unwrap();
+        assert_eq!(traffic.upload_bytes - before.upload_bytes, 16);
+        assert_eq!(traffic.readback_bytes - before.readback_bytes, 16);
+        assert!(traffic.submissions > before.submissions);
+        let counters = gpu::frame_counters(&machine.ext).unwrap();
+        assert_eq!((counters.maps, counters.constant_time_maps), (2, 0));
+    }
 }
 
 // spec: GFX-RES-1 GFX-DXGI-5

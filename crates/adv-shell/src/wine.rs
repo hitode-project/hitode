@@ -587,6 +587,34 @@ fn report(
             counters.readback_bytes as f64 / frames,
         ));
     }
+    #[cfg(all(feature = "gpu", feature = "graphics-counters"))]
+    {
+        let ext = &session.machine.ext;
+        if let Some(traffic) =
+            adv_runtime::d3d11_traffic(ext).or_else(|| adv_runtime::d3d9_traffic(ext))
+        {
+            let front = |counters: Option<adv_runtime::D3d9Counters>| {
+                counters.map_or_else(
+                    || "null".to_owned(),
+                    |counters| format!(
+                        "{{\"presents\": {}, \"damage_pixels\": {}, \"maps\": {}, \"constant_time_maps\": {}}}",
+                        counters.presents, counters.damage_pixels, counters.maps, counters.constant_time_maps
+                    ),
+                )
+            };
+            fields.push(format!(
+                concat!(
+                    "\"graphics_parity\": {{\"submissions\": {}, \"upload_bytes\": {}, \"readback_bytes\": {}, ",
+                    "\"d3d9\": {}, \"d3d11\": {}}}"
+                ),
+                traffic.submissions,
+                traffic.upload_bytes,
+                traffic.readback_bytes,
+                front(adv_runtime::d3d9_counters(ext)),
+                front(adv_runtime::d3d11_counters(ext))
+            ));
+        }
+    }
 
     let mut codec = adv_runtime::wine::vorbisfile::stats(&session.machine).map_or_else(
         || "{\"provider\": \"guest\"}".into(),

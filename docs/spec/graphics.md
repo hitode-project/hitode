@@ -264,7 +264,7 @@ Direct3D 11 captures the dynamic index window and the vertex and instance window
 
 ### GFX-REC-8 Frontend work counters
 
-**Rule**: Diagnostic counter builds MUST report retained bytes and lookups per draw, entries per successful StateBlock Apply, and dead frame/pass eliminations. Ordinary builds MUST compile out work instrumentation.
+**Rule**: Diagnostic counter builds MUST report retained bytes and lookups per draw, entries per successful StateBlock Apply, and dead frame/pass eliminations. They MUST report publication damage, queue submissions, upload and readback bytes, and constant-time maps for front-end comparisons. Ordinary builds MUST compile out work instrumentation.
 **Verification**: Test
 
 The diagnostic Cargo feature is `adv-dx/d3d9-counters`. Retained payloads are counted per command, including shared snapshots; cumulative recorded bytes do not measure resident memory or memory traffic. Recording limits continue to use the logical upload size.

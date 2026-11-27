@@ -1837,6 +1837,8 @@ impl WorkerState {
         if let Some(f) = self.facades.get_mut(&facade) {
             f.stats.readbacks += 1;
         }
+        #[cfg(feature = "graphics-counters")]
+        self.stream.count_readback(size);
     }
 }
 

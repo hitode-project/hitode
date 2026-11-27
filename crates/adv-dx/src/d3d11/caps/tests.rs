@@ -266,6 +266,7 @@ fn feature_layouts_masks_and_creation_status() {
     let high = Report::derive(&Fixture::m1().caps(), paths).unwrap();
     let low = Report::derive_at_most(&Fixture::m1().caps(), paths, FeatureLevel::L9_3).unwrap();
     for feature in Feature::ALL {
+        let path = feature.path();
         let probe_format = 28;
         let size = feature.size();
         assert_eq!(
@@ -274,17 +275,20 @@ fn feature_layouts_masks_and_creation_status() {
                 .words()
                 .len()
                 * 4,
-            size
+            size,
+            "{path}"
         );
         assert_eq!(
             high.check_feature(feature as u32, size - 4, probe_format),
-            Err(Error::InvalidArgument)
+            Err(Error::InvalidArgument),
+            "{path}"
         );
     }
     assert_eq!(low.check_feature(5, 56, 0).unwrap().words()[9], 0);
     assert_eq!(low.check_feature(5, 56, 0).unwrap().words()[11], 0);
     assert_eq!(high.check_feature(5, 56, 0).unwrap().words()[9], 1);
     assert_eq!(high.check_feature(5, 56, 0).unwrap().words()[11], 1);
+    assert_eq!(high.check_feature(6, 4, 0).unwrap().words(), &[1]);
     assert_eq!(high.check_feature(14, 36, 0).unwrap().words()[7], 1);
     assert_eq!(high.check_feature(21, 4, 0), Err(Error::InvalidArgument));
     let counter = high.counter_info();

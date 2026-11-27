@@ -592,6 +592,10 @@ impl<P> Recording<P> {
         counters.changed_pixels += delta.map_or(0, Region::area);
         counters.executed_pixels += execution_area;
         counters.extra_pixels += extra;
+        #[cfg(feature = "d3d9-counters")]
+        {
+            counters.damage_pixels += self.verify_region.as_ref().map_or(0, Region::area);
+        }
         trace::work(&self.damage.work, self.damage.planned);
         trace::frame_end();
     }

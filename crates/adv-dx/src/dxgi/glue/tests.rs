@@ -264,6 +264,17 @@ fn every_queried_interface_uses_covered_guest_thunks() {
     let entry = m.resolve_import("fixture", "device_factory").unwrap();
     assert_eq!(guest_call(&mut m, entry, &[OBJECT]), 0);
     let factory = m.cpu.read_u32(OBJECT).unwrap();
+    assert_eq!(
+        method(&mut m, factory, 11, &[0, OBJECT]),
+        Error::InvalidCall.hresult()
+    );
+    assert_eq!(
+        method(&mut m, factory, 11, &[1, OBJECT]),
+        Error::Unsupported.hresult()
+    );
+    assert_eq!(m.cpu.read_u32(OBJECT).unwrap(), 0);
+    let diagnostics = m.ext.get::<adv_abi::ApiDiagnostics>();
+    assert_eq!(diagnostics.warnings.values().copied().sum::<u64>(), 1);
     entries(
         &mut m,
         factory,
