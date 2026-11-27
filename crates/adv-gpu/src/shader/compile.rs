@@ -50,6 +50,8 @@ pub fn precompile(wgsl: &str, bindings: &[Binding]) -> Result<Precompiled> {
         Options {
             version: if matrix { (2, 3) } else { (2, 1) },
             textures: 128,
+            compact: false,
+            argument_buffers: false,
             bounds: naga::proc::BoundsCheckPolicies {
                 index: naga::proc::BoundsCheckPolicy::Unchecked,
                 buffer: naga::proc::BoundsCheckPolicy::Unchecked,
@@ -79,6 +81,8 @@ pub fn precompile(wgsl: &str, bindings: &[Binding]) -> Result<Precompiled> {
 pub(crate) struct Options {
     pub version: (u8, u8),
     pub textures: u32,
+    pub compact: bool,
+    pub argument_buffers: bool,
     pub bounds: naga::proc::BoundsCheckPolicies,
 }
 pub(crate) struct Metal {
@@ -96,10 +100,154 @@ pub(crate) struct MetalEntry {
     pub name: String,
     pub used: Used,
     pub sizes: Option<Box<[Option<u8>]>>,
+    pub remap: Option<Remap>,
 }
 
 /// The byte-size table occupies the last Metal buffer argument.
 pub(crate) const SIZES: usize = 30;
+
+/// The last ordinary buffer slot becomes the argument buffer on overflow.
+pub(crate) const ARGUMENTS: usize = SIZES - 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Location {
+    Direct(u8),
+    Argument(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Register {
+    pub group: u32,
+    pub slot: u32,
+    pub buffer: bool,
+}
+
+#[cfg(all(feature = "backend", target_vendor = "apple"))]
+pub(crate) struct Remap {
+    pub registers: HashMap<Register, Location>,
+    pub argument_writes: Box<[bool]>,
+    pub sizes: Box<[Option<Location>]>,
+}
+
+struct Resource {
+    binding: naga::ResourceBinding,
+    register: Register,
+    writable: bool,
+}
+
+/// Legacy indices also describe precompiled shaders. Modern shaders can reassign
+/// the used buffers and spill sampled images that intersect the storage indices.
+fn metal_locations(resources: &[Resource], options: &Options) -> Result<(Used, Vec<Location>)> {
+    let mut used = Used::default();
+    let direct = resources
+        .iter()
+        .map(|resource| {
+            let Register {
+                group,
+                slot,
+                buffer,
+            } = resource.register;
+            Ok(Location::Direct(
+                used.add(group, slot, buffer, options.textures)? as u8,
+            ))
+        })
+        .collect::<Result<Vec<_>>>();
+    let fixed_images = resources
+        .iter()
+        .filter(|resource| resource.register.group == 3 && !resource.register.buffer)
+        .enumerate()
+        .all(|(ordinal, resource)| resource.register.slot as usize == ordinal);
+    if !options.compact || (direct.is_ok() && fixed_images) {
+        used.check_samplers()?;
+        return Ok((used, direct?));
+    }
+
+    let images = resources
+        .iter()
+        .filter(|r| r.register.group == 3 && !r.register.buffer)
+        .count();
+    let Some(first_image) = 96u32.checked_sub(images as u32) else {
+        return Err(Error::Invalid("Metal storage image table is full".into()));
+    };
+    let buffers = resources.iter().filter(|r| r.register.buffer).count();
+    let image_collision = resources.iter().any(|r| {
+        let Register { group, slot, .. } = r.register;
+        group == 1 && (slot >= options.textures || (first_image..96).contains(&slot))
+    });
+    let spill = buffers > SIZES || image_collision;
+    if spill && !options.argument_buffers {
+        return Err(Error::Invalid(
+            "Metal binding overflow requires Tier 2 argument buffers".into(),
+        ));
+    }
+
+    let mut used = Used::default();
+    let mut low_buffer = 0;
+    let mut high_buffer = (SIZES - usize::from(spill)) as u32;
+    let mut storage_image = 96;
+    let mut locations = vec![Location::Direct(0); resources.len()];
+    // Place constant buffers before storage buffers, which grow from the top.
+    for (i, resource) in resources
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.register.group == 0)
+        .chain(
+            resources
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.register.group != 0),
+        )
+    {
+        let Register {
+            group,
+            slot,
+            buffer,
+        } = resource.register;
+        let index = match (group, buffer) {
+            (0, true) if low_buffer < high_buffer => {
+                let index = low_buffer;
+                low_buffer += 1;
+                Some(index)
+            }
+            (3, true) if low_buffer < high_buffer => {
+                high_buffer -= 1;
+                Some(high_buffer)
+            }
+            (0 | 3, true) => None,
+            (3, false) => {
+                storage_image -= 1;
+                Some(storage_image)
+            }
+            (1, false) if slot >= options.textures || (first_image..96).contains(&slot) => None,
+            _ => Some(slot),
+        };
+        locations[i] = match index {
+            Some(index) => {
+                match (group, buffer) {
+                    (_, true) => used.buffers |= 1 << index,
+                    (2, false) => used.samplers |= 1 << index,
+                    _ => used.textures |= 1 << index,
+                }
+                Location::Direct(if group == 2 {
+                    sampler_index(index)
+                } else {
+                    index
+                } as u8)
+            }
+            None => Location::Argument(0),
+        };
+    }
+    // Argument buffer ids must increase in the order the writer emits members.
+    let mut id = 0;
+    for location in &mut locations {
+        if matches!(location, Location::Argument(_)) {
+            *location = Location::Argument(id);
+            id += 1;
+        }
+    }
+    used.check_samplers()?;
+    Ok((used, locations))
+}
 
 /// The one mapping from portable slots to Metal argument tables and indices.
 /// Encoding calls this for admitted slots; shader creation checks the limits.
@@ -245,7 +393,7 @@ pub(crate) fn metal(
                 .collect(),
         );
         let mut resources = msl::EntryPointResources::default();
-        let mut used = Used::default();
+        let mut registers = Vec::new();
         let mut sizes = Vec::new();
         for (handle, var) in module.global_variables.iter() {
             if module.types[var.ty]
@@ -257,9 +405,7 @@ pub(crate) fn metal(
                 } else {
                     Some(
                         var.binding
-                            .as_ref()
-                            .ok_or_else(|| compile_error(&ep.name, "unbound runtime array"))?
-                            .binding,
+                            .ok_or_else(|| compile_error(&ep.name, "unbound runtime array"))?,
                     )
                 });
             }
@@ -320,40 +466,110 @@ pub(crate) fn metal(
                     format!("undeclared binding {}:{}", binding.group, binding.binding),
                 ));
             }
-            let index = used.add(
-                portable.group,
-                stage_slot(stage, portable.group, portable.binding),
-                buffer,
-                options.textures,
-            )? as u8;
-            let mut target = msl::BindTarget::default();
-            match (buffer, portable.group) {
-                (true, _) => target.buffer = Some(index),
-                (false, 2) => target.sampler = Some(msl::BindSamplerTarget::Resource(index)),
-                _ => target.texture = Some(index),
-            }
-            target.mutable = matches!(var.space, naga::AddressSpace::Storage { access } if access.contains(naga::StorageAccess::STORE));
-            resources.resources.insert(binding, target);
+            registers.push(Resource {
+                binding,
+                register: Register {
+                    group: portable.group,
+                    slot: stage_slot(stage, portable.group, portable.binding),
+                    buffer,
+                },
+                writable: matches!(var.space, naga::AddressSpace::Storage { access }
+                    if access.contains(naga::StorageAccess::STORE))
+                    || entry_info[handle]
+                        .intersects(naga::valid::GlobalUse::WRITE | naga::valid::GlobalUse::ATOMIC),
+            });
         }
-        used.check_samplers()?;
+        let (used, locations) = metal_locations(&registers, &options)?;
+        let mut remapped = false;
+        for (resource, &location) in registers.iter().zip(&locations) {
+            let Register {
+                group,
+                slot,
+                buffer,
+            } = resource.register;
+            let mut target = msl::BindTarget {
+                mutable: resource.writable,
+                ..Default::default()
+            };
+            match location {
+                Location::Argument(id) => {
+                    resources.argument_buffer = Some(ARGUMENTS as u8);
+                    target.argument_buffer_index = Some(id);
+                    remapped = true;
+                }
+                Location::Direct(native) => {
+                    let original = if group == 2 {
+                        sampler_index(slot)
+                    } else {
+                        index(group, slot, buffer).1
+                    };
+                    remapped |= original != u32::from(native);
+                    match (buffer, group) {
+                        (true, _) => target.buffer = Some(native),
+                        (false, 2) => {
+                            target.sampler = Some(msl::BindSamplerTarget::Resource(native))
+                        }
+                        _ => target.texture = Some(native),
+                    }
+                }
+            }
+            resources.resources.insert(resource.binding, target);
+        }
         if !sizes.is_empty() {
             resources.sizes_buffer = Some(SIZES as u8);
         }
         let reads_sizes = sizes.iter().any(Option::is_some);
-        if reads_sizes && sizes.len() > SIZES {
+        if reads_sizes && sizes.len() > SIZES && !options.compact {
             return Err(compile_error(&ep.name, "too many runtime arrays"));
         }
+        remapped |= reads_sizes && sizes.len() > SIZES;
+        #[cfg(not(all(feature = "backend", target_vendor = "apple")))]
+        let _ = (used, remapped);
         #[cfg(all(feature = "backend", target_vendor = "apple"))]
-        entries.push(MetalEntry {
-            name: String::new(),
-            used,
-            sizes: reads_sizes.then(|| {
-                sizes
-                    .iter()
-                    .map(|slot| slot.map(|slot| index(3, stage_slot(stage, 3, slot), true).1 as u8))
-                    .collect()
-            }),
-        });
+        {
+            let size_locations = || {
+                sizes.iter().map(|binding| {
+                    binding
+                        .and_then(|binding| registers.iter().position(|r| r.binding == binding))
+                        .map(|i| locations[i])
+                })
+            };
+            let direct_sizes = reads_sizes
+                && sizes.len() <= SIZES
+                && size_locations()
+                    .all(|location| !matches!(location, Some(Location::Argument(_))));
+            entries.push(MetalEntry {
+                name: String::new(),
+                used,
+                sizes: direct_sizes.then(|| {
+                    size_locations()
+                        .map(|location| match location {
+                            Some(Location::Direct(index)) => Some(index),
+                            _ => None,
+                        })
+                        .collect()
+                }),
+                remap: remapped.then(|| Remap {
+                    registers: registers
+                        .iter()
+                        .zip(&locations)
+                        .map(|(r, &location)| (r.register, location))
+                        .collect(),
+                    argument_writes: registers
+                        .iter()
+                        .zip(&locations)
+                        .filter_map(|(r, location)| {
+                            matches!(location, Location::Argument(_)).then_some(r.writable)
+                        })
+                        .collect(),
+                    sizes: if direct_sizes || !reads_sizes {
+                        Box::new([])
+                    } else {
+                        size_locations().collect()
+                    },
+                }),
+            });
+        }
         msl_options
             .per_entry_point_map
             .insert(ep.name.clone(), resources);

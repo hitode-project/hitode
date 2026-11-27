@@ -233,7 +233,7 @@ impl Ring {
         if self.buffer.is_none() {
             self.buffer = Some(device.create_buffer(&BufferDesc {
                 size: chunk_bytes * RING_CHUNKS,
-                usage: BufferUsage::STORAGE | BufferUsage::INDIRECT,
+                usage: BufferUsage::STORAGE | BufferUsage::INDIRECT | BufferUsage::COPY_SRC,
                 memory: Memory::Device,
                 label: "expansion ring",
             })?);

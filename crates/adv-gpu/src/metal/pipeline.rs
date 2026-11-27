@@ -100,6 +100,7 @@ pub(super) struct RenderData {
     pub topology: MTLPrimitiveType,
     /// Vertex, then fragment.
     pub used: [shader::Used; 2],
+    pub remap: [Option<Arc<shader::Remapped>>; 2],
     pub sizes: [Option<Box<[Option<u8>]>>; 2],
 }
 /// Encoder raster state a pipeline implies; passes emit only what changes.
@@ -153,6 +154,7 @@ pub(super) struct ComputeData {
     pub workgroup: MTLSize,
     pub threadgroup: Box<[u32]>,
     pub used: shader::Used,
+    pub remap: Option<Arc<shader::Remapped>>,
     pub sizes: Option<Box<[Option<u8>]>>,
 }
 
@@ -281,6 +283,7 @@ impl Device {
                         Topology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
                     },
                     used,
+                    remap: [vertex.remap.clone(), fragment.and_then(|f| f.remap.clone())],
                     sizes: [vertex.sizes.clone(), fragment.and_then(|f| f.sizes.clone())],
                 })),
             })
@@ -338,6 +341,7 @@ impl Device {
                     },
                     threadgroup: entry.threadgroup.clone(),
                     used,
+                    remap: entry.remap.clone(),
                     sizes: entry.sizes.clone(),
                 })),
             })
@@ -350,6 +354,21 @@ impl Device {
         stage: Stages,
         function: &shader::Function,
     ) -> Result<shader::Used> {
+        if let Some(remap) = &function.remap {
+            for register in remap.layout.registers.keys() {
+                if !bindings.iter().any(|b| {
+                    let (group, buffer) = shader::binding_group(b.kind);
+                    b.stages.contains(stage)
+                        && (group, buffer) == (register.group, register.buffer)
+                        && crate::shader::compile::stage_slot(stage, group, b.slot) == register.slot
+                }) {
+                    return Err(Error::Invalid(format!(
+                        "{stage:?} reads a binding the pipeline does not declare"
+                    )));
+                }
+            }
+            return Ok(function.used.unwrap());
+        }
         let mut declared = shader::Used::default();
         for b in bindings.iter().filter(|b| b.stages.contains(stage)) {
             let (group, buffer) = shader::binding_group(b.kind);

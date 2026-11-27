@@ -20,6 +20,12 @@ pub use compile::{Precompiled, precompile};
 pub enum Source<'a> {
     Wgsl(&'a str),
     Ir(Box<naga::Module>),
+    /// IR with stage-local registers compacted by the caller. The backend may
+    /// remap their native indices and use indirect resource tables. Set the
+    /// pipeline before binding its registers, and record one draw per render
+    /// pass so a packed window can copy its inputs before rendering begins.
+    /// Give read-only storage buffers copy-source usage for this path.
+    CompactIr(Box<naga::Module>),
     /// Build-time output: SPIR-V words for Vulkan, MSL source or a Metal
     /// library for Metal, declaring the argument indices
     /// [`crate::pipeline::Binding`] lists. Only the current backend's half is

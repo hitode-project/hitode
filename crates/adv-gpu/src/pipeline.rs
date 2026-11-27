@@ -42,7 +42,7 @@ pub const MAX_COLOR_TARGETS: usize = 8;
 
 /// First vertex-only slot in each group. The modern facade compacts shader
 /// registers into separate vertex and fragment banks.
-pub const VERTEX_BINDING_BASES: [u32; 4] = [32, 128, 32, 32];
+pub const VERTEX_BINDING_BASES: [u32; 4] = [32, 128, 32, 192];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]

@@ -98,6 +98,9 @@ impl Queue {
     }
     pub(crate) fn submit(&mut self, mut encoder: crate::Encoder) -> Result<Token> {
         self.device.inner.check()?;
+        if let Some(error) = encoder.inner.error.take() {
+            return Err(error);
+        }
         encoder.inner.finish_blit();
         let command = encoder.inner.command.clone();
         let spans = std::mem::take(&mut encoder.inner.spans);

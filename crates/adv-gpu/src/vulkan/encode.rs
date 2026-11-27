@@ -122,6 +122,7 @@ impl Encoder {
         &mut self,
         layout: vk::DescriptorSetLayout,
         key: &[binding::Bound],
+        indexed: bool,
     ) -> Result<(vk::DescriptorSet, bool)> {
         if self.resources.descriptors.is_none() {
             let mut arena = self
@@ -138,7 +139,7 @@ impl Encoder {
             .descriptors
             .as_mut()
             .unwrap()
-            .get(&self.shared.context, layout, key)
+            .get(&self.shared.context, layout, key, indexed)
     }
     pub(super) fn new(shared: Arc<queue::Shared>, bindings: binding::Bindings) -> Self {
         shared.context.open.fetch_add(1, Ordering::AcqRel);
@@ -1683,6 +1684,19 @@ impl RenderPass<'_> {
         if !self.encoder.ready() {
             return false;
         }
+        // The programmable draw executor opens one pass per draw, after
+        // recording all its storage ranges. Copy them before rendering starts.
+        if let Some(pipeline) = self.pipeline.as_deref()
+            && !pipeline.storage_window.is_empty()
+        {
+            let mut bindings = self.encoder.bindings.take().unwrap();
+            let packed = bindings.prepare_storage_window(self.encoder, pipeline);
+            self.encoder.bindings = Some(bindings);
+            if let Err(error) = packed {
+                self.encoder.error = Some(error);
+                return false;
+            }
+        }
         // Only split out a preamble CB eagerly if an earlier command in this
         // encoder touched an image that is not in a read-only layout or ran
         // query ops, so any lazy mid-pass preamble stays strictly ordered.
@@ -2285,6 +2299,13 @@ impl ComputePass<'_> {
             "dispatch without a pipeline"
         );
         let mut bindings = self.encoder.bindings.take().unwrap();
+        if let Some(pipeline) = pipeline
+            && !pipeline.storage_window.is_empty()
+            && self.encoder.ready()
+            && let Err(error) = bindings.prepare_storage_window(self.encoder, pipeline)
+        {
+            self.encoder.error = Some(error);
+        }
         let ready = pipeline
             .is_some_and(|p| bindings.flush(self.encoder, p, vk::PipelineBindPoint::COMPUTE));
         self.encoder.bindings = Some(bindings);
