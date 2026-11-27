@@ -4,7 +4,7 @@ use crate::gpu::{self, Gpu, Target};
 
 impl<P: Presenter> Surfaces<P> {
     pub fn fork_gpu(&self) -> Result<Gpu, gpu::Error> {
-        self.gpu.fork()
+        self.gpu.fork_front()
     }
 
     /// Discard a GPU cache of guest-backed pixels after synchronizing its CPU copy.

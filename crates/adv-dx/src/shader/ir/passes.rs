@@ -104,6 +104,7 @@ fn instructions(block: &mut Block, f: &mut impl FnMut(&mut Instruction)) {
 
 const FUNCTION_BODY: u64 = 1 << 32;
 
+#[derive(PartialEq, Eq, Hash)]
 pub struct InterfaceBinding {
     pub table: u32,
     pub offsets: Vector,

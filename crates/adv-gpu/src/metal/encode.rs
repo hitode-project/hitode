@@ -161,9 +161,7 @@ impl Encoder {
                     texture.setUsage(MTLTextureUsage::RenderTarget);
                     let scratch = self
                         .device
-                        .0
-                        .raw
-                        .newTextureWithDescriptor(&texture)
+                        .new_texture(&texture)
                         .expect("Metal bounded resolve");
                     attachment.setResolveTexture(Some(&scratch));
                     resolves.push((scratch, resolve.inner.raw.clone()));
@@ -238,9 +236,7 @@ impl Encoder {
         // A pass can begin an occlusion query created after it opens.
         let visibility = self.visibility.get_or_insert_with(|| {
             self.device
-                .0
-                .raw
-                .newBufferWithLength_options(
+                .new_buffer(
                     65536,
                     MTLResourceOptions::StorageModeShared
                         | MTLResourceOptions::HazardTrackingModeTracked,
@@ -508,9 +504,7 @@ impl Encoder {
             // Seed one word, then double non-overlapping ranges in GPU memory.
             let seed = self
                 .device
-                .0
-                .raw
-                .newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
+                .new_buffer(4, MTLResourceOptions::StorageModeShared)
                 .expect("Metal fill pattern");
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -1311,9 +1305,7 @@ impl Bindings {
             };
             // Each draw owns its bytes until the command buffer completes.
             let arguments = device
-                .0
-                .raw
-                .newBufferWithLength_options(
+                .new_buffer(
                     encoder.encodedLength(),
                     MTLResourceOptions::StorageModeShared,
                 )

@@ -65,6 +65,7 @@ pub struct Window {
     pub visible: bool,
     /// Client origin on screen for top-level windows.
     pub origin: (i32, i32),
+    outer_size: [i32; 2],
     parent: u32,
     /// A top-level window's style.
     style: u32,
@@ -255,6 +256,31 @@ pub fn window(ext: &adv_machine::Ext, hwnd: u32) -> Option<Window> {
     ext.try_get::<Windows>()?.0.get(&hwnd).copied()
 }
 
+impl Window {
+    pub fn minimized(self) -> bool {
+        self.style & 0x2000_0000 != 0
+    }
+}
+
+/// Resize a Wine window to a client extent while keeping its position and order.
+pub fn resize_client(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    size: [u32; 2],
+    then: adv_machine::Continuation,
+) -> Outcome {
+    let target = module_base(env.cpu, env.sys.peb, "user32.dll")
+        .and_then(|base| module_export(env.cpu, base, "SetWindowPos"));
+    let (Some(window), Some(target)) = (window(env.ext, hwnd), target) else {
+        return then(env, adv_machine::Resume::Returned(0));
+    };
+    let [left, top, right, bottom] = window.client;
+    let width = size[0] + (window.outer_size[0] - (right - left)).max(0) as u32;
+    let height = size[1] + (window.outer_size[1] - (bottom - top)).max(0) as u32;
+    let flags = 0x2 | SWP_NOZORDER | SWP_NOACTIVATE; // SWP_NOMOVE
+    Outcome::call(target, [hwnd, 0, 0, 0, width, height, flags], then)
+}
+
 /// Every window win32u reported, with the guest thread that owns it.
 fn windows(ext: &adv_machine::Ext) -> Vec<(u32, adv_machine::CtxId)> {
     let mut windows: Vec<_> = ext
@@ -358,12 +384,15 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
     if is_desktop(env, hwnd) {
         return Outcome::Return(0);
     }
-    let (client, extent) = match (
+    let (outer, client, extent) = match (
+        read_rect(env, rects),
         read_rect(env, rects + CLIENT_RECT),
         read_rect(env, rects + VISIBLE_RECT),
     ) {
-        (Ok(client), Ok(extent)) => (client, extent),
-        (Err(error), _) | (_, Err(error)) => return Outcome::Fail(error),
+        (Ok(outer), Ok(client), Ok(extent)) => (outer, client, extent),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            return Outcome::Fail(error);
+        }
     };
     let window = env
         .ext
@@ -373,6 +402,7 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
         .or_default();
     window.client = client;
     window.extent = extent;
+    window.outer_size = [outer[2] - outer[0], outer[3] - outer[1]];
     if flags & SWP_SHOWWINDOW != 0 {
         window.visible = true;
     }

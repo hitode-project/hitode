@@ -109,7 +109,7 @@ impl Buffer {
 
 pub(crate) struct Image {
     pub(super) core: Arc<ImageCore>,
-    default: std::sync::OnceLock<crate::ImageView>,
+    default: std::sync::OnceLock<Arc<crate::ImageView>>,
 }
 impl Clone for Image {
     fn clone(&self) -> Self {
@@ -134,6 +134,7 @@ pub(super) struct ImageCore {
     pub(super) conversion: Option<vk::SamplerYcbcrConversion>,
     pub(super) allocation: Option<ImageAllocation>,
     pub(super) states: Mutex<Vec<ImageState>>,
+    pub(super) views: Mutex<HashMap<(ViewDesc, ViewLayout), Arc<ViewCore>>>,
 }
 pub(crate) enum ImageAllocation {
     Private(Allocation),
@@ -173,6 +174,7 @@ impl ImageState {
 }
 impl Drop for ImageCore {
     fn drop(&mut self) {
+        self.views.get_mut().unwrap().clear();
         self.context.retire(Retired::Image {
             handle: self.handle,
             allocation: self.allocation.take().unwrap(),
@@ -185,9 +187,10 @@ impl Drop for ImageCore {
     }
 }
 #[derive(Clone)]
-pub(crate) struct ImageView(pub(super) Arc<ViewCore>);
+pub(crate) struct ImageView(pub(super) Arc<ViewCore>, crate::Image);
 pub(super) struct ViewCore {
-    pub(super) image: crate::Image,
+    context: Arc<Context>,
+    usage: Usage,
     pub(super) handle: vk::ImageView,
     pub(super) desc: ViewDesc,
     pub(super) format: Format,
@@ -203,7 +206,7 @@ impl ViewCore {
         if let Some(&index) = self.sampled.get() {
             return Ok(index);
         }
-        let context = &self.image.inner.core.context;
+        let context = &self.context;
         let Some(heap) = &context.heap else {
             return Ok(0);
         };
@@ -214,10 +217,7 @@ impl ViewCore {
             Some(
                 vk::DescriptorImageInfo::default()
                     .image_view(self.handle)
-                    .image_layout(binding::sampled_layout(
-                        self.format,
-                        self.image.inner.core.desc.usage,
-                    )),
+                    .image_layout(binding::sampled_layout(self.format, self.usage)),
             ),
         )?;
         if self.sampled.set(index).is_err() {
@@ -228,7 +228,7 @@ impl ViewCore {
 }
 impl Drop for ViewCore {
     fn drop(&mut self) {
-        self.image.inner.core.context.retire(Retired::View {
+        self.context.retire(Retired::View {
             handle: self.handle,
             sampled: self.sampled.get().copied(),
             storage: self.storage,
@@ -251,7 +251,7 @@ impl Image {
             },
             ViewLayout::default(),
         )?;
-        let _ = image.default.set(default);
+        let _ = image.default.set(Arc::new(default));
         Ok(crate::Image { inner: image })
     }
     #[cfg(target_os = "android")]
@@ -278,6 +278,7 @@ impl Image {
                 },
                 ViewLayout::default(),
             )
+            .map(Arc::new)
             .expect("default image view")
         })
     }
@@ -297,6 +298,26 @@ impl Image {
         self.default_view(desc, layout)
     }
     fn default_view(&self, desc: &ViewDesc, layout: ViewLayout) -> Result<crate::ImageView> {
+        let mut views = self.core.views.lock().unwrap();
+        let native = match views.entry((desc.clone(), layout)) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry
+                .insert(Arc::new(self.create_native_view(desc, layout)?))
+                .clone(),
+        };
+        // The allocation owns the cached native views. Only public views
+        // carry the image back-reference.
+        let image = crate::Image {
+            inner: Image {
+                core: self.core.clone(),
+                default: std::sync::OnceLock::new(),
+            },
+        };
+        Ok(crate::ImageView {
+            inner: ImageView(native, image),
+        })
+    }
+    fn create_native_view(&self, desc: &ViewDesc, layout: ViewLayout) -> Result<ViewCore> {
         let planar = self.core.desc.format == Format::Nv12 && self.core.conversion.is_none();
         if planar
             && (desc.plane > 1
@@ -471,15 +492,17 @@ impl Image {
             .core
             .context
             .result(unsafe { self.core.context.device.create_image_view(&info, None) })?;
+        #[cfg(feature = "counters")]
+        self.core
+            .context
+            .creations
+            .image_views
+            .fetch_add(1, Ordering::Relaxed);
         let mut core = ViewCore {
             sampled: std::sync::OnceLock::new(),
             storage: None,
-            image: crate::Image {
-                inner: Image {
-                    core: self.core.clone(),
-                    default: std::sync::OnceLock::new(),
-                },
-            },
+            context: self.core.context.clone(),
+            usage: self.core.desc.usage,
             handle,
             desc: desc.clone(),
             format,
@@ -500,9 +523,7 @@ impl Image {
                 )?,
             );
         }
-        Ok(crate::ImageView {
-            inner: ImageView(Arc::new(core)),
-        })
+        Ok(core)
     }
 }
 pub(super) fn layers(desc: &ImageDesc) -> u32 {
@@ -517,10 +538,10 @@ impl ImageView {
         self.0.format
     }
     pub(crate) fn image(&self) -> &crate::Image {
-        &self.0.image
+        &self.1
     }
     pub(crate) fn size(&self) -> Extent {
-        let desc = self.0.image.desc();
+        let desc = self.1.desc();
         let chroma = desc.format.planes() > 1 && self.0.desc.plane == 1;
         let width = if chroma {
             desc.size.width.div_ceil(2)
@@ -607,6 +628,8 @@ impl Device {
             },
             &format!("buffer: {}", desc.label),
         )?;
+        #[cfg(feature = "counters")]
+        self.0.creations.buffers.fetch_add(1, Ordering::Relaxed);
         let requirements = unsafe { self.0.device.get_buffer_memory_requirements(handle) };
         let allocation = match self
             .0
@@ -796,6 +819,7 @@ impl Device {
             conversion: None,
             video: None,
             allocation: Some(ImageAllocation::Private(allocation)),
+            views: Default::default(),
             states: Mutex::new(vec![
                 ImageState::default();
                 (desc.mips * layers(desc)) as usize

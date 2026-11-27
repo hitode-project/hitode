@@ -8,7 +8,7 @@ Hitode runs the original x86-32 Windows executables and DLLs of classic ADV (vis
 
 The approach is borrowed from console emulators. The game's own code runs unchanged as the *guest*. Hitode provides what that code expects from its "hardware": Wine's Windows userland over an NT platform of its own, graphics, audio and video devices, time and threads. Where a library call or a hot leaf function has a proven-equivalent native implementation, Hitode may run that instead, as long as the guest cannot tell the difference.
 
-The main targets are games that use GDI, DirectDraw, Direct3D 9, DirectSound and the classic video paths. x64 guests, Direct3D 11 and OpenGL are out of scope.
+The main targets are games that use GDI, DirectDraw, Direct3D 9–11, DirectSound and the classic video paths. x64 guests and OpenGL are out of scope.
 
 ## Principles
 
@@ -78,9 +78,19 @@ level and format table. Resources and immutable state use the shared COM
 identity table. Context snapshots share individual state groups and each
 context indexes its bound views by resource and subresource. The D3D11
 front pulls vertex inputs through the shared shader writer and records typed
-draws and transfers for the GPU worker. DXGI swap chains use D3D11 resources
-for back buffers and the shared presentation path for frame output. D3D11 and
-DXGI are installed only in their test assemblies.
+draws and transfers for the GPU worker. Each device reuses translated stages
+and parsed WGSL while the corresponding shader objects live. Draw offsets,
+strides and expansion counts travel through the upload ring. Dynamic vertex and index
+captures use the same ring and reuse their windows within a frame until the
+shadow changes. Dynamic textures use pooled staging uploads in draw order.
+Metal and Vulkan keep views for the life of each texture. Vulkan cached sets
+for compact shaders use dynamic offsets for buffer windows within the device's
+dynamic descriptor limits. Vulkan reuses the queue's packed storage buffer
+when resource bindings exceed the native storage descriptor limit. D3D10 and
+D3D10.1 use the same device core. The Wine session derives feature levels from
+the attached backend and supplies DXGI with window geometry and the shared surface store. DXGI swap
+chains use D3D11 resources for back buffers and publish through the same
+presenter as Direct3D 9.
 
 For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe` and calls their imports through the machine. `adv-unix::builtin` installs those images in the prefix before process startup. `adv-runtime::wine` assembles the graphics fronts on that stack: our DirectDraw as such an image, with memory DCs from Wine's GDI. `adv-drv` holds the driver modules win32u loads, such as the user driver whose window reports give the fronts their geometry.
 
@@ -90,7 +100,7 @@ For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe`
 2. **Load.** `adv-runtime::wine` starts the program through `adv-nt` and Wine's PE loader, using the bundled Windows modules and native device fronts.
 3. **Run.** `adv-machine` owns guest scheduling, and `adv-cpu` runs guest code. The guest sees eight processors. Code runs first in the interpreter; hot code is translated to host machine code. The owner may run proved computations over nonconflicting ranges concurrently with workers. It drains the workers before ordinary guest execution or services. A proved spin backedge can hand off to a ready peer without parking the spinner.
 4. **Call the system.** Wine implements Windows behavior above the NT and Unix boundaries served by `adv-nt` and `adv-unix`. Native device fronts use `adv-abi`. Guest callbacks and waits save continuations that resume in the same thread's context.
-5. **Draw.** GDI, DirectDraw and Direct3D 9 front ends draw through the neutral surfaces of `adv-device`, with software and GPU backends behind one interface. GPU work uses `adv-gpu`, with Metal on Apple and Vulkan elsewhere ([GFX-METAL-1](docs/spec/graphics.md#gfx-metal-1-apple-programmable-draws)). A finished frame goes into a mailbox.
+5. **Draw.** GDI, DirectDraw and the Direct3D fronts draw through `adv-device`, with software and GPU backends behind one interface. GPU work uses `adv-gpu`, with Metal on Apple and Vulkan elsewhere ([GFX-METAL-1](docs/spec/graphics.md#gfx-metal-1-apple-programmable-draws)). A finished frame goes into a mailbox.
    Every surface store and GPU facade on an execution thread shares one command producer and GPU owner. The native GPU constructor selects the presenter before the execution starts; it remains fixed until the last facade drops. Software surfaces compare declared damage against their last published slot and suppress identical frames. Three mapped, host-cached guest-format buffers rotate, copying each buffer's damage debt and publishing a `frame::Base::Software`. `adv-display::stages::ingest` decodes its damaged tiles with one draw; video composition can bind the same decoder inline. Display stages own their input types; the shell maps device publications onto them.
 6. **Present.** Dropping a host frame never skips a draw, lock or readback that the guest can observe. The UI opens the native device and platform compositor before execution starts. The GPU owner maps device frames into `adv-display::display`, which owns the planner, one indexed presentable pool per planner pool, and one render pass per target on the same queue. One unlatched transaction gates a newest held frame; settings, window changes and compositor completions poke the command owner without guest work. Detach and rebuild transfer the same leases without encoding. The last 600 presents and their stage GPU times live in the recorder; bounded latch feedback carries publication timestamps, actual placement, cursor regions and recorder statistics to the UI. Captures and debugger pixel gates read the last presented composition on the owner.
 7. **Sound and input.** DirectSound and waveOut share one mixer and playback clock, and the host audio callback only reads mixed PCM. Host input events become USER messages in the guest's queues.

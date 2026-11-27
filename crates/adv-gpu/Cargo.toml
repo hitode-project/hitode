@@ -14,6 +14,7 @@ backend = ["precompile", "dep:arrayvec", "dep:ash", "dep:gpu-allocator", "dep:ob
 precompile = ["naga/spv-out", "naga/msl-out"]
 # Serializable damage regions for the display recorder.
 serde = ["dep:serde"]
+counters = []
 
 [dependencies]
 arrayvec = { version = "0.7", optional = true }

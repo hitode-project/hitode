@@ -1,7 +1,7 @@
 {
   "dist": {
-    "url": "https://github.com/hitode-project/hitode/releases/download/wine-dist-11.0-4/hitode-wine-11.0-sse.tar.xz",
-    "sha256": "93c6868d38df1d798a8995dfd373fcefe24c17f2b192571f0c4ee38ba4906ec1",
+    "url": "https://github.com/hitode-project/hitode/releases/download/wine-dist-11.0-5/hitode-wine-11.0-sse.tar.xz",
+    "sha256": "204723b3ec676dd3ecdb0c3cfea01972541b7f246f68f252feeeed0a4f66572f",
     "directory": "wine11-sse-strip"
   },
   "source": {

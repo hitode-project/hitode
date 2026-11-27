@@ -1573,7 +1573,7 @@ fn geometry_stream_output_appends_and_drives_draw_auto_through_guest_vtables() {
     assert_eq!(r.read(target, staging, 4, 4), [0xff0000ff; 4]);
 }
 
-// spec: GFX-REC-7
+// spec: GFX-REC-7 GFX-CACHE-1
 #[test]
 fn guest_constant_updates_keep_recorded_draws_in_order() {
     const UPDATES: u32 = 24;
@@ -1629,7 +1629,7 @@ fn guest_constant_updates_keep_recorded_draws_in_order() {
             let x = (update * DRAWS_PER_UPDATE + draw) as i32;
             write_value(&mut r.machine, DESCRIPTOR, [x, 0, x + 1, 1]);
             r.call(45, &[1, DESCRIPTOR]);
-            r.call(13, &[3, 0]);
+            r.call(13, &[3, 3 * draw]);
             expected.push(pixel);
         }
     }
@@ -1638,9 +1638,14 @@ fn guest_constant_updates_keep_recorded_draws_in_order() {
     {
         let traffic = gpu::traffic(&r.machine.ext).unwrap();
         let counters = gpu::frame_counters(&r.machine.ext).unwrap();
+        let variants = gpu::variant_counters(&r.machine.ext).unwrap();
+        assert_eq!(variants.misses, 2);
+        assert_eq!(variants.hits, 2 * u64::from(width) - 2);
+        // Each draw uploads a 32-byte parameter header with one padded
+        // pair of fetches. Guest constants still upload once per update.
         assert_eq!(
             traffic.upload_bytes - before.upload_bytes,
-            u64::from(UPDATES) * 16
+            u64::from(UPDATES) * 16 + u64::from(width) * 48
         );
         assert_eq!(traffic.submissions - before.submissions, 2);
         assert_eq!(

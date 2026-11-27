@@ -860,7 +860,12 @@ device_glue!(duplicate1, DuplicateOutput1, 5, |env: &mut Env<'_>| {
 #[cfg(test)]
 mod tests;
 
-/// Install the window and device services for private swap-chain callers.
+#[cfg(feature = "gpu")]
+pub(crate) fn set_adapter(ext: &mut adv_machine::Ext, adapter: super::caps::AdapterInfo) {
+    ext.get_mut::<State>().provider.adapter = adapter;
+}
+
+/// Install the window and device services for swap-chain callers.
 pub fn install_swap_chains<B: Backend>(machine: &mut Machine<B>, services: super::swap::Services) {
     machine.ext.insert(services);
     machine

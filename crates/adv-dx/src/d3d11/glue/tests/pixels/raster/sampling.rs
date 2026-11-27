@@ -27,6 +27,10 @@ impl SampleOutput {
 
     fn draw(&self, r: &mut Raster, parameters: [f32; 4], count: usize) -> Vec<[u32; 4]> {
         r.draw(0..64, parameters);
+        self.read(r, count)
+    }
+
+    fn read(&self, r: &mut Raster, count: usize) -> Vec<[u32; 4]> {
         r.call(47, &[self.staging, self.target]);
         let map = map(&mut r.machine, r.context, self.staging, 1);
         let texels = (0..count as u32)
@@ -228,6 +232,41 @@ fn dynamic_texture_sampling_sees_gpu_copies_before_mapping() {
     r.call(47, &[dynamic, source]);
     let pixels = output.draw(&mut r, [0., 0., 0., 0.], 1);
     assert_eq!(pixels, [[1.0f32, 0., 0., 1.].map(f32::to_bits)]);
+
+    let write_texel = |r: &mut Raster, value| {
+        let mapped = map(&mut r.machine, r.context, dynamic, 4);
+        write_value(&mut r.machine, mapped.pData, value);
+        r.call(15, &[dynamic, 0]);
+    };
+    write_texel(&mut r, 0xff00_ff00u32);
+    r.draw(0..1, [0.; 4]);
+    #[cfg(feature = "d3d9-counters")]
+    let upload = gpu::traffic(&r.machine.ext).unwrap().upload_bytes;
+    #[cfg(feature = "d3d9-counters")]
+    let views = gpu::capture_counters(&r.machine.ext)
+        .unwrap()
+        .image_views_created;
+    r.draw(1..2, [0.; 4]);
+    #[cfg(feature = "d3d9-counters")]
+    assert_eq!(
+        gpu::traffic(&r.machine.ext).unwrap().upload_bytes - upload,
+        64
+    );
+
+    write_texel(&mut r, 0xffff_0000u32);
+    r.draw(2..3, [0.; 4]);
+    assert_eq!(
+        output.read(&mut r, 3),
+        [[0.0f32, 1., 0., 1.], [0., 1., 0., 1.], [0., 0., 1., 1.]]
+            .map(|rgba| rgba.map(f32::to_bits)),
+    );
+    #[cfg(feature = "d3d9-counters")]
+    assert_eq!(
+        gpu::capture_counters(&r.machine.ext)
+            .unwrap()
+            .image_views_created,
+        views
+    );
 }
 
 #[test]

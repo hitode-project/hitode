@@ -198,7 +198,7 @@ public static class AbiMetadata
         return string.Join("|", sig.ParameterTypes.Select((t, i) => names.GetValueOrDefault(i + 1, "arg" + i) + ":" + t.Name + ":" + t.Kind + ":" + Round(t.Size, 4) / 4));
     }
 
-    // DXGI display objects, D3D10.1 and D3D11.1.
+    // DXGI display objects, D3D10.1 and D3D11.2.
     static readonly string[] GraphicsInterfaces = (
         "IDXGIObject IDXGIDeviceSubObject IDXGIResource IDXGIResource1 IDXGIKeyedMutex " +
         "IDXGIFactory IDXGIFactory1 IDXGIFactory2 IDXGIFactory3 IDXGIFactory4 IDXGIFactory5 IDXGIFactory6 IDXGIFactory7 " +
@@ -211,7 +211,7 @@ public static class AbiMetadata
         "ID3D10RenderTargetView ID3D10DepthStencilView ID3D10VertexShader ID3D10GeometryShader ID3D10PixelShader " +
         "ID3D10InputLayout ID3D10SamplerState ID3D10DepthStencilState ID3D10BlendState ID3D10BlendState1 " +
         "ID3D10RasterizerState ID3D10Asynchronous ID3D10Query ID3D10Predicate ID3D10Counter ID3D10Multithread " +
-        "ID3D11Device ID3D11Device1 ID3D11DeviceContext ID3D11DeviceContext1 ID3D11DeviceChild " +
+        "ID3D11Device ID3D11Device1 ID3D11Device2 ID3D11DeviceContext ID3D11DeviceContext1 ID3D11DeviceContext2 ID3D11DeviceChild " +
         "ID3D11Resource ID3D11Buffer ID3D11Texture1D ID3D11Texture2D ID3D11Texture3D ID3D11View " +
         "ID3D11ShaderResourceView ID3D11RenderTargetView ID3D11DepthStencilView ID3D11UnorderedAccessView " +
         "ID3D11VertexShader ID3D11HullShader ID3D11DomainShader ID3D11GeometryShader ID3D11PixelShader " +

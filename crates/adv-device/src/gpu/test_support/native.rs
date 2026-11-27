@@ -108,7 +108,7 @@ pub fn request(fallback: bool) -> Result<Gpu, Error> {
             execution.capture.borrow().is_some(),
             "capture must precede other facades"
         );
-        return Gpu::facade(execution);
+        return Gpu::facade(execution, None);
     }
     let (presenter, receiver) = CapturePresenter::new();
     let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {

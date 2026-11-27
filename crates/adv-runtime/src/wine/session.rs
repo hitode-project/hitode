@@ -425,12 +425,6 @@ pub(super) fn link(source: &Path, target: &Path) -> Result<(), String> {
     std::os::unix::fs::symlink(source, target).map_err(|e| format!("{}: {e}", target.display()))
 }
 
-/// Wine modules backed by `wined3d`/OpenGL that Hitode does not serve.
-/// Exposing Wine's `dxgi.dll` in `system32` causes D3D9 titles that probe it
-/// (such as Microsoft's DirectX SDK / Unity VRAM detection) to load a DLL whose
-/// `CreateDXGIFactory` fails without GL instead of taking their non-DXGI fallback.
-const OMITTED_MODULES: &[&str] = &["dxgi.dll"];
-
 /// Create or refresh the prefix; returns it and drive C:.
 fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
     let prefix = config.prefix.to_owned();
@@ -489,9 +483,8 @@ fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
             let entry = entry.map_err(|e| e.to_string())?;
             let name = entry.file_name();
             if directory == MODULES
-                && OMITTED_MODULES
-                    .iter()
-                    .any(|&omitted| name.eq_ignore_ascii_case(omitted))
+                && !cfg!(feature = "gpu")
+                && name.eq_ignore_ascii_case("dxgi.dll")
             {
                 let target = windows.join("system32").join(&name);
                 if target
@@ -711,7 +704,10 @@ fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
     machine.ext.insert(VideoDeadline(video));
     let media = adv_drv::media::pump(machine)?;
     #[cfg(feature = "gpu")]
-    return adv_dx::d3d9::pump(machine).map(|gpu| gpu || media);
+    {
+        let modern = adv_dx::d3d11::pump(machine)?;
+        adv_dx::d3d9::pump(machine).map(|gpu| gpu || modern || media)
+    }
     #[cfg(not(feature = "gpu"))]
     Ok(media)
 }
@@ -1323,7 +1319,10 @@ impl Session {
                 .set_background_sender(self.machine.cpu.background_sender()?)
                 .map_err(|e| e.to_string())?;
             #[cfg(feature = "gpu")]
-            adv_dx::d3d9::fork_host_state(&self.machine.ext, &mut machine.ext)?;
+            {
+                adv_dx::d3d9::fork_host_state(&self.machine.ext, &mut machine.ext)?;
+                adv_dx::d3d11::fork_gpu(&self.machine.ext, &mut machine, self.wake.clone())?;
+            }
             // Captures read the foreground machine's frames through the host GPU.
             #[cfg(feature = "gpu")]
             if let Some(waker) = self.machine.ext.try_get::<adv_device::frame::Waker>() {
@@ -1489,6 +1488,14 @@ impl Session {
 
     /// The host application gained or lost activation.
     pub fn activate(&mut self, active: bool) -> bool {
+        #[cfg(feature = "gpu")]
+        if let Some(draw) = self
+            .machine
+            .ext
+            .try_get_mut::<adv_dx::ddraw::front::State>()
+        {
+            draw.set_application_active(active);
+        }
         let queued = project::activate(&mut self.machine.ext, active);
         self.queued(queued)
     }
@@ -1618,8 +1625,7 @@ impl Session {
             .map(|_| ())
     }
 
-    /// Attach `gpu` to Direct3D 9 and route readback completions to `wake`.
-    /// Call from the
+    /// Attach the shared GPU to the Direct3D fronts. Call from the
     /// `prepare` of [`Session::start`].
     #[cfg(feature = "gpu")]
     pub fn attach_gpu(
@@ -1631,9 +1637,16 @@ impl Session {
             .ext
             .get_mut::<SurfaceStore>()
             .set_deferred_presentation(true)?;
+        let modern = gpu.fork_front().map_err(|error| error.to_string())?;
         adv_dx::d3d9::set_gpu(&mut machine.ext, gpu)?;
         let background = machine.cpu.background_sender()?;
-        adv_dx::d3d9::set_background(&mut machine.ext, background, wake);
+        adv_dx::d3d9::set_background(&mut machine.ext, background, wake.clone());
+        adv_dx::d3d11::configure_gpu(
+            machine,
+            modern,
+            adv_dx::d3d11::caps::Coverage::production(),
+            wake,
+        );
         Ok(())
     }
 }
@@ -1693,7 +1706,7 @@ mod link_tests {
 
     // spec: WINE-SES-1, WINE-SYS-15
     #[test]
-    fn prefix_omits_dxgi_and_cleans_stale_symlink_without_touching_regular_file() {
+    fn prefix_serves_dxgi_with_gpu_and_removes_stale_links_without_gpu() {
         let root = std::env::temp_dir().join(format!("adv-prefix-omit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dist = root.join("dist");
@@ -1730,21 +1743,28 @@ mod link_tests {
         let (_, drive) = super::prefix(&config).unwrap();
         let system32 = drive.join("windows/system32");
         assert!(system32.join("ntdll.dll").symlink_metadata().is_ok());
-        assert!(system32.join("dxgi.dll").symlink_metadata().is_err());
+        let dxgi = system32.join("dxgi.dll");
+        let check_dxgi = || {
+            if cfg!(feature = "gpu") {
+                assert_eq!(std::fs::read_link(&dxgi).unwrap(), modules.join("dxgi.dll"));
+            } else {
+                assert!(dxgi.symlink_metadata().is_err());
+            }
+        };
+        check_dxgi();
 
-        // Refreshing an older prefix removes a stale/dangling symlink.
-        std::os::unix::fs::symlink(
-            root.join("removed-bundle/dxgi.dll"),
-            system32.join("dxgi.dll"),
-        )
-        .unwrap();
+        if cfg!(feature = "gpu") {
+            std::fs::remove_file(&dxgi).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("removed-bundle/dxgi.dll"), &dxgi).unwrap();
         super::prefix(&config).unwrap();
-        assert!(system32.join("dxgi.dll").symlink_metadata().is_err());
+        check_dxgi();
 
-        // A user-supplied regular file in system32 stays untouched.
-        std::fs::write(system32.join("dxgi.dll"), b"native").unwrap();
-        super::prefix(&config).unwrap();
-        assert_eq!(std::fs::read(system32.join("dxgi.dll")).unwrap(), b"native");
+        if !cfg!(feature = "gpu") {
+            std::fs::write(&dxgi, b"native").unwrap();
+            super::prefix(&config).unwrap();
+            assert_eq!(std::fs::read(&dxgi).unwrap(), b"native");
+        }
 
         std::fs::remove_dir_all(&root).unwrap();
     }

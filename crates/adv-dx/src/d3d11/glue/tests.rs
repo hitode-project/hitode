@@ -388,8 +388,19 @@ fn forced_d3d9_refuses_all_d3d11_device_creation_exports() {
 fn device_entry_negotiates_levels_and_retains_its_immediate_context() {
     let mut machine = machine();
     let (device, context) = create(&mut machine, 5, 0, &[0x9100, 0xb000]);
-    check_vtable(&mut machine, device, DLL, "ID3D11Device1");
-    check_vtable(&mut machine, context, DLL, "ID3D11DeviceContext1");
+    check_vtable(&mut machine, device, DLL, "ID3D11Device2");
+    check_vtable(&mut machine, context, DLL, "ID3D11DeviceContext2");
+    for (pointer, iid) in [
+        (device, IID_ID3D11DEVICE1),
+        (device, IID_ID3D11DEVICE2),
+        (context, IID_ID3D11DEVICECONTEXT1),
+        (context, IID_ID3D11DEVICECONTEXT2),
+    ] {
+        machine.cpu.write(IID, &iid).unwrap();
+        assert_eq!(method(&mut machine, pointer, 0, &[IID, OUT]), 0);
+        assert_eq!(machine.cpu.read_u32(OUT).unwrap(), pointer);
+        method(&mut machine, pointer, 2, &[]);
+    }
     assert_eq!(machine.cpu.read_u32(LEVEL).unwrap(), 0x9100);
     assert_eq!(method(&mut machine, device, 37, &[]), 0x9100);
     assert_eq!(refs(&mut machine, device), 2);
@@ -398,11 +409,14 @@ fn device_entry_negotiates_levels_and_retains_its_immediate_context() {
     assert_eq!(refs(&mut machine, device), 1);
     assert_eq!(method(&mut machine, device, 40, &[CONTEXT]), 0);
     assert_eq!(machine.cpu.read_u32(CONTEXT).unwrap(), context);
+    assert_eq!(method(&mut machine, device, 50, &[CONTEXT]), 0);
+    assert_eq!(machine.cpu.read_u32(CONTEXT).unwrap(), context);
+    assert_eq!(method(&mut machine, context, 2, &[]), 1);
     assert_eq!(refs(&mut machine, device), 2);
-    machine.cpu.write(IID, &IID_IDXGIDEVICE).unwrap();
+    machine.cpu.write(IID, &IID_IDXGIDEVICE3).unwrap();
     assert_eq!(method(&mut machine, device, 0, &[IID, OUT]), 0);
     let dxgi = machine.cpu.read_u32(OUT).unwrap();
-    check_vtable(&mut machine, dxgi, DLL, "IDXGIDevice1");
+    check_vtable(&mut machine, dxgi, DLL, "IDXGIDevice3");
     assert_ne!(device, dxgi);
     machine.cpu.write(IID, &adv_abi::com::IUNKNOWN).unwrap();
     assert_eq!(method(&mut machine, dxgi, 0, &[IID, OUT]), 0);

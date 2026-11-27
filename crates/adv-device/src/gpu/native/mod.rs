@@ -69,7 +69,7 @@ pub use modern::{
 };
 pub use record::Readback;
 pub use resources::{Depth, Image, ImageId, Staged, Target};
-pub use uniform::{BufferWindow, UniformWindow};
+pub use uniform::{BufferWindow, CapturedWindow, UniformWindow};
 
 use super::{Error, Rect, Stats};
 
@@ -91,7 +91,7 @@ pub struct Gpu {
     clip: Option<Rect>,
     readbacks: Arc<std::sync::atomic::AtomicUsize>,
     readback_limit: usize,
-    staging: resources::StagingPool,
+    staging: std::cell::RefCell<resources::StagingPool>,
     execution: std::rc::Rc<Execution>,
 }
 
@@ -193,21 +193,29 @@ impl Gpu {
             *cached.borrow_mut() = std::rc::Rc::downgrade(&execution);
             Ok(execution)
         })?;
-        Self::facade(execution)
+        Self::facade(execution, None)
     }
     /// Another facade on this execution, for a child process that the
     /// session drives on the same thread. Its commands share the device,
     /// worker, stream and owner; pipelines, recording state and staging start fresh.
     pub fn fork(&self) -> Result<Self, Error> {
         self.check()?;
-        Self::facade(self.execution.clone())
+        Self::facade(self.execution.clone(), None)
     }
-    fn facade(execution: std::rc::Rc<Execution>) -> Result<Self, Error> {
+
+    /// Another API front on the same worker, sharing its immutable fallback texture.
+    pub fn fork_front(&self) -> Result<Self, Error> {
+        self.check()?;
+        Self::facade(self.execution.clone(), Some(self.facade_id))
+    }
+
+    fn facade(execution: std::rc::Rc<Execution>, shared_white: Option<u64>) -> Result<Self, Error> {
         let device = execution.device.clone();
         let stream = execution.stream.clone();
         let failure = Arc::new(std::sync::Mutex::new(None));
-        let (facade_id, pipeline_jobs, pipeline_counters) =
-            execution.worker.create_facade(failure.clone())?;
+        let (facade_id, pipeline_jobs, pipeline_counters) = execution
+            .worker
+            .create_facade(failure.clone(), shared_white)?;
         Ok(Self {
             device,
             stream,

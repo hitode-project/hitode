@@ -18,7 +18,10 @@ pub use glue::{
 };
 
 #[cfg(feature = "gpu")]
-pub use glue::{configure_gpu, configure_surface_dc, configure_swap_chains};
+pub use glue::{
+    configure_event_signal, configure_gpu, configure_surface_dc, configure_swap_chains, fork_gpu,
+    pump,
+};
 
 #[cfg(all(feature = "gpu", feature = "d3d9-counters"))]
-pub use glue::{frame_counters, traffic};
+pub use glue::{capture_counters, frame_counters, traffic, variant_counters};

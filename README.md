@@ -53,9 +53,9 @@ For now Hitode ships a simple player: a launcher that manages the library (with 
 
 ## Which games run
 
-Hitode does not target particular games or engines. It implements the system features 32-bit Windows visual novels commonly use: GDI, DirectDraw, Direct3D 9, DirectSound, DirectInput, and video through DirectShow, Windows Media and VfW. A game built on these has a chance to run as it is, whether it uses a commercial engine, any version of one, or a brand's in-house engine.
+Hitode does not target particular games or engines. It implements the system features 32-bit Windows visual novels commonly use: GDI, DirectDraw, Direct3D 7, 9, 10 and 11 (with DXGI), DirectSound, DirectMusic (MIDI), DirectInput, and video through DirectShow, Windows Media and VfW. A game built on these has a chance to run as it is, whether it uses a commercial engine, any version of one, or a brand's in-house engine.
 
-Not supported: 64-bit programs; programs that use Direct3D 10 or later, or OpenGL; programs that only run after bypassing a protector or DRM.
+Not supported: 64-bit programs; programs that use Direct3D 12, Vulkan or OpenGL; programs that only run after bypassing a protector or DRM.
 
 To find out whether your game runs, import it and try. If it will not start, freezes, crashes, stutters or drains the battery, [tell us](https://github.com/hitode-project/hitode/issues/new?template=game-issue.yml) which game and what happened, ideally with the anonymous report the launcher creates. Issues with the same cause are grouped together, and the fix goes into the shared behavior, so one fix helps every similar game. Known problems are in the [issue list](https://github.com/hitode-project/hitode/issues?q=label%3Acompatibility); share the games that play well in [Discussions](https://github.com/hitode-project/hitode/discussions).
 
@@ -83,7 +83,7 @@ Hitode has two parts: a **runtime** that runs Windows programs, and a **player**
 
 The approach follows console emulators: the game's own code runs unchanged, and Hitode provides the "hardware" it expects, namely a subset of Windows, graphics, audio and video devices, time and threads.
 
-Windows behavior comes from Wine, built together with the rest of Hitode; its modules run as guest code and cover the long tail. Everything the player feels is host code: audio mixing, MIDI, video decoding, DirectDraw and Direct3D 9, and the timing of all of them. The NT kernel, the Wine server and the drivers run in the same process, so the layers call each other directly. Where a Wine function's bytes are verified unchanged, a native body may run it as host code with the same result.
+Windows behavior comes from Wine, built together with the rest of Hitode; its modules run as guest code and cover the long tail. Everything the player feels is host code: audio mixing, MIDI, video decoding, DirectDraw and Direct3D (7, 9, 10 and 11), and the timing of all of them. The NT kernel, the Wine server and the drivers run in the same process, so the layers call each other directly. Where a Wine function's bytes are verified unchanged, a native body may run it as host code with the same result.
 
 The runtime also runs without the launcher. `adv-run` is its command-line entry point, for debugging and automated tests.
 
@@ -167,7 +167,7 @@ Hitode is released under the [GNU General Public License, version 3 or any later
 Third-party parts keep their own licenses:
 
 - `crates/adv-cpu-core/softfloat`: Berkeley SoftFloat 3e, BSD-3-Clause.
-- `vendor/cpal` (Apache-2.0) and `vendor/symphonia-codec-adpcm` (MPL-2.0): patched upstream code.
+- `vendor/cpal` (Apache-2.0), `vendor/naga` (Apache-2.0 OR MIT) and `vendor/symphonia-codec-adpcm` (MPL-2.0): patched upstream code.
 - `vendor/libtheora`: the decoder of Xiph libtheora 1.2.0, BSD-3-Clause, with local changes; see its `NOTICE`.
 - `vendor/wine`: the server of Wine 11.0 and the headers it includes, the `l_intl.nls` table the server loads at startup, and the `ntsyscalls.h` system call table, LGPL-2.1-or-later, unmodified; see its `NOTICE`.
 - `crates/adv-unix/freetype`: the FreeType ftgrays rasterizer, used under the FreeType License (FTL); see its `LICENSE.TXT`.

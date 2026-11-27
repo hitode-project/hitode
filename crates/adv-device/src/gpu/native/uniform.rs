@@ -1,4 +1,4 @@
-//! Reusable constant-buffer windows in the resident part of the upload ring.
+//! Reusable buffer windows in the resident part of the upload ring.
 //! A resource can keep a window across frames while transient spans wrap.
 //! Recordings and submissions keep their own leases on older windows.
 
@@ -41,7 +41,10 @@ impl Pool {
                 "uniform window exceeds the buffer size limit".into(),
             ));
         }
-        let align = limits.uniform_offset_alignment.max(16);
+        let align = limits
+            .uniform_offset_alignment
+            .max(limits.storage_offset_alignment)
+            .max(16);
         let size_class = u64::from(size.max(align)).next_power_of_two();
         let class = size_class.trailing_zeros() as usize;
         let block = self.free.lock().unwrap()[class].pop();
@@ -56,6 +59,8 @@ impl Pool {
                         .create_buffer(&BufferDesc {
                             size: PAGE_BYTES.max(extent),
                             usage: BufferUsage::UNIFORM
+                                | BufferUsage::INDEX
+                                | BufferUsage::STORAGE
                                 | BufferUsage::COPY_SRC
                                 | BufferUsage::COPY_DST,
                             memory: Memory::Upload,
@@ -115,11 +120,33 @@ impl UniformWindow {
     }
 }
 
+/// CPU-initialized storage used only for read-only shader and index bindings.
+#[derive(Clone)]
+pub struct CapturedWindow(UniformWindow);
+
+impl CapturedWindow {
+    /// # Safety
+    /// This window must only be bound for GPU reads.
+    pub unsafe fn bytes(&self) -> &[u8] {
+        let slice = self.0.binding();
+        let mapping = slice.buffer.mapped().unwrap().cast::<u8>();
+        // SAFETY: The lease keeps these initialized bytes immutable. Captured
+        // windows are bound for GPU reads only.
+        unsafe {
+            std::slice::from_raw_parts(
+                mapping.as_ptr().add(slice.offset as usize),
+                slice.size as usize,
+            )
+        }
+    }
+}
+
 /// A native buffer range or a range whose allocation belongs to the ring.
 #[derive(Clone)]
 pub enum BufferWindow {
     Native(BufferRange),
     Uniform(UniformWindow),
+    Captured(CapturedWindow),
 }
 
 impl From<BufferRange> for BufferWindow {
@@ -133,17 +160,40 @@ impl BufferWindow {
         match self {
             Self::Native(range) => range.buffer.slice(range.range.clone()),
             Self::Uniform(window) => window.binding(),
+            Self::Captured(window) => window.0.binding(),
         }
     }
 
     pub(super) fn retain(&self, windows: &mut Vec<UniformWindow>) {
-        if let Self::Uniform(window) = self {
-            windows.push(window.clone());
+        match self {
+            Self::Uniform(window) => windows.push(window.clone()),
+            Self::Captured(window) => windows.push(window.0.clone()),
+            Self::Native(_) => {}
         }
     }
 }
 
 impl Gpu {
+    pub fn capture_window<E>(
+        &self,
+        size: u32,
+        read: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<CapturedWindow, E>
+    where
+        E: From<Error>,
+    {
+        let padded = u64::from(size).max(1).next_multiple_of(4);
+        let padded = u32::try_from(padded)
+            .map_err(|_| Error::Invalid("capture exceeds the upload window".into()))?;
+        self.uniform_window(padded, |out| {
+            let (bytes, padding) = out.split_at_mut(size as usize);
+            read(bytes)?;
+            padding.fill(0);
+            Ok(())
+        })
+        .map(CapturedWindow)
+    }
+
     /// Initialize a window before publishing its lease to recorders.
     pub fn uniform_window<E>(
         &self,

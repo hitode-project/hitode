@@ -370,12 +370,13 @@ fn draw(image: &Image, vertex: Arc<ModernShader>, fragment: Arc<ModernShader>) -
 
 fn inputs(gpu: &Gpu, index: &[u32]) -> Inputs {
     Inputs {
+        draw_state: None,
         primitives: index.len() as u32 / 3,
         vertices: Some(upload(
             gpu,
             &[0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
         )),
-        indices: Some(upload(gpu, index)),
+        indices: Some(upload(gpu, index).into()),
         vertex: SlotBindings::default(),
         geometry: SlotBindings::default(),
         hull: SlotBindings::default(),
@@ -837,9 +838,10 @@ fn domain_points_are_shaded_once_and_streamed_as_a_list() {
     );
     let filled = buffer(&gpu, &[0], BufferUsage::STORAGE, Memory::Readback);
     let input = Inputs {
+        draw_state: None,
         primitives: indices.len() as u32 / 3,
         vertices: Some(upload(&gpu, bytemuck::cast_slice(&vertices))),
-        indices: Some(upload(&gpu, &indices)),
+        indices: Some(upload(&gpu, &indices).into()),
         vertex: SlotBindings::default(),
         geometry: SlotBindings::default(),
         hull: SlotBindings::default(),

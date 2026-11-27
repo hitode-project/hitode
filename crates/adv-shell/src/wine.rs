@@ -628,6 +628,29 @@ fn report(
                 front(adv_runtime::d3d11_counters(ext))
             ));
         }
+        if let Some(counts) = adv_runtime::d3d11_capture_counters(ext) {
+            fields.push(format!(
+                concat!(
+                    "\"d3d11_captures\": {{\"ring_bytes\": {}, \"captures_reused\": {}, ",
+                    "\"buffers_created\": {}, \"image_views_created\": {}, \"device_memory_created\": {}, ",
+                    "\"descriptor_sets_allocated\": {}, \"descriptor_set_updates\": {}, \"descriptor_pushes\": {}}}"
+                ),
+                counts.ring_bytes,
+                counts.captures_reused,
+                counts.buffers_created,
+                counts.image_views_created,
+                counts.device_memory_created,
+                counts.descriptor_sets_allocated,
+                counts.descriptor_set_updates,
+                counts.descriptor_pushes,
+            ));
+        }
+        if let Some(counts) = adv_runtime::d3d11_variant_counters(ext) {
+            fields.push(format!(
+                "\"d3d11_shader_variants\": {{\"hits\": {}, \"misses\": {}, \"last_miss_frame\": {}}}",
+                counts.hits, counts.misses, counts.last_miss_frame,
+            ));
+        }
     }
 
     let mut codec = adv_runtime::wine::vorbisfile::stats(&session.machine).map_or_else(

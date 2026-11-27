@@ -2068,12 +2068,12 @@ fn storage_binding_limits(indexed: bool) {
         if indexed { 0 } else { 128 }
     );
 
-    let result = readback(&device, stride * 8);
+    let result = readback(&device, stride * 16);
+    #[cfg(feature = "counters")]
+    let before = device.resource_creations().buffers;
     let mut encoder = queue.encoder("packed storage window");
     let last = 127 * stride;
-    encoder.fill_buffer(input.slice(last..last + 4), 200);
-    expected += 200 - 128;
-    {
+    let dispatch = |encoder: &mut crate::Encoder| {
         let mut pass = encoder.compute_pass(&ComputePassDesc {
             timestamps: None,
             label: "storage window",
@@ -2095,14 +2095,26 @@ fn storage_binding_limits(indexed: bool) {
             );
         }
         pass.dispatch(1, 1, 1);
-    }
+    };
+    dispatch(&mut encoder);
     encoder.copy_buffer(output.slice(0..stride * 8), &result, 0);
+    encoder.fill_buffer(input.slice(last..last + 4), 200);
+    dispatch(&mut encoder);
+    encoder.copy_buffer(output.slice(0..stride * 8), &result, stride * 8);
     finish(&mut queue, encoder);
-    for i in 0..8 {
-        let offset = i * stride as usize;
-        assert_eq!(
-            &bytes(&result)[offset..offset + 4],
-            &(expected + i as u32).to_ne_bytes()
-        );
+    #[cfg(feature = "counters")]
+    assert_eq!(
+        device.resource_creations().buffers - before,
+        u64::from(!indexed)
+    );
+    let actual = bytes(&result);
+    for (frame, expected) in [expected, expected + 200 - 128].into_iter().enumerate() {
+        for i in 0..8 {
+            let offset = (frame * 8 + i) * stride as usize;
+            assert_eq!(
+                &actual[offset..offset + 4],
+                &(expected + i as u32).to_ne_bytes()
+            );
+        }
     }
 }

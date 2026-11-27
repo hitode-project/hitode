@@ -94,6 +94,11 @@ pub struct Expand {
 
 impl Expand {
     pub(super) fn retain_uniforms(&self, windows: &mut Vec<super::UniformWindow>) {
+        for bin in &self.bins {
+            if let Some((index, _)) = &bin.draw.index {
+                index.retain(windows);
+            }
+        }
         for slots in self
             .prelude
             .iter()
@@ -107,6 +112,11 @@ impl Expand {
         {
             for uniform in slots.uniforms.iter().flatten() {
                 uniform.retain(windows);
+            }
+            for storage in slots.storage.iter().flatten() {
+                if let StorageBinding::Window(window) = storage {
+                    window.retain(windows);
+                }
             }
         }
     }

@@ -433,7 +433,7 @@ pub fn start_connected<B: Backend>(
         (peb::HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD, 0x1000),
         (peb::OS_MAJOR_VERSION, 10),
         (peb::OS_MINOR_VERSION, 0),
-        (peb::OS_BUILD_NUMBER, 19045),
+        (peb::OS_BUILD_NUMBER, crate::kuser::BUILD_NUMBER),
         (peb::OS_PLATFORM_ID, VER_PLATFORM_WIN32_NT),
     ] {
         machine.cpu.write_u32(peb + offset, value)?;

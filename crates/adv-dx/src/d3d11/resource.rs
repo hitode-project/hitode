@@ -4,8 +4,8 @@ use super::{
     ops::Error,
 };
 use adv_device::gpu::{
-    BufferRange, BufferWindow, Gpu, ImageAlias, ImageRegion, ModernTransfer, TransferBuffer,
-    UniformWindow,
+    BufferRange, BufferWindow, Gpu, ImageAlias, ImageRegion, ModernTransfer, Staged,
+    TransferBuffer, UniformWindow,
 };
 use adv_gpu::{
     Buffer, Caps, Extent, Format, FormatCaps, Image, ImageView,
@@ -783,8 +783,9 @@ pub fn texture_transfer(
     let packing = CopyPitch::new(region.image.desc().format, row);
     let source =
         transfer_buffer_with_pitch(gpu, packing, rows, region.extent.depth_or_layers, bytes)?;
-    Ok(ModernTransfer::Upload {
+    Ok(ModernTransfer::UploadStaged {
         source,
+        rows,
         destination: region,
     })
 }
@@ -886,7 +887,7 @@ fn transfer_buffer(
     rows: u32,
     layers: u32,
     bytes: &[u8],
-) -> Result<TransferBuffer, Error> {
+) -> Result<Staged, Error> {
     transfer_buffer_with_pitch(
         gpu,
         CopyPitch::new(Format::Rgba8Unorm, row),
@@ -902,33 +903,15 @@ fn transfer_buffer_with_pitch(
     rows: u32,
     layers: u32,
     bytes: &[u8],
-) -> Result<TransferBuffer, Error> {
+) -> Result<Staged, Error> {
     let CopyPitch { row, pitch } = packing;
-    let size = u64::from(pitch) * u64::from(rows) * u64::from(layers);
-    let buffer = gpu.device().create_buffer(&BufferDesc {
-        size,
-        usage: BufferUsage::COPY_SRC,
-        memory: Memory::Upload,
-        label: "D3D11 texture upload",
-    })?;
-    let mapping = buffer.mapped().unwrap();
-    // SAFETY: Each row fits the newly allocated mapped buffer. No other
-    // reader or writer can access the buffer before submission.
-    unsafe {
-        for (index, source) in bytes.chunks_exact(row as usize).enumerate() {
-            mapping
-                .cast::<u8>()
-                .as_ptr()
-                .add(index * pitch as usize)
-                .copy_from_nonoverlapping(source.as_ptr(), row as usize);
+    let total_rows = rows.checked_mul(layers).ok_or(Error::InvalidArgument)?;
+    Ok(gpu.stage_image_bytes(row, pitch, total_rows, |output| {
+        for (destination, source) in output
+            .chunks_exact_mut(pitch as usize)
+            .zip(bytes.chunks_exact(row as usize))
+        {
+            destination[..row as usize].copy_from_slice(source);
         }
-    }
-    #[cfg(feature = "d3d9-counters")]
-    gpu.count_upload(bytes.len() as u64);
-    Ok(TransferBuffer {
-        buffer,
-        offset: 0,
-        row_pitch: pitch,
-        rows,
-    })
+    })?)
 }

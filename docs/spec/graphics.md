@@ -245,6 +245,9 @@ Changes to presentation rectangles MUST preserve rendering history while prevent
 COPY MUST preserve front-buffer pixels outside its destination. It MUST reuse overlap with the same source mapping where the retained front and the backbuffer delta are known. New coverage and a changed mapping require copying the affected destination pixels. A new front or a changed publication source requires full published damage.
 
 D3D11 MUST enqueue presentation without waiting for GPU completion. Outside verification, it MUST copy only recorded output damage when the previous publication remains current. A Present without output writes MUST preserve pacing and completion counts without a copy or publication when that publication remains current.
+The Wine session publishes DXGI frames through its shared surface store and
+frame accounting. A present blocked by GPU queue admission resumes on a host
+wake.
 
 ### GFX-REC-6 D3D9 unchanged calls
 
@@ -270,11 +273,22 @@ with Direct3D 9. Draws and dispatches retain the selected offset and length
 through GPU completion. A binding shorter than the shader's block uses a
 zero-padded window in that ring.
 
-Direct3D 11 captures the dynamic index window and the vertex and instance windows determined at draw admission. GPU-resident index buffers and indirect arguments with resource bounds stay on the GPU. Expanded indirect draws read arguments at an ordered boundary when one or both dimensions lack a resource bound and report the readback in diagnostic builds.
+Direct3D 11 captures the dynamic index range and the vertex and instance
+ranges determined at draw admission in aligned upload ring windows. A device
+reuses a window for the same shadow revision and byte range until Present.
+Recorded commands and submissions hold their own leases through GPU completion.
+GPU-resident index buffers and indirect arguments with resource bounds stay on
+the GPU. Expanded indirect draws read arguments at an ordered boundary when one
+or both dimensions lack a resource bound and report the readback in diagnostic
+builds.
 
 Direct3D 11 dynamic maps preserve untouched bytes in a fixed guest shadow.
 A GPU write makes that shadow stale, and the next map refreshes it at an
 ordered, counted readback. Maps with a current shadow take constant time.
+Sampling a GPU-backed dynamic texture records an upload from pooled staging
+memory when the shadow is newer. Uploads update the same GPU image in draw
+order, so earlier draws still read their original contents. Metal and Vulkan
+keep native views by description for the lifetime of their texture.
 ResolveSubresource requires a default-usage destination.
 
 ### GFX-REC-8 Frontend work counters
@@ -282,7 +296,13 @@ ResolveSubresource requires a default-usage destination.
 **Rule**: Diagnostic counter builds MUST report retained bytes and lookups per draw, entries per successful StateBlock Apply, and dead frame/pass eliminations. They MUST report publication damage, queue submissions, upload and readback bytes, and constant-time maps for front-end comparisons. Ordinary builds MUST compile out work instrumentation.
 **Verification**: Test
 
-The diagnostic Cargo feature is `adv-dx/d3d9-counters`. Retained payloads are counted per command, including shared snapshots; cumulative recorded bytes do not measure resident memory or memory traffic. Recording limits continue to use the logical upload size.
+The diagnostic Cargo feature is `adv-dx/d3d9-counters`. Retained payloads are counted per command, including shared snapshots; cumulative recorded bytes do not measure resident memory or memory traffic. Recording limits continue to use the logical upload size. The D3D11 report
+also counts shadow bytes copied into the ring, captures reused, and buffer, image
+view, and device-memory creations on the shared GPU device since D3D11 attachment.
+On Vulkan it counts newly allocated descriptor sets, descriptor update calls
+and descriptor push calls. Metal counts memory backing owned buffers, textures
+and presentable surfaces. Vulkan counts new allocator blocks and imported
+device memory.
 
 ### GFX-REC-9 Dead target writes
 
@@ -396,6 +416,8 @@ DXGI output ownership uses the same exclusive-mode owner as DirectDraw and DXGI 
 DXGI fullscreen gamma capabilities write 256 equally spaced control points between zero and one, preserving the unused positions. Gamma programming round-trips the full control structure. Scanout uses the first 256 points without scale or offset. Desktop duplication rejects null metadata buffers with `E_INVALIDARG` and preserves the required-size output.
 
 A Win32 desktop process can create a composition chain with a hardware or software device. Its buffers have no window until a compositor attaches the chain.
+The D3D11 device exposes one DXGI device face through IDXGIDevice3.
+The session delivers EnqueueSetEvent after the earlier graphics work completes.
 
 ## Capabilities
 
@@ -411,13 +433,16 @@ A Win32 desktop process can create a composition chain with a hardware or softwa
 
 ### GFX-CAP-3 Excluded resources
 
-**Rule**: Shader Model 4+, D3D10/11, geometry and tessellation shaders, N-patches, and shader ProcessVertices MUST remain unsupported. Cube textures, volume textures, additional swap chains, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented.
+**Rule**: The Direct3D 9 front MUST refuse Shader Model 4+, geometry and tessellation shaders, N-patches, and shader ProcessVertices. Cube textures, volume textures, additional swap chains, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented by that front.
 **Verification**: Test
 
 ### GFX-CAP-4 Direct3D 11 capability derivation
 
 **Rule**: The Direct3D 11 capability core MUST select the highest level whose mandatory paths execute on the device. Optional compute support and feature queries MUST reflect the selected level and executing paths.
 **Verification**: Test
+
+Device and context interfaces through D3D11.2 share their respective base COM
+identities. Tiled resource queries report Tier 0.
 
 Modern GPU bindings compact each stage's used registers. Metal binds constant
 buffers at their ring offsets, keeps storage images at index 95 and below,
@@ -524,7 +549,9 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 The shader-core fixture directory holds the token ledger, Windows shader-creation HRESULTs
 and measured readbacks. The guest tests execute captured geometry, hull, domain and class
 linkage programs. Residency feedback and double precision have Windows bytecode oracles. The shader core does not report tiled resources or emit
-64-bit floating-point operations.
+64-bit floating-point operations. Vulkan compares sampled color texels in the shader
+when a D3D11 comparison instruction uses a color view. Depth views use depth
+comparison sampling where the format supports it.
 
 ### GFX-SHADER-6 Expansion order
 
@@ -709,6 +736,12 @@ A clipped primitive can execute whole or in pieces. Each invocation sees the cov
 
 **Rule**: Pipeline keys MUST include immutable program identity, texture visibility, vertex layout, and blend, depth, and raster state. Program construction MUST assign an identity retained by clones. The pipeline cache MUST retain at most 512 entries with FIFO eviction.
 **Verification**: Test — identity and FIFO eviction are covered, but complete key-component coverage also requires review.
+
+D3D11 caches translated and parsed stage variants per device. Entries compare the shader
+objects, resolved linkage, and all code-generation inputs, and retire when a referenced shader
+object is destroyed. The depth-only mask variants live with the device. Draw offsets, strides
+and primitive counts are uniform data. Graphics counter builds report variant hits, misses and
+the D3D11 frame of the last miss.
 
 ### GFX-CACHE-2 WGSL cache validity
 

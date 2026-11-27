@@ -144,7 +144,7 @@ mod tests;
 
 use crate::pacing::PresentQueue;
 use adv_abi::types::{DXGI_MODE_DESC, DXGI_SWAP_CHAIN_FULLSCREEN_DESC};
-use adv_abi::{Env, com::Iid};
+use adv_abi::{Env, Outcome, com::Iid};
 use adv_machine::{Ext, Objects};
 
 /// The device front owns back-buffer objects and performs recorded presentation.
@@ -155,7 +155,7 @@ pub trait Buffers: Sync {
         self.identity(env, device).map(|_| ())
     }
     fn surface_owner(&self, env: &Env<'_>, pointer: u32) -> Result<(u32, u32), Error>;
-    fn scanout(&self, env: &mut Env<'_>, surface: u32, serial: u64) -> Result<(), Error>;
+    fn scanout(&self, env: &mut Env<'_>, surface: u32, serial: u64) -> Result<Option<u64>, Error>;
     #[cfg(feature = "gpu")]
     fn capture(&self, env: &mut Env<'_>) -> Result<adv_device::frame::Waker, Error>;
     #[cfg(feature = "gpu")]
@@ -188,17 +188,30 @@ pub trait Buffers: Sync {
         serial: u64,
         first: bool,
         composition: bool,
-    ) -> Result<bool, Error>;
+    ) -> Result<(bool, Option<u64>), Error>;
+    #[cfg(feature = "gpu")]
+    fn present_wake_generation(&self, ext: &Ext) -> Option<u64>;
+    #[cfg(feature = "gpu")]
+    fn wait_for_present(
+        &self,
+        env: &mut Env<'_>,
+        generation: u64,
+        then: adv_machine::Continuation,
+    ) -> Outcome;
     fn latency(&self, env: &Env<'_>, device: u32) -> u32;
     fn shared_adapter(&self, env: &Env<'_>, handle: u32) -> Result<super::caps::Adapter, Error>;
     fn output(&self, env: &mut Env<'_>, device: u32) -> Result<u32, Error>;
 }
 
+pub type ResizeWindow = fn(&mut Env<'_>, u32, DXGI_MODE_DESC, adv_machine::Continuation) -> Outcome;
+pub type FrameCompleted = fn(&mut Env<'_>, u32, u64) -> Option<Outcome>;
+
 pub struct Services {
     pub reported_build: u32,
     pub buffers: &'static dyn Buffers,
     pub window: fn(&Ext, &Objects, u32) -> Option<Window>,
-    pub resize: fn(&mut Env<'_>, u32, DXGI_MODE_DESC) -> Result<(), Error>,
+    pub resize: ResizeWindow,
+    pub completed: Option<FrameCompleted>,
 }
 
 pub(super) struct Chain {

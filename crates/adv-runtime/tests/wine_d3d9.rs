@@ -51,19 +51,17 @@ fn wine_gdi_draws_into_d3d9_surfaces_that_reach_the_presenter() {
             // As the shell attaches a GPU: its wake, and the readback worker.
             let wake = adv_sync::WakeEvent::new().unwrap();
             machine.cpu.set_waker(wake.clone()).unwrap();
-            machine
-                .ext
-                .get_mut::<SurfaceStore>()
-                .set_deferred_presentation(true)
-                .unwrap();
-            adv_dx::d3d9::set_gpu(&mut machine.ext, gpu).unwrap();
-            let sender = machine.cpu.background_sender().unwrap();
-            adv_dx::d3d9::set_background(&mut machine.ext, sender, wake.clone());
+            adv_runtime::wine::session::Session::attach_gpu(machine, gpu, wake.clone()).unwrap();
             machine.ext.insert(Wake(wake));
             machine.ext.insert(common::HostServices(serve));
         },
         |machine| {
             capture(machine);
+            #[cfg(feature = "graphics-counters")]
+            assert_eq!(
+                adv_dx::d3d9::traffic(&machine.ext).unwrap().upload_bytes,
+                8200
+            );
             let frame = &machine.ext.get::<SurfaceStore>().presenter;
             let stride = frame.width as usize;
             presented = Some((

@@ -147,6 +147,7 @@ impl<'a> Emitter<'a> {
         }
         parameters(&mut source);
         if let Some((assembly, width)) = self.plan.assembly() {
+            pulled::draw_state(&mut source, 0);
             assembly.schedule(&mut source, width);
         }
         if let Some(output) = tessellated {
@@ -283,10 +284,10 @@ impl<'a> Emitter<'a> {
             && assembly.strip(width)
             && assembly.count_statistics
         {
-            let instances = if assembly.indirect.is_some() {
-                "dx_schedule[5]".to_owned()
+            let instances = if assembly.indirect {
+                "dx_schedule[5]"
             } else {
-                format!("dx_params.z / {}u", assembly.primitives(width))
+                "dx_params.z / dx_draw_state.primitives"
             };
             let predicate = assembly.predicate.map_or_else(
                 || "true".into(),
@@ -367,6 +368,7 @@ impl<'a> Emitter<'a> {
         }
         source.push_str("}\n");
         ComputeProgram {
+            shader: OnceCell::new(),
             source,
             entry: "primitive_main",
             bindings: self
@@ -421,22 +423,22 @@ impl<'a> Emitter<'a> {
         let per_instance = self.topology.fixed_slots(self.max_vertices);
         let primitive_id = if let Some(output) = self.tessellation {
             let (assembly, _) = self.plan.assembly().unwrap();
-            let count = if assembly.indirect.is_some() {
-                "dx_schedule[1]".into()
+            let count = if assembly.indirect {
+                "dx_schedule[1]"
             } else {
-                format!("{}u", output.count)
+                "dx_draw_state.primitives"
             };
             format!(
                 "(dx_params.x + dx_points[dx_indices[(dx_params.w + primitive) * {}u]].w) % {count}",
                 output.arity
             )
         } else if let Source::InputAssembler { assembly, .. } = self.plan.source {
-            let count = if assembly.indirect.is_some() {
-                "dx_schedule[1]".into()
+            let count = if assembly.indirect {
+                "dx_schedule[1]"
             } else if assembly.strip(self.plan.input_vertices) {
-                "dx_strip[0].x".into()
+                "dx_strip[0].x"
             } else {
-                format!("{}u", assembly.primitives(self.plan.input_vertices))
+                "dx_draw_state.primitives"
             };
             format!("(dx_params.x + primitive) % {count}")
         } else {
@@ -671,6 +673,7 @@ impl<'a> Emitter<'a> {
             let mut source = String::new();
             parameters(&mut source);
             if let Some((assembly, width)) = self.plan.assembly() {
+                pulled::draw_state(&mut source, 0);
                 assembly.schedule(&mut source, width);
             }
             storage(
@@ -805,6 +808,7 @@ impl<'a> Emitter<'a> {
         }
         prefix.push_str("}\n}\n");
         let prefix = ComputeProgram {
+            shader: OnceCell::new(),
             source: prefix,
             entry: "prefix_main",
             bindings: Vec::new(),
@@ -864,6 +868,7 @@ impl<'a> Emitter<'a> {
         (
             prefix,
             Some(ComputeProgram {
+                shader: OnceCell::new(),
                 source: write,
                 entry: "stream_main",
                 bindings: Vec::new(),
@@ -891,6 +896,7 @@ pub(super) fn initialize(bins: usize, argument_region: usize) -> ComputeProgram 
     )
     .unwrap();
     ComputeProgram {
+        shader: OnceCell::new(),
         source,
         entry: "initialize_main",
         bindings: Vec::new(),

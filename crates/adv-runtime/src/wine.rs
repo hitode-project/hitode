@@ -1,6 +1,6 @@
-//! Assembly of the graphics fronts on the Wine userland (issue #58): our
-//! DirectDraw and Direct3D 9 as PE images that Wine's loader maps, over the
-//! process surface store, with memory DCs that Wine's GDI draws into.
+//! Assembly of the graphics fronts on the Wine userland. Wine's loader maps
+//! their PE images over the process surface store. DirectDraw, Direct3D 9,
+//! and DXGI surfaces use memory DCs that Wine's GDI draws into.
 //!
 //! A surface's DC comes from `D3DKMTCreateDCFromMemory` over the surface's
 //! own pixels, called through the IAT of the front's image so that a guest
@@ -40,10 +40,21 @@ mod xaudio2;
 pub const GRAPHICS_DRIVER: &str = adv_drv::user::MODULE;
 
 /// The fronts' images, by the index their memory DCs are bound to.
-const IMAGES: [&str; 2] = ["ddraw.dll", "d3d9.dll"];
+const IMAGES: [&str; 6] = [
+    "ddraw.dll",
+    "d3d9.dll",
+    "dxgi.dll",
+    "d3d11.dll",
+    "d3d10core.dll",
+    "d3d10_1core.dll",
+];
 const DDRAW: usize = 0;
 #[cfg(feature = "gpu")]
 const D3D9: usize = 1;
+#[cfg(feature = "gpu")]
+const DXGI: usize = 2;
+#[cfg(feature = "gpu")]
+const D3D11: usize = 3;
 const GDI32: &str = "gdi32.dll";
 const DDRAW_EXPORTS: [&str; 7] = [
     "DirectDrawCreate",
@@ -70,6 +81,8 @@ const CREATED_BITMAP: u32 = 32;
 
 pub fn register(registry: &mut Registry) {
     adv_dx::ddraw::register(registry);
+    #[cfg(feature = "gpu")]
+    adv_dx::ddraw::d3d::register(registry);
     class::register(registry);
     dmsynth::register(registry);
     sound::register(registry);
@@ -77,7 +90,11 @@ pub fn register(registry: &mut Registry) {
     winmm::register(registry);
     xaudio2::register(registry);
     #[cfg(feature = "gpu")]
-    adv_dx::d3d9::register(registry);
+    {
+        adv_dx::d3d9::register(registry);
+        adv_dx::dxgi::register(registry);
+        adv_dx::d3d11::register_children(registry);
+    }
     adv_drv::register(registry);
 }
 
@@ -120,6 +137,17 @@ pub fn install<B: Backend>(
             },
         },
     )?;
+    #[cfg(feature = "gpu")]
+    {
+        adv_dx::ddraw::d3d::install(machine)?;
+        machine
+            .ext
+            .get_mut::<adv_dx::ddraw::front::State>()
+            .set_activation_provider(|ext, hwnd| {
+                (adv_drv::user::input::presented_window(ext) == Some(hwnd))
+                    .then(|| !adv_drv::user::project::minimized(ext))
+            });
+    }
     class::install(machine)?;
     let ddraw: Vec<_> = DDRAW_EXPORTS.into_iter().chain(class::EXPORTS).collect();
     install_image(machine, drive, DDRAW, &ddraw)?;
@@ -138,6 +166,7 @@ pub fn install<B: Backend>(
     {
         adv_dx::d3d9::install(machine, d3d9_provider())?;
         install_image(machine, drive, D3D9, &D3D9_EXPORTS)?;
+        install_modern_graphics(machine, drive)?;
     }
     let provider = adv_drv::Provider {
         memory: guest_memory,
@@ -145,6 +174,106 @@ pub fn install<B: Backend>(
     };
     adv_drv::media::install(machine)?;
     adv_drv::install(machine, drive, provider)
+}
+
+#[cfg(feature = "gpu")]
+fn install_modern_graphics<B: Backend>(
+    machine: &mut Machine<B>,
+    drive: &Path,
+) -> Result<(), String> {
+    adv_dx::dxgi::install(
+        machine,
+        adv_dx::dxgi::Provider {
+            adapter: Default::default(),
+            display: adv_dx::dxgi::shared_display,
+            window_exists: |ext, _, hwnd| adv_drv::user::window(ext, hwnd).is_some(),
+            next_vblank: |ext| {
+                let vsync = ext.try_get::<std::sync::Arc<adv_sync::vsync::Vsync>>()?;
+                let (phase, period) = vsync.phase(std::time::Instant::now())?;
+                Some(period - phase)
+            },
+            devices: None,
+        },
+    )?;
+    adv_dx::d3d11::install_children(machine)?;
+    adv_dx::d3d11::configure_swap_chains(
+        machine,
+        adv_nt::kuser::BUILD_NUMBER,
+        |ext, _, hwnd| {
+            let window = adv_drv::user::window(ext, hwnd)?;
+            let [left, top, right, bottom] = window.client;
+            Some(adv_dx::dxgi::swap::Window {
+                client: [(right - left).max(0) as u32, (bottom - top).max(0) as u32],
+                minimized: window.minimized(),
+            })
+        },
+        |env, hwnd, mode, then| {
+            adv_drv::user::resize_client(env, hwnd, [mode.Width, mode.Height], then)
+        },
+        Some(|env, hwnd, serial| {
+            if let Some(id) = env.ext.get::<Surfaces<Snapshot>>().base_source() {
+                adv_drv::user::input::front_frame(env.ext, hwnd, id);
+            }
+            frame_completed(env, serial)
+        }),
+    );
+    adv_dx::d3d11::configure_surface_dc(machine, memory_dc::<D3D11>());
+    adv_dx::d3d11::configure_event_signal(machine, |env, event| {
+        matches!(
+            adv_nt::sync::set_event(env, &[event, 0]),
+            Outcome::Return(0)
+        )
+    });
+    static EXPORTS: std::sync::OnceLock<Vec<Vec<(String, u16)>>> = std::sync::OnceLock::new();
+    let exports = EXPORTS.get_or_init(|| {
+        let mut registry = Registry::default();
+        adv_dx::dxgi::register(&mut registry);
+        adv_dx::d3d11::register_children(&mut registry);
+        IMAGES[DXGI..]
+            .iter()
+            .map(|module| graphics_exports(&registry, module))
+            .collect()
+    });
+    for (index, (&module, exports)) in IMAGES[DXGI..].iter().zip(exports).enumerate() {
+        let exports: Vec<_> = exports
+            .iter()
+            .map(|(name, ordinal)| Export {
+                name,
+                ordinal: *ordinal,
+            })
+            .collect();
+        let imports = if DXGI + index == D3D11 {
+            vec![gdi_imports()]
+        } else {
+            Vec::new()
+        };
+        let built = ModuleImage::build(machine, module, &exports, &imports)?;
+        adv_unix::builtin::install(drive, &built).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn graphics_exports(registry: &Registry, module: &str) -> Vec<(String, u16)> {
+    let names: Vec<_> = registry
+        .exports(module)
+        .into_iter()
+        .filter(|name| registry.is_implemented(module, name))
+        .collect();
+    let ordinals: HashMap<_, _> = adv_abi::ordinals::exports(module)
+        .map(|(ordinal, name)| (name, ordinal))
+        .collect();
+    let mut named_ordinals = (ordinals.values().copied().max().unwrap_or(0) + 1)..;
+    names
+        .into_iter()
+        .map(|name| {
+            let ordinal = ordinals
+                .get(name.as_str())
+                .copied()
+                .unwrap_or_else(|| named_ordinals.next().unwrap());
+            (name, ordinal)
+        })
+        .collect()
 }
 
 /// A thread that waits has ended its frame: publish the software frame it
@@ -202,7 +331,13 @@ fn install_image<B: Backend>(
         .zip(1..)
         .map(|(&name, ordinal)| Export { name, ordinal })
         .collect();
-    let imports = [ImportModule {
+    let built = ModuleImage::build(machine, IMAGES[image], &exports, &[gdi_imports()])?;
+    adv_unix::builtin::install(drive, &built).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn gdi_imports() -> ImportModule {
+    ImportModule {
         dll: GDI32.into(),
         imports: GDI_IMPORTS
             .into_iter()
@@ -214,10 +349,7 @@ fn install_image<B: Backend>(
                 iat_rva: 0,
             })
             .collect(),
-    }];
-    let built = ModuleImage::build(machine, IMAGES[image], &exports, &imports)?;
-    adv_unix::builtin::install(drive, &built).map_err(|e| e.to_string())?;
-    Ok(())
+    }
 }
 
 /// The heap of guest storage that the old stack's fronts allocate.

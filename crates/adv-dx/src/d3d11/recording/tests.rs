@@ -193,7 +193,7 @@ fn frame_verification_observes_pixels_outside_damage_after_present_returns() {
     };
     gpu.upload(&target, all, 64, &[0u8; 16 * 16 * 4]).unwrap();
     recording
-        .verify(&mut gpu, &target, Region::whole((16, 16)))
+        .verify(&mut gpu, &target, Region::whole((16, 16)), None)
         .unwrap();
     let changed = Rect {
         x: 15,
@@ -202,7 +202,7 @@ fn frame_verification_observes_pixels_outside_damage_after_present_returns() {
         h: 1,
     };
     gpu.upload(&target, changed, 4, &[255, 0, 0, 0]).unwrap();
-    recording.verify(&mut gpu, &target, damage).unwrap();
+    recording.verify(&mut gpu, &target, damage, None).unwrap();
 
     // Wait from the fixture after submitting both observations.
     gpu.completion().unwrap().recv().unwrap();

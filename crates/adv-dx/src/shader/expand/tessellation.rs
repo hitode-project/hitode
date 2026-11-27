@@ -9,7 +9,7 @@ const HULL_OUTPUT: u32 = 206;
 pub(super) const POINTS: u32 = 207;
 pub(super) const RANGES: u32 = 208;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Tessellation {
     pub input_points: u32,
     output_points: u32,
@@ -86,7 +86,7 @@ impl Tessellation {
         vertex: Shader<'_>,
         hull: Shader<'_>,
         domain: Shader<'_>,
-        fetches: &[pulled::VertexFetch],
+        fetches: &[pulled::FetchLayout],
         assembly: Assembly,
         regions: &mut Vec<ExpansionRegion>,
     ) -> Result<(ComputeProgram, u32, Programs), Error> {
@@ -137,6 +137,7 @@ impl Tessellation {
 
         let mut hs_code = hs.source;
         parameters(&mut hs_code);
+        pulled::draw_state(&mut hs_code, 0);
         assembly.schedule(&mut hs_code, self.input_points);
         hs_code.push_str("struct TessPatch { edges: vec4<u32>, inside: vec2<u32>, domain: u32, partitioning: u32, output: u32, }\n");
         storage(
@@ -161,11 +162,10 @@ impl Tessellation {
             true,
         );
         entry(&mut hs_code, "hull_main", WORKGROUP);
-        let count = assembly.primitives(self.input_points);
-        let per_draw = if assembly.indirect.is_some() {
-            "dx_schedule[1]".into()
+        let per_draw = if assembly.indirect {
+            "dx_schedule[1]"
         } else {
-            format!("{count}u")
+            "dx_draw_state.primitives"
         };
         let active = assembly.active(self.input_points);
         writeln!(
@@ -231,9 +231,11 @@ impl Tessellation {
             ),
         ]
         .map(|(entry, workgroup_size, expansion)| ComputeProgram {
+            shader: OnceCell::new(),
             source: {
                 let mut source = include_str!("../tessellator/compute.wgsl").to_owned();
                 parameters(&mut source);
+                pulled::draw_state(&mut source, 0);
                 assembly.schedule(&mut source, self.input_points);
                 writeln!(source, "fn tess_active() -> u32 {{ return {active}; }}").unwrap();
                 source
@@ -261,6 +263,7 @@ impl Tessellation {
         let vertices = region(self.max_points, ds.outputs * 16);
         let mut ds_code = ds.source;
         parameters(&mut ds_code);
+        pulled::draw_state(&mut ds_code, 0);
         assembly.schedule(&mut ds_code, self.input_points);
         writeln!(
             ds_code,
@@ -351,7 +354,6 @@ impl Tessellation {
             points,
             ranges,
             arity: self.topology.vertices(),
-            count,
             maximum: self.max_indices / self.topology.vertices(),
         };
         Ok((
@@ -409,6 +411,7 @@ fn program(
     items_per_primitive: u32,
 ) -> ComputeProgram {
     ComputeProgram {
+        shader: OnceCell::new(),
         source,
         entry,
         bindings,
@@ -433,7 +436,6 @@ pub(super) struct Output {
     pub points: usize,
     pub ranges: usize,
     pub arity: u32,
-    pub count: u32,
     pub maximum: u32,
 }
 

@@ -361,6 +361,7 @@ fn present_call(env: &mut Env<'_>, this: u32, interval: u32, flags: u32) -> Outc
         let backend = services(env)?;
         let device = chain.device;
         let buffer = chain.buffers[0];
+        let hwnd = chain.window;
         let first = chain.generation == 0;
         let composition = chain.composition.is_some();
         let hz = chain.fullscreen.RefreshRate;
@@ -387,18 +388,33 @@ fn present_call(env: &mut Env<'_>, this: u32, interval: u32, flags: u32) -> Outc
             }));
         }
         let serial = env.ext.get::<State>().presentation + 1;
-        match backend.present(env, buffer, source, serial, first, composition) {
-            Ok(true) => env.ext.get_mut::<State>().presentation = serial,
-            Ok(false) => (),
-            Err(Error::StillDrawing) if flags & 8 == 0 => {
-                let deadline = now + 1000;
-                env.sys.keep_exact_deadline();
-                return Ok(Outcome::block(Wait::Until(deadline), move |env, _| {
-                    present_call(env, this, interval, flags)
-                }));
-            }
-            Err(error) => return Err(error),
-        }
+        #[cfg(feature = "gpu")]
+        let generation = backend.present_wake_generation(env.ext);
+        let completed_serial =
+            match backend.present(env, buffer, source, serial, first, composition) {
+                Ok((published, completed)) => {
+                    if published {
+                        env.ext.get_mut::<State>().presentation = serial;
+                    }
+                    completed
+                }
+                Err(Error::StillDrawing) if flags & 8 == 0 => {
+                    #[cfg(feature = "gpu")]
+                    if let Some(generation) = generation {
+                        return Ok(backend.wait_for_present(
+                            env,
+                            generation,
+                            Box::new(move |env, _| present_call(env, this, interval, flags)),
+                        ));
+                    }
+                    let deadline = now + 1000;
+                    env.sys.keep_exact_deadline();
+                    return Ok(Outcome::block(Wait::Until(deadline), move |env, _| {
+                        present_call(env, this, interval, flags)
+                    }));
+                }
+                Err(error) => return Err(error),
+            };
         let chain = chain_mut(env, this)?;
         chain.queue.submit(now, interval, hz);
         chain.generation = serial;
@@ -406,9 +422,18 @@ fn present_call(env: &mut Env<'_>, this: u32, interval: u32, flags: u32) -> Outc
             chain.buffers.rotate_left(1);
         }
         update_latency_timer(env, this)?;
-        Ok(Outcome::Return(0))
+        Ok(complete_present(env, hwnd, completed_serial))
     })();
     result.unwrap_or_else(|error: Error| Outcome::Return(error.hresult()))
+}
+
+pub(super) fn complete_present(env: &mut Env<'_>, hwnd: u32, serial: Option<u64>) -> Outcome {
+    env.ext
+        .get::<Services>()
+        .completed
+        .zip(serial)
+        .and_then(|(completed, serial)| completed(env, hwnd, serial))
+        .unwrap_or(Outcome::Return(0))
 }
 
 fn set_fullscreen(env: &mut Env<'_>) -> Outcome {
@@ -618,24 +643,39 @@ fn resize_buffers(env: &mut Env<'_>) -> Outcome {
 
 fn resize_target(env: &mut Env<'_>) -> Outcome {
     let (this, raw) = (env.arg(0), read::<DXGI_MODE_DESC>(env, env.arg(1)));
-    call(|| {
+    let result = (|| {
         let raw = raw?;
         let chain = chain(env, this)?;
         if chain.composition.is_some() {
             return Err(Error::InvalidCall);
         }
-        let window = chain.window;
-        let resize = env.ext.get::<Services>().resize;
-        resize(env, window, raw)?;
-        let fullscreen = &mut chain_mut(env, this)?.fullscreen;
-        fullscreen.RefreshRate = raw.RefreshRate;
-        fullscreen.ScanlineOrdering = raw.ScanlineOrdering;
-        fullscreen.Scaling = raw.Scaling;
-        if fullscreen.Windowed == 0 {
-            ops::output_mode_changed(env.ext);
-        }
-        Ok(())
-    })
+        Ok::<_, Error>((raw, chain.window))
+    })();
+    let (raw, window) = match result {
+        Ok(args) => args,
+        Err(error) => return Outcome::Return(error.hresult()),
+    };
+    let resize = env.ext.get::<Services>().resize;
+    resize(
+        env,
+        window,
+        raw,
+        Box::new(move |env, result| {
+            call(|| {
+                if result.value() == 0 {
+                    return Err(Error::InvalidCall);
+                }
+                let fullscreen = &mut chain_mut(env, this)?.fullscreen;
+                fullscreen.RefreshRate = raw.RefreshRate;
+                fullscreen.ScanlineOrdering = raw.ScanlineOrdering;
+                fullscreen.Scaling = raw.Scaling;
+                if fullscreen.Windowed == 0 {
+                    ops::output_mode_changed(env.ext);
+                }
+                Ok(())
+            })
+        }),
+    )
 }
 
 fn containing_output(env: &mut Env<'_>) -> Outcome {

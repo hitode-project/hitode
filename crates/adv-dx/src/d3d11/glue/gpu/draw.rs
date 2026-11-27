@@ -1,4 +1,8 @@
 //! Lower immutable immediate-context bindings to the existing modern executor.
+mod variants;
+pub(in crate::d3d11) use variants::ShaderVariants;
+
+use self::variants::*;
 use super::{resource::storage_format, *};
 use crate::{
     d3d11::{
@@ -14,7 +18,7 @@ use crate::{
             self, BindingLocation, BorderChannel, BorderSampler, BorderTexture, LodSampler,
             Options, TextureLod, Translation,
             pulled::{
-                self, DRAW_ARGUMENTS_SLOT, DrawStart, InputStep, VERTEX_STREAM_BASE,
+                self, DRAW_ARGUMENTS_SLOT, DrawStart, FetchLayout, InputStep, VERTEX_STREAM_BASE,
                 VertexComponent, VertexFetch, VertexFormat,
             },
         },
@@ -25,14 +29,14 @@ use adv_abi::types::{
     D3D11_RASTERIZER_DESC1, D3D11_SAMPLER_DESC,
 };
 use adv_device::gpu::{
-    DispatchArguments, DrawArguments, ModernColor, ModernDepth, ModernDraw, ModernShader,
-    SlotBindings, StorageBinding,
+    CapturedWindow, DispatchArguments, DrawArguments, ModernColor, ModernDepth, ModernDraw,
+    ModernShader, SlotBindings, StorageBinding,
 };
 use adv_gpu::{
     encode::{IndexFormat, Load, Store},
     pipeline as p, resource as r,
 };
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 #[derive(Clone)]
 enum DrawRange {
@@ -79,23 +83,63 @@ impl DrawRange {
 
     fn start(&self, indexed: bool) -> DrawStart {
         match self {
+            Self::Direct { .. } => DrawStart::Direct,
+            Self::Indirect(..) => DrawStart::Indirect { indexed },
+        }
+    }
+
+    fn parameters(&self, indexed: bool) -> DrawParameters {
+        match self {
             Self::Direct {
                 vertices,
                 instances,
                 base_vertex,
-            } => DrawStart::Direct {
-                vertex: if indexed {
+            } => DrawParameters {
+                base_vertex: if indexed {
                     *base_vertex as u32
                 } else {
                     vertices.start
                 },
-                instance: instances.start,
+                first_instance: instances.start,
+                ..Default::default()
             },
-            Self::Indirect(args, ..) => DrawStart::Indirect {
-                first_word: (args.range.start / 4) as u32,
-                indexed,
+            Self::Indirect(args, ..) => DrawParameters {
+                argument_word: (args.range.start / 4) as u32,
+                ..Default::default()
             },
         }
+    }
+}
+
+/// The fixed prefix of DxDrawState, followed by pairs of vertex offsets and strides.
+#[repr(C)]
+#[derive(Default, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DrawParameters {
+    first: u32,
+    base_vertex: u32,
+    first_instance: u32,
+    primitives: u32,
+    index_offset: u32,
+    count: u32,
+    argument_word: u32,
+    instances: u32,
+}
+
+impl DrawParameters {
+    fn upload(self, gpu: &Gpu, fetches: &[VertexFetch]) -> Result<BufferWindow, Error> {
+        let size = size_of::<Self>() + 16 * fetches.len().div_ceil(2).max(1);
+        let uniform = gpu.uniform_window(size as u32, |out| {
+            let (prefix, fetch_params) = out.split_at_mut(size_of::<Self>());
+            prefix.copy_from_slice(bytemuck::bytes_of(&self));
+            let (parameters, _) = fetch_params.as_chunks_mut::<8>();
+            let (used, padding) = parameters.split_at_mut(fetches.len());
+            for (out, fetch) in used.iter_mut().zip(fetches) {
+                out.copy_from_slice(bytemuck::bytes_of(&[fetch.offset, fetch.stride]));
+            }
+            padding.fill([0; 8]);
+            Ok::<_, Error>(())
+        })?;
+        Ok(BufferWindow::Uniform(uniform))
     }
 }
 
@@ -256,8 +300,14 @@ impl IaCapture {
     }
 }
 
+pub(in crate::d3d11) type BufferCaptures =
+    HashMap<(ResourceKey, Range<u32>), (u64, CapturedWindow)>;
+
 struct CapturedIndex {
-    binding: (BufferRange, IndexFormat),
+    binding: (BufferWindow, IndexFormat),
+    storage: BufferWindow,
+    offset: u32,
+    len: u32,
     vertices: Option<Range<u32>>,
 }
 
@@ -295,8 +345,12 @@ fn ensure_index(
     {
         let range =
             binding.offset + vertices.start * stride..binding.offset + vertices.end * stride;
-        let bytes = shadow_bytes(env, binding.buffer, range.clone())?;
-        capture.record(binding.buffer, &range, &bytes);
+        let window = capture_buffer(env, binding.buffer, range, capture)?;
+        let BufferWindow::Captured(captured) = &window else {
+            unreachable!()
+        };
+        // The upload window is an index source and read-only expansion input.
+        let bytes = &unsafe { captured.bytes() }[..vertices.len() * stride as usize];
         let restart = if stride == 2 { 0xffff } else { u32::MAX };
         let mut first = u32::MAX;
         let mut last = 0;
@@ -314,50 +368,37 @@ fn ensure_index(
             }
         }
         *vertices = 0..vertices.len() as u32;
-        let length = bytes.len();
-        let backing = resource::upload(
-            &execution(env.ext)?.gpu,
-            &bytes,
-            BufferUsage::INDEX | BufferUsage::STORAGE,
-            (length as u64).next_multiple_of(4),
-        )?;
-        let range = 0..length as u64;
+        let len = bytes.len() as u32;
         let fetched = if first <= last {
             first..last.saturating_add(1)
         } else {
             0..0
         };
         return Ok(CapturedIndex {
-            binding: (
-                BufferRange {
-                    buffer: backing,
-                    range,
-                },
-                format,
-            ),
+            binding: (window.clone(), format),
+            storage: window,
+            offset: 0,
+            len,
             vertices: Some(fetched),
         });
     }
-    let backing = capture_buffer(
-        env,
-        binding.buffer,
-        BufferUsage::INDEX | BufferUsage::STORAGE,
-        binding.offset..buffer.size(),
-        capture,
-    )?;
-    let native = if capture_shadow {
-        0..u64::from(buffer.size() - binding.offset)
-    } else {
-        u64::from(binding.offset)..u64::from(buffer.size())
+    let window = capture_buffer(env, binding.buffer, binding.offset..buffer.size(), capture)?;
+    let (storage, offset) = match &window {
+        BufferWindow::Native(native) => (
+            BufferRange {
+                buffer: native.buffer.clone(),
+                range: 0..native.buffer.desc().size,
+            }
+            .into(),
+            binding.offset,
+        ),
+        _ => (window.clone(), 0),
     };
     Ok(CapturedIndex {
-        binding: (
-            BufferRange {
-                buffer: backing,
-                range: native,
-            },
-            format,
-        ),
+        binding: (window, format),
+        storage,
+        offset,
+        len: buffer.size() - binding.offset,
         vertices: None,
     })
 }
@@ -366,40 +407,62 @@ fn captures_shadow(env: &Env<'_>, pointer: u32, desc: Resource) -> bool {
     desc.usage() == Usage::Dynamic && !context::owned(env, pointer).unwrap().dynamic_shadow_stale()
 }
 
-fn shadow_bytes(env: &mut Env<'_>, pointer: u32, range: Range<u32>) -> Result<Vec<u8>, Error> {
-    let table = table(env);
-    let object = table.get_mut(&mut env.sys.objects, pointer).unwrap();
-    let base = object.mapping().unwrap().pointer();
-    array(env, base + range.start, range.end - range.start)
-}
-
 fn capture_buffer(
     env: &mut Env<'_>,
     pointer: u32,
-    usage: BufferUsage,
     range: Range<u32>,
     capture: &mut IaCapture,
-) -> Result<adv_gpu::Buffer, Error> {
+) -> Result<BufferWindow, Error> {
     let desc = description(env, pointer)?;
-    let Resource::Buffer(_) = desc else {
+    let Resource::Buffer(buffer) = desc else {
         return Err(Error::InvalidArgument);
     };
     if captures_shadow(env, pointer, desc) {
-        let bytes = shadow_bytes(env, pointer, range.clone())?;
-        capture.record(pointer, &range, &bytes);
-        let size = bytes.len();
-        let buffer = resource::upload(
-            &execution(env.ext)?.gpu,
-            &bytes,
-            usage | BufferUsage::COPY_SRC,
-            (size as u64).max(1).next_multiple_of(4),
-        )?;
-        return Ok(buffer);
+        let shadow = context::owned(env, pointer).unwrap().shadow();
+        let revision = shadow.capture_revision();
+        let address = shadow.pointer() + range.start;
+        let size = range.end - range.start;
+        let key = (key(env, pointer, 0), range);
+        let mut cache = device_state(env)?.captures.borrow_mut();
+        let exec = env
+            .ext
+            .get::<State>()
+            .execution
+            .as_ref()
+            .ok_or(Error::Device)?;
+        let reused = cache
+            .get(&key)
+            .filter(|(version, _)| revision == Some(*version));
+        let window = if let Some((_, window)) = reused {
+            #[cfg(feature = "d3d9-counters")]
+            exec.count_capture_reuse();
+            window.clone()
+        } else {
+            let window = exec.gpu.capture_window(size, |bytes| {
+                env.cpu
+                    .read(address, bytes)
+                    .map_err(|_| Error::InvalidArgument)
+            })?;
+            #[cfg(feature = "d3d9-counters")]
+            exec.count_capture_bytes(u64::from(size));
+            if let Some(revision) = revision {
+                cache.insert(key.clone(), (revision, window.clone()));
+            }
+            window
+        };
+        // IA captures are bound for GPU reads only.
+        let bytes = unsafe { window.bytes() };
+        capture.record(pointer, &key.1, &bytes[..size as usize]);
+        return Ok(BufferWindow::Captured(window));
     }
-    let Backing::Buffer(buffer) = backing(env, pointer, desc)? else {
+    let Backing::Buffer(native) = backing(env, pointer, desc)? else {
         unreachable!()
     };
-    Ok(buffer)
+    Ok(BufferRange {
+        range: u64::from(range.start)..u64::from(buffer.size()).next_multiple_of(4),
+        buffer: native,
+    }
+    .into())
 }
 
 fn vertex_capture(
@@ -408,7 +471,7 @@ fn vertex_capture(
     args: &DrawRange,
     vertices: Option<&Range<u32>>,
 ) -> Range<u32> {
-    let elements = match (fetch.step, args) {
+    let elements = match (fetch.layout.step, args) {
         (InputStep::Vertex, _) => vertices.cloned(),
         (InputStep::Instance(rate), DrawRange::Direct { instances, .. }) => {
             let last = (instances.len() as u32 - 1).checked_div(rate).unwrap_or(0);
@@ -425,7 +488,7 @@ fn vertex_capture(
         Some(elements) => {
             address(elements.start)
                 ..address(elements.end - 1)
-                    .saturating_add(fetch.format.bytes)
+                    .saturating_add(fetch.layout.format.bytes)
                     .min(size)
         }
         None => fetch.offset.min(size)..size,
@@ -450,18 +513,26 @@ fn capture_texture(
     let format = texture.format();
     let rows = height.div_ceil(u32::from(format.alignment[1]));
     let row = width.div_ceil(u32::from(format.alignment[0])) * u32::from(format.aligned_unit_bytes);
-    let mut bytes = Vec::with_capacity((row * rows * depth) as usize);
-    for slice in 0..depth {
-        for y in 0..rows {
-            bytes.extend(array::<u8>(
-                env,
-                layout.slice(base, slice) + y * layout.row_pitch(),
-                row,
-            )?);
-        }
+    let mut bytes = vec![0; (row * rows * depth) as usize];
+    for (index, output) in bytes.chunks_mut(row as usize).enumerate() {
+        let index = index as u32;
+        let address = layout.slice(base, index / rows) + (index % rows) * layout.row_pitch();
+        env.cpu
+            .read(address, output)
+            .map_err(|_| Error::InvalidArgument)?;
     }
+    let current = table
+        .get_mut(&mut env.sys.objects, pointer)
+        .unwrap()
+        .backing()
+        .unwrap()
+        .clone();
+    let write = key(env, pointer, 0);
     let execution = execution(env.ext)?;
-    let backing = Backing::new(&execution.gpu, desc)?;
+    let backing = match current {
+        Some(backing) => backing,
+        None => Backing::new(&execution.gpu, desc)?,
+    };
     if let Some(upload) = backing.upload_texture(
         &execution.gpu,
         texture,
@@ -470,8 +541,17 @@ fn capture_texture(
         [width, height, depth],
         &bytes,
     )? {
-        execution.gpu.transfer(upload)?;
+        execution.append(
+            Command::Transfer(upload),
+            extent_rect([width, height, depth]),
+            None,
+            write,
+        )?;
     }
+    let object = table.get_mut(&mut env.sys.objects, pointer).unwrap();
+    object.take_initial_data();
+    *object.backing().unwrap() = Some(backing.clone());
+    object.mapping().unwrap().dynamic_uploaded(0);
     Ok(backing)
 }
 
@@ -605,7 +685,10 @@ fn slots_for(
                 reads.push(key(env, view.resource, view.desc.subresources().mips.start));
                 let backing = match desc {
                     super::Resource::Texture(texture)
-                        if captures_shadow(env, view.resource, desc) =>
+                        if desc.usage() == Usage::Dynamic
+                            && context::owned(env, view.resource)
+                                .unwrap()
+                                .dynamic_cpu_newer() =>
                     {
                         capture_texture(env, view.resource, desc, texture)?
                     }
@@ -727,6 +810,12 @@ fn sampler_description(env: &Env<'_>, pointer: u32) -> D3D11_SAMPLER_DESC {
 
 #[derive(Default)]
 struct ShaderViews {
+    options: ViewOptions,
+    writable: Vec<(u32, u32)>,
+}
+
+#[derive(Default, PartialEq, Eq, Hash)]
+struct ViewOptions {
     storage_formats: Vec<(u32, naga::StorageFormat)>,
     storage_extents: Vec<(u32, [u32; 4])>,
     storage_slices: Vec<(u32, std::ops::Range<u32>)>,
@@ -734,7 +823,6 @@ struct ShaderViews {
     buffer_formats: Vec<(u32, naga::StorageFormat)>,
     rgb_buffers: Vec<u32>,
     buffer_elements: Vec<(Register, u32, u32)>,
-    writable: Vec<(u32, u32)>,
 }
 
 impl ShaderViews {
@@ -775,9 +863,10 @@ impl ShaderViews {
                         atomic,
                     ) {
                         let extent = resource::LinearStorage::new(texture, &view.desc).extent;
-                        views.storage_extents.push((binding.slot, extent));
+                        views.options.storage_extents.push((binding.slot, extent));
                     } else if texture.kind() == TextureKind::D3 {
                         views
+                            .options
                             .storage_slices
                             .push((binding.slot, view.desc.elements()));
                     }
@@ -788,20 +877,21 @@ impl ShaderViews {
             if let BindingKind::Typed { dimension, .. } = binding.kind {
                 if writable {
                     views
+                        .options
                         .storage_formats
                         .push((binding.slot, storage_format(view.desc.format())?));
                     if view.desc.format() == 65 {
-                        views.alpha_uavs |= 1 << binding.slot;
+                        views.options.alpha_uavs |= 1 << binding.slot;
                     }
                 } else if dimension == ResourceDimension::Buffer {
                     let (format, rgb) = resource::buffer_format(view.desc.format())?;
-                    views.buffer_formats.push((binding.slot, format));
+                    views.options.buffer_formats.push((binding.slot, format));
                     if rgb {
-                        views.rgb_buffers.push(binding.slot);
+                        views.options.rgb_buffers.push(binding.slot);
                     }
                 }
                 if dimension == ResourceDimension::Buffer {
-                    views.buffer_elements.push((
+                    views.options.buffer_elements.push((
                         binding.register,
                         binding.slot,
                         view.desc.elements().len() as u32,
@@ -819,7 +909,9 @@ impl ShaderViews {
                 .map(|&(resource, mip)| (key(env, resource, mip), false)),
         );
     }
+}
 
+impl ViewOptions {
     fn options<'a>(&'a self, options: Options<'a>) -> Options<'a> {
         Options {
             storage_formats: &self.storage_formats,
@@ -834,7 +926,7 @@ impl ShaderViews {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq, Hash)]
 struct Sampling {
     lods: Vec<TextureLod>,
     samplers: Vec<(u32, LodSampler)>,
@@ -842,6 +934,7 @@ struct Sampling {
     border_textures: Vec<BorderTexture>,
     depths: Vec<u32>,
     depths24: Vec<u32>,
+    color_comparison: Vec<u32>,
     unorm: Vec<(u32, [u8; 4])>,
     manual_filter: Vec<u32>,
     manual_samplers: Vec<BorderSampler>,
@@ -903,6 +996,12 @@ impl Sampling {
             let mips = &view.desc.subresources().mips;
             let minimum = minimum - mips.start as f32;
             let depth = view.desc.aspects().intersects(Aspects::DEPTH);
+            let color_comparison = !cfg!(target_vendor = "apple")
+                && !depth
+                && reflection.comparison_textures.contains(&binding.slot);
+            if color_comparison {
+                state.color_comparison.push(binding.slot);
+            }
             if resource::unfilterable_view(caps(env.ext).unwrap(), view.desc.format(), depth) {
                 state.manual_filter.push(binding.slot);
             }
@@ -938,7 +1037,9 @@ impl Sampling {
             } else if view.desc.format() == 98 {
                 state.unorm.push((binding.slot, [8; 4]));
             }
-            if (!state.border_samplers.is_empty() || state.manual_filter.contains(&binding.slot))
+            if (color_comparison
+                || !state.border_samplers.is_empty()
+                || state.manual_filter.contains(&binding.slot))
                 && let Some(format) = format
             {
                 let channels = std::array::from_fn(|lane| {
@@ -988,6 +1089,7 @@ impl Sampling {
             border_textures: &self.border_textures,
             depth_textures: &self.depths,
             depth24_textures: &self.depths24,
+            color_comparison: &self.color_comparison,
             exact_unorm: &self.unorm,
             manual_filter: &self.manual_filter,
             manual_samplers: &self.manual_samplers,
@@ -1545,18 +1647,24 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     };
     let mut reads = Vec::new();
     let mut capture = IaCapture::default();
-    let (index, vertices) = if indexed {
+    let (index, indices, index_offset, index_len, vertices) = if indexed {
         let strip = matches!(
             topology,
             p::Topology::LineStrip | p::Topology::TriangleStrip
         );
         let index = ensure_index(env, &snapshot, &mut args, strip, &mut capture)?;
         reads.push(key(env, snapshot.ia.indices.buffer, 0));
-        (Some(index.binding), index.vertices)
+        (
+            Some(index.binding),
+            Some(index.storage),
+            index.offset,
+            index.len,
+            index.vertices,
+        )
     } else if let DrawRange::Direct { vertices, .. } = &args {
-        (None, Some(vertices.clone()))
+        (None, None, 0, 0, Some(vertices.clone()))
     } else {
-        (None, None)
+        (None, None, 0, 0, None)
     };
     let (
         vertex_shader,
@@ -1572,15 +1680,14 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         alpha_to_coverage,
         inexact_sample_mask,
     ) = {
-        let caps = env
+        let execution = env
             .ext
             .get::<State>()
             .execution
             .as_ref()
-            .ok_or(Error::Device)?
-            .gpu
-            .device()
-            .caps();
+            .ok_or(Error::Device)?;
+        let caps = execution.gpu.device().caps();
+        let mut cache = device_state(env)?.variants.borrow_mut();
         let vertex_shader =
             bound_shader(env, &snapshot, Stage::Vertex).ok_or(Error::InvalidArgument)?;
         let pixel_shader = raster_stream.and_then(|_| bound_shader(env, &snapshot, Stage::Pixel));
@@ -1596,7 +1703,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         let reflection = vertex_shader.reflection();
         let pixel_reflection = pixel_shader.map(|shader| (u64::from(pixel), shader.reflection()));
         let input_layout = context::owned(env, layout).and_then(Object::input_layout);
-        let mut fetches = Vec::new();
+        let mut fetches = smallvec::SmallVec::<[VertexFetch; 8]>::new();
         let mut captures: [Option<Range<u32>>; STREAMS] = std::array::from_fn(|_| None);
         for input in &reflection.signatures.input {
             if input.system_value != SystemValue::None {
@@ -1610,19 +1717,21 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 continue;
             }
             let fetch = VertexFetch {
-                register: input.register,
-                mask: input.mask,
-                stream: entry.slot as u32,
+                layout: FetchLayout {
+                    register: input.register,
+                    mask: input.mask,
+                    stream: entry.slot as u32,
+                    step: match entry.rate {
+                        InputRate::Vertex => InputStep::Vertex,
+                        InputRate::Instance(rate) => InputStep::Instance(rate),
+                    },
+                    format: vertex_format(entry.format)?,
+                },
                 offset: bound
                     .offset
                     .checked_add(entry.offset)
                     .ok_or(Error::InvalidArgument)?,
                 stride: bound.stride,
-                step: match entry.rate {
-                    InputRate::Vertex => InputStep::Vertex,
-                    InputRate::Instance(rate) => InputStep::Instance(rate),
-                },
-                format: vertex_format(entry.format)?,
             };
             let desc = description(env, bound.buffer)?;
             let Resource::Buffer(buffer) = desc else {
@@ -1639,7 +1748,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             fetches.push(fetch);
         }
         for fetch in &mut fetches {
-            if let Some(range) = &captures[fetch.stream as usize] {
+            if let Some(range) = &captures[fetch.layout.stream as usize] {
                 fetch.offset = fetch.offset.wrapping_sub(range.start);
             }
         }
@@ -1653,9 +1762,14 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         } else {
             (None, None)
         };
-        let producer = geometry_shader
-            .or(domain_shader)
-            .map_or(reflection, |shader| shader.reflection());
+        let (producer_stage, producer_shader) = if let Some(shader) = geometry_shader {
+            (Stage::Geometry, shader)
+        } else if let Some(shader) = domain_shader {
+            (Stage::Domain, shader)
+        } else {
+            (Stage::Vertex, vertex_shader)
+        };
+        let producer = producer_shader.reflection();
         let clip_components = producer
             .signatures
             .output
@@ -1691,12 +1805,19 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             ..facts
         };
         let variant = Variant::select(reflection, &facts, caps);
-        let sampling = Sampling::new(env, &snapshot, Stage::Vertex, reflection);
-        let views = ShaderViews::new(env, &snapshot, Stage::Vertex, reflection)?;
-        let options = Options {
-            raster_samples: samples,
-            ..views.options(sampling.options())
+        let vertex_input = StageInput {
+            shader: ShaderIdentity::new(&snapshot, Stage::Vertex, vertex_shader),
+            variant,
+            options: StageOptions {
+                raster_samples: samples,
+                sampling: Sampling::new(env, &snapshot, Stage::Vertex, reflection),
+                views: ShaderViews::new(env, &snapshot, Stage::Vertex, reflection)?.options,
+                ..Default::default()
+            },
         };
+        let fragment_identity =
+            pixel_shader.map(|shader| ShaderIdentity::new(&snapshot, Stage::Pixel, shader));
+        let mut vertex_input = Some(vertex_input);
         let expanded = if expand {
             let (first, count, base_vertex, first_instance, instance_count, indirect) = match &args
             {
@@ -1716,12 +1837,13 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                     let (vertices, instances) = if let Some(vertices) = automatic {
                         (*vertices, 1)
                     } else {
-                        let index_extent = index.as_ref().map(|(buffer, format)| {
+                        let index_extent = index.as_ref().map(|(_, format)| {
                             let stride = if *format == IndexFormat::U32 { 4 } else { 2 };
-                            (buffer.range.end - buffer.range.start) as u32 / stride
+                            index_len / stride
                         });
                         let Some(limits) = indirect_bounds(env, &snapshot, &fetches, index_extent)?
                         else {
+                            drop(cache);
                             let direct = read_indirect_draw(env, arguments, indexed)?;
                             return render(env, indexed, direct);
                         };
@@ -1733,116 +1855,83 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                         0,
                         0,
                         instances,
-                        Some(expand::Indirect {
-                            first_word: (arguments.range.start / 4) as u32,
-                            instances,
-                        }),
+                        Some((arguments.range.start / 4) as u32),
                     )
                 }
             };
             let assembly = expand::Assembly {
                 count_statistics: statistics_active,
                 predicate: bound_predicate.as_ref().map(|_| !predicate_value),
-                first,
-                count,
-                base_vertex,
-                first_instance,
-                indirect,
-                index: index.as_ref().map(|(buffer, format)| expand::IndexInput {
-                    offset: buffer.range.start as u32,
+                indirect: indirect.is_some(),
+                index: index.as_ref().map(|(_, format)| expand::IndexInput {
                     wide: *format == IndexFormat::U32,
                 }),
                 step,
                 flip_winding,
             };
-            let primitives = assembly
-                .primitives(tessellation.map_or(input_vertices, |layout| layout.input_points))
+            let primitives_per_instance = assembly.primitives(
+                count,
+                tessellation.map_or(input_vertices, |layout| layout.input_points),
+            );
+            let primitives = primitives_per_instance
                 .checked_mul(instance_count)
                 .ok_or(Error::InvalidArgument)?;
             if primitives == 0 {
                 return Ok(());
             }
-            let mut compile_stage = |shader: Option<&crate::d3d11::desc::Shader>, stage| {
+            let parameters = DrawParameters {
+                first,
+                base_vertex: base_vertex as u32,
+                first_instance,
+                primitives: primitives_per_instance,
+                index_offset,
+                count,
+                argument_word: indirect.unwrap_or_default(),
+                instances: instance_count,
+            };
+            let mut stage_input = |shader: Option<&crate::d3d11::desc::Shader>, stage| {
                 shader
                     .map(|shader| {
                         let reflection = shader.reflection();
                         let views = ShaderViews::new(env, &snapshot, stage, reflection)?;
                         views.writes(env, &mut writes);
-                        Ok::<_, Error>((
-                            Variant::select(
+                        Ok::<_, Error>(StageInput {
+                            shader: ShaderIdentity::new(&snapshot, stage, shader),
+                            variant: Variant::select(
                                 reflection,
                                 &DrawFacts {
-                                    storage_formats: &views.storage_formats,
+                                    storage_formats: &views.options.storage_formats,
                                     ..facts
                                 },
                                 caps,
                             ),
-                            Sampling::new(env, &snapshot, stage, reflection),
-                            views,
-                        ))
+                            options: StageOptions {
+                                sampling: Sampling::new(env, &snapshot, stage, reflection),
+                                views: views.options,
+                                ..Default::default()
+                            },
+                        })
                     })
                     .transpose()
             };
-            let geometry_options = compile_stage(geometry_shader, Stage::Geometry)?;
-            let hull_options = compile_stage(hull_shader, Stage::Hull)?;
-            let domain_options = compile_stage(domain_shader, Stage::Domain)?;
-            let geometry_stage = geometry_shader.zip(geometry_options.as_ref()).map(
-                |(shader, (variant, sampling, views))| expand::Shader {
-                    ir: shader.module(),
-                    variant,
-                    options: views.options(sampling.options()),
-                },
-            );
-            let vertex = expand::Shader {
-                ir: vertex_shader.module(),
-                variant: &variant,
-                options,
-            };
-            let hs;
-            let ds;
-            let source = if let Some(layout) = tessellation {
-                let (hs_variant, hs_sampling, hs_views) = hull_options.as_ref().unwrap();
-                let (ds_variant, ds_sampling, ds_views) = domain_options.as_ref().unwrap();
-                hs = expand::Shader {
-                    ir: hull_shader.unwrap().module(),
-                    variant: hs_variant,
-                    options: hs_views.options(hs_sampling.options()),
-                };
-                ds = expand::Shader {
-                    ir: domain_shader.unwrap().module(),
-                    variant: ds_variant,
-                    options: ds_views.options(ds_sampling.options()),
-                };
-                expand::Source::Tessellated {
-                    vertex,
-                    hull: &hs,
-                    domain: &ds,
-                    fetches: &fetches,
-                    assembly,
-                    layout,
-                }
-            } else {
-                expand::Source::InputAssembler {
-                    shader: vertex,
-                    fetches: &fetches,
-                    assembly,
-                }
-            };
-            let variants: Vec<_> = raster_bins
-                .iter()
-                .map(|(bin, _, _)| {
-                    Variant::select(producer, &DrawFacts { bin: *bin, ..facts }, caps)
-                })
-                .collect();
-            let bins: Vec<_> = variants.iter().collect();
-            let programs = expand::Plan {
-                source,
+            let key = ExpansionKey {
+                vertex: vertex_input.take().unwrap(),
+                geometry: stage_input(geometry_shader, Stage::Geometry)?,
+                hull: stage_input(hull_shader, Stage::Hull)?,
+                domain: stage_input(domain_shader, Stage::Domain)?,
+                fetches: fetches.iter().map(|fetch| fetch.layout).collect(),
+                assembly,
+                tessellation,
                 topology: input_topology,
                 input_vertices,
-                geometry: geometry_stage,
-                raster: raster_stream.map(|stream| expand::Raster {
-                    bins: &bins,
-                    fragment: pixel_reflection.map(|(_, reflection)| reflection),
+                raster: raster_stream.map(|stream| RasterKey {
+                    bins: raster_bins
+                        .iter()
+                        .map(|(bin, _, _)| {
+                            Variant::select(producer, &DrawFacts { bin: *bin, ..facts }, caps)
+                        })
+                        .collect(),
+                    fragment: fragment_identity.clone(),
                     stream,
                     cull: match raster.CullMode {
                         1 => expand::Cull::None,
@@ -1853,12 +1942,62 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                     front_ccw: raster.FrontCounterClockwise != 0,
                     depth_clip: raster.DepthClipEnable != 0,
                 }),
-                stream_output: &stream_output,
+                stream_shader: geometry,
+                stream_output,
                 stream_statistics: counted_streams,
-            }
-            .emit()
-            .map_err(shader_error)?;
-            Some((programs, primitives))
+            };
+            let programs = cached(&mut cache.expansion, key, execution, |key| {
+                let vertex = key.vertex.expansion(vertex_shader);
+                let hs;
+                let ds;
+                let source = if let Some(layout) = key.tessellation {
+                    hs = key.hull.as_ref().unwrap().expansion(hull_shader.unwrap());
+                    ds = key
+                        .domain
+                        .as_ref()
+                        .unwrap()
+                        .expansion(domain_shader.unwrap());
+                    expand::Source::Tessellated {
+                        vertex,
+                        hull: &hs,
+                        domain: &ds,
+                        fetches: &key.fetches,
+                        assembly: key.assembly,
+                        layout,
+                    }
+                } else {
+                    expand::Source::InputAssembler {
+                        shader: vertex,
+                        fetches: &key.fetches,
+                        assembly: key.assembly,
+                    }
+                };
+                let bins: Vec<_> = key.raster.iter().flat_map(|raster| &raster.bins).collect();
+                expand::Plan {
+                    source,
+                    topology: key.topology,
+                    input_vertices: key.input_vertices,
+                    geometry: key
+                        .geometry
+                        .as_ref()
+                        .zip(geometry_shader)
+                        .map(|(input, shader)| input.expansion(shader)),
+                    raster: key.raster.as_ref().map(|raster| expand::Raster {
+                        bins: &bins,
+                        fragment: pixel_reflection.map(|(_, reflection)| reflection),
+                        stream: raster.stream,
+                        cull: raster.cull,
+                        front_ccw: raster.front_ccw,
+                        depth_clip: raster.depth_clip,
+                    }),
+                    stream_output: &key.stream_output,
+                    stream_statistics: key.stream_statistics,
+                }
+                .emit()
+                .map(std::rc::Rc::new)
+                .map_err(shader_error)
+            })?;
+            Some((programs, primitives, parameters))
         } else {
             None
         };
@@ -1870,7 +2009,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             let variant = Variant::select(
                 shader.reflection(),
                 &DrawFacts {
-                    storage_formats: &views.storage_formats,
+                    storage_formats: &views.options.storage_formats,
                     ..facts
                 },
                 caps,
@@ -1889,63 +2028,82 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                         writes_uav
                             || reads_coverage && (metal_mask & active_samples).count_ones() > 1
                     });
-            let sampling = Sampling::new(env, &snapshot, Stage::Pixel, shader.reflection());
-            let options = Options {
-                raster_samples: samples,
-                raster_sample_mask: metal_mask,
-                alpha_targets,
-                image_atomics: true,
-                ..views.options(sampling.options())
+            let key = FragmentKey {
+                input: StageInput {
+                    shader: fragment_identity.clone().unwrap(),
+                    variant,
+                    options: StageOptions {
+                        raster_samples: samples,
+                        raster_sample_mask: metal_mask,
+                        alpha_targets,
+                        image_atomics: true,
+                        sampling: Sampling::new(env, &snapshot, Stage::Pixel, reflection),
+                        views: views.options,
+                    },
+                },
+                expanded: expanded.as_ref().map(|(programs, ..)| {
+                    (
+                        ShaderIdentity::new(&snapshot, producer_stage, producer_shader),
+                        programs.fragment_layout(),
+                    )
+                }),
             };
-            let code = if let Some((programs, _)) = &expanded {
-                programs.fragment_code(shader.module(), &variant, producer, options)
-            } else {
-                wgsl::emit_variant(shader.module(), &variant, None, options)
-            }
-            .map_err(shader_error)?;
+            let translated = cached(&mut cache.fragment, key, execution, |key| {
+                let input = &key.input;
+                let options = input.options.wgsl();
+                let code = if let Some((programs, ..)) = &expanded {
+                    programs.fragment_code(shader.module(), &input.variant, producer, options)
+                } else {
+                    wgsl::emit_variant(shader.module(), &input.variant, None, options)
+                }
+                .map_err(shader_error)?;
+                Translated::new(code, adv_gpu::shader::Stage::Fragment).map(std::rc::Rc::new)
+            })?;
             (
-                Some(Arc::new(
-                    modern_shader(&code, adv_gpu::shader::Stage::Fragment)?
-                        .with_per_sample_uav_effects(code.per_sample_uav_effects),
-                )),
-                Some(code),
+                Some(translated.shader.clone()),
+                Some(translated),
                 inexact_sample_mask,
             )
         } else if metal_mask != u32::MAX {
             // Depth-only draws still need a mask output. An empty mask also
             // suppresses the guest shader's side effects.
-            let source = format!(
-                "@fragment fn fragment_main() -> @builtin(sample_mask) u32 {{ return {metal_mask}u; }}"
-            );
-            (
-                Some(Arc::new(ModernShader::wgsl(
-                    xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
+            let shader = cached(&mut cache.masks, metal_mask, execution, |mask| {
+                let source = format!(
+                    "@fragment fn fragment_main() -> @builtin(sample_mask) u32 {{ return {mask}u; }}"
+                );
+                let id = xxhash_rust::xxh3::xxh3_64(source.as_bytes());
+                Ok(Arc::new(ModernShader::wgsl(
+                    id,
                     &source,
                     "fragment_main",
                     adv_gpu::shader::Stage::Fragment,
-                )?)),
-                None,
-                false,
-            )
+                )?))
+            })?;
+            (Some(shader), None, false)
         } else {
             (None, None, false)
         };
         let vertex_code;
-        let gs_reflection = geometry_shader.map(|shader| shader.reflection().clone());
-        let vertex_reflection = reflection.clone();
-        let hull_reflection = hull_shader.map(|shader| shader.reflection().clone());
-        let domain_reflection = domain_shader.map(|shader| shader.reflection().clone());
+        let vertex_reflection;
+        let geometry_reflection;
+        let hull_reflection;
+        let domain_reflection;
         let mut tessellation_bindings = None;
-        let (vertex, vertex_slots, gs_slots) = if let Some((programs, _)) = &expanded {
+        let (vertex, vertex_slots, gs_slots) = if let Some((programs, ..)) = &expanded {
+            vertex_reflection = vertex_shader.reflection_handle();
+            geometry_reflection =
+                geometry_shader.map(crate::d3d11::desc::Shader::reflection_handle);
             let vertex_source = if let Some((vertex, hull)) = programs.tessellation_stages() {
+                hull_reflection = hull_shader.unwrap().reflection_handle();
+                domain_reflection = domain_shader.unwrap().reflection_handle();
                 tessellation_bindings = Some((
                     (
-                        hull_reflection.as_ref().unwrap(),
+                        &*hull_reflection,
                         hull.bindings.as_slice(),
                         hull.counters.as_slice(),
                     ),
                     (
-                        domain_reflection.as_ref().unwrap(),
+                        &*domain_reflection,
                         programs.source.bindings.as_slice(),
                         programs.source.counters.as_slice(),
                     ),
@@ -1957,11 +2115,11 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             (
                 None,
                 (
-                    &vertex_reflection,
+                    &*vertex_reflection,
                     vertex_source.bindings.as_slice(),
                     vertex_source.counters.as_slice(),
                 ),
-                gs_reflection.as_ref().map(|reflection| {
+                geometry_reflection.as_deref().map(|reflection| {
                     (
                         reflection,
                         programs.primitive.bindings.as_slice(),
@@ -1970,24 +2128,31 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 }),
             )
         } else {
-            vertex_code = pulled::vertex(
-                vertex_shader.module(),
-                &variant,
-                pixel_reflection.map(|(_, reflection)| reflection),
-                options,
-                &fetches,
-                args.start(indexed),
-            )
-            .map_err(shader_error)?;
+            let key = VertexKey {
+                input: vertex_input.unwrap(),
+                fragment: fragment_identity,
+                fetches: fetches.iter().map(|fetch| fetch.layout).collect(),
+                start: args.start(indexed),
+            };
+            vertex_code = cached(&mut cache.vertex, key, execution, |key| {
+                let code = pulled::vertex(
+                    vertex_shader.module(),
+                    &key.input.variant,
+                    pixel_reflection.map(|(_, reflection)| reflection),
+                    key.input.options.wgsl(),
+                    &key.fetches,
+                    key.start,
+                )
+                .map_err(shader_error)?;
+                Translated::new(code, adv_gpu::shader::Stage::Vertex).map(std::rc::Rc::new)
+            })?;
             (
-                Some(Arc::new(modern_shader(
-                    &vertex_code,
-                    adv_gpu::shader::Stage::Vertex,
-                )?)),
-                bindings(&vertex_code),
+                Some(vertex_code.shader.clone()),
+                bindings(&vertex_code.code),
                 None,
             )
         };
+        drop(cache);
         let vertex_bindings = slots_for(env, &snapshot, Stage::Vertex, vertex_slots, &mut reads)?;
         let geometry_bindings = gs_slots
             .map(|layout| slots_for(env, &snapshot, Stage::Geometry, layout, &mut reads))
@@ -2003,7 +2168,15 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         };
         let fragment = pixel_code
             .as_ref()
-            .map(|code| slots_for(env, &snapshot, Stage::Pixel, bindings(code), &mut reads))
+            .map(|code| {
+                slots_for(
+                    env,
+                    &snapshot,
+                    Stage::Pixel,
+                    bindings(&code.code),
+                    &mut reads,
+                )
+            })
             .transpose()?
             .unwrap_or_default();
         (
@@ -2032,8 +2205,8 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             }),
         );
     }
-    for fetch in fetches {
-        let stream = fetch.stream as usize;
+    for fetch in &fetches {
+        let stream = fetch.layout.stream as usize;
         let slot = VERTEX_STREAM_BASE as usize + stream;
         if vertex_bindings
             .storage
@@ -2043,19 +2216,24 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             continue;
         }
         let pointer = snapshot.ia.vertices[stream].buffer;
-        let buffer = capture_buffer(
+        let window = capture_buffer(
             env,
             pointer,
-            BufferUsage::STORAGE,
             captures[stream].clone().unwrap_or(0..0),
             &mut capture,
         )?;
         reads.push(key(env, pointer, 0));
-        let range = 0..buffer.desc().size;
+        let window = match window {
+            BufferWindow::Native(mut native) => {
+                native.range.start = 0;
+                native.into()
+            }
+            captured => captured,
+        };
         set_slot(
             &mut vertex_bindings.storage,
             slot,
-            StorageBinding::Buffer(BufferRange { buffer, range }),
+            StorageBinding::Window(window),
         );
     }
     let (occlusion, statistics) =
@@ -2157,10 +2335,6 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             queries::record_statistics(env, counters, None)?;
         }
     }
-    let indices = index.as_ref().map(|(index, _)| BufferRange {
-        buffer: index.buffer.clone(),
-        range: 0..index.buffer.desc().size,
-    });
     let make_draw = |vertex, viewport, bounds: Rect, occlusion| ModernDraw {
         state_ids: [
             layout,
@@ -2207,7 +2381,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         occlusion,
         predicate: None,
     };
-    let command = if let Some((programs, primitives)) = expansion {
+    let command = if let Some((programs, primitives, parameters)) = expansion {
         let mut bins = Vec::new();
         for (i, (bin, viewport, bounds)) in raster_bins.into_iter().enumerate() {
             let (occlusion, statistics) = if i == 0 {
@@ -2240,6 +2414,10 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             &execution.gpu,
             expand::Inputs {
                 primitives,
+                draw_state: Some(expand::DrawState {
+                    uniform: parameters.upload(&execution.gpu, &fetches)?,
+                    primitives_per_instance: parameters.primitives,
+                }),
                 vertices: None,
                 indices,
                 vertex: vertex_bindings,
@@ -2261,6 +2439,10 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             bins,
         )?))
     } else {
+        let state = args
+            .parameters(indexed)
+            .upload(&execution(env.ext)?.gpu, &fetches)?;
+        expand::bind_draw_state(&mut vertex_bindings, state);
         Command::Draw {
             draw: Box::new(make_draw(
                 vertex_shader.unwrap(),
@@ -2357,17 +2539,20 @@ fn indirect_bounds(
         if fetch.stride == 0 {
             continue;
         }
-        let resource = description(env, snapshot.ia.vertices[fetch.stream as usize].buffer)?;
+        let resource = description(
+            env,
+            snapshot.ia.vertices[fetch.layout.stream as usize].buffer,
+        )?;
         let Resource::Buffer(buffer) = resource else {
             unreachable!()
         };
         let available = buffer.size().saturating_sub(fetch.offset);
-        let records = if available < fetch.format.bytes {
+        let records = if available < fetch.layout.format.bytes {
             0
         } else {
-            1 + (available - fetch.format.bytes) / fetch.stride
+            1 + (available - fetch.layout.format.bytes) / fetch.stride
         };
-        match fetch.step {
+        match fetch.layout.step {
             InputStep::Vertex => {
                 vertex_extent = Some(vertex_extent.map_or(records, |current| current.min(records)));
             }
@@ -2385,16 +2570,6 @@ fn indirect_bounds(
 fn shader_error(error: crate::shader::ir::Error) -> Error {
     log::debug!("D3D11 shader variant: {error}");
     Error::InvalidArgument
-}
-
-fn modern_shader(code: &Translation, stage: adv_gpu::shader::Stage) -> Result<ModernShader, Error> {
-    let id = xxhash_rust::xxh3::xxh3_64(code.source.as_bytes());
-    Ok(ModernShader::wgsl(
-        id,
-        &code.source,
-        code.entry_point,
-        stage,
-    )?)
 }
 
 pub(in crate::d3d11::glue) fn dispatch(env: &mut Env<'_>) -> Result<(), Error> {
@@ -2427,40 +2602,58 @@ fn compute(
     let views = ShaderViews::new(env, &snapshot, Stage::Compute, shader.reflection())?;
     let mut writes = Vec::new();
     views.writes(env, &mut writes);
-    let caps = env
+    let gpu_execution = env
         .ext
         .get::<State>()
         .execution
         .as_ref()
-        .ok_or(Error::Device)?
-        .gpu
-        .device()
-        .caps();
+        .ok_or(Error::Device)?;
     let facts = DrawFacts {
-        storage_formats: &views.storage_formats,
+        storage_formats: &views.options.storage_formats,
         ..Default::default()
     };
-    let variant = Variant::select(shader.reflection(), &facts, caps);
-    let sampling = Sampling::new(env, &snapshot, Stage::Compute, shader.reflection());
-    let code = wgsl::emit_variant(
-        shader.module(),
-        &variant,
-        None,
-        Options {
+    let input = StageInput {
+        shader: ShaderIdentity::new(&snapshot, Stage::Compute, shader),
+        variant: Variant::select(
+            shader.reflection(),
+            &facts,
+            gpu_execution.gpu.device().caps(),
+        ),
+        options: StageOptions {
             image_atomics: true,
-            ..views.options(sampling.options())
+            sampling: Sampling::new(env, &snapshot, Stage::Compute, shader.reflection()),
+            views: views.options,
+            ..Default::default()
         },
-    )
-    .map_err(shader_error)?;
-    let mut reads = Vec::new();
-    reads.extend(indirect_read);
+    };
     let threads = shader
         .reflection()
         .workgroup_size
         .unwrap()
         .into_iter()
         .product::<u32>();
-    let bindings = slots_for(env, &snapshot, Stage::Compute, bindings(&code), &mut reads)?;
+    let (code, pipeline) = &*cached(
+        &mut device_state(env)?.variants.borrow_mut().compute,
+        input,
+        gpu_execution,
+        |input| {
+            let code =
+                wgsl::emit_variant(shader.module(), &input.variant, None, input.options.wgsl())
+                    .map_err(shader_error)?;
+            let stage = Translated::new(code, adv_gpu::shader::Stage::Compute)?;
+            let pipeline = Arc::new(gpu_execution.gpu.prepare_dispatch(stage.shader.clone())?);
+            Ok(std::rc::Rc::new((stage, pipeline)))
+        },
+    )?;
+    let mut reads = Vec::new();
+    reads.extend(indirect_read);
+    let bindings = slots_for(
+        env,
+        &snapshot,
+        Stage::Compute,
+        bindings(&code.code),
+        &mut reads,
+    )?;
     let mut arguments = arguments;
     if let Some(buffer) = queries::predicate(env, snapshot.predication.predicate) {
         let words = match arguments {
@@ -2498,15 +2691,11 @@ fn compute(
         }
     }
     let execution = execution(env.ext)?;
-    let pipeline = Arc::new(execution.gpu.prepare_dispatch(Arc::new(modern_shader(
-        &code,
-        adv_gpu::shader::Stage::Compute,
-    )?))?);
     let extent = extent_rect([1, 1, 1]);
     execution.recording.append(
         &mut execution.gpu,
         Command::Dispatch {
-            pipeline,
+            pipeline: pipeline.clone(),
             bindings,
             arguments,
         },
@@ -2574,23 +2763,28 @@ mod tests {
     fn dynamic_ia_captures_only_the_window_determined_at_admission() {
         let draw = DrawRange::direct(3, 5, 5, 3, 0).ok().unwrap();
         let fetch = VertexFetch {
-            register: 0,
-            mask: 15,
-            stream: 0,
             offset: 12,
             stride: 24,
-            step: InputStep::Vertex,
-            format: VertexFormat {
-                bytes: 16,
-                bits: [32; 4],
-                kinds: [VertexComponent::Float; 4],
-                offsets: [0, 32, 64, 96],
+            layout: FetchLayout {
+                register: 0,
+                mask: 15,
+                stream: 0,
+                step: InputStep::Vertex,
+                format: VertexFormat {
+                    bytes: 16,
+                    bits: [32; 4],
+                    kinds: [VertexComponent::Float; 4],
+                    offsets: [0, 32, 64, 96],
+                },
             },
         };
         assert_eq!(vertex_capture(fetch, 1024, &draw, Some(&(5..8))), 132..196);
         assert_eq!(vertex_capture(fetch, 1024, &draw, None), 12..1024);
         let instanced = VertexFetch {
-            step: InputStep::Instance(2),
+            layout: FetchLayout {
+                step: InputStep::Instance(2),
+                ..fetch.layout
+            },
             ..fetch
         };
         assert_eq!(vertex_capture(instanced, 1024, &draw, None), 84..148);

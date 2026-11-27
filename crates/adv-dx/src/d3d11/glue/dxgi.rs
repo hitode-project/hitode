@@ -5,8 +5,8 @@ use adv_abi::gfx_iids::*;
 
 macro_rules! methods {
     ($($method:ident => $handler:ident $level:ident),+ $(,)?) => {
-        ("IDXGIDevice1", &[
-            $((concat!("IDXGIDevice1::", stringify!($method)), $handler, ImplementationLevel::$level)),+
+        ("IDXGIDevice3", &[
+            $((concat!("IDXGIDevice3::", stringify!($method)), $handler, ImplementationLevel::$level)),+
         ])
     };
 }
@@ -26,6 +26,10 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     GetGPUThreadPriority => get_priority State,
     SetMaximumFrameLatency => set_latency State,
     GetMaximumFrameLatency => get_latency State,
+    OfferResources => offer_resources Implement,
+    ReclaimResources => reclaim_resources Implement,
+    EnqueueSetEvent => enqueue_event Implement,
+    Trim => trim State,
 );
 
 macro_rules! resource_methods {
@@ -228,7 +232,13 @@ pub(super) fn attach_device_face(
         &mut env.sys.objects,
         device,
         face,
-        &[IID_IDXGIOBJECT, IID_IDXGIDEVICE, IID_IDXGIDEVICE1],
+        &[
+            IID_IDXGIOBJECT,
+            IID_IDXGIDEVICE,
+            IID_IDXGIDEVICE1,
+            IID_IDXGIDEVICE2,
+            IID_IDXGIDEVICE3,
+        ],
     );
     let pointer = dxgi::create_device_adapter(env, adapter)?;
     let state = ops::object_mut(env, table, device)?
@@ -272,22 +282,81 @@ fn retain_adapter(env: &mut Env<'_>, adapter: u32, iid: Iid, out: u32) -> Outcom
 fn residency(env: &mut Env<'_>) -> Outcome {
     let (this, pointers, output, count) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     call((|| {
-        let table = table(env);
-        let owner = table
-            .canonical(&env.sys.objects, this)
-            .ok_or(Error::InvalidArgument)?;
-        let resources = array::<u32>(env, pointers, count)?;
-        for resource in resources {
-            let object = ops::object(env, table, resource)?;
-            if object.device() != Some(owner) || object.resource().is_none() {
-                return Err(Error::InvalidArgument);
-            }
-        }
+        validate_resources(env, this, pointers, count)?;
         for index in 0..count {
             write(env, output + 4 * index, 1u32)?;
         }
         Ok(())
     })())
+}
+
+fn validate_resources(env: &Env<'_>, device: u32, pointers: u32, count: u32) -> Result<(), Error> {
+    let table = table(env);
+    let owner = table
+        .canonical(&env.sys.objects, device)
+        .ok_or(Error::InvalidArgument)?;
+    for resource in array::<u32>(env, pointers, count)? {
+        let object = ops::object(env, table, resource)?;
+        if object.device() != Some(owner) || object.resource().is_none() {
+            return Err(Error::InvalidArgument);
+        }
+    }
+    Ok(())
+}
+
+fn offer_resources(env: &mut Env<'_>) -> Outcome {
+    let [device, count, pointers, priority] = std::array::from_fn(|i| env.arg(i as u32));
+    // Offering permits reclamation of the backing. Retain its contents.
+    call(if (1..=3).contains(&priority) {
+        validate_resources(env, device, pointers, count)
+    } else {
+        Err(Error::InvalidArgument)
+    })
+}
+
+fn reclaim_resources(env: &mut Env<'_>) -> Outcome {
+    let [device, count, pointers, output] = std::array::from_fn(|i| env.arg(i as u32));
+    call((|| {
+        validate_resources(env, device, pointers, count)?;
+        if output != 0 {
+            for index in 0..count {
+                write(env, output + 4 * index, 0u32)?;
+            }
+        }
+        Ok(())
+    })())
+}
+
+fn enqueue_event(env: &mut Env<'_>) -> Outcome {
+    #[cfg(feature = "gpu")]
+    return call((|| {
+        let event = env.arg(1);
+        if event == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if get_state(env)?.null_device {
+            let signal = env.ext.get::<State>().signal_event;
+            return signal(env, event)
+                .then_some(())
+                .ok_or(Error::InvalidArgument);
+        }
+        gpu::enqueue_event(env.ext, event)
+    })());
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = env;
+        Outcome::Return(dxgi::Error::Unavailable.hresult())
+    }
+}
+
+fn trim(env: &mut Env<'_>) -> Outcome {
+    #[cfg(feature = "gpu")]
+    if let Ok(execution) = gpu::execution(env.ext) {
+        execution.trim();
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = env;
+    Outcome::Return(0)
 }
 
 fn set_priority(env: &mut Env<'_>) -> Outcome {
@@ -432,7 +501,12 @@ impl dxgi::swap::Buffers for SwapBuffers {
         Ok((surface, object.device().unwrap()))
     }
 
-    fn scanout(&self, env: &mut Env<'_>, surface: u32, serial: u64) -> Result<(), dxgi::Error> {
+    fn scanout(
+        &self,
+        env: &mut Env<'_>,
+        surface: u32,
+        serial: u64,
+    ) -> Result<Option<u64>, dxgi::Error> {
         let Some(Resource::Texture(texture)) = table(env)
             .get(&env.sys.objects, surface)
             .and_then(Object::resource)
@@ -441,7 +515,7 @@ impl dxgi::swap::Buffers for SwapBuffers {
         };
         let [width, height, _] = texture.extent(0);
         self.present(env, surface, [width, height], serial, true, false)
-            .map(|_| ())
+            .map(|(_, completed)| completed)
     }
 
     fn capture(&self, env: &mut Env<'_>) -> Result<adv_device::frame::Waker, dxgi::Error> {
@@ -594,6 +668,7 @@ impl dxgi::swap::Buffers for SwapBuffers {
     }
 
     fn release(&self, env: &mut Env<'_>, pointer: u32, interfaces: &mut Vec<u32>) {
+        gpu::release_presentation(env.ext, pointer);
         let released = table(env).release_bound(&mut env.sys.objects, pointer);
         for pointer in released.allocations {
             free(env, pointer);
@@ -609,7 +684,7 @@ impl dxgi::swap::Buffers for SwapBuffers {
         serial: u64,
         first: bool,
         composition: bool,
-    ) -> Result<bool, dxgi::Error> {
+    ) -> Result<(bool, Option<u64>), dxgi::Error> {
         if device_state(
             env,
             table(env)
@@ -619,11 +694,11 @@ impl dxgi::swap::Buffers for SwapBuffers {
         )?
         .null_device
         {
-            return Ok(false);
+            return Ok((false, None));
         }
         if composition {
             return gpu::flush_shared(env)
-                .map(|()| false)
+                .map(|()| (false, None))
                 .map_err(|_| dxgi::Error::Unavailable);
         }
         gpu::present(env, resource, size, serial, first).map_err(|error| match error {
@@ -634,6 +709,26 @@ impl dxgi::swap::Buffers for SwapBuffers {
 
     fn latency(&self, env: &Env<'_>, device: u32) -> u32 {
         device_state(env, device).unwrap().latency
+    }
+
+    fn present_wake_generation(&self, ext: &adv_machine::Ext) -> Option<u64> {
+        Some(
+            ext.get::<State>()
+                .execution
+                .as_ref()?
+                .wake
+                .as_ref()?
+                .generation(),
+        )
+    }
+
+    fn wait_for_present(
+        &self,
+        env: &mut Env<'_>,
+        generation: u64,
+        then: adv_machine::Continuation,
+    ) -> Outcome {
+        gpu::wait_for_present(env, generation, then)
     }
 
     fn shared_adapter(&self, env: &Env<'_>, handle: u32) -> Result<Adapter, dxgi::Error> {

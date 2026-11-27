@@ -11,6 +11,9 @@ pub(super) struct ImageData {
     pub(super) raw: Object<dyn MTLTexture>,
     pub(super) planes: Option<[Object<dyn MTLTexture>; 2]>,
     desc: ImageDesc,
+    views: Mutex<HashMap<(ViewDesc, ViewLayout), View>>,
+    #[cfg(feature = "counters")]
+    creations: Arc<crate::queue::CreationCounters>,
     lost: Arc<OnceLock<String>>,
 }
 
@@ -29,6 +32,15 @@ pub(crate) struct ImageView {
     image: crate::Image,
     size: Extent,
     pub(super) depth_plane: usize,
+    format: Format,
+}
+
+// The cache owns the native view without an Image back-reference.
+#[derive(Clone)]
+struct View {
+    raw: Object<dyn MTLTexture>,
+    size: Extent,
+    depth_plane: usize,
     format: Format,
 }
 
@@ -56,11 +68,7 @@ impl Device {
             ));
         }
         let d = self.texture_descriptor(desc)?;
-        let raw = self
-            .0
-            .raw
-            .newTextureWithDescriptor(&d)
-            .ok_or(Error::OutOfMemory)?;
+        let raw = self.new_texture(&d).ok_or(Error::OutOfMemory)?;
         Ok(self.wrap_image(raw, desc))
     }
     /// The texture descriptor for `desc`, after checking it against the caps.
@@ -167,6 +175,9 @@ impl Device {
                     raw,
                     planes: None,
                     desc: *desc,
+                    views: Default::default(),
+                    #[cfg(feature = "counters")]
+                    creations: self.0.creations.clone(),
                     lost: self.0.lost.clone(),
                 }),
                 view: OnceLock::new(),
@@ -182,9 +193,7 @@ impl Device {
             MTLResourceOptions::StorageModeShared
         };
         let raw = self
-            .0
-            .raw
-            .newBufferWithLength_options(
+            .new_buffer(
                 desc.size as usize,
                 mode | MTLResourceOptions::HazardTrackingModeTracked,
             )
@@ -361,6 +370,31 @@ impl Image {
         if let Some(reason) = self.data.lost.get() {
             return Err(Error::DeviceLost(reason.clone()));
         }
+        let key = (desc.clone(), layout);
+        let mut views = self.data.views.lock().unwrap();
+        if let Some(view) = views.get(&key) {
+            return Ok(self.wrap_view(view.clone()));
+        }
+        let view = self.make_view(desc, layout)?;
+        views.insert(key, view.clone());
+        Ok(self.wrap_view(view))
+    }
+
+    fn wrap_view(&self, view: View) -> crate::ImageView {
+        crate::ImageView {
+            inner: ImageView {
+                raw: view.raw,
+                image: crate::Image {
+                    inner: self.clone(),
+                },
+                size: view.size,
+                depth_plane: view.depth_plane,
+                format: view.format,
+            },
+        }
+    }
+
+    fn make_view(&self, desc: &ViewDesc, layout: ViewLayout) -> Result<View> {
         let image = self.desc();
         if let Some(planes) = &self.data.planes {
             let plane = desc.plane as usize;
@@ -374,19 +408,14 @@ impl Image {
             {
                 return Err(Error::Invalid("NV12 plane view".into()));
             }
-            return Ok(crate::ImageView {
-                inner: ImageView {
-                    raw: planes[plane].clone(),
-                    format: [Format::R8Unorm, Format::Rg8Unorm][plane],
-                    depth_plane: 0,
-                    image: crate::Image {
-                        inner: self.clone(),
-                    },
-                    size: Extent {
-                        width: planes[plane].width() as u32,
-                        height: planes[plane].height() as u32,
-                        depth_or_layers: 1,
-                    },
+            return Ok(View {
+                raw: planes[plane].clone(),
+                format: [Format::R8Unorm, Format::Rg8Unorm][plane],
+                depth_plane: 0,
+                size: Extent {
+                    width: planes[plane].width() as u32,
+                    height: planes[plane].height() as u32,
+                    depth_or_layers: 1,
                 },
             });
         }
@@ -491,6 +520,11 @@ impl Image {
             }
         }
         .ok_or_else(|| Error::Invalid("incompatible Metal texture view".into()))?;
+        #[cfg(feature = "counters")]
+        self.data
+            .creations
+            .image_views
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let size = Extent {
             width: (image.size.width >> desc.mips.start).max(1),
             height: (image.size.height >> desc.mips.start).max(1),
@@ -500,19 +534,14 @@ impl Image {
                 desc.layers.len() as u32
             },
         };
-        Ok(crate::ImageView {
-            inner: ImageView {
-                raw,
-                image: crate::Image {
-                    inner: self.clone(),
-                },
-                size,
-                format: view_format,
-                depth_plane: if volume_slice {
-                    desc.layers.start as usize
-                } else {
-                    0
-                },
+        Ok(View {
+            raw,
+            size,
+            format: view_format,
+            depth_plane: if volume_slice {
+                desc.layers.start as usize
+            } else {
+                0
             },
         })
     }

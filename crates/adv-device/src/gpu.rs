@@ -27,12 +27,12 @@ pub use depth::{DepthFormat, Stencil, StencilFace, StencilOp};
 pub use native::test_support;
 
 pub use native::{
-    BlockTexture, BufferRange, BufferWindow, Depth, Dispatch, DispatchArguments, DrawArguments,
-    Expand, ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude, ExpansionRegion,
-    ExpansionWindow, Gpu, Image, ImageAlias, ImageId, ImageRegion, ModernColor, ModernDepth,
-    ModernDraw, ModernShader, ModernTransfer, Predicate, QuerySlot, Readback, SlotBindings, Staged,
-    StorageBinding, Target, TimestampDisjoint, TransferBuffer, UniformWindow, decode_bc,
-    decoded_bc_format,
+    BlockTexture, BufferRange, BufferWindow, CapturedWindow, Depth, Dispatch, DispatchArguments,
+    DrawArguments, Expand, ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude,
+    ExpansionRegion, ExpansionWindow, Gpu, Image, ImageAlias, ImageId, ImageRegion, ModernColor,
+    ModernDepth, ModernDraw, ModernShader, ModernTransfer, Predicate, QuerySlot, Readback,
+    SlotBindings, Staged, StorageBinding, Target, TimestampDisjoint, TransferBuffer, UniformWindow,
+    decode_bc, decoded_bc_format,
 };
 pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,

@@ -94,14 +94,14 @@ impl Image {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ViewLayout {
     /// Keep a one-layer slice arrayed when the shader declares an array.
     pub array: bool,
     pub components: ViewComponents,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ViewComponents {
     #[default]
     Identity,

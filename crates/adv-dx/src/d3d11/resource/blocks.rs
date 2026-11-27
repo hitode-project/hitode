@@ -91,8 +91,9 @@ impl Blocks {
             let pixels = adv_device::gpu::decode_bc(bc, extent, bytes).unwrap();
             let row = pixels.len() as u32 / (extent.height * extent.depth_or_layers);
             let source = transfer_buffer(gpu, row, extent.height, extent.depth_or_layers, &pixels)?;
-            gpu.transfer(adv_device::gpu::ModernTransfer::Upload {
+            gpu.transfer(adv_device::gpu::ModernTransfer::UploadStaged {
                 source,
+                rows: extent.height,
                 destination,
             })?;
         }

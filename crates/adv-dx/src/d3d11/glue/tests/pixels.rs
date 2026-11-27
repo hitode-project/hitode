@@ -102,7 +102,7 @@ fn update_dynamic<T: Pod>(
     method(machine, context, 15, &[resource, 0]);
 }
 
-// spec: GFX-INPUT-1 GFX-REC-1 GFX-RES-1
+// spec: GFX-INPUT-1 GFX-REC-1 GFX-REC-7 GFX-RES-1
 #[test]
 fn windows_fill_and_sampling_rows_through_guest_vtables() {
     let mut machine = machine();
@@ -280,16 +280,14 @@ fn windows_fill_and_sampling_rows_through_guest_vtables() {
     for (format, offset) in [(57, 2), (42, 4)] {
         let indices = [0u32, 0, 1, 2, 3, 4, 5, 6];
         let index = buffer(&mut machine, device, Bind::INDEX, 32);
-        if format == 57 {
-            update_dynamic(
-                &mut machine,
-                context,
-                index,
-                &indices.map(|index| index as u16),
-            );
-        } else {
-            update_dynamic(&mut machine, context, index, &indices);
-        }
+        let restore_indices = |machine: &mut Machine<JitCpu>| {
+            if format == 57 {
+                update_dynamic(machine, context, index, &indices.map(|index| index as u16));
+            } else {
+                update_dynamic(machine, context, index, &indices);
+            }
+        };
+        restore_indices(&mut machine);
         assert_eq!(
             method(&mut machine, context, 19, &[index, format, offset]),
             0
@@ -299,8 +297,45 @@ fn windows_fill_and_sampling_rows_through_guest_vtables() {
             method(&mut machine, context, 20, &[6, 2, 1, u32::MAX, 3]),
             0
         );
+        assert_eq!(method(&mut machine, context, 111, &[]), 0);
+        #[cfg(feature = "d3d9-counters")]
+        let before = gpu::capture_counters(&machine.ext).unwrap();
+        assert_eq!(
+            method(&mut machine, context, 20, &[6, 2, 1, u32::MAX, 3]),
+            0
+        );
+        #[cfg(feature = "d3d9-counters")]
+        {
+            let after = gpu::capture_counters(&machine.ext).unwrap();
+            assert_eq!(after.captures_reused - before.captures_reused, 2);
+            assert_eq!(after.ring_bytes, before.ring_bytes);
+        }
         assert_eq!(method(&mut machine, context, 47, &[staging, rt]), 0);
         assert_rows(&mut machine, context, staging, "quad-1-1-5-5", 0);
+
+        let mapped = map(&mut machine, context, index, 5);
+        if format == 57 {
+            write_value(&mut machine, mapped.pData + 2 * offset, [1u16; 6]);
+        } else {
+            write_value(&mut machine, mapped.pData + 2 * offset, [1u32; 6]);
+        }
+        assert_eq!(method(&mut machine, context, 15, &[index, 0]), 0);
+        assert_eq!(method(&mut machine, context, 50, &[rtv, DESCRIPTOR]), 0);
+        assert_eq!(
+            method(&mut machine, context, 20, &[6, 2, 1, u32::MAX, 3]),
+            0
+        );
+        assert_eq!(method(&mut machine, context, 47, &[staging, rt]), 0);
+        let mapped = map(&mut machine, context, staging, 1);
+        assert_eq!(
+            machine
+                .cpu
+                .read_u32(mapped.pData + 2 * mapped.RowPitch + 8)
+                .unwrap(),
+            0
+        );
+        assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
+        restore_indices(&mut machine);
     }
 
     write_value(&mut machine, ARRAY + 8, 0u32);
@@ -726,7 +761,8 @@ fn guest_swap_chain_presents_the_back_buffer_and_resizes_after_release() {
                 minimized: false,
             })
         },
-        |_, _, _| Ok(()),
+        |env, _, _, then| then(env, adv_machine::Resume::Returned(1)),
+        None,
     );
 
     let swap_output = OUT + 32;
@@ -1222,7 +1258,8 @@ fn alt_enter_respects_window_association_and_toggles_exclusive_mode() {
                 minimized: false,
             })
         },
-        |_, _, _| Ok(()),
+        |env, _, _, then| then(env, adv_machine::Resume::Returned(1)),
+        None,
     );
     write_value(
         &mut machine,
@@ -1297,16 +1334,26 @@ fn presented_device(
     u32,
     std::sync::mpsc::Receiver<adv_device::frame::test_support::CapturedFrame>,
 ) {
+    let (presenter, frames) = adv_device::frame::test_support::CapturePresenter::new();
+    let (chain, device, context) =
+        presented_device_with(machine, Box::new(presenter), adv_gpu::caps::Modern::empty());
+    (chain, device, context, frames)
+}
+
+fn presented_device_with(
+    machine: &mut Machine<JitCpu>,
+    presenter: Box<dyn adv_device::frame::Presenter>,
+    disable: adv_gpu::caps::Modern,
+) -> (u32, u32, u32) {
     use adv_abi::types::{DXGI_MODE_DESC, DXGI_SWAP_CHAIN_DESC};
-    use adv_device::frame::test_support::CapturePresenter;
-    let (presenter, frames) = CapturePresenter::new();
     let (hardware, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
         software: !cfg!(target_vendor = "apple"),
         validation: true,
+        disable,
         ..Default::default()
     })
     .unwrap();
-    let gpu = Gpu::request_with_presenter(hardware, queue, Box::new(presenter)).unwrap();
+    let gpu = Gpu::request_with_presenter(hardware, queue, presenter).unwrap();
     machine.ext.get_mut::<State>().execution = Some(gpu::Execution::new(gpu));
     configure_swap_chains(
         machine,
@@ -1317,7 +1364,8 @@ fn presented_device(
                 minimized: false,
             })
         },
-        |_, _, _| Ok(()),
+        |env, _, _, then| then(env, adv_machine::Resume::Returned(1)),
+        None,
     );
     write_value(
         machine,
@@ -1368,8 +1416,253 @@ fn presented_device(
         machine.cpu.read_u32(OUT + 4).unwrap(),
         machine.cpu.read_u32(OUT).unwrap(),
         machine.cpu.read_u32(CONTEXT).unwrap(),
-        frames,
     )
+}
+
+// spec: GFX-REC-7 GFX-REC-8 GFX-SAMPLER-4
+#[cfg(feature = "d3d9-counters")]
+#[test]
+fn guest_draw_uploads_reuse_gpu_objects() {
+    draw_uploads(adv_gpu::caps::Modern::empty());
+}
+
+// spec: GFX-REC-7 GFX-REC-8
+#[cfg(all(feature = "d3d9-counters", not(target_vendor = "apple")))]
+#[test]
+fn guest_draw_uploads_reuse_cached_descriptor_sets() {
+    use adv_gpu::caps::Modern;
+    draw_uploads(Modern::BINDLESS | Modern::PUSH_DESCRIPTORS);
+}
+
+#[cfg(feature = "d3d9-counters")]
+fn draw_uploads(disable: adv_gpu::caps::Modern) {
+    use adv_device::frame::{Base, Frame, Presenter, Waker};
+    use std::{sync::mpsc, time::Duration};
+
+    struct Frames {
+        sender: mpsc::Sender<u64>,
+        serial: Option<u64>,
+    }
+    impl Presenter for Frames {
+        fn presentable(&self, _: u32, _: u32) -> bool {
+            false
+        }
+
+        fn present(&mut self, queue: &mut adv_gpu::Queue, frame: Frame) {
+            let Base::Gpu { ready, .. } = frame.base else {
+                panic!("expected a GPU frame");
+            };
+            assert!(queue.wait(ready, Duration::from_secs(20)).unwrap());
+            self.serial = Some(frame.serial);
+        }
+
+        fn service(&mut self, _: &mut adv_gpu::Queue, _: Option<&Waker>) {
+            // The owner has polled completion and released this frame's uploads.
+            if let Some(serial) = self.serial.take() {
+                self.sender.send(serial).unwrap();
+            }
+        }
+    }
+
+    let mut machine = machine();
+    let (sender, frames) = mpsc::channel();
+    let presenter = Frames {
+        sender,
+        serial: None,
+    };
+    let (chain, device, context) =
+        presented_device_with(&mut machine, Box::new(presenter), disable);
+    machine.cpu.map(CODE_BYTES, 4096, Prot::RW).unwrap();
+    machine.cpu.write(ARRAY, b"POSITION\0TEXCOORD\0").unwrap();
+    let elements = [
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: ARRAY,
+            Format: 2,
+            ..Default::default()
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: ARRAY + 9,
+            Format: 16,
+            AlignedByteOffset: 16,
+            ..Default::default()
+        },
+    ];
+    let vs_bytes = include_bytes!("../../../../tests/fixtures/shader-core/vs_5_0.dxbc");
+    machine.cpu.write(CODE_BYTES, vs_bytes).unwrap();
+    machine
+        .cpu
+        .write(DESCRIPTOR, bytemuck::cast_slice(&elements))
+        .unwrap();
+    let layout = create_object(
+        &mut machine,
+        device,
+        11,
+        &[DESCRIPTOR, 2, CODE_BYTES, vs_bytes.len() as u32],
+    );
+    let vs = create_object(
+        &mut machine,
+        device,
+        12,
+        &[CODE_BYTES, vs_bytes.len() as u32, 0],
+    );
+    let ps_bytes = include_bytes!("../../../../tests/fixtures/d3d11/guest_texel_load.dxbc");
+    machine.cpu.write(CODE_BYTES, ps_bytes).unwrap();
+    let ps = create_object(
+        &mut machine,
+        device,
+        15,
+        &[CODE_BYTES, ps_bytes.len() as u32, 0],
+    );
+    let vb = buffer(&mut machine, device, Bind::VERTEX, 192);
+    let ib = buffer(&mut machine, device, Bind::INDEX, 24);
+    let vs_constant = buffer(&mut machine, device, Bind::CONSTANT, 32);
+    let ps_constant = buffer(&mut machine, device, Bind::CONSTANT, 16);
+    update_dynamic(
+        &mut machine,
+        context,
+        vs_constant,
+        &[2.0f32 / 32., -2. / 24., 1., 1., -1., 1., 0., 0.],
+    );
+    update_dynamic(&mut machine, context, ps_constant, &[0.0f32; 4]);
+    let default = texture(&mut machine, device, 0, Bind::SHADER, 0, 0, 1);
+    let dynamic = texture(&mut machine, device, 2, Bind::SHADER, 0x10000, 0, 1);
+    let views =
+        [default, dynamic].map(|texture| create_object(&mut machine, device, 7, &[texture, 0]));
+
+    machine.cpu.write(IID, &IID_ID3D11TEXTURE2D).unwrap();
+    assert_eq!(method(&mut machine, chain, 9, &[0, IID, OUT]), 0);
+    let back = machine.cpu.read_u32(OUT).unwrap();
+    let target = create_object(&mut machine, device, 9, &[back, 0]);
+    let raster = D3D11_RASTERIZER_DESC {
+        FillMode: 3,
+        CullMode: 1,
+        DepthClipEnable: 1,
+        ..Default::default()
+    };
+    write_value(&mut machine, DESCRIPTOR, raster);
+    let raster = create_object(&mut machine, device, 22, &[DESCRIPTOR]);
+    let call = |machine: &mut Machine<JitCpu>, slot, args: &[u32]| {
+        assert_eq!(
+            method(machine, context, slot, args),
+            0,
+            "context slot {slot}"
+        );
+    };
+    write_value(
+        &mut machine,
+        ARRAY,
+        [vb, 24, 0, vs_constant, ps_constant, target],
+    );
+    call(&mut machine, 7, &[0, 1, ARRAY + 12]);
+    call(&mut machine, 9, &[ps, 0, 0]);
+    call(&mut machine, 11, &[vs, 0, 0]);
+    call(&mut machine, 16, &[0, 1, ARRAY + 16]);
+    call(&mut machine, 17, &[layout]);
+    call(&mut machine, 18, &[0, 1, ARRAY, ARRAY + 4, ARRAY + 8]);
+    call(&mut machine, 19, &[ib, 57, 0]);
+    call(&mut machine, 24, &[4]);
+    call(&mut machine, 33, &[1, ARRAY + 20, 0]);
+    call(&mut machine, 43, &[raster]);
+    write_value(
+        &mut machine,
+        DESCRIPTOR,
+        D3D11_VIEWPORT {
+            Width: 32.,
+            Height: 24.,
+            MaxDepth: 1.,
+            ..Default::default()
+        },
+    );
+    call(&mut machine, 44, &[1, DESCRIPTOR]);
+
+    const WARMUP: u64 = 16;
+    const FRAMES: u64 = 240;
+    const DRAWS: u64 = 64;
+    let render = |machine: &mut Machine<JitCpu>, frame: u64| {
+        write_value(machine, ARRAY, [frame as u8, 128, 0, 255]);
+        call(machine, 48, &[default, 0, 0, ARRAY, 4, 4]);
+        update_dynamic(machine, context, dynamic, &[[0u8, frame as u8, 128, 255]]);
+        for (side, view) in views.into_iter().enumerate() {
+            let left = 16. * side as f32;
+            let v = |x, y| [x, y, 0.5, 1., 0., 0.];
+            let vertices = [
+                v(left, 0.),
+                v(left + 16., 0.),
+                v(left, 24.),
+                v(left + 16., 24.),
+            ];
+            let access = 4 + side as u32;
+            let mapped = map(machine, context, vb, access);
+            write_value(machine, mapped.pData + 96 * side as u32, vertices);
+            call(machine, 15, &[vb, 0]);
+            let mapped = map(machine, context, ib, access);
+            write_value(
+                machine,
+                mapped.pData + 12 * side as u32,
+                [0u16, 1, 2, 2, 1, 3],
+            );
+            call(machine, 15, &[ib, 0]);
+            write_value(machine, ARRAY, view);
+            call(machine, 8, &[0, 1, ARRAY]);
+            for _ in 0..DRAWS / 2 {
+                call(machine, 12, &[6, 6 * side as u32, 4 * side as u32]);
+            }
+        }
+        assert_eq!(method(machine, chain, 8, &[0, 0]), 0);
+        assert_eq!(frames.recv_timeout(Duration::from_secs(20)).unwrap(), frame);
+    };
+    for frame in 1..=WARMUP {
+        render(&mut machine, frame);
+    }
+    let before = gpu::capture_counters(&machine.ext).unwrap();
+    for frame in WARMUP + 1..=WARMUP + FRAMES {
+        render(&mut machine, frame);
+    }
+    let after = gpu::capture_counters(&machine.ext).unwrap();
+    let creations = [
+        after.buffers_created - before.buffers_created,
+        after.device_memory_created - before.device_memory_created,
+        after.image_views_created - before.image_views_created,
+    ];
+    let sets = after.descriptor_sets_allocated - before.descriptor_sets_allocated;
+    let updates = after.descriptor_set_updates - before.descriptor_set_updates;
+    let pushes = after.descriptor_pushes - before.descriptor_pushes;
+    eprintln!(
+        "{FRAMES} frames, {} draws, buffer/memory/view creations {creations:?}, descriptor allocations {sets}, updates {updates}, pushes {pushes}",
+        FRAMES * DRAWS
+    );
+    assert_eq!(creations, [0; 3]);
+    assert!(sets <= 3 * FRAMES && updates <= 3 * FRAMES);
+
+    write_value(
+        &mut machine,
+        DESCRIPTOR,
+        D3D11_TEXTURE2D_DESC {
+            Width: 32,
+            Height: 24,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: 28,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: 3,
+            CPUAccessFlags: 0x20000,
+            ..Default::default()
+        },
+    );
+    let staging = create_object(&mut machine, device, 5, &[DESCRIPTOR, 0]);
+    call(&mut machine, 47, &[staging, back]);
+    let mapped = map(&mut machine, context, staging, 1);
+    let pixel = |x: u32| {
+        GuestPtr::<[u8; 4]>::new(mapped.pData + 12 * mapped.RowPitch + 4 * x)
+            .read(&machine.cpu)
+            .unwrap()
+    };
+    let final_color = (WARMUP + FRAMES) as u8;
+    assert_eq!(pixel(8), [final_color, 128, 0, 255]);
+    assert_eq!(pixel(24), [0, final_color, 128, 255]);
 }
 
 // spec: GFX-REC-2 GFX-REC-3 GFX-REC-5 GFX-PACE-1

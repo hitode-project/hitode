@@ -426,7 +426,7 @@ pub(super) fn finish(env: &mut Env<'_>) -> Result<(), Error> {
         let binding = env
             .sys
             .thunks
-            .published_index(DLL, "ID3D11DeviceContext1::End")
+            .published_index(DLL, "ID3D11DeviceContext2::End")
             .unwrap();
         for pointer in queries {
             recording_mut(env).list.push(Operation::Call(Command {

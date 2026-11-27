@@ -99,50 +99,7 @@ impl crate::dxgi::Devices for OutputDevices {
                     *output.gamma.as_deref().ok_or(Error::InvalidCall)?,
                 )
             }),
-            SetDisplaySurface => call(|| {
-                let device = owned(env)?;
-                let backend = swap_chain::services(env)?;
-                let (surface, parent) = backend.surface_owner(env, first)?;
-                let state = env.ext.get::<State>();
-                if parent != device {
-                    return Err(Error::InvalidCall);
-                }
-                let chain = state
-                    .chains
-                    .values()
-                    .flatten()
-                    .find_map(|&pointer| {
-                        let Kind::SwapChain(chain) = &ops::object(env, pointer).ok()?.kind else {
-                            return None;
-                        };
-                        chain.buffers.contains(&surface).then_some(chain)
-                    })
-                    .ok_or(Error::InvalidCall)?;
-                let serial = state.presentation + 1;
-                let (window, raw, fullscreen) =
-                    (chain.window, chain.description.desc(), chain.fullscreen);
-                let current = mode(env, this)?;
-                let resized = (raw.Width, raw.Height) != (current.Width, current.Height);
-                if resized {
-                    let resize = env.ext.get::<Services>().resize;
-                    resize(
-                        env,
-                        window,
-                        DXGI_MODE_DESC {
-                            Width: raw.Width,
-                            Height: raw.Height,
-                            Format: raw.Format,
-                            RefreshRate: fullscreen.RefreshRate,
-                            ScanlineOrdering: fullscreen.ScanlineOrdering,
-                            Scaling: fullscreen.Scaling,
-                        },
-                    )?;
-                    ops::output_mode_changed(env.ext);
-                }
-                backend.scanout(env, surface, serial)?;
-                env.ext.get_mut::<State>().presentation = serial;
-                Ok(())
-            }),
+            SetDisplaySurface => set_display_surface(env, this, first),
             GetDisplaySurfaceData | GetDisplaySurfaceData1 => {
                 #[cfg(feature = "gpu")]
                 return call(|| display_surface(env, first));
@@ -180,6 +137,74 @@ impl crate::dxgi::Devices for OutputDevices {
             | GetSharedResourceAdapterLuid => ops::device_unavailable(invocation.operation),
         }
     }
+}
+
+fn set_display_surface(env: &mut Env<'_>, this: u32, pointer: u32) -> Outcome {
+    let result = (|| {
+        let device = owned(env)?;
+        let backend = swap_chain::services(env)?;
+        let (surface, parent) = backend.surface_owner(env, pointer)?;
+        if parent != device {
+            return Err(Error::InvalidCall);
+        }
+        let state = env.ext.get::<State>();
+        let chain = state
+            .chains
+            .values()
+            .flatten()
+            .find_map(|&pointer| {
+                let Kind::SwapChain(chain) = &ops::object(env, pointer).ok()?.kind else {
+                    return None;
+                };
+                chain.buffers.contains(&surface).then_some(chain)
+            })
+            .ok_or(Error::InvalidCall)?;
+        let (raw, fullscreen) = (chain.description.desc(), chain.fullscreen);
+        let current = mode(env, this)?;
+        let resize = ((raw.Width, raw.Height) != (current.Width, current.Height)).then_some(
+            DXGI_MODE_DESC {
+                Width: raw.Width,
+                Height: raw.Height,
+                Format: raw.Format,
+                RefreshRate: fullscreen.RefreshRate,
+                ScanlineOrdering: fullscreen.ScanlineOrdering,
+                Scaling: fullscreen.Scaling,
+            },
+        );
+        Ok::<_, Error>((backend, surface, chain.window, resize))
+    })();
+    let (backend, surface, window, resize) = match result {
+        Ok(args) => args,
+        Err(error) => return Outcome::Return(error.hresult()),
+    };
+    let scanout = move |env: &mut Env<'_>| {
+        let result = (|| {
+            let serial = env.ext.get::<State>().presentation + 1;
+            let completed = backend.scanout(env, surface, serial)?;
+            env.ext.get_mut::<State>().presentation = serial;
+            Ok::<_, Error>(completed)
+        })();
+        match result {
+            Ok(completed) => swap_chain::complete_present(env, window, completed),
+            Err(error) => Outcome::Return(error.hresult()),
+        }
+    };
+    let Some(mode) = resize else {
+        return scanout(env);
+    };
+    let resize = env.ext.get::<Services>().resize;
+    resize(
+        env,
+        window,
+        mode,
+        Box::new(move |env, result| {
+            if result.value() == 0 {
+                return Outcome::Return(Error::InvalidCall.hresult());
+            }
+            ops::output_mode_changed(env.ext);
+            scanout(env)
+        }),
+    )
 }
 
 #[cfg(feature = "gpu")]

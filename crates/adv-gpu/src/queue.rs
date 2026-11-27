@@ -45,6 +45,35 @@ pub struct AdapterIdentity {
     pub tier: String,
 }
 
+#[cfg(feature = "counters")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceCreations {
+    pub buffers: u64,
+    pub image_views: u64,
+    /// Vulkan memory blocks (including imports), or Metal-owned backing allocations.
+    pub device_memory: u64,
+}
+
+#[cfg(feature = "counters")]
+#[derive(Default)]
+pub(crate) struct CreationCounters {
+    pub(crate) buffers: std::sync::atomic::AtomicU64,
+    pub(crate) image_views: std::sync::atomic::AtomicU64,
+    pub(crate) device_memory: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "counters")]
+impl CreationCounters {
+    pub(crate) fn read(&self) -> ResourceCreations {
+        use std::sync::atomic::Ordering::Relaxed;
+        ResourceCreations {
+            buffers: self.buffers.load(Relaxed),
+            image_views: self.image_views.load(Relaxed),
+            device_memory: self.device_memory.load(Relaxed),
+        }
+    }
+}
+
 impl Device {
     /// Open the platform's device and its queue.
     pub fn open(options: &DeviceOptions) -> Result<(Device, Queue)> {
@@ -59,6 +88,20 @@ impl Device {
     ) -> Result<T> {
         imp::Device::open_with(options, &mut init)
     }
+    #[cfg(feature = "counters")]
+    pub fn resource_creations(&self) -> ResourceCreations {
+        self.inner.resource_creations()
+    }
+
+    /// Vulkan descriptor sets allocated, update calls, and push calls, respectively.
+    #[cfg(feature = "counters")]
+    pub fn descriptor_work(&self) -> (u64, u64, u64) {
+        #[cfg(not(target_vendor = "apple"))]
+        return self.inner.descriptor_work();
+        #[cfg(target_vendor = "apple")]
+        (0, 0, 0)
+    }
+
     pub fn adapter_identity(&self) -> AdapterIdentity {
         self.inner.adapter_identity()
     }

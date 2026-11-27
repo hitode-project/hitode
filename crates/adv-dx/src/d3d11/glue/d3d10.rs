@@ -400,7 +400,7 @@ fn context_call(env: &mut Env<'_>, method: &'static str) -> Outcome {
     };
     invoke(
         env,
-        "ID3D11DeviceContext1",
+        "ID3D11DeviceContext2",
         method,
         args,
         move |env, result| {
@@ -522,7 +522,7 @@ fn query_call(env: &mut Env<'_>, method: &str) -> Outcome {
         .immediate()
         .unwrap();
     args.insert(0, immediate);
-    invoke(env, "ID3D11DeviceContext1", method, args, |_, result| {
+    invoke(env, "ID3D11DeviceContext2", method, args, |_, result| {
         Outcome::Return(result)
     })
 }
@@ -684,7 +684,7 @@ fn device_call(env: &mut Env<'_>, method: &'static str) -> Outcome {
     };
     invoke(
         env,
-        "ID3D11Device1",
+        "ID3D11Device2",
         core_method,
         args,
         move |env, result| {
