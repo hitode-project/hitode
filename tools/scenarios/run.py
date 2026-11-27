@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from pathlib import Path
@@ -33,7 +34,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "wine"))
 import probes  # noqa: E402
-from work import estimate as estimate_work  # noqa: E402
+from work import measure  # noqa: E402
 
 SCENARIOS = Path("tests/scenarios")
 # Per-iteration growth a steady counter may gain on head over base: the
@@ -95,12 +96,14 @@ def counters(report: dict) -> dict[str, int]:
     return found
 
 
-def execute(scenario: dict, binary: Path, wine: Path, work: Path, iterations: int | None) -> dict:
+def execute(scenario: dict, binary: Path, wine: Path, work: Path) -> dict:
     game = work / "game"
     game.mkdir(parents=True)
     build(scenario, game)
-    if iterations is not None:
-        (game / "scenario-input.txt").write_text(f"{iterations}\n")
+    steady = scenario.get("steady")
+    if steady:
+        low, high = steady["iterations"]
+        (game / "scenario-input.txt").write_text(f"{high} 0 {low}\n")
     report = work / "report.json"
     command = [
         str(binary), "--headless", "--seconds", str(scenario.get("seconds", 60)),
@@ -108,10 +111,10 @@ def execute(scenario: dict, binary: Path, wine: Path, work: Path, iterations: in
         *scenario.get("args", []), "--exe", str(game / scenario["exe"]),
     ]
     env = dict(os.environ, ADV_AUDIO_MUTE_DEVICE="1")
-    layout = scenario.get("steady", {}).get("kernel_work")
-    if layout:
+    if steady:
         env["ADV_JIT_MAP_DIR"] = str(work / "jit")
     log = work / "log.txt"
+    start = time.monotonic()
     with log.open("w") as sink:
         process = subprocess.Popen(command, stdout=sink, stderr=subprocess.STDOUT, env=env)
         # A hung build ignores its own time limit; the scenario's is final.
@@ -120,6 +123,7 @@ def execute(scenario: dict, binary: Path, wine: Path, work: Path, iterations: in
         _, _, usage = os.wait4(process.pid, 0)
         timer.cancel()
         process.returncode = 0
+    seconds = time.monotonic() - start
     data = json.loads(report.read_text()) if report.exists() else {}
     data["peak_rss"] = usage.ru_maxrss * (1 if sys.platform == "darwin" else 1024)
     outputs = {}
@@ -133,6 +137,7 @@ def execute(scenario: dict, binary: Path, wine: Path, work: Path, iterations: in
         "passed": data.get("stop_reason") == "guest_exit" and exit_code == 0,
         "exit": exit_code,
         "stop": data.get("stop_reason"),
+        "seconds": seconds,
         "outputs": outputs,
         "counters": counters(data),
         "log": log.read_text(errors="replace")[-2000:],
@@ -141,39 +146,25 @@ def execute(scenario: dict, binary: Path, wine: Path, work: Path, iterations: in
 
 def run_one(scenario: dict, binary: Path, wine: Path) -> dict:
     with tempfile.TemporaryDirectory(prefix="adv-scenario-") as scratch:
+        directory = Path(scratch)
         steady = scenario.get("steady")
         try:
-            if not steady:
-                result = execute(scenario, binary, wine, Path(scratch) / "run", None)
-                result["levels"] = {n: result["counters"].get(n, 0) for n in scenario.get("levels", [])}
-                result["min"] = {n: result["counters"].get(n, 0) for n in scenario.get("min", {})}
-                return result
-            low, high = steady["iterations"]
-            first = execute(scenario, binary, wine, Path(scratch) / "low", low)
-            result = execute(scenario, binary, wine, Path(scratch) / "high", high)
+            result = execute(scenario, binary, wine, directory)
+            if result["passed"] and steady:
+                counts, decisions = measure(directory / "jit", directory / "game" / scenario["exe"],
+                                            probes.COMPILER, steady)
+                low, high = steady["iterations"]
+                result["steady"] = {name: counts[name] / (high - low)
+                                    for name in steady.get("counters", [])}
+                result["steady_min"] = {name: counts[name] / (high - low)
+                                        for name in steady.get("min", {})}
+                if decisions:
+                    result["split_policy"] = decisions
         except RuntimeError as error:
             return {"passed": False, "exit": None, "stop": "error", "outputs": {},
                     "counters": {}, "log": str(error)}
-        result["passed"] = result["passed"] and first["passed"]
-        if result["passed"] and (layout := steady.get("kernel_work")):
-            directory = Path(scratch)
-            runs = [(n, json.loads((directory / p / "report.json").read_text()))
-                    for n, p in ((low, "low"), (high, "high"))]
-            high_run = directory / "high"
-            prices = estimate_work(high_run / "jit", high_run / "game" / scenario["exe"],
-                                   probes.COMPILER, layout, runs)
-            for run, counts in zip((first, result), prices):
-                run["counters"].update(counts)
         result["levels"] = {n: result["counters"].get(n, 0) for n in scenario.get("levels", [])}
         result["min"] = {n: result["counters"].get(n, 0) for n in scenario.get("min", {})}
-        result["steady"] = {
-            name: (result["counters"].get(name, 0) - first["counters"].get(name, 0)) / (high - low)
-            for name in steady.get("counters", [])
-        }
-        result["steady_min"] = {
-            name: (result["counters"].get(name, 0) - first["counters"].get(name, 0)) / (high - low)
-            for name in steady.get("min", {})
-        }
         return result
 
 
@@ -225,7 +216,10 @@ def exceeds(before: float, value: float) -> bool:
 
 
 def check_floors(name: str, scenario: dict, res: dict, suffix: str = "") -> list[str]:
-    errors = []
+    errors = [
+        f"{name}: priced split chose {row['choice']}, expected {row['expected']}{suffix}"
+        for row in res.get("split_policy", []) if row["choice"] != row["expected"]
+    ]
     for kind, spec_floors, unit in (
         ("min", scenario.get("min", {}), ""),
         ("steady_min", scenario.get("steady", {}).get("min", {}), " per iteration"),

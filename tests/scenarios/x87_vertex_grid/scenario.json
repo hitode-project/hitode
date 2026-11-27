@@ -7,10 +7,9 @@
   "steady": {
     "iterations": [8, 16],
     "counters": [
-      "owner_retired", "kernel_host_words", "kernel_tier1_cells",
+      "kernel_host_words", "kernel_tier1_cells",
       "kernel_x87_entries", "kernel_x87_publications", "kernel_control_updates",
-      "x87_value_completions", "x87_value_dispatches",
-      "interpreter_instructions", "native_entries", "native_exits", "resident_cold_exits"
+      "value_calls", "interprets", "interpreted_exits", "resident_cold_exits"
     ],
     "min": {
       "kernel_resident_cells": 45000

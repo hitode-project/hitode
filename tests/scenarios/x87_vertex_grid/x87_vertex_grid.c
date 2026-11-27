@@ -256,9 +256,9 @@ int main(void)
         {grid_down, 17, 1}, {grid_up, 17, 2}, {grid_call, 17, 3},
         {grid_single, 17, 3}, {grid_heap, 17, 3},
     };
-    unsigned iterations, selected = 0;
+    unsigned iterations, selected = 0, warmup = 0;
     FILE *input = fopen("scenario-input.txt", "r");
-    if (!input || fscanf(input, "%u %u", &iterations, &selected) < 1 ||
+    if (!input || fscanf(input, "%u %u %u", &iterations, &selected, &warmup) < 1 ||
         !iterations || selected > sizeof(variants) / sizeof(variants[0])) return 2;
     fclose(input);
     FILE *out = fopen("x87-vertex-grid.bin", "wb");
@@ -269,13 +269,18 @@ int main(void)
     for (unsigned v = 0; v < sizeof(variants) / sizeof(variants[0]); v++) {
         if (selected && selected != v + 1) continue;
         Corners c;
-        for (unsigned frame = 0; frame < iterations; frame++)
+        for (unsigned frame = 0; frame < iterations; frame++) {
+            if (warmup && frame == warmup)
+                __asm__ volatile("int 0x2d" : : "a"(0x4849544f), "c"(2 * v) : "memory");
             for (unsigned call = 0; call < CALLS; call++) {
                 unsigned seed = call + v;
                 for (unsigned i = 0; i < sizeof(c.sample); i++)
                     c.sample[i] = (uint8_t)(seed * 3 + i * 29);
                 variants[v].run(grid, c, variants[v].cols);
             }
+        }
+        if (warmup)
+            __asm__ volatile("int 0x2d" : : "a"(0x4849544f), "c"(2 * v + 1) : "memory");
         if (!verify(out, grid, c, variants[v].cols, variants[v].rc)) return 4 + v;
     }
     free(grid);

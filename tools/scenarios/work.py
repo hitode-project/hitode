@@ -26,8 +26,102 @@ def resident_trips(calls: int, trips: int, arrivals: int, tier1_hits: int | None
     return direct * trips + backedge * (trips - 1)
 
 
+def symbols(exe: Path, compiler: str) -> dict[str, int]:
+    output = subprocess.check_output([compiler.removesuffix("gcc") + "nm", "-n", str(exe)], text=True)
+    return {fields[2]: int(fields[0], 16) for line in output.splitlines()
+            if len(fields := line.split()) == 3}
+
+
+SITE = re.compile(r" (access|checked_fault|helper_exit|resident_cold_exit|interpreter|value) "
+                  r"(0x[0-9a-f]+)(?: (\w+(?:\(\d+\))?))?=(\d+)")
+METRICS = {
+    "access": "accesses", "checked_fault": "checked_faults",
+    "helper_exit": "helper_exits", "resident_cold_exit": "resident_cold_exits",
+    "value": "value_calls",
+}
+INTERPRETER_METRICS = {"Fetch": "interprets", "HostFault": "faults", "OperandFault": "faults"}
+
+
+def site_counts(diagnostics: str, limits: list[tuple[int, int]]) -> Counter:
+    counts = Counter()
+    for event, pc, cause, count in SITE.findall(diagnostics):
+        if any(lo <= int(pc, 16) < hi for lo, hi in limits):
+            metric = (METRICS[event] if event != "interpreter"
+                      else INTERPRETER_METRICS.get(cause, "interpreted_exits"))
+            counts[metric] += int(count)
+    return counts
+
+
+def split_choice(iterations: int, retired: int, ns: float, wake: int, work: int,
+                 last: int, saved: int, limit: int, idle: int) -> tuple[int, int]:
+    """Replay the block policy from its price, frame pace and available helpers."""
+    serial = iterations * ns
+    need = min(int(serial), max(0, max(last, work + int(serial)) - limit - saved))
+    worth = max(0, int((serial - wake) / (4 * wake) - 1))
+    most = min(idle, worth)
+    if not need or not most:
+        return 0, 0
+    slice_iterations = max(1, 65536 // retired)
+    helpers = most
+    for count in range(1, most + 1):
+        part = (serial - wake) / (count + 1)
+        if wake + part + min(part / 4, slice_iterations * ns) + 10000 <= serial - need:
+            helpers = count
+            break
+    blocks = 4 * (helpers + 1)
+    return helpers, min(slice_iterations, (iterations + blocks - 1) // blocks)
+
+
+def measure(mapping: Path, exe: Path, compiler: str, steady: dict) -> tuple[Counter, list[dict]]:
+    rows = [line.split("\t", 3) for file in mapping.glob("opt-*.tsv")
+            for line in file.read_text().splitlines()]
+    marks = {int(row[3].split("\t", 1)[0]): row[3].split("\t", 1)[1]
+             for row in rows if len(row) == 4 and row[2] == "mark"}
+    layout = steady.get("kernel_work")
+    expected = 2 * len(layout["kernels"]) if layout else 2
+    if marks.keys() != set(range(expected)):
+        raise RuntimeError(f"expected {expected} measurement marks, received {sorted(marks)}")
+    names = symbols(exe, compiler)
+    def limits(regions):
+        return [(names[name], names[name + "_end"]) for name in regions]
+
+    low, high = steady["iterations"]
+    totals = Counter()
+    if layout:
+        totals.update(estimate(mapping, exe, compiler, layout, names, (low, high), marks))
+        for index, kernel in enumerate(layout["kernels"]):
+            regions = [kernel[0], *(name for caller, name, _ in layout.get("callees", [])
+                                    if caller == kernel[0])]
+            totals.update(site_counts(marks[2 * index + 1], limits(regions)))
+            totals.subtract(site_counts(marks[2 * index], limits(regions)))
+    else:
+        regions = limits(steady["regions"])
+        totals.update(site_counts(marks[1], regions))
+        totals.subtract(site_counts(marks[0], regions))
+    decisions = []
+    if name := steady.get("split_policy"):
+        lo, hi = limits([name])[0]
+        for row in rows:
+            if len(row) != 4 or row[2] != "split_price" or not lo <= int(row[1]) < hi:
+                continue
+            trips, retired, ns, wake, work, last, saved, limit, idle, helpers, size = row[3].split("\t")
+            inputs = (int(trips), int(retired), float(ns), int(wake), int(work),
+                      int(last), int(saved), int(limit), int(idle))
+            actual = (int(helpers), int(size))
+            decisions.append({
+                "inputs": dict(zip(("iterations", "retired_per_iteration", "ns_per_iteration",
+                                    "wake_ns", "work_ns", "last_ns", "saved_ns", "limit_ns",
+                                    "idle_helpers"), inputs)),
+                "choice": actual,
+                "expected": split_choice(*inputs),
+            })
+        if not decisions:
+            raise RuntimeError(f"no priced split decisions for {name}")
+    return totals, decisions
+
+
 def estimate(mapping: Path, exe: Path, compiler: str, layout: dict,
-             runs: list[tuple[int, dict]]) -> list[dict[str, int]]:
+             names: dict[str, int], iterations: tuple[int, int], marks: dict[int, str]) -> Counter:
     """Price straight-line kernel phases with deterministic trip counts.
 
     Resident entries at each loop head are priced from direct entries
@@ -36,8 +130,6 @@ def estimate(mapping: Path, exe: Path, compiler: str, layout: dict,
     emission. The runner's existing counters account for work outside it.
     """
     maps = list(mapping.glob("insn-*.tsv"))
-    if not maps:
-        return [{} for _ in runs]
     programs = {}
     for path in maps:
         for line in path.with_name(path.name.replace("insn-", "jit-")).read_text().splitlines():
@@ -52,9 +144,6 @@ def estimate(mapping: Path, exe: Path, compiler: str, layout: dict,
                 resident_cost[int(fields[1])] = (int(fields[3]), int(fields[4]))
 
     prefix = compiler.removesuffix("gcc")
-    symbols = subprocess.check_output([prefix + "nm", "-n", str(exe)], text=True)
-    names = {fields[2]: int(fields[0], 16) for line in symbols.splitlines()
-             if len(fields := line.split()) == 3}
     limits = [(names[name], names[name + "_end"]) for name, _ in layout["kernels"]]
     for _, name, _ in layout.get("callees", []):
         limits.append((names[name], names[name + "_end"]))
@@ -102,21 +191,21 @@ def estimate(mapping: Path, exe: Path, compiler: str, layout: dict,
             cost["kernel_control_updates"] += int(mode == "a64" and pc in control)
         return cost
 
-    def count(iterations: int, report: dict) -> dict[str, int]:
-        diagnostics = report.get("a64_diagnostics", "")
-        entries = {int(pc, 16): int(count) for pc, count in re.findall(
-            r"span (0x[0-9a-f]+)=\[entries (\d+)", diagnostics)}
-        tier1 = {
-            int(pc, 16): sum(int(n) for n in re.findall(r"\d+", counts))
-            for pc, counts in re.findall(
-                r"(0x[0-9a-f]+)=\[builds \d+, misses \d+, joins \d+, versions \d+, arrivals \[([^\]]*)\]",
-                diagnostics,
-            )
-        }
+    def count(iterations: int, endpoint: int) -> Counter:
         calls = iterations * layout["calls"]
         rows = calls * layout["rows"]
         totals = Counter()
-        for name, columns in layout["kernels"]:
+        for index, (name, columns) in enumerate(layout["kernels"]):
+            diagnostics = marks[2 * index + endpoint]
+            entries = {int(pc, 16): int(count) for pc, count in re.findall(
+                r"span (0x[0-9a-f]+)=\[entries (\d+)", diagnostics)}
+            tier1 = {
+                int(pc, 16): sum(int(n) for n in re.findall(r"\d+", counts))
+                for pc, counts in re.findall(
+                    r"(0x[0-9a-f]+)=\[builds \d+, misses \d+, joins \d+, versions \d+, arrivals \[([^\]]*)\]",
+                    diagnostics,
+                )
+            }
             row, col, col_end, row_end, end = (names[name + suffix] for suffix in
                                               ("_row", "_col", "_col_end", "_row_end", "_end"))
             row_arrivals = min(calls, entries.get(row, 0))
@@ -166,6 +255,9 @@ def estimate(mapping: Path, exe: Path, compiler: str, layout: dict,
                                             resident_rows + boundary * row_arrivals)
             for counter in ("kernel_x87_entries", "kernel_x87_publications", "kernel_control_updates"):
                 totals[counter] += row_arrivals + col_arrivals
-        return dict(totals)
+        return totals
 
-    return [count(iterations, report) for iterations, report in runs]
+    low, high = iterations
+    totals = count(high, 1)
+    totals.subtract(count(low, 0))
+    return totals

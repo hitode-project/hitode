@@ -47,8 +47,9 @@ A scenario pins observable behavior of a whole build. It is a directory `tests/s
 | `exe`, `args`, `seconds` | The guest program `adv-run` starts, extra `adv-run` options and the time limit. |
 | `outputs` | Files the guest writes. Their bytes are compared between builds. |
 | `frame` | When true, the last presented frame's hash is compared too. |
-| `steady` | `iterations` (two counts written to `scenario-input.txt`), report `counters` whose growth per iteration is compared, and optional `min` per-iteration floors. On AArch64, `retired` counts all retired guest instructions, `owner_retired` counts owner work including its share of split jobs, `worker_retired` counts worker work, `split_retired` counts guest instructions retired in split jobs, and `whole_worker_jobs` counts completed whole worker jobs. |
-| `steady.kernel_work` | Optional emitted host-word estimate for fixture kernels with fixed trip counts. It combines JIT map word counts and resident entry counts outside execution. Use `--sync-compilation` to make the form selection independent of background compilation progress. |
+| `steady` | `iterations` gives the warm-up and total iteration counts. `counters` and optional `min` floors apply to per-iteration deltas between guest marks from one process. `regions` names kernels with matching `_end` symbols for counters attributed to guest instruction addresses. |
+| `steady.kernel_work` | A kernel layout for the emitted host-word estimate and attributed counters. The estimate combines JIT map word counts and resident entry counts. Use `--sync-compilation` to make form selection independent of background compilation progress. |
+| `steady.split_policy` | A kernel symbol with a matching `_end` symbol. At least one offer in that range MUST reach the block split policy with a measured price. The judge checks each helper count and block size against the recorded trip count, price, wake estimate, frame pace and helper availability. |
 | `levels` | Report counters compared by their final value, such as `peak_heap_bytes`, `live_heap_bytes` or `peak_rss`. |
 | `min` | Optional minimum values that named final report counters MUST reach on the change. |
 | `gpu` | When true, the scenario pins behavior of the target GPUs. CI runners lack them, so CI skips it by name; run it with `--gpu` on a target device when a change touches the GPU path. |
@@ -56,9 +57,10 @@ A scenario pins observable behavior of a whole build. It is a directory `tests/s
 A `kernel_work` layout supplies `calls` per iteration, `rows` per call, and pairs of `[symbol, columns]` in `kernels`.
 The executable marks the row and column heads, their fall-throughs, and the function end with `_row`, `_col`, `_col_end`, `_row_end`, and `_end` suffixes.
 Optional `callees` entries give the kernel symbol, callee symbol, and calls per cell.
-The final run's generated words price both endpoints of the steady interval.
+The judge writes total iterations, zero and warm-up iterations to `scenario-input.txt`. With JIT maps enabled, a synthetic fixture marks a boundary with `int 0x2d`, EAX set to `0x4849544f` and ECX set to the mark number. The start and end marks are 0 and 1, or a pair per kernel in layout order.
+The run's generated words price both endpoints of each steady interval.
 The estimate prices resident arrivals from the first taken backedge, or from entry when Tier-1 arrivals show the first pass bypassed Tier-1.
-Separate report counters retain helper, interpreter and native exit work.
+Steady counters cover work attributed to the specified kernels. Whole-process totals such as retired instructions and native entries remain available in the run report.
 
 The guest judges its own result: exit status 0 means the pinned behavior holds. `tools/scenarios/run.py gate` judges a change by a base build. In CI, the base is the latest cached master build, and CI runs that commit's copy of the judge. Every master commit since that build passed the same gate:
 

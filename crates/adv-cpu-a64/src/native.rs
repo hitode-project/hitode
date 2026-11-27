@@ -362,6 +362,11 @@ unsafe extern "C" fn access(
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
     let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
     native.diagnostics.accesses += 1;
+    if let Some(paths) = &mut native.code.slow_paths
+        && let Some(site) = native.code.faults.site(site)
+    {
+        *paths.accesses.entry(site.eip).or_default() += 1;
+    }
     let width = (kind & 31) as usize;
     // SAFETY: the runtime is live; the cold path shares this transfer field.
     let vector = unsafe { &mut (*runtime).value_frame.operand };
@@ -584,6 +589,9 @@ unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> 
         HostOutcome::Continue => 0,
         HostOutcome::Exit => {
             native.diagnostics.helper_exits += 1;
+            if let Some(paths) = &mut native.code.slow_paths {
+                *paths.helper_exits.entry(pc).or_default() += 1;
+            }
             u64::from(LEAVE)
         }
         HostOutcome::Preempted => {
@@ -906,6 +914,16 @@ impl Native {
             let _ = write!(output, " exit {exit:?}={count}");
         }
         if let Some(paths) = &self.code.slow_paths {
+            for (name, sites) in [
+                ("access", &paths.accesses),
+                ("checked_fault", &paths.checked_faults),
+                ("helper_exit", &paths.helper_exits),
+                ("resident_cold_exit", &paths.resident_cold_exits),
+            ] {
+                for (&eip, &count) in sites {
+                    let _ = write!(output, " {name} {eip:#010x}={count}");
+                }
+            }
             for (&(eip, cause), &count) in &paths.interpreter {
                 let _ = write!(output, " interpreter {eip:#010x} {cause:?}={count}");
             }

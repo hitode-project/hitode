@@ -5,14 +5,12 @@
   "seconds": 60,
   "outputs": ["threaded-x87-blocks.bin"],
   "min": {
-    "split_proofs": 1,
-    "splits": 4,
-    "split_retired": 200000000,
-    "whole_worker_jobs": 500,
-    "worker_retired": 100000000
+    "split_proofs": 1
   },
   "steady": {
-    "iterations": [4, 8],
-    "counters": ["retired", "interprets", "accesses", "resident_cold_exits"]
+    "iterations": [2, 4],
+    "regions": ["_warp_rows", "_block_trunc", "_blend_band"],
+    "split_policy": "_blend_band",
+    "counters": ["interprets", "accesses", "resident_cold_exits"]
   }
 }

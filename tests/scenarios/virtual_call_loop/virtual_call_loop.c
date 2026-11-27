@@ -23,6 +23,7 @@ __asm__(
     "  inc dword ptr [ecx+4]\n"
     "  mov eax, esp\n"
     "  ret\n"
+    "_method_end:\n"
     ".globl _spin\n"
     "_spin:\n"
     "  push ebx\n"
@@ -42,18 +43,26 @@ __asm__(
     "  pop edi\n"
     "  pop esi\n"
     "  pop ebx\n"
-    "  ret\n");
+    "  ret\n"
+    "_spin_end:\n");
 
 int main(void) {
     static void *vtable[2] = {0, (void *)method};
     Object object = {vtable, 0};
-    unsigned iterations = 100000, calls;
+    unsigned iterations = 100000, warmup = 0, calls;
     FILE *input = fopen("scenario-input.txt", "r"), *output;
     if (input) {
-        if (fscanf(input, "%u", &iterations) != 1) return 3;
+        if (fscanf(input, "%u %*u %u", &iterations, &warmup) < 1) return 3;
         fclose(input);
     }
-    calls = spin(&object, iterations);
+    if (warmup) {
+        spin(&object, warmup);
+        __asm__ volatile("int 0x2d" : : "a"(0x4849544f), "c"(0) : "memory");
+        calls = spin(&object, iterations - warmup);
+        __asm__ volatile("int 0x2d" : : "a"(0x4849544f), "c"(1) : "memory");
+    } else {
+        calls = spin(&object, iterations);
+    }
     output = fopen("virtual-call-loop.bin", "wb");
     if (!output || fwrite(&calls, 4, 1, output) != 1) return 4;
     fclose(output);
