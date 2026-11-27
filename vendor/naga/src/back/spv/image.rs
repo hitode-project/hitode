@@ -1230,15 +1230,14 @@ impl BlockContext<'_> {
                     size: vec_size,
                     scalar: crate::Scalar::U32,
                 });
-                let id_extended = self.gen_id();
-                let mut inst = Instruction::image_query(
-                    spirv::Op::ImageQuerySizeLod,
-                    extended_size_type_id,
-                    id_extended,
-                    image_id,
-                );
-                inst.add_operand(self.get_index_constant(0));
-                block.body.push(inst);
+                let level_id = match class {
+                    Ic::Sampled { multi: true, .. }
+                    | Ic::Depth { multi: true }
+                    | Ic::Storage { .. } => None,
+                    _ => Some(self.get_index_constant(0)),
+                };
+                let id_extended =
+                    self.write_coordinate_bounds(extended_size_type_id, image_id, level_id, block);
 
                 let extract_id = self.gen_id();
                 block.body.push(Instruction::composite_extract(

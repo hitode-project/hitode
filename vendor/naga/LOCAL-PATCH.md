@@ -89,6 +89,11 @@ The SPIR-V writer passes the selected descriptor element pointer to
 `OpImageTexelPointer` when an atomic targets a storage texture in a binding
 array. Direct storage textures use their global variable pointer.
 
+## SPIR-V texture layer counts
+
+The SPIR-V writer uses `OpImageQuerySize` to read the layer count of
+multisampled and storage textures, whose size query takes no mip level.
+
 ## SPIR-V sample masks
 
 Vulkan requires an integer array for the SampleMask interface variable. The

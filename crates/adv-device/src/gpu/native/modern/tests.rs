@@ -1779,7 +1779,8 @@ fn sampling_probe_mip_selection_and_clamp() {
             .unwrap();
         let actual = sample(&mut gpu, mips.view().clone(), Some(sampler), &source, 56);
         let epsilon = if filter == Filter::Linear {
-            0.5 / 255.
+            // D3D11.3 §7.18.16.2 allows filtering at the format's precision.
+            1. / 255.
         } else {
             f32::EPSILON
         };

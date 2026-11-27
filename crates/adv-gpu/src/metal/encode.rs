@@ -392,6 +392,38 @@ impl Encoder {
             }
         }
     }
+    pub(crate) fn download_depth_stencil(
+        &mut self,
+        src: ImageCopy<'_>,
+        depth: BufferCopy<'_>,
+        stencil: BufferCopy<'_>,
+        size: Extent,
+    ) {
+        let blit = self.blit();
+        for (destination, option) in [
+            (depth, MTLBlitOption::DepthFromDepthStencil),
+            (stencil, MTLBlitOption::StencilFromDepthStencil),
+        ] {
+            let pitch = destination.row_pitch as usize;
+            let stride = pitch * destination.rows as usize;
+            for (slice, origin, depth, offset) in regions(src, size) {
+                unsafe {
+                    blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                        &src.image.inner.data.raw,
+                        slice,
+                        src.mip as usize,
+                        origin,
+                        metal_size(size.width, size.height, depth),
+                        &destination.buffer.inner.0.raw,
+                        destination.offset as usize + offset * stride,
+                        pitch,
+                        stride,
+                        option,
+                    );
+                }
+            }
+        }
+    }
     pub(crate) fn copy_image(&mut self, src: ImageCopy<'_>, dst: ImageCopy<'_>, size: Extent) {
         let blit = self.blit();
         for ((ss, so, depth, _), (ds, dest, _, _)) in

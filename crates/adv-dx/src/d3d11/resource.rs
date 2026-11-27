@@ -137,7 +137,7 @@ impl Backing {
         if packed_resolve(caps, dxgi, format).is_some() {
             usage |= Usage::COLOR | Usage::SAMPLED;
         }
-        if bind.contains(Bind::RENDER_TARGET) || format.has_stencil() {
+        if bind.contains(Bind::RENDER_TARGET) {
             usage |= Usage::SAMPLED;
         }
         let image = gpu.device().create_image(&ImageDesc {

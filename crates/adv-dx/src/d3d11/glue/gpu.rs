@@ -366,72 +366,74 @@ pub(super) fn download(
             _ => unit,
         };
         let row = rect.w * physical_unit;
+        let depth_stencil = match (backing, resource) {
+            (Backing::Image(image), Resource::Texture(texture))
+                if image.desc().format.has_stencil() =>
+            {
+                Some((texture.format().parent == 44, image.desc().format))
+            }
+            _ => None,
+        };
+        let transfer_row = if depth_stencil.is_some() {
+            rect.w * 4
+        } else {
+            row
+        };
         let pitch = if let Backing::Image(image) = backing {
-            resource::CopyPitch::new(image.desc().format, row).pitch
+            resource::CopyPitch::new(image.desc().format, transfer_row).pitch
         } else {
             row.next_multiple_of(256)
         };
-        let packed_depth = matches!(backing, Backing::Image(image)
-            if image.desc().format.has_stencil());
+        let depth_size = u64::from(pitch) * u64::from(rect.h);
+        let stencil_pitch = if depth_stencil.is_some() {
+            rect.w.next_multiple_of(256)
+        } else {
+            0
+        };
         let buffer = execution.gpu.device().create_buffer(&BufferDesc {
-            size: u64::from(pitch) * u64::from(rect.h),
-            usage: if packed_depth {
-                BufferUsage::STORAGE
-            } else {
-                BufferUsage::COPY_DST
-            },
+            size: depth_size + u64::from(stencil_pitch) * u64::from(rect.h),
+            usage: BufferUsage::COPY_DST,
             memory: Memory::Readback,
             label: "D3D11 Map readback",
         })?;
-        match (backing, resource) {
-            (Backing::Image(image), Resource::Texture(texture)) if packed_depth => {
-                depth_stencil::pack(
-                    &mut execution.gpu,
-                    resource::region(image, texture, subresource),
-                    rect,
-                    pitch,
-                    buffer.clone(),
-                    texture.format().parent == 44,
-                )?;
+        let destination = |offset, row_pitch| TransferBuffer {
+            buffer: buffer.clone(),
+            offset,
+            row_pitch,
+            rows: rect.h,
+        };
+        let transfer = match (backing, resource) {
+            (Backing::Buffer(source), Resource::Buffer(_)) => ModernTransfer::CopyBuffer {
+                source: BufferRange {
+                    buffer: source.clone(),
+                    range: rect.x as u64..rect.x as u64 + u64::from(rect.w),
+                },
+                destination: buffer.clone(),
+                offset: 0,
+            },
+            (Backing::Constant(_), Resource::Buffer(_)) => ModernTransfer::CopyBufferWindow {
+                source: backing
+                    .buffer_window(u64::from(rect.x)..u64::from(rect.x) + u64::from(rect.w)),
+                destination: BufferRange {
+                    buffer: buffer.clone(),
+                    range: 0..u64::from(row),
+                }
+                .into(),
+            },
+            (Backing::Image(image), Resource::Texture(texture)) if depth_stencil.is_some() => {
+                ModernTransfer::DownloadDepthStencil {
+                    source: pixel_region(image, texture, subresource, slice, rect),
+                    depth: destination(0, pitch),
+                    stencil: destination(depth_size, stencil_pitch),
+                }
             }
-            _ => {
-                let transfer = match (backing, resource) {
-                    (Backing::Buffer(source), Resource::Buffer(_)) => ModernTransfer::CopyBuffer {
-                        source: BufferRange {
-                            buffer: source.clone(),
-                            range: rect.x as u64..rect.x as u64 + u64::from(rect.w),
-                        },
-                        destination: buffer.clone(),
-                        offset: 0,
-                    },
-                    (Backing::Constant(_), Resource::Buffer(_)) => {
-                        ModernTransfer::CopyBufferWindow {
-                            source: backing.buffer_window(
-                                u64::from(rect.x)..u64::from(rect.x) + u64::from(rect.w),
-                            ),
-                            destination: BufferRange {
-                                buffer: buffer.clone(),
-                                range: 0..u64::from(row),
-                            }
-                            .into(),
-                        }
-                    }
-                    (Backing::Image(image), Resource::Texture(texture)) => {
-                        ModernTransfer::Download {
-                            source: pixel_region(image, texture, subresource, slice, rect),
-                            destination: TransferBuffer {
-                                buffer: buffer.clone(),
-                                offset: 0,
-                                row_pitch: pitch,
-                                rows: rect.h,
-                            },
-                        }
-                    }
-                    _ => unreachable!(),
-                };
-                execution.gpu.transfer(transfer)?;
-            }
-        }
+            (Backing::Image(image), Resource::Texture(texture)) => ModernTransfer::Download {
+                source: pixel_region(image, texture, subresource, slice, rect),
+                destination: destination(0, pitch),
+            },
+            _ => unreachable!(),
+        };
+        execution.gpu.transfer(transfer)?;
         execution
             .gpu
             .completion()?
@@ -450,8 +452,18 @@ pub(super) fn download(
             let src = (line * pitch) as usize;
             let dst =
                 layout.slice(base, slice) + (rect.y + line) * layout.row_pitch() + rect.x * unit;
-            let mut row = &bytes[src..src + row as usize];
-            if let (Backing::Image(image), Resource::Texture(texture)) = (backing, resource)
+            let mut row = &bytes[src..src + transfer_row as usize];
+            if let Some((d24, format)) = depth_stencil {
+                let stencil = (depth_size + u64::from(line) * u64::from(stencil_pitch)) as usize;
+                depth_stencil::pack_row(
+                    row,
+                    &bytes[stencil..stencil + rect.w as usize],
+                    d24,
+                    format,
+                    &mut packed,
+                );
+                row = &packed;
+            } else if let (Backing::Image(image), Resource::Texture(texture)) = (backing, resource)
                 && (physical_unit != unit || image.desc().format == adv_gpu::Format::Abgr4Unorm)
             {
                 resource::readback_row(texture, image.desc().format, row, &mut packed);

@@ -1,84 +1,33 @@
-//! Pack separate depth and stencil aspects into their guest-visible layout.
+//! Pack native depth and stencil transfer planes into the guest row layout.
 
-use super::*;
-use adv_device::gpu::{DispatchArguments, ImageRegion, ModernShader, SlotBindings, StorageBinding};
-use adv_gpu::resource::ViewDesc;
-use std::sync::Arc;
+use adv_gpu::Format;
 
-pub(super) fn pack(
-    gpu: &mut Gpu,
-    source: ImageRegion,
-    rect: Rect,
-    pitch: u32,
-    buffer: Buffer,
+pub(super) fn pack_row(
+    depth: &[u8],
+    stencil: &[u8],
     d24: bool,
-) -> Result<(), Error> {
-    const PACK: &str = r#"
-struct Region {
-    rect: vec4<u32>,
-    stride: vec4<u32>,
-}
-@group(0) @binding(0) var<uniform> region: Region;
-@group(1) @binding(0) var depth: texture_depth_2d;
-@group(1) @binding(1) var stencil: texture_2d<u32>;
-@group(3) @binding(0) var<storage, read_write> packed: array<u32>;
-
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    if any(id.xy >= region.rect.zw) { return; }
-    let at = vec2<i32>(id.xy + region.rect.xy);
-    let depth_value = textureLoad(depth, at, 0);
-    let s = textureLoad(stencil, at, 0).g;
-    let row = id.y * region.stride.x;
-    if region.stride.y != 0u {
-        let d = u32(round(depth_value * 16777215.0));
-        packed[row + id.x] = d | (s << 24u);
+    format: Format,
+    packed: &mut Vec<u8>,
+) {
+    let texels = depth.as_chunks::<4>().0.iter().zip(stencil);
+    packed.clear();
+    if d24 {
+        let native_d24 = !cfg!(target_vendor = "apple") && format == Format::Depth24UnormStencil8;
+        for (&depth, &stencil) in texels {
+            let code = if native_d24 {
+                // Vulkan transfers X8_D24_UNORM_PACK32 as integer depth codes.
+                depth
+            } else {
+                // The backing stores float depth. Quantize once to D24.
+                let value = f64::from(f32::from_le_bytes(depth));
+                ((value * 16_777_215.0).round() as u32).to_le_bytes()
+            };
+            packed.extend_from_slice(&[code[0], code[1], code[2], stencil]);
+        }
     } else {
-        packed[row + 2u * id.x] = bitcast<u32>(depth_value);
-        packed[row + 2u * id.x + 1u] = s;
+        for (depth, &stencil) in texels {
+            packed.extend_from_slice(depth);
+            packed.extend_from_slice(&[stencil, 0, 0, 0]);
+        }
     }
-}
-"#;
-    let shader = Arc::new(ModernShader::wgsl(
-        xxhash_rust::xxh3::xxh3_64(PACK.as_bytes()),
-        PACK,
-        "main",
-        adv_gpu::shader::Stage::Compute,
-    )?);
-    let pipeline = gpu.prepare_dispatch(shader)?;
-    let view = |plane| {
-        source.image.create_view(&ViewDesc {
-            plane,
-            dimension: Some(adv_gpu::resource::Dimension::D2),
-            mips: source.mip..source.mip + 1,
-            layers: source.layer..source.layer + 1,
-            format: None,
-        })
-    };
-    let params = [
-        [rect.x, rect.y, rect.w, rect.h],
-        [pitch / 4, u32::from(d24), 0, 0],
-    ];
-    let uniform = resource::upload(gpu, bytemuck::bytes_of(&params), BufferUsage::UNIFORM, 32)?;
-    let size = buffer.desc().size;
-    gpu.dispatch(
-        &pipeline,
-        &SlotBindings {
-            uniforms: vec![Some(
-                BufferRange {
-                    buffer: uniform,
-                    range: 0..32,
-                }
-                .into(),
-            )],
-            images: vec![Some(view(2)?), Some(view(1)?)],
-            storage: vec![Some(StorageBinding::Buffer(BufferRange {
-                buffer,
-                range: 0..size,
-            }))],
-            ..Default::default()
-        },
-        DispatchArguments::Direct([rect.w.div_ceil(8), rect.h.div_ceil(8), 1]),
-    )?;
-    Ok(())
 }

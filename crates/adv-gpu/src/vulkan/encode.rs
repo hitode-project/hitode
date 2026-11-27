@@ -295,10 +295,10 @@ impl Encoder {
             return;
         }
         // A 2D attachment view of a volume still transitions the full mip.
-        let layers = if core.desc.dimension == Dimension::D3 {
-            0..1
+        let (layers, layer_count) = if core.desc.dimension == Dimension::D3 {
+            (0..1, vk::REMAINING_ARRAY_LAYERS)
         } else {
-            layers
+            (layers, 1)
         };
         let mut states = core.states.lock().unwrap();
         let written = access.intersects(WRITES);
@@ -335,7 +335,7 @@ impl Encoder {
                     .base_mip_level(mip)
                     .level_count(1)
                     .base_array_layer(layer)
-                    .layer_count(1);
+                    .layer_count(layer_count);
                 barriers.push(
                     vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(old.stage)
@@ -1047,23 +1047,43 @@ impl Encoder {
             return;
         }
         self.synced = false;
-        for (source, aspect, bytes) in [
-            (depth, vk::ImageAspectFlags::DEPTH, 4),
-            (stencil, vk::ImageAspectFlags::STENCIL, 1),
-        ] {
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(source.offset)
-                .buffer_row_length(source.row_pitch / bytes)
-                .buffer_image_height(source.rows)
-                .image_subresource(subresource(dst, size).aspect_mask(aspect))
-                .image_offset(offset(dst.origin))
-                .image_extent(copy_extent(dst, size));
+        for (buffer, region) in depth_stencil_copies(dst, size, depth, stencil) {
             unsafe {
                 self.shared.context.device.cmd_copy_buffer_to_image(
                     self.command,
-                    source.buffer.inner.0.handle,
+                    buffer,
                     dst.image.inner.core.handle,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            }
+        }
+    }
+    pub(crate) fn download_depth_stencil(
+        &mut self,
+        src: ImageCopy<'_>,
+        depth: BufferCopy<'_>,
+        stencil: BufferCopy<'_>,
+        size: Extent,
+    ) {
+        self.memory_barrier();
+        self.copy_transition(
+            src,
+            size,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::AccessFlags2::TRANSFER_READ,
+        );
+        if !self.ready() {
+            return;
+        }
+        self.synced = false;
+        for (buffer, region) in depth_stencil_copies(src, size, depth, stencil) {
+            unsafe {
+                self.shared.context.device.cmd_copy_image_to_buffer(
+                    self.command,
+                    src.image.inner.core.handle,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    buffer,
                     &[region],
                 );
             }
@@ -1570,6 +1590,28 @@ fn subresource(copy: ImageCopy<'_>, size: Extent) -> vk::ImageSubresourceLayers 
             size.depth_or_layers
         })
 }
+fn depth_stencil_copies(
+    image: ImageCopy<'_>,
+    size: Extent,
+    depth: BufferCopy<'_>,
+    stencil: BufferCopy<'_>,
+) -> [(vk::Buffer, vk::BufferImageCopy); 2] {
+    [
+        (depth, vk::ImageAspectFlags::DEPTH, 4),
+        (stencil, vk::ImageAspectFlags::STENCIL, 1),
+    ]
+    .map(|(buffer, aspect, bytes)| {
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(buffer.offset)
+            .buffer_row_length(buffer.row_pitch / bytes)
+            .buffer_image_height(buffer.rows)
+            .image_subresource(subresource(image, size).aspect_mask(aspect))
+            .image_offset(offset(image.origin))
+            .image_extent(copy_extent(image, size));
+        (buffer.buffer.inner.0.handle, region)
+    })
+}
+
 fn buffer_image_copies(
     buffer: BufferCopy<'_>,
     image: ImageCopy<'_>,

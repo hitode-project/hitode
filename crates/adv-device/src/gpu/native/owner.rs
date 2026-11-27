@@ -422,6 +422,16 @@ impl State {
                 source,
                 destination,
             } => encoder.copy_image_to_buffer(source.copy(), destination.copy(), source.extent),
+            DownloadDepthStencil {
+                source,
+                depth,
+                stencil,
+            } => encoder.download_depth_stencil(
+                source.copy(),
+                depth.copy(),
+                stencil.copy(),
+                source.extent,
+            ),
             CopyBuffer {
                 source,
                 destination,
