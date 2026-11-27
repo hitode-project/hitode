@@ -38,9 +38,28 @@ pub(crate) enum ValidationStrategy {
     ScalarWitness,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CORE_CLASS: std::cell::Cell<Option<CoreClass>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_core_class<R>(class: CoreClass, f: impl FnOnce() -> R) -> R {
+    TEST_CORE_CLASS.with(|cell| {
+        let prev = cell.replace(Some(class));
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
 impl CoreClass {
     /// Detects the host core class once per process.
     pub(crate) fn detect() -> Self {
+        #[cfg(test)]
+        if let Some(class) = TEST_CORE_CLASS.with(std::cell::Cell::get) {
+            return class;
+        }
         static CLASS: OnceLock<CoreClass> = OnceLock::new();
         *CLASS.get_or_init(detect_core_class)
     }
