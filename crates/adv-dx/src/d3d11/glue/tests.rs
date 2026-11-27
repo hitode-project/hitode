@@ -22,23 +22,6 @@ const RESULT: u32 = DATA + 0x180;
 fn machine() -> Machine<JitCpu> {
     let mut registry = Registry::default();
     register_children(&mut registry);
-    let coverage = registry.coverage();
-    assert_eq!(
-        coverage.implement + coverage.state + coverage.safe_fail,
-        140 + FACES
-            .iter()
-            .chain(d3d10::FACES)
-            .map(|(_, slots)| slots.len())
-            .sum::<usize>()
-    );
-    assert_eq!(coverage.legacy, 0);
-    let excluded: Vec<_> = FACES
-        .iter()
-        .flat_map(|(_, slots)| slots.iter())
-        .filter_map(|&(name, _, level)| (level == ImplementationLevel::SafeFail).then_some(name))
-        .collect();
-    assert!(excluded.is_empty());
-    assert!(registry.signature_conflicts().is_empty());
     crate::dxgi::register(&mut registry);
     #[cfg(feature = "gpu")]
     {
@@ -142,6 +125,44 @@ fn machine() -> Machine<JitCpu> {
         max_buffer_size: 1 << 28,
     };
     machine
+}
+
+// spec: GFX-CAP-1 GFX-INTEROP-1
+#[test]
+fn every_d3d10_and_d3d11_vtable_slot_is_registered() {
+    let mut registry = Registry::default();
+    register_children(&mut registry);
+    let coverage = registry.coverage();
+    assert_eq!(coverage.safe_fail, 0);
+    assert_eq!(coverage.legacy, 0);
+    assert!(registry.signature_conflicts().is_empty());
+
+    let mut machine = machine();
+    for &(face, slots) in FACES.iter().chain(d3d10::FACES) {
+        let vtable = machine.ext.get::<State>().vtables[face];
+        let signatures = signature::com_signatures()
+            .iter()
+            .filter(|entry| entry.module == face);
+        let count = signatures.clone().count();
+        assert_eq!(count, slots.len(), "{face}");
+        for entry in signatures {
+            let index = u32::from(entry.com_slot.unwrap());
+            let name = format!("{face}::{}", entry.name);
+            assert!(
+                matches!(
+                    registry.level(DLL, &name),
+                    Some(ImplementationLevel::Implement | ImplementationLevel::State)
+                ),
+                "{name}"
+            );
+            let thunk = machine.resolve_import(DLL, &name).unwrap();
+            assert_eq!(
+                machine.cpu.read_u32(vtable + 4 * index).unwrap(),
+                thunk,
+                "{name}"
+            );
+        }
+    }
 }
 
 fn guest_call(machine: &mut Machine<JitCpu>, entry: u32, arguments: &[u32]) -> u32 {
@@ -314,6 +335,53 @@ fn create(machine: &mut Machine<JitCpu>, driver: u32, adapter: u32, levels: &[u3
 
 const LEVEL: u32 = OUT + 16;
 const CONTEXT: u32 = OUT + 20;
+
+// spec: GFX-INTEROP-1
+#[test]
+fn forced_d3d9_refuses_all_d3d11_device_creation_exports() {
+    let mut machine = machine();
+    machine.ext.get_mut::<State>().force_d3d9 = true;
+    let swap = OUT + 24;
+    for (name, args, outputs) in [
+        (
+            "D3D11CreateDevice",
+            vec![0, 1, 0, 0, 0, 0, 7, OUT, LEVEL, CONTEXT],
+            vec![OUT, LEVEL, CONTEXT],
+        ),
+        (
+            "D3D11CreateDeviceAndSwapChain",
+            vec![
+                0,
+                1,
+                0,
+                0xc000_0000,
+                0,
+                0,
+                7,
+                DATA,
+                swap,
+                OUT,
+                LEVEL,
+                CONTEXT,
+            ],
+            vec![swap, OUT, LEVEL, CONTEXT],
+        ),
+        (
+            "D3D11CoreCreateDevice",
+            vec![0, 0, 0, 0, 0, DATA, 1, 7, OUT, LEVEL],
+            vec![OUT, LEVEL],
+        ),
+    ] {
+        let entry = machine.resolve_import(DLL, name).unwrap();
+        for &out in &outputs {
+            machine.cpu.write_u32(out, u32::MAX).unwrap();
+        }
+        assert_eq!(guest_call(&mut machine, entry, &args), 0x887a0004, "{name}");
+        for out in outputs {
+            assert_eq!(machine.cpu.read_u32(out).unwrap(), 0, "{name}");
+        }
+    }
+}
 
 // spec: GFX-CAP-4 GFX-DXGI-1
 #[test]

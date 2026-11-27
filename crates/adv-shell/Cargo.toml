@@ -10,6 +10,7 @@ description = "Host platform shell: window, input, audio device, execution drive
 [features]
 default = []
 gpu = ["adv-runtime/gpu", "adv-device/gpu", "dep:adv-display", "dep:adv-gpu"]
+graphics-counters = ["adv-runtime/graphics-counters"]
 media = ["adv-runtime/media"]
 
 [dependencies]

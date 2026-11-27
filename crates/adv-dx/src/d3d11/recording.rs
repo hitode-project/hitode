@@ -103,7 +103,7 @@ pub struct Effects<'a> {
 pub struct Recording {
     inner: record::Recording<Command>,
     #[cfg(feature = "d3d9-counters")]
-    counters: record::Counters,
+    pub(super) counters: record::Counters,
 }
 
 impl Recording {

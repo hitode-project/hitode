@@ -87,8 +87,20 @@ pub struct Counters {
     pub changed_pixels: u64,
     pub executed_pixels: u64,
     pub extra_pixels: u64,
+    #[cfg(feature = "d3d9-counters")]
+    pub damage_pixels: u64,
+    #[cfg(feature = "d3d9-counters")]
+    pub maps: u64,
+    #[cfg(feature = "d3d9-counters")]
+    pub constant_time_maps: u64,
 }
 impl Counters {
+    #[cfg(feature = "d3d9-counters")]
+    pub(crate) fn mapped(&mut self, constant_time: bool) {
+        self.maps += 1;
+        self.constant_time_maps += u64::from(constant_time);
+    }
+
     pub fn work_report(&self) -> String {
         if !cfg!(feature = "d3d9-counters") {
             return String::new();

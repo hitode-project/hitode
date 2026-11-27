@@ -237,6 +237,8 @@ pub(super) fn lock_internal(
         if flags & 0x10 == 0 {
             recording::invalidate_readback_destination(env, owner, storage);
         }
+        #[cfg(feature = "d3d9-counters")]
+        env.ext.get_mut::<State>().frames.mapped(true);
         return Outcome::Return(0);
     }
     let owner = r.device;
@@ -778,6 +780,8 @@ fn publish_lock(
             ..lock
         }),
     );
+    #[cfg(feature = "d3d9-counters")]
+    env.ext.get_mut::<State>().frames.mapped(false);
     0
 }
 fn cleanup(env: &mut Env<'_>, transfer: PendingTransfer) {

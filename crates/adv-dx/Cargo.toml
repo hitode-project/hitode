@@ -11,7 +11,7 @@ publish.workspace = true
 default = []
 gpu = ["adv-device/gpu"]
 # Compile-time diagnostics; omitted entirely from ordinary draw/state paths.
-d3d9-counters = []
+d3d9-counters = ["adv-device/graphics-counters"]
 # DirectShow movie decoding through FFmpeg (needs FFMPEG_DIR at build time).
 media = ["adv-device/media"]
 

@@ -320,6 +320,15 @@ pub struct Stats {
     pub persisted_pipelines: u64,
     pub discarded_pipelines: u64,
 }
+
+/// Guest command stream traffic, shared by the graphics facades of one GPU owner.
+#[cfg(feature = "graphics-counters")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Traffic {
+    pub submissions: u64,
+    pub upload_bytes: u64,
+    pub readback_bytes: u64,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Unavailable(String),

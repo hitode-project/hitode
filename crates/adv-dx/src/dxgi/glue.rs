@@ -413,10 +413,15 @@ fn enum_outputs(env: &mut Env<'_>) -> Outcome {
 fn software_adapter(env: &mut Env<'_>) -> Outcome {
     // Custom software rasterizer DLLs are excluded. WARP uses EnumWarpAdapter.
     let module = env.arg(1);
-    interface_out(env, env.arg(2), |_| {
+    interface_out(env, env.arg(2), |env| {
         Err(if module == 0 {
             Error::InvalidCall
         } else {
+            adv_abi::warn_unavailable(
+                env,
+                "IDXGIFactory::CreateSoftwareAdapter",
+                "guest software rasterizer DLLs are outside the adapter set",
+            );
             Error::Unsupported
         })
     })
