@@ -60,6 +60,9 @@ fn main() {
 /// Static FFmpeg checks the OS version with `@available`, which calls
 /// `__isPlatformVersionAtLeast` from clang's runtime library; rustc links
 /// Apple targets with `-nodefaultlibs`, which leaves that library out.
+/// `-bundle` keeps rustc from trying to unpack Apple's universal archive
+/// into staticlibs (such as the iOS launcher) while still passing `-l` to
+/// the final linker.
 fn link_clang_runtime() {
     let compiler = cc::Build::new().get_compiler();
     let Ok(output) = std::process::Command::new(compiler.path())
@@ -80,6 +83,6 @@ fn link_clang_runtime() {
     };
     if output.status.success() && path.is_file() {
         println!("cargo:rustc-link-search=native={}", dir.display());
-        println!("cargo:rustc-link-lib=static={name}");
+        println!("cargo:rustc-link-lib=static:-bundle={name}");
     }
 }
