@@ -21,6 +21,7 @@ use std::time::Duration;
 type Object<T> = Retained<ProtocolObject<T>>;
 
 mod caps;
+pub use caps::MetalFamily;
 mod clear;
 mod encode;
 mod pipeline;
