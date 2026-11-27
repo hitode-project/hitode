@@ -268,6 +268,28 @@ fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
         &input,
         &constants,
     );
+    // Shared subroutine bodies run as functions over the caller's registers,
+    // including a call through a Boolean that skips its body.
+    let mut words = ins(Opcode::Mov, &[dst(0, 0), src(2, 4)]);
+    words.extend(ins(Opcode::Call, &[src(18, 1)]));
+    words.extend(ins(Opcode::Call, &[src(18, 1)]));
+    words.extend(ins(Opcode::CallNz, &[src(18, 2), src(14, 0)]));
+    words.extend(ins(Opcode::Mov, &[dst(8, 0), src(0, 0)]));
+    words.extend(ins(Opcode::Ret, &[]));
+    words.extend(ins(Opcode::Label, &[src(18, 1)]));
+    words.extend(ins(Opcode::Call, &[src(18, 2)]));
+    words.extend(ins(Opcode::Add, &[dst(0, 0), src(0, 0), src(2, 4)]));
+    words.extend(ins(Opcode::Ret, &[]));
+    words.extend(ins(Opcode::Label, &[src(18, 2)]));
+    words.extend(ins(Opcode::Mul, &[dst(0, 0), src(0, 0), src(2, 3)]));
+    words.extend(ins(Opcode::Ret, &[]));
+    compare_gpu(
+        &mut gpu,
+        "subroutines",
+        shader(3, 0, words),
+        &input,
+        &constants,
+    );
     for minor in 1..=4 {
         let mut words = vec![
             Opcode::Mul as u32,

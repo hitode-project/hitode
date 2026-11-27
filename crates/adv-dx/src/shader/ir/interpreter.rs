@@ -99,6 +99,10 @@ pub fn run(
 pub struct Prepared {
     module: Module,
     temporary_count: u32,
+    /// The entry block ends here; shared subroutine bodies follow.
+    entry: usize,
+    routines: HashMap<u64, std::ops::Range<usize>>,
+    fuel: usize,
 }
 
 impl Prepared {
@@ -110,10 +114,20 @@ impl Prepared {
         if reflection.doubles {
             return Err(Error::DoublePrecision);
         }
+        let (entry, routines) = passes::subroutines(&module.body);
         Ok(Self {
             module,
             temporary_count: reflection.temporary_count,
+            entry,
+            routines: routines.into_iter().collect(),
+            fuel: crate::shader::MAX_EXECUTION_STEPS,
         })
+    }
+
+    /// Statements one run may execute before it stops with `ExecutionLimit`.
+    pub fn with_fuel(mut self, fuel: usize) -> Self {
+        self.fuel = fuel;
+        self
     }
 
     pub fn run(
@@ -130,10 +144,12 @@ impl Prepared {
             arrays: HashMap::new(),
             immediate: &[],
             outputs: Outputs::default(),
-            fuel: crate::shader::MAX_EXECUTION_STEPS,
+            fuel: self.fuel,
             flush: self.module.model.flushes_denormals(),
+            body: &self.module.body,
+            routines: &self.routines,
         };
-        let _ = machine.block(&self.module.body)?;
+        let _ = machine.block(&self.module.body[..self.entry])?;
         Ok(machine.outputs)
     }
 }
@@ -155,6 +171,8 @@ struct Machine<'a, C: ?Sized, R> {
     outputs: Outputs,
     fuel: usize,
     flush: bool,
+    body: &'a [Statement],
+    routines: &'a HashMap<u64, std::ops::Range<usize>>,
 }
 
 impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
@@ -163,7 +181,7 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
         Ok(())
     }
 
-    fn block(&mut self, block: &'a Block) -> Result<ControlFlow<Branch>, Error> {
+    fn block(&mut self, block: &'a [Statement]) -> Result<ControlFlow<Branch>, Error> {
         for statement in block {
             self.tick()?;
             let branch = match statement {
@@ -179,6 +197,9 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
                     ControlFlow::Continue(())
                 }
                 Statement::CustomData { .. } => ControlFlow::Continue(()),
+                Statement::Execute(op) if matches!(op.opcode, Opcode::Call | Opcode::Callc) => {
+                    self.call(op)?
+                }
                 Statement::Execute(instruction) => self.instruction(instruction)?,
                 Statement::If {
                     test,
@@ -230,6 +251,30 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
             }
         }
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// Run a shared subroutine body. Its return resumes the caller; a discard
+    /// ends the program.
+    fn call(&mut self, op: &Instruction) -> Result<ControlFlow<Branch>, Error> {
+        if op.opcode == Opcode::Callc {
+            let value = self.read(&op.sources[1], ValueType::Uint, false)?[0];
+            if (value != 0) != op.test_nonzero {
+                return Ok(ControlFlow::Continue(()));
+            }
+        }
+        let label = passes::call_target(op)?;
+        let range = self
+            .routines
+            .get(&label)
+            .ok_or(Error::Invalid("call target"))?
+            .clone();
+        let body = self.body;
+        Ok(match self.block(&body[range])? {
+            ControlFlow::Break(Branch::Return) if self.outputs.discarded => {
+                ControlFlow::Break(Branch::Return)
+            }
+            _ => ControlFlow::Continue(()),
+        })
     }
 
     fn instruction(&mut self, op: &Instruction) -> Result<ControlFlow<Branch>, Error> {

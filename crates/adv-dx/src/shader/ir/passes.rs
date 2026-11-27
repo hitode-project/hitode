@@ -10,7 +10,11 @@ pub(crate) fn prepare(module: &Module) -> Result<(Module, Reflection), Error> {
     verify(module)?;
     let mut reflection = analyze(module);
     let mut module = module.clone();
-    if inline_calls(&mut module, reflection.temporary_count, None)? {
+    // Direct3D 9 subroutines stay shared bodies: inlining each call site
+    // multiplies nested subroutines past any size budget.
+    if module.model == Model::Legacy {
+        check_calls(&module.body)?;
+    } else if inline_calls(&mut module, reflection.temporary_count, None)? {
         reflection = analyze(&module);
     }
     if module.model.flushes_denormals() {
@@ -128,6 +132,98 @@ pub fn specialize_interfaces(
     interface_members::lower(&mut module, bindings)?;
     verify(&module)?;
     Ok(module)
+}
+
+/// The end of the entry block and the body range of each subroutine after it.
+pub(crate) fn subroutines(body: &[Statement]) -> (usize, Vec<(u64, std::ops::Range<usize>)>) {
+    let labels: Vec<_> = body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, statement)| static_label(statement, false).map(|label| (index, label)))
+        .collect();
+    let entry = labels.first().map_or(body.len(), |&(index, _)| index);
+    let routines = labels
+        .iter()
+        .enumerate()
+        .map(|(n, &(start, label))| {
+            let end = labels.get(n + 1).map_or(body.len(), |&(index, _)| index);
+            (label, start + 1..end)
+        })
+        .collect();
+    (entry, routines)
+}
+
+/// The label a call statement targets.
+pub(crate) fn call_target(op: &Instruction) -> Result<u64, Error> {
+    match op.sources.first().and_then(Operand::register) {
+        Some((Register::Label, [Index::Direct(label)])) => Ok(*label),
+        _ => Err(Error::Invalid("call target")),
+    }
+}
+
+/// Every call reaches a subroutine and no subroutine reaches itself.
+fn check_calls(body: &[Statement]) -> Result<(), Error> {
+    fn calls(block: &[Statement], out: &mut Vec<u64>) -> Result<(), Error> {
+        for statement in block {
+            match statement {
+                Statement::Execute(op) if matches!(op.opcode, Opcode::Call | Opcode::Callc) => {
+                    out.push(call_target(op)?);
+                }
+                Statement::If { accept, reject, .. } => {
+                    calls(accept, out)?;
+                    if let Some(reject) = reject {
+                        calls(reject, out)?;
+                    }
+                }
+                Statement::Loop(body) => calls(body, out)?,
+                Statement::Switch { cases, .. } => {
+                    for case in cases {
+                        calls(&case.body, out)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    let (entry, routines) = subroutines(body);
+    let mut graph = std::collections::HashMap::new();
+    for (label, range) in &routines {
+        let mut targets = Vec::new();
+        calls(&body[range.clone()], &mut targets)?;
+        if graph.insert(*label, targets).is_some() {
+            return Err(Error::Invalid("duplicate label"));
+        }
+    }
+    let mut roots = Vec::new();
+    calls(&body[..entry], &mut roots)?;
+    // 0 unvisited, 1 on the current path, 2 finished.
+    let mut state = std::collections::HashMap::new();
+    fn visit(
+        label: u64,
+        graph: &std::collections::HashMap<u64, Vec<u64>>,
+        state: &mut std::collections::HashMap<u64, u8>,
+    ) -> Result<(), Error> {
+        match state.get(&label) {
+            Some(1) => return Err(Error::Invalid("recursive call")),
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        let targets = graph.get(&label).ok_or(Error::Invalid("call target"))?;
+        state.insert(label, 1);
+        for &target in targets {
+            visit(target, graph, state)?;
+        }
+        state.insert(label, 2);
+        Ok(())
+    }
+    for label in roots
+        .into_iter()
+        .chain(graph.keys().copied().collect::<Vec<_>>())
+    {
+        visit(label, &graph, &mut state)?;
+    }
+    Ok(())
 }
 
 fn static_label(statement: &Statement, linkage: bool) -> Option<u64> {

@@ -342,6 +342,9 @@ struct Writer<'a> {
     /// Float source modifiers flush denormals first, as DXBC requires.
     flush: bool,
     legacy: Option<&'a legacy::Library<'a>>,
+    /// The state a shared subroutine call passes: `&r, &o, &v` from the entry
+    /// function and the received pointers from another subroutine.
+    call_arguments: &'static str,
 }
 
 impl<'a> Writer<'a> {
@@ -361,6 +364,7 @@ impl<'a> Writer<'a> {
             depth: 0,
             flush: module.model.flushes_denormals(),
             legacy: None,
+            call_arguments: "",
         }
     }
 
@@ -459,6 +463,20 @@ impl<'a> Writer<'a> {
     fn instruction(&mut self, op: &Instruction) -> Result<(), Error> {
         use Opcode::*;
         if op.opcode == Nop {
+            return Ok(());
+        }
+        if matches!(op.opcode, Call | Callc) {
+            let label = passes::call_target(op)?;
+            let call = format!("dx_l{label}({});", self.call_arguments);
+            if op.opcode == Callc {
+                let value = self.read(&op.sources[1], ValueType::Uint, false)?;
+                let comparison = if op.test_nonzero { "!=" } else { "==" };
+                self.open(&format!("if ({value}).x {comparison} 0u"));
+                self.line(&call);
+                self.close();
+            } else {
+                self.line(&call);
+            }
             return Ok(());
         }
         if matches!(

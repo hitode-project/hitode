@@ -80,8 +80,8 @@ pub(super) fn parse(tokens: &[u32]) -> Result<Shader, Error> {
         }
         let predicated = token & 0x10000000 != 0;
         let coissue = token & 0x40000000 != 0;
-        if predicated && version.major < 3 {
-            return Err(Error::new(offset, "predication requires SM3"));
+        if predicated && !predication(version) {
+            return Err(Error::new(offset, "predication requires SM2.x"));
         }
         if coissue
             && (stage != Stage::Pixel || version.major != 1 || result.instructions.is_empty())
@@ -427,7 +427,10 @@ fn register(token: u32, stage: Stage, version: Version, offset: usize) -> Result
             "SM3 vertex outputs require generic declared output registers",
         ));
     }
-    if version.major < 3 && matches!(kind, Predicate | Misc) {
+    if kind == Predicate && !predication(version) {
+        return Err(Error::new(offset, "register requires SM2.x"));
+    }
+    if version.major < 3 && kind == Misc {
         return Err(Error::new(offset, "register requires SM3"));
     }
     if version.major == 1
@@ -637,7 +640,10 @@ fn validate_opcode(op: Opcode, stage: Stage, v: Version, offset: usize) -> Resul
     if op == Dcl && stage == Stage::Pixel && v.major < 2 {
         return Err(Error::new(offset, "pixel input declarations require SM2"));
     }
-    if matches!(op, Setp | Texldl | Breakp) && v.major < 3 {
+    if matches!(op, Setp | Breakp) && !predication(v) {
+        return Err(Error::new(offset, "opcode requires SM2.x"));
+    }
+    if op == Texldl && v.major < 3 {
         return Err(Error::new(offset, "opcode requires SM3"));
     }
     if matches!(
@@ -891,4 +897,9 @@ fn mask(mask: u8) -> String {
         .filter(|i| mask & (1 << i) != 0)
         .map(|i| "xyzw".chars().nth(i).unwrap_or('x'))
         .collect()
+}
+
+/// The predicate register belongs to the 2.x profiles (version 2.1) and SM3.
+fn predication(version: Version) -> bool {
+    version.major >= 3 || version.major == 2 && version.minor >= 1
 }

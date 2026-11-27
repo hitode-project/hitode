@@ -91,8 +91,9 @@ fn fields(shader: &Shader) -> Vec<Field> {
                 11 => Target::Fog,
                 _ => continue,
             };
+            // A scalar output reads the first component its declaration names.
             let mask = if matches!(target, Target::PointSize | Target::Fog) {
-                1
+                1 << d.mask.trailing_zeros().min(3)
             } else {
                 d.mask
             };
@@ -140,7 +141,8 @@ fn result_wgsl(fields: &[Field]) -> String {
         };
         let register = f.register;
         if matches!(f.target, Target::Depth | Target::PointSize | Target::Fog) {
-            out.push_str(&format!("{name} = bitcast<f32>(o[{register}].x);\n"));
+            let c = LANES[f.mask.trailing_zeros() as usize];
+            out.push_str(&format!("{name} = bitcast<f32>(o[{register}].{c});\n"));
         } else if f.mask == 15 {
             out.push_str(&format!("{name} = bitcast<vec4<f32>>(o[{register}]);\n"));
         } else {
@@ -1114,18 +1116,34 @@ impl Lower<'_> {
     /// Round half away from zero.
     fn round(&mut self, write: &Write, v: Value) {
         let v = self.plain(v);
-        let magnitude = self.scratch(
+        let whole = self.scratch(ir::Opcode::RoundZ, 15, vec![v.operand()]);
+        // |v| - |trunc(v)| is exact, unlike |v| + 0.5.
+        let fraction = self.scratch(
             ir::Opcode::Add,
             15,
-            vec![v.absolute().operand(), float(0.5).operand()],
+            vec![v.absolute().operand(), whole.absolute().negated().operand()],
         );
-        let floor = self.scratch(ir::Opcode::RoundNi, 15, vec![magnitude.operand()]);
+        let up = self.scratch(
+            ir::Opcode::Ge,
+            15,
+            vec![fraction.operand(), float(0.5).operand()],
+        );
+        let one = self.scratch(
+            ir::Opcode::And,
+            15,
+            vec![up.operand(), float(1.0).operand()],
+        );
         let sign = self.scratch(
             ir::Opcode::And,
             15,
             vec![v.operand(), bits([0x8000_0000; 4]).operand()],
         );
-        self.write_to(write, ir::Opcode::Or, vec![floor.operand(), sign.operand()]);
+        let step = self.scratch(ir::Opcode::Or, 15, vec![one.operand(), sign.operand()]);
+        self.write_to(
+            write,
+            ir::Opcode::Add,
+            vec![whole.operand(), step.operand()],
+        );
     }
 
     /// `base` to the power `exponent` for a nonnegative base, as C `pow`: one
@@ -1278,11 +1296,25 @@ impl Lower<'_> {
             Texkill => {
                 let d = ins.destination.as_ref().ok_or("missing destination")?;
                 let q = self.register(d.register, d.relative, 0)?;
-                let negative =
-                    self.scratch(ir::Opcode::Lt, 7, vec![q.operand(), float(0.0).operand()]);
-                let any = self.scratch(ir::Opcode::Or, 1, vec![negative.lane(0), negative.lane(1)]);
-                let any2 = self.scratch(ir::Opcode::Or, 1, vec![any.lane(0), negative.lane(2)]);
-                self.exec(ir::Opcode::Discard, vec![], vec![any2.lane(0)]);
+                // PS 1.x tests xyz; later models test all four components.
+                let lanes = if self.shader.version.major == 1 { 3 } else { 4 };
+                let mut negative =
+                    self.scratch(ir::Opcode::Lt, 15, vec![q.operand(), float(0.0).operand()]);
+                if let Some(p) = &ins.predicate {
+                    let test = self.predicate_mask(p)?;
+                    negative = self.scratch(
+                        ir::Opcode::And,
+                        15,
+                        vec![negative.operand(), test.operand()],
+                    );
+                }
+                let mut any = negative.lane(0);
+                for lane in 1..lanes {
+                    any = self
+                        .scratch(ir::Opcode::Or, 1, vec![any, negative.lane(lane)])
+                        .lane(0);
+                }
+                self.exec(ir::Opcode::Discard, vec![], vec![any]);
                 Ok(())
             }
             Texm3x2pad | Texm3x3pad => {
@@ -1297,8 +1329,7 @@ impl Lower<'_> {
             Texdepth => {
                 let d = ins.destination.as_ref().ok_or("missing destination")?;
                 let r = Value::new(temp(u32::from(d.register.index)));
-                let reciprocal = self.reciprocal(r.lane(1));
-                self.depth(r.lane(0), reciprocal.lane(0));
+                self.depth(r.lane(0), r.lane(1));
                 Ok(())
             }
             Texm3x2depth => {
@@ -1307,8 +1338,10 @@ impl Lower<'_> {
                 let t = self.texcoord(d);
                 let z = self.alloc();
                 self.dot(mask(temp(z), 1), &t, &a, 3, false);
-                let reciprocal = self.reciprocal(Value::new(temp(z)).lane(0));
-                self.depth(Value::new(temp(MATRIX)).lane(0), reciprocal.lane(0));
+                self.depth(
+                    Value::new(temp(MATRIX)).lane(0),
+                    Value::new(temp(z)).lane(0),
+                );
                 self.matrix = 0;
                 Ok(())
             }
@@ -1327,12 +1360,20 @@ impl Lower<'_> {
         Value::new(input(n))
     }
 
-    fn depth(&mut self, numerator: ir::Operand, reciprocal: ir::Operand) {
-        let product = self.scratch(ir::Opcode::Mul, 1, vec![numerator, reciprocal]);
+    /// Depth `numerator / denominator` clamped to [0, 1], and one for a zero denominator.
+    fn depth(&mut self, numerator: ir::Operand, denominator: ir::Operand) {
+        let reciprocal = self.reciprocal(denominator.clone());
+        let product = self.scratch(ir::Opcode::Mul, 1, vec![numerator, reciprocal.lane(0)]);
+        let zero = self.scratch(ir::Opcode::Eq, 1, vec![denominator, float(0.0).lane(0)]);
+        let depth = self.scratch(
+            ir::Opcode::Movc,
+            1,
+            vec![zero.lane(0), float(1.0).lane(0), product.lane(0)],
+        );
         let mut op = instruction(
             ir::Opcode::Mov,
             vec![mask(output(OUTPUT_DEPTH), 1)],
-            vec![product.lane(0)],
+            vec![depth.lane(0)],
         );
         op.saturate = true;
         self.push(Statement::Execute(op));
@@ -1669,10 +1710,16 @@ impl Lower<'_> {
                 let a = self.source(&ins.sources[0], 0)?;
                 let length = self.alloc();
                 self.dot(mask(temp(length), 1), &a, &a, 3, false);
-                let scale =
-                    self.scratch(ir::Opcode::Rsq, 1, vec![Value::new(temp(length)).lane(0)]);
-                let n = self.scratch(ir::Opcode::Mul, 7, vec![a.operand(), scale.lane(0)]);
-                self.compose(w, [n.lane(0), n.lane(1), n.lane(2), a.lane(3)]);
+                let squared = Value::new(temp(length));
+                let root = self.scratch(ir::Opcode::Rsq, 1, vec![squared.lane(0)]);
+                let zero =
+                    self.scratch(ir::Opcode::Eq, 1, vec![squared.lane(0), float(0.0).lane(0)]);
+                let scale = self.scratch(
+                    ir::Opcode::Movc,
+                    1,
+                    vec![zero.lane(0), float(f32::MAX).lane(0), root.lane(0)],
+                );
+                to(self, ir::Opcode::Mul, vec![a.operand(), scale.lane(0)]);
             }
             SinCos => {
                 let a = self.source(&ins.sources[0], 0)?;
@@ -1700,6 +1747,12 @@ impl Lower<'_> {
                     ir::Opcode::Movc,
                     vec![m.operand(), v[1].operand(), v[2].operand()],
                 );
+            }
+            Cnd if version.minor < 4 && ins.coissue && w.mask & 8 == 0 => {
+                // Windows drivers select src1 for the colour half of a
+                // co-issued PS 1.1-1.3 cnd, whatever the condition.
+                let v = self.sources(ins)?;
+                to(self, ir::Opcode::Mov, vec![v[1].operand()]);
             }
             Cnd => {
                 let v = self.sources(ins)?;
@@ -1784,11 +1837,43 @@ impl Lower<'_> {
                 } else {
                     self.source(&ins.sources[0], 0)?
                 };
+                // A sampler swizzle reorders the texel before the write mask.
+                let swizzle = match ins.sources.get(1) {
+                    Some(s) if version.major > 1 && s.swizzle != [0, 1, 2, 3] => Some(s.swizzle),
+                    _ => None,
+                };
+                let texel = self.alloc();
+                let plain = Write {
+                    register: temp(texel),
+                    mask: 15,
+                    saturate: false,
+                    finish: None,
+                };
+                let target = if swizzle.is_some() { &plain } else { w };
+                // Without implicit gradients, a sample whose written lanes are
+                // all predicated off is skipped, so it needs no texture.
+                let skip = match &ins.predicate {
+                    Some(p) if self.shader.stage == Stage::Vertex || ins.opcode != Tex => {
+                        let test = self.predicate_mask(p)?;
+                        let mut any = None;
+                        for lane in (0..4).filter(|lane| w.mask & (1 << lane) != 0) {
+                            any = Some(match any {
+                                None => test.lane(lane),
+                                Some(any) => self
+                                    .scratch(ir::Opcode::Or, 1, vec![any, test.lane(lane)])
+                                    .lane(0),
+                            });
+                        }
+                        self.blocks.push(Vec::new());
+                        any
+                    }
+                    _ => None,
+                };
                 if ins.opcode == Texldd {
                     let dx = self.source(&ins.sources[2], 0)?;
                     let dy = self.source(&ins.sources[3], 0)?;
                     self.sample(
-                        w,
+                        target,
                         index,
                         coordinate.operand(),
                         0,
@@ -1800,7 +1885,19 @@ impl Lower<'_> {
                     } else {
                         u32::from(ins.controls)
                     };
-                    self.sample(w, index, coordinate.operand(), mode, None);
+                    self.sample(target, index, coordinate.operand(), mode, None);
+                }
+                if let Some(swizzle) = swizzle {
+                    let sampled = Value::new(temp(texel)).swizzled(swizzle);
+                    to(self, ir::Opcode::Mov, vec![sampled.operand()]);
+                }
+                if let Some(any) = skip {
+                    let accept = self.blocks.pop().unwrap();
+                    self.push(Statement::If {
+                        test: test_instruction(any, true),
+                        accept,
+                        reject: None,
+                    });
                 }
             }
             Texreg2ar | Texreg2gb | Texreg2rgb | Texdp3tex => {
@@ -1942,13 +2039,13 @@ impl Lower<'_> {
                         perturb.swizzled([1, 1, 1, 1]).operand(),
                     ],
                 );
-                let offset =
-                    self.scratch(ir::Opcode::Add, 3, vec![first.operand(), second.operand()]);
+                let partial =
+                    self.scratch(ir::Opcode::Add, 3, vec![base.operand(), first.operand()]);
                 let c = self.alloc();
                 self.exec(
                     ir::Opcode::Add,
                     vec![mask(temp(c), 3)],
-                    vec![base.operand(), offset.operand()],
+                    vec![partial.operand(), second.operand()],
                 );
                 self.exec(
                     ir::Opcode::Mov,
@@ -1996,7 +2093,8 @@ fn test_instruction(value: ir::Operand, nonzero: bool) -> ir::Instruction {
 
 fn sampler_dimension(shader: &Shader, ins: &Instruction, index: u8) -> SamplerDimension {
     let implicit = match ins.opcode {
-        Opcode::Texreg2rgb | Opcode::Texm3x3tex => SamplerDimension::D3,
+        // texreg2rgb samples a 2D texture with its first two coordinates too.
+        Opcode::Texm3x3tex => SamplerDimension::D3,
         Opcode::Texm3x3spec | Opcode::Texm3x3vspec => SamplerDimension::Cube,
         _ => SamplerDimension::D2,
     };
@@ -2331,11 +2429,50 @@ impl ir::interpreter::Resources for Textures<'_> {
     }
 }
 
+/// Statements in a block and the blocks nested in it.
+fn statements(block: &[Statement]) -> usize {
+    block
+        .iter()
+        .map(|statement| {
+            1 + match statement {
+                Statement::If { accept, reject, .. } => {
+                    statements(accept) + reject.as_deref().map_or(0, statements)
+                }
+                Statement::Loop(body) => statements(body),
+                Statement::Switch { cases, .. } => {
+                    cases.iter().map(|case| statements(&case.body)).sum()
+                }
+                _ => 0,
+            }
+        })
+        .sum()
+}
+
 impl Program {
     pub fn new(shader: &Shader) -> Result<Self, Error> {
         let lowered = lower(shader)?;
+        // The budget counts guest instructions, as the GPU loop guard does:
+        // each one costs the statements it lowers to on average.
+        let guest = shader
+            .instructions
+            .iter()
+            .filter(|i| {
+                !matches!(
+                    i.opcode,
+                    Opcode::Nop
+                        | Opcode::Dcl
+                        | Opcode::Def
+                        | Opcode::Defi
+                        | Opcode::Defb
+                        | Opcode::Phase
+                )
+            })
+            .count()
+            .max(1);
+        let expansion = statements(&lowered.module.body).div_ceil(guest).max(1);
         let prepared = ir::interpreter::Prepared::new(&lowered.module)
-            .map_err(|e| Error::new(0, format!("lowered shader: {e}")))?;
+            .map_err(|e| Error::new(0, format!("lowered shader: {e}")))?
+            .with_fuel(MAX_EXECUTION_STEPS * expansion);
         Ok(Self {
             prepared,
             inputs: lowered.inputs,
@@ -2395,11 +2532,11 @@ impl Program {
                     continue;
                 }
                 Target::PointSize => {
-                    outputs.point_size = value[0];
+                    outputs.point_size = value[f.mask.trailing_zeros() as usize];
                     continue;
                 }
                 Target::Fog => {
-                    outputs.fog = value[0];
+                    outputs.fog = value[f.mask.trailing_zeros() as usize];
                     continue;
                 }
             };

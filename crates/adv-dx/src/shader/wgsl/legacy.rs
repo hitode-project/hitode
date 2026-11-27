@@ -64,12 +64,22 @@ pub(crate) fn emit(module: &Module, library: &Library<'_>) -> Result<String, Err
     writer.source.push_str(library.result);
     writer.line("return result;");
     writer.close();
-    writer.open("fn dx_run(input: ShaderInputs) -> ShaderOutputs");
-    if !library.inputs.is_empty() {
-        writer.line(&format!(
-            "var v: array<vec4<u32>, {}>;",
-            library.input_count
+    // Each subroutine is a function over the caller's registers.
+    let (entry, routines) = passes::subroutines(&module.body);
+    let inputs = library.input_count.max(1);
+    let temporaries = reflection.temporary_count.max(1);
+    for (label, range) in &routines {
+        writer.open(&format!(
+            "fn dx_l{label}(r: ptr<function, array<vec4<u32>, {temporaries}>>, o: ptr<function, array<vec4<u32>, {outputs}>>, v: ptr<function, array<vec4<u32>, {inputs}>>)"
         ));
+        writer.call_arguments = "r, o, v";
+        writer.result.clear();
+        writer.block(&module.body[range.clone()])?;
+        writer.close();
+    }
+    writer.open("fn dx_run(input: ShaderInputs) -> ShaderOutputs");
+    if !library.inputs.is_empty() || !routines.is_empty() {
+        writer.line(&format!("var v: array<vec4<u32>, {inputs}>;"));
         for (register, value) in library.inputs {
             writer.line(&format!("v[{register}] = bitcast<vec4<u32>>({value});"));
         }
@@ -77,7 +87,8 @@ pub(crate) fn emit(module: &Module, library: &Library<'_>) -> Result<String, Err
     writer.line(&format!("var o: array<vec4<u32>, {outputs}>;"));
     writer.temporaries(&module, &reflection)?;
     writer.result = "dx_result(o)".into();
-    if !writer.block(&module.body)? {
+    writer.call_arguments = "&r, &o, &v";
+    if !writer.block(&module.body[..entry])? {
         writer.line("return dx_result(o);");
     }
     writer.close();
