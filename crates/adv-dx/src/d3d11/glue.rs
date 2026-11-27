@@ -725,6 +725,7 @@ pub fn configure_gpu<B: Backend>(
             ..paths
         },
     );
+    gpu.set_wake(Some(std::sync::Arc::new(wake.clone())));
     let mut execution = gpu::Execution::new(gpu);
     execution.wake = Some(wake);
     machine.ext.get_mut::<State>().execution = Some(execution);
