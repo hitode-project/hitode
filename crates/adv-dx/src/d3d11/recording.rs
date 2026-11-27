@@ -106,7 +106,7 @@ pub struct Effects<'a> {
 #[derive(Default)]
 pub struct Recording {
     inner: record::Recording<Command>,
-    damage: Option<(ResourceKey, Region)>,
+    damage: Option<(ResourceKey, Region, Option<Rect>)>,
     verification: Option<Arc<Verification>>,
     verification_serial: u64,
     #[cfg(feature = "d3d9-counters")]
@@ -200,7 +200,7 @@ impl Recording {
 
     pub(super) fn damage(&self, key: ResourceKey, size: (u32, u32)) -> Option<Region> {
         match &self.damage {
-            Some((old, damage)) if *old == key && damage.size() == size => {
+            Some((old, damage, _)) if *old == key && damage.size() == size => {
                 (!damage.is_empty()).then(|| damage.clone())
             }
             _ => Some(Region::whole(size)),
@@ -208,10 +208,12 @@ impl Recording {
     }
 
     pub(super) fn written(&mut self, key: ResourceKey, bounds: Rect) {
-        if let Some((old, damage)) = &mut self.damage
+        if let Some((old, damage, last)) = &mut self.damage
             && *old == key
+            && *last != Some(bounds)
         {
             damage.add(bounds.into());
+            *last = Some(bounds);
         }
     }
 
@@ -280,11 +282,12 @@ impl Recording {
     ) {
         self.inner.finish(0, Some(serial));
         match &mut self.damage {
-            Some((old, damage)) if damage.size() == size => {
+            Some((old, damage, last)) if damage.size() == size => {
                 *old = key;
+                *last = None;
                 damage.clear();
             }
-            _ => self.damage = Some((key, Region::empty(size))),
+            _ => self.damage = Some((key, Region::empty(size), None)),
         }
         #[cfg(feature = "d3d9-counters")]
         {

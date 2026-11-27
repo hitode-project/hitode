@@ -278,6 +278,9 @@ Direct3D 11 captures the dynamic index window and the vertex and instance window
 Direct3D 11 dynamic maps preserve untouched bytes in a fixed guest shadow.
 A GPU write makes that shadow stale, and the next map refreshes it at an
 ordered, counted readback. Maps with a current shadow take constant time.
+Sampling a dynamic texture uploads a newer shadow once and keeps the GPU
+image for subsequent draws. A new shadow upload gives previously recorded
+draws their original image.
 ResolveSubresource requires a default-usage destination.
 
 ### GFX-REC-8 Frontend work counters
@@ -717,6 +720,12 @@ A clipped primitive can execute whole or in pieces. Each invocation sees the cov
 
 **Rule**: Pipeline keys MUST include immutable program identity, texture visibility, vertex layout, and blend, depth, and raster state. Program construction MUST assign an identity retained by clones. The pipeline cache MUST retain at most 512 entries with FIFO eviction.
 **Verification**: Test — identity and FIFO eviction are covered, but complete key-component coverage also requires review.
+
+D3D11 caches translated and parsed stage variants per device. Entries compare the shader
+objects, resolved linkage, and all code-generation inputs, and retire when a referenced shader
+object is destroyed. The depth-only mask variants live with the device. Draw offsets, strides
+and primitive counts are uniform data. Graphics counter builds report variant hits, misses and
+the D3D11 frame of the last miss.
 
 ### GFX-CACHE-2 WGSL cache validity
 

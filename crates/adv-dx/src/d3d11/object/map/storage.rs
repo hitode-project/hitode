@@ -211,6 +211,11 @@ impl Storage {
     }
 
     #[cfg(feature = "gpu")]
+    pub(in crate::d3d11) fn dynamic_cpu_newer(&self, subresource: u32) -> bool {
+        self.subresources[subresource as usize].dynamic == DynamicResidency::CpuNewer
+    }
+
+    #[cfg(feature = "gpu")]
     pub(in crate::d3d11) fn dynamic_gpu_write(&mut self, subresource: u32) {
         self.subresources[subresource as usize].dynamic = DynamicResidency::GpuNewer;
     }

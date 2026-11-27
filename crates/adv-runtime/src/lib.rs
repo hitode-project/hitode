@@ -53,7 +53,10 @@ pub use adv_dx::dsound::{AudioSourceStatus, PcmDigest};
 #[cfg(all(feature = "gpu", feature = "graphics-counters"))]
 pub use adv_dx::{
     d3d9::traffic as d3d9_traffic,
-    d3d11::{frame_counters as d3d11_counters, traffic as d3d11_traffic},
+    d3d11::{
+        frame_counters as d3d11_counters, traffic as d3d11_traffic,
+        variant_counters as d3d11_variant_counters,
+    },
 };
 pub use graphics::{
     FrameConsumer, FrameProducer, FrameView, GraphicsStats, PendingFrame, Presenter, Snapshot,

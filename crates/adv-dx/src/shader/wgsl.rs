@@ -129,7 +129,7 @@ pub struct BorderSampler {
     pub comparison: i32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BorderChannel {
     Missing,
     Float,
@@ -137,11 +137,61 @@ pub enum BorderChannel {
     Snorm(u8),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BorderTexture {
     pub slot: u32,
     pub channels: [BorderChannel; 4],
 }
+
+// Floating-point options are emitted as literals or bit patterns. Preserve
+// signed zero and compare NaNs by their bits as well.
+#[cfg(feature = "gpu")]
+macro_rules! option_key {
+    ($ty:ty, |$value:ident| $key:expr) => {
+        impl PartialEq for $ty {
+            fn eq(&self, other: &Self) -> bool {
+                let key = |$value: &Self| $key;
+                key(self) == key(other)
+            }
+        }
+
+        impl Eq for $ty {}
+
+        impl std::hash::Hash for $ty {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                let $value = self;
+                std::hash::Hash::hash(&$key, state);
+            }
+        }
+    };
+}
+
+#[cfg(feature = "gpu")]
+option_key!(LodSampler, |s| (
+    s.bias.to_bits(),
+    s.min.to_bits(),
+    s.max.to_bits(),
+    s.max_anisotropy,
+    s.round_mip,
+    s.point,
+    s.linear_comparison,
+));
+#[cfg(feature = "gpu")]
+option_key!(TextureLod, |t| (
+    t.slot,
+    t.minimum.to_bits(),
+    t.last,
+    t.default_alpha,
+));
+#[cfg(feature = "gpu")]
+option_key!(BorderSampler, |s| (
+    s.slot,
+    s.axes,
+    s.color.map(f32::to_bits),
+    s.linear,
+    s.lod,
+    s.comparison,
+));
 
 pub fn emit(module: &Module, options: Options<'_>) -> Result<Translation, Error> {
     let (module, reflection) = passes::prepare(module)?;

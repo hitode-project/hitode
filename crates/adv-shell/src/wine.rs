@@ -628,6 +628,12 @@ fn report(
                 front(adv_runtime::d3d11_counters(ext))
             ));
         }
+        if let Some(counts) = adv_runtime::d3d11_variant_counters(ext) {
+            fields.push(format!(
+                "\"d3d11_shader_variants\": {{\"hits\": {}, \"misses\": {}, \"last_miss_frame\": {}}}",
+                counts.hits, counts.misses, counts.last_miss_frame,
+            ));
+        }
     }
 
     let mut codec = adv_runtime::wine::vorbisfile::stats(&session.machine).map_or_else(

@@ -370,6 +370,7 @@ fn draw(image: &Image, vertex: Arc<ModernShader>, fragment: Arc<ModernShader>) -
 
 fn inputs(gpu: &Gpu, index: &[u32]) -> Inputs {
     Inputs {
+        draw_state: None,
         primitives: index.len() as u32 / 3,
         vertices: Some(upload(
             gpu,
@@ -837,6 +838,7 @@ fn domain_points_are_shaded_once_and_streamed_as_a_list() {
     );
     let filled = buffer(&gpu, &[0], BufferUsage::STORAGE, Memory::Readback);
     let input = Inputs {
+        draw_state: None,
         primitives: indices.len() as u32 / 3,
         vertices: Some(upload(&gpu, bytemuck::cast_slice(&vertices))),
         indices: Some(upload(&gpu, &indices)),

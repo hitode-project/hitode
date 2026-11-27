@@ -151,6 +151,8 @@ pub(super) struct Device {
     pub(crate) multithreaded: bool,
     pub(super) text_filter: [u32; 2],
     states: [BTreeMap<Vec<u8>, u32>; 4],
+    #[cfg(feature = "gpu")]
+    pub(super) variants: std::cell::RefCell<super::glue::ShaderVariants>,
 }
 
 impl Kind {
@@ -289,6 +291,14 @@ impl Object {
             unreachable!();
         };
         mapping.as_ref().unwrap().dynamic_shadow_stale(0)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(super) fn dynamic_cpu_newer(&self) -> bool {
+        let Kind::Resource { mapping, .. } = &self.kind else {
+            unreachable!();
+        };
+        mapping.as_ref().unwrap().dynamic_cpu_newer(0)
     }
 
     pub fn initial_data(&self, subresource: u32) -> Option<&[u8]> {
@@ -576,6 +586,8 @@ impl Table {
                 multithreaded: false,
                 text_filter: [0; 2],
                 states: Default::default(),
+                #[cfg(feature = "gpu")]
+                variants: Default::default(),
             }),
         )
     }
@@ -1048,6 +1060,14 @@ impl Table {
             private,
             ..
         } = destroyed.value;
+        #[cfg(feature = "gpu")]
+        if matches!(&kind, Kind::Shader { .. })
+            && let Some(owner) = self
+                .get_mut(objects, device)
+                .and_then(Object::device_state_mut)
+        {
+            owner.variants.get_mut().release(&destroyed.interfaces);
+        }
         result.allocations.extend(destroyed.interfaces);
         result
             .private_interfaces

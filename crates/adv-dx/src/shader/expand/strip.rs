@@ -11,20 +11,40 @@ pub(super) fn declare(source: &mut String, write: bool) {
 
 pub(super) fn prepare(
     gpu: &Gpu,
+    compiled: &OnceCell<ComputeProgram>,
     assembly: Assembly,
     width: u32,
+    state: &DrawState,
     indices: BufferRange,
     arguments: Option<&BufferRange>,
 ) -> Result<(BufferRange, ExpansionPrelude), adv_device::gpu::Error> {
-    let Assembly {
-        count, first, step, ..
-    } = assembly;
+    let table = gpu.expansion_storage(u64::from(1 + state.primitives_per_instance) * 8)?;
+    let program = compiled.get_or_init(|| emit(assembly, width));
+    let mut slots = SlotBindings::default();
+    bind_draw_state(&mut slots, state.uniform.clone());
+    bind_storage(&mut slots, INDEX_SLOT, indices);
+    bind_storage(&mut slots, SLOT, table.clone());
+    if let Some(arguments) = arguments {
+        bind_storage(&mut slots, DRAW_ARGUMENTS_SLOT, arguments.clone());
+    }
+    Ok((
+        table,
+        ExpansionPrelude {
+            dispatch: program.prepare(gpu)?,
+            slots,
+            groups: [1, 1, 1],
+        },
+    ))
+}
+
+fn emit(assembly: Assembly, width: u32) -> ComputeProgram {
+    let step = assembly.step;
     let index = assembly.index.unwrap();
-    let table = gpu.expansion_storage(u64::from(1 + assembly.primitives(width)) * 8)?;
     let mut source = String::new();
+    pulled::draw_state(&mut source, 0);
     storage(&mut source, INDEX_SLOT, "dx_indices", "array<u32>", false);
     declare(&mut source, true);
-    if assembly.indirect.is_some() {
+    if assembly.indirect {
         storage(
             &mut source,
             DRAW_ARGUMENTS_SLOT,
@@ -34,18 +54,14 @@ pub(super) fn prepare(
         );
     }
     entry(&mut source, "strip_main", 1);
-    if let Some(Indirect {
-        first_word: word, ..
-    }) = assembly.indirect
-    {
-        writeln!(
-            source,
-            "let count = min(dx_draw[{word}u], {count}u); let first = dx_draw[{}u];",
-            word + 2
-        )
-        .unwrap();
+    if assembly.indirect {
+        source.push_str(
+            "let word = dx_draw_state.argument_word;
+             let count = min(dx_draw[word], dx_draw_state.count);
+             let first = dx_draw[word + 2u];\n",
+        );
     } else {
-        writeln!(source, "let count = {count}u; let first = {first}u;").unwrap();
+        source.push_str("let count = dx_draw_state.count; let first = dx_draw_state.first;\n");
     }
     source.push_str(
         "var run = 0u; var written = 0u; var vertices = 0u;
@@ -71,7 +87,8 @@ pub(super) fn prepare(
 }}"
     )
     .unwrap();
-    let program = ComputeProgram {
+    ComputeProgram {
+        shader: OnceCell::new(),
         source,
         entry: "strip_main",
         bindings: Vec::new(),
@@ -79,19 +96,5 @@ pub(super) fn prepare(
         expansion: Vec::new(),
         workgroup_size: None,
         items_per_primitive: 1,
-    };
-    let mut slots = SlotBindings::default();
-    bind_storage(&mut slots, INDEX_SLOT, indices);
-    bind_storage(&mut slots, SLOT, table.clone());
-    if let Some(arguments) = arguments {
-        bind_storage(&mut slots, DRAW_ARGUMENTS_SLOT, arguments.clone());
     }
-    Ok((
-        table,
-        ExpansionPrelude {
-            dispatch: program.prepare(gpu)?,
-            slots,
-            groups: [1, 1, 1],
-        },
-    ))
 }

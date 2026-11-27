@@ -2,6 +2,7 @@
 use super::*;
 
 mod draw;
+pub(in crate::d3d11) use draw::ShaderVariants;
 mod gamma;
 mod queries;
 use crate::d3d11::{
@@ -41,6 +42,8 @@ pub(super) struct Execution {
     gamma: Option<(u64, gamma::Pass)>,
     verify_frames: bool,
     other_presentations: Option<u64>,
+    #[cfg(feature = "d3d9-counters")]
+    variants: std::cell::Cell<VariantCounters>,
 }
 
 impl Execution {
@@ -64,7 +67,21 @@ impl Execution {
             gamma: None,
             verify_frames: std::env::var("ADV_VERIFY_FRAMES").as_deref() == Ok("1"),
             other_presentations: None,
+            #[cfg(feature = "d3d9-counters")]
+            variants: Default::default(),
         }
+    }
+
+    #[cfg(feature = "d3d9-counters")]
+    fn variant_counts(&self, hit: bool) {
+        let mut counts = self.variants.get();
+        if hit {
+            counts.hits += 1;
+        } else {
+            counts.misses += 1;
+            counts.last_miss_frame = self.recording.counters.presents + 1;
+        }
+        self.variants.set(counts);
     }
 
     pub(super) fn fork(&self) -> Result<Gpu, adv_device::gpu::Error> {
@@ -254,6 +271,19 @@ pub fn frame_counters(ext: &Ext) -> Option<crate::d3d9::FrameCounters> {
 }
 
 #[cfg(feature = "d3d9-counters")]
+#[derive(Clone, Copy, Default)]
+pub struct VariantCounters {
+    pub hits: u64,
+    pub misses: u64,
+    pub last_miss_frame: u64,
+}
+
+#[cfg(feature = "d3d9-counters")]
+pub fn variant_counters(ext: &Ext) -> Option<VariantCounters> {
+    Some(ext.try_get::<State>()?.execution.as_ref()?.variants.get())
+}
+
+#[cfg(feature = "d3d9-counters")]
 pub fn traffic(ext: &Ext) -> Option<adv_device::gpu::Traffic> {
     Some(ext.try_get::<State>()?.execution.as_ref()?.gpu.traffic())
 }
@@ -262,9 +292,13 @@ fn context_device(env: &Env<'_>) -> Result<u32, Error> {
     context::owner(env)
 }
 
-fn null_device(env: &Env<'_>) -> Result<bool, Error> {
+fn device_state<'a>(env: &'a Env<'_>) -> Result<&'a crate::d3d11::object::Device, Error> {
     let object = ops::object(env, table(env), context_device(env)?)?;
-    Ok(object.device_state().unwrap().null_device)
+    Ok(object.device_state().unwrap())
+}
+
+fn null_device(env: &Env<'_>) -> Result<bool, Error> {
+    Ok(device_state(env)?.null_device)
 }
 
 fn description(env: &Env<'_>, pointer: u32) -> Result<Resource, Error> {

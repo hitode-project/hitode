@@ -202,14 +202,29 @@ pub(crate) fn raster(
 /// Storage slots above the shader-resource and expansion bindings.
 pub const VERTEX_STREAM_BASE: u32 = 192;
 pub const DRAW_ARGUMENTS_SLOT: u32 = 224;
+pub const DRAW_STATE_SLOT: u32 = 33;
 
-#[derive(Clone, Copy, Debug)]
-pub enum DrawStart {
-    Direct { vertex: u32, instance: u32 },
-    Indirect { first_word: u32, indexed: bool },
+pub(crate) fn draw_state(source: &mut String, fetch_count: usize) {
+    let vectors = fetch_count.div_ceil(2).max(1);
+    writeln!(
+        source,
+        "struct DxDrawState {{
+            first: u32, base_vertex: u32, first_instance: u32, primitives: u32,
+            index_offset: u32, count: u32, argument_word: u32, instances: u32,
+            fetch: array<vec4<u32>, {vectors}>,
+        }}
+        @group(0) @binding({DRAW_STATE_SLOT}) var<uniform> dx_draw_state: DxDrawState;"
+    )
+    .unwrap();
 }
 
-#[derive(Clone, Copy, Debug, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DrawStart {
+    Direct,
+    Indirect { indexed: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InputStep {
     Vertex,
     Instance(u32),
@@ -217,16 +232,21 @@ pub enum InputStep {
 
 #[derive(Clone, Copy, Debug)]
 pub struct VertexFetch {
+    pub layout: FetchLayout,
+    pub offset: u32,
+    pub stride: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FetchLayout {
     pub register: u32,
     pub mask: u8,
     pub stream: u32,
-    pub offset: u32,
-    pub stride: u32,
     pub step: InputStep,
     pub format: VertexFormat,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VertexFormat {
     pub bytes: u32,
     pub bits: [u8; 4],
@@ -234,7 +254,7 @@ pub struct VertexFormat {
     pub offsets: [u8; 4],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VertexComponent {
     Float,
     Sint,
@@ -248,7 +268,7 @@ pub fn vertex(
     variant: &Variant,
     fragment: Option<&Reflection>,
     options: Options<'_>,
-    fetches: &[VertexFetch],
+    fetches: &[FetchLayout],
     start: DrawStart,
 ) -> Result<Translation, Error> {
     let pulled = fetched(module, variant, options, fetches)?;
@@ -268,18 +288,16 @@ pub fn vertex(
     }
     writer.source.push_str(&pulled.source);
     let (vertex_start, instance_start) = match start {
-        DrawStart::Direct { vertex, instance } => (format!("{vertex}u"), format!("{instance}u")),
-        DrawStart::Indirect {
-            first_word,
-            indexed,
-        } => {
+        DrawStart::Direct => ("dx_draw_state.base_vertex", "dx_draw_state.first_instance"),
+        DrawStart::Indirect { indexed } => {
             writer.line(&format!(
                 "@group(3) @binding({DRAW_ARGUMENTS_SLOT}) var<storage, read> dx_draw: array<u32>;"
             ));
-            let vertex_word = first_word + if indexed { 3 } else { 2 };
+            let vertex_offset = if indexed { 3 } else { 2 };
+            writer.line(&format!("const DX_VERTEX_WORD = {vertex_offset}u;"));
             (
-                format!("dx_draw[{vertex_word}u]"),
-                format!("dx_draw[{}u]", vertex_word + 1),
+                "dx_draw[dx_draw_state.argument_word + DX_VERTEX_WORD]",
+                "dx_draw[dx_draw_state.argument_word + DX_VERTEX_WORD + 1u]",
             )
         }
     };
@@ -311,12 +329,13 @@ pub(crate) fn fetched(
     module: &Module,
     variant: &Variant,
     options: Options<'_>,
-    fetches: &[VertexFetch],
+    fetches: &[FetchLayout],
 ) -> Result<Pulled, Error> {
     let mut pulled = emit(module, &variant.pull_input(), Invocation::Vertex, options)?;
     let reflection = super::super::analysis::analyze(module);
     let mut writer = Writer::new(module, &reflection, options);
     writer.source = std::mem::take(&mut pulled.source);
+    draw_state(&mut writer.source, fetches.len());
     let streams: std::collections::BTreeSet<_> = fetches.iter().map(|fetch| fetch.stream).collect();
     for stream in streams {
         let binding = VERTEX_STREAM_BASE + stream;
@@ -353,14 +372,12 @@ pub(crate) fn fetched(
     Ok(pulled)
 }
 
-fn emit_fetch(writer: &mut Writer<'_>, index: usize, fetch: VertexFetch) -> Result<(), Error> {
+fn emit_fetch(writer: &mut Writer<'_>, index: usize, fetch: FetchLayout) -> Result<(), Error> {
     use VertexComponent::*;
-    let VertexFetch {
+    let FetchLayout {
         register,
         mask,
         stream,
-        offset,
-        stride,
         step,
         format,
     } = fetch;
@@ -372,8 +389,11 @@ fn emit_fetch(writer: &mut Writer<'_>, index: usize, fetch: VertexFetch) -> Resu
         }
     };
     let address = format!("dx_address_{index}");
+    let pair = if index.is_multiple_of(2) { "xy" } else { "zw" };
     writer.line(&format!(
-        "let {address} = {offset}u + ({index_expr}) * {stride}u;"
+        "let dx_fetch_{index} = dx_draw_state.fetch[{}].{pair};
+         let {address} = dx_fetch_{index}.x + ({index_expr}) * dx_fetch_{index}.y;",
+        index / 2
     ));
     let bytes = format.bytes;
     let bound = format!("dx_size_{index}");

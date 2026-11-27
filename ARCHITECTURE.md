@@ -78,7 +78,9 @@ level and format table. Resources and immutable state use the shared COM
 identity table. Context snapshots share individual state groups and each
 context indexes its bound views by resource and subresource. The D3D11
 front pulls vertex inputs through the shared shader writer and records typed
-draws and transfers for the GPU worker. D3D10 and D3D10.1 use the same device
+draws and transfers for the GPU worker. Each device reuses translated stages
+and parsed WGSL while the corresponding shader objects live. Draw offsets,
+strides and expansion counts travel through the uniform ring. D3D10 and D3D10.1 use the same device
 core. The Wine session derives feature levels from the attached backend and
 supplies DXGI with window geometry and the shared surface store. DXGI swap
 chains use D3D11 resources for back buffers and publish through the same

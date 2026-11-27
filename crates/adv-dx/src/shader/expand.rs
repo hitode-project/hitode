@@ -3,9 +3,8 @@
 
 mod primitive;
 mod schedule;
-mod strip;
-pub use schedule::Indirect;
 pub mod statistics;
+mod strip;
 mod tessellation;
 pub use tessellation::Tessellation;
 #[cfg(test)]
@@ -18,12 +17,12 @@ use super::tessellator::{self, Domain, Partitioning};
 use super::variant::Variant;
 use super::wgsl::{BindingLocation, Options, STATISTICS_SLOT, Translation, pulled};
 use adv_device::gpu::{
-    BufferRange, Expand, ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude,
-    ExpansionRegion, ExpansionWindow, Gpu, ModernDraw, ModernShader, QuerySlot, SlotBindings,
-    StorageBinding,
+    BufferRange, BufferWindow, Expand, ExpansionBinding, ExpansionDispatch, ExpansionDraw,
+    ExpansionPrelude, ExpansionRegion, ExpansionWindow, Gpu, ModernDraw, ModernShader, QuerySlot,
+    SlotBindings, StorageBinding,
 };
-use std::fmt::Write;
 use std::sync::Arc;
+use std::{cell::OnceCell, fmt::Write};
 
 const WORKGROUP: u32 = 64;
 const PARAMETERS: u32 = 32;
@@ -39,7 +38,7 @@ const FILLED_BASE: u32 = 176;
 const TARGET_BASE: u32 = 169;
 const STREAM_STATISTICS: u32 = 180;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Topology {
     Point,
     Line,
@@ -80,14 +79,14 @@ pub enum Source<'a> {
     Vertex(Shader<'a>),
     InputAssembler {
         shader: Shader<'a>,
-        fetches: &'a [pulled::VertexFetch],
+        fetches: &'a [pulled::FetchLayout],
         assembly: Assembly,
     },
     Tessellated {
         vertex: Shader<'a>,
         hull: &'a Shader<'a>,
         domain: &'a Shader<'a>,
-        fetches: &'a [pulled::VertexFetch],
+        fetches: &'a [pulled::FetchLayout],
         assembly: Assembly,
         layout: Tessellation,
     },
@@ -100,43 +99,41 @@ pub enum Source<'a> {
 }
 
 /// A direct IA draw is expanded in API primitive order.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Assembly {
     pub count_statistics: bool,
     pub predicate: Option<bool>,
-    pub first: u32,
-    pub count: u32,
-    pub base_vertex: i32,
-    pub first_instance: u32,
     pub index: Option<IndexInput>,
     pub step: u32,
     pub flip_winding: bool,
-    pub indirect: Option<Indirect>,
+    pub indirect: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IndexInput {
-    pub offset: u32,
     pub wide: bool,
 }
 
 impl IndexInput {
     fn read(self, source: &mut String, at: &str) {
-        let Self { offset, wide } = self;
-        if wide {
-            writeln!(source, "let vertex_id = dx_indices[{offset}u / 4u + {at}];").unwrap();
+        if self.wide {
+            writeln!(
+                source,
+                "let vertex_id = dx_indices[dx_draw_state.index_offset / 4u + {at}];"
+            )
+            .unwrap();
         } else {
-            writeln!(source, "let word = {offset}u / 2u + {at}; let vertex_id = (dx_indices[word / 2u] >> (16u * (word & 1u))) & 65535u;").unwrap();
+            writeln!(source, "let word = dx_draw_state.index_offset / 2u + {at}; let vertex_id = (dx_indices[word / 2u] >> (16u * (word & 1u))) & 65535u;").unwrap();
         }
     }
 }
 
 impl Assembly {
-    pub fn primitives(self, input_vertices: u32) -> u32 {
-        if self.count < input_vertices {
+    pub fn primitives(self, count: u32, input_vertices: u32) -> u32 {
+        if count < input_vertices {
             0
         } else {
-            1 + (self.count - input_vertices) / self.step
+            1 + (count - input_vertices) / self.step
         }
     }
 
@@ -147,7 +144,7 @@ impl Assembly {
     fn active(self, input_vertices: u32) -> &'static str {
         match (
             self.predicate.is_some(),
-            self.indirect.is_some(),
+            self.indirect,
             self.strip(input_vertices),
         ) {
             (true, _, _) => "dx_predicated_count()",
@@ -158,21 +155,18 @@ impl Assembly {
     }
 
     fn schedule(self, source: &mut String, input_vertices: u32) {
-        if self.indirect.is_some() {
+        if self.indirect {
             storage(source, schedule::SLOT, "dx_schedule", "array<u32>", false);
         }
         if self.strip(input_vertices) {
             strip::declare(source, false);
-            if self.indirect.is_none() {
-                let maximum = self.primitives(input_vertices);
-                writeln!(
-                    source,
-                    "fn dx_strip_active() -> u32 {{
-                    let total = dx_strip[0].x * (dx_params.z / {maximum}u);
+            if !self.indirect {
+                source.push_str(
+                    "fn dx_strip_active() -> u32 {
+                    let total = dx_strip[0].x * (dx_params.z / dx_draw_state.primitives);
                     return min(dx_params.y, max(total, dx_params.x) - dx_params.x);
-                }}"
-                )
-                .unwrap();
+                }\n",
+                );
             }
         }
         if let Some(value) = self.predicate {
@@ -188,15 +182,11 @@ impl Assembly {
 
     fn emit(self, source: &mut String, input_vertices: u32) {
         let Self {
-            first,
-            base_vertex,
-            first_instance,
             index,
             step,
             flip_winding,
             ..
         } = self;
-        let count = self.primitives(input_vertices);
         if index.is_some() {
             storage(source, INDEX_SLOT, "dx_indices", "array<u32>", false);
         }
@@ -210,15 +200,20 @@ impl Assembly {
             let item = dx_params.x + primitive;"
         )
         .unwrap();
-        if self.indirect.is_some() {
+        if self.indirect {
             source.push_str("let first = dx_schedule[2]; let base_vertex = dx_schedule[3]; let first_instance = dx_schedule[4]; let per_draw = dx_schedule[1];\n");
         } else {
             let per_draw = if self.strip(input_vertices) {
-                "dx_strip[0].x".into()
+                "dx_strip[0].x"
             } else {
-                format!("{count}u")
+                "dx_draw_state.primitives"
             };
-            writeln!(source, "let first = {first}u; let base_vertex = {}u; let first_instance = {first_instance}u; let per_draw = {per_draw};", base_vertex as u32).unwrap();
+            writeln!(
+                source,
+                "let first = dx_draw_state.first; let base_vertex = dx_draw_state.base_vertex;
+                 let first_instance = dx_draw_state.first_instance; let per_draw = {per_draw};"
+            )
+            .unwrap();
         }
         writeln!(
             source,
@@ -314,7 +309,7 @@ impl Source<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cull {
     None,
     Front,
@@ -331,7 +326,7 @@ pub struct Raster<'a> {
     pub depth_clip: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct StreamOutput {
     pub stream: u32,
     /// Register and lane at each 32-bit offset in the SO target's stride.
@@ -354,6 +349,7 @@ pub struct Plan<'a> {
 
 pub struct ComputeProgram {
     pub source: String,
+    shader: OnceCell<Result<Arc<ModernShader>, adv_device::gpu::Error>>,
     pub entry: &'static str,
     /// The guest register layout before modern pipeline slot compaction.
     pub bindings: Vec<BindingLocation>,
@@ -366,7 +362,7 @@ pub struct ComputeProgram {
 pub struct Programs {
     pub source: ComputeProgram,
     pub primitive: ComputeProgram,
-    pub raster: Vec<String>,
+    raster: Vec<RasterProgram>,
     pub topology: Topology,
     initialize: Option<ComputeProgram>,
     scan: Option<ComputeProgram>,
@@ -383,10 +379,18 @@ pub struct Programs {
     tessellation: Option<tessellation::Programs>,
     window_regions: std::ops::Range<usize>,
     assembly: Option<(Assembly, u32)>,
+    strip: OnceCell<ComputeProgram>,
+    schedule: OnceCell<ComputeProgram>,
+}
+
+struct RasterProgram {
+    source: String,
+    shader: OnceCell<Result<Arc<ModernShader>, adv_device::gpu::Error>>,
 }
 
 pub struct Inputs {
     pub primitives: u32,
+    pub draw_state: Option<DrawState>,
     /// Packed source input registers; system values occupy their declared lanes.
     pub vertices: Option<BufferRange>,
     /// One u32 source record index per input primitive vertex.
@@ -403,13 +407,33 @@ pub struct Inputs {
     pub stream_output: Vec<(BufferRange, BufferRange)>,
 }
 
+pub struct DrawState {
+    pub uniform: BufferWindow,
+    pub primitives_per_instance: u32,
+}
+
 pub struct BinDraw {
     pub draw: ModernDraw,
     pub fragment: SlotBindings,
     pub statistics: Option<QuerySlot>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FragmentLayout {
+    topology: Topology,
+    registers: u32,
+    stream: u32,
+}
+
 impl Programs {
+    pub(crate) fn fragment_layout(&self) -> FragmentLayout {
+        FragmentLayout {
+            topology: self.topology,
+            registers: self.registers,
+            stream: self.raster_stream,
+        }
+    }
+
     pub fn tessellation_stages(&self) -> Option<(&ComputeProgram, &ComputeProgram)> {
         self.tessellation
             .as_ref()
@@ -417,14 +441,19 @@ impl Programs {
     }
 
     pub fn vertex_shader(&self, bin: usize) -> Result<Arc<ModernShader>, adv_device::gpu::Error> {
-        let source = &self.raster[bin];
-        ModernShader::wgsl(
-            xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
-            source,
-            "vertex_main",
-            adv_device::gpu::ShaderStage::Vertex,
-        )
-        .map(Arc::new)
+        let raster = &self.raster[bin];
+        raster
+            .shader
+            .get_or_init(|| {
+                ModernShader::wgsl(
+                    xxhash_rust::xxh3::xxh3_64(raster.source.as_bytes()),
+                    &raster.source,
+                    "vertex_main",
+                    adv_device::gpu::ShaderStage::Vertex,
+                )
+                .map(Arc::new)
+            })
+            .clone()
     }
 
     pub fn fragment_shader(
@@ -454,17 +483,18 @@ impl Programs {
         producer: &Reflection,
         options: Options<'_>,
     ) -> Result<Translation, Error> {
+        let layout = self.fragment_layout();
         let mut producer = producer.clone();
         producer
             .signatures
             .output
-            .retain(|element| element.stream == self.raster_stream);
+            .retain(|element| element.stream == layout.stream);
         super::wgsl::emit_expanded_fragment(
             module,
             variant,
             &producer,
-            self.topology.vertices(),
-            self.registers,
+            layout.topology.vertices(),
+            layout.registers,
             options,
         )
     }
@@ -477,6 +507,7 @@ impl Programs {
     ) -> Result<Expand, adv_device::gpu::Error> {
         let Inputs {
             primitives,
+            draw_state,
             vertices,
             indices,
             mut vertex,
@@ -515,8 +546,10 @@ impl Programs {
             let prelude = if let Some((assembly, width)) = strip {
                 let (buffer, prelude) = strip::prepare(
                     gpu,
+                    &self.strip,
                     assembly,
                     width,
+                    draw_state.as_ref().unwrap(),
                     indices.as_ref().unwrap().clone(),
                     indirect.as_ref(),
                 )?;
@@ -569,6 +602,11 @@ impl Programs {
         if let Some(write) = &self.write {
             programs.push(write.dispatch(gpu, stream)?);
         }
+        if let Some(state) = &draw_state {
+            for program in &mut programs {
+                bind_draw_state(&mut program.slots, state.uniform.clone());
+            }
+        }
         if let Some(predicate) = predicate {
             for program in &mut programs {
                 bind_storage(&mut program.slots, PREDICATE_SLOT, predicate.clone());
@@ -608,15 +646,14 @@ impl Programs {
             .collect();
         let mut regions = self.regions.clone();
         let mut first_output = first_output;
-        if let Some((assembly, input_vertices)) = self
-            .assembly
-            .filter(|(assembly, _)| assembly.indirect.is_some())
+        if let Some((assembly, input_vertices)) =
+            self.assembly.filter(|(assembly, _)| assembly.indirect)
         {
             schedule::insert(
-                gpu,
+                (gpu, &self.schedule),
                 assembly,
                 input_vertices,
-                (indirect.unwrap(), strip_buffer),
+                (indirect.unwrap(), strip_buffer, draw_state.unwrap().uniform),
                 &mut regions,
                 &mut programs,
                 self.initialize.as_ref().map(|_| first_output),
@@ -655,16 +692,19 @@ impl ComputeProgram {
     }
 
     fn prepare(&self, gpu: &Gpu) -> Result<adv_device::gpu::Dispatch, adv_device::gpu::Error> {
-        let mut identity = xxhash_rust::xxh3::Xxh3::new();
-        identity.update(self.source.as_bytes());
-        identity.update(self.entry.as_bytes());
-        let shader = ModernShader::wgsl(
-            identity.digest(),
-            &self.source,
-            self.entry,
-            adv_device::gpu::ShaderStage::Compute,
-        )?;
-        gpu.prepare_dispatch(Arc::new(shader))
+        let shader = self.shader.get_or_init(|| {
+            let mut identity = xxhash_rust::xxh3::Xxh3::new();
+            identity.update(self.source.as_bytes());
+            identity.update(self.entry.as_bytes());
+            ModernShader::wgsl(
+                identity.digest(),
+                &self.source,
+                self.entry,
+                adv_device::gpu::ShaderStage::Compute,
+            )
+            .map(Arc::new)
+        });
+        gpu.prepare_dispatch(shader.clone()?)
     }
 }
 
@@ -733,6 +773,12 @@ fn bind_storage(slots: &mut SlotBindings, register: u32, buffer: BufferRange) {
         slots.storage.resize_with(register as usize + 1, || None);
     }
     slots.storage[register as usize] = Some(StorageBinding::Buffer(buffer));
+}
+
+pub(crate) fn bind_draw_state(slots: &mut SlotBindings, uniform: BufferWindow) {
+    let slot = pulled::DRAW_STATE_SLOT as usize;
+    slots.uniforms.resize_with(slot + 1, || None);
+    slots.uniforms[slot] = Some(uniform);
 }
 
 fn scratch(slot: u32, region: usize) -> ExpansionBinding {
@@ -854,6 +900,10 @@ impl Plan<'_> {
                             topology.vertices(),
                             raster.stream,
                         )
+                        .map(|source| RasterProgram {
+                            source,
+                            shader: OnceCell::new(),
+                        })
                     })
                     .collect::<Result<_, _>>()?;
                 (
@@ -921,6 +971,8 @@ impl Plan<'_> {
             domain,
             assembled: matches!(self.source, Source::Vertex(_)),
             assembly: self.assembly(),
+            strip: OnceCell::new(),
+            schedule: OnceCell::new(),
             tessellation,
             window_regions: window_start..window_end,
         })
@@ -948,6 +1000,7 @@ impl Plan<'_> {
             source.push_str("}\n");
             return Ok((
                 ComputeProgram {
+                    shader: OnceCell::new(),
                     source,
                     entry: "source_main",
                     bindings: pulled.locations,
@@ -1075,6 +1128,7 @@ impl Plan<'_> {
         source.push_str("}\n");
         Ok((
             ComputeProgram {
+                shader: OnceCell::new(),
                 source,
                 entry: "source_main",
                 bindings: pulled.locations,

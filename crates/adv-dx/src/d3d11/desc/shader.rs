@@ -14,7 +14,9 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct Shader {
     module: Module,
-    reflection: Reflection,
+    reflection: Arc<Reflection>,
+    #[cfg(feature = "gpu")]
+    pub(crate) specialization: Option<Arc<[crate::shader::ir::passes::InterfaceBinding]>>,
     pub stage: Stage,
     pub linkage: Option<Arc<dxbc::linkage::Linkage>>,
     pub stream_output: Option<StreamOutput>,
@@ -116,7 +118,9 @@ impl Shader {
         }
         Ok(Self {
             module,
-            reflection,
+            reflection: Arc::new(reflection),
+            #[cfg(feature = "gpu")]
+            specialization: None,
             stage,
             linkage,
             stream_output: None,
@@ -228,13 +232,20 @@ impl Shader {
         let reflection = crate::shader::analysis::analyze(&module);
         Ok(Self {
             module,
-            reflection,
+            reflection: Arc::new(reflection),
+            #[cfg(feature = "gpu")]
+            specialization: Some(bindings.into()),
             ..self.clone()
         })
     }
 
     pub fn module(&self) -> &Module {
         &self.module
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn reflection_handle(&self) -> Arc<Reflection> {
+        self.reflection.clone()
     }
 
     pub fn reflection(&self) -> &Reflection {
