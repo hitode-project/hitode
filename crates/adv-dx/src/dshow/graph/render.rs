@@ -427,9 +427,17 @@ fn plug_streams(
                        outputs: VecDeque<(u32, Iid)>,
                        mut done: [Option<Stream>; 2]| {
         let (role, clsid, name) = if major == MEDIATYPE_VIDEO {
-            (Role::VideoDecoder, CLSID_MPEG_VIDEO_CODEC, "Video decoder")
+            (
+                Role::VideoDecoder,
+                CLSID_MPEG_VIDEO_CODEC,
+                "MPEG Video Decoder",
+            )
         } else {
-            (Role::AudioDecoder, CLSID_MPEG_AUDIO_CODEC, "Audio decoder")
+            (
+                Role::AudioDecoder,
+                CLSID_MPEG_AUDIO_CODEC,
+                "MPEG Audio Decoder",
+            )
         };
         let decoder = match member(env, build.graph, role, clsid, name) {
             Ok(filter) => filter,

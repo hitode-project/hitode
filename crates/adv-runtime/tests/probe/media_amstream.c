@@ -29,6 +29,11 @@ static void check_audio(IAMMultiMediaStream *stream)
     unsigned mpeg = 0;
 
     CHECK(IAMMultiMediaStream_GetFilterGraph(stream, &graph));
+    /* Titles look the MPEG-1 decoders up by the names Windows gives them. */
+    CHECK(IGraphBuilder_FindFilterByName(graph, L"MPEG Video Decoder", &filter));
+    IBaseFilter_Release(filter);
+    CHECK(IGraphBuilder_FindFilterByName(graph, L"MPEG Audio Decoder", &filter));
+    IBaseFilter_Release(filter);
     CHECK(IGraphBuilder_EnumFilters(graph, &filters));
     while (IEnumFilters_Next(filters, 1, &filter, NULL) == S_OK) {
         CLSID clsid;
