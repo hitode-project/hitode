@@ -3,12 +3,105 @@ use objc2_foundation::NSProcessInfo;
 
 // Apple Metal Feature Set Tables, GPU implementation limits and texture capabilities:
 // https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
+/// The device facts the Metal format table depends on, as the Feature Set Tables list them per
+/// GPU family, so the table can be derived for a family without that device.
+#[derive(Clone, Copy, Debug)]
+pub struct MetalFamily {
+    /// Apple5 or newer.
+    pub apple: bool,
+    pub apple3: bool,
+    pub apple6: bool,
+    pub apple7: bool,
+    pub apple9: bool,
+    pub bc: bool,
+    pub float32_filtering: bool,
+    pub image_atomics: bool,
+    /// Bit i set when 2^i samples are supported.
+    pub sample_counts: u32,
+}
+
+impl MetalFamily {
+    fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Self {
+        let apple6 = raw.supportsFamily(MTLGPUFamily::Apple6);
+        let mac = raw.supportsFamily(MTLGPUFamily::Mac2);
+        Self {
+            apple: raw.supportsFamily(MTLGPUFamily::Apple5),
+            apple3: raw.supportsFamily(MTLGPUFamily::Apple3),
+            apple6,
+            apple7: raw.supportsFamily(MTLGPUFamily::Apple7),
+            apple9: raw.supportsFamily(MTLGPUFamily::Apple9),
+            bc: raw.supportsBCTextureCompression(),
+            float32_filtering: raw.supports32BitFloatFiltering(),
+            image_atomics: (apple6 || mac) && objc2::available!(macos = 14.0, ios = 17.0),
+            sample_counts: [1usize, 2, 4, 8, 16]
+                .into_iter()
+                .enumerate()
+                .filter(|&(_, n)| raw.supportsTextureSampleCount(n))
+                .fold(0, |mask, (i, _)| mask | (1 << i)),
+        }
+    }
+
+    /// Apple7 (A14, M1) as the Feature Set Tables give it.
+    pub fn apple7() -> Self {
+        Self {
+            apple: true,
+            apple3: true,
+            apple6: true,
+            apple7: true,
+            apple9: false,
+            bc: true,
+            float32_filtering: true,
+            image_atomics: true,
+            sample_counts: 0b111,
+        }
+    }
+
+    /// Each format's capabilities and sample-count mask for this family.
+    pub fn formats(&self) -> Vec<(Format, FormatCaps, u32)> {
+        FORMATS
+            .iter()
+            .map(|&f| {
+                let mut caps = format_caps(self, f);
+                if self.image_atomics && matches!(f, Format::R32Uint | Format::R32Sint) {
+                    caps |= FormatCaps::STORAGE_ATOMIC;
+                }
+                let samples = if !caps.intersects(FormatCaps::COLOR | FormatCaps::DEPTH_STENCIL) {
+                    0
+                } else if self.apple
+                    && !self.apple7
+                    && matches!(
+                        f,
+                        Format::R32Uint
+                            | Format::R32Sint
+                            | Format::Rg32Uint
+                            | Format::Rg32Sint
+                            | Format::Rg32Float
+                            | Format::Rgba32Uint
+                            | Format::Rgba32Sint
+                            | Format::Rgba32Float
+                    )
+                {
+                    1
+                } else {
+                    self.sample_counts
+                };
+                (f, caps, samples)
+            })
+            .collect()
+    }
+}
+
 pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
-    let apple = raw.supportsFamily(MTLGPUFamily::Apple5);
-    let apple6 = raw.supportsFamily(MTLGPUFamily::Apple6);
-    let apple7 = raw.supportsFamily(MTLGPUFamily::Apple7);
+    let family = MetalFamily::query(raw);
+    let MetalFamily {
+        apple,
+        apple6,
+        apple7,
+        bc,
+        sample_counts,
+        ..
+    } = family;
     let mac = raw.supportsFamily(MTLGPUFamily::Mac2);
-    let bc = raw.supportsBCTextureCompression();
     let mut features = Features::SHADER_F16
         | Features::OCCLUSION_QUERIES
         | Features::PIPELINE_CACHE
@@ -23,7 +116,7 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
     if apple || mac {
         features |= Features::MULTIPLE_VIEWPORTS;
     }
-    if (apple6 || mac) && objc2::available!(macos = 14.0, ios = 17.0) {
+    if family.image_atomics {
         features |= Features::IMAGE_ATOMICS;
     }
     if apple {
@@ -43,43 +136,7 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
     if bc {
         features |= Features::BC_TEXTURES;
     }
-    let sample_counts = [1usize, 2, 4, 8, 16]
-        .into_iter()
-        .enumerate()
-        .filter(|&(_, n)| raw.supportsTextureSampleCount(n))
-        .fold(0, |mask, (i, _)| mask | (1 << i));
-    let formats = FORMATS
-        .iter()
-        .map(|&f| {
-            let mut caps = format_caps(raw, f, apple, bc);
-            if features.contains(Features::IMAGE_ATOMICS)
-                && matches!(f, Format::R32Uint | Format::R32Sint)
-            {
-                caps |= FormatCaps::STORAGE_ATOMIC;
-            }
-            let samples = if !caps.intersects(FormatCaps::COLOR | FormatCaps::DEPTH_STENCIL) {
-                0
-            } else if apple
-                && !apple7
-                && matches!(
-                    f,
-                    Format::R32Uint
-                        | Format::R32Sint
-                        | Format::Rg32Uint
-                        | Format::Rg32Sint
-                        | Format::Rg32Float
-                        | Format::Rgba32Uint
-                        | Format::Rgba32Sint
-                        | Format::Rgba32Float
-                )
-            {
-                1
-            } else {
-                sample_counts
-            };
-            (f, caps, samples)
-        })
-        .collect();
+    let formats = family.formats();
     Caps {
         features,
         ieee_f32: true,
@@ -205,13 +262,9 @@ const FORMATS: &[Format] = &[
     Format::P010,
 ];
 
-fn format_caps(
-    raw: &ProtocolObject<dyn MTLDevice>,
-    f: Format,
-    apple: bool,
-    bc: bool,
-) -> FormatCaps {
+fn format_caps(family: &MetalFamily, f: Format) -> FormatCaps {
     use FormatCaps as C;
+    let MetalFamily { apple, bc, .. } = *family;
     let color = C::SAMPLED | C::FILTERED | C::COLOR | C::BLEND;
     match f {
         Format::Nv12 => C::SAMPLED | C::FILTERED | C::PRESENTABLE,
@@ -226,7 +279,7 @@ fn format_caps(
         f if f.is_bc() => {
             if bc {
                 let mut caps = C::SAMPLED | C::FILTERED;
-                if raw.supportsFamily(MTLGPUFamily::Apple3) {
+                if family.apple3 {
                     caps |= C::BC_VOLUME;
                 }
                 caps
@@ -237,14 +290,14 @@ fn format_caps(
         Format::Depth16Unorm => C::SAMPLED | C::FILTERED | C::DEPTH_STENCIL,
         Format::Depth24UnormStencil8 | Format::Depth32FloatStencil8 => {
             let mut caps = C::SAMPLED | C::DEPTH_STENCIL;
-            if !apple || raw.supportsFamily(MTLGPUFamily::Apple9) {
+            if !apple || family.apple9 {
                 caps |= C::FILTERED;
             }
             caps
         }
         Format::Depth32Float => {
             let mut caps = C::SAMPLED | C::DEPTH_STENCIL;
-            if raw.supports32BitFloatFiltering() {
+            if family.float32_filtering {
                 caps |= C::FILTERED;
             }
             caps
@@ -256,7 +309,7 @@ fn format_caps(
         f if f.is_uint() || f.is_sint() => C::SAMPLED | C::COLOR | C::STORAGE,
         Format::R32Float | Format::Rg32Float | Format::Rgba32Float => {
             let mut caps = C::SAMPLED | C::COLOR | C::STORAGE | C::BLEND;
-            if raw.supports32BitFloatFiltering() {
+            if family.float32_filtering {
                 caps |= C::FILTERED;
             }
             if f == Format::R32Float {

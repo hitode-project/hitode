@@ -258,8 +258,16 @@ fn target_profiles_apply_the_production_format_paths() {
     use crate::d3d11::resource::native_format;
     use crate::dxgi::formats::FORMATS;
 
-    let gpu = adv_device::gpu::Gpu::request(false).unwrap();
-    let metal = gpu.device().caps();
+    // The Apple7 table from the Feature Set Tables, independent of the host device.
+    let apple7 = adv_gpu::MetalFamily::apple7().formats();
+    let table = |format: Format| {
+        apple7
+            .iter()
+            .find(|(f, _, _)| *f == format)
+            .map_or((FormatCaps::empty(), 0), |&(_, caps, samples)| {
+                (caps, samples)
+            })
+    };
     let requirements = requirements();
     let derive = |caps: &Caps| {
         let production = format::production(caps);
@@ -284,8 +292,7 @@ fn target_profiles_apply_the_production_format_paths() {
                 })
                 .chain([(115, Format::Abgr4Unorm)])
                 .map(|(dxgi, format)| {
-                    let mut flags = metal.format(format);
-                    let mut samples = metal.format_sample_counts(format);
+                    let (mut flags, mut samples) = table(format);
                     if (!packed && matches!(dxgi, 86 | 115))
                         || (!bc && matches!(dxgi, 70..=84 | 94..=99))
                     {
