@@ -149,8 +149,27 @@ use adv_machine::{Ext, Objects};
 
 /// The device front owns back-buffer objects and performs recorded presentation.
 pub trait Buffers: Sync {
-    fn validate_device(&self, env: &Env<'_>, device: u32) -> Result<(), Error>;
+    fn identity(&self, env: &Env<'_>, device: u32) -> Result<u32, Error>;
+    fn adapter(&self, env: &Env<'_>, device: u32) -> Result<super::caps::Adapter, Error>;
+    fn validate_device(&self, env: &Env<'_>, device: u32) -> Result<(), Error> {
+        self.identity(env, device).map(|_| ())
+    }
+    fn surface_owner(&self, env: &Env<'_>, pointer: u32) -> Result<(u32, u32), Error>;
+    fn scanout(&self, env: &mut Env<'_>, surface: u32, serial: u64) -> Result<(), Error>;
+    #[cfg(feature = "gpu")]
+    fn capture(&self, env: &mut Env<'_>) -> Result<adv_device::frame::Waker, Error>;
+    #[cfg(feature = "gpu")]
+    fn copy_display(&self, env: &mut Env<'_>, surface: u32) -> Result<(), Error>;
+    #[cfg(feature = "gpu")]
+    fn desktop_resource(
+        &self,
+        env: &mut Env<'_>,
+        device: u32,
+        mode: DXGI_MODE_DESC,
+        frame: &adv_device::frame::Captured,
+    ) -> Result<u32, Error>;
     fn caps<'a>(&self, ext: &'a Ext) -> Result<&'a Caps, Error>;
+    fn drop_device_ref(&self, env: &mut Env<'_>, device: u32);
     fn retain_device(&self, env: &mut Env<'_>, device: u32) -> Result<(), Error>;
     fn create(
         &self,
@@ -168,7 +187,8 @@ pub trait Buffers: Sync {
         size: [u32; 2],
         serial: u64,
         first: bool,
-    ) -> Result<(), Error>;
+        composition: bool,
+    ) -> Result<bool, Error>;
     fn latency(&self, env: &Env<'_>, device: u32) -> u32;
     fn shared_adapter(&self, env: &Env<'_>, handle: u32) -> Result<super::caps::Adapter, Error>;
     fn output(&self, env: &mut Env<'_>, device: u32) -> Result<u32, Error>;
@@ -186,6 +206,8 @@ pub(super) struct Chain {
     pub buffers: Vec<u32>,
     pub description: Description,
     pub window: u32,
+    pub composition: Option<u32>,
+    pub matrix: adv_abi::types::DXGI_MATRIX_3X2_F,
     pub fullscreen: DXGI_SWAP_CHAIN_FULLSCREEN_DESC,
     pub target: u32,
     pub generation: u64,
@@ -211,9 +233,6 @@ impl Chain {
                 entry.remove();
             }
         }
-        if self.fullscreen.Windowed == 0 {
-            crate::ddraw::front::modes::set_modern_exclusive(env.ext, pointer, false);
-        }
         if self.waitable != 0 {
             env.sys.objects.close(self.waitable);
         }
@@ -224,6 +243,9 @@ impl Chain {
         interfaces.push(self.device);
         if self.target != 0 {
             interfaces.push(self.target);
+        }
+        if let Some(restrict) = self.composition.filter(|&restrict| restrict != 0) {
+            interfaces.push(restrict);
         }
     }
 }

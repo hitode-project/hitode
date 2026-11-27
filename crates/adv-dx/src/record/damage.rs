@@ -852,17 +852,6 @@ impl Analysis {
                 && h.seen == self.epoch
         })
     }
-    #[cfg(feature = "gpu")]
-    pub fn written_region(&self, key: Content, size: (u32, u32)) -> Region {
-        let mut region = Region::empty(size);
-        if let Some(history) = self.histories.get(&key) {
-            for &(_, bounds) in history.next.iter().flat_map(|sequence| &sequence.entries) {
-                region.add(bounds.into());
-            }
-        }
-        region
-    }
-
     pub fn finish(&mut self) {
         for h in self.histories.values_mut() {
             if !self.planned && !h.next.is_empty() {
