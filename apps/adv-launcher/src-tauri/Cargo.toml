@@ -67,6 +67,9 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std",
 
 [target.'cfg(target_os = "macos")'.dependencies]
 adv-shell = { path = "../../../crates/adv-shell", features = ["media"] }
+ed25519-dalek = { version = "2.2", default-features = false }
+libc = "0.2"
+plist = "1.8"
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"

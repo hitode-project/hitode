@@ -213,6 +213,7 @@ dependencies = [
  "base64 0.23.1",
  "block2",
  "chrono",
+ "ed25519-dalek",
  "fontdb",
  "getrandom 0.3.4",
  "jni 0.21.1",

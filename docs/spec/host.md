@@ -343,6 +343,12 @@ A scan MUST visit visible subdirectories up to the selected depth, even if an an
 **Applies to**: Launcher
 **Verification**: Test
 
+### HOST-UPDATE-2 Signed macOS in-app update
+
+**Rule**: In-app updates MUST download only HTTPS GitHub assets matching the verified release tag. An archive MUST pass Ed25519 signature, bundle metadata, and codesign checks before replacing the running bundle. Bundle replacement MUST roll back on failure.
+**Applies to**: Launcher, macOS
+**Verification**: Test
+
 ## Menus and dialogs
 
 ### HOST-MENU-1 Native menu projection
