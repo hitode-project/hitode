@@ -507,9 +507,6 @@ impl Native {
         let mut duration_us = input.context.duration().max(0) as u64;
         // SAFETY: the context is open; this reads its estimation method.
         let method = unsafe { (*input.context.as_ptr()).duration_estimation_method };
-        if method == ff::ffi::AVDurationEstimationMethod::AVFMT_DURATION_FROM_PTS {
-            duration_us = duration_us.max(input.packet_end_100ns()? / 10);
-        }
         let asf = input.context.format().name() == "asf";
         let video = input
             .context
@@ -527,6 +524,28 @@ impl Native {
         };
         if video.is_none() && audio.is_none() {
             return Err(ff::Error::StreamNotFound.into());
+        }
+        let measure_tail = method == ff::ffi::AVDurationEstimationMethod::AVFMT_DURATION_FROM_PTS;
+        let mpeg_header = if input.context.format().name() == "mpeg"
+            && let Some(audio) = &audio
+            && matches!(
+                audio.decoder.id(),
+                codec::Id::MP1 | codec::Id::MP2 | codec::Id::MP3
+            ) {
+            let header = input
+                .context
+                .packets()
+                .find(|(stream, _)| stream.index() == audio.stream)
+                .and_then(|(_, packet)| packet.data()?.get(..4)?.try_into().ok());
+            if !measure_tail {
+                input.rewind()?;
+            }
+            header
+        } else {
+            None
+        };
+        if measure_tail {
+            duration_us = duration_us.max(input.packet_end_100ns()? / 10);
         }
         let origin_us = unsafe { (*input.context.as_ptr()).start_time };
         let origin_us = if origin_us == ff::ffi::AV_NOPTS_VALUE {
@@ -553,6 +572,7 @@ impl Native {
                 codec: a.decoder.id().name().into(),
                 sample_rate: a.decoder.rate(),
                 channels: a.decoder.channels(),
+                mpeg_header,
             }),
         };
         Ok(Self {

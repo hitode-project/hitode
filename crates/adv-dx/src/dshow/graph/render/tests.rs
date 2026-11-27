@@ -336,6 +336,7 @@ fn render_ex_connects_an_existing_guest_audio_renderer() {
         codec: "authored".into(),
         sample_rate: 44100,
         channels: 2,
+        mpeg_header: None,
     });
     let members = state.graphs[&graph].members.len();
     let outcome = extended(&mut env(&mut m), graph, out, 1, 0);

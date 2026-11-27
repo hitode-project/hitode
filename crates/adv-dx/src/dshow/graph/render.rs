@@ -368,7 +368,11 @@ fn file(
                 if !present {
                     continue;
                 }
-                let mt = filter::output_type(major, &header);
+                let mt = if major == MEDIATYPE_AUDIO {
+                    filter::splitter_audio_type(&info, &header)
+                } else {
+                    filter::output_type(major, &header)
+                };
                 if let Err(error) =
                     filter::new_pin(env, build.splitter, OUTPUT, name, major, Some(mt))
                 {

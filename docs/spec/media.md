@@ -175,7 +175,7 @@ Pause and Stop cancel earlier Run requests even during a guest callback. A cance
 ### MEDIA-GRAPH-26 Rendered file splitters
 
 **Rule**: RenderFile's splitter outputs MUST carry the media types their stream headers give, as IAsyncReader splitters' do. Each output MUST try the graph's members before a host decoder. A guest input MUST receive the file's demuxed packets.
-**Verification**: Test — header types; members-first rendering and packet delivery also require review.
+**Verification**: Test — header types and amstream playback; members-first rendering and packet delivery also require review.
 
 ### MEDIA-STREAM-1 Pull delivery
 
@@ -201,6 +201,8 @@ Pause and Stop cancel earlier Run requests even during a guest callback. A cance
 
 **Rule**: Guest-created MPEG filters MUST enumerate and validate Windows' MPEG stream and decoded output formats, while Render's splitter MUST accept any decodable container without demuxing it. Splitter audio types MUST preserve MPEG frame header fields and offer payload, elementary payload, and MP3 formats when applicable. Media negotiation MUST validate explicit output formats and prioritize downstream types for wildcard requests.
 **Verification**: Test
+
+For MPEG-1 audio in a program stream, the splitter MUST derive the audio type from the first demuxed audio frame header. Splitter audio offers to guest pins MUST include a `WAVEFORMATEX` block.
 
 ### MEDIA-STREAM-6 Filter pin ownership
 

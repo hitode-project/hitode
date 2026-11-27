@@ -55,6 +55,8 @@ pub struct AudioInfo {
     pub codec: String,
     pub sample_rate: u32,
     pub channels: u16,
+    /// The first MPEG audio frame header in a program stream.
+    pub mpeg_header: Option<[u8; 4]>,
 }
 
 /// A decoded picture. GPU display retains YUV; CPU-only builds retain BGRA.
