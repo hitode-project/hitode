@@ -2,6 +2,7 @@
 
 mod alu;
 mod interface;
+pub(crate) mod legacy;
 mod memory;
 #[cfg(feature = "gpu")]
 pub(crate) mod pulled;
@@ -338,6 +339,12 @@ struct Writer<'a> {
     elect_counter: bool,
     atomic_bindings: &'a HashSet<(Register, u32)>,
     depth: usize,
+    /// Float source modifiers flush denormals first, as DXBC requires.
+    flush: bool,
+    legacy: Option<&'a legacy::Library<'a>>,
+    /// The state a shared subroutine call passes: `&r, &o, &v` from the entry
+    /// function and the received pointers from another subroutine.
+    call_arguments: &'static str,
 }
 
 impl<'a> Writer<'a> {
@@ -355,6 +362,9 @@ impl<'a> Writer<'a> {
             elect_counter: false,
             atomic_bindings: &reflection.atomic_bindings,
             depth: 0,
+            flush: module.model.flushes_denormals(),
+            legacy: None,
+            call_arguments: "",
         }
     }
 
@@ -455,6 +465,20 @@ impl<'a> Writer<'a> {
         if op.opcode == Nop {
             return Ok(());
         }
+        if matches!(op.opcode, Call | Callc) {
+            let label = passes::call_target(op)?;
+            let call = format!("dx_l{label}({});", self.call_arguments);
+            if op.opcode == Callc {
+                let value = self.read(&op.sources[1], ValueType::Uint, false)?;
+                let comparison = if op.test_nonzero { "!=" } else { "==" };
+                self.open(&format!("if ({value}).x {comparison} 0u"));
+                self.line(&call);
+                self.close();
+            } else {
+                self.line(&call);
+            }
+            return Ok(());
+        }
         if matches!(
             op.opcode,
             Break | Breakc | Continue | Continuec | Ret | Retc | Discard
@@ -545,6 +569,10 @@ impl<'a> Writer<'a> {
                         return Err(Error::UnsupportedOpcode(op.opcode));
                     }
                     format!("({resource}).{component}")
+                } else if self.legacy.is_some_and(|l| l.guard_products)
+                    && matches!(op.opcode, Mul | Mad)
+                {
+                    legacy::product(op.opcode, &args, lane)
                 } else {
                     alu::expression(op.opcode, &args, i, lane)?
                 };
@@ -672,10 +700,17 @@ impl<'a> Writer<'a> {
             (Modifier::AbsoluteNegate, ValueType::Int | ValueType::Uint) => {
                 format!("(vec4<u32>(0u) - bitcast<vec4<u32>>(abs(bitcast<vec4<i32>>({value}))))")
             }
-            (Modifier::Negate, _) => format!("(dx_flush4({value}) ^ vec4<u32>(0x80000000u))"),
-            (Modifier::Absolute, _) => format!("(dx_flush4({value}) & vec4<u32>(0x7fffffffu))"),
-            (Modifier::AbsoluteNegate, _) => {
-                format!("(dx_flush4({value}) | vec4<u32>(0x80000000u))")
+            (Modifier::Negate | Modifier::Absolute | Modifier::AbsoluteNegate, _) => {
+                let value = if self.flush {
+                    format!("dx_flush4({value})")
+                } else {
+                    value
+                };
+                match operand.modifier {
+                    Modifier::Negate => format!("({value} ^ vec4<u32>(0x80000000u))"),
+                    Modifier::Absolute => format!("({value} & vec4<u32>(0x7fffffffu))"),
+                    _ => format!("({value} | vec4<u32>(0x80000000u))"),
+                }
             }
         };
         Ok(if flush && ty == ValueType::Float {

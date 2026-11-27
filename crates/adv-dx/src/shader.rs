@@ -1,6 +1,9 @@
-//! Bounded Direct3D 9 shader bytecode frontend and WGSL library translator.
+//! Bounded Direct3D 9 shader bytecode frontend and the shared shader core.
 //!
-//! The translator is written here instead of linking vkd3d-shader or Wine. SM1-3
+//! SM1-3 programs lower into the register IR in [`sm`], so the WGSL back end
+//! and the scalar interpreter that serve DXBC also serve Direct3D 9.
+//!
+//! The frontend is written here instead of linking vkd3d-shader or Wine. SM1-3
 //! bytecode is regular, and its semantic details need differential tests either
 //! way; vkd3d-shader is an LGPL C library that would need dynamic linking, an
 //! Android cross-build and a SPIR-V to naga hop. Both remain semantic references.
@@ -14,13 +17,12 @@ mod cache;
 pub mod dxbc;
 #[cfg(feature = "gpu")]
 pub mod expand;
-pub mod interpreter;
 pub mod ir;
 mod parser;
+pub mod sm;
 pub mod tessellator;
 #[cfg(test)]
 mod tests;
-mod translate;
 #[cfg(feature = "gpu")]
 pub mod variant;
 pub mod wgsl;
@@ -29,7 +31,7 @@ pub const MAX_SHADER_TOKENS: usize = 65_536;
 pub const MAX_EXECUTION_STEPS: usize = 65_536;
 pub const MAX_FLOW_DEPTH: usize = 32;
 pub const MAX_TRANSLATION_BYTES: usize = 4 * 1024 * 1024;
-pub const TRANSLATOR_ABI: &str = "adv-d3d9-wgsl-8";
+pub const TRANSLATOR_ABI: &str = "adv-d3d9-wgsl-9";
 /// Read a guest token stream without mistaking immediate or comment data for END.
 /// The callback's index is in DWORDs, and is always below MAX_SHADER_TOKENS.
 pub fn read_bytecode<E: std::fmt::Display>(
@@ -255,7 +257,7 @@ pub struct Shader {
     pub inputs: Vec<Declaration>,
     pub outputs: Vec<Declaration>,
     pub(crate) tokens: Vec<u32>,
-    pub(crate) flow: Vec<Flow>,
+    pub(crate) program: std::sync::OnceLock<Option<sm::Program>>,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Flow {
@@ -298,7 +300,14 @@ impl Shader {
         &self.tokens
     }
     pub fn translate(&self, ieee_f32: bool) -> Result<Translation, Error> {
-        translate::translate(self, ieee_f32)
+        sm::translate(self, ieee_f32)
+    }
+    /// The program prepared for scalar execution, built on first use; `None`
+    /// when the shader does not lower.
+    pub fn program(&self) -> Option<&sm::Program> {
+        self.program
+            .get_or_init(|| sm::Program::new(self).ok())
+            .as_ref()
     }
     /// Opt-in local cache; stores translated WGSL only, never original game bytecode.
     /// Cache I/O failures are non-fatal and fall back to fresh translation.

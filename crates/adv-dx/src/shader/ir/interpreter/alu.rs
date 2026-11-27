@@ -17,7 +17,8 @@ pub(super) fn saturate(value: u32) -> u32 {
     }
 }
 
-pub(super) fn modify(value: u32, modifier: Modifier, ty: ValueType) -> u32 {
+pub(super) fn modify(value: u32, modifier: Modifier, ty: ValueType, denormals: bool) -> u32 {
+    let flush = |value| if denormals { flush(value) } else { value };
     match (modifier, ty) {
         (Modifier::None, _) => value,
         (Modifier::Negate, ValueType::Int | ValueType::Uint) => value.wrapping_neg(),

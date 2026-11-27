@@ -6,12 +6,12 @@ pub fn verify(module: &Module) -> Result<(), Error> {
     match (module.stage, module.model) {
         (
             Stage::Hull | Stage::Domain,
-            Model::Sm40 | Model::Sm41 | Model::Level91 | Model::Level93,
+            Model::Sm40 | Model::Sm41 | Model::Level91 | Model::Level93 | Model::Legacy,
         )
-        | (Stage::Geometry | Stage::Compute, Model::Level91 | Model::Level93) => {
+        | (Stage::Geometry | Stage::Compute, Model::Level91 | Model::Level93 | Model::Legacy) => {
             return Err(Error::Invalid("stage for shader model"));
         }
-        (Stage::Vertex | Stage::Pixel, Model::Level91 | Model::Level93)
+        (Stage::Vertex | Stage::Pixel, Model::Level91 | Model::Level93 | Model::Legacy)
         | (_, Model::Sm40 | Model::Sm41 | Model::Sm50) => {}
     }
     for element in module

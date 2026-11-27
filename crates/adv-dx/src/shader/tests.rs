@@ -1,4 +1,4 @@
-use super::interpreter::*;
+use super::sm::*;
 use super::*;
 fn reg(kind: u32, index: u32) -> u32 {
     0x80000000 | ((kind & 7) << 28) | ((kind & 24) << 8) | index
@@ -422,4 +422,377 @@ fn vs1_implicit_relative_address_rounds_before_read() {
             .position,
         constants.f[5]
     );
+}
+#[test]
+// spec: GFX-NUM-1
+fn predication_lit_pow_and_saturate_follow_reference() {
+    let mut body = Vec::new();
+    for (register, usage) in [(0, 0), (1, 5), (2, 10)] {
+        body.extend(instruction(
+            Opcode::Dcl,
+            &[0x80000000 | usage, dst(6, register)],
+        ));
+    }
+    let mut setp = instruction(Opcode::Setp, &[dst(19, 0), src(2, 1), src(2, 0)]);
+    setp[0] |= 1 << 16;
+    body.extend(setp);
+    body.extend(instruction(Opcode::Mov, &[dst(0, 0), src(2, 2)]));
+    let mut predicated = instruction(Opcode::Mov, &[dst(0, 0), src(19, 0), src(2, 3)]);
+    predicated[0] |= 0x10000000;
+    body.extend(predicated);
+    body.extend(instruction(Opcode::Mov, &[dst(6, 0), src(0, 0)]));
+    body.extend(instruction(Opcode::Lit, &[dst(6, 1), src(2, 4)]));
+    body.extend(instruction(
+        Opcode::Pow,
+        &[dst(0, 1), reg(2, 5), reg(2, 5) | 0x550000],
+    ));
+    body.extend(instruction(
+        Opcode::Mov,
+        &[(dst(0, 1) & !0xf0000) | 0x120000, reg(2, 6)],
+    ));
+    body.extend(instruction(
+        Opcode::Mov,
+        &[(dst(6, 2) & !0xf0000) | 0x30000, src(0, 1)],
+    ));
+    let s = shader(Stage::Vertex, 3, 0, &body);
+    validate(&s);
+    let mut constants = Constants::default();
+    constants.f[1] = [1.0, 0.0, 1.0, 0.0];
+    constants.f[2] = [5.0; 4];
+    constants.f[3] = [7.0; 4];
+    constants.f[4] = [1.0, -1.0, 0.0, 0.0];
+    constants.f[6] = [f32::NAN; 4];
+    let out = s
+        .program()
+        .unwrap()
+        .run(&Inputs::default(), &constants, &mut NoTextures)
+        .unwrap();
+    // Predication selects per component, lit leaves z zero unless y > 0,
+    // pow(0, 0) is one and saturate maps NaN to zero.
+    assert_eq!(out.position, [7.0, 5.0, 7.0, 5.0]);
+    assert_eq!(out.texcoords[0], [1.0, 1.0, 0.0, 1.0]);
+    assert_eq!(out.colors[0][..2], [1.0, 0.0]);
+}
+
+fn run(
+    shader: &Shader,
+    input: &Inputs,
+    constants: &Constants,
+    sampler: &mut dyn Sampler,
+) -> Result<Outputs, Error> {
+    Program::new(shader)?.run(input, constants, sampler)
+}
+#[test]
+// spec: GFX-NUM-1
+fn relative_reads_take_definitions_from_one_table() {
+    // aL runs 2, 3, 4: c[aL + 1] reads the defined c3, the bound c4 and the defined c5.
+    let mut body = Vec::new();
+    body.extend(instruction(
+        Opcode::Def,
+        &[dst(2, 3), 1f32.to_bits(), 0, 0, 0],
+    ));
+    body.extend(instruction(
+        Opcode::Def,
+        &[dst(2, 5), 4f32.to_bits(), 0, 0, 0],
+    ));
+    body.extend(instruction(Opcode::Defi, &[dst(7, 0), 3, 2, 1, 0]));
+    body.extend(instruction(Opcode::Mov, &[dst(0, 0), src(2, 0)]));
+    body.extend(instruction(Opcode::Loop, &[src(15, 0), src(7, 0)]));
+    body.extend(instruction(
+        Opcode::Add,
+        &[dst(0, 0), src(0, 0), src(2, 1) | 0x2000, reg(15, 0)],
+    ));
+    body.extend(instruction(Opcode::EndLoop, &[]));
+    body.extend(instruction(Opcode::Mov, &[dst(8, 0), src(0, 0)]));
+    let s = shader(Stage::Pixel, 3, 0, &body);
+    validate(&s);
+    let mut constants = Constants::default();
+    constants.f[3] = [100.0; 4];
+    constants.f[4] = [2.0; 4];
+    let out = run(&s, &Inputs::default(), &constants, &mut NoTextures).unwrap();
+    assert_eq!(out.colors[0][0], 7.0);
+
+    // Many definitions and relative reads stay within the translation size limit.
+    let mut body = instruction(Opcode::Dcl, &[0x80000000, dst(6, 0)]);
+    for n in 0..256 {
+        body.extend(instruction(Opcode::Def, &[dst(2, n), n, 0, 0, 0]));
+    }
+    body.extend(instruction(
+        Opcode::Mova,
+        &[(dst(3, 0) & !0xf0000) | 0x10000, src(2, 0)],
+    ));
+    for _ in 0..160 {
+        body.extend(instruction(
+            Opcode::Add,
+            &[dst(0, 0), src(0, 0), src(2, 0) | 0x2000, reg(3, 0)],
+        ));
+    }
+    body.extend(instruction(Opcode::Mov, &[dst(6, 0), src(0, 0)]));
+    let s = shader(Stage::Vertex, 3, 0, &body);
+    validate(&s);
+}
+
+struct Texel(Vec4);
+
+impl Sampler for Texel {
+    fn sample(&mut self, _: u8, _: Vec4, _: u32) -> Result<Vec4, String> {
+        Ok(self.0)
+    }
+}
+
+/// An SM1 instruction, whose opcode token carries no length.
+fn sm1(op: Opcode, args: &[u32]) -> Vec<u32> {
+    let mut words = vec![op as u32];
+    words.extend(args);
+    words
+}
+
+fn predicated(mut words: Vec<u32>) -> Vec<u32> {
+    words[0] |= 0x10000000;
+    words
+}
+
+#[test]
+// spec: GFX-SHADER-1
+fn nested_subroutines_stay_shared_bodies() {
+    // Main calls l1 four times, l1 calls l2 eight times and l2 calls l3 eight
+    // times; l3 holds four nrm and one add, so inlining would emit 256 copies.
+    let mut body = instruction(Opcode::Dcl, &[0x80000000, dst(6, 0)]);
+    body.extend(instruction(Opcode::Mov, &[dst(0, 0), src(2, 0)]));
+    for _ in 0..4 {
+        body.extend(instruction(Opcode::Call, &[src(18, 1)]));
+    }
+    body.extend(instruction(Opcode::Mov, &[dst(6, 0), src(0, 0)]));
+    body.extend(instruction(Opcode::Ret, &[]));
+    for (label, callee) in [(1, 2), (2, 3)] {
+        body.extend(instruction(Opcode::Label, &[src(18, label)]));
+        for _ in 0..8 {
+            body.extend(instruction(Opcode::Call, &[src(18, callee)]));
+        }
+        body.extend(instruction(Opcode::Ret, &[]));
+    }
+    body.extend(instruction(Opcode::Label, &[src(18, 3)]));
+    for n in 0..4 {
+        body.extend(instruction(Opcode::Nrm, &[dst(0, 1 + n), src(2, 2)]));
+    }
+    body.extend(instruction(Opcode::Add, &[dst(0, 0), src(0, 0), src(2, 1)]));
+    body.extend(instruction(Opcode::Ret, &[]));
+    let s = shader(Stage::Vertex, 3, 0, &body);
+    let translation = s.translate(false).unwrap();
+    assert!(translation.source.len() < 64 << 10);
+    validate(&s);
+    let mut constants = Constants::default();
+    constants.f[1] = [1.0; 4];
+    constants.f[2] = [1.0, 2.0, 2.0, 3.0];
+    let out = run(&s, &Inputs::default(), &constants, &mut NoTextures).unwrap();
+    assert_eq!(out.position, [256.0; 4]);
+}
+
+#[test]
+// spec: GFX-NUM-1
+fn texkill_follows_predicate_model_and_subroutines() {
+    // (p0.x) texkill r0 with r0 negative discards only under a true predicate.
+    let kill = |setp: bool| {
+        let mut body = instruction(Opcode::Mov, &[dst(0, 0), src(2, 0)]);
+        if setp {
+            let mut test = instruction(Opcode::Setp, &[dst(19, 0), src(2, 1), src(2, 2)]);
+            test[0] |= 1 << 16;
+            body.extend(test);
+        }
+        body.extend(predicated(instruction(
+            Opcode::Texkill,
+            &[dst(0, 0), reg(19, 0)],
+        )));
+        body.extend(instruction(Opcode::Mov, &[dst(8, 0), src(2, 1)]));
+        shader(Stage::Pixel, 3, 0, &body)
+    };
+    let mut constants = Constants::default();
+    constants.f[0] = [-1.0; 4];
+    constants.f[1] = [1.0; 4];
+    for setp in [false, true] {
+        let s = kill(setp);
+        validate(&s);
+        let out = run(&s, &Inputs::default(), &constants, &mut NoTextures).unwrap();
+        assert_eq!(out.discarded, setp);
+    }
+
+    // SM2 tests w; PS 1.x does not.
+    let mut body = instruction(Opcode::Dcl, &[0x80000000, dst(3, 0)]);
+    body.extend(instruction(Opcode::Texkill, &[dst(3, 0)]));
+    body.extend(instruction(Opcode::Mov, &[dst(8, 0), src(2, 1)]));
+    let s = shader(Stage::Pixel, 2, 0, &body);
+    validate(&s);
+    let mut input = Inputs::default();
+    input.t[0] = [1.0, 1.0, 1.0, -1.0];
+    assert!(
+        run(&s, &input, &constants, &mut NoTextures)
+            .unwrap()
+            .discarded
+    );
+    let mut body = sm1(Opcode::Texkill, &[dst(3, 0)]);
+    body.extend(sm1(Opcode::Mov, &[dst(0, 0), src(2, 1)]));
+    let s = shader(Stage::Pixel, 1, 1, &body);
+    assert!(
+        !run(&s, &input, &constants, &mut NoTextures)
+            .unwrap()
+            .discarded
+    );
+
+    // A discard inside a subroutine ends the program.
+    let mut body = instruction(Opcode::Mov, &[dst(0, 0), src(2, 0)]);
+    body.extend(instruction(Opcode::Call, &[src(18, 0)]));
+    body.extend(instruction(Opcode::Mov, &[dst(8, 0), src(2, 1)]));
+    body.extend(instruction(Opcode::Ret, &[]));
+    body.extend(instruction(Opcode::Label, &[src(18, 0)]));
+    body.extend(instruction(Opcode::Texkill, &[dst(0, 0)]));
+    body.extend(instruction(Opcode::Ret, &[]));
+    let s = shader(Stage::Pixel, 3, 0, &body);
+    validate(&s);
+    assert!(
+        run(&s, &Inputs::default(), &constants, &mut NoTextures)
+            .unwrap()
+            .discarded
+    );
+}
+
+#[test]
+// spec: GFX-NUM-1
+fn vertex_rounding_normalize_fog_and_masked_samples() {
+    let mut body = Vec::new();
+    for (usage, register, mask) in [
+        (0, 0, 0xf0000),
+        (5, 1, 0xf0000),
+        (5, 2, 0xf0000),
+        (11, 3, 0x80000),
+    ] {
+        body.extend(instruction(
+            Opcode::Dcl,
+            &[
+                0x80000000 | usage | (u32::from(register == 2) << 16),
+                (dst(6, register) & !0xf0000) | mask,
+            ],
+        ));
+    }
+    body.extend(instruction(
+        Opcode::Dcl,
+        &[0x80000000 | (2 << 27), dst(10, 2)],
+    ));
+    // A sample whose lanes are all predicated off needs no texture.
+    body.extend(predicated(instruction(
+        Opcode::Texldl,
+        &[dst(0, 1), reg(19, 0), src(2, 0), src(10, 2)],
+    )));
+    // mova rounds 0.49999997 to 0, so c[a0.x + 1] reads c1.
+    body.extend(instruction(
+        Opcode::Mova,
+        &[(dst(3, 0) & !0xf0000) | 0x10000, src(2, 0)],
+    ));
+    body.extend(instruction(
+        Opcode::Mov,
+        &[dst(6, 0), src(2, 1) | 0x2000, reg(3, 0)],
+    ));
+    // nrm scales every lane and uses FLT_MAX for zero length.
+    body.extend(instruction(Opcode::Nrm, &[dst(6, 1), src(2, 3)]));
+    body.extend(instruction(Opcode::Nrm, &[dst(6, 2), src(2, 4)]));
+    // Fog declared in o3.w reads w.
+    body.extend(instruction(
+        Opcode::Mov,
+        &[(dst(6, 3) & !0xf0000) | 0x80000, src(2, 5)],
+    ));
+    let s = shader(Stage::Vertex, 3, 0, &body);
+    validate(&s);
+    let mut constants = Constants::default();
+    constants.f[0] = [f32::from_bits(0x3effffff); 4];
+    constants.f[1] = [1.0; 4];
+    constants.f[2] = [2.0; 4];
+    constants.f[3] = [2.0, 0.0, 0.0, 0.5];
+    constants.f[4] = [0.0, 0.0, 0.0, 1.0];
+    constants.f[5] = [0.25, 0.0, 0.0, 0.75];
+    let out = run(&s, &Inputs::default(), &constants, &mut NoTextures).unwrap();
+    assert_eq!(out.position, [1.0; 4]);
+    assert_eq!(out.texcoords[0], [1.0, 0.0, 0.0, 0.25]);
+    assert_eq!(out.texcoords[1], [0.0, 0.0, 0.0, f32::MAX]);
+    assert_eq!(out.fog, 0.75);
+}
+
+#[test]
+// spec: GFX-NUM-1
+fn pixel_swizzles_depth_and_coissued_cnd() {
+    // texldl r0, v0, s3.zyxw reorders the texel.
+    let mut body = instruction(Opcode::Dcl, &[0x80000005, dst(1, 0)]);
+    body.extend(instruction(
+        Opcode::Dcl,
+        &[0x80000000 | (2 << 27), dst(10, 3)],
+    ));
+    body.extend(instruction(
+        Opcode::Texldl,
+        &[dst(0, 0), src(1, 0), reg(10, 3) | 0xc60000],
+    ));
+    body.extend(instruction(Opcode::Mov, &[dst(8, 0), src(0, 0)]));
+    let s = shader(Stage::Pixel, 3, 0, &body);
+    validate(&s);
+    let out = run(
+        &s,
+        &Inputs::default(),
+        &Constants::default(),
+        &mut Texel([0.125, 0.25, 0.5, 1.0]),
+    )
+    .unwrap();
+    assert_eq!(out.colors[0], [0.5, 0.25, 0.125, 1.0]);
+
+    // texdepth writes one for a zero denominator.
+    for (value, depth) in [([0.25, 0.5, 0.0, 0.0], 0.5), ([0.5, 0.0, 0.0, 0.0], 1.0)] {
+        let mut body = sm1(Opcode::Mov, &[dst(0, 5), src(2, 0)]);
+        body.extend(sm1(Opcode::Phase, &[]));
+        body.extend(sm1(Opcode::Texdepth, &[dst(0, 5)]));
+        body.extend(sm1(Opcode::Mov, &[dst(0, 0), src(2, 0)]));
+        let s = shader(Stage::Pixel, 1, 4, &body);
+        validate(&s);
+        let mut constants = Constants::default();
+        constants.f[0] = value;
+        let out = run(&s, &Inputs::default(), &constants, &mut NoTextures).unwrap();
+        assert_eq!(out.depth, depth);
+    }
+
+    // The colour half of a co-issued PS 1.1 cnd selects src1.
+    for alpha in [0.25, 0.75] {
+        let mut body = sm1(Opcode::Mov, &[(dst(0, 0) & !0xf0000) | 0x80000, src(2, 0)]);
+        let mut cnd = sm1(
+            Opcode::Cnd,
+            &[
+                (dst(0, 0) & !0xf0000) | 0x70000,
+                reg(0, 0) | 0xff0000,
+                src(2, 1),
+                src(2, 2),
+            ],
+        );
+        cnd[0] |= 0x40000000;
+        body.extend(cnd);
+        let s = shader(Stage::Pixel, 1, 1, &body);
+        validate(&s);
+        let mut constants = Constants::default();
+        constants.f[0] = [0.0, 0.0, 0.0, alpha];
+        constants.f[1] = [1.0, 0.5, 0.25, 0.0];
+        constants.f[2] = [0.0; 4];
+        let out = run(&s, &Inputs::default(), &constants, &mut NoTextures).unwrap();
+        assert_eq!(out.colors[0], [1.0, 0.5, 0.25, alpha]);
+    }
+
+    // ps_2_x calls through a predicate.
+    let mut body = instruction(Opcode::Mov, &[dst(0, 0), src(2, 0)]);
+    let mut test = instruction(Opcode::Setp, &[dst(19, 0), src(2, 1), src(2, 0)]);
+    test[0] |= 1 << 16;
+    body.extend(test);
+    body.extend(instruction(Opcode::CallNz, &[src(18, 0), reg(19, 0)]));
+    body.extend(instruction(Opcode::Mov, &[dst(8, 0), src(0, 0)]));
+    body.extend(instruction(Opcode::Ret, &[]));
+    body.extend(instruction(Opcode::Label, &[src(18, 0)]));
+    body.extend(instruction(Opcode::Mov, &[dst(0, 0), src(2, 1)]));
+    body.extend(instruction(Opcode::Ret, &[]));
+    let s = shader(Stage::Pixel, 2, 1, &body);
+    validate(&s);
+    let mut constants = Constants::default();
+    constants.f[1] = [0.5; 4];
+    let out = run(&s, &Inputs::default(), &constants, &mut NoTextures).unwrap();
+    assert_eq!(out.colors[0], [0.5; 4]);
 }

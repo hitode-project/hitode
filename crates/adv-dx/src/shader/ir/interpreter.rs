@@ -13,6 +13,20 @@ pub struct Inputs {
 
 pub type Constants = HashMap<u32, Vec<Vector>>;
 
+/// Constant buffer rows by slot; a row outside the buffer reads as zero.
+pub trait ConstantBuffers {
+    fn row(&self, slot: u32, row: u32) -> Vector;
+}
+
+impl ConstantBuffers for Constants {
+    fn row(&self, slot: u32, row: u32) -> Vector {
+        self.get(&slot)
+            .and_then(|rows| rows.get(row as usize))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Outputs {
     pub registers: HashMap<(Register, u32), Vector>,
@@ -74,28 +88,70 @@ impl Resources for NoTextures {
 pub fn run(
     module: &Module,
     inputs: &Inputs,
-    constants: &Constants,
+    constants: &impl ConstantBuffers,
     resources: &mut impl Resources,
 ) -> Result<Outputs, Error> {
-    if matches!(module.stage, Stage::Geometry | Stage::Hull | Stage::Domain) {
-        return Err(Error::UnsupportedStage(module.stage));
+    Prepared::new(module)?.run(inputs, constants, resources)
+}
+
+/// A module after the shared semantic passes, for repeated execution.
+#[derive(Clone, Debug)]
+pub struct Prepared {
+    module: Module,
+    temporary_count: u32,
+    /// The entry block ends here; shared subroutine bodies follow.
+    entry: usize,
+    routines: HashMap<u64, std::ops::Range<usize>>,
+    fuel: usize,
+}
+
+impl Prepared {
+    pub fn new(module: &Module) -> Result<Self, Error> {
+        if matches!(module.stage, Stage::Geometry | Stage::Hull | Stage::Domain) {
+            return Err(Error::UnsupportedStage(module.stage));
+        }
+        let (module, reflection) = passes::prepare(module)?;
+        if reflection.doubles {
+            return Err(Error::DoublePrecision);
+        }
+        let (entry, routines) = passes::subroutines(&module.body);
+        Ok(Self {
+            module,
+            temporary_count: reflection.temporary_count,
+            entry,
+            routines: routines.into_iter().collect(),
+            fuel: crate::shader::MAX_EXECUTION_STEPS,
+        })
     }
-    let (module, reflection) = passes::prepare(module)?;
-    if reflection.doubles {
-        return Err(Error::DoublePrecision);
+
+    /// Statements one run may execute before it stops with `ExecutionLimit`.
+    pub fn with_fuel(mut self, fuel: usize) -> Self {
+        self.fuel = fuel;
+        self
     }
-    let mut machine = Machine {
-        inputs,
-        constants,
-        resources,
-        temps: vec![[0; 4]; reflection.temporary_count as usize],
-        arrays: HashMap::new(),
-        immediate: &[],
-        outputs: Outputs::default(),
-        fuel: crate::shader::MAX_EXECUTION_STEPS,
-    };
-    let _ = machine.block(&module.body)?;
-    Ok(machine.outputs)
+
+    pub fn run(
+        &self,
+        inputs: &Inputs,
+        constants: &impl ConstantBuffers,
+        resources: &mut impl Resources,
+    ) -> Result<Outputs, Error> {
+        let mut machine = Machine {
+            inputs,
+            constants,
+            resources,
+            temps: vec![[0; 4]; self.temporary_count as usize],
+            arrays: HashMap::new(),
+            immediate: &[],
+            outputs: Outputs::default(),
+            fuel: self.fuel,
+            flush: self.module.model.flushes_denormals(),
+            body: &self.module.body,
+            routines: &self.routines,
+        };
+        let _ = machine.block(&self.module.body[..self.entry])?;
+        Ok(machine.outputs)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,24 +161,27 @@ enum Branch {
     Continue,
 }
 
-struct Machine<'a, R> {
+struct Machine<'a, C: ?Sized, R> {
     inputs: &'a Inputs,
-    constants: &'a Constants,
+    constants: &'a C,
     resources: &'a mut R,
     temps: Vec<Vector>,
     arrays: HashMap<u32, Vec<Vector>>,
     immediate: &'a [Vector],
     outputs: Outputs,
     fuel: usize,
+    flush: bool,
+    body: &'a [Statement],
+    routines: &'a HashMap<u64, std::ops::Range<usize>>,
 }
 
-impl<'a, R: Resources> Machine<'a, R> {
+impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
     fn tick(&mut self) -> Result<(), Error> {
         self.fuel = self.fuel.checked_sub(1).ok_or(Error::ExecutionLimit)?;
         Ok(())
     }
 
-    fn block(&mut self, block: &'a Block) -> Result<ControlFlow<Branch>, Error> {
+    fn block(&mut self, block: &'a [Statement]) -> Result<ControlFlow<Branch>, Error> {
         for statement in block {
             self.tick()?;
             let branch = match statement {
@@ -138,6 +197,9 @@ impl<'a, R: Resources> Machine<'a, R> {
                     ControlFlow::Continue(())
                 }
                 Statement::CustomData { .. } => ControlFlow::Continue(()),
+                Statement::Execute(op) if matches!(op.opcode, Opcode::Call | Opcode::Callc) => {
+                    self.call(op)?
+                }
                 Statement::Execute(instruction) => self.instruction(instruction)?,
                 Statement::If {
                     test,
@@ -189,6 +251,30 @@ impl<'a, R: Resources> Machine<'a, R> {
             }
         }
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// Run a shared subroutine body. Its return resumes the caller; a discard
+    /// ends the program.
+    fn call(&mut self, op: &Instruction) -> Result<ControlFlow<Branch>, Error> {
+        if op.opcode == Opcode::Callc {
+            let value = self.read(&op.sources[1], ValueType::Uint, false)?[0];
+            if (value != 0) != op.test_nonzero {
+                return Ok(ControlFlow::Continue(()));
+            }
+        }
+        let label = passes::call_target(op)?;
+        let range = self
+            .routines
+            .get(&label)
+            .ok_or(Error::Invalid("call target"))?
+            .clone();
+        let body = self.body;
+        Ok(match self.block(&body[range])? {
+            ControlFlow::Break(Branch::Return) if self.outputs.discarded => {
+                ControlFlow::Break(Branch::Return)
+            }
+            _ => ControlFlow::Continue(()),
+        })
     }
 
     fn instruction(&mut self, op: &Instruction) -> Result<ControlFlow<Branch>, Error> {
@@ -356,11 +442,7 @@ impl<'a, R: Resources> Machine<'a, R> {
             OperandValue::Constant { slot, byte_offset } => {
                 let slot = self.index(slot, 1)?;
                 let row = self.index(byte_offset, 16)?;
-                self.constants
-                    .get(&slot)
-                    .and_then(|rows| rows.get(row as usize))
-                    .copied()
-                    .unwrap_or_default()
+                self.constants.row(slot, row)
             }
             OperandValue::Register {
                 register: Register::IndexableTemp,
@@ -407,7 +489,7 @@ impl<'a, R: Resources> Machine<'a, R> {
         let swizzle = operand.components.swizzle();
         Ok(std::array::from_fn(|lane| {
             let value = vector[swizzle[lane] as usize];
-            let value = alu::modify(value, operand.modifier, ty);
+            let value = alu::modify(value, operand.modifier, ty, self.flush);
             if flush && ty == ValueType::Float {
                 alu::flush(value)
             } else {

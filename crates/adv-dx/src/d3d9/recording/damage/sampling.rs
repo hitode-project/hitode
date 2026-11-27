@@ -2,7 +2,7 @@
 use super::*;
 use crate::shader::{
     Opcode, Register, RegisterKind, Shader, SourceModifier,
-    interpreter::{self, Outputs},
+    sm::{NoTextures, Outputs},
 };
 use adv_device::gpu::{Address, Filter, Sampler, Topology};
 
@@ -496,13 +496,14 @@ fn vertices(
     for n in 0..count {
         let mut output = if let Some(vertex) = vertex {
             let program = draw.programmable.as_ref()?;
-            interpreter::run(
-                vertex,
-                &vertex_input(program, n as u32)?,
-                &program.vertex_constants,
-                &mut interpreter::NoTextures,
-            )
-            .ok()?
+            vertex
+                .program()?
+                .run(
+                    &vertex_input(program, n as u32)?,
+                    &program.vertex_constants,
+                    &mut NoTextures,
+                )
+                .ok()?
         } else if transformed {
             let p = draw.programmable.as_ref()?;
             let index = if draw.fixed_vertex.is_some() {

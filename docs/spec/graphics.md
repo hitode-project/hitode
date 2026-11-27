@@ -775,6 +775,7 @@ Binding changes MUST NOT start speculative preparation for transient shader pair
 ### GFX-NUM-1 Floating-point semantics
 
 **Rule**: D3D9 shader arithmetic MUST use f32 and preserve reference behavior for special values, including zero multiplication, reciprocal zero, and logarithm zero.
+SM1–3 programs MUST reach WGSL emission and scalar execution through one lowering into the shared register IR, so both apply one set of rules; predication MUST select each destination component by its predicate component.
 SM4–5 WGSL emission and scalar execution MUST apply the same DXBC arithmetic rules.
 DXBC floating-point arithmetic MUST flush denormals to sign-preserved zero where the instruction requires it.
 DXBC `f32tof16` MUST round toward zero and clamp finite overflow to the largest finite half.

@@ -32,7 +32,7 @@ pub(in crate::d3d9) fn bounds(env: &Env<'_>, device: &Device, operation: &Operat
     }
 }
 fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> {
-    use crate::shader::interpreter::{self, NoTextures};
+    use crate::shader::sm::NoTextures;
     if d.programmable
         .as_ref()
         .is_some_and(|p| p.instance_count != 1 || p.streams.iter().any(|s| s.instance))
@@ -95,11 +95,12 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
         } else {
             let shader = shaders::bound(env, device.hot.borrow().shaders.vertex?)?;
             let translation = shader.translation.as_ref().ok()?;
+            let program = shader.parsed.program()?;
             for n in 0..p.vertex_count {
                 let input = vertex_input(p, n)?;
-                let output =
-                    interpreter::run(&shader.parsed, &input, &p.vertex_constants, &mut NoTextures)
-                        .ok()?;
+                let output = program
+                    .run(&input, &p.vertex_constants, &mut NoTextures)
+                    .ok()?;
                 if point.is_some() && translation.writes_point_size {
                     margin = margin.max(1. + point_size(output.point_size)? * 0.5);
                 }
@@ -201,14 +202,14 @@ fn fixed_position(d: &fixed::Draw, ordinal: usize) -> Option<([f32; 4], [f32; 3]
 pub(in crate::d3d9) fn vertex_input(
     p: &adv_device::gpu::ProgrammableDraw,
     n: u32,
-) -> Option<crate::shader::interpreter::Inputs> {
+) -> Option<crate::shader::sm::Inputs> {
     stream_input(&p.streams, n)
 }
 pub(in crate::d3d9) fn stream_input(
     streams: &[adv_device::gpu::VertexStream],
     n: u32,
-) -> Option<crate::shader::interpreter::Inputs> {
-    let mut input = crate::shader::interpreter::Inputs::default();
+) -> Option<crate::shader::sm::Inputs> {
+    let mut input = crate::shader::sm::Inputs::default();
     for stream in streams {
         for a in &stream.attributes {
             if a.format == AttributeFormat::Bgra8Unorm {

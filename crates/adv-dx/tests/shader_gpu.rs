@@ -3,7 +3,7 @@
 use adv_device::gpu::{ConstantBlock, DrawState, Gpu, GpuBackend, Program, ProgrammableDraw};
 use adv_dx::shader::{
     Opcode, Shader, Stage,
-    interpreter::{self, Constants, Inputs, NoTextures},
+    sm::{Constants, Inputs, NoTextures},
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,7 +51,11 @@ fn full_source(shader: &Shader, input: &Inputs) -> String {
     source
 }
 fn compare_gpu(gpu: &mut Gpu, name: &str, shader: Shader, input: &Inputs, constants: &Constants) {
-    let expected = interpreter::run(&shader, input, constants, &mut NoTextures).unwrap();
+    let expected = shader
+        .program()
+        .unwrap()
+        .run(input, constants, &mut NoTextures)
+        .unwrap();
     let source = full_source(&shader, input);
     let target = gpu.target(16, 12, false).unwrap();
     let draw = ProgrammableDraw {
@@ -264,6 +268,28 @@ fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
         &input,
         &constants,
     );
+    // Shared subroutine bodies run as functions over the caller's registers,
+    // including a call through a Boolean that skips its body.
+    let mut words = ins(Opcode::Mov, &[dst(0, 0), src(2, 4)]);
+    words.extend(ins(Opcode::Call, &[src(18, 1)]));
+    words.extend(ins(Opcode::Call, &[src(18, 1)]));
+    words.extend(ins(Opcode::CallNz, &[src(18, 2), src(14, 0)]));
+    words.extend(ins(Opcode::Mov, &[dst(8, 0), src(0, 0)]));
+    words.extend(ins(Opcode::Ret, &[]));
+    words.extend(ins(Opcode::Label, &[src(18, 1)]));
+    words.extend(ins(Opcode::Call, &[src(18, 2)]));
+    words.extend(ins(Opcode::Add, &[dst(0, 0), src(0, 0), src(2, 4)]));
+    words.extend(ins(Opcode::Ret, &[]));
+    words.extend(ins(Opcode::Label, &[src(18, 2)]));
+    words.extend(ins(Opcode::Mul, &[dst(0, 0), src(0, 0), src(2, 3)]));
+    words.extend(ins(Opcode::Ret, &[]));
+    compare_gpu(
+        &mut gpu,
+        "subroutines",
+        shader(3, 0, words),
+        &input,
+        &constants,
+    );
     for minor in 1..=4 {
         let mut words = vec![
             Opcode::Mul as u32,
@@ -428,7 +454,10 @@ fn constants_read_in_place_match_reference_on_device() {
     }
     for (body, constants) in bodies {
         let shader = shader(3, 0, body);
-        let expected = interpreter::run(&shader, &Inputs::default(), &constants, &mut NoTextures)
+        let expected = shader
+            .program()
+            .unwrap()
+            .run(&Inputs::default(), &constants, &mut NoTextures)
             .unwrap()
             .colors[0]
             .map(f32::to_bits);

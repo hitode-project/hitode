@@ -8,6 +8,7 @@ pub fn disassemble(bytes: &[u8]) -> Result<String, ParseError> {
         Model::Sm40 | Model::Level91 | Model::Level93 => "4_0",
         Model::Sm41 => "4_1",
         Model::Sm50 => "5_0",
+        Model::Legacy => unreachable!("DXBC never carries legacy shader models"),
     };
     let mut output = format!("{}_{model}\n", module.stage.prefix());
     block(&mut output, &module.body, 0);
