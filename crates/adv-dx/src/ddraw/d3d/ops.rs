@@ -545,9 +545,6 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
     ) {
         return super::report::enumerate(env, face, method, args);
     }
-    if face == Face::ExecuteBuffer && method == "Validate" {
-        return execute::validate(env, args);
-    }
     let result = {
         let (state, store) = env.ext.get2_installed_mut::<front::State, SurfaceStore>();
         let mut memory = (state.provider.memory)(env.cpu);
@@ -633,7 +630,7 @@ impl Calls<'_> {
             "TransformVertices" => return self.transform_vertices(args),
             "LightElements" => 0x80004001, // Retired before the Direct3D 3 interface.
 
-            "Lock" | "Unlock" | "SetExecuteData" | "GetExecuteData" | "Optimize"
+            "Lock" | "Unlock" | "SetExecuteData" | "GetExecuteData" | "Validate" | "Optimize"
                 if face == Face::ExecuteBuffer =>
             {
                 return self.execute_buffer(method, args);
@@ -642,7 +639,7 @@ impl Calls<'_> {
                 return self.process_vertices(method, args);
             }
             "Lock" | "Unlock" | "GetVertexBufferDesc" | "Optimize" => {
-                return self.vertex_buffer(method, args);
+                return self.vertex_buffer(face, method, args);
             }
             "BeginScene" | "EndScene" | "Clear" | "SetRenderTarget" | "GetRenderTarget"
             | "SetTexture" | "GetTexture" | "PreLoad" | "ValidateDevice"
@@ -815,7 +812,12 @@ impl Calls<'_> {
                 .attached(sid)
                 .into_iter()
                 .any(|surface| self.draw.caps(surface)[0] & creation::ZBUFFER != 0);
-            device.state = Some(super::state::State::new(image.width, image.height, depth));
+            device.state = Some(super::state::State::new(
+                image.width,
+                image.height,
+                depth,
+                (face == Face::Direct3D7).then_some(kind),
+            ));
         }
         let pointer = self.make(faces, &[], Object::Device(Box::new(device)))?;
         if pointer == OUT_OF_MEMORY {
@@ -835,6 +837,7 @@ impl Calls<'_> {
         let sid = self.draw.surface_id(self.objects, device.target).unwrap();
         let target = &self.store[sid];
         let size = (target.width, target.height);
+        let rgb = device.kind == caps::Device::Rgb;
         let device = super::device_mut(self.draw, self.objects, args[0]).unwrap();
         let Some(state) = device.state.as_mut() else {
             return Ok(INVALID);
@@ -857,9 +860,21 @@ impl Calls<'_> {
                 };
             }
             match method {
+                "SetRenderState" if face == Face::Device7 => {
+                    let [slot, value] = [args[1], args[2]];
+                    if decode::device7_render(slot) {
+                        state.set(crate::fixed::Setting::RenderRegister(slot as i32, value));
+                    } else if value != 0 || !decode::retired_zero(rgb, slot) {
+                        return Ok(Err(INVALID));
+                    }
+                }
                 "SetRenderState" => state.set(validated!(decode::render(args[1], args[2]))),
                 "GetRenderState" => {
-                    let value = validated!(decode::render_value(&state.fixed, args[1]));
+                    let value = validated!(if face == Face::Device7 {
+                        decode::device7_render_value(&state.fixed, args[1])
+                    } else {
+                        decode::render_value(&state.fixed, args[1])
+                    });
                     memory.arg_put_u32(args[2], value)?;
                 }
                 "SetTextureStageState" => {
@@ -933,6 +948,21 @@ impl Calls<'_> {
                     } else {
                         write(memory, args[2], &state.fixed.clip_planes[n])?;
                     }
+                }
+                "SetClipStatus" if face == Face::Device7 => {
+                    let [flags, status, min_x, max_x, min_y, max_y, _, _] = read(memory, args[1])?;
+                    if flags & 4 != 0 {
+                        return Ok(Err(INVALID));
+                    }
+                    if flags & 1 != 0 {
+                        state.clip_status[1] = status;
+                    }
+                    if flags & 2 != 0 {
+                        state.clip_status[2..6].copy_from_slice(&[min_x, max_x, min_y, max_y]);
+                    }
+                }
+                "GetClipStatus" if face == Face::Device7 => {
+                    memory.arg_write(args[1], bytemuck::cast_slice(&state.clip_status[..6]))?;
                 }
                 "SetClipStatus" => state.clip_status = read(memory, args[1])?,
                 "GetClipStatus" => write(memory, args[1], &state.clip_status)?,

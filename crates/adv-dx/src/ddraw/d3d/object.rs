@@ -62,6 +62,8 @@ pub(super) struct LegacyState {
     pub light: BTreeMap<u32, u32>,
     pub batch: Option<PrimitiveBatch>,
     pub stats: [u32; 5],
+    pub execute_status: u32,
+    pub execute_extent: Option<adv_abi::types::D3DRECT>,
     pub picked: Vec<adv_abi::types::D3DPICKRECORD>,
 }
 
@@ -105,7 +107,10 @@ impl Device {
             target,
             viewports: Vec::new(),
             current_viewport: 0,
-            legacy: LegacyState::default(),
+            legacy: LegacyState {
+                execute_status: 0x01ff_f000,
+                ..Default::default()
+            },
             state: None,
             material_handles: BTreeMap::new(),
             texture_handles: BTreeMap::new(),
