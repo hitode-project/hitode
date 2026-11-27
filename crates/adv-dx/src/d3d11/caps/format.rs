@@ -277,6 +277,10 @@ pub(super) fn derive(
     level: FeatureLevel,
     compute: bool,
 ) -> Option<BTreeMap<u32, FormatSupport>> {
+    let native_8x = caps
+        .features
+        .contains(Features::STANDARD_SAMPLE_LOCATIONS | Features::FULL_SAMPLE_COVERAGE);
+    let sample_mask = if native_8x { u32::MAX } else { !8 };
     let mut result = BTreeMap::new();
     for row in table() {
         let downlevel = (level != FeatureLevel::L11_0).then(|| row.downlevel[level.column()]);
@@ -316,7 +320,7 @@ pub(super) fn derive(
             } else {
                 path.and_then(|path| path.backing)
                     .map_or(0, |format| caps.format_sample_counts(format))
-            };
+            } & sample_mask;
             let count = bit.sample_count();
             let mask = samples & count;
             let available = resolve_path(caps, path, bit, row.format) && (count == 0 || mask != 0);
@@ -324,7 +328,10 @@ pub(super) fn derive(
                 support.allow(bit);
                 support.sample_counts |= mask;
             } else if required
-                && !matches!(bit, Share | Msaa8)
+                && !matches!(
+                    bit,
+                    Share | Msaa4 | Msaa8 | MsaaOther | MsaaLoad | MsaaResolve
+                )
                 && class == FormatClass::Resource
                 && !(bit == Display && present_format(row.format).is_none())
             {

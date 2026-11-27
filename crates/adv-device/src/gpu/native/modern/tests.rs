@@ -367,6 +367,207 @@ fn pixel_probe_standard_multisample_resolve_and_load() {
     }
 }
 
+#[test]
+#[cfg(target_vendor = "apple")]
+fn native_multisample_values_match_the_standard_positions() {
+    let Some(mut gpu) = executor() else { return };
+    let format = Format::Rgba8Unorm;
+    let caps = gpu.device().caps();
+    let sample_counts = caps.format_sample_counts(format);
+    let vertex = shader(
+        "
+struct Vertex {
+    @builtin(position) position: vec4<f32>,
+    @location(0) xy: vec2<f32>,
+}
+@vertex fn main(@builtin(vertex_index) i: u32) -> Vertex {
+    let p = array(vec2(0., 3.), vec2(0., -1.), vec2(4., -1.))[i];
+    return Vertex(vec4(p, 0.5, 1.), (p * vec2(1., -1.) + 1.) * 0.5);
+}",
+        Stage::Vertex,
+    );
+    let fragment = shader(
+        "
+struct Pixel {
+    @location(0) color: vec4<f32>,
+    @builtin(sample_mask) mask: u32,
+}
+@fragment fn main(@location(0) @interpolate(linear, sample) xy: vec2<f32>,
+                  @builtin(sample_index) i: u32) -> Pixel {
+    return Pixel(vec4(f32(i + 1u), round(xy * 16.), 0.) / 255., 0x77u);
+}",
+        Stage::Fragment,
+    );
+    let load = shader(
+        "
+@group(1) @binding(0) var source: texture_multisampled_2d<f32>;
+@fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(source, vec2(0i), u32(p.x));
+}",
+        Stage::Fragment,
+    );
+    let p4 = [[6, 2], [14, 6], [2, 10], [10, 14]];
+    let p8 = [
+        [9, 5],
+        [7, 11],
+        [13, 9],
+        [5, 3],
+        [3, 13],
+        [1, 7],
+        [11, 15],
+        [15, 1],
+    ];
+    for positions in [p4.as_slice(), p8.as_slice()] {
+        let samples = positions.len() as u32;
+        if sample_counts & samples == 0 {
+            continue;
+        }
+        let usage = Usage::COLOR | Usage::SAMPLED | Usage::COPY_SRC | Usage::COPY_DST;
+        let msaa = image(&gpu, 1, 1, format, samples, 1, usage);
+        let copy = image(&gpu, 1, 1, format, samples, 1, usage);
+        let mut draw_msaa = draw(
+            1,
+            1,
+            vertex.clone(),
+            fragment.clone(),
+            [color(&msaa, Load::Clear([0.; 4]))],
+        );
+        draw_msaa.samples = samples;
+        simple(&mut gpu, draw_msaa);
+        let region = |image: Image| ImageRegion {
+            extent: image.desc().size,
+            image,
+            mip: 0,
+            layer: 0,
+            origin: (0, 0, 0),
+        };
+        gpu.transfer(ModernTransfer::CopyImage {
+            source: region(msaa),
+            destination: region(copy.clone()),
+        })
+        .unwrap();
+        let sampled = target(&gpu, samples, 1, format);
+        gpu.draw_modern(
+            draw(
+                samples,
+                1,
+                shader(TRIANGLE, Stage::Vertex),
+                load.clone(),
+                [color(&sampled, Load::DontCare)],
+            ),
+            &SlotBindings::default(),
+            &SlotBindings {
+                images: vec![Some(copy.view().clone())],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let resolved = target(&gpu, 1, 1, format);
+        gpu.resolve(copy.view().clone(), resolved.view().clone())
+            .unwrap();
+
+        let expected: Vec<_> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, &[x, y])| {
+                // The triangle covers the right half of the pixel.
+                if x >= 8 && 0x77 & (1 << i) != 0 {
+                    [i as u8 + 1, x, y, 0]
+                } else {
+                    [0; 4]
+                }
+            })
+            .collect();
+        assert_eq!(
+            read_image(&mut gpu, &sampled, 0, 4),
+            expected.as_flattened()
+        );
+        for (channel, actual) in read_image(&mut gpu, &resolved, 0, 4)
+            .into_iter()
+            .enumerate()
+        {
+            let sum = expected
+                .iter()
+                .map(|pixel| u32::from(pixel[channel]))
+                .sum::<u32>();
+            assert!((f64::from(actual) - f64::from(sum) / f64::from(samples)).abs() <= 0.6);
+        }
+    }
+}
+
+#[test]
+#[cfg(target_vendor = "apple")]
+fn metal_sample_mask_output_reduces_input_coverage() {
+    let Some(mut gpu) = executor() else { return };
+    let format = Format::Rgba8Unorm;
+    let msaa = image(&gpu, 1, 1, format, 4, 1, Usage::COLOR | Usage::SAMPLED);
+    let sampled = target(&gpu, 4, 1, format);
+    let edge = shader(
+        "
+@vertex fn main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = array(vec2(0., 3.), vec2(0., -1.), vec2(4., -1.));
+    return vec4(p[i], 0.5, 1.);
+}",
+        Stage::Vertex,
+    );
+    let load = shader(
+        "
+@group(1) @binding(0) var source: texture_multisampled_2d<f32>;
+@fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(source, vec2(0i), u32(p.x));
+}
+",
+        Stage::Fragment,
+    );
+    let vertex = shader(TRIANGLE, Stage::Vertex);
+    let slots = SlotBindings {
+        images: vec![Some(msaa.view().clone())],
+        ..Default::default()
+    };
+    // The edge covers samples 1 and 3. D3D11 exposes both bits to each
+    // invocation even when the shader masks out sample 3.
+    for (fragment, expected) in [
+        (
+            "@fragment fn main(@builtin(sample_index) i: u32, @builtin(sample_mask) mask: u32)
+                -> @location(0) vec4<f32> {
+                return vec4(f32(i + 1u), f32(mask), 0., 0.) / 255.;
+            }",
+            [0, 0, 0, 0, 2, 10, 0, 0, 0, 0, 0, 0, 4, 10, 0, 0],
+        ),
+        (
+            "struct Pixel { @location(0) color: vec4<f32>, @builtin(sample_mask) mask: u32 }
+            @fragment fn main(@builtin(sample_index) i: u32, @builtin(sample_mask) mask: u32)
+                -> Pixel {
+                return Pixel(vec4(f32(i + 1u), f32(mask), 0., 0.) / 255., 0x77u);
+            }",
+            [0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ),
+    ] {
+        let mut raster = draw(
+            1,
+            1,
+            edge.clone(),
+            shader(fragment, Stage::Fragment),
+            [color(&msaa, Load::Clear([0.; 4]))],
+        );
+        raster.samples = 4;
+        simple(&mut gpu, raster);
+        gpu.draw_modern(
+            draw(
+                4,
+                1,
+                vertex.clone(),
+                load.clone(),
+                [color(&sampled, Load::DontCare)],
+            ),
+            &SlotBindings::default(),
+            &slots,
+        )
+        .unwrap();
+        assert_eq!(read_image(&mut gpu, &sampled, 0, 4), expected);
+    }
+}
+
 // spec: GFX-PASS-1 GFX-PASS-3
 #[test]
 fn mrt_compute_boundaries_predication_and_queries() {
