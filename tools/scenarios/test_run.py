@@ -227,6 +227,24 @@ class Judge(unittest.TestCase):
 
 
 class Work(unittest.TestCase):
+    def test_site_counts_exclude_addresses_outside_the_kernel(self):
+        counts = work.site_counts(
+            " access 0x00401000=3 access 0x7b080000=6"
+            " interpreter 0x00401004 HostFault=1 interpreter 0x00401008 OperandFault=2",
+            [(0x401000, 0x401010)],
+        )
+        self.assertEqual(counts, {"accesses": 3, "faults": 3})
+
+    def test_split_choice_uses_pace_and_helper_availability(self):
+        self.assertEqual(work.split_choice(10000, 25, 100.0, 20000, 0, 0, 0, 2000000, 2),
+                         (0, 0))
+        self.assertEqual(work.split_choice(10000, 25, 100.0, 20000, 0, 0, 0, 900000, 2),
+                         (1, 1250))
+        self.assertEqual(work.split_choice(10000, 25, 100.0, 20000, 0, 0, 0, 100000, 2),
+                         (2, 834))
+        self.assertEqual(work.split_choice(10000, 25, 100.0, 20000, 0, 0, 0, 100000, 0),
+                         (0, 0))
+
     def test_resident_trips_falls_back_to_backedge_without_tier1_counts(self):
         self.assertEqual(work.resident_trips(1440, 2, 1375, None), 1375)
         self.assertEqual(work.resident_trips(1440, 2, 0, None), 0)

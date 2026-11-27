@@ -1404,13 +1404,27 @@ impl<'a, U, R> Session<'a, U, R> {
         pace: Pace,
     ) -> Option<Done> {
         let most = self.pool.idle().min(plan.iterations as usize - 1);
-        let Some((helpers, size)) = super::plan::split_work(
+        let choice = super::plan::split_work(
             plan.iterations,
             (retired, ns),
             self.wake_estimate.ns,
             pace,
             most,
-        ) else {
+        );
+        let (helpers, size) = choice.unwrap_or_default();
+        crate::jit_map::optimized(
+            key.0,
+            format_args!(
+                "split_price\t{}\t{retired}\t{ns:?}\t{}\t{}\t{}\t{}\t{}\t{most}\t{helpers}\t{size}",
+                plan.iterations,
+                self.wake_estimate.ns,
+                pace.work_ns,
+                pace.last_ns,
+                pace.saved_ns,
+                pace.limit_ns,
+            ),
+        );
+        let Some((helpers, size)) = choice else {
             if most > 0
                 && self.wake_estimate.ns > super::plan::WAKE_NS
                 && super::plan::split_work(

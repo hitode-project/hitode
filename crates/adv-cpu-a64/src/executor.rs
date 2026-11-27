@@ -909,6 +909,17 @@ impl Executor {
                     return Ok(RunOutcome::UnsupportedInstruction { pc, code });
                 }
                 Step::Trap { pc, vector } => {
+                    // The synthetic scenario's diagnostic boundary.
+                    if vector == 0x2d
+                        && self.state.regs[0] == 0x4849_544f
+                        && crate::jit_map::enabled()
+                    {
+                        crate::jit_map::optimized(
+                            pc,
+                            format_args!("mark\t{}\t{}", self.state.regs[1], self.diagnostics()),
+                        );
+                        continue;
+                    }
                     if bridge.handler.is_none() {
                         return Ok(RunOutcome::Trap { pc, vector });
                     }

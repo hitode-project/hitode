@@ -5,6 +5,7 @@
   "outputs": ["virtual-call-loop.bin"],
   "steady": {
     "iterations": [2000000, 4000000],
+    "regions": ["_spin", "_method"],
     "counters": ["accesses", "helper_exits", "checked_faults", "faults", "interprets"]
   }
 }

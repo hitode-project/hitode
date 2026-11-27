@@ -1,11 +1,11 @@
-/* Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 -masm=intel -fno-omit-frame-pointer -fno-if-conversion -fno-if-conversion2 -mincoming-stack-boundary=2 -mpreferred-stack-boundary=6 threaded_x87_blocks.c -o threaded_x87_blocks.exe -lddraw */
+/* Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 -masm=intel -fno-toplevel-reorder -fno-omit-frame-pointer -fno-if-conversion -fno-if-conversion2 -mincoming-stack-boundary=2 -mpreferred-stack-boundary=6 threaded_x87_blocks.c -o threaded_x87_blocks.exe -lddraw */
 #define COBJMACROS
 #include <stdint.h>
 #include <stdio.h>
 #include <windows.h>
 #include <ddraw.h>
 
-enum { WIDTH = 1280, HEIGHT = 720, CHANNELS = 4, TILE = 8, TEAM = 8 };
+enum { WIDTH = 1280, HEIGHT = 128, CHANNELS = 4, TILE = 8, TEAM = 8 };
 enum { PITCH = WIDTH * CHANNELS, COLUMNS = WIDTH / TILE, ROWS = HEIGHT / TILE };
 
 typedef struct { float x, y; } Point;
@@ -33,6 +33,7 @@ static int (__cdecl *thread_number)(void);
 extern double block_floor(double);
 
 __asm__(
+    "  .text\n"
     "_block_trunc:\n"
     "  push ebp\n"
     "  mov ebp, esp\n"
@@ -95,6 +96,7 @@ __asm__(
     "  fild dword ptr [esp+4]\n"
     "  add esp, 8\n"
     "  ret\n"
+    "_block_trunc_end:\n"
 );
 
 static inline int trunc_coordinate(double coordinate)
@@ -202,6 +204,7 @@ void warp_rows(const Frame *frame, int first, int last)
         }
     }
 }
+__asm__("_warp_rows_end:");
 
 static void __cdecl warp_team(const Frame *frame)
 {
@@ -219,6 +222,7 @@ static __attribute__((noinline, noclone)) void blend_band(
 {
     blend(output, input, CHANNELS, PITCH, 16384, 32768, bytes);
 }
+__asm__("_blend_band_end:");
 
 /* A band of already prepared samples can be split at any byte. Two peers
    first reach the same byte loop while there is local work to price. */
@@ -279,9 +283,9 @@ static void __cdecl count_team(const Frame *frame)
 
 int main(void)
 {
-    unsigned iterations;
+    unsigned iterations, warmup = 0;
     FILE *input = fopen("scenario-input.txt", "r");
-    if (!input || fscanf(input, "%u", &iterations) != 1 || !iterations) return 2;
+    if (!input || fscanf(input, "%u %*u %u", &iterations, &warmup) < 1 || !iterations) return 2;
     fclose(input);
 
     HMODULE dll = LoadLibraryA("vcomp.dll");
@@ -306,9 +310,13 @@ int main(void)
     int status = prepare_independent_band(&frame);
     if (status) return status;
     for (unsigned i = 0; i < iterations; i++) {
+        if (warmup && i == warmup)
+            __asm__ volatile("int 0x2d" : : "a"(0x4849544f), "c"(0) : "memory");
         fork_team(1, 1, warp_team, &frame);
         blend_band(band[0], source[0], sizeof(band));
     }
+    if (warmup)
+        __asm__ volatile("int 0x2d" : : "a"(0x4849544f), "c"(1) : "memory");
 
     for (int y = 0; y < HEIGHT; y++)
         for (int x = 0; x < WIDTH; x++)

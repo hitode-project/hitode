@@ -286,6 +286,9 @@ impl Native {
                 self.strike(memory, site.eip, pc, cpu);
             } else {
                 self.diagnostics.checked_faults += 1;
+                if let Some(paths) = &mut self.code.slow_paths {
+                    *paths.checked_faults.entry(site.eip).or_default() += 1;
+                }
             }
         }
         returned.commit_repeat(cpu);
@@ -635,6 +638,9 @@ impl Native {
         elapsed: u64,
     ) {
         self.diagnostics.resident_cold_exits += 1;
+        if let Some(paths) = &mut self.code.slow_paths {
+            *paths.resident_cold_exits.entry(site).or_default() += 1;
+        }
         *self
             .diagnostics
             .resident_cold_exits_by_reason

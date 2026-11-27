@@ -223,16 +223,15 @@ jobs:
       # latest master build the daily refresh cached, with that commit's own
       # scenarios and judge. Every master commit since then passed the same
       # gate, so its intended changes carry their claiming scenarios.
-      # Paused: the x87 scenarios flake and block merges; remove `false &&` to re-enable.
       - name: Restore the latest master build for behavior scenarios
-        if: ${{ false && !cancelled() && steps.compile.outcome == 'success' && env.WORKSPACE_GROUP == 'runtime-apps' }}
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' && env.WORKSPACE_GROUP == 'runtime-apps' }}
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/scenario-base
-          key: scenario-adv-run-${{ github.sha }}
-          restore-keys: scenario-adv-run-
+          key: scenario-adv-run-v2-${{ github.sha }}
+          restore-keys: scenario-adv-run-v2-
       - name: Judge behavior scenarios
-        if: ${{ false && !cancelled() && steps.compile.outcome == 'success' && env.WORKSPACE_GROUP == 'runtime-apps' }}
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' && env.WORKSPACE_GROUP == 'runtime-apps' }}
         timeout-minutes: 25
         run: |
           set -o pipefail
@@ -259,13 +258,13 @@ jobs:
           cp "$head_bin" target/scenario-head/adv-run
           git rev-parse HEAD > target/scenario-head/commit
       - name: Cache this master build for later scenarios
-        if: false && env.WORKSPACE_GROUP == 'runtime-apps' && github.ref == 'refs/heads/master'
+        if: env.WORKSPACE_GROUP == 'runtime-apps' && github.ref == 'refs/heads/master'
         run: rm -rf target/scenario-base && mv target/scenario-head target/scenario-base
-      - if: false && env.WORKSPACE_GROUP == 'runtime-apps' && github.ref == 'refs/heads/master'
+      - if: env.WORKSPACE_GROUP == 'runtime-apps' && github.ref == 'refs/heads/master'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: target/scenario-base
-          key: scenario-adv-run-${{ github.sha }}
+          key: scenario-adv-run-v2-${{ github.sha }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
