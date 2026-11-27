@@ -242,6 +242,10 @@ fn dynamic_texture_sampling_sees_gpu_copies_before_mapping() {
     r.draw(0..1, [0.; 4]);
     #[cfg(feature = "d3d9-counters")]
     let upload = gpu::traffic(&r.machine.ext).unwrap().upload_bytes;
+    #[cfg(feature = "d3d9-counters")]
+    let views = gpu::capture_counters(&r.machine.ext)
+        .unwrap()
+        .metal_views_created;
     r.draw(1..2, [0.; 4]);
     #[cfg(feature = "d3d9-counters")]
     assert_eq!(
@@ -255,6 +259,13 @@ fn dynamic_texture_sampling_sees_gpu_copies_before_mapping() {
         output.read(&mut r, 3),
         [[0.0f32, 1., 0., 1.], [0., 1., 0., 1.], [0., 0., 1., 1.]]
             .map(|rgba| rgba.map(f32::to_bits)),
+    );
+    #[cfg(feature = "d3d9-counters")]
+    assert_eq!(
+        gpu::capture_counters(&r.machine.ext)
+            .unwrap()
+            .metal_views_created,
+        views
     );
 }
 

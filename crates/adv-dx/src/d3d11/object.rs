@@ -153,6 +153,8 @@ pub(super) struct Device {
     states: [BTreeMap<Vec<u8>, u32>; 4],
     #[cfg(feature = "gpu")]
     pub(super) variants: std::cell::RefCell<super::glue::ShaderVariants>,
+    #[cfg(feature = "gpu")]
+    pub(super) captures: std::cell::RefCell<super::glue::BufferCaptures>,
 }
 
 impl Kind {
@@ -286,11 +288,16 @@ impl Object {
     }
 
     #[cfg(feature = "gpu")]
-    pub(super) fn dynamic_shadow_stale(&self) -> bool {
+    pub(super) fn shadow(&self) -> &map::Storage {
         let Kind::Resource { mapping, .. } = &self.kind else {
             unreachable!();
         };
-        mapping.as_ref().unwrap().dynamic_shadow_stale(0)
+        mapping.as_ref().unwrap()
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(super) fn dynamic_shadow_stale(&self) -> bool {
+        self.shadow().dynamic_shadow_stale(0)
     }
 
     #[cfg(feature = "gpu")]
@@ -588,6 +595,8 @@ impl Table {
                 states: Default::default(),
                 #[cfg(feature = "gpu")]
                 variants: Default::default(),
+                #[cfg(feature = "gpu")]
+                captures: Default::default(),
             }),
         )
     }

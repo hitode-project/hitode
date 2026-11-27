@@ -44,6 +44,8 @@ impl Device {
             .ok_or(Error::OutOfMemory)?;
         let device = crate::Device {
             inner: Device(Arc::new(DeviceState {
+                #[cfg(feature = "counters")]
+                creations: Default::default(),
                 raw,
                 caps,
                 event: event.clone(),
@@ -267,14 +269,12 @@ impl Device {
                 return Err(Error::Unavailable("pipeline statistics queries".into()));
             }
             QueryKind::Occlusion => QueryData::Occlusion(
-                self.0
-                    .raw
-                    .newBufferWithLength_options(
-                        count as usize * 8,
-                        MTLResourceOptions::StorageModePrivate
-                            | MTLResourceOptions::HazardTrackingModeTracked,
-                    )
-                    .ok_or(Error::OutOfMemory)?,
+                self.new_buffer(
+                    count as usize * 8,
+                    MTLResourceOptions::StorageModePrivate
+                        | MTLResourceOptions::HazardTrackingModeTracked,
+                )
+                .ok_or(Error::OutOfMemory)?,
             ),
             QueryKind::Timestamp => {
                 if !self.caps().features.contains(Features::TIMESTAMPS) {

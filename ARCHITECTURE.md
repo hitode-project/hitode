@@ -80,7 +80,10 @@ context indexes its bound views by resource and subresource. The D3D11
 front pulls vertex inputs through the shared shader writer and records typed
 draws and transfers for the GPU worker. Each device reuses translated stages
 and parsed WGSL while the corresponding shader objects live. Draw offsets,
-strides and expansion counts travel through the uniform ring. D3D10 and D3D10.1 use the same device
+strides and expansion counts travel through the upload ring. Dynamic vertex and index
+captures use the same ring and reuse their windows within a frame until the
+shadow changes. Dynamic textures use pooled staging uploads in draw order,
+and Metal reuses views for each texture. D3D10 and D3D10.1 use the same device
 core. The Wine session derives feature levels from the attached backend and
 supplies DXGI with window geometry and the shared surface store. DXGI swap
 chains use D3D11 resources for back buffers and publish through the same

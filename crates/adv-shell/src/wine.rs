@@ -628,6 +628,18 @@ fn report(
                 front(adv_runtime::d3d11_counters(ext))
             ));
         }
+        if let Some(counts) = adv_runtime::d3d11_capture_counters(ext) {
+            fields.push(format!(
+                concat!(
+                    "\"d3d11_captures\": {{\"ring_bytes\": {}, \"captures_reused\": {}, ",
+                    "\"metal_buffers_created\": {}, \"metal_views_created\": {}}}"
+                ),
+                counts.ring_bytes,
+                counts.captures_reused,
+                counts.metal_buffers_created,
+                counts.metal_views_created,
+            ));
+        }
         if let Some(counts) = adv_runtime::d3d11_variant_counters(ext) {
             fields.push(format!(
                 "\"d3d11_shader_variants\": {{\"hits\": {}, \"misses\": {}, \"last_miss_frame\": {}}}",

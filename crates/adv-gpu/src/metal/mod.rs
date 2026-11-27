@@ -43,7 +43,16 @@ pub(crate) use shader::Shader;
 #[derive(Clone)]
 pub(crate) struct Device(Arc<DeviceState>);
 
+#[cfg(feature = "counters")]
+#[derive(Default)]
+struct ResourceCreations {
+    buffers: std::sync::atomic::AtomicU64,
+    views: std::sync::atomic::AtomicU64,
+}
+
 struct DeviceState {
+    #[cfg(feature = "counters")]
+    creations: Arc<ResourceCreations>,
     raw: Object<dyn MTLDevice>,
     caps: Caps,
     event: Object<dyn MTLSharedEvent>,
@@ -57,6 +66,29 @@ struct DeviceState {
 }
 
 impl Device {
+    #[cfg(feature = "counters")]
+    pub(crate) fn resource_creations(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.0.creations.buffers.load(Relaxed),
+            self.0.creations.views.load(Relaxed),
+        )
+    }
+
+    fn new_buffer(
+        &self,
+        length: usize,
+        options: MTLResourceOptions,
+    ) -> Option<Object<dyn MTLBuffer>> {
+        let buffer = self.0.raw.newBufferWithLength_options(length, options)?;
+        #[cfg(feature = "counters")]
+        self.0
+            .creations
+            .buffers
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(buffer)
+    }
+
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }

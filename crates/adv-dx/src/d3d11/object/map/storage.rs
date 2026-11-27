@@ -117,6 +117,10 @@ impl Layouts {
             .map(|layout| Subresource {
                 layout,
                 dynamic: DynamicResidency::Current,
+                #[cfg(feature = "gpu")]
+                shadow_revision: 0,
+                #[cfg(feature = "gpu")]
+                mapped: false,
                 staging: if coherent(self.resource) {
                     (0..layout.depth).map(|_| Residency::cpu()).collect()
                 } else {
@@ -135,6 +139,10 @@ impl Layouts {
 struct Subresource {
     layout: Layout,
     dynamic: DynamicResidency,
+    #[cfg(feature = "gpu")]
+    shadow_revision: u64,
+    #[cfg(feature = "gpu")]
+    mapped: bool,
     staging: Box<[Residency<u32>]>,
 }
 
@@ -202,7 +210,28 @@ impl Storage {
             }
         }
         entry.dynamic = DynamicResidency::CpuNewer;
+        #[cfg(feature = "gpu")]
+        {
+            entry.shadow_revision += 1;
+            entry.mapped = true;
+        }
         Ok(self.mapped(subresource))
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(in crate::d3d11) fn capture_revision(&self) -> Option<u64> {
+        let entry = &self.subresources[0];
+        (!entry.mapped).then_some(entry.shadow_revision)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(in crate::d3d11) fn unmap_buffer(&mut self) {
+        self.subresources[0].mapped = false;
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(in crate::d3d11) fn shadow_written(&mut self, subresource: u32) {
+        self.subresources[subresource as usize].shadow_revision += 1;
     }
 
     #[cfg(feature = "gpu")]

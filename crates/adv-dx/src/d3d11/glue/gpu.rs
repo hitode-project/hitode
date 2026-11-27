@@ -2,7 +2,7 @@
 use super::*;
 
 mod draw;
-pub(in crate::d3d11) use draw::ShaderVariants;
+pub(in crate::d3d11) use draw::{BufferCaptures, ShaderVariants};
 mod gamma;
 mod queries;
 use crate::d3d11::{
@@ -44,6 +44,10 @@ pub(super) struct Execution {
     other_presentations: Option<u64>,
     #[cfg(feature = "d3d9-counters")]
     variants: std::cell::Cell<VariantCounters>,
+    #[cfg(feature = "d3d9-counters")]
+    captures: std::cell::Cell<CaptureCounters>,
+    #[cfg(feature = "d3d9-counters")]
+    initial_metal_creations: (u64, u64),
 }
 
 impl Execution {
@@ -54,6 +58,8 @@ impl Execution {
 
     pub(super) fn new(gpu: Gpu) -> Self {
         Self {
+            #[cfg(feature = "d3d9-counters")]
+            initial_metal_creations: gpu.device().metal_resource_creations(),
             gpu,
             wake: None,
             events: Vec::new(),
@@ -69,6 +75,8 @@ impl Execution {
             other_presentations: None,
             #[cfg(feature = "d3d9-counters")]
             variants: Default::default(),
+            #[cfg(feature = "d3d9-counters")]
+            captures: Default::default(),
         }
     }
 
@@ -82,6 +90,20 @@ impl Execution {
             counts.last_miss_frame = self.recording.counters.presents + 1;
         }
         self.variants.set(counts);
+    }
+
+    #[cfg(feature = "d3d9-counters")]
+    fn count_capture_bytes(&self, bytes: u64) {
+        let mut counts = self.captures.get();
+        counts.ring_bytes += bytes;
+        self.captures.set(counts);
+    }
+
+    #[cfg(feature = "d3d9-counters")]
+    fn count_capture_reuse(&self) {
+        let mut counts = self.captures.get();
+        counts.captures_reused += 1;
+        self.captures.set(counts);
     }
 
     pub(super) fn fork(&self) -> Result<Gpu, adv_device::gpu::Error> {
@@ -284,6 +306,25 @@ pub fn variant_counters(ext: &Ext) -> Option<VariantCounters> {
 }
 
 #[cfg(feature = "d3d9-counters")]
+#[derive(Clone, Copy, Default)]
+pub struct CaptureCounters {
+    pub ring_bytes: u64,
+    pub captures_reused: u64,
+    pub metal_buffers_created: u64,
+    pub metal_views_created: u64,
+}
+
+#[cfg(feature = "d3d9-counters")]
+pub fn capture_counters(ext: &Ext) -> Option<CaptureCounters> {
+    let execution = ext.try_get::<State>()?.execution.as_ref()?;
+    let mut counters = execution.captures.get();
+    let (buffers, views) = execution.gpu.device().metal_resource_creations();
+    counters.metal_buffers_created = buffers - execution.initial_metal_creations.0;
+    counters.metal_views_created = views - execution.initial_metal_creations.1;
+    Some(counters)
+}
+
+#[cfg(feature = "d3d9-counters")]
 pub fn traffic(ext: &Ext) -> Option<adv_device::gpu::Traffic> {
     Some(ext.try_get::<State>()?.execution.as_ref()?.gpu.traffic())
 }
@@ -398,20 +439,21 @@ fn replace_constants(env: &mut Env<'_>, pointer: u32, window: UniformWindow) {
     }
 }
 
-pub(super) fn unmap_constants(
-    env: &mut Env<'_>,
-    pointer: u32,
-    subresource: u32,
-) -> Result<(), Error> {
+pub(super) fn unmap_buffer(env: &mut Env<'_>, pointer: u32, subresource: u32) -> Result<(), Error> {
     let resource = context::owned(env, pointer).and_then(Object::resource);
     let Some(resource @ Resource::Buffer(buffer)) = resource else {
         return Ok(());
     };
-    if subresource != 0
-        || !resource.bind().contains(Bind::CONSTANT)
-        || resource.usage() != Usage::Dynamic
-        || null_device(env)?
-    {
+    if subresource != 0 || resource.usage() != Usage::Dynamic {
+        return Ok(());
+    }
+    table(env)
+        .get_mut(&mut env.sys.objects, pointer)
+        .unwrap()
+        .mapping()
+        .unwrap()
+        .unmap_buffer();
+    if !resource.bind().contains(Bind::CONSTANT) || null_device(env)? {
         return Ok(());
     }
     let address = table(env)
@@ -1064,6 +1106,7 @@ pub(super) fn write_dynamic(
     env.cpu
         .write(base, bytes)
         .map_err(|_| Error::InvalidArgument)?;
+    shadow.shadow_written(subresource);
     if location.resource.bind().contains(Bind::CONSTANT) {
         let window = execution(env.ext)?.gpu.uniform_window(size[0], |out| {
             out.copy_from_slice(bytes);
@@ -1735,6 +1778,13 @@ pub(super) fn present(
     execution
         .recording
         .presented(key, size, serial, pixels, submitted);
+    ops::object(env, table(env), device)
+        .map_err(error)?
+        .device_state()
+        .unwrap()
+        .captures
+        .borrow_mut()
+        .clear();
     Ok((publish, completed))
 }
 

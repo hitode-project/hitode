@@ -273,14 +273,22 @@ with Direct3D 9. Draws and dispatches retain the selected offset and length
 through GPU completion. A binding shorter than the shader's block uses a
 zero-padded window in that ring.
 
-Direct3D 11 captures the dynamic index window and the vertex and instance windows determined at draw admission. GPU-resident index buffers and indirect arguments with resource bounds stay on the GPU. Expanded indirect draws read arguments at an ordered boundary when one or both dimensions lack a resource bound and report the readback in diagnostic builds.
+Direct3D 11 captures the dynamic index range and the vertex and instance
+ranges determined at draw admission in aligned upload ring windows. A device
+reuses a window for the same shadow revision and byte range until Present.
+Recorded commands and submissions hold their own leases through GPU completion.
+GPU-resident index buffers and indirect arguments with resource bounds stay on
+the GPU. Expanded indirect draws read arguments at an ordered boundary when one
+or both dimensions lack a resource bound and report the readback in diagnostic
+builds.
 
 Direct3D 11 dynamic maps preserve untouched bytes in a fixed guest shadow.
 A GPU write makes that shadow stale, and the next map refreshes it at an
 ordered, counted readback. Maps with a current shadow take constant time.
-Sampling a dynamic texture uploads a newer shadow once and keeps the GPU
-image for subsequent draws. A new shadow upload gives previously recorded
-draws their original image.
+Sampling a GPU-backed dynamic texture records an upload from pooled staging
+memory when the shadow is newer. Uploads update the same GPU image in draw
+order, so earlier draws still read their original contents. Metal keeps native
+views by description for the lifetime of their texture.
 ResolveSubresource requires a default-usage destination.
 
 ### GFX-REC-8 Frontend work counters
@@ -288,7 +296,9 @@ ResolveSubresource requires a default-usage destination.
 **Rule**: Diagnostic counter builds MUST report retained bytes and lookups per draw, entries per successful StateBlock Apply, and dead frame/pass eliminations. They MUST report publication damage, queue submissions, upload and readback bytes, and constant-time maps for front-end comparisons. Ordinary builds MUST compile out work instrumentation.
 **Verification**: Test
 
-The diagnostic Cargo feature is `adv-dx/d3d9-counters`. Retained payloads are counted per command, including shared snapshots; cumulative recorded bytes do not measure resident memory or memory traffic. Recording limits continue to use the logical upload size.
+The diagnostic Cargo feature is `adv-dx/d3d9-counters`. Retained payloads are counted per command, including shared snapshots; cumulative recorded bytes do not measure resident memory or memory traffic. Recording limits continue to use the logical upload size. The D3D11 report
+also counts shadow bytes copied into the ring, captures reused, and Metal buffer
+and view creations on the shared GPU device since D3D11 attachment.
 
 ### GFX-REC-9 Dead target writes
 

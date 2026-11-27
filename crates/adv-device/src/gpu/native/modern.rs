@@ -22,6 +22,7 @@ pub struct BufferRange {
 pub enum StorageBinding {
     Image(ImageView),
     Buffer(BufferRange),
+    Window(BufferWindow),
     ImageAlias(ImageAlias),
 }
 
@@ -213,7 +214,10 @@ impl ModernShader {
                     BindingKind::StorageBuffer { .. } => {
                         match slots.storage.get(i).and_then(Clone::clone) {
                             Some(StorageBinding::Buffer(buffer)) => {
-                                Some(Bound::StorageBuffer(buffer))
+                                Some(Bound::StorageBuffer(buffer.into()))
+                            }
+                            Some(StorageBinding::Window(window)) => {
+                                Some(Bound::StorageBuffer(window))
                             }
                             Some(StorageBinding::ImageAlias(alias)) => {
                                 Some(Bound::ImageAlias(alias))
@@ -337,7 +341,7 @@ enum Bound {
     Uniform(BufferWindow),
     Sampled(ImageView),
     Sampler(Sampler),
-    StorageBuffer(BufferRange),
+    StorageBuffer(BufferWindow),
     StorageImage(ImageView),
     ImageAlias(ImageAlias),
 }
@@ -349,7 +353,7 @@ pub(crate) struct BoundSlot {
 
 impl BoundSlot {
     pub(super) fn retain_uniform(&self, windows: &mut Vec<UniformWindow>) {
-        if let Bound::Uniform(window) = &self.resource {
+        if let Bound::Uniform(window) | Bound::StorageBuffer(window) = &self.resource {
             window.retain(windows);
         }
     }
@@ -359,7 +363,7 @@ impl BoundSlot {
             Bound::Uniform(b) => Bind::Uniform(b.binding()),
             Bound::Sampled(view) => Bind::Sampled(view),
             Bound::Sampler(sampler) => Bind::Sampler(sampler),
-            Bound::StorageBuffer(b) => Bind::StorageBuffer(b.buffer.slice(b.range.clone())),
+            Bound::StorageBuffer(b) => Bind::StorageBuffer(b.binding()),
             Bound::StorageImage(view) => Bind::StorageImage(view),
             Bound::ImageAlias(alias) => Bind::StorageBuffer(
                 alias
@@ -434,7 +438,7 @@ pub struct ModernDraw {
     pub blend_constant: [f32; 4],
     pub depth_bias: [f32; 3],
     pub arguments: DrawArguments,
-    pub index: Option<(BufferRange, IndexFormat)>,
+    pub index: Option<(BufferWindow, IndexFormat)>,
     pub occlusion: Option<QuerySlot>,
     pub predicate: Option<Predicate>,
 }
@@ -675,9 +679,14 @@ pub enum ModernTransfer {
         source: TransferBuffer,
         destination: ImageRegion,
     },
+    UploadStaged {
+        source: super::Staged,
+        rows: u32,
+        destination: ImageRegion,
+    },
     UploadDepthStencil {
-        depth: TransferBuffer,
-        stencil: TransferBuffer,
+        depth: super::Staged,
+        stencil: super::Staged,
         destination: ImageRegion,
     },
     Download {

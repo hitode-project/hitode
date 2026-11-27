@@ -151,7 +151,7 @@ impl Gpu {
             self.stage_bytes(pitch, rows, &data[..pitch as usize * rows as usize])?
         } else {
             let row_pitch = size.width * texture.encoding.pixel_bytes;
-            self.stage_image_bytes(row_pitch, size.height, |out| {
+            self.stage_image_bytes(row_pitch, row_pitch, size.height, |out| {
                 // SAFETY: data includes all compressed blocks in each row, out has
                 // row_pitch * height bytes, and the decoder copies only valid texels.
                 unsafe {

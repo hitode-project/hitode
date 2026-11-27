@@ -69,7 +69,7 @@ pub use modern::{
 };
 pub use record::Readback;
 pub use resources::{Depth, Image, ImageId, Staged, Target};
-pub use uniform::{BufferWindow, UniformWindow};
+pub use uniform::{BufferWindow, CapturedWindow, UniformWindow};
 
 use super::{Error, Rect, Stats};
 
@@ -91,7 +91,7 @@ pub struct Gpu {
     clip: Option<Rect>,
     readbacks: Arc<std::sync::atomic::AtomicUsize>,
     readback_limit: usize,
-    staging: resources::StagingPool,
+    staging: std::cell::RefCell<resources::StagingPool>,
     execution: std::rc::Rc<Execution>,
 }
 

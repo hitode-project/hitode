@@ -15,7 +15,7 @@ pub(super) fn prepare(
     assembly: Assembly,
     width: u32,
     state: &DrawState,
-    indices: BufferRange,
+    indices: adv_device::gpu::BufferWindow,
     arguments: Option<&BufferRange>,
 ) -> Result<(BufferRange, ExpansionPrelude), adv_device::gpu::Error> {
     let table = gpu.expansion_storage(u64::from(1 + state.primitives_per_instance) * 8)?;

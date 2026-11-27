@@ -102,7 +102,7 @@ fn update_dynamic<T: Pod>(
     method(machine, context, 15, &[resource, 0]);
 }
 
-// spec: GFX-INPUT-1 GFX-REC-1 GFX-RES-1
+// spec: GFX-INPUT-1 GFX-REC-1 GFX-REC-7 GFX-RES-1
 #[test]
 fn windows_fill_and_sampling_rows_through_guest_vtables() {
     let mut machine = machine();
@@ -280,16 +280,14 @@ fn windows_fill_and_sampling_rows_through_guest_vtables() {
     for (format, offset) in [(57, 2), (42, 4)] {
         let indices = [0u32, 0, 1, 2, 3, 4, 5, 6];
         let index = buffer(&mut machine, device, Bind::INDEX, 32);
-        if format == 57 {
-            update_dynamic(
-                &mut machine,
-                context,
-                index,
-                &indices.map(|index| index as u16),
-            );
-        } else {
-            update_dynamic(&mut machine, context, index, &indices);
-        }
+        let restore_indices = |machine: &mut Machine<JitCpu>| {
+            if format == 57 {
+                update_dynamic(machine, context, index, &indices.map(|index| index as u16));
+            } else {
+                update_dynamic(machine, context, index, &indices);
+            }
+        };
+        restore_indices(&mut machine);
         assert_eq!(
             method(&mut machine, context, 19, &[index, format, offset]),
             0
@@ -299,8 +297,45 @@ fn windows_fill_and_sampling_rows_through_guest_vtables() {
             method(&mut machine, context, 20, &[6, 2, 1, u32::MAX, 3]),
             0
         );
+        assert_eq!(method(&mut machine, context, 111, &[]), 0);
+        #[cfg(feature = "d3d9-counters")]
+        let before = gpu::capture_counters(&machine.ext).unwrap();
+        assert_eq!(
+            method(&mut machine, context, 20, &[6, 2, 1, u32::MAX, 3]),
+            0
+        );
+        #[cfg(feature = "d3d9-counters")]
+        {
+            let after = gpu::capture_counters(&machine.ext).unwrap();
+            assert_eq!(after.captures_reused - before.captures_reused, 2);
+            assert_eq!(after.ring_bytes, before.ring_bytes);
+        }
         assert_eq!(method(&mut machine, context, 47, &[staging, rt]), 0);
         assert_rows(&mut machine, context, staging, "quad-1-1-5-5", 0);
+
+        let mapped = map(&mut machine, context, index, 5);
+        if format == 57 {
+            write_value(&mut machine, mapped.pData + 2 * offset, [1u16; 6]);
+        } else {
+            write_value(&mut machine, mapped.pData + 2 * offset, [1u32; 6]);
+        }
+        assert_eq!(method(&mut machine, context, 15, &[index, 0]), 0);
+        assert_eq!(method(&mut machine, context, 50, &[rtv, DESCRIPTOR]), 0);
+        assert_eq!(
+            method(&mut machine, context, 20, &[6, 2, 1, u32::MAX, 3]),
+            0
+        );
+        assert_eq!(method(&mut machine, context, 47, &[staging, rt]), 0);
+        let mapped = map(&mut machine, context, staging, 1);
+        assert_eq!(
+            machine
+                .cpu
+                .read_u32(mapped.pData + 2 * mapped.RowPitch + 8)
+                .unwrap(),
+            0
+        );
+        assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
+        restore_indices(&mut machine);
     }
 
     write_value(&mut machine, ARRAY + 8, 0u32);

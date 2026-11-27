@@ -403,6 +403,12 @@ impl State {
         }
         self.poll(consumer)
     }
+    // Submit assigns the completion token to these pending uploads.
+    fn retain_upload(&mut self, staged: super::Staged) {
+        self.uploads.push_back((Token(u64::MAX), staged));
+        self.pending_uploads += 1;
+    }
+
     fn transfer(&mut self, transfer: modern::ModernTransfer) {
         use adv_gpu::encode::{ColorAttachment, DepthAttachment, Load, RenderPassDesc, Store};
         use modern::ModernTransfer::*;
@@ -431,16 +437,32 @@ impl State {
             } => {
                 encoder.copy_buffer_to_image(source.copy(), destination.copy(), destination.extent)
             }
+            UploadStaged {
+                source,
+                rows,
+                destination,
+            } => {
+                encoder.copy_buffer_to_image(
+                    source.copy(rows),
+                    destination.copy(),
+                    destination.extent,
+                );
+                self.retain_upload(source);
+            }
             UploadDepthStencil {
                 depth,
                 stencil,
                 destination,
-            } => encoder.upload_depth_stencil(
-                depth.copy(),
-                stencil.copy(),
-                destination.copy(),
-                destination.extent,
-            ),
+            } => {
+                encoder.upload_depth_stencil(
+                    depth.copy(destination.extent.height),
+                    stencil.copy(destination.extent.height),
+                    destination.copy(),
+                    destination.extent,
+                );
+                self.retain_upload(depth);
+                self.retain_upload(stencil);
+            }
             Download {
                 source,
                 destination,
@@ -600,8 +622,7 @@ impl State {
                     },
                     extent,
                 );
-                self.uploads.push_back((Token(u64::MAX), staged));
-                self.pending_uploads += 1;
+                self.retain_upload(staged);
             }
             Command::ReadImage {
                 image,
@@ -682,9 +703,7 @@ impl State {
                     extent(rect),
                 );
                 if let UploadSource::Staged(staged) = source {
-                    // Submit assigns the completion token to these pending uploads.
-                    self.uploads.push_back((Token(u64::MAX), staged));
-                    self.pending_uploads += 1;
+                    self.retain_upload(staged);
                 }
             }
             Command::Copy {
@@ -825,6 +844,9 @@ impl State {
         let draw = render.draw;
         for binding in render.vertex.iter().chain(&render.fragment) {
             binding.retain_uniform(&mut self.uniforms);
+        }
+        if let Some((index, _)) = &draw.index {
+            index.retain(&mut self.uniforms);
         }
         let predicated = draw
             .predicate
@@ -1192,7 +1214,7 @@ pub(super) fn draw_modern_pass(
         pass.bind(binding.slot, binding.binding());
     }
     if let Some((index, format)) = &draw.index {
-        pass.set_index_buffer(index.buffer.slice(index.range.clone()), *format);
+        pass.set_index_buffer(index.binding(), *format);
     }
     if let Some(query) = &draw.occlusion {
         pass.begin_occlusion(&query.set, query.index);

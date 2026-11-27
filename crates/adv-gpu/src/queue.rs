@@ -59,6 +59,14 @@ impl Device {
     ) -> Result<T> {
         imp::Device::open_with(options, &mut init)
     }
+    #[cfg(feature = "counters")]
+    pub fn metal_resource_creations(&self) -> (u64, u64) {
+        #[cfg(target_vendor = "apple")]
+        return self.inner.resource_creations();
+        #[cfg(not(target_vendor = "apple"))]
+        (0, 0)
+    }
+
     pub fn adapter_identity(&self) -> AdapterIdentity {
         self.inner.adapter_identity()
     }

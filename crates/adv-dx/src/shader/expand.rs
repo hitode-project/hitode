@@ -394,7 +394,7 @@ pub struct Inputs {
     /// Packed source input registers; system values occupy their declared lanes.
     pub vertices: Option<BufferRange>,
     /// One u32 source record index per input primitive vertex.
-    pub indices: Option<BufferRange>,
+    pub indices: Option<BufferWindow>,
     pub vertex: SlotBindings,
     pub geometry: SlotBindings,
     pub hull: SlotBindings,
@@ -768,11 +768,11 @@ pub fn draw_auto(
     Ok((gpu.prepare_dispatch(shader)?, bindings, arguments))
 }
 
-fn bind_storage(slots: &mut SlotBindings, register: u32, buffer: BufferRange) {
+fn bind_storage(slots: &mut SlotBindings, register: u32, buffer: impl Into<BufferWindow>) {
     if slots.storage.len() <= register as usize {
         slots.storage.resize_with(register as usize + 1, || None);
     }
-    slots.storage[register as usize] = Some(StorageBinding::Buffer(buffer));
+    slots.storage[register as usize] = Some(StorageBinding::Window(buffer.into()));
 }
 
 pub(crate) fn bind_draw_state(slots: &mut SlotBindings, uniform: BufferWindow) {

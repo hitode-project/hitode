@@ -1247,7 +1247,7 @@ fn unmap_resource(env: &mut Env<'_>) -> Outcome {
         call(if deferred::current(env).is_some() {
             deferred::unmap_resource(env, resource, subresource)
         } else {
-            gpu::unmap_constants(env, resource, subresource)
+            gpu::unmap_buffer(env, resource, subresource)
         })
     }
     #[cfg(not(feature = "gpu"))]

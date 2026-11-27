@@ -29,14 +29,14 @@ use adv_abi::types::{
     D3D11_RASTERIZER_DESC1, D3D11_SAMPLER_DESC,
 };
 use adv_device::gpu::{
-    DispatchArguments, DrawArguments, ModernColor, ModernDepth, ModernDraw, ModernShader,
-    SlotBindings, StorageBinding,
+    CapturedWindow, DispatchArguments, DrawArguments, ModernColor, ModernDepth, ModernDraw,
+    ModernShader, SlotBindings, StorageBinding,
 };
 use adv_gpu::{
     encode::{IndexFormat, Load, Store},
     pipeline as p, resource as r,
 };
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 #[derive(Clone)]
 enum DrawRange {
@@ -300,8 +300,14 @@ impl IaCapture {
     }
 }
 
+pub(in crate::d3d11) type BufferCaptures =
+    HashMap<(ResourceKey, Range<u32>), (u64, CapturedWindow)>;
+
 struct CapturedIndex {
-    binding: (BufferRange, IndexFormat),
+    binding: (BufferWindow, IndexFormat),
+    storage: BufferWindow,
+    offset: u32,
+    len: u32,
     vertices: Option<Range<u32>>,
 }
 
@@ -339,8 +345,12 @@ fn ensure_index(
     {
         let range =
             binding.offset + vertices.start * stride..binding.offset + vertices.end * stride;
-        let bytes = shadow_bytes(env, binding.buffer, range.clone())?;
-        capture.record(binding.buffer, &range, &bytes);
+        let window = capture_buffer(env, binding.buffer, range, capture)?;
+        let BufferWindow::Captured(captured) = &window else {
+            unreachable!()
+        };
+        // The upload window is an index source and read-only expansion input.
+        let bytes = &unsafe { captured.bytes() }[..vertices.len() * stride as usize];
         let restart = if stride == 2 { 0xffff } else { u32::MAX };
         let mut first = u32::MAX;
         let mut last = 0;
@@ -358,50 +368,37 @@ fn ensure_index(
             }
         }
         *vertices = 0..vertices.len() as u32;
-        let length = bytes.len();
-        let backing = resource::upload(
-            &execution(env.ext)?.gpu,
-            &bytes,
-            BufferUsage::INDEX | BufferUsage::STORAGE,
-            (length as u64).next_multiple_of(4),
-        )?;
-        let range = 0..length as u64;
+        let len = bytes.len() as u32;
         let fetched = if first <= last {
             first..last.saturating_add(1)
         } else {
             0..0
         };
         return Ok(CapturedIndex {
-            binding: (
-                BufferRange {
-                    buffer: backing,
-                    range,
-                },
-                format,
-            ),
+            binding: (window.clone(), format),
+            storage: window,
+            offset: 0,
+            len,
             vertices: Some(fetched),
         });
     }
-    let backing = capture_buffer(
-        env,
-        binding.buffer,
-        BufferUsage::INDEX | BufferUsage::STORAGE,
-        binding.offset..buffer.size(),
-        capture,
-    )?;
-    let native = if capture_shadow {
-        0..u64::from(buffer.size() - binding.offset)
-    } else {
-        u64::from(binding.offset)..u64::from(buffer.size())
+    let window = capture_buffer(env, binding.buffer, binding.offset..buffer.size(), capture)?;
+    let (storage, offset) = match &window {
+        BufferWindow::Native(native) => (
+            BufferRange {
+                buffer: native.buffer.clone(),
+                range: 0..native.buffer.desc().size,
+            }
+            .into(),
+            binding.offset,
+        ),
+        _ => (window.clone(), 0),
     };
     Ok(CapturedIndex {
-        binding: (
-            BufferRange {
-                buffer: backing,
-                range: native,
-            },
-            format,
-        ),
+        binding: (window, format),
+        storage,
+        offset,
+        len: buffer.size() - binding.offset,
         vertices: None,
     })
 }
@@ -410,40 +407,62 @@ fn captures_shadow(env: &Env<'_>, pointer: u32, desc: Resource) -> bool {
     desc.usage() == Usage::Dynamic && !context::owned(env, pointer).unwrap().dynamic_shadow_stale()
 }
 
-fn shadow_bytes(env: &mut Env<'_>, pointer: u32, range: Range<u32>) -> Result<Vec<u8>, Error> {
-    let table = table(env);
-    let object = table.get_mut(&mut env.sys.objects, pointer).unwrap();
-    let base = object.mapping().unwrap().pointer();
-    array(env, base + range.start, range.end - range.start)
-}
-
 fn capture_buffer(
     env: &mut Env<'_>,
     pointer: u32,
-    usage: BufferUsage,
     range: Range<u32>,
     capture: &mut IaCapture,
-) -> Result<adv_gpu::Buffer, Error> {
+) -> Result<BufferWindow, Error> {
     let desc = description(env, pointer)?;
-    let Resource::Buffer(_) = desc else {
+    let Resource::Buffer(buffer) = desc else {
         return Err(Error::InvalidArgument);
     };
     if captures_shadow(env, pointer, desc) {
-        let bytes = shadow_bytes(env, pointer, range.clone())?;
-        capture.record(pointer, &range, &bytes);
-        let size = bytes.len();
-        let buffer = resource::upload(
-            &execution(env.ext)?.gpu,
-            &bytes,
-            usage | BufferUsage::COPY_SRC,
-            (size as u64).max(1).next_multiple_of(4),
-        )?;
-        return Ok(buffer);
+        let shadow = context::owned(env, pointer).unwrap().shadow();
+        let revision = shadow.capture_revision();
+        let address = shadow.pointer() + range.start;
+        let size = range.end - range.start;
+        let key = (key(env, pointer, 0), range);
+        let mut cache = device_state(env)?.captures.borrow_mut();
+        let exec = env
+            .ext
+            .get::<State>()
+            .execution
+            .as_ref()
+            .ok_or(Error::Device)?;
+        let reused = cache
+            .get(&key)
+            .filter(|(version, _)| revision == Some(*version));
+        let window = if let Some((_, window)) = reused {
+            #[cfg(feature = "d3d9-counters")]
+            exec.count_capture_reuse();
+            window.clone()
+        } else {
+            let window = exec.gpu.capture_window(size, |bytes| {
+                env.cpu
+                    .read(address, bytes)
+                    .map_err(|_| Error::InvalidArgument)
+            })?;
+            #[cfg(feature = "d3d9-counters")]
+            exec.count_capture_bytes(u64::from(size));
+            if let Some(revision) = revision {
+                cache.insert(key.clone(), (revision, window.clone()));
+            }
+            window
+        };
+        // IA captures are bound for GPU reads only.
+        let bytes = unsafe { window.bytes() };
+        capture.record(pointer, &key.1, &bytes[..size as usize]);
+        return Ok(BufferWindow::Captured(window));
     }
-    let Backing::Buffer(buffer) = backing(env, pointer, desc)? else {
+    let Backing::Buffer(native) = backing(env, pointer, desc)? else {
         unreachable!()
     };
-    Ok(buffer)
+    Ok(BufferRange {
+        range: u64::from(range.start)..u64::from(buffer.size()).next_multiple_of(4),
+        buffer: native,
+    }
+    .into())
 }
 
 fn vertex_capture(
@@ -502,8 +521,18 @@ fn capture_texture(
             .read(address, output)
             .map_err(|_| Error::InvalidArgument)?;
     }
+    let current = table
+        .get_mut(&mut env.sys.objects, pointer)
+        .unwrap()
+        .backing()
+        .unwrap()
+        .clone();
+    let write = key(env, pointer, 0);
     let execution = execution(env.ext)?;
-    let backing = Backing::new(&execution.gpu, desc)?;
+    let backing = match current {
+        Some(backing) => backing,
+        None => Backing::new(&execution.gpu, desc)?,
+    };
     if let Some(upload) = backing.upload_texture(
         &execution.gpu,
         texture,
@@ -512,7 +541,12 @@ fn capture_texture(
         [width, height, depth],
         &bytes,
     )? {
-        execution.gpu.transfer(upload)?;
+        execution.append(
+            Command::Transfer(upload),
+            extent_rect([width, height, depth]),
+            None,
+            write,
+        )?;
     }
     let object = table.get_mut(&mut env.sys.objects, pointer).unwrap();
     object.take_initial_data();
@@ -1603,18 +1637,24 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     };
     let mut reads = Vec::new();
     let mut capture = IaCapture::default();
-    let (index, vertices) = if indexed {
+    let (index, indices, index_offset, index_len, vertices) = if indexed {
         let strip = matches!(
             topology,
             p::Topology::LineStrip | p::Topology::TriangleStrip
         );
         let index = ensure_index(env, &snapshot, &mut args, strip, &mut capture)?;
         reads.push(key(env, snapshot.ia.indices.buffer, 0));
-        (Some(index.binding), index.vertices)
+        (
+            Some(index.binding),
+            Some(index.storage),
+            index.offset,
+            index.len,
+            index.vertices,
+        )
     } else if let DrawRange::Direct { vertices, .. } = &args {
-        (None, Some(vertices.clone()))
+        (None, None, 0, 0, Some(vertices.clone()))
     } else {
-        (None, None)
+        (None, None, 0, 0, None)
     };
     let (
         vertex_shader,
@@ -1787,9 +1827,9 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                     let (vertices, instances) = if let Some(vertices) = automatic {
                         (*vertices, 1)
                     } else {
-                        let index_extent = index.as_ref().map(|(buffer, format)| {
+                        let index_extent = index.as_ref().map(|(_, format)| {
                             let stride = if *format == IndexFormat::U32 { 4 } else { 2 };
-                            (buffer.range.end - buffer.range.start) as u32 / stride
+                            index_len / stride
                         });
                         let Some(limits) = indirect_bounds(env, &snapshot, &fetches, index_extent)?
                         else {
@@ -1834,9 +1874,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 base_vertex: base_vertex as u32,
                 first_instance,
                 primitives: primitives_per_instance,
-                index_offset: index
-                    .as_ref()
-                    .map_or(0, |(buffer, _)| buffer.range.start as u32),
+                index_offset,
                 count,
                 argument_word: indirect.unwrap_or_default(),
                 instances: instance_count,
@@ -2168,19 +2206,24 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             continue;
         }
         let pointer = snapshot.ia.vertices[stream].buffer;
-        let buffer = capture_buffer(
+        let window = capture_buffer(
             env,
             pointer,
-            BufferUsage::STORAGE,
             captures[stream].clone().unwrap_or(0..0),
             &mut capture,
         )?;
         reads.push(key(env, pointer, 0));
-        let range = 0..buffer.desc().size;
+        let window = match window {
+            BufferWindow::Native(mut native) => {
+                native.range.start = 0;
+                native.into()
+            }
+            captured => captured,
+        };
         set_slot(
             &mut vertex_bindings.storage,
             slot,
-            StorageBinding::Buffer(BufferRange { buffer, range }),
+            StorageBinding::Window(window),
         );
     }
     let (occlusion, statistics) =
@@ -2282,10 +2325,6 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             queries::record_statistics(env, counters, None)?;
         }
     }
-    let indices = index.as_ref().map(|(index, _)| BufferRange {
-        buffer: index.buffer.clone(),
-        range: 0..index.buffer.desc().size,
-    });
     let make_draw = |vertex, viewport, bounds: Rect, occlusion| ModernDraw {
         state_ids: [
             layout,

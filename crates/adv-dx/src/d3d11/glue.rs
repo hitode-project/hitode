@@ -20,9 +20,9 @@ mod dxgi;
 #[cfg(feature = "gpu")]
 mod gpu;
 #[cfg(feature = "gpu")]
-pub(super) use gpu::ShaderVariants;
+pub(super) use gpu::{BufferCaptures, ShaderVariants};
 #[cfg(all(feature = "gpu", feature = "d3d9-counters"))]
-pub use gpu::{frame_counters, traffic, variant_counters};
+pub use gpu::{capture_counters, frame_counters, traffic, variant_counters};
 mod linkage;
 
 const DLL: &str = "d3d11.dll";

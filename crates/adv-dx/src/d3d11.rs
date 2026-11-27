@@ -24,4 +24,4 @@ pub use glue::{
 };
 
 #[cfg(all(feature = "gpu", feature = "d3d9-counters"))]
-pub use glue::{frame_counters, traffic, variant_counters};
+pub use glue::{capture_counters, frame_counters, traffic, variant_counters};

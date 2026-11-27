@@ -359,6 +359,15 @@ pub struct Staged {
     len: u32,
 }
 impl Staged {
+    pub(super) fn copy(&self, rows: u32) -> adv_gpu::encode::BufferCopy<'_> {
+        adv_gpu::encode::BufferCopy {
+            buffer: self.buffer(),
+            offset: 0,
+            row_pitch: self.pitch,
+            rows,
+        }
+    }
+
     pub fn pitch(&self) -> u32 {
         self.pitch
     }
@@ -498,20 +507,22 @@ impl Gpu {
     pub fn stores(&self, texel: TexelFormat) -> bool {
         stores(&self.device, texel)
     }
-    fn take_stage(
-        &mut self,
-        row_bytes: u32,
-        rows: u32,
-    ) -> Result<(Arc<adv_gpu::Buffer>, u32), Error> {
+    fn take_stage(&self, row_bytes: u32, rows: u32) -> Result<(Arc<adv_gpu::Buffer>, u32), Error> {
         self.check()?;
         let size = row_bytes
             .checked_mul(rows)
             .filter(|_| row_bytes != 0 && rows != 0)
             .ok_or_else(|| Error::Invalid("staged upload size".into()))?;
-        Ok((self.staging.take(&self.device, u64::from(size))?, size))
+        Ok((
+            self.staging
+                .borrow_mut()
+                .take(&self.device, u64::from(size))?,
+            size,
+        ))
     }
-    pub(super) fn stage_image_bytes(
-        &mut self,
+    pub fn stage_image_bytes(
+        &self,
+        row_bytes: u32,
         pitch: u32,
         rows: u32,
         fill: impl FnOnce(&mut [u8]),
@@ -520,7 +531,9 @@ impl Gpu {
         // SAFETY: the staging allocation has no GPU users or other writers.
         fill(unsafe { &mut buffer.mapped().unwrap().as_mut()[..len as usize] });
         #[cfg(feature = "graphics-counters")]
-        self.count_upload(u64::from(len));
+        self.count_upload(u64::from(row_bytes) * u64::from(rows));
+        #[cfg(not(feature = "graphics-counters"))]
+        let _ = row_bytes;
         Ok(Staged { buffer, pitch, len })
     }
 
@@ -1253,10 +1266,10 @@ pub(super) mod tests {
         std::thread::spawn(move || drop(held)).join().unwrap();
         assert_eq!(Arc::as_ptr(&stage(&mut gpu, 5).buffer), medium_id);
         drop(small);
-        assert_eq!(gpu.staging.0.len(), 4);
+        assert_eq!(gpu.staging.borrow().0.len(), 4);
         // A request past the budget trims every idle buffer first.
         let above_budget = stage(&mut gpu, FREE_STAGING_BYTES as u32);
-        assert_eq!(gpu.staging.0.len(), 1);
+        assert_eq!(gpu.staging.borrow().0.len(), 1);
         drop(above_budget);
     }
     // spec: GFX-SAMPLER-4
