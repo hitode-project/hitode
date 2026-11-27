@@ -159,10 +159,14 @@ impl Kind {
         const RESOURCE: &[Iid] = &[IID_ID3D11DEVICECHILD, IID_ID3D11RESOURCE];
         const VIEW: &[Iid] = &[IID_ID3D11DEVICECHILD, IID_ID3D11VIEW];
         match self {
-            Self::Device(_) => (IID_ID3D11DEVICE1, &[IID_ID3D11DEVICE]),
+            Self::Device(_) => (IID_ID3D11DEVICE2, &[IID_ID3D11DEVICE, IID_ID3D11DEVICE1]),
             Self::Context(_) => (
-                IID_ID3D11DEVICECONTEXT1,
-                &[IID_ID3D11DEVICECONTEXT, IID_ID3D11DEVICECHILD],
+                IID_ID3D11DEVICECONTEXT2,
+                &[
+                    IID_ID3D11DEVICECONTEXT,
+                    IID_ID3D11DEVICECONTEXT1,
+                    IID_ID3D11DEVICECHILD,
+                ],
             ),
             Self::ContextState(_) => (IID_ID3DDEVICECONTEXTSTATE, DEVICE_CHILD),
             Self::CommandList(_) => (IID_ID3D11COMMANDLIST, DEVICE_CHILD),

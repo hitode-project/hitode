@@ -308,7 +308,6 @@ fn target_profiles_apply_the_production_format_paths() {
                 (caps, samples)
             })
     };
-    let requirements = requirements();
     let derive = |caps: &Caps| {
         let production = format::production(caps);
         let formats = production
@@ -316,10 +315,8 @@ fn target_profiles_apply_the_production_format_paths() {
             .map(|format| format.path())
             .collect::<Vec<_>>();
         let coverage = Coverage {
-            requirements: &requirements,
-            emulated: EMULATED,
-            features: FEATURES,
             formats: &formats,
+            ..Coverage::production()
         };
         Report::derive(caps, coverage)
     };

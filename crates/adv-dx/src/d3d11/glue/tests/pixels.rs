@@ -726,7 +726,8 @@ fn guest_swap_chain_presents_the_back_buffer_and_resizes_after_release() {
                 minimized: false,
             })
         },
-        |_, _, _| Ok(()),
+        |env, _, _, then| then(env, adv_machine::Resume::Returned(1)),
+        None,
     );
 
     let swap_output = OUT + 32;
@@ -1222,7 +1223,8 @@ fn alt_enter_respects_window_association_and_toggles_exclusive_mode() {
                 minimized: false,
             })
         },
-        |_, _, _| Ok(()),
+        |env, _, _, then| then(env, adv_machine::Resume::Returned(1)),
+        None,
     );
     write_value(
         &mut machine,
@@ -1317,7 +1319,8 @@ fn presented_device(
                 minimized: false,
             })
         },
-        |_, _, _| Ok(()),
+        |env, _, _, then| then(env, adv_machine::Resume::Returned(1)),
+        None,
     );
     write_value(
         machine,

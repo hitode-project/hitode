@@ -19,7 +19,7 @@ use adv_gpu::{
     Buffer, Extent, ImageView,
     resource::{BufferDesc, BufferUsage, Memory},
 };
-use adv_machine::Ext;
+use adv_machine::{Ext, Object as WaitObject, Wait};
 pub(super) use draw::{
     dispatch, dispatch_indirect, draw, draw_auto, draw_indexed, draw_indexed_indirect,
     draw_indexed_instanced, draw_indirect, draw_instanced,
@@ -29,10 +29,14 @@ use std::sync::{Arc, mpsc::TryRecvError};
 
 pub(super) struct Execution {
     gpu: Gpu,
+    pub(super) wake: Option<adv_sync::WakeEvent>,
+    events: Vec<(u32, std::sync::mpsc::Receiver<()>)>,
+    present_waits: Vec<PresentWait>,
     pub(super) recording: Recording,
     active_queries: BTreeMap<(u64, u64), u32>,
     zero_constants: Option<UniformWindow>,
-    present_target: Option<adv_device::gpu::Image>,
+    present_target: Option<adv_device::gpu::Target>,
+    present_surface: Option<(u32, u32)>,
     present_gamma: Option<u64>,
     gamma: Option<(u64, gamma::Pass)>,
     verify_frames: bool,
@@ -48,15 +52,69 @@ impl Execution {
     pub(super) fn new(gpu: Gpu) -> Self {
         Self {
             gpu,
+            wake: None,
+            events: Vec::new(),
+            present_waits: Vec::new(),
             recording: Recording::default(),
             active_queries: BTreeMap::new(),
             zero_constants: None,
             present_target: None,
+            present_surface: None,
             present_gamma: None,
             gamma: None,
             verify_frames: std::env::var("ADV_VERIFY_FRAMES").as_deref() == Ok("1"),
             other_presentations: None,
         }
+    }
+
+    pub(super) fn fork(&self) -> Result<Gpu, adv_device::gpu::Error> {
+        self.gpu.fork_front()
+    }
+
+    pub(super) fn poll(&self) -> Result<(), adv_device::gpu::Error> {
+        self.gpu.poll()
+    }
+
+    pub(super) fn completed_events(&mut self) -> Vec<u32> {
+        let mut ready = Vec::new();
+        self.events
+            .retain(|(event, completion)| match completion.try_recv() {
+                Ok(()) => {
+                    ready.push(*event);
+                    false
+                }
+                Err(TryRecvError::Empty) => true,
+                Err(TryRecvError::Disconnected) => false,
+            });
+        ready
+    }
+
+    pub(super) fn trim(&mut self) {
+        self.zero_constants = None;
+    }
+
+    pub(super) fn wake_presents(&mut self, sys: &mut adv_machine::Sys) -> bool {
+        let Some(wake) = &self.wake else {
+            return false;
+        };
+        let generation = wake.generation();
+        let mut progress = false;
+        self.present_waits.retain_mut(|wait| {
+            if sys
+                .contexts
+                .get(wait.context as usize)
+                .is_none_or(|context| context.is_done())
+            {
+                sys.objects.close(wait.event);
+                return false;
+            }
+            if wait.generation.is_some_and(|last| last != generation) {
+                wait.generation = None;
+                progress |= sys.set_event(wait.event);
+            }
+            true
+        });
+        progress
     }
 
     fn append(
@@ -97,6 +155,76 @@ impl Execution {
     fn barrier(&mut self, reason: Boundary) -> Result<(), Error> {
         self.recording.flush(&mut self.gpu, reason)?;
         Ok(())
+    }
+}
+
+struct PresentWait {
+    context: adv_machine::CtxId,
+    event: u32,
+    generation: Option<u64>,
+}
+
+pub(super) fn wait_for_present(
+    env: &mut Env<'_>,
+    generation: u64,
+    then: adv_machine::Continuation,
+) -> Outcome {
+    let event = env.sys.objects.insert(WaitObject::Event {
+        manual_reset: true,
+        signaled: false,
+    });
+    if event == 0 {
+        return Outcome::Return(crate::dxgi::Error::OutOfMemory.hresult());
+    }
+    env.ext
+        .get_mut::<State>()
+        .execution
+        .as_mut()
+        .unwrap()
+        .present_waits
+        .push(PresentWait {
+            context: env.context,
+            event,
+            generation: Some(generation),
+        });
+    Outcome::block(
+        Wait::Object {
+            handle: event,
+            deadline: None,
+        },
+        move |env, result| {
+            env.sys.objects.close(event);
+            env.ext
+                .get_mut::<State>()
+                .execution
+                .as_mut()
+                .unwrap()
+                .present_waits
+                .retain(|wait| wait.event != event);
+            then(env, result)
+        },
+    )
+}
+
+pub(super) fn enqueue_event(ext: &mut Ext, event: u32) -> Result<(), Error> {
+    let execution = execution(ext)?;
+    execution.recording.submit(&mut execution.gpu)?;
+    let completion = execution.gpu.completion_with_wake(execution.wake.clone())?;
+    execution.events.push((event, completion));
+    Ok(())
+}
+
+pub(super) fn release_presentation(ext: &mut Ext, pointer: u32) {
+    let Ok(execution) = execution(ext) else {
+        return;
+    };
+    if let Some((resource, id)) = execution.present_surface
+        && resource == pointer
+    {
+        execution.present_surface = None;
+        execution.present_target = None;
+        ext.get_mut::<adv_device::surface::SurfaceStore>()
+            .delete(id);
     }
 }
 
@@ -1408,7 +1536,7 @@ pub(super) fn present(
     source: [u32; 2],
     serial: u64,
     first: bool,
-) -> Result<bool, adv_device::gpu::Error> {
+) -> Result<(bool, Option<u64>), adv_device::gpu::Error> {
     use adv_device::gpu::{Error as GpuError, Filter, Image};
     use adv_device::surface::SurfaceStore;
     let error = |error: Error| GpuError::Device(format!("D3D11 present: {:#x}", error.hresult()));
@@ -1440,7 +1568,21 @@ pub(super) fn present(
                 .is_none_or(|(old, pass)| old != revision || pass.size() != size)
         })
         .map(|(_, curve)| *curve);
-    let execution = execution(env.ext).map_err(error)?;
+    let shared = env
+        .ext
+        .get::<crate::dxgi::swap::Services>()
+        .completed
+        .is_some();
+    let (state, mut store) = if shared {
+        let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
+        (state, Some(store))
+    } else {
+        (env.ext.get_mut::<State>(), None)
+    };
+    let execution = state
+        .execution
+        .as_mut()
+        .ok_or_else(|| error(Error::Device))?;
     let damage = if first
         || execution.other_presentations != other_presentations
         || execution.present_gamma != revision
@@ -1463,8 +1605,9 @@ pub(super) fn present(
     let target = execution
         .present_target
         .as_ref()
-        .filter(|image| (image.width(), image.height()) == size)
+        .filter(|target| (target.image.width(), target.image.height()) == size)
         .cloned();
+    let new_target = target.is_none();
     let (target, submitted) = execution.gpu.with_nonblocking_admission(|gpu| {
         let commands = execution.recording.submit(gpu)?;
         if !publish && !execution.verify_frames {
@@ -1489,7 +1632,7 @@ pub(super) fn present(
         }
         let target = match target {
             Some(target) => target,
-            None => gpu.presentation_target(size.0, size.1, false)?.image,
+            None => gpu.presentation_target(size.0, size.1, false)?,
         };
         let copies = if execution.verify_frames {
             vec![extent_rect([size.0, size.1, 1]).into()]
@@ -1503,32 +1646,62 @@ pub(super) fn present(
             Image::from_native(image)
         };
         for rect in copies {
-            gpu.blit(&source, rect.into(), &target, rect.into(), Filter::Nearest)?;
+            gpu.blit(
+                &source,
+                rect.into(),
+                &target.image,
+                rect.into(),
+                Filter::Nearest,
+            )?;
         }
         if execution.verify_frames {
             let changed = damage.clone().unwrap_or_else(|| Region::empty(size));
-            execution.recording.verify(gpu, &target, changed)?;
-        }
-        if let Some(damage) = damage {
-            gpu.present_admitted(
-                &target,
-                damage,
-                serial,
-                std::sync::Arc::new([]),
-                std::sync::Arc::new([]),
-            );
+            execution
+                .recording
+                .verify(gpu, &target.image, changed, execution.wake.clone())?;
         }
         Ok((Some(target), true))
     })?;
+    let gpu = &mut execution.gpu;
+    let completed = if let Some(damage) = damage {
+        let target = target.as_ref().unwrap();
+        if let Some(store) = &mut store {
+            let id = if let Some((_, id)) = execution.present_surface {
+                if new_target {
+                    store
+                        .replace_native(id, target.clone())
+                        .map_err(GpuError::Invalid)?;
+                }
+                id
+            } else {
+                store
+                    .insert_native(target.clone())
+                    .map_err(GpuError::Invalid)?
+            };
+            gpu.with_nonblocking_admission(|gpu| store.present_native(id, Some(damage), gpu))
+                .map_err(GpuError::Invalid)?;
+            execution.present_surface = Some((pointer, id));
+            Some(store.stats.presentations)
+        } else {
+            gpu.present_admitted(&target.image, damage, serial, Arc::new([]), Arc::new([]));
+            None
+        }
+    } else if let Some(store) = &mut store {
+        let (_, id) = execution.present_surface.unwrap();
+        Some(store.repeat_native_frame(id)?)
+    } else {
+        None
+    };
     if let Some(target) = target {
         execution.present_target = Some(target);
-        execution.other_presentations = other_presentations;
         execution.present_gamma = revision;
     }
+    execution.other_presentations = completed.or(other_presentations);
+    let serial = completed.unwrap_or(serial);
     execution
         .recording
         .presented(key, size, serial, pixels, submitted);
-    Ok(publish)
+    Ok((publish, completed))
 }
 
 pub(super) fn capture(ext: &mut Ext) -> Result<adv_device::frame::Waker, Error> {

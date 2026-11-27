@@ -60,10 +60,14 @@ impl Recording {
                 h: 1,
             },
         });
-        Ok(Self {
+        Ok(Self::with_white(white))
+    }
+
+    fn with_white(white: Image) -> Self {
+        Self {
             white,
             samplers: HashMap::new(),
-        })
+        }
     }
 }
 
@@ -186,6 +190,7 @@ type FacadeInitReply = Result<(PipelineJobs, gpu::compile::CompileCounters), Err
 pub(super) enum WorkerItem {
     CreateFacade {
         id: u64,
+        shared_white: Option<u64>,
         failure: Arc<Mutex<Option<Error>>>,
         reply: mpsc::SyncSender<FacadeInitReply>,
     },
@@ -491,10 +496,19 @@ impl WorkerHandle {
     pub(super) fn create_facade(
         &self,
         failure: Arc<Mutex<Option<Error>>>,
+        shared_white: Option<u64>,
     ) -> Result<(u64, PipelineJobs, gpu::compile::CompileCounters), Error> {
         let id = self.next_facade.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = mpsc::sync_channel(1);
-        self.push_boundary(WorkerItem::CreateFacade { id, failure, reply }, 0);
+        self.push_boundary(
+            WorkerItem::CreateFacade {
+                id,
+                shared_white,
+                failure,
+                reply,
+            },
+            0,
+        );
         let (jobs, counters) = rx
             .recv()
             .map_err(|_| Error::Device("adv-gfx-worker stopped".into()))??;
@@ -840,8 +854,19 @@ impl WorkerState {
 
     fn execute(&mut self, item: WorkerItem) -> Result<(), (u64, Error)> {
         match item {
-            WorkerItem::CreateFacade { id, failure, reply } => {
-                let result = Recording::new(&self.device, &mut self.stream).map(|recording| {
+            WorkerItem::CreateFacade {
+                id,
+                shared_white,
+                failure,
+                reply,
+            } => {
+                let recording = match shared_white {
+                    Some(source) => Ok(Recording::with_white(
+                        self.facades[&source].recording.white.clone(),
+                    )),
+                    None => Recording::new(&self.device, &mut self.stream),
+                };
+                let result = recording.map(|recording| {
                     let pipelines = Pipelines::default();
                     let jobs = pipelines.jobs();
                     let counters = pipelines.counters();

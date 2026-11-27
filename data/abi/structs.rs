@@ -2741,6 +2741,27 @@ impl crate::GuestArg for D3D11_MAPPED_SUBRESOURCE {
     const WORDS: u8 = 3;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3D11_PACKED_MIP_DESC {
+    pub NumStandardMips: u8,
+    pub NumPackedMips: u8,
+    pub _padding0: [u8; 2],
+    pub NumTilesForPackedMips: u32,
+    pub StartTileIndexInOverallResource: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3D11_PACKED_MIP_DESC>() == 12);
+const _: () = assert!(core::mem::align_of::<D3D11_PACKED_MIP_DESC>() == 4);
+impl Default for D3D11_PACKED_MIP_DESC { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(D3D11_PACKED_MIP_DESC, NumStandardMips) == 0);
+const _: () = assert!(core::mem::offset_of!(D3D11_PACKED_MIP_DESC, NumPackedMips) == 1);
+const _: () = assert!(core::mem::offset_of!(D3D11_PACKED_MIP_DESC, NumTilesForPackedMips) == 4);
+const _: () = assert!(core::mem::offset_of!(D3D11_PACKED_MIP_DESC, StartTileIndexInOverallResource) == 8);
+impl crate::GuestArg for D3D11_PACKED_MIP_DESC {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 3;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
 #[repr(C, align(8))]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3D11_QUERY_DATA_PIPELINE_STATISTICS {
@@ -3059,6 +3080,26 @@ const _: () = assert!(core::mem::offset_of!(D3D11_SUBRESOURCE_DATA, pSysMem) == 
 const _: () = assert!(core::mem::offset_of!(D3D11_SUBRESOURCE_DATA, SysMemPitch) == 4);
 const _: () = assert!(core::mem::offset_of!(D3D11_SUBRESOURCE_DATA, SysMemSlicePitch) == 8);
 impl crate::GuestArg for D3D11_SUBRESOURCE_DATA {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 3;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3D11_SUBRESOURCE_TILING {
+    pub WidthInTiles: u32,
+    pub HeightInTiles: u16,
+    pub DepthInTiles: u16,
+    pub StartTileIndexInOverallResource: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3D11_SUBRESOURCE_TILING>() == 12);
+const _: () = assert!(core::mem::align_of::<D3D11_SUBRESOURCE_TILING>() == 4);
+impl Default for D3D11_SUBRESOURCE_TILING { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(D3D11_SUBRESOURCE_TILING, WidthInTiles) == 0);
+const _: () = assert!(core::mem::offset_of!(D3D11_SUBRESOURCE_TILING, HeightInTiles) == 4);
+const _: () = assert!(core::mem::offset_of!(D3D11_SUBRESOURCE_TILING, DepthInTiles) == 6);
+const _: () = assert!(core::mem::offset_of!(D3D11_SUBRESOURCE_TILING, StartTileIndexInOverallResource) == 8);
+impl crate::GuestArg for D3D11_SUBRESOURCE_TILING {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 3;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
@@ -3593,6 +3634,66 @@ const _: () = assert!(core::mem::offset_of!(D3D11_TEXTURE3D_DESC, MiscFlags) == 
 impl crate::GuestArg for D3D11_TEXTURE3D_DESC {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 9;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3D11_TILED_RESOURCE_COORDINATE {
+    pub X: u32,
+    pub Y: u32,
+    pub Z: u32,
+    pub Subresource: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3D11_TILED_RESOURCE_COORDINATE>() == 16);
+const _: () = assert!(core::mem::align_of::<D3D11_TILED_RESOURCE_COORDINATE>() == 4);
+impl Default for D3D11_TILED_RESOURCE_COORDINATE { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(D3D11_TILED_RESOURCE_COORDINATE, X) == 0);
+const _: () = assert!(core::mem::offset_of!(D3D11_TILED_RESOURCE_COORDINATE, Y) == 4);
+const _: () = assert!(core::mem::offset_of!(D3D11_TILED_RESOURCE_COORDINATE, Z) == 8);
+const _: () = assert!(core::mem::offset_of!(D3D11_TILED_RESOURCE_COORDINATE, Subresource) == 12);
+impl crate::GuestArg for D3D11_TILED_RESOURCE_COORDINATE {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 4;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3D11_TILE_REGION_SIZE {
+    pub NumTiles: u32,
+    pub bUseBox: i32,
+    pub Width: u32,
+    pub Height: u16,
+    pub Depth: u16,
+}
+const _: () = assert!(core::mem::size_of::<D3D11_TILE_REGION_SIZE>() == 16);
+const _: () = assert!(core::mem::align_of::<D3D11_TILE_REGION_SIZE>() == 4);
+impl Default for D3D11_TILE_REGION_SIZE { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(D3D11_TILE_REGION_SIZE, NumTiles) == 0);
+const _: () = assert!(core::mem::offset_of!(D3D11_TILE_REGION_SIZE, bUseBox) == 4);
+const _: () = assert!(core::mem::offset_of!(D3D11_TILE_REGION_SIZE, Width) == 8);
+const _: () = assert!(core::mem::offset_of!(D3D11_TILE_REGION_SIZE, Height) == 12);
+const _: () = assert!(core::mem::offset_of!(D3D11_TILE_REGION_SIZE, Depth) == 14);
+impl crate::GuestArg for D3D11_TILE_REGION_SIZE {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 4;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct D3D11_TILE_SHAPE {
+    pub WidthInTexels: u32,
+    pub HeightInTexels: u32,
+    pub DepthInTexels: u32,
+}
+const _: () = assert!(core::mem::size_of::<D3D11_TILE_SHAPE>() == 12);
+const _: () = assert!(core::mem::align_of::<D3D11_TILE_SHAPE>() == 4);
+impl Default for D3D11_TILE_SHAPE { fn default() -> Self { <Self as bytemuck::Zeroable>::zeroed() } }
+const _: () = assert!(core::mem::offset_of!(D3D11_TILE_SHAPE, WidthInTexels) == 0);
+const _: () = assert!(core::mem::offset_of!(D3D11_TILE_SHAPE, HeightInTexels) == 4);
+const _: () = assert!(core::mem::offset_of!(D3D11_TILE_SHAPE, DepthInTexels) == 8);
+impl crate::GuestArg for D3D11_TILE_SHAPE {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 3;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
 #[repr(C, align(4))]

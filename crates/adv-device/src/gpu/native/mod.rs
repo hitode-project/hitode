@@ -193,21 +193,29 @@ impl Gpu {
             *cached.borrow_mut() = std::rc::Rc::downgrade(&execution);
             Ok(execution)
         })?;
-        Self::facade(execution)
+        Self::facade(execution, None)
     }
     /// Another facade on this execution, for a child process that the
     /// session drives on the same thread. Its commands share the device,
     /// worker, stream and owner; pipelines, recording state and staging start fresh.
     pub fn fork(&self) -> Result<Self, Error> {
         self.check()?;
-        Self::facade(self.execution.clone())
+        Self::facade(self.execution.clone(), None)
     }
-    fn facade(execution: std::rc::Rc<Execution>) -> Result<Self, Error> {
+
+    /// Another API front on the same worker, sharing its immutable fallback texture.
+    pub fn fork_front(&self) -> Result<Self, Error> {
+        self.check()?;
+        Self::facade(self.execution.clone(), Some(self.facade_id))
+    }
+
+    fn facade(execution: std::rc::Rc<Execution>, shared_white: Option<u64>) -> Result<Self, Error> {
         let device = execution.device.clone();
         let stream = execution.stream.clone();
         let failure = Arc::new(std::sync::Mutex::new(None));
-        let (facade_id, pipeline_jobs, pipeline_counters) =
-            execution.worker.create_facade(failure.clone())?;
+        let (facade_id, pipeline_jobs, pipeline_counters) = execution
+            .worker
+            .create_facade(failure.clone(), shared_white)?;
         Ok(Self {
             device,
             stream,

@@ -15,8 +15,8 @@ use deferred::{execute_list, finish_list, get_context_flags, get_type, swap_stat
 
 macro_rules! methods {
     ($($method:ident => $handler:ident $level:ident),+ $(,)?) => {
-        ("ID3D11DeviceContext1", &[
-            $((concat!("ID3D11DeviceContext1::", stringify!($method)), $handler, ImplementationLevel::$level)),+
+        ("ID3D11DeviceContext2", &[
+            $((concat!("ID3D11DeviceContext2::", stringify!($method)), $handler, ImplementationLevel::$level)),+
         ])
     };
 }
@@ -156,7 +156,25 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     SwapDeviceContextState => swap_state Implement,
     ClearView => clear_view Implement,
     DiscardView1 => discard State,
+    UpdateTileMappings => invalid_tile_operation Implement,
+    CopyTileMappings => invalid_tile_operation Implement,
+    CopyTiles => no_effect State,
+    UpdateTiles => no_effect State,
+    ResizeTilePool => invalid_tile_operation Implement,
+    TiledResourceBarrier => no_effect State,
+    IsAnnotationEnabled => no_effect State,
+    SetMarkerInt => no_effect State,
+    BeginEventInt => no_effect State,
+    EndEvent => no_effect State,
 );
+
+fn invalid_tile_operation(_: &mut Env<'_>) -> Outcome {
+    Outcome::Return(Error::InvalidArgument.hresult())
+}
+
+fn no_effect(_: &mut Env<'_>) -> Outcome {
+    Outcome::Return(0)
+}
 
 macro_rules! stage_methods {
     ($stage:ident, $($name:ident => $method:ident),+ $(,)?) => {

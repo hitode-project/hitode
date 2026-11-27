@@ -14,6 +14,8 @@ pub mod swap;
 
 #[cfg(feature = "gpu")]
 pub(crate) use glue::output::gamma as output_gamma;
+#[cfg(feature = "gpu")]
+pub(crate) use glue::set_adapter;
 pub use glue::{
     adapter_kind, create_device_adapter, create_device_factory, install, query_adapter, register,
 };

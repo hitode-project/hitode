@@ -220,6 +220,7 @@ impl Recording {
         gpu: &mut Gpu,
         image: &Image,
         damage: Region,
+        wake: Option<adv_sync::WakeEvent>,
     ) -> Result<(), Error> {
         let history = self
             .verification
@@ -260,6 +261,9 @@ impl Recording {
                         log::warn!("D3D11 frame verification readback failed: {error}");
                     }
                 }
+            }
+            if let Some(wake) = wake {
+                wake.signal();
             }
         })?;
         self.verification_serial += 1;

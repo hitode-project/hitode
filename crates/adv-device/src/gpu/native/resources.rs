@@ -763,7 +763,7 @@ pub(super) mod tests {
             #[cfg(feature = "test-support")]
             capture: Default::default(),
         });
-        let gpu = Gpu::facade(execution).unwrap();
+        let gpu = Gpu::facade(execution, None).unwrap();
         Some((gpu, queue, consumer))
     }
     pub(in crate::gpu::native) fn upload_chunk(

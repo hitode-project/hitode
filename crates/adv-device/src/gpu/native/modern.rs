@@ -723,13 +723,20 @@ impl Gpu {
     }
 
     pub fn completion(&self) -> Result<std::sync::mpsc::Receiver<()>, Error> {
+        self.completion_with_wake(None)
+    }
+
+    pub fn completion_with_wake(
+        &self,
+        wake: Option<adv_sync::WakeEvent>,
+    ) -> Result<std::sync::mpsc::Receiver<()>, Error> {
         let (send, receive) = std::sync::mpsc::channel();
         self.check()?;
         self.execution.worker.admit_cmd(0, self.wake.get())?;
         self.execution.worker.push_boundary(
             super::record::WorkerItem::TransferImage {
                 facade: self.facade_id,
-                command: Box::new(super::stream::Command::Complete(send)),
+                command: Box::new(super::stream::Command::Complete(send, wake)),
             },
             0,
         );

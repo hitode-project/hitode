@@ -1,6 +1,6 @@
 //! Assembly of the graphics fronts on the Wine userland. Wine's loader maps
-//! their PE images over the process surface store. DirectDraw and Direct3D 9
-//! also supply memory DCs that Wine's GDI draws into.
+//! their PE images over the process surface store. DirectDraw, Direct3D 9,
+//! and DXGI surfaces use memory DCs that Wine's GDI draws into.
 //!
 //! A surface's DC comes from `D3DKMTCreateDCFromMemory` over the surface's
 //! own pixels, called through the IAT of the front's image so that a guest
@@ -53,6 +53,8 @@ const DDRAW: usize = 0;
 const D3D9: usize = 1;
 #[cfg(feature = "gpu")]
 const DXGI: usize = 2;
+#[cfg(feature = "gpu")]
+const D3D11: usize = 3;
 const GDI32: &str = "gdi32.dll";
 const DDRAW_EXPORTS: [&str; 7] = [
     "DirectDrawCreate",
@@ -194,6 +196,34 @@ fn install_modern_graphics<B: Backend>(
         },
     )?;
     adv_dx::d3d11::install_children(machine)?;
+    adv_dx::d3d11::configure_swap_chains(
+        machine,
+        adv_nt::kuser::BUILD_NUMBER,
+        |ext, _, hwnd| {
+            let window = adv_drv::user::window(ext, hwnd)?;
+            let [left, top, right, bottom] = window.client;
+            Some(adv_dx::dxgi::swap::Window {
+                client: [(right - left).max(0) as u32, (bottom - top).max(0) as u32],
+                minimized: window.minimized(),
+            })
+        },
+        |env, hwnd, mode, then| {
+            adv_drv::user::resize_client(env, hwnd, [mode.Width, mode.Height], then)
+        },
+        Some(|env, hwnd, serial| {
+            if let Some(id) = env.ext.get::<Surfaces<Snapshot>>().base_source() {
+                adv_drv::user::input::front_frame(env.ext, hwnd, id);
+            }
+            frame_completed(env, serial)
+        }),
+    );
+    adv_dx::d3d11::configure_surface_dc(machine, memory_dc::<D3D11>());
+    adv_dx::d3d11::configure_event_signal(machine, |env, event| {
+        matches!(
+            adv_nt::sync::set_event(env, &[event, 0]),
+            Outcome::Return(0)
+        )
+    });
     static EXPORTS: std::sync::OnceLock<Vec<Vec<(String, u16)>>> = std::sync::OnceLock::new();
     let exports = EXPORTS.get_or_init(|| {
         let mut registry = Registry::default();
@@ -204,7 +234,7 @@ fn install_modern_graphics<B: Backend>(
             .map(|module| graphics_exports(&registry, module))
             .collect()
     });
-    for (&module, exports) in IMAGES[DXGI..].iter().zip(exports) {
+    for (index, (&module, exports)) in IMAGES[DXGI..].iter().zip(exports).enumerate() {
         let exports: Vec<_> = exports
             .iter()
             .map(|(name, ordinal)| Export {
@@ -212,7 +242,12 @@ fn install_modern_graphics<B: Backend>(
                 ordinal: *ordinal,
             })
             .collect();
-        let built = ModuleImage::build(machine, module, &exports, &[])?;
+        let imports = if DXGI + index == D3D11 {
+            vec![gdi_imports()]
+        } else {
+            Vec::new()
+        };
+        let built = ModuleImage::build(machine, module, &exports, &imports)?;
         adv_unix::builtin::install(drive, &built).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -296,7 +331,13 @@ fn install_image<B: Backend>(
         .zip(1..)
         .map(|(&name, ordinal)| Export { name, ordinal })
         .collect();
-    let imports = [ImportModule {
+    let built = ModuleImage::build(machine, IMAGES[image], &exports, &[gdi_imports()])?;
+    adv_unix::builtin::install(drive, &built).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn gdi_imports() -> ImportModule {
+    ImportModule {
         dll: GDI32.into(),
         imports: GDI_IMPORTS
             .into_iter()
@@ -308,10 +349,7 @@ fn install_image<B: Backend>(
                 iat_rva: 0,
             })
             .collect(),
-    }];
-    let built = ModuleImage::build(machine, IMAGES[image], &exports, &imports)?;
-    adv_unix::builtin::install(drive, &built).map_err(|e| e.to_string())?;
-    Ok(())
+    }
 }
 
 /// The heap of guest storage that the old stack's fronts allocate.

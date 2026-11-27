@@ -6,14 +6,17 @@ use crate::d3d11::{
     desc::{Buffer, InputLayout, Shader, Texture, ViewDesc},
 };
 use crate::shader::ir::Stage;
-use adv_abi::types::{D3D11_COUNTER_DESC, D3D11_INPUT_ELEMENT_DESC, D3D11_SUBRESOURCE_DATA};
+use adv_abi::types::{
+    D3D11_COUNTER_DESC, D3D11_INPUT_ELEMENT_DESC, D3D11_PACKED_MIP_DESC, D3D11_SUBRESOURCE_DATA,
+    D3D11_TILE_SHAPE,
+};
 use context::deferred::{create_deferred, create_state};
 use std::sync::Arc;
 
 macro_rules! methods {
     ($($method:ident => $handler:ident $level:ident),+ $(,)?) => {
-        ("ID3D11Device1", &[
-            $((concat!("ID3D11Device1::", stringify!($method)), $handler, ImplementationLevel::$level)),+
+        ("ID3D11Device2", &[
+            $((concat!("ID3D11Device2::", stringify!($method)), $handler, ImplementationLevel::$level)),+
         ])
     };
 }
@@ -69,6 +72,10 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     CreateDeviceContextState => create_state Implement,
     OpenSharedResource1 => open_shared_nt Implement,
     OpenSharedResourceByName => open_shared_by_name Implement,
+    GetImmediateContext2 => immediate_context Implement,
+    CreateDeferredContext2 => create_deferred Implement,
+    GetResourceTiling => resource_tiling State,
+    CheckMultisampleQualityLevels1 => multisample_quality1 Implement,
 );
 
 #[derive(Default)]
@@ -607,9 +614,44 @@ fn format_support(env: &mut Env<'_>) -> Outcome {
 
 fn multisample_quality(env: &mut Env<'_>) -> Outcome {
     let (device, format, count, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    sample_quality(env, device, format, count, false, out)
+}
+
+fn multisample_quality1(env: &mut Env<'_>) -> Outcome {
+    let [device, format, count, flags, out] = std::array::from_fn(|i| env.arg(i as u32));
+    sample_quality(env, device, format, count, flags & 1 != 0, out)
+}
+
+fn sample_quality(
+    env: &mut Env<'_>,
+    device: u32,
+    format: u32,
+    count: u32,
+    tiled: bool,
+    out: u32,
+) -> Outcome {
     call((|| {
         let quality = report(env, device)?.multisample_quality(format, count)?;
-        write(env, out, quality)
+        write(env, out, if tiled { 0 } else { quality })
+    })())
+}
+
+fn resource_tiling(env: &mut Env<'_>) -> Outcome {
+    let [tiles, packed, shape, count] = std::array::from_fn(|i| env.arg(i as u32 + 2));
+    // Ordinary resources have no tile shape or subresource tilings.
+    call((|| {
+        for out in [tiles, count] {
+            if out != 0 {
+                write(env, out, 0u32)?;
+            }
+        }
+        if packed != 0 {
+            write(env, packed, D3D11_PACKED_MIP_DESC::default())?;
+        }
+        if shape != 0 {
+            write(env, shape, D3D11_TILE_SHAPE::default())?;
+        }
+        Ok(())
     })())
 }
 

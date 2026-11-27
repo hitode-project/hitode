@@ -26,6 +26,46 @@ pub struct Coverage<'a> {
     pub formats: &'a [FormatPath<'a>],
 }
 
+#[cfg(feature = "gpu")]
+impl Coverage<'static> {
+    /// Executing paths of the native front. Hardware limits and format
+    /// operations are checked separately for the attached GPU.
+    pub fn production() -> Self {
+        Self {
+            requirements: level::requirements(FeatureLevel::L11_0),
+            emulated: &[
+                Requirement::PsInputRegisters,
+                Requirement::Viewports,
+                Requirement::Scissors,
+                Requirement::FramebufferLayers,
+                Requirement::Bc1ThroughBc3,
+                Requirement::Bc4Bc5,
+                Requirement::Bc6hBc7,
+                Requirement::QueryTimestampAndDisjoint,
+            ],
+            features: &[
+                FeaturePath::ConcurrentCreates,
+                FeaturePath::CommandLists,
+                FeaturePath::Discard,
+                FeaturePath::UpdateCopyFlags,
+                FeaturePath::ClearView,
+                FeaturePath::OverlappingCopy,
+                FeaturePath::PartialConstantUpdate,
+                FeaturePath::ConstantOffsets,
+                FeaturePath::DynamicConstantNoOverwrite,
+                FeaturePath::DynamicSrvNoOverwrite,
+                FeaturePath::Sad4,
+                FeaturePath::FullNonPowerOfTwo,
+                FeaturePath::ShadowComparison,
+                FeaturePath::ClearDepthView,
+                FeaturePath::SimpleInstancing,
+                FeaturePath::MixedCubeDepthView,
+            ],
+            formats: &[],
+        }
+    }
+}
+
 impl Coverage<'_> {
     fn limit(self, requirement: Requirement) -> u32 {
         self.requirements

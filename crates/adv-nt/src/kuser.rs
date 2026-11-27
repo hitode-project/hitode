@@ -39,7 +39,7 @@ const ACTIVE_PROCESSOR_COUNT: u32 = 0x3c0;
 const ACTIVE_GROUP_COUNT: u32 = 0x3c4;
 
 /// Windows 10 22H2, as the PEB reports it.
-const BUILD_NUMBER: u32 = 19045;
+pub const BUILD_NUMBER: u32 = 19045;
 const MAJOR_VERSION: u32 = 10;
 const VER_NT_WORKSTATION: u32 = 1;
 const VER_SUITE_SINGLEUSERTS: u32 = 0x100;

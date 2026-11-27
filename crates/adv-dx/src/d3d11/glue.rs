@@ -103,6 +103,8 @@ pub(super) struct State {
     #[cfg(feature = "gpu")]
     execution: Option<gpu::Execution>,
     #[cfg(feature = "gpu")]
+    signal_event: fn(&mut Env<'_>, u32) -> bool,
+    #[cfg(feature = "gpu")]
     shared: BTreeMap<u32, std::sync::Weak<super::object::Shared>>,
     #[cfg(feature = "gpu")]
     last_shared: u32,
@@ -185,6 +187,8 @@ pub fn install_children<B: Backend>(machine: &mut Machine<B>) -> Result<(), Stri
         force_d3d9: std::env::var_os("ADV_FORCE_D3D9").is_some_and(|value| value == "1"),
         #[cfg(feature = "gpu")]
         execution: None,
+        #[cfg(feature = "gpu")]
+        signal_event: |env, event| env.sys.set_event(event),
         #[cfg(feature = "gpu")]
         shared: BTreeMap::new(),
         #[cfg(feature = "gpu")]
@@ -702,8 +706,13 @@ pub fn configure_gpu<B: Backend>(
     machine: &mut Machine<B>,
     gpu: adv_device::gpu::Gpu,
     paths: super::caps::Coverage<'_>,
+    wake: adv_sync::WakeEvent,
 ) {
     let caps = gpu.device().caps();
+    crate::dxgi::set_adapter(
+        &mut machine.ext,
+        crate::dxgi::caps::AdapterInfo::from_gpu(caps),
+    );
     let production = super::caps::production_formats(caps);
     let formats = production.iter().map(|row| row.path()).collect::<Vec<_>>();
     configure_devices(
@@ -714,7 +723,53 @@ pub fn configure_gpu<B: Backend>(
             ..paths
         },
     );
-    machine.ext.get_mut::<State>().execution = Some(gpu::Execution::new(gpu));
+    let mut execution = gpu::Execution::new(gpu);
+    execution.wake = Some(wake);
+    machine.ext.get_mut::<State>().execution = Some(execution);
+}
+
+#[cfg(feature = "gpu")]
+pub fn fork_gpu<B: Backend>(
+    parent: &adv_machine::Ext,
+    child: &mut Machine<B>,
+    wake: adv_sync::WakeEvent,
+) -> Result<(), String> {
+    if let Some(execution) = &parent.get::<State>().execution {
+        let gpu = execution.fork().map_err(|error| error.to_string())?;
+        configure_gpu(child, gpu, super::caps::Coverage::production(), wake);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
+    let state = machine.ext.get_mut::<State>();
+    let Some(execution) = &mut state.execution else {
+        return Ok(false);
+    };
+    execution.poll().map_err(|error| error.to_string())?;
+    let ready = execution.completed_events();
+    let mut progress = execution.wake_presents(&mut machine.sys);
+    let signal = state.signal_event;
+    let mut env = Env {
+        context: machine.sys.current,
+        cpu: &mut machine.cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        thunk: 0,
+    };
+    for event in ready {
+        progress |= signal(&mut env, event);
+    }
+    Ok(progress)
+}
+
+#[cfg(feature = "gpu")]
+pub fn configure_event_signal<B: Backend>(
+    machine: &mut Machine<B>,
+    signal: fn(&mut Env<'_>, u32) -> bool,
+) {
+    machine.ext.get_mut::<State>().signal_event = signal;
 }
 
 #[cfg(feature = "gpu")]
@@ -722,7 +777,8 @@ pub fn configure_swap_chains<B: Backend>(
     machine: &mut Machine<B>,
     reported_build: u32,
     window: fn(&adv_machine::Ext, &adv_machine::Objects, u32) -> Option<crate::dxgi::swap::Window>,
-    resize: fn(&mut Env<'_>, u32, adv_abi::types::DXGI_MODE_DESC) -> Result<(), crate::dxgi::Error>,
+    resize: crate::dxgi::swap::ResizeWindow,
+    completed: Option<crate::dxgi::swap::FrameCompleted>,
 ) {
     crate::dxgi::install_swap_chains(
         machine,
@@ -730,6 +786,7 @@ pub fn configure_swap_chains<B: Backend>(
             buffers: &dxgi::SwapBuffers,
             window,
             resize,
+            completed,
             reported_build,
         },
     );

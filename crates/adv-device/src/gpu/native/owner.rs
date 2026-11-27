@@ -392,7 +392,7 @@ impl State {
                 Command::Present { .. }
                     | Command::PresentSwap { .. }
                     | Command::Readback { .. }
-                    | Command::Complete(_)
+                    | Command::Complete(..)
                     | Command::Submit
             ) {
                 debug_assert_eq!(at + 1, self.chunks[chunk].commands.len());
@@ -629,12 +629,15 @@ impl State {
             }
 
             Command::ModernTransfer(transfer) => self.transfer(*transfer),
-            Command::Complete(send) => {
+            Command::Complete(send, wake) => {
                 let token = self.submit(None)?;
                 self.queue.on_complete(
                     token,
                     Box::new(move || {
                         let _ = send.send(());
+                        if let Some(wake) = wake {
+                            wake.signal();
+                        }
                     }),
                 );
             }

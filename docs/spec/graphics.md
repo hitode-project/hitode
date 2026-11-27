@@ -245,6 +245,9 @@ Changes to presentation rectangles MUST preserve rendering history while prevent
 COPY MUST preserve front-buffer pixels outside its destination. It MUST reuse overlap with the same source mapping where the retained front and the backbuffer delta are known. New coverage and a changed mapping require copying the affected destination pixels. A new front or a changed publication source requires full published damage.
 
 D3D11 MUST enqueue presentation without waiting for GPU completion. Outside verification, it MUST copy only recorded output damage when the previous publication remains current. A Present without output writes MUST preserve pacing and completion counts without a copy or publication when that publication remains current.
+The Wine session publishes DXGI frames through its shared surface store and
+frame accounting. A present blocked by GPU queue admission resumes on a host
+wake.
 
 ### GFX-REC-6 D3D9 unchanged calls
 
@@ -396,6 +399,8 @@ DXGI output ownership uses the same exclusive-mode owner as DirectDraw and DXGI 
 DXGI fullscreen gamma capabilities write 256 equally spaced control points between zero and one, preserving the unused positions. Gamma programming round-trips the full control structure. Scanout uses the first 256 points without scale or offset. Desktop duplication rejects null metadata buffers with `E_INVALIDARG` and preserves the required-size output.
 
 A Win32 desktop process can create a composition chain with a hardware or software device. Its buffers have no window until a compositor attaches the chain.
+The D3D11 device exposes one DXGI device face through IDXGIDevice3.
+The session delivers EnqueueSetEvent after the earlier graphics work completes.
 
 ## Capabilities
 
@@ -411,13 +416,16 @@ A Win32 desktop process can create a composition chain with a hardware or softwa
 
 ### GFX-CAP-3 Excluded resources
 
-**Rule**: Shader Model 4+, D3D10/11, geometry and tessellation shaders, N-patches, and shader ProcessVertices MUST remain unsupported. Cube textures, volume textures, additional swap chains, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented.
+**Rule**: The Direct3D 9 front MUST refuse Shader Model 4+, geometry and tessellation shaders, N-patches, and shader ProcessVertices. Cube textures, volume textures, additional swap chains, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented by that front.
 **Verification**: Test
 
 ### GFX-CAP-4 Direct3D 11 capability derivation
 
 **Rule**: The Direct3D 11 capability core MUST select the highest level whose mandatory paths execute on the device. Optional compute support and feature queries MUST reflect the selected level and executing paths.
 **Verification**: Test
+
+Device and context interfaces through D3D11.2 share their respective base COM
+identities. Tiled resource queries report Tier 0.
 
 Modern GPU bindings compact each stage's used registers. Metal binds constant
 buffers at their ring offsets, keeps storage images at index 95 and below,
