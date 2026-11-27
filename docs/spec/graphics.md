@@ -615,6 +615,7 @@ The overflow predicate compares storage needed with primitives written for its s
 ### GFX-STAGE-4 Output merger UAVs
 
 **Rule**: At feature level 11_0 a pixel shader MUST access its bound output-merger UAVs. Pixel UAV writes MUST execute when neither color nor depth attachments are bound.
+Metal multisample pipelines with pixel shader UAV writes or atomics MUST retain native per-sample execution and be counted and warned once per pipeline.
 **Verification**: Test
 
 ### GFX-STAGE-5 Geometry shader raster routing

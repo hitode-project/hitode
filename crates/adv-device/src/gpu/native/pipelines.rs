@@ -170,6 +170,7 @@ pub(super) struct Pipelines {
     anticipated: u64,
     cache_hits: u64,
     inexact_sample_mask_pipelines: u64,
+    per_sample_uav_pipelines: u64,
     batch: Option<Compile<()>>,
     cache: Option<Arc<p::PipelineCache>>,
     store: Option<Archive>,
@@ -282,11 +283,11 @@ impl Pipelines {
             draw.sample_mask.hash(&mut digest);
         }
         let hash = digest.0.finalize().into();
-        let task = {
+        let (task, per_sample_uav_shader) = {
             let mut jobs = self.jobs.lock().unwrap();
             if let Some((task, _, _)) = jobs.get(&hash) {
                 self.cache_hits += 1;
-                task.clone()
+                (task.clone(), None)
             } else {
                 if draw.inexact_sample_mask {
                     self.inexact_sample_mask_pipelines += 1;
@@ -297,6 +298,15 @@ impl Pipelines {
                     );
                 }
                 let vertex = draw.vertex.clone();
+                let per_sample_uav_shader = draw
+                    .fragment
+                    .as_ref()
+                    .filter(|shader| {
+                        cfg!(target_vendor = "apple")
+                            && draw.samples > 1
+                            && shader.has_guest_uav_effects()
+                    })
+                    .map(|shader| shader.identity());
                 let fragment = draw.fragment.clone();
                 let device = device.clone();
                 let cache = self.cache.clone();
@@ -359,10 +369,18 @@ impl Pipelines {
                 self.modern_order.push_back(hash);
                 jobs.insert(hash, (task.clone(), None, false));
                 self.misses += 1;
-                task
+                (task, per_sample_uav_shader)
             }
         };
-        Ok(task.wait().clone().map_err(Error::Device)??.pipeline)
+        let pipeline = task.wait().clone().map_err(Error::Device)??.pipeline;
+        if let Some(hash) = per_sample_uav_shader {
+            self.per_sample_uav_pipelines += 1;
+            log::warn!(
+                "Metal pixel shader {hash:016x} performs UAV effects per covered sample ({}x MSAA)",
+                draw.samples,
+            );
+        }
+        Ok(pipeline)
     }
     pub fn fixed(
         &mut self,
@@ -642,6 +660,7 @@ impl Pipelines {
         gpu::Stats {
             pipeline_cache_hits: self.cache_hits,
             inexact_sample_mask_pipelines: self.inexact_sample_mask_pipelines,
+            per_sample_uav_pipelines: self.per_sample_uav_pipelines,
             anticipated_pipeline_draws: self.anticipated,
             compile_waits: waits,
             compile_wait_ns: ns,
