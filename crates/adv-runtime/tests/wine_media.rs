@@ -49,13 +49,35 @@ fn probe(name: &str, expected: &str) {
     ] {
         std::fs::copy(fixtures.join(name), root.join(name)).unwrap();
     }
+    if name == "amstream" {
+        const PREFIX_SIZE: usize = 64 * 1024;
+        let movie = std::fs::read(fixtures.join("synthetic.mpg")).unwrap();
+        // A program-stream padding packet places both elementary stream headers
+        // beyond the splitter's old 64 KiB file-header read.
+        let mut padded = movie[..12].to_vec();
+        padded.extend_from_slice(&[0, 0, 1, 0xbe]);
+        let padding = (PREFIX_SIZE - padded.len() - 2) as u16;
+        padded.extend_from_slice(&padding.to_be_bytes());
+        padded.resize(PREFIX_SIZE, 0xff);
+        padded.extend_from_slice(&movie);
+        std::fs::write(root.join("synthetic.mpg"), padded).unwrap();
+    }
+    let prefix = root.join("prefix");
+    let system32 = prefix.join("drive_c/windows/system32");
+    let retained_modules = ["quartz.dll", "wmvcore.dll", "qasf.dll"];
+    if name == "fallback" {
+        std::fs::create_dir_all(&system32).unwrap();
+        for module in retained_modules {
+            std::fs::write(system32.join(format!("wine{module}")), b"stale module").unwrap();
+        }
+    }
     let mut fds = [0; 2];
     // SAFETY: two fresh descriptors, transferred once to File ownership.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     let (mut output, stdout) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
     let config = Config {
         dist: &dist,
-        prefix: &root.join("prefix"),
+        prefix: &prefix,
         drive: None,
         locale: 0x409,
         fonts: "",
@@ -68,6 +90,13 @@ fn probe(name: &str, expected: &str) {
     };
     let wake = adv_sync::WakeEvent::new().unwrap();
     let mut session = Session::start(&config, wake, |_| Ok(())).unwrap();
+    if name == "fallback" {
+        for module in retained_modules {
+            let retained = std::fs::read(system32.join(format!("wine{module}"))).unwrap();
+            let original = std::fs::read(dist.join("lib/wine/i386-windows").join(module)).unwrap();
+            assert!(retained == original, "{module} was not refreshed");
+        }
+    }
     drop(stdout);
     let until = Instant::now() + Duration::from_secs(60);
     let mut pixels = false;
@@ -110,6 +139,11 @@ fn probe(name: &str, expected: &str) {
     };
     if matches!(stop, Stop::Exited(0)) {
         match name {
+            "amstream" => {
+                let stats = session.machine.ext.get::<adv_dx::dshow::Playback>();
+                assert!(stats.audio_frames > 0, "amstream decoded no audio");
+                assert!(stats.video_frames > 0, "amstream decoded no video");
+            }
             "dshow" | "mci" | "video" | "video_read" => {
                 let stats = session.machine.ext.get::<adv_dx::dshow::Playback>();
                 if name != "dshow" {
@@ -180,6 +214,12 @@ fn mci_runs_to_completion() {
 #[test]
 fn directshow_samples() {
     probe("dshow", "media dshow ok");
+}
+
+// spec: MEDIA-GRAPH-26, MEDIA-STREAM-1, MEDIA-STREAM-5
+#[test]
+fn amstream_plays_mpeg_with_late_stream_headers() {
+    probe("amstream", "media amstream ok");
 }
 
 // spec: WINE-MEDIA-8, WINE-MEDIA-10, WINE-MEDIA-11

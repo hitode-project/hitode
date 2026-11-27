@@ -1617,7 +1617,11 @@ fn offered_types(env: &Env<'_>, pin: u32) -> Vec<MediaType> {
         })
         .collect(),
         (Some(Role::Splitter), OUTPUT) if p.major == MEDIATYPE_AUDIO => {
-            let Some(mt) = p.types.first().cloned() else {
+            let Some(mt) = p
+                .types
+                .first()
+                .filter(|mt| mt.format_type == FORMAT_WAVEFORMATEX)
+            else {
                 return Vec::new();
             };
             let mut types = vec![mt.clone()];
@@ -1625,7 +1629,7 @@ fn offered_types(env: &Env<'_>, pin: u32) -> Vec<MediaType> {
             payload.sub = MEDIASUBTYPE_MPEG1PAYLOAD;
             types.push(payload);
             if mt.format.get(18..20) == Some(&4u16.to_le_bytes()) {
-                let mut mp3 = mt;
+                let mut mp3 = mt.clone();
                 mp3.sub = fourcc_type(0x55);
                 mp3.format[0..2].copy_from_slice(&0x55u16.to_le_bytes());
                 mp3.format[12..14].copy_from_slice(&1u16.to_le_bytes());
@@ -1810,6 +1814,9 @@ fn connect_hosts(env: &mut Env<'_>, out: u32, input: u32) -> u32 {
     }
     let candidates = match o.mt.clone() {
         Some(mt) => vec![mt],
+        // Host decoders use the source decoder even for streams whose
+        // compressed format the splitter cannot offer to a guest pin.
+        None if state.filters[&o.filter].role == Role::Splitter => o.types.clone(),
         None => offered_types(env, out),
     };
     if candidates.is_empty() {
@@ -2542,6 +2549,18 @@ pub(super) fn output_type(major: Iid, bytes: &[u8]) -> MediaType {
     })
 }
 
+pub(super) fn splitter_audio_type(info: &adv_device::media::StreamInfo, bytes: &[u8]) -> MediaType {
+    let header = if info.container == "mpeg" {
+        info.audio
+            .as_ref()
+            .and_then(|audio| audio.mpeg_header.as_ref())
+            .map_or(&[][..], |header| header.as_slice())
+    } else {
+        bytes
+    };
+    output_type(MEDIATYPE_AUDIO, header)
+}
+
 /// The guest copy of a file name, NUL-terminated.
 fn guest_name(env: &mut Env<'_>, path: &[u16]) -> Option<u32> {
     let bytes: Vec<u8> = path
@@ -2639,7 +2658,6 @@ pub(super) fn attach_source(
     bytes: Vec<u8>,
 ) -> Outcome {
     let length = bytes.len();
-    let audio_type = output_type(MEDIATYPE_AUDIO, &bytes);
     let video_type = output_type(MEDIATYPE_VIDEO, &bytes);
     let filter = state(env).pins[&pin].filter;
     let generic = state(env).filters[&filter].generic;
@@ -2651,7 +2669,7 @@ pub(super) fn attach_source(
     } else {
         adv_device::media::demux_reader(std::io::Cursor::new(bytes.clone())).ok()
     };
-    let (decoder, info) = match Decoder::open_reader(std::io::Cursor::new(bytes)) {
+    let (decoder, info) = match Decoder::open_reader(std::io::Cursor::new(bytes.clone())) {
         Ok(decoder) => {
             let info = decoder.info().clone();
             if !generic && !["mpeg", "mpegvideo", "mp3"].contains(&info.container.as_str()) {
@@ -2659,7 +2677,7 @@ pub(super) fn attach_source(
                     Outcome::Return(VFW_E_TYPE_NOT_ACCEPTED)
                 });
             }
-            (Some(decoder), Some(info))
+            (decoder, info)
         }
         Err(error) => {
             log::warn!("DirectShow: cannot decode {length}-byte stream: {error}");
@@ -2671,28 +2689,26 @@ pub(super) fn attach_source(
             });
         }
     };
-    let video = info.as_ref().is_none_or(|i| i.video.is_some());
-    let audio = info.as_ref().is_some_and(|i| i.audio.is_some());
+    let audio_type = splitter_audio_type(&info, &bytes);
+    let video = info.video.is_some();
+    let audio = info.audio.is_some();
     log::info!(
-        "DirectShow: splitter {filter:#x} source {length} bytes: {}",
-        info.as_ref().map_or("undecodable".to_owned(), |i| format!(
-            "{} video={:?} audio={:?} {} us",
-            i.container,
-            i.video
-                .as_ref()
-                .map(|v| (v.codec.as_str(), v.width, v.height)),
-            i.audio
-                .as_ref()
-                .map(|a| (a.codec.as_str(), a.sample_rate, a.channels)),
-            i.duration_us
-        ))
+        "DirectShow: splitter {filter:#x} source {length} bytes: {} video={:?} audio={:?} {} us",
+        info.container,
+        info.video
+            .as_ref()
+            .map(|v| (v.codec.as_str(), v.width, v.height)),
+        info.audio
+            .as_ref()
+            .map(|a| (a.codec.as_str(), a.sample_rate, a.channels)),
+        info.duration_us
     );
     state(env).filters.get_mut(&filter).unwrap().packets = packets;
     state(env).filters.get_mut(&filter).unwrap().source = Some(Source {
         file_handle: None,
-        duration_us: info.as_ref().map_or(0, |i| i.duration_us),
-        decoder,
-        info,
+        duration_us: info.duration_us,
+        decoder: Some(decoder),
+        info: Some(info),
     });
     for (present, name, mt) in [(video, "Video", video_type), (audio, "Audio", audio_type)] {
         if !present {

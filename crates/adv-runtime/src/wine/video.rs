@@ -178,12 +178,21 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Res
             completed: super::frame_completed,
         },
     );
+    let directory = drive.join("windows/system32");
     for &(module, original, exports) in MODULES {
-        let directory = drive.join("windows/system32");
+        let path = directory.join(module);
         let retained = directory.join(original);
-        if !retained.exists() {
-            std::fs::copy(directory.join(module), &retained).map_err(|e| e.to_string())?;
-        }
+        // Prefix setup links the distribution DLL before the first machine
+        // replaces it with the host image. Later machines use the retained DLL.
+        let wine = if path.is_symlink() {
+            let wine = fs::read(&path).map_err(|e| e.to_string())?;
+            if !fs::read(&retained).is_ok_and(|existing| existing == wine) {
+                fs::write(&retained, &wine).map_err(|e| e.to_string())?;
+            }
+            wine
+        } else {
+            fs::read(&retained).map_err(|e| e.to_string())?
+        };
         let imports = [ImportModule {
             dll: original.into(),
             imports: exports
@@ -202,7 +211,6 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Res
             .iter()
             .map(|&(name, ordinal, _)| Export { name, ordinal })
             .collect();
-        let wine = std::fs::read(&retained).map_err(|e| e.to_string())?;
         let image = ModuleImage::build_replacing(machine, module, &exports, &imports, &wine)?;
         adv_unix::builtin::install(drive, &image).map_err(|e| e.to_string())?;
     }

@@ -822,6 +822,8 @@ Windowless VMR-7 (`CLSID_VideoMixingRenderer`) converts pushed uncompressed RGB 
 **Rule**: Native media images MUST preserve Wine's export names and ordinals. Unimplemented exports and quartz classes MUST delegate to Wine's retained original modules. External audio-renderer activation MUST retain Wine's push-sample support.
 **Verification**: Test
 
+Each retained media module MUST match the active Wine distribution and MUST only be rewritten when its contents differ.
+
 ## Native WinMM
 
 ### WINE-AUD-8 Native wave output
