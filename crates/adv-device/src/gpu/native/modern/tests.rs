@@ -2126,10 +2126,13 @@ fn maximum_textures_samplers_constants_and_uavs_execute_together() {
             constants.mapped().unwrap().as_mut()[(last - 16) as usize..(last - 12) as usize]
                 .copy_from_slice(&value.to_ne_bytes());
         }
-        slots.uniforms.push(Some(BufferRange {
-            buffer: constants.clone(),
-            range: first..last,
-        }));
+        slots.uniforms.push(Some(
+            BufferRange {
+                buffer: constants.clone(),
+                range: first..last,
+            }
+            .into(),
+        ));
         writeln!(
             source,
             "@group(0) @binding({i}) var<uniform> c{i}: array<vec4<u32>, 4096>;"
@@ -2244,10 +2247,13 @@ fn vertex_streams_buffer_srvs_and_constant_buffers_keep_their_offsets_and_length
                 .copy_from_slice(&(i as u32 + 1).to_ne_bytes());
         }
         if i < CONSTANTS {
-            slots.uniforms.push(Some(BufferRange {
-                buffer: data.clone(),
-                range: offset..offset + 16,
-            }));
+            slots.uniforms.push(Some(
+                BufferRange {
+                    buffer: data.clone(),
+                    range: offset..offset + 16,
+                }
+                .into(),
+            ));
             writeln!(
                 source,
                 "@group(0) @binding({i}) var<uniform> c{i}: vec4<u32>;"

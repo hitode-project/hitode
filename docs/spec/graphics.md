@@ -260,7 +260,17 @@ Hot state setters, getters, scene boundaries, and unchanged bindings or state bl
 
 Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices and indices use 128-bit content keys. Whole-image upload snapshots hash their texels during capture unless a large texture's sampled probe changed from its previous upload. Partial uploads, changed probes, and fills use admission identities. Insufficient storage wraps before the complete binding window exceeds the buffer. Immutable snapshots retain only used registers, reuse unchanged captures across writes to unused registers and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
 
+Direct3D 11 constant updates write aligned windows in the upload ring shared
+with Direct3D 9. Draws and dispatches retain the selected offset and length
+through GPU completion. A binding shorter than the shader's block uses a
+zero-padded window in that ring.
+
 Direct3D 11 captures the dynamic index window and the vertex and instance windows determined at draw admission. GPU-resident index buffers and indirect arguments with resource bounds stay on the GPU. Expanded indirect draws read arguments at an ordered boundary when one or both dimensions lack a resource bound and report the readback in diagnostic builds.
+
+Direct3D 11 dynamic maps preserve untouched bytes in a fixed guest shadow.
+A GPU write makes that shadow stale, and the next map refreshes it at an
+ordered, counted readback. Maps with a current shadow take constant time.
+ResolveSubresource requires a default-usage destination.
 
 ### GFX-REC-8 Frontend work counters
 
@@ -402,7 +412,7 @@ A valid hardware composition chain can be created on a Win32 desktop process. It
 **Verification**: Test
 
 Modern GPU bindings compact each stage's used registers. Metal binds constant
-buffers at their buffer offsets, keeps storage images at index 95 and below,
+buffers at their ring offsets, keeps storage images at index 95 and below,
 and places overflowing textures and buffers in a Tier 2 argument buffer.
 Vulkan uses cached sets when the heap indices exceed the push budget. Descriptor
 indexing provides the larger descriptor limits, and read-only storage buffers

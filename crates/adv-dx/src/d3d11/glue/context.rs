@@ -1160,6 +1160,8 @@ pub(super) fn map_subresource(
     let backing = object.backing().and_then(|backing| backing.clone());
     let storage = object.mapping().ok_or(Error::InvalidArgument)?;
     let base = storage.pointer();
+    #[cfg(all(feature = "gpu", feature = "d3d9-counters"))]
+    let constant_time = request == map::Map::Dynamic && !storage.dynamic_shadow_stale(subresource);
     let mapped = storage.map(subresource, mode, flags, false, |layout, slice, parts| {
         #[cfg(feature = "gpu")]
         if let Some(backing) = &backing {
@@ -1183,20 +1185,25 @@ pub(super) fn map_subresource(
         Ok(())
     })?;
     #[cfg(all(feature = "gpu", feature = "d3d9-counters"))]
-    gpu::count_map(env.ext, request == map::Map::Dynamic);
+    gpu::count_map(env.ext, constant_time);
     Ok(mapped)
 }
 
 fn unmap_resource(env: &mut Env<'_>) -> Outcome {
     #[cfg(feature = "gpu")]
-    if deferred::current(env).is_some() {
+    {
         let (resource, subresource) = (env.arg(1), env.arg(2));
-        return call(deferred::unmap_resource(env, resource, subresource));
+        call(if deferred::current(env).is_some() {
+            deferred::unmap_resource(env, resource, subresource)
+        } else {
+            gpu::unmap_constants(env, resource, subresource)
+        })
     }
     #[cfg(not(feature = "gpu"))]
-    let _ = env;
-    // Immediate draws capture dynamic ranges as they admit each draw.
-    Outcome::Return(0)
+    {
+        let _ = env;
+        Outcome::Return(0)
+    }
 }
 
 macro_rules! gpu_methods {

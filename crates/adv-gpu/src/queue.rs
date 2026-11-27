@@ -131,7 +131,19 @@ impl Device {
     }
     /// A new upload ring for one producer thread.
     pub fn ring(&self, size: u64) -> Result<Ring> {
-        self.inner.ring(size)
+        self.ring_with_resident(size, 0).map(|(ring, _)| ring)
+    }
+
+    /// A transient upload ring and its backing buffer. The last `resident`
+    /// bytes belong to the caller and are outside the ring's FIFO.
+    pub fn ring_with_resident(&self, size: u64, resident: u64) -> Result<(Ring, Buffer)> {
+        if size == 0 {
+            return Err(crate::Error::Invalid("ring size must be nonzero".into()));
+        }
+        let capacity = size
+            .checked_add(resident)
+            .ok_or_else(|| crate::Error::Invalid("ring backing size overflow".into()))?;
+        self.inner.ring(size, capacity)
     }
     pub fn create_present_pool(&self, desc: &PoolDesc) -> Result<PresentPool> {
         PresentPool::new(self, desc)
