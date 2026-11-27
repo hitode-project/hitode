@@ -1123,7 +1123,10 @@ fn map_resource(env: &mut Env<'_>) -> Outcome {
         let mapped = if deferred::current(env).is_some() {
             #[cfg(feature = "gpu")]
             {
-                deferred::map_resource(env, pointer, subresource, mode, flags)?
+                let mapped = deferred::map_resource(env, pointer, subresource, mode, flags)?;
+                #[cfg(feature = "d3d9-counters")]
+                gpu::count_map(env.ext, false);
+                mapped
             }
             #[cfg(not(feature = "gpu"))]
             return Err(Error::InvalidArgument);
@@ -1179,6 +1182,8 @@ pub(super) fn map_subresource(
         let _ = (base, layout, slice, parts);
         Ok(())
     })?;
+    #[cfg(all(feature = "gpu", feature = "d3d9-counters"))]
+    gpu::count_map(env.ext, request == map::Map::Dynamic);
     Ok(mapped)
 }
 

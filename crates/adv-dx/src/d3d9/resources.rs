@@ -957,6 +957,8 @@ pub(super) fn texture_lock(
     if flags & 0x10 == 0 {
         recording::invalidate_readback_destination(env, owner, storage);
     }
+    #[cfg(feature = "d3d9-counters")]
+    env.ext.get_mut::<State>().frames.mapped(flags & 0x10 != 0);
     0
 }
 #[win32(d3d9,name="IDirect3DTexture9::UnlockRect",level=implement)]

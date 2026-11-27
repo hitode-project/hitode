@@ -484,6 +484,8 @@ pub fn upload(gpu: &Gpu, bytes: &[u8], usage: BufferUsage, size: u64) -> Result<
             .as_ptr()
             .copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
     }
+    #[cfg(feature = "d3d9-counters")]
+    gpu.count_upload(size + bytes.len() as u64);
     Ok(buffer)
 }
 
@@ -755,6 +757,8 @@ fn transfer_buffer_with_pitch(
                 .copy_from_nonoverlapping(source.as_ptr(), row as usize);
         }
     }
+    #[cfg(feature = "d3d9-counters")]
+    gpu.count_upload(bytes.len() as u64);
     Ok(TransferBuffer {
         buffer,
         offset: 0,

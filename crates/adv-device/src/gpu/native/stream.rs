@@ -198,9 +198,22 @@ struct Shared {
     /// whose ring is full can reserve again.
     retired: Condvar,
     completed: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "graphics-counters")]
+    traffic: Traffic,
     #[cfg(feature = "test-support")]
     submissions: Arc<TestGate>,
 }
+
+#[cfg(feature = "graphics-counters")]
+#[derive(Default)]
+struct Traffic {
+    submissions: std::sync::atomic::AtomicU64,
+    upload_bytes: std::sync::atomic::AtomicU64,
+    readback_bytes: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "graphics-counters")]
+use std::sync::atomic::Ordering;
 
 pub(crate) fn channel(ring: Ring) -> (Producer, Consumer) {
     let shared = Arc::new(Shared::default());
@@ -222,6 +235,14 @@ pub struct Waker {
     capture_hook: Option<Arc<dyn Fn(crate::frame::CaptureReply) + Send + Sync>>,
 }
 impl Waker {
+    #[cfg(feature = "graphics-counters")]
+    pub(super) fn submitted(&self) {
+        self.shared
+            .traffic
+            .submissions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn poke(&self) {
         let mut state = self.shared.state.lock().unwrap();
         state.poked = true;
@@ -431,11 +452,29 @@ impl Producer {
         };
         let bytes = self.chunk.spans[usize::from(span)].bytes();
         write(&mut bytes[offset as usize..(offset + len64) as usize]);
+        #[cfg(feature = "graphics-counters")]
+        self.count_upload(len64);
         Ok(Bytes {
             span,
             offset: offset as u32,
             len,
         })
+    }
+
+    #[cfg(feature = "graphics-counters")]
+    pub(super) fn count_upload(&self, bytes: u64) {
+        self.shared
+            .traffic
+            .upload_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "graphics-counters")]
+    pub(super) fn count_readback(&self, bytes: u64) {
+        self.shared
+            .traffic
+            .readback_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     fn span(&mut self, size: u64, align: u64) -> adv_gpu::Result<u16> {
@@ -562,6 +601,32 @@ impl Drop for Consumer {
 #[derive(Clone)]
 pub(crate) struct Gate(Arc<Shared>);
 impl Gate {
+    #[cfg(feature = "graphics-counters")]
+    pub(super) fn count_upload(&self, bytes: u64) {
+        self.0
+            .traffic
+            .upload_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "graphics-counters")]
+    pub(super) fn count_readback(&self, bytes: u64) {
+        self.0
+            .traffic
+            .readback_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "graphics-counters")]
+    pub(super) fn traffic(&self) -> super::super::Traffic {
+        let traffic = &self.0.traffic;
+        super::super::Traffic {
+            submissions: traffic.submissions.load(Ordering::Relaxed),
+            upload_bytes: traffic.upload_bytes.load(Ordering::Relaxed),
+            readback_bytes: traffic.readback_bytes.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn completed(&self) -> u64 {
         self.0.completed.load(std::sync::atomic::Ordering::Acquire)
     }

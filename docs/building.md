@@ -51,6 +51,10 @@ existing pair). An existing build only installs the modules the script lists;
 compare checksums of the other installed binaries before and after. `DIST` holds
 `usr/local`; the stripped runtime contains its `lib` and `share` directories.
 
+Append `d3d10` to rebuild just the two patched D3D10 PE modules in a
+configured Wine build and an existing pair of dists. This updates their
+two identity tables. Use isolated output for verifying the graphics build.
+
 Run `tools/wine/prefix-template.sh DIST/usr/local OUTPUT` on that builder, then
 install `OUTPUT` at `share/hitode/prefix` in both distributions. The script runs
 Wine's registration entry point for the media COM classes and filter mapper.

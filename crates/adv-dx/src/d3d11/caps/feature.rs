@@ -5,7 +5,7 @@ use adv_gpu::Caps;
 use std::collections::BTreeMap;
 
 macro_rules! features {
-    ($($variant:ident = $value:literal => $layout:ty),+ $(,)?) => {
+    ($($variant:ident = $value:literal => $layout:ty, $path:literal);+ $(;)?) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         #[repr(u32)]
         pub enum Feature { $($variant = $value),+ }
@@ -17,6 +17,9 @@ macro_rules! features {
             pub fn size(self) -> usize {
                 match self { $(Self::$variant => size_of::<$layout>()),+ }
             }
+            pub fn path(self) -> &'static str {
+                match self { $(Self::$variant => $path),+ }
+            }
             pub(super) fn parse(value: u32) -> Result<Self, Error> {
                 match value { $($value => Ok(Self::$variant),)+ _ => Err(Error::InvalidArgument) }
             }
@@ -25,27 +28,27 @@ macro_rules! features {
 }
 
 features! {
-    Threading = 0 => D3D11_FEATURE_DATA_THREADING,
-    Doubles = 1 => D3D11_FEATURE_DATA_DOUBLES,
-    FormatSupport = 2 => D3D11_FEATURE_DATA_FORMAT_SUPPORT,
-    FormatSupport2 = 3 => D3D11_FEATURE_DATA_FORMAT_SUPPORT2,
-    Compute4x = 4 => D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS,
-    Options = 5 => D3D11_FEATURE_DATA_D3D11_OPTIONS,
-    Architecture = 6 => D3D11_FEATURE_DATA_ARCHITECTURE_INFO,
-    D3d9Options = 7 => D3D11_FEATURE_DATA_D3D9_OPTIONS,
-    MinPrecision = 8 => D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT,
-    D3d9Shadow = 9 => D3D11_FEATURE_DATA_D3D9_SHADOW_SUPPORT,
-    Options1 = 10 => D3D11_FEATURE_DATA_D3D11_OPTIONS1,
-    D3d9Instancing = 11 => D3D11_FEATURE_DATA_D3D9_SIMPLE_INSTANCING_SUPPORT,
-    Markers = 12 => D3D11_FEATURE_DATA_MARKER_SUPPORT,
-    D3d9Options1 = 13 => D3D11_FEATURE_DATA_D3D9_OPTIONS1,
-    Options2 = 14 => D3D11_FEATURE_DATA_D3D11_OPTIONS2,
-    Options3 = 15 => D3D11_FEATURE_DATA_D3D11_OPTIONS3,
-    VirtualAddress = 16 => D3D11_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT,
-    Options4 = 17 => D3D11_FEATURE_DATA_D3D11_OPTIONS4,
-    ShaderCache = 18 => D3D11_FEATURE_DATA_SHADER_CACHE,
-    Options5 = 19 => D3D11_FEATURE_DATA_D3D11_OPTIONS5,
-    Displayable = 20 => D3D11_FEATURE_DATA_DISPLAYABLE,
+    Threading = 0 => D3D11_FEATURE_DATA_THREADING, "device creation and deferred command lists";
+    Doubles = 1 => D3D11_FEATURE_DATA_DOUBLES, "excluded fp64 shader operations";
+    FormatSupport = 2 => D3D11_FEATURE_DATA_FORMAT_SUPPORT, "resource backing and format operations";
+    FormatSupport2 = 3 => D3D11_FEATURE_DATA_FORMAT_SUPPORT2, "resource backing and storage operations";
+    Compute4x = 4 => D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS, "downlevel compute admission and dispatch";
+    Options = 5 => D3D11_FEATURE_DATA_D3D11_OPTIONS, "context operations, dynamic maps and integer shader lowering";
+    Architecture = 6 => D3D11_FEATURE_DATA_ARCHITECTURE_INFO, "adapter tile-based rendering";
+    D3d9Options = 7 => D3D11_FEATURE_DATA_D3D9_OPTIONS, "non-power-of-two texture addressing";
+    MinPrecision = 8 => D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT, "full-precision shader lowering";
+    D3d9Shadow = 9 => D3D11_FEATURE_DATA_D3D9_SHADOW_SUPPORT, "comparison samplers";
+    Options1 = 10 => D3D11_FEATURE_DATA_D3D11_OPTIONS1, "depth ClearView";
+    D3d9Instancing = 11 => D3D11_FEATURE_DATA_D3D9_SIMPLE_INSTANCING_SUPPORT, "instanced draw";
+    Markers = 12 => D3D11_FEATURE_DATA_MARKER_SUPPORT, "excluded guest profiler markers";
+    D3d9Options1 = 13 => D3D11_FEATURE_DATA_D3D9_OPTIONS1, "texture addressing, comparison samplers, instancing and depth cube views";
+    Options2 = 14 => D3D11_FEATURE_DATA_D3D11_OPTIONS2, "typed UAV loads and adapter memory architecture";
+    Options3 = 15 => D3D11_FEATURE_DATA_D3D11_OPTIONS3, "array-index routing restricted to geometry expansion";
+    VirtualAddress = 16 => D3D11_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT, "backend buffer size limit";
+    Options4 = 17 => D3D11_FEATURE_DATA_D3D11_OPTIONS4, "excluded extended NV12 sharing";
+    ShaderCache = 18 => D3D11_FEATURE_DATA_SHADER_CACHE, "excluded guest-visible shader cache";
+    Options5 = 19 => D3D11_FEATURE_DATA_D3D11_OPTIONS5, "excluded shared resource tiers";
+    Displayable = 20 => D3D11_FEATURE_DATA_DISPLAYABLE, "excluded displayable surfaces";
 }
 
 /// Optional feature bits with a distinct executing path.

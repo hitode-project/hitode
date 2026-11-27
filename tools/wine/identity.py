@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the code identity table of a Wine distribution.
 
-usage: identity.py DIST STRIPPED_DIST
+usage: identity.py DIST STRIPPED_DIST [PE_MODULE ...]
 
 DIST is the installation with debug information, as build-media.sh leaves
 it; STRIPPED_DIST is the runtime distribution. For every PE module in
@@ -17,6 +17,7 @@ reads only the tables of the modules it maps. Unix i386 ELF modules use
 their ELF and program headers, STT_FUNC symbols (including local symbols),
 local STT_OBJECT symbols for the data rows, and the dwords patched by dynamic
 relocations.
+When PE module names are supplied, update only those identity tables.
 """
 
 import re
@@ -231,14 +232,17 @@ def elf_rows(debug: Elf, stripped: Elf) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
+    if len(argv) < 2:
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
         return 2
     dist, stripped = Path(argv[0]), Path(argv[1])
+    names = argv[2:]
     debug_root = next(p for p in (dist / "usr/local" / MODULES, dist / MODULES) if p.is_dir())
     output = stripped / OUTPUT
     output.mkdir(parents=True, exist_ok=True)
-    for path in sorted((stripped / MODULES).iterdir()):
+    windows = stripped / MODULES
+    paths = [windows / name for name in names] if names else sorted(windows.iterdir())
+    for path in paths:
         try:
             image = Image(path.read_bytes())
             debug = Image((debug_root / path.name).read_bytes())
@@ -246,6 +250,8 @@ def main(argv: list[str]) -> int:
             continue
         rows = module_rows(debug, image)
         (output / f"{path.name.lower()}.tsv").write_text("\n".join(rows) + "\n")
+    if names:
+        return 0
     unix_debug = debug_root.parent / "i386-unix"
     for path in sorted((stripped / UNIX_MODULES).glob("*.so")):
         image = Elf(path.read_bytes())

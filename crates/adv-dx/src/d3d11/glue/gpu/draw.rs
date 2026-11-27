@@ -2176,6 +2176,9 @@ fn read_indirect_draw(
     #[cfg(feature = "d3d9-counters")]
     exec.recording
         .count_indirect_readback(arguments.range.end - arguments.range.start);
+    #[cfg(feature = "d3d9-counters")]
+    exec.gpu
+        .count_readback(arguments.range.end - arguments.range.start);
     // The completion marker follows the argument transfer.
     let words: &[u32] = bytemuck::cast_slice(unsafe { buffer.mapped().unwrap().as_ref() });
     let (base_vertex, first_instance) = if indexed {
