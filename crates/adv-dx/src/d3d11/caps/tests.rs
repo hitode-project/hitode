@@ -123,6 +123,8 @@ impl Fixture {
     fn mali_r48() -> Self {
         // Report 51870 (Mali-G57 MC2, r48p0).
         let mut result = Self::m1();
+        result.limits.sample_counts = 1 | 4 | 8;
+        result.rgba_samples = result.limits.sample_counts;
         result.limits.max_image_layers = 4096;
         result.limits.max_sampled_images = 500_000;
         result.limits.max_storage_bindings = 500_000;
@@ -207,8 +209,18 @@ fn mandatory_rows_follow_device_and_coverage() {
         features: FEATURES,
     };
     for (name, fixture, level, compute, quality_8x) in [
-        ("Apple7", Fixture::m1(), FeatureLevel::L10_1, true, 0),
-        ("Apple8–9", Fixture::m1(), FeatureLevel::L10_1, true, 0),
+        ("Apple7", Fixture::m1(), FeatureLevel::L11_0, true, 0),
+        ("Apple8–9", Fixture::m1(), FeatureLevel::L11_0, true, 0),
+        (
+            "Apple10+",
+            Fixture {
+                features: Fixture::m1().features - Features::FULL_SAMPLE_COVERAGE,
+                ..Fixture::native_8x()
+            },
+            FeatureLevel::L11_0,
+            true,
+            0,
+        ),
         (
             "Native 8x",
             Fixture::native_8x(),
@@ -251,6 +263,10 @@ fn mandatory_rows_follow_device_and_coverage() {
             &[u32::from(compute)]
         );
         assert_eq!(report.multisample_quality(28, 8), Ok(quality_8x), "{name}");
+        for count in [1, 2, 4] {
+            let quality = u32::from(fixture.rgba_samples & count != 0);
+            assert_eq!(report.multisample_quality(28, count), Ok(quality), "{name}");
+        }
     }
 
     let without_fallbacks = Coverage {
@@ -398,7 +414,7 @@ fn formats_follow_the_backing_and_the_operation() {
     let report = Report::derive(&with_8x.caps(), paths).unwrap();
     assert_eq!(report.multisample_quality(28, 8), Ok(1));
     assert_eq!(report.multisample_quality(45, 8), Ok(0));
-    assert_eq!(report.level, FeatureLevel::L10_1);
+    assert_eq!(report.level, FeatureLevel::L11_0);
     for missing in [
         Features::STANDARD_SAMPLE_LOCATIONS,
         Features::FULL_SAMPLE_COVERAGE,
@@ -409,7 +425,7 @@ fn formats_follow_the_backing_and_the_operation() {
         };
         let report = Report::derive(&limited.caps(), paths).unwrap();
         assert_eq!(report.multisample_quality(28, 8), Ok(0));
-        assert_eq!(report.level, FeatureLevel::L10_1);
+        assert_eq!(report.level, FeatureLevel::L11_0);
     }
     let no_typed_load = Fixture {
         storage_read: false,
@@ -425,6 +441,57 @@ fn formats_follow_the_backing_and_the_operation() {
     let report = Report::derive(&no_uav.caps(), paths).unwrap();
     assert!(report.level < FeatureLevel::L11_0);
     assert_eq!(report.check_format(98), Err(Error::FormatUnsupported));
+}
+
+// spec: GFX-CAP-4 GFX-CAP-5
+#[test]
+fn sample_counts_only_affect_queries_and_texture_creation() {
+    use crate::d3d11::{abi::*, desc};
+
+    let paths = Coverage {
+        requirements: &requirements(),
+        emulated: EMULATED,
+        formats: &format::fixture_rows(),
+        features: FEATURES,
+    };
+    for samples in [1, 1 | 2, 1 | 4, 1 | 2 | 4] {
+        let mut fixture = Fixture::m1();
+        fixture.limits.sample_counts = samples;
+        fixture.rgba_samples = samples;
+        let report = Report::derive(&fixture.caps(), paths).unwrap();
+        assert_eq!(report.level, FeatureLevel::L11_0);
+
+        for count in [1, 2, 4, 8] {
+            let supported = samples & count != 0;
+            for format in [28, 85] {
+                assert_eq!(
+                    report.multisample_quality(format, count),
+                    Ok(u32::from(supported))
+                );
+                let create = desc::Texture::new_2d(
+                    D3D11_TEXTURE2D_DESC {
+                        Width: 1,
+                        Height: 1,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: format as i32,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: count,
+                            Quality: 0,
+                        },
+                        BindFlags: desc::Bind::RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    false,
+                    &report,
+                );
+                assert_eq!(
+                    create.err(),
+                    (!supported).then_some(desc::Error::InvalidArgument)
+                );
+            }
+        }
+    }
 }
 
 // spec: GFX-DXGI-2

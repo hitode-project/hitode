@@ -147,7 +147,6 @@ requirements! {
     Wireframe "wireframe" => "native raster state or wireframe expansion",
     ClipDistances "clip_distances" => "native clip distances or pixel discard",
     CullDistances "cull_distances" => "cull-distance expansion",
-    MultisampleRenderTargets "multisample_render_targets" => "multisample color and depth attachments",
     ImmediateContext "immediate_context" => "immediate recording",
     DeferredContext "deferred_context" => "command-list recording and execution",
 }
@@ -206,7 +205,6 @@ impl Requirement {
             Self::QueryTimestampAndDisjoint => features.contains(Features::TIMESTAMPS),
             Self::ColorBytesPerSample => limits.max_color_bytes_per_sample >= value,
             Self::FramebufferLayers => limits.max_framebuffer_layers >= value,
-            Self::MultisampleRenderTargets => limits.sample_counts & value != 0,
             Self::VsPsProfile
             | Self::MaxTessellationFactor
             | Self::ClassLinkage

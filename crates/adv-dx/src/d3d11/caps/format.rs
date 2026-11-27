@@ -328,8 +328,10 @@ pub(super) fn derive(
                 support.allow(bit);
                 support.sample_counts |= mask;
             } else if required
-                && bit != Share
-                && (bit != Msaa8 || level == FeatureLevel::L11_0)
+                && !matches!(
+                    bit,
+                    Share | Msaa4 | Msaa8 | MsaaOther | MsaaLoad | MsaaResolve
+                )
                 && class == FormatClass::Resource
                 && !(bit == Display && present_format(row.format).is_none())
             {

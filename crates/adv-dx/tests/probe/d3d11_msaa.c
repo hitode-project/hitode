@@ -1,5 +1,6 @@
-/* Pending Windows hardware and WARP rows: 8x format quality levels, standard
- * and center creation, sample index and coverage, attribute evaluation,
+/* Pending Windows hardware and WARP rows: 8x format quality levels,
+ * CreateTexture2D HRESULT for counts with zero quality levels, standard and
+ * center creation, sample index and coverage, attribute evaluation,
  * per-sample depth, copy, MS SRV load and sample positions, and resolve.
  * Build: i686-w64-mingw32-gcc -O1 -Wall -o d3d11_msaa.exe d3d11_msaa.c -ld3d11 -ld3dcompiler
  * Run: d3d11_msaa.exe [warp]
@@ -96,6 +97,27 @@ static void read_strip(ID3D11DeviceContext *ctx, ID3D11Texture2D *staging,
     ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
 }
 
+static void unsupported_counts(ID3D11Device *device)
+{
+    const DXGI_FORMAT formats[] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B5G6R5_UNORM};
+    const UINT counts[] = {2, 4, 8, 32};
+    for (unsigned f = 0; f < sizeof(formats) / sizeof(*formats); ++f) {
+        for (unsigned s = 0; s < sizeof(counts) / sizeof(*counts); ++s) {
+            UINT quality;
+            HRESULT hr = ID3D11Device_CheckMultisampleQualityLevels(device, formats[f], counts[s],
+                &quality);
+            if (hr != S_OK || quality != 0) continue;
+            const D3D11_TEXTURE2D_DESC desc = {1, 1, 1, 1, formats[f],
+                {counts[s], 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0};
+            ID3D11Texture2D *image = NULL;
+            hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &image);
+            printf("create-unsupported-count\t%u\t%u\t%08lx\n",
+                (unsigned)formats[f], counts[s], (unsigned long)hr);
+            if (image) ID3D11Texture2D_Release(image);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     const D3D_DRIVER_TYPE driver = argc > 1 && !strcmp(argv[1], "warp")
@@ -105,6 +127,7 @@ int main(int argc, char **argv)
     ID3D11DeviceContext *ctx;
     CHECK(D3D11CreateDevice(NULL, driver, NULL, 0, &level, 1, D3D11_SDK_VERSION,
         &device, NULL, &ctx));
+    unsupported_counts(device);
     for (unsigned format = 1; format <= 115; ++format) {
         UINT quality = 0;
         HRESULT hr = ID3D11Device_CheckMultisampleQualityLevels(device, (DXGI_FORMAT)format,
