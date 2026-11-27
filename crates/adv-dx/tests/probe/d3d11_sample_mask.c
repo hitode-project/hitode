@@ -1,4 +1,4 @@
-/* Hardware and WARP sample mask rows are pending.
+/* Hardware and WARP sample mask rows.
  * Build: i686-w64-mingw32-gcc -O1 -o d3d11_sample_mask.exe d3d11_sample_mask.c -ld3d11 -ld3dcompiler_47 */
 #define COBJMACROS
 #include <windows.h>
