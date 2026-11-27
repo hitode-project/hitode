@@ -6,6 +6,8 @@ mod format;
 mod level;
 
 pub use feature::{Feature, FeatureAnswer, FeaturePath};
+#[cfg(feature = "gpu")]
+pub(super) use format::production as production_formats;
 pub use format::{FormatOperation, FormatPath, FormatSupport};
 pub use level::{FeatureLevel, Requirement};
 

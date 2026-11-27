@@ -398,6 +398,65 @@ impl Bound {
     }
 }
 
+pub(super) fn bind_input_attachments(
+    encoder: &mut Encoder,
+    layout: vk::PipelineLayout,
+    ordered: super::pipeline::OrderedColor,
+    views: &[vk::ImageView; 8],
+    constant: [f32; 4],
+) -> Result<()> {
+    let mut key = ArrayVec::<Bound, 9>::new();
+    key.push(Bound {
+        handle: ordered.layout.as_raw(),
+        ..Bound::default()
+    });
+    key.extend(color_slots(ordered.reads).map(|slot| Bound {
+        handle: views[slot].as_raw(),
+        ..Bound::default()
+    }));
+    let (set, fresh) = encoder.descriptor_set(ordered.layout, &key, false)?;
+    let device = &encoder.shared.context.device;
+    unsafe {
+        if fresh {
+            let images: ArrayVec<_, 8> = color_slots(ordered.reads)
+                .map(|slot| {
+                    vk::DescriptorImageInfo::default()
+                        .image_view(views[slot])
+                        .image_layout(vk::ImageLayout::GENERAL)
+                })
+                .collect();
+            let writes: ArrayVec<_, 8> = color_slots(ordered.reads)
+                .zip(&images)
+                .map(|(slot, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(slot as u32)
+                        .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
+                        .image_info(std::slice::from_ref(info))
+                })
+                .collect();
+            device.update_descriptor_sets(&writes, &[]);
+        }
+        device.cmd_bind_descriptor_sets(
+            encoder.command,
+            vk::PipelineBindPoint::GRAPHICS,
+            layout,
+            ordered.set,
+            &[set],
+            &[],
+        );
+        let bytes = constant.map(f32::to_ne_bytes);
+        device.cmd_push_constants(
+            encoder.command,
+            layout,
+            vk::ShaderStageFlags::ALL,
+            ordered.push_offset,
+            bytes.as_flattened(),
+        );
+    }
+    Ok(())
+}
+
 /// Bindings of one pass. Slots persist across pipelines, as D3D registers
 /// do. `bind` and `flush` hash nothing, clone nothing and lock only when a
 /// slot changes to a resource that needs a layout transition or a new
@@ -986,6 +1045,7 @@ impl DescriptorArena {
             vk::DescriptorType::SAMPLER,
             vk::DescriptorType::STORAGE_IMAGE,
             vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::INPUT_ATTACHMENT,
         ]
         .map(|ty| vk::DescriptorPoolSize {
             ty,

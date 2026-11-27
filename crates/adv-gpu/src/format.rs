@@ -18,6 +18,8 @@ pub enum Format {
     B5g6r5Unorm,
     Bgr5a1Unorm,
     Bgra4Unorm,
+    /// Metal packed color with alpha in the low nibble.
+    Abgr4Unorm,
     Rgb10a2Unorm,
     // Float and integer color (upscaler intermediates, guest render targets).
     R16Float,
@@ -25,6 +27,9 @@ pub enum Format {
     Rgba16Float,
     R32Float,
     Rg32Float,
+    Rgb32Float,
+    Rgb32Uint,
+    Rgb32Sint,
     Rgba32Float,
     R32Uint,
     // Block compressed (guest DXT textures).
@@ -133,6 +138,7 @@ impl Format {
                 | Self::Rg8Uint
                 | Self::Rg16Uint
                 | Self::Rg32Uint
+                | Self::Rgb32Uint
                 | Self::Rgba8Uint
                 | Self::Rgba16Uint
                 | Self::Rgba32Uint
@@ -150,6 +156,7 @@ impl Format {
                 | Self::Rg8Sint
                 | Self::Rg16Sint
                 | Self::Rg32Sint
+                | Self::Rgb32Sint
                 | Self::Rgba8Sint
                 | Self::Rgba16Sint
                 | Self::Rgba32Sint

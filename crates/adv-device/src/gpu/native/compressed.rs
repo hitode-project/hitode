@@ -58,6 +58,40 @@ unsafe extern "C" {
     );
 }
 
+/// The texel format produced by the BC decoder for a typed compressed view.
+pub fn decoded_bc_format(format: Format) -> Option<Format> {
+    encoding(format).map(|entry| entry.uncompressed)
+}
+
+/// Decode tightly packed BC blocks one volume slice at a time.
+pub fn decode_bc(format: Format, extent: Extent, data: &[u8]) -> Option<Vec<u8>> {
+    let encoding = encoding(format)?;
+    let source_pitch = extent.width.div_ceil(4) * encoding.block_bytes;
+    let source_slice = source_pitch * extent.height.div_ceil(4);
+    let pitch = extent.width * encoding.pixel_bytes;
+    let slice = pitch * extent.height;
+    let mut decoded = vec![0; slice as usize * extent.depth_or_layers as usize];
+    for (input, output) in data
+        .chunks_exact(source_slice as usize)
+        .zip(decoded.chunks_exact_mut(slice as usize))
+    {
+        // SAFETY: Each input contains complete BC blocks and each output has
+        // room for all valid texels of the slice at the given row pitch.
+        unsafe {
+            adv_decode_bc(
+                encoding.kind,
+                input.as_ptr(),
+                source_pitch,
+                output.as_mut_ptr(),
+                extent.width,
+                extent.height,
+                pitch,
+            );
+        }
+    }
+    Some(decoded)
+}
+
 impl BlockTexture {
     pub fn image(&self) -> &Image {
         &self.image

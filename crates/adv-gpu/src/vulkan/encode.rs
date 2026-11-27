@@ -94,6 +94,8 @@ pub(super) struct PassKey {
     width: u32,
     height: u32,
     layers: u32,
+    slots: u8,
+    reads: u8,
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct AttachmentKey {
@@ -537,12 +539,13 @@ impl Encoder {
         &'e mut self,
         desc: &RenderPassDesc<'_>,
         slots: u8,
+        reads: u8,
     ) -> crate::RenderPass<'e> {
         self.memory_barrier();
         let timestamp = self.timestamp_start(desc.timestamps);
         let modern = self.shared.context.caps.modern;
         let none = modern.contains(Modern::LOAD_STORE_OP_NONE);
-        let dynamic = modern.contains(Modern::DYNAMIC_RENDERING);
+        let dynamic = modern.contains(Modern::DYNAMIC_RENDERING) && reads == 0;
         let mut barriers = Vec::with_capacity(desc.colors.len() * 2 + 1);
         let mut attachment_handles = ArrayVec::<vk::Image, 17>::new();
         let mut dimensions = Extent {
@@ -551,6 +554,7 @@ impl Encoder {
             depth_or_layers: 1,
         };
         let mut needs_empty_pass = false;
+        let mut input_views = [vk::ImageView::null(); 8];
         let begin_info = if dynamic {
             let mut dynamic_colors: ArrayVec<_, 8> = (0..slot_count(slots))
                 .map(|_| vk::RenderingAttachmentInfo::default())
@@ -712,6 +716,16 @@ impl Encoder {
             let mut depth_ref = None;
             for (slot, color) in color_slots(slots).zip(&desc.colors) {
                 let view = &color.view.inner;
+                let mut layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+                let mut access = vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                    | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE;
+                let mut stages = vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
+                if reads & (1 << slot) != 0 {
+                    layout = vk::ImageLayout::GENERAL;
+                    access |= vk::AccessFlags2::INPUT_ATTACHMENT_READ;
+                    stages |= vk::PipelineStageFlags2::FRAGMENT_SHADER;
+                    input_views[slot] = view.0.handle;
+                }
                 dimensions = view.size();
                 if matches!(color.load, Load::Clear(_)) || color.resolve.is_some() {
                     needs_empty_pass = true;
@@ -722,10 +736,9 @@ impl Encoder {
                     &view.0.image.inner.core,
                     view.0.desc.mips.clone(),
                     view.0.desc.layers.clone(),
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags2::COLOR_ATTACHMENT_READ
-                        | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    layout,
+                    access,
+                    stages,
                 );
                 let clear = match color.load {
                     Load::Clear(value) => vk::ClearValue {
@@ -752,13 +765,13 @@ impl Encoder {
                     store_op(color.store, none),
                     vk::AttachmentLoadOp::DONT_CARE,
                     vk::AttachmentStoreOp::DONT_CARE,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    layout,
                 ));
                 views.push(view.0.handle);
                 clears.push(clear);
                 colors[slot] = vk::AttachmentReference {
                     attachment: index,
-                    layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    layout,
                 };
                 if let Some(resolve) = color.resolve {
                     let view = &resolve.inner;
@@ -859,10 +872,10 @@ impl Encoder {
                 match self.legacy_pass(
                     &attachments,
                     &views,
-                    &colors,
-                    &resolves,
+                    (&colors, &resolves),
                     depth_ref.as_ref(),
                     dimensions,
+                    (slots, reads),
                 ) {
                     Ok(pair) => Some(pair),
                     Err(e) => {
@@ -882,6 +895,7 @@ impl Encoder {
                 area: desc.area,
                 begin_info,
                 attachment_handles,
+                input_views,
                 needs_empty_pass,
                 begun: false,
                 timestamp,
@@ -912,10 +926,10 @@ impl Encoder {
         &mut self,
         attachments: &[vk::AttachmentDescription],
         views: &[vk::ImageView],
-        colors: &[vk::AttachmentReference],
-        resolves: &[vk::AttachmentReference],
+        (colors, resolves): (&[vk::AttachmentReference], &[vk::AttachmentReference]),
         depth: Option<&vk::AttachmentReference>,
         size: Extent,
+        (slots, reads): (u8, u8),
     ) -> Result<(vk::RenderPass, vk::Framebuffer)> {
         let key = PassKey {
             attachments: attachments
@@ -935,6 +949,8 @@ impl Encoder {
             width: size.width,
             height: size.height,
             layers: size.depth_or_layers,
+            slots,
+            reads,
         };
         let mut cache = self.shared.context.passes.lock().unwrap();
         if let Some(pass) = cache.get(&key) {
@@ -944,6 +960,12 @@ impl Encoder {
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(colors)
             .resolve_attachments(resolves);
+        let inputs = pipeline::input_attachments(colors, reads);
+        if reads != 0 {
+            subpass = subpass
+                .flags(vk::SubpassDescriptionFlags::RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_EXT)
+                .input_attachments(&inputs);
+        }
         if let Some(depth) = depth {
             subpass = subpass.depth_stencil_attachment(depth);
         }
@@ -1678,6 +1700,7 @@ pub(crate) struct RenderPass<'e> {
     area: Rect,
     begin_info: PassBegin,
     attachment_handles: ArrayVec<vk::Image, 17>,
+    input_views: [vk::ImageView; 8],
     needs_empty_pass: bool,
     begun: bool,
     timestamp: Option<(vk::QueryPool, u32)>,
@@ -2053,6 +2076,20 @@ impl RenderPass<'_> {
         let ready = pipeline
             .is_some_and(|p| bindings.flush(self.encoder, p, vk::PipelineBindPoint::GRAPHICS));
         self.encoder.bindings = Some(bindings);
+        if ready
+            && let Some(pipeline) = pipeline
+            && let Some(ordered) = pipeline.ordered
+            && let Err(error) = binding::bind_input_attachments(
+                self.encoder,
+                pipeline.layout,
+                ordered,
+                &self.input_views,
+                self.blend_constant,
+            )
+        {
+            self.encoder.error = Some(error);
+            return false;
+        }
         self.encoder.synced &= !ready;
         ready
     }

@@ -174,7 +174,6 @@ const EMULATED: &[Requirement] = &[
     Requirement::Bc1ThroughBc3,
     Requirement::Bc4Bc5,
     Requirement::Bc6hBc7,
-    Requirement::R32UavAtomics,
     Requirement::QueryTimestampAndDisjoint,
 ];
 
@@ -290,6 +289,145 @@ fn mandatory_rows_follow_device_and_coverage() {
         assert_eq!(level::requirements(level).len(), Requirement::ALL.len());
     }
     assert!(Report::derive(&Fixture::m1().caps(), Coverage::default()).is_none());
+}
+
+// spec: GFX-CAP-4 GFX-CAP-5
+#[cfg(all(feature = "gpu", target_vendor = "apple"))]
+#[test]
+fn target_profiles_apply_the_production_format_paths() {
+    use crate::d3d11::resource::native_format;
+    use crate::dxgi::formats::FORMATS;
+
+    // The Apple7 table from the Feature Set Tables, independent of the host device.
+    let apple7 = adv_gpu::MetalFamily::apple7().formats();
+    let table = |format: Format| {
+        apple7
+            .iter()
+            .find(|(f, _, _)| *f == format)
+            .map_or((FormatCaps::empty(), 0), |&(_, caps, samples)| {
+                (caps, samples)
+            })
+    };
+    let requirements = requirements();
+    let derive = |caps: &Caps| {
+        let production = format::production(caps);
+        let formats = production
+            .iter()
+            .map(|format| format.path())
+            .collect::<Vec<_>>();
+        let coverage = Coverage {
+            requirements: &requirements,
+            emulated: EMULATED,
+            features: FEATURES,
+            formats: &formats,
+        };
+        Report::derive(caps, coverage)
+    };
+    let profile = |fixture: Fixture,
+                   float_filter: bool,
+                   depth_filter: bool,
+                   packed: bool,
+                   bc: bool,
+                   float_blend: Option<FormatCaps>| {
+        let formats = FORMATS
+            .iter()
+            .filter_map(|layout| native_format(layout.format).map(|format| (layout.format, format)))
+            .chain([(115, Format::Abgr4Unorm)])
+            .map(|(dxgi, format)| {
+                let (mut flags, mut samples) = table(format);
+                if (!packed && matches!(dxgi, 86 | 115))
+                    || (!bc && matches!(dxgi, 70..=84 | 94..=99))
+                {
+                    flags = FormatCaps::empty();
+                    samples = 0;
+                }
+                if (!float_filter
+                    && matches!(
+                        format,
+                        Format::R32Float
+                            | Format::Rg32Float
+                            | Format::Rgba32Float
+                            | Format::Depth32Float
+                    ))
+                    || (!depth_filter
+                        && matches!(
+                            format,
+                            Format::Depth24UnormStencil8 | Format::Depth32FloatStencil8
+                        ))
+                {
+                    flags -= FormatCaps::FILTERED;
+                }
+                if let Some(blend) = float_blend
+                    && matches!(
+                        format,
+                        Format::R32Float | Format::Rg32Float | Format::Rgba32Float
+                    )
+                {
+                    flags = (flags - FormatCaps::BLEND) | blend;
+                }
+                (format, flags, samples)
+            })
+            .collect();
+        Caps::from_reported_formats(fixture.limits, fixture.features, formats)
+    };
+    for (name, caps, expected) in [
+        (
+            "Apple7 without native float filtering",
+            profile(Fixture::m1(), false, false, true, true, None),
+            Some((FeatureLevel::L11_0, true)),
+        ),
+        (
+            "Apple8 with native float filtering",
+            profile(Fixture::m1(), true, false, true, true, None),
+            Some((FeatureLevel::L11_0, true)),
+        ),
+        (
+            "Adreno 610 limits",
+            profile(Fixture::adreno_610(), false, false, false, false, None),
+            Some((FeatureLevel::L10_1, true)),
+        ),
+        (
+            "Mali r48 limits",
+            profile(Fixture::mali_r48(), false, false, false, false, None),
+            Some((FeatureLevel::L10_1, false)),
+        ),
+        (
+            "Mali r21 limits",
+            profile(Fixture::mali_r21(), false, false, false, false, None),
+            Some((FeatureLevel::L9_3, false)),
+        ),
+    ] {
+        assert_eq!(
+            derive(&caps).map(|report| (report.level, report.compute_4x)),
+            expected,
+            "{name}"
+        );
+    }
+    let caps = profile(
+        Fixture::mali_r48(),
+        true,
+        true,
+        true,
+        false,
+        Some(FormatCaps::empty()),
+    );
+    let report = derive(&caps).unwrap();
+    assert_eq!(report.level, FeatureLevel::L9_3);
+    assert!(!report.supports(2, FormatOperation::Blend));
+
+    let caps = profile(
+        Fixture::mali_r48(),
+        true,
+        true,
+        true,
+        false,
+        Some(FormatCaps::ORDERED_BLEND),
+    );
+    let report = derive(&caps).unwrap();
+    for format in [2, 16, 41] {
+        assert!(report.supports(format, FormatOperation::Blend));
+        assert_eq!(report.multisample_quality(format, 4), Ok(0));
+    }
 }
 
 // spec: GFX-CAP-4

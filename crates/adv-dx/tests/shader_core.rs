@@ -221,7 +221,7 @@ fn programmable_corpus_emits_valid_wgsl() {
                 },
                 "texture_atomic_return" => wgsl::Options {
                     storage_formats: &[(1, naga::StorageFormat::R32Uint)],
-                    storage_extents: &[(1, [8, 1, 1])],
+                    storage_extents: &[(1, [8, 1, 1, 8])],
                     ..Default::default()
                 },
                 _ => Default::default(),

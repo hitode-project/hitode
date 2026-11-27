@@ -688,7 +688,7 @@ pub(crate) fn parse_spirv(words: &[u32]) -> Result<naga::Module> {
         .map_err(|e| compile_error("SPIR-V", e))
 }
 
-fn instructions(words: &[u32]) -> impl Iterator<Item = &[u32]> {
+pub(super) fn instructions(words: &[u32]) -> impl Iterator<Item = &[u32]> {
     let mut rest = &words[5..];
     std::iter::from_fn(move || {
         if rest.is_empty() {

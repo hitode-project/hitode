@@ -2808,10 +2808,33 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
                 array_index,
                 fun,
                 value,
+                result,
             } => {
+                let result_name = result.map(|result| {
+                    let name = Baked(result).to_string();
+                    self.named_expressions.insert(result, name.clone());
+                    name
+                });
+                if let (Some(result), Some(name)) = (result, &result_name) {
+                    let crate::Expression::AtomicResult { ty, .. } = func_ctx.expressions[result]
+                    else {
+                        unreachable!()
+                    };
+                    write!(self.out, "{level}")?;
+                    self.write_type(module, ty)?;
+                    writeln!(self.out, " {name};")?;
+                }
                 write!(self.out, "{level}")?;
 
-                let fun_str = fun.to_hlsl_suffix();
+                let compare = match fun {
+                    crate::AtomicFunction::Exchange { compare } => compare,
+                    _ => None,
+                };
+                let fun_str = if compare.is_some() && result.is_none() {
+                    "CompareStore"
+                } else {
+                    fun.to_hlsl_suffix()
+                };
                 write!(self.out, "Interlocked{fun_str}(")?;
                 self.write_expr(module, image, func_ctx)?;
                 write!(self.out, "[")?;
@@ -2825,7 +2848,14 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
                 )?;
                 write!(self.out, "],")?;
 
+                if let Some(compare) = compare {
+                    self.write_expr(module, compare, func_ctx)?;
+                    write!(self.out, ", ")?;
+                }
                 self.write_expr(module, value, func_ctx)?;
+                if let Some(name) = result_name {
+                    write!(self.out, ", {name}")?;
+                }
                 writeln!(self.out, ");")?;
             }
             Statement::WorkGroupUniformLoad { pointer, result } => {

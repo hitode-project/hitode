@@ -2126,8 +2126,15 @@ impl<'a, W: Write> Writer<'a, W> {
                 array_index,
                 fun,
                 value,
+                result,
             } => {
                 write!(self.out, "{level}")?;
+                if let Some(result) = result {
+                    let name = Baked(result).to_string();
+                    self.write_value_type(ctx.info[result].ty.inner_with(&self.module.types))?;
+                    write!(self.out, " {name} = ")?;
+                    self.named_expressions.insert(result, name);
+                }
                 self.write_image_atomic(ctx, image, coordinate, array_index, fun, value)?
             }
             Statement::RayQuery { .. } => unreachable!(),
@@ -4038,6 +4045,13 @@ impl<'a, W: Write> Writer<'a, W> {
         // Separate the coordinate from the value to write and write the expression
         // of the value to write.
         write!(self.out, ", ")?;
+        if let crate::AtomicFunction::Exchange {
+            compare: Some(compare),
+        } = fun
+        {
+            self.write_expr(compare, ctx)?;
+            write!(self.out, ", ")?;
+        }
         self.write_expr(value, ctx)?;
         // End the call to `imageAtomic` and the statement.
         writeln!(self.out, ");")?;

@@ -1,4 +1,5 @@
 mod border;
+mod filter;
 mod typed_buffer;
 
 #[cfg(feature = "gpu")]
@@ -31,6 +32,9 @@ impl Writer<'_> {
         module: &Module,
         reflection: &Reflection,
     ) -> Result<(), Error> {
+        if !self.options.manual_filter.is_empty() {
+            self.source.push_str(filter::CUBE);
+        }
         let mut storage_slot = reflection
             .bindings
             .iter()
@@ -98,16 +102,16 @@ impl Writer<'_> {
                     dimension, returns, ..
                 } if binding.register == Register::Resource => {
                     let dimension = match dimension {
-                        ResourceDimension::Texture1D => "1d",
+                        ResourceDimension::Texture1D => "2d",
                         ResourceDimension::Texture2D => "2d",
                         ResourceDimension::Texture2DMs => "multisampled_2d",
                         ResourceDimension::Texture3D => "3d",
                         ResourceDimension::TextureCube => "cube",
                         ResourceDimension::Texture2DArray => "2d_array",
                         ResourceDimension::TextureCubeArray => "cube_array",
-                        ResourceDimension::Texture1DArray
-                        | ResourceDimension::Texture2DMsArray
-                        | ResourceDimension::RawBuffer
+                        ResourceDimension::Texture1DArray => "2d_array",
+                        ResourceDimension::Texture2DMsArray => "multisampled_2d_array",
+                        ResourceDimension::RawBuffer
                         | ResourceDimension::StructuredBuffer
                         | ResourceDimension::Buffer => {
                             return Err(Error::UnsupportedRegister(binding.register));
@@ -146,28 +150,23 @@ impl Writer<'_> {
                     self.check_typed_format(returns[0], format)?;
                     let atomic = self.atomic_bindings.contains(&(binding.register, slot));
                     if self.storage_extent(slot).is_some() {
-                        if !matches!(
-                            format,
-                            naga::StorageFormat::R32Uint
-                                | naga::StorageFormat::R32Sint
-                                | naga::StorageFormat::R32Float
-                        ) {
-                            return Err(Error::Invalid("buffer-backed UAV format"));
-                        }
-                        self.declare_buffer(&name, slot, true, atomic);
+                        self.declare_buffer(
+                            &name,
+                            slot,
+                            true,
+                            atomic || typed_buffer::Layout::new(format)?.bits < 32,
+                        );
                         self.locations.push(BindingLocation {
                             register: binding.register,
                             slot,
                             group: 3,
                             binding: slot,
                             sampler_min_lod_bits: None,
+                            point_sampler: false,
                         });
                         continue;
                     }
-                    if atomic
-                        && (!self.options.image_atomics
-                            || dimension != ResourceDimension::Texture2D)
-                    {
+                    if atomic && !self.options.image_atomics {
                         return Err(Error::MissingStorageExtent(slot));
                     }
                     let dimension = storage_dimension(dimension)
@@ -196,6 +195,7 @@ impl Writer<'_> {
                 group,
                 binding: physical_slot,
                 sampler_min_lod_bits: None,
+                point_sampler: false,
             });
         }
         for binding in &reflection.bindings {
@@ -548,7 +548,7 @@ impl Writer<'_> {
             .ok_or(Error::MissingStorageFormat(slot))
     }
 
-    fn storage_extent(&self, slot: u32) -> Option<[u32; 3]> {
+    fn storage_extent(&self, slot: u32) -> Option<[u32; 4]> {
         self.options
             .storage_extents
             .iter()
@@ -565,9 +565,17 @@ impl Writer<'_> {
     ) -> Result<Option<String>, Error> {
         let (coordinate, layer, condition) = match dimension {
             ResourceDimension::Texture1D => (
-                format!("bitcast<i32>({}.x)", args[0]),
+                format!("vec2<i32>(bitcast<i32>({}.x), 0)", args[0]),
                 String::new(),
-                format!("{}.x < textureDimensions({name})", args[0]),
+                format!("{}.x < textureDimensions({name}).x", args[0]),
+            ),
+            ResourceDimension::Texture1DArray => (
+                format!("vec2<i32>(bitcast<i32>({}.x), 0)", args[0]),
+                format!(", bitcast<i32>({}.y)", args[0]),
+                format!(
+                    "{}.x < textureDimensions({name}).x && {}.y < textureNumLayers({name})",
+                    args[0], args[0]
+                ),
             ),
             ResourceDimension::Texture2D => (
                 format!("bitcast<vec2<i32>>({}.xy)", args[0]),
@@ -582,15 +590,36 @@ impl Writer<'_> {
                     args[0], args[0]
                 ),
             ),
-            ResourceDimension::Texture3D => (
-                format!("bitcast<vec3<i32>>({}.xyz)", args[0]),
-                String::new(),
-                format!("all({}.xyz < textureDimensions({name}))", args[0]),
-            ),
+            ResourceDimension::Texture3D => {
+                let (coordinate, condition) = if let Some((_, slices)) = self
+                    .options
+                    .storage_slices
+                    .iter()
+                    .find(|(index, _)| *index == slot)
+                {
+                    (
+                        format!(
+                            "bitcast<vec3<i32>>({}.xyz + vec3<u32>(0u, 0u, {}u))",
+                            args[0], slices.start
+                        ),
+                        format!(
+                            "all({}.xy < textureDimensions({name}).xy) && {}.z < {}u",
+                            args[0],
+                            args[0],
+                            slices.len()
+                        ),
+                    )
+                } else {
+                    (
+                        format!("bitcast<vec3<i32>>({}.xyz)", args[0]),
+                        format!("all({}.xyz < textureDimensions({name}))", args[0]),
+                    )
+                };
+                (coordinate, String::new(), condition)
+            }
             ResourceDimension::Buffer
             | ResourceDimension::Texture2DMs
             | ResourceDimension::TextureCube
-            | ResourceDimension::Texture1DArray
             | ResourceDimension::Texture2DMsArray
             | ResourceDimension::TextureCubeArray
             | ResourceDimension::RawBuffer
@@ -600,9 +629,14 @@ impl Writer<'_> {
         };
         if op.opcode == Opcode::StoreUavTyped {
             let scalar = scalar_name(self.storage_format(slot)?);
+            let lanes = if self.options.alpha_uavs & (1 << slot) != 0 {
+                ".wxyz"
+            } else {
+                ""
+            };
             self.open(&format!("if {condition}"));
             self.line(&format!(
-                "textureStore({name}, {coordinate}{layer}, bitcast<vec4<{scalar}>>({}));",
+                "textureStore({name}, {coordinate}{layer}, bitcast<vec4<{scalar}>>({}{lanes}));",
                 args[1]
             ));
             self.close();
@@ -611,33 +645,70 @@ impl Writer<'_> {
             let result = format!("typed_result_{}", self.serial);
             self.line(&format!("var {result}: vec4<u32>;"));
             self.open(&format!("if {condition}"));
-            self.line(&format!(
-                "{result} = bitcast<vec4<u32>>(textureLoad({name}, {coordinate}{layer}));"
-            ));
+            let load = format!("textureLoad({name}, {coordinate}{layer})");
+            let load = if self.options.alpha_uavs & (1 << slot) != 0 {
+                format!("vec4<f32>(0.0, 0.0, 0.0, {load}.x)")
+            } else {
+                load
+            };
+            self.line(&format!("{result} = bitcast<vec4<u32>>({load});"));
             self.close();
             Ok(Some(result))
         } else if op.opcode.is_atomic() {
             use Opcode::*;
             let format = self.storage_format(slot)?;
-            let builtin = match op.opcode {
-                AtomicAnd => "And",
-                AtomicOr => "Or",
-                AtomicXor => "Xor",
-                AtomicIadd => "Add",
-                AtomicImax if format == naga::StorageFormat::R32Sint => "Max",
-                AtomicImin if format == naga::StorageFormat::R32Sint => "Min",
-                AtomicUmax if format == naga::StorageFormat::R32Uint => "Max",
-                AtomicUmin if format == naga::StorageFormat::R32Uint => "Min",
-                _ => return Err(Error::MissingStorageExtent(slot)),
+            let signed = format == naga::StorageFormat::R32Sint;
+            let (builtin, other_type) = match op.opcode {
+                AtomicAnd | ImmAtomicAnd => ("And", None),
+                AtomicOr | ImmAtomicOr => ("Or", None),
+                AtomicXor | ImmAtomicXor => ("Xor", None),
+                AtomicIadd | ImmAtomicIadd => ("Add", None),
+                AtomicImax | ImmAtomicImax => ("Max", (!signed).then_some("i32")),
+                AtomicImin | ImmAtomicImin => ("Min", (!signed).then_some("i32")),
+                AtomicUmax | ImmAtomicUmax => ("Max", signed.then_some("u32")),
+                AtomicUmin | ImmAtomicUmin => ("Min", signed.then_some("u32")),
+                ImmAtomicExch => ("Exchange", None),
+                AtomicCmpStore | ImmAtomicCmpExch => ("CompareExchange", None),
+                _ => return Err(Error::UnsupportedOpcode(op.opcode)),
             };
             let scalar = scalar_name(format);
+            let result = format!("atomic_result_{}", self.serial);
+            let returning = op.destinations.len() > 1;
+            if returning {
+                self.line(&format!("var {result} = 0u;"));
+            }
+            let location = format!("{name}, {coordinate}{layer}");
+            let value = format!("bitcast<{scalar}>({}.x)", args[1]);
             self.open(&format!("if {condition}"));
-            self.line(&format!(
-                "textureAtomic{builtin}({name}, {coordinate}{layer}, bitcast<{scalar}>({}.x));",
-                args[1]
-            ));
+            let call = if let Some(other_type) = other_type {
+                let operation = if builtin == "Max" { "max" } else { "min" };
+                self.line(&format!(
+                    "var observed = textureAtomicOr({location}, {scalar}(0));"
+                ));
+                self.open("loop");
+                self.line(&format!("let update = bitcast<{scalar}>({operation}(bitcast<{other_type}>(observed), bitcast<{other_type}>({}.x)));", args[1]));
+                self.line(&format!(
+                    "let previous = textureAtomicCompareExchange({location}, observed, update);"
+                ));
+                self.line("if previous == observed { break; }");
+                self.line("observed = previous;");
+                self.close();
+                "observed".into()
+            } else if builtin == "CompareExchange" {
+                format!(
+                    "textureAtomicCompareExchange({location}, {value}, bitcast<{scalar}>({}.x))",
+                    args[2]
+                )
+            } else {
+                format!("textureAtomic{builtin}({location}, {value})")
+            };
+            if returning {
+                self.line(&format!("{result} = bitcast<u32>({call});"));
+            } else if other_type.is_none() {
+                self.line(&format!("{call};"));
+            }
             self.close();
-            Ok(None)
+            Ok(returning.then(|| format!("vec4<u32>({result})")))
         } else {
             Err(Error::UnsupportedOpcode(op.opcode))
         }
@@ -659,35 +730,50 @@ impl Writer<'_> {
             .iter()
             .find(|lod| lod.slot == slot)
             .copied();
+        let narrow = matches!(
+            dimension,
+            ResourceDimension::Texture1D | ResourceDimension::Texture1DArray
+        );
+        let multisampled = matches!(
+            dimension,
+            ResourceDimension::Texture2DMs | ResourceDimension::Texture2DMsArray
+        );
         let (width, lanes, array) = match dimension {
-            ResourceDimension::Texture1D => (1, "x", ""),
+            ResourceDimension::Texture1D => (2, "x", ""),
+            ResourceDimension::Texture1DArray => (2, "x", "y"),
             ResourceDimension::Texture2D | ResourceDimension::Texture2DMs => (2, "xy", ""),
-            ResourceDimension::Texture2DArray => (2, "xy", "z"),
+            ResourceDimension::Texture2DArray | ResourceDimension::Texture2DMsArray => {
+                (2, "xy", "z")
+            }
             ResourceDimension::Texture3D | ResourceDimension::TextureCube => (3, "xyz", ""),
             ResourceDimension::TextureCubeArray => (3, "xyz", "w"),
             ResourceDimension::Buffer
-            | ResourceDimension::Texture1DArray
-            | ResourceDimension::Texture2DMsArray
             | ResourceDimension::RawBuffer
             | ResourceDimension::StructuredBuffer => {
                 return Err(Error::UnsupportedOpcode(op.opcode));
             }
         };
         let cast = |value: &str, ty: &str| {
-            if width == 1 {
-                format!("bitcast<{ty}>({value}.{lanes})")
+            if narrow {
+                format!("vec2<{ty}>(bitcast<{ty}>({value}.x), 0)")
             } else {
                 format!("bitcast<vec{width}<{ty}>>({value}.{lanes})")
             }
         };
+        if op.opcode == Resinfo {
+            return Ok(self.resource_info(op, args, texture, dimension));
+        }
+        if matches!(op.opcode, SampleInfo | SamplePos) && multisampled {
+            return self.sample_query(op, &format!("textureNumSamples({texture})"), args);
+        }
         let load_layer = if array.is_empty() {
             String::new()
         } else {
             format!(", bitcast<i32>({}.{})", args[0], array)
         };
         let offset = if let Some(offset) = op.resource.offset {
-            if width == 1 {
-                format!(", {}i", offset[0])
+            if narrow {
+                format!(", vec2<i32>({}i, 0)", offset[0])
             } else {
                 let values: Vec<_> = offset[..width].iter().map(|v| format!("{v}i")).collect();
                 format!(", vec{width}<i32>({})", values.join(", "))
@@ -695,14 +781,6 @@ impl Writer<'_> {
         } else {
             String::new()
         };
-        if op.opcode == Resinfo {
-            return Ok(self.resource_info(op, args, texture, dimension));
-        }
-        if matches!(op.opcode, SampleInfo | SamplePos)
-            && dimension == ResourceDimension::Texture2DMs
-        {
-            return self.sample_query(op, &format!("textureNumSamples({texture})"), args);
-        }
         let empty = lod.is_some_and(|lod| lod.minimum > lod.last as f32);
         let default = lod.map_or(0, |lod| lod.default_alpha);
         if empty && op.opcode != Lod {
@@ -741,16 +819,8 @@ impl Writer<'_> {
                 format!(" && {level} >= {minimum}u")
             };
             self.open(&format!("if {level} < {count}{first}"));
-            let index_u32 = if width == 1 {
-                format!("bitcast<u32>({xy})")
-            } else {
-                format!("bitcast<vec{width}<u32>>({xy})")
-            };
-            let in_bounds = if width == 1 {
-                format!("{index_u32} < {dimensions}")
-            } else {
-                format!("all({index_u32} < {dimensions})")
-            };
+            let index_u32 = format!("bitcast<vec{width}<u32>>({xy})");
+            let in_bounds = format!("all({index_u32} < {dimensions})");
             let in_bounds = if array.is_empty() {
                 in_bounds
             } else {
@@ -775,7 +845,11 @@ impl Writer<'_> {
             return Ok(result);
         }
         let (sampler, component) = sampler.ok_or(Error::UnsupportedOpcode(op.opcode))?;
-        let mut coord = cast(&args[0], "f32");
+        let mut coord = if narrow {
+            format!("vec2<f32>(bitcast<f32>({}.x), 0.5)", args[0])
+        } else {
+            cast(&args[0], "f32")
+        };
         let suffix = if array.is_empty() {
             String::new()
         } else {
@@ -793,6 +867,7 @@ impl Writer<'_> {
             .iter()
             .find(|border| border.slot == sampler)
             .copied();
+        let manual = self.options.manual_filter.contains(&slot);
         if matches!(op.opcode, Gather4 | Gather4C | Gather4Po | Gather4PoC) {
             if lod.is_some_and(|lod| lod.minimum >= 1.) {
                 return Ok(format!(
@@ -807,17 +882,22 @@ impl Writer<'_> {
                 );
             }
             let comparison = matches!(op.opcode, Gather4C | Gather4PoC);
+            let sampler = if manual && !comparison {
+                self.sampler_variant(sampler, None, true)
+            } else {
+                format!("s{sampler}")
+            };
             let mut call = if matches!(op.opcode, Gather4 | Gather4Po) {
                 let component = if self.options.depth_textures.contains(&slot) {
                     String::new()
                 } else {
                     format!("{component}i, ")
                 };
-                format!("textureGather({component}{texture}, s{sampler}, {coord}{suffix}{offset})")
+                format!("textureGather({component}{texture}, {sampler}, {coord}{suffix}{offset})")
             } else {
                 let reference = args.last().unwrap();
                 format!(
-                    "textureGatherCompare({texture}, s{sampler}, {coord}{suffix}, bitcast<f32>({reference}.x){offset})"
+                    "textureGatherCompare({texture}, {sampler}, {coord}{suffix}, bitcast<f32>({reference}.x){offset})"
                 )
             };
             if matches!(
@@ -869,6 +949,19 @@ impl Writer<'_> {
             }
             return Ok(format!("bitcast<vec4<u32>>({call})"));
         }
+        if manual {
+            return self.filter_sample(filter::FilterSample {
+                op,
+                arguments: args,
+                texture,
+                slot,
+                sampler,
+                dimension,
+                coordinate: &coord,
+                layer: &suffix,
+                lod,
+            });
+        }
         let sampling = self
             .options
             .lod_samplers
@@ -876,7 +969,7 @@ impl Writer<'_> {
             .find_map(|(slot, mode)| (*slot == sampler).then_some(*mode));
         let mip = sampling.filter(|mode| mode.round_mip);
         let sampler = if let Some(lod) = lod {
-            self.clamped_sampler(sampler, lod.minimum)
+            self.sampler_variant(sampler, Some(lod.minimum.to_bits()), false)
         } else {
             format!("s{sampler}")
         };
@@ -965,7 +1058,7 @@ impl Writer<'_> {
                 "mix(mix({name}.w, {name}.z, {weight}.x), mix({name}.x, {name}.y, {weight}.x), {weight}.y)"
             );
         }
-        if let Some(border) = border
+        if let Some(mut border) = border
             && !matches!(
                 dimension,
                 ResourceDimension::TextureCube | ResourceDimension::TextureCubeArray
@@ -976,6 +1069,9 @@ impl Writer<'_> {
                 .iter()
                 .find(|format| format.slot == slot)
         {
+            if narrow {
+                border.axes[1] = false;
+            }
             sample = self.border_sample(border::BorderSample {
                 sampler: border,
                 format: *format,
@@ -1029,12 +1125,12 @@ impl Writer<'_> {
         format!("vec4<f32>({channels})")
     }
 
-    fn clamped_sampler(&mut self, slot: u32, minimum: f32) -> String {
-        let bits = Some(minimum.to_bits());
+    fn sampler_variant(&mut self, slot: u32, bits: Option<u32>, point: bool) -> String {
         if let Some(location) = self.locations.iter().find(|location| {
             location.register == Register::Sampler
                 && location.slot == slot
                 && location.sampler_min_lod_bits == bits
+                && location.point_sampler == point
         }) {
             return format!("dx_s{}", location.binding);
         }
@@ -1042,7 +1138,9 @@ impl Writer<'_> {
             + self
                 .locations
                 .iter()
-                .filter(|location| location.sampler_min_lod_bits.is_some())
+                .filter(|location| {
+                    location.sampler_min_lod_bits.is_some() || location.point_sampler
+                })
                 .count() as u32;
         self.locations.push(BindingLocation {
             register: Register::Sampler,
@@ -1050,16 +1148,18 @@ impl Writer<'_> {
             group: 2,
             binding,
             sampler_min_lod_bits: bits,
+            point_sampler: point,
         });
         format!("dx_s{binding}")
     }
 
     pub(super) fn clamped_sampler_declarations(&mut self) {
         for location in &self.locations {
-            if location.sampler_min_lod_bits.is_some() {
+            if location.sampler_min_lod_bits.is_some() || location.point_sampler {
                 let binding = location.binding;
-                let ty = if self.bindings[&(Register::Sampler, location.slot)]
-                    == BindingKind::Sampler(SamplerMode::Comparison)
+                let ty = if !location.point_sampler
+                    && self.bindings[&(Register::Sampler, location.slot)]
+                        == BindingKind::Sampler(SamplerMode::Comparison)
                 {
                     "sampler_comparison"
                 } else {
@@ -1186,7 +1286,10 @@ impl Writer<'_> {
         texture: &str,
         dimension: ResourceDimension,
     ) -> String {
-        let multisampled = dimension == ResourceDimension::Texture2DMs;
+        let multisampled = matches!(
+            dimension,
+            ResourceDimension::Texture2DMs | ResourceDimension::Texture2DMsArray
+        );
         let count = if multisampled {
             "1u".into()
         } else {
@@ -1202,17 +1305,20 @@ impl Writer<'_> {
         self.line(&format!("var {name} = vec4<u32>(0u, 0u, 0u, {count});"));
         self.open(&format!("if {level} < {count}"));
         let dimensions = match dimension {
-            ResourceDimension::Texture1D => format!("vec3<u32>({size}, 0u, 0u)"),
+            ResourceDimension::Texture1D => format!("vec3<u32>({size}.x, 0u, 0u)"),
+            ResourceDimension::Texture1DArray => {
+                format!("vec3<u32>({size}.x, textureNumLayers({texture}), 0u)")
+            }
             ResourceDimension::Texture3D => size,
-            ResourceDimension::Texture2DArray | ResourceDimension::TextureCubeArray => {
+            ResourceDimension::Texture2DArray
+            | ResourceDimension::Texture2DMsArray
+            | ResourceDimension::TextureCubeArray => {
                 format!("vec3<u32>({size}, textureNumLayers({texture}))")
             }
             ResourceDimension::Texture2D
             | ResourceDimension::Texture2DMs
             | ResourceDimension::TextureCube
             | ResourceDimension::Buffer
-            | ResourceDimension::Texture1DArray
-            | ResourceDimension::Texture2DMsArray
             | ResourceDimension::RawBuffer
             | ResourceDimension::StructuredBuffer => format!("vec3<u32>({size}, 0u)"),
         };
@@ -1230,7 +1336,13 @@ impl Writer<'_> {
                 }
             };
             let x = axis('x', true);
-            let y = axis('y', dimension != ResourceDimension::Texture1D);
+            let y = axis(
+                'y',
+                !matches!(
+                    dimension,
+                    ResourceDimension::Texture1D | ResourceDimension::Texture1DArray
+                ),
+            );
             let z = axis('z', dimension == ResourceDimension::Texture3D);
             format!("bitcast<vec4<u32>>(vec4<f32>({x}, {y}, {z}, f32({name}.w)))")
         } else {
@@ -1241,14 +1353,14 @@ impl Writer<'_> {
 
 fn storage_dimension(dimension: ResourceDimension) -> Option<&'static str> {
     match dimension {
-        ResourceDimension::Texture1D => Some("1d"),
+        ResourceDimension::Texture1D => Some("2d"),
+        ResourceDimension::Texture1DArray => Some("2d_array"),
         ResourceDimension::Texture2D => Some("2d"),
         ResourceDimension::Texture2DArray => Some("2d_array"),
         ResourceDimension::Texture3D => Some("3d"),
         ResourceDimension::Buffer
         | ResourceDimension::Texture2DMs
         | ResourceDimension::TextureCube
-        | ResourceDimension::Texture1DArray
         | ResourceDimension::Texture2DMsArray
         | ResourceDimension::TextureCubeArray
         | ResourceDimension::RawBuffer

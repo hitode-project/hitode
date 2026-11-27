@@ -25,6 +25,8 @@ bitflags::bitflags! {
         /// `DontCare`. Falls back to ordinary memory without
         /// [`crate::Features::TRANSIENT_ATTACHMENTS`].
         const TRANSIENT = 1 << 6;
+        /// Color attachment read by ordered fragment blending.
+        const INPUT_COLOR = 1 << 7;
     }
 }
 
@@ -76,12 +78,37 @@ impl Image {
     /// image declared in [`ImageDesc::view_formats`]. A8 images also provide
     /// the identity R8 view for attachment and storage writes.
     pub fn create_view(&self, desc: &ViewDesc) -> Result<ImageView> {
-        self.inner.create_view(desc)
+        self.inner.create_view(desc, ViewLayout::default())
+    }
+    /// Override the default view layout for a shader's declared resource type.
+    pub fn create_view_with_layout(
+        &self,
+        desc: &ViewDesc,
+        layout: ViewLayout,
+    ) -> Result<ImageView> {
+        self.inner.create_view(desc, layout)
     }
     /// Identity of the allocation, equal for every clone and view.
     pub fn id(&self) -> u64 {
         self.inner.id()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewLayout {
+    /// Keep a one-layer slice arrayed when the shader declares an array.
+    pub array: bool,
+    pub components: ViewComponents,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewComponents {
+    #[default]
+    Identity,
+    /// Read RGB from the allocation and supply a constant alpha of one.
+    Rgb,
+    /// Read alpha from the allocation and supply zero for RGB.
+    Alpha,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

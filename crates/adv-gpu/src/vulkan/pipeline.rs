@@ -1,4 +1,5 @@
 use super::*;
+use arrayvec::ArrayVec;
 use ash::vk::Handle;
 use std::hash::{Hash, Hasher};
 
@@ -69,6 +70,7 @@ struct PipelinePassKey {
     depth: Option<Format>,
     samples: u32,
     slots: u8,
+    reads: u8,
 }
 
 #[derive(Default)]
@@ -76,6 +78,7 @@ pub(super) struct Pipelines {
     render: HashMap<RenderKey, Arc<Compiled>>,
     compute: HashMap<ComputeKey, Arc<Compiled>>,
     passes: HashMap<PipelinePassKey, vk::RenderPass>,
+    input_layouts: HashMap<u8, vk::DescriptorSetLayout>,
 }
 /// A driver pipeline and what binding needs from it, resolved once. Lives
 /// in the device's cache until the device drops.
@@ -93,9 +96,36 @@ pub(super) struct Compiled {
     pub(super) indexed_set: bool,
     /// Bindless tier: uniform slots, one bit each.
     pub(super) uniforms: u64,
+    pub(super) ordered: Option<OrderedColor>,
     #[cfg(target_os = "android")]
     pub(super) video: Option<(u32, Arc<VideoPool>)>,
 }
+
+#[derive(Clone, Copy)]
+pub(super) struct OrderedColor {
+    pub(super) reads: u8,
+    pub(super) set: u32,
+    pub(super) layout: vk::DescriptorSetLayout,
+    pub(super) push_offset: u32,
+}
+
+pub(super) fn input_attachments(
+    colors: &[vk::AttachmentReference],
+    reads: u8,
+) -> ArrayVec<vk::AttachmentReference, 8> {
+    colors
+        .iter()
+        .enumerate()
+        .map(|(slot, &color)| {
+            if reads & (1 << slot) != 0 {
+                color
+            } else {
+                unused_attachment()
+            }
+        })
+        .collect()
+}
+
 impl Pipelines {
     pub(super) fn destroy(&mut self, device: &ash::Device) {
         unsafe {
@@ -109,6 +139,9 @@ impl Pipelines {
             for (_, pass) in self.passes.drain() {
                 device.destroy_render_pass(pass, None);
             }
+            for (_, layout) in self.input_layouts.drain() {
+                device.destroy_descriptor_set_layout(layout, None);
+            }
         }
         self.render.clear();
         self.compute.clear();
@@ -118,12 +151,14 @@ impl Pipelines {
         context: &Context,
         desc: &RenderPipelineDesc,
         slots: u8,
+        reads: u8,
     ) -> Result<vk::RenderPass> {
         let key = PipelinePassKey {
             colors: desc.colors.iter().map(|c| c.format).collect(),
             depth: desc.depth_stencil.map(|d| d.format),
             samples: desc.samples,
             slots,
+            reads,
         };
         if let Some(&pass) = self.passes.get(&key) {
             return Ok(pass);
@@ -159,6 +194,12 @@ impl Pipelines {
         let mut subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&colors);
+        let inputs = input_attachments(&colors, reads);
+        if reads != 0 {
+            subpass = subpass
+                .flags(vk::SubpassDescriptionFlags::RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_EXT)
+                .input_attachments(&inputs);
+        }
         if key.depth.is_some() {
             subpass = subpass.depth_stencil_attachment(&depth);
         }
@@ -173,12 +214,40 @@ impl Pipelines {
         self.passes.insert(key, pass);
         Ok(pass)
     }
+
+    fn input_layout(&mut self, context: &Context, reads: u8) -> Result<vk::DescriptorSetLayout> {
+        if let Some(&layout) = self.input_layouts.get(&reads) {
+            return Ok(layout);
+        }
+        let inputs: ArrayVec<_, 8> = color_slots(reads)
+            .map(|slot| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(slot as u32)
+                    .descriptor_count(1)
+                    .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            })
+            .collect();
+        let layout = context.result(unsafe {
+            context.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&inputs),
+                None,
+            )
+        })?;
+        self.input_layouts.insert(reads, layout);
+        Ok(layout)
+    }
 }
 #[derive(Clone)]
 pub(crate) struct RenderPipeline {
     pub(super) compiled: Arc<Compiled>,
     _context: Arc<Context>,
     pub(super) dynamic: Dynamic,
+}
+impl RenderPipeline {
+    pub(crate) fn attachment_reads(&self) -> u8 {
+        self.compiled.ordered.map_or(0, |ordered| ordered.reads)
+    }
 }
 #[derive(Clone)]
 pub(crate) struct ComputePipeline {
@@ -407,6 +476,7 @@ fn layouts(
     video: Option<&Arc<VideoPool>>,
     classic: bool,
     indexed_set: bool,
+    ordered: Option<OrderedColor>,
 ) -> Result<(vk::PipelineLayout, vk::DescriptorSetLayout)> {
     let (mut sets, own) = if let Some(heap) = context.heap.as_ref().filter(|_| !classic) {
         let count = bindings
@@ -466,13 +536,16 @@ fn layouts(
         }
         sets.push(video.resources.layout);
     }
+    if let Some(ordered) = ordered {
+        sets.push(ordered.layout);
+    }
     let push = [vk::PushConstantRange {
         stage_flags: vk::ShaderStageFlags::ALL,
         offset: 0,
         size: context.caps.limits.push_constant_bytes,
     }];
     let mut info = vk::PipelineLayoutCreateInfo::default().set_layouts(&sets);
-    if !classic && context.heap.is_some() {
+    if !classic && context.heap.is_some() || ordered.is_some() {
         info = info.push_constant_ranges(&push);
     }
     match context.result(unsafe { context.device.create_pipeline_layout(&info, None) }) {
@@ -545,12 +618,46 @@ impl Device {
                 let entries: Vec<&Entry> = std::iter::once(&desc.vertex)
                     .chain(&desc.fragment)
                     .collect();
-                let compiled =
-                    Arc::new(
-                        self.compile(&key.bindings, &entries, video, |layout, stages| {
-                            self.compile_render(desc, slots, layout, stages, cache, &mut pipelines)
-                        })?,
-                    );
+                let reads = if desc.samples == 1
+                    && desc
+                        .fragment
+                        .as_ref()
+                        .is_some_and(|ps| ps.shader.inner.compact())
+                {
+                    color_slots(slots)
+                        .zip(&desc.colors)
+                        .filter(|(_, color)| {
+                            color.blend.is_some()
+                                && self
+                                    .caps()
+                                    .format(color.format)
+                                    .contains(FormatCaps::ORDERED_BLEND)
+                        })
+                        .fold(0, |mask, (slot, _)| mask | 1 << slot)
+                } else {
+                    0
+                };
+                let ordered = if reads != 0 {
+                    Some((desc, slots, reads, pipelines.input_layout(&self.0, reads)?))
+                } else {
+                    None
+                };
+                let compiled = Arc::new(self.compile(
+                    &key.bindings,
+                    &entries,
+                    video,
+                    ordered,
+                    |layout, stages| {
+                        self.compile_render(
+                            desc,
+                            (slots, reads),
+                            layout,
+                            stages,
+                            cache,
+                            &mut pipelines,
+                        )
+                    },
+                )?);
                 pipelines.render.insert(key, compiled.clone());
                 compiled
             }
@@ -580,21 +687,23 @@ impl Device {
                     Some(cache) => cache.handle(&self.0)?,
                     None => vk::PipelineCache::null(),
                 };
-                let compiled =
-                    Arc::new(
-                        self.compile(&key.1, &[&desc.entry], None, |layout, stages| {
-                            let info = vk::ComputePipelineCreateInfo::default()
-                                .stage(stages[0])
-                                .layout(layout);
-                            let created = unsafe {
-                                self.0.device.create_compute_pipelines(cache, &[info], None)
-                            };
-                            self.0.result_in(
-                                created.map(|h| h[0]).map_err(|(_, error)| error),
-                                &format!("compute pipeline: {}", desc.label),
-                            )
-                        })?,
-                    );
+                let compiled = Arc::new(self.compile(
+                    &key.1,
+                    &[&desc.entry],
+                    None,
+                    None,
+                    |layout, stages| {
+                        let info = vk::ComputePipelineCreateInfo::default()
+                            .stage(stages[0])
+                            .layout(layout);
+                        let created =
+                            unsafe { self.0.device.create_compute_pipelines(cache, &[info], None) };
+                        self.0.result_in(
+                            created.map(|h| h[0]).map_err(|(_, error)| error),
+                            &format!("compute pipeline: {}", desc.label),
+                        )
+                    },
+                )?);
                 pipelines.compute.insert(key, compiled.clone());
                 compiled
             }
@@ -613,6 +722,7 @@ impl Device {
         bindings: &[Binding],
         entries: &[&Entry],
         video: Option<&Arc<VideoPool>>,
+        ordered: Option<(&RenderPipelineDesc, u8, u8, vk::DescriptorSetLayout)>,
         build: impl FnOnce(
             vk::PipelineLayout,
             &[vk::PipelineShaderStageCreateInfo<'_>],
@@ -627,7 +737,7 @@ impl Device {
                 let slots = self
                     .0
                     .max_heap_uniform_slots
-                    .saturating_sub(u32::from(video.is_some()));
+                    .saturating_sub(u32::from(video.is_some() || ordered.is_some()));
                 bindings
                     .iter()
                     .all(|b| b.kind != BindingKind::UniformBuffer || b.slot < slots)
@@ -638,11 +748,46 @@ impl Device {
                     strides.extend(entry.shader.inner.storage_strides(entry.index));
                 }
                 let bytes = self.0.caps.limits.push_constant_bytes;
+                let bytes = if ordered.is_some() {
+                    (bytes - 16) & !15
+                } else {
+                    bytes
+                };
                 binding::PushLayout::new(bindings, heap, bytes, &strides)
             });
         let heap = push.is_some();
         let push = push.unwrap_or_default();
         let mut bindings = bindings.to_vec();
+        let ordered_layout = ordered.map(|(_, _, reads, layout)| {
+            let uniforms = bindings
+                .iter()
+                .filter(|b| b.kind == BindingKind::UniformBuffer)
+                .map(|b| b.slot + 1)
+                .max()
+                .unwrap_or(0);
+            OrderedColor {
+                reads,
+                set: 1 + if heap { uniforms } else { 0 },
+                layout,
+                push_offset: if heap {
+                    (self.0.caps.limits.push_constant_bytes - 16) & !15
+                } else {
+                    0
+                },
+            }
+        });
+        let blend = ordered
+            .zip(ordered_layout)
+            .map(
+                |((desc, slots, reads, _), pass)| crate::shader::blend::AttachmentBlend {
+                    colors: &desc.colors,
+                    slots,
+                    reads,
+                    alpha_to_coverage: desc.alpha_to_coverage,
+                    set: pass.set,
+                    push_offset: pass.push_offset,
+                },
+            );
         let compact = entries.iter().all(|e| e.shader.inner.compact());
         let indexed_set = !heap
             && compact
@@ -683,9 +828,14 @@ impl Device {
         let modules = entries
             .iter()
             .map(|e| {
-                e.shader
-                    .inner
-                    .stage(e, &push, video.as_ref().map(|v| v.0), heap, &storage_window)
+                e.shader.inner.stage(
+                    e,
+                    &push,
+                    video.as_ref().map(|v| v.0),
+                    heap,
+                    &storage_window,
+                    blend,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let stages: Vec<_> = modules.iter().map(|m| m.info()).collect();
@@ -695,6 +845,7 @@ impl Device {
             video.as_ref().map(|v| &v.1),
             classic,
             indexed_set,
+            ordered_layout,
         )?;
         let handle = match build(layout, &stages) {
             Ok(handle) => handle,
@@ -724,6 +875,7 @@ impl Device {
             classic,
             indexed_set,
             uniforms,
+            ordered: ordered_layout,
             #[cfg(target_os = "android")]
             video,
         })
@@ -731,7 +883,7 @@ impl Device {
     fn compile_render(
         &self,
         desc: &RenderPipelineDesc,
-        slots: u8,
+        (slots, reads): (u8, u8),
         layout: vk::PipelineLayout,
         stages: &[vk::PipelineShaderStageCreateInfo<'_>],
         cache: vk::PipelineCache,
@@ -758,7 +910,7 @@ impl Device {
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::from_raw(desc.samples))
-            .alpha_to_coverage_enable(desc.alpha_to_coverage);
+            .alpha_to_coverage_enable(desc.alpha_to_coverage && reads & 1 == 0);
         let mut depth = vk::PipelineDepthStencilStateCreateInfo::default();
         if let Some(d) = desc.depth_stencil {
             depth = depth
@@ -778,7 +930,7 @@ impl Device {
         for (slot, c) in color_slots(slots).zip(&desc.colors) {
             let mut attachment = vk::PipelineColorBlendAttachmentState::default()
                 .color_write_mask(vk::ColorComponentFlags::from_raw(c.write_mask as u32));
-            if let Some((rgb, alpha)) = c.blend {
+            if let Some((rgb, alpha)) = c.blend.filter(|_| reads & (1 << slot) == 0) {
                 attachment = attachment
                     .blend_enable(true)
                     .src_color_blend_factor(factor(rgb.src))
@@ -791,7 +943,12 @@ impl Device {
             attachments[slot] = attachment;
             formats[slot] = formats::vk(c.format);
         }
-        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+        let mut blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+        if reads != 0 {
+            blend = blend.flags(
+                vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT,
+            );
+        }
         let mut dynamic = vec![
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
@@ -838,10 +995,10 @@ impl Device {
             .color_blend_state(&blend)
             .dynamic_state(&dynamic)
             .layout(layout);
-        if modern.contains(Modern::DYNAMIC_RENDERING) {
+        if modern.contains(Modern::DYNAMIC_RENDERING) && reads == 0 {
             info = info.push_next(&mut rendering);
         } else {
-            info = info.render_pass(pipelines.compatible_pass(context, desc, slots)?);
+            info = info.render_pass(pipelines.compatible_pass(context, desc, slots, reads)?);
         }
         let created = unsafe {
             context

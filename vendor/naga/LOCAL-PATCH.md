@@ -77,7 +77,13 @@ diff --git a/naga/src/back/msl/writer.rs b/naga/src/back/msl/writer.rs
              }
 ```
 
-## SPIR-V texture atomics
+## Texture atomics
+
+The WGSL front end can return the previous texel from a storage-image atomic.
+It supports exchange and strong compare-exchange for R32 integer images.
+SPIR-V also supports exchange for R32 float images when the device enables
+floating-point image atomics. MSL retries a weak compare-exchange after a
+spurious failure to preserve strong compare-exchange semantics.
 
 The SPIR-V writer passes the selected descriptor element pointer to
 `OpImageTexelPointer` when an atomic targets a storage texture in a binding
