@@ -1,4 +1,4 @@
-//! Pack both depth/stencil aspects into their guest-visible D24S8 layout.
+//! Pack separate depth and stencil aspects into their guest-visible layout.
 
 use super::*;
 use adv_device::gpu::{DispatchArguments, ImageRegion, ModernShader, SlotBindings, StorageBinding};
@@ -11,6 +11,7 @@ pub(super) fn pack(
     rect: Rect,
     pitch: u32,
     buffer: Buffer,
+    d24: bool,
 ) -> Result<(), Error> {
     const PACK: &str = r#"
 struct Region {
@@ -26,9 +27,16 @@ struct Region {
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy >= region.rect.zw) { return; }
     let at = vec2<i32>(id.xy + region.rect.xy);
-    let d = u32(round(textureLoad(depth, at, 0) * 16777215.0));
+    let depth_value = textureLoad(depth, at, 0);
     let s = textureLoad(stencil, at, 0).g;
-    packed[id.y * region.stride.x + id.x] = d | (s << 24u);
+    let row = id.y * region.stride.x;
+    if region.stride.y != 0u {
+        let d = u32(round(depth_value * 16777215.0));
+        packed[row + id.x] = d | (s << 24u);
+    } else {
+        packed[row + 2u * id.x] = bitcast<u32>(depth_value);
+        packed[row + 2u * id.x + 1u] = s;
+    }
 }
 "#;
     let shader = Arc::new(ModernShader::wgsl(
@@ -47,7 +55,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             format: None,
         })
     };
-    let params = [[rect.x, rect.y, rect.w, rect.h], [pitch / 4, 0, 0, 0]];
+    let params = [
+        [rect.x, rect.y, rect.w, rect.h],
+        [pitch / 4, u32::from(d24), 0, 0],
+    ];
     let uniform = resource::upload(gpu, bytemuck::bytes_of(&params), BufferUsage::UNIFORM, 32)?;
     let size = buffer.desc().size;
     gpu.dispatch(

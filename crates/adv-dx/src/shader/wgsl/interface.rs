@@ -151,12 +151,24 @@ impl Writer<'_> {
             self.open(&format!("{attrib} fn {entry}({args}){returns}"));
             let mut result: Vec<_> = outputs
                 .iter()
-                .map(|field| match field.register {
-                    "" => format!("{sample_mask}u"),
-                    "o_coverage" if sample_mask != u32::MAX => {
-                        format!("o_coverage.x & {sample_mask}u")
+                .map(|field| {
+                    let value = match field.register {
+                        "" => format!("{sample_mask}u"),
+                        "o_coverage" if sample_mask != u32::MAX => {
+                            format!("o_coverage.x & {sample_mask}u")
+                        }
+                        _ => field.output(),
+                    };
+                    let alpha = self.stage == Stage::Pixel
+                        && (0..8).any(|slot| {
+                            self.options.alpha_targets & (1 << slot) != 0
+                                && field.attribute == format!("@location({slot})")
+                        });
+                    if alpha {
+                        format!("({value}).wyzw")
+                    } else {
+                        value
                     }
-                    _ => field.output(),
                 })
                 .collect();
             if let Some(variant) = variant_outputs {

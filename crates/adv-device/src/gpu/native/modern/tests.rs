@@ -167,6 +167,101 @@ fn read_image(gpu: &mut Gpu, image: &Image, mip: u32, bpp: u32) -> Vec<u8> {
     mapped(&buffer)[..(pitch * rows) as usize].to_vec()
 }
 
+// spec: GFX-CAP-5
+#[test]
+fn image_filter_downsamples_and_resolves_with_point_loads() {
+    let Some(mut gpu) = executor() else { return };
+    let format = Format::R32Float;
+    let texture = image(
+        &gpu,
+        4,
+        2,
+        format,
+        1,
+        2,
+        Usage::SAMPLED | Usage::STORAGE | Usage::COPY_DST | Usage::COPY_SRC,
+    );
+    upload(
+        &mut gpu,
+        &texture,
+        0,
+        16,
+        2,
+        bytemuck::bytes_of(&[0f32, 2., 4., 6., 8., 10., 12., 14.]),
+    );
+    let view = |mip| {
+        texture
+            .create_view(&ViewDesc {
+                format: None,
+                dimension: None,
+                mips: mip..mip + 1,
+                layers: 0..1,
+                plane: 0,
+            })
+            .unwrap()
+    };
+    let mip = gpu.prepare_image_filter(format, false, false).unwrap();
+    gpu.dispatch(
+        &mip,
+        &SlotBindings {
+            images: vec![Some(view(0))],
+            storage: vec![Some(StorageBinding::Image(view(1)))],
+            ..Default::default()
+        },
+        DispatchArguments::Direct([1, 1, 1]),
+    )
+    .unwrap();
+    assert_eq!(
+        read_image(&mut gpu, &texture, 1, 4),
+        bytemuck::bytes_of(&[5f32, 9.])
+    );
+
+    if gpu.device().caps().format_sample_counts(format) & 4 != 0 {
+        let source = image(&gpu, 2, 1, format, 4, 1, Usage::COLOR | Usage::SAMPLED);
+        let mut draw = draw(
+            2,
+            1,
+            shader(TRIANGLE, Stage::Vertex),
+            shader(
+                "@fragment fn main(@builtin(sample_index) i: u32) -> @location(0) f32 { return f32(i) * 0.125; }",
+                Stage::Fragment,
+            ),
+            [color(&source, Load::DontCare)],
+        );
+        draw.samples = 4;
+        simple(&mut gpu, draw);
+        let resolve = gpu.prepare_image_filter(format, false, true).unwrap();
+        gpu.dispatch(
+            &resolve,
+            &SlotBindings {
+                images: vec![Some(source.view().clone())],
+                storage: vec![Some(StorageBinding::Image(view(1)))],
+                ..Default::default()
+            },
+            DispatchArguments::Direct([1, 1, 1]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_image(&mut gpu, &texture, 1, 4),
+            bytemuck::bytes_of(&[0.1875f32; 2])
+        );
+        let packed = target(&gpu, 2, 1, Format::Bgra8Unorm);
+        gpu.draw_modern(
+            ModernDraw::packed_resolve(packed.view().clone(), [31, 31, 31, 1]).unwrap(),
+            &SlotBindings::default(),
+            &SlotBindings {
+                images: vec![Some(source.view().clone())],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_image(&mut gpu, &packed, 0, 4),
+            [0, 0, 49, 255, 0, 0, 49, 255]
+        );
+    }
+}
+
 fn oracle(name: &str, row: usize) -> impl Iterator<Item = &'static str> {
     let prefix = format!("{name}\t{row}\t");
     PROBES

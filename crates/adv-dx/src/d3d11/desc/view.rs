@@ -270,6 +270,13 @@ impl View {
             desc.format = source.format;
         }
         let target = format_layout(desc.format).ok_or(Error::InvalidArgument)?;
+        if shader
+            && resource.bind().contains(Bind::DEPTH_STENCIL)
+            && matches!(source.format, 39 | 53)
+            && !matches!((source.format, target.format), (39, 41) | (53, 56))
+        {
+            return Err(Error::InvalidArgument);
+        }
         if (source.format != target.format
             && !(typeless && source.cast_family.contains(&target.format)))
             || (target.type_level != TypeLevel::FullType && target.parent == target.format)
@@ -401,6 +408,12 @@ impl View {
 
     pub fn kind(&self) -> ViewKind {
         self.kind
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn arrayed(&self) -> bool {
+        let dimension = self.desc.dimension + i32::from(self.kind == ViewKind::DepthStencil);
+        matches!(dimension, 3 | 5 | 7 | 10)
     }
 
     pub fn format(&self) -> u32 {

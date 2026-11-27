@@ -139,6 +139,8 @@ pub(crate) mod health;
 mod metal;
 #[cfg(all(feature = "backend", target_vendor = "apple"))]
 use metal as imp;
+#[cfg(all(feature = "backend", target_vendor = "apple"))]
+pub use metal::MetalFamily;
 #[cfg(all(feature = "backend", not(target_vendor = "apple")))]
 mod vulkan;
 #[cfg(all(feature = "backend", not(target_vendor = "apple")))]

@@ -52,6 +52,7 @@ impl Shader {
         video_set: Option<u32>,
         heap: bool,
         storage_window: &[u32],
+        blend: Option<crate::shader::blend::AttachmentBlend<'_>>,
     ) -> Result<ShaderStage<'a>> {
         let (module, temporary) = if let Some(shader) = &self.0.pipeline {
             let mut module = shader.module.clone();
@@ -93,21 +94,34 @@ impl Shader {
             if !storage_window.is_empty() {
                 naga::compact::compact(&mut module, naga::compact::KeepUnused::No);
             }
+            let name = self.0.entries[entry.index as usize].0.to_str().unwrap();
+            let blend = blend.filter(|_| entry.stage == Stage::Fragment);
+            if let Some(blend) = blend {
+                let heap_push = heap.then(|| {
+                    module
+                        .global_variables
+                        .iter()
+                        .find_map(|(handle, global)| {
+                            (global.space == naga::AddressSpace::Immediate).then_some(handle)
+                        })
+                        .unwrap()
+                });
+                crate::shader::blend::specialize(&mut module, name, blend, heap_push);
+            }
             let mut words = lower(
                 &module,
                 Some(&naga::back::spv::PipelineOptions {
                     shader_stage: naga_stage(entry.stage),
-                    entry_point: self.0.entries[entry.index as usize]
-                        .0
-                        .to_str()
-                        .unwrap()
-                        .into(),
+                    entry_point: name.into(),
                 }),
                 heap,
                 self.0.context.caps.ieee_f32,
             )?;
             if has_video {
                 combine_video_sampler(&mut words, video_set.unwrap());
+            }
+            if let Some(blend) = blend {
+                crate::shader::blend::input_attachments(&mut words, blend.set);
             }
             (
                 self.0.context.result_in(

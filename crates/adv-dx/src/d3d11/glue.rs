@@ -703,7 +703,17 @@ pub fn configure_gpu<B: Backend>(
     gpu: adv_device::gpu::Gpu,
     paths: super::caps::Coverage<'_>,
 ) {
-    configure_devices(machine, gpu.device().caps(), paths);
+    let caps = gpu.device().caps();
+    let production = super::caps::production_formats(caps);
+    let formats = production.iter().map(|row| row.path()).collect::<Vec<_>>();
+    configure_devices(
+        machine,
+        caps,
+        super::caps::Coverage {
+            formats: &formats,
+            ..paths
+        },
+    );
     machine.ext.get_mut::<State>().execution = Some(gpu::Execution::new(gpu));
 }
 

@@ -390,6 +390,18 @@ impl State {
                 source,
                 destination,
             } => encoder.copy_image(source.copy(), destination.copy(), source.extent),
+            CopyImageBits {
+                source,
+                scratch,
+                destination,
+            } => {
+                encoder.copy_image_to_buffer(source.copy(), scratch.copy(), source.extent);
+                encoder.copy_buffer_to_image(
+                    scratch.copy(),
+                    destination.copy(),
+                    destination.extent,
+                );
+            }
             Upload {
                 source,
                 destination,
@@ -496,6 +508,13 @@ impl State {
                 for binding in &work.bindings {
                     binding.retain_uniform(&mut self.uniforms);
                 }
+                for alias in work
+                    .bindings
+                    .iter()
+                    .filter_map(modern::BoundSlot::image_alias)
+                {
+                    alias.copy(self.encoder(), false);
+                }
                 let mut pass = self
                     .encoder()
                     .compute_pass(&adv_gpu::encode::ComputePassDesc {
@@ -511,6 +530,14 @@ impl State {
                     modern::DispatchArguments::Indirect(buffer) => {
                         pass.dispatch_indirect(buffer.buffer.slice(buffer.range));
                     }
+                }
+                drop(pass);
+                for alias in work
+                    .bindings
+                    .iter()
+                    .filter_map(modern::BoundSlot::image_alias)
+                {
+                    alias.copy(self.encoder(), true);
                 }
             }
             Command::Resolve {
@@ -1099,11 +1126,15 @@ pub(super) fn draw_modern_pass(
 ) {
     #[cfg(target_vendor = "apple")]
     let _ = statistics;
+    let aliases = || fragment.iter().filter_map(modern::BoundSlot::image_alias);
+    for alias in aliases() {
+        alias.copy(encoder, false);
+    }
     let desc = pass::modern_attachments(draw, chunk);
-    let mut pass = match draw.color_slots {
-        Some(slots) => encoder.render_pass_slots(&desc, slots),
-        None => encoder.render_pass(&desc),
-    };
+    let slots = draw
+        .color_slots
+        .unwrap_or_else(|| ((1u16 << desc.colors.len()) - 1) as u8);
+    let mut pass = encoder.render_pass_for_pipeline(&desc, slots, pipeline);
     pass.set_pipeline(pipeline);
     let [x, y, w, h, min, max] = draw.viewport;
     pass.set_viewport(x, y, w, h, min, max);
@@ -1153,6 +1184,10 @@ pub(super) fn draw_modern_pass(
     }
     if draw.occlusion.is_some() {
         pass.end_occlusion();
+    }
+    drop(pass);
+    for alias in aliases() {
+        alias.copy(encoder, true);
     }
 }
 

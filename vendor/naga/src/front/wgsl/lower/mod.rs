@@ -3270,9 +3270,17 @@ impl<'source, 'temp> Lowerer<'source, 'temp> {
                     );
                     return Ok(Some((result, MustUse::No)));
                 }
-                "textureAtomicMin" | "textureAtomicMax" | "textureAtomicAdd"
-                | "textureAtomicAnd" | "textureAtomicOr" | "textureAtomicXor" => {
-                    let mut args = ctx.prepare_args(arguments, 3, function_span);
+                "textureAtomicMin"
+                | "textureAtomicMax"
+                | "textureAtomicAdd"
+                | "textureAtomicAnd"
+                | "textureAtomicOr"
+                | "textureAtomicXor"
+                | "textureAtomicExchange"
+                | "textureAtomicCompareExchange" => {
+                    let comparing = function_name == "textureAtomicCompareExchange";
+                    let mut args =
+                        ctx.prepare_args(arguments, 3 + u32::from(comparing), function_span);
 
                     let image = args.next()?;
                     let image_span = ctx.ast_expressions.get_span(image);
@@ -3288,31 +3296,49 @@ impl<'source, 'temp> Lowerer<'source, 'temp> {
                         })
                         .transpose()?;
 
+                    let compare = comparing
+                        .then(|| self.expression(args.next()?, ctx))
+                        .transpose()?;
                     let value = self.expression(args.next()?, ctx)?;
-
                     args.finish()?;
 
-                    let rctx = ctx.runtime_expression_ctx(function_span)?;
-                    rctx.block
-                        .extend(rctx.emitter.finish(&rctx.function.expressions));
-                    rctx.emitter.start(&rctx.function.expressions);
-                    let stmt = ir::Statement::ImageAtomic {
-                        image,
-                        coordinate,
-                        array_index,
-                        fun: match function_name {
-                            "textureAtomicMin" => ir::AtomicFunction::Min,
-                            "textureAtomicMax" => ir::AtomicFunction::Max,
-                            "textureAtomicAdd" => ir::AtomicFunction::Add,
-                            "textureAtomicAnd" => ir::AtomicFunction::And,
-                            "textureAtomicOr" => ir::AtomicFunction::InclusiveOr,
-                            "textureAtomicXor" => ir::AtomicFunction::ExclusiveOr,
-                            _ => unreachable!(),
-                        },
-                        value,
+                    let result = if is_statement {
+                        let rctx = ctx.runtime_expression_ctx(function_span)?;
+                        rctx.block
+                            .extend(rctx.emitter.finish(&rctx.function.expressions));
+                        rctx.emitter.start(&rctx.function.expressions);
+                        None
+                    } else {
+                        let ty = ctx.register_type(value)?;
+                        Some(ctx.interrupt_emitter(
+                            ir::Expression::AtomicResult {
+                                ty,
+                                comparison: false,
+                            },
+                            function_span,
+                        )?)
                     };
-                    rctx.block.push(stmt, function_span);
-                    return Ok(None);
+                    let rctx = ctx.runtime_expression_ctx(function_span)?;
+                    rctx.block.push(
+                        ir::Statement::ImageAtomic {
+                            image,
+                            coordinate,
+                            array_index,
+                            fun: match function_name {
+                                "textureAtomicMin" => ir::AtomicFunction::Min,
+                                "textureAtomicMax" => ir::AtomicFunction::Max,
+                                "textureAtomicAdd" => ir::AtomicFunction::Add,
+                                "textureAtomicAnd" => ir::AtomicFunction::And,
+                                "textureAtomicOr" => ir::AtomicFunction::InclusiveOr,
+                                "textureAtomicXor" => ir::AtomicFunction::ExclusiveOr,
+                                _ => ir::AtomicFunction::Exchange { compare },
+                            },
+                            value,
+                            result,
+                        },
+                        function_span,
+                    );
+                    return Ok(result.map(|result| (result, MustUse::No)));
                 }
                 "storageBarrier" => {
                     ctx.prepare_args(arguments, 0, function_span).finish()?;

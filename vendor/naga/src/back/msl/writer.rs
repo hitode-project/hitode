@@ -1580,22 +1580,59 @@ impl<W: Write> Writer<W> {
         image: Handle<crate::Expression>,
         address: &TexelAddress,
         fun: crate::AtomicFunction,
-        value: Handle<crate::Expression>,
+        (value, result): (Handle<crate::Expression>, Option<Handle<crate::Expression>>),
         context: &StatementContext,
     ) -> BackendResult {
-        write!(self.out, "{level}")?;
-        self.put_expression(image, &context.expression, false)?;
-        let op = if context.expression.resolve_type(value).scalar_width() == Some(8) {
-            fun.to_msl_64_bit()?
+        let ctx = &context.expression;
+        let value_ty = ctx.resolve_type(value);
+        if let crate::AtomicFunction::Exchange {
+            compare: Some(compare),
+        } = fun
+        {
+            let expected = self.namer.call("image_expected");
+            let vector = if value_ty.scalar_kind() == Some(crate::ScalarKind::Sint) {
+                "int4"
+            } else {
+                "uint4"
+            };
+            write!(self.out, "{level}{vector} {expected} = {vector}(")?;
+            self.put_expression(compare, ctx, true)?;
+            writeln!(self.out, ");")?;
+            write!(self.out, "{level}while (!")?;
+            self.put_expression(image, ctx, false)?;
+            write!(self.out, ".atomic_compare_exchange_weak(")?;
+            self.put_image_atomic_address(address, ctx)?;
+            write!(self.out, ", &{expected}, {vector}(")?;
+            self.put_expression(value, ctx, true)?;
+            write!(self.out, ")) && {expected}.x == ")?;
+            self.put_expression(compare, ctx, true)?;
+            writeln!(self.out, ") {{}}")?;
+            if let Some(result) = result {
+                let name = Baked(result).to_string();
+                write!(self.out, "{level}")?;
+                self.start_baking_expression(result, ctx, &name)?;
+                writeln!(self.out, "{expected}.x;")?;
+                self.named_expressions.insert(result, name);
+            }
         } else {
-            fun.to_msl()
-        };
-        write!(self.out, ".atomic_{op}(")?;
-        // coordinates in IR are int, but Metal expects uint
-        self.put_cast_to_uint_scalar_or_vector(address.coordinate, &context.expression)?;
-        write!(self.out, ", ")?;
-        self.put_expression(value, &context.expression, true)?;
-        writeln!(self.out, ");")?;
+            write!(self.out, "{level}")?;
+            if let Some(result) = result {
+                let name = Baked(result).to_string();
+                self.start_baking_expression(result, ctx, &name)?;
+                self.named_expressions.insert(result, name);
+            }
+            self.put_expression(image, ctx, false)?;
+            let op = if value_ty.scalar_width() == Some(8) {
+                fun.to_msl_64_bit()?
+            } else {
+                fun.to_msl()
+            };
+            write!(self.out, ".atomic_{op}(")?;
+            self.put_image_atomic_address(address, ctx)?;
+            write!(self.out, ", ")?;
+            self.put_expression(value, ctx, true)?;
+            writeln!(self.out, "){};", if result.is_some() { ".x" } else { "" })?;
+        }
 
         // Workaround for Apple Metal TBDR driver bug: fragment shader atomic
         // texture writes randomly drop unless followed by a standard texture
@@ -1619,13 +1656,22 @@ impl<W: Write> Writer<W> {
         write!(self.out, "{x} == -99999) {{ ")?;
         self.put_expression(image, &context.expression, false)?;
         write!(self.out, ".write({zero_value}, ")?;
-        self.put_cast_to_uint_scalar_or_vector(address.coordinate, &context.expression)?;
-        if let Some(array_index) = address.array_index {
-            write!(self.out, ", ")?;
-            self.put_expression(array_index, &context.expression, true)?;
-        }
+        self.put_image_atomic_address(address, &context.expression)?;
         writeln!(self.out, "); }}")?;
 
+        Ok(())
+    }
+
+    fn put_image_atomic_address(
+        &mut self,
+        address: &TexelAddress,
+        context: &ExpressionContext,
+    ) -> BackendResult {
+        self.put_cast_to_uint_scalar_or_vector(address.coordinate, context)?;
+        if let Some(index) = address.array_index {
+            write!(self.out, ", ")?;
+            self.put_cast_to_uint_scalar_or_vector(index, context)?;
+        }
         Ok(())
     }
 
@@ -4283,6 +4329,7 @@ impl<W: Write> Writer<W> {
                     array_index,
                     fun,
                     value,
+                    result,
                 } => {
                     let address = TexelAddress {
                         coordinate,
@@ -4290,7 +4337,7 @@ impl<W: Write> Writer<W> {
                         sample: None,
                         level: None,
                     };
-                    self.put_image_atomic(level, image, &address, fun, value, context)?
+                    self.put_image_atomic(level, image, &address, fun, (value, result), context)?
                 }
                 crate::Statement::WorkGroupUniformLoad { pointer, result } => {
                     self.write_barrier(crate::Barrier::WORK_GROUP, level)?;

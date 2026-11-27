@@ -25,7 +25,7 @@ pub(super) use draw::{
     draw_indexed_instanced, draw_indirect, draw_instanced,
 };
 pub(super) use queries::{begin_query, end_query, get_data};
-use std::sync::mpsc::TryRecvError;
+use std::sync::{Arc, mpsc::TryRecvError};
 
 pub(super) struct Execution {
     gpu: Gpu,
@@ -189,7 +189,7 @@ pub(super) fn backing(
     let initial = object.take_initial_data();
     for (index, bytes) in initial.iter().enumerate() {
         let transfer = match (&backing, resource) {
-            (Backing::Buffer(buffer), Resource::Buffer(_)) => ModernTransfer::CopyBuffer {
+            (Backing::Buffer(buffer), Resource::Buffer(_)) => Some(ModernTransfer::CopyBuffer {
                 source: BufferRange {
                     buffer: resource::upload(
                         &execution.gpu,
@@ -201,14 +201,20 @@ pub(super) fn backing(
                 },
                 destination: buffer.clone(),
                 offset: 0,
-            },
-            (Backing::Image(image), Resource::Texture(texture)) => {
-                let destination = resource::region(image, texture, index as u32);
-                resource::texture_transfer(&execution.gpu, texture, destination, bytes)?
-            }
+            }),
+            (_, Resource::Texture(texture)) => backing.upload_texture(
+                &execution.gpu,
+                texture,
+                index as u32,
+                [0; 3],
+                texture.extent(index as u32 % texture.levels()),
+                bytes,
+            )?,
             _ => unreachable!(),
         };
-        execution.gpu.transfer(transfer)?;
+        if let Some(transfer) = transfer {
+            execution.gpu.transfer(transfer)?;
+        }
     }
     if map::coherent(resource) {
         let storage = object.mapping().unwrap();
@@ -338,10 +344,35 @@ pub(super) fn download(
             Resource::Buffer(_) => 1,
             Resource::Texture(texture) => u32::from(texture.format().aligned_unit_bytes),
         };
-        let row = rect.w * unit;
-        let pitch = row.next_multiple_of(256);
+        if let Backing::Blocks(blocks) = backing {
+            let row = rect.w * unit;
+            let packed = blocks.read(
+                subresource,
+                [rect.x * 4, rect.y * 4, slice],
+                [rect.w * 4, rect.h * 4, 1],
+            );
+            for (line, bytes) in packed.chunks_exact(row as usize).enumerate() {
+                let dst = layout.slice(base, slice)
+                    + (rect.y + line as u32) * layout.row_pitch()
+                    + rect.x * unit;
+                cpu.write(dst, bytes).map_err(|_| Error::InvalidArgument)?;
+            }
+            continue;
+        }
+        let physical_unit = match (backing, resource) {
+            (Backing::Image(image), Resource::Texture(texture)) => {
+                resource::transfer_unit(texture, image.desc().format)
+            }
+            _ => unit,
+        };
+        let row = rect.w * physical_unit;
+        let pitch = if let Backing::Image(image) = backing {
+            resource::CopyPitch::new(image.desc().format, row).pitch
+        } else {
+            row.next_multiple_of(256)
+        };
         let packed_depth = matches!(backing, Backing::Image(image)
-            if image.desc().format == adv_gpu::Format::Depth24UnormStencil8);
+            if image.desc().format.has_stencil());
         let buffer = execution.gpu.device().create_buffer(&BufferDesc {
             size: u64::from(pitch) * u64::from(rect.h),
             usage: if packed_depth {
@@ -354,12 +385,13 @@ pub(super) fn download(
         })?;
         match (backing, resource) {
             (Backing::Image(image), Resource::Texture(texture)) if packed_depth => {
-                depth24::pack(
+                depth_stencil::pack(
                     &mut execution.gpu,
                     resource::region(image, texture, subresource),
                     rect,
                     pitch,
                     buffer.clone(),
+                    texture.format().parent == 44,
                 )?;
             }
             _ => {
@@ -413,18 +445,25 @@ pub(super) fn download(
         // SAFETY: the transfer has finished and the readback allocation lives
         // through all copies into the guest shadow.
         let bytes = unsafe { readback.as_ref() };
+        let mut packed = Vec::new();
         for line in 0..rect.h {
             let src = (line * pitch) as usize;
             let dst =
                 layout.slice(base, slice) + (rect.y + line) * layout.row_pitch() + rect.x * unit;
-            cpu.write(dst, &bytes[src..src + row as usize])
-                .map_err(|_| Error::InvalidArgument)?;
+            let mut row = &bytes[src..src + row as usize];
+            if let (Backing::Image(image), Resource::Texture(texture)) = (backing, resource)
+                && (physical_unit != unit || image.desc().format == adv_gpu::Format::Abgr4Unorm)
+            {
+                resource::readback_row(texture, image.desc().format, row, &mut packed);
+                row = &packed;
+            }
+            cpu.write(dst, row).map_err(|_| Error::InvalidArgument)?;
         }
     }
     Ok(())
 }
 
-mod depth24;
+mod depth_stencil;
 
 pub(super) fn staging_access(
     env: &mut Env<'_>,
@@ -522,6 +561,15 @@ fn upload_shadow(
             (Backing::Image(image), Resource::Texture(texture)) => {
                 let destination = pixel_region(image, texture, subresource, shadow.slice, rect);
                 resource::texture_transfer(&execution.gpu, texture, destination, &bytes)?
+            }
+            (Backing::Blocks(blocks), Resource::Texture(_)) => {
+                blocks.write(
+                    subresource,
+                    [rect.x * 4, rect.y * 4, shadow.slice],
+                    [rect.w * 4, rect.h * 4, 1],
+                    &bytes,
+                );
+                continue;
             }
             _ => unreachable!(),
         };
@@ -631,6 +679,9 @@ impl Location {
                 Access::Write,
             )?;
         }
+        if matches!(backing, Backing::Blocks(_)) {
+            return Ok(());
+        }
         let execution = execution(env.ext)?;
         execution.barrier(Boundary::Map)?;
         let completion = execution.gpu.completion()?;
@@ -681,6 +732,24 @@ fn submit_copy(
     let whole = at == [0; 3] && size == destination.extent();
     let src = source.acquire(env, true)?;
     let dest = destination.acquire(env, !whole)?;
+    if let (
+        Backing::Blocks(src),
+        Backing::Blocks(dst),
+        Resource::Texture(from),
+        Resource::Texture(to),
+    ) = (&src, &dest, source.resource, destination.resource)
+    {
+        if from.format().parent != to.format().parent
+            || from.kind() != to.kind()
+            || !aligned_box(from, source.extent(), origin, size)
+            || !aligned_box(to, destination.extent(), at, size)
+        {
+            return Err(Error::InvalidArgument);
+        }
+        let bytes = src.read(source.subresource, origin, size);
+        dst.write(destination.subresource, at, size, &bytes);
+        return destination.written(env, &dest, whole);
+    }
     let transfer = match (&src, &dest, source.resource, destination.resource) {
         (
             Backing::Buffer(source),
@@ -709,7 +778,12 @@ fn submit_copy(
             Backing::Image(destination_image),
             Resource::Texture(from),
             Resource::Texture(to),
-        ) if from.format().parent == to.format().parent && from.samples() == to.samples() => {
+        ) if from.format().parent == to.format().parent
+            && from.kind() == to.kind()
+            && from.samples() == to.samples()
+            && aligned_box(from, source.extent(), origin, size)
+            && aligned_box(to, destination.extent(), at, size) =>
+        {
             let mut source_region = resource::region(source_image, from, source.subresource);
             source_region.origin = origin.into();
             source_region.extent = Extent {
@@ -721,9 +795,38 @@ fn submit_copy(
                 resource::region(destination_image, to, destination.subresource);
             destination_region.origin = at.into();
             destination_region.extent = source_region.extent;
-            ModernTransfer::CopyImage {
-                source: source_region,
-                destination: destination_region,
+            if source_image.desc().format.has_depth() != destination_image.desc().format.has_depth()
+            {
+                if from.samples() != 1 {
+                    return Err(Error::InvalidArgument);
+                }
+                let row = size[0] * u32::from(from.format().aligned_unit_bytes);
+                let row_pitch = row.next_multiple_of(256);
+                let rows = size[1];
+                let buffer = execution(env.ext)?
+                    .gpu
+                    .device()
+                    .create_buffer(&BufferDesc {
+                        size: u64::from(row_pitch) * u64::from(rows) * u64::from(size[2]),
+                        usage: BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
+                        memory: Memory::Device,
+                        label: "D3D11 depth/color bit copy",
+                    })?;
+                ModernTransfer::CopyImageBits {
+                    source: source_region,
+                    scratch: TransferBuffer {
+                        buffer,
+                        offset: 0,
+                        row_pitch,
+                        rows,
+                    },
+                    destination: destination_region,
+                }
+            } else {
+                ModernTransfer::CopyImage {
+                    source: source_region,
+                    destination: destination_region,
+                }
             }
         }
         _ => return Err(Error::InvalidArgument),
@@ -797,16 +900,16 @@ pub(super) fn write_dynamic(
     }
     let backing = location.acquire(env, false)?;
     let gpu = &execution(env.ext)?.gpu;
-    let transfer = match (backing, location.resource) {
-        (Backing::Buffer(buffer), Resource::Buffer(_)) => ModernTransfer::CopyBuffer {
+    let transfer = match (&backing, location.resource) {
+        (Backing::Buffer(buffer), Resource::Buffer(_)) => Some(ModernTransfer::CopyBuffer {
             source: BufferRange {
                 buffer: resource::upload(gpu, bytes, BufferUsage::COPY_SRC, buffer.desc().size)?,
                 range: 0..bytes.len() as u64,
             },
-            destination: buffer,
+            destination: buffer.clone(),
             offset: 0,
-        },
-        (Backing::Image(image), Resource::Texture(texture)) => {
+        }),
+        (_, Resource::Texture(texture)) => {
             let format = texture.format();
             let row = size[0].div_ceil(u32::from(format.alignment[0]))
                 * u32::from(format.aligned_unit_bytes);
@@ -818,17 +921,14 @@ pub(super) fn write_dynamic(
                     packed.extend_from_slice(&bytes[offset..offset + row as usize]);
                 }
             }
-            resource::texture_transfer(
-                gpu,
-                texture,
-                resource::region(&image, texture, subresource),
-                &packed,
-            )?
+            backing.upload_texture(gpu, texture, subresource, [0; 3], size, &packed)?
         }
         _ => unreachable!(),
     };
-    let write = key(env, pointer, subresource);
-    execution(env.ext)?.append(Command::Transfer(transfer), extent_rect(size), None, write)?;
+    if let Some(transfer) = transfer {
+        let write = key(env, pointer, subresource);
+        execution(env.ext)?.append(Command::Transfer(transfer), extent_rect(size), None, write)?;
+    }
     table
         .get_mut(&mut env.sys.objects, pointer)
         .unwrap()
@@ -836,6 +936,14 @@ pub(super) fn write_dynamic(
         .unwrap()
         .dynamic_uploaded(subresource);
     Ok(())
+}
+
+fn aligned_box(texture: Texture, full: [u32; 3], at: [u32; 3], size: [u32; 3]) -> bool {
+    (0..3).all(|axis| {
+        let align = u32::from(texture.format().alignment[axis]);
+        at[axis].is_multiple_of(align)
+            && (size[axis].is_multiple_of(align) || at[axis] + size[axis] == full[axis])
+    })
 }
 
 fn box_extent(input: D3D11_BOX) -> ([u32; 3], [u32; 3]) {
@@ -890,6 +998,11 @@ pub(super) fn update_resource(env: &mut Env<'_>) -> Result<(), Error> {
     {
         return Err(Error::InvalidArgument);
     }
+    if let Resource::Texture(texture) = destination.resource
+        && !aligned_box(texture, extent, origin, size)
+    {
+        return Err(Error::InvalidArgument);
+    }
     if destination.resource.bind().contains(Bind::CONSTANT) {
         let cpu = &*env.cpu;
         let source = execution(env.ext)?.gpu.uniform_window(size[0], |out| {
@@ -912,7 +1025,8 @@ pub(super) fn update_resource(env: &mut Env<'_>) -> Result<(), Error> {
             write,
         );
     }
-    let backing = destination.acquire(env, false)?;
+    let whole = origin == [0; 3] && size == extent;
+    let backing = destination.acquire(env, !whole)?;
     let transfer = match (&backing, destination.resource) {
         (Backing::Buffer(buffer), Resource::Buffer(_)) => {
             let bytes = array::<u8>(env, data, size[0])?;
@@ -922,16 +1036,16 @@ pub(super) fn update_resource(env: &mut Env<'_>) -> Result<(), Error> {
                 BufferUsage::COPY_SRC,
                 u64::from(size[0]).next_multiple_of(4),
             )?;
-            ModernTransfer::CopyBuffer {
+            Some(ModernTransfer::CopyBuffer {
                 source: BufferRange {
                     buffer: source,
                     range: 0..u64::from(size[0]),
                 },
                 destination: buffer.clone(),
                 offset: u64::from(origin[0]),
-            }
+            })
         }
-        (Backing::Image(image), Resource::Texture(texture)) => {
+        (_, Resource::Texture(texture)) => {
             let format = texture.format();
             let row = size[0].div_ceil(u32::from(format.alignment[0]))
                 * u32::from(format.aligned_unit_bytes);
@@ -946,30 +1060,34 @@ pub(super) fn update_resource(env: &mut Env<'_>) -> Result<(), Error> {
                     packed.extend(array::<u8>(env, addr, row)?);
                 }
             }
-            let mut dest = resource::region(image, texture, destination.subresource);
-            dest.origin = origin.into();
-            dest.extent = Extent {
-                width: size[0],
-                height: size[1],
-                depth_or_layers: size[2],
-            };
-            resource::texture_transfer(&execution(env.ext)?.gpu, texture, dest, &packed)?
+            backing.upload_texture(
+                &execution(env.ext)?.gpu,
+                texture,
+                destination.subresource,
+                origin,
+                size,
+                &packed,
+            )?
         }
         _ => unreachable!(),
     };
-    let write = key(env, destination.pointer, destination.subresource);
-    execution(env.ext)?.append_region(
-        Command::Transfer(transfer),
-        extent_rect(extent),
-        Rect {
-            x: origin[0],
-            y: origin[1],
-            w: size[0],
-            h: size[1],
-        },
-        None,
-        write,
-    )
+    if let Some(transfer) = transfer {
+        let write = key(env, destination.pointer, destination.subresource);
+        execution(env.ext)?.append_region(
+            Command::Transfer(transfer),
+            extent_rect(extent),
+            Rect {
+                x: origin[0],
+                y: origin[1],
+                w: size[0],
+                h: size[1],
+            },
+            None,
+            write,
+        )
+    } else {
+        destination.written(env, &backing, whole)
+    }
 }
 
 fn image_view(
@@ -1001,7 +1119,7 @@ fn image_view(
         };
         staging_access(env, resource, desc, subresource, &backing, access)?;
     }
-    Ok((backing.view(&view)?, key))
+    Ok((backing.view(&execution(env.ext)?.gpu, &view)?, key))
 }
 
 fn view_rect(view: &ImageView) -> Rect {
@@ -1016,10 +1134,10 @@ pub(super) fn clear_color(env: &mut Env<'_>) -> Result<(), Error> {
     let (pointer, value) = (env.arg(1), read::<[f32; 4]>(env, env.arg(2))?);
     let (view, key) = image_view(env, pointer, ViewKind::RenderTarget)?;
     let extent = view_rect(&view);
-    for view in clear_color_slices(env, pointer, view)? {
+    for view in clear_slices(env, pointer, view)? {
         let command = Command::Transfer(ModernTransfer::ClearColor {
+            value: color_clear_value(&view, value.map(f64::from)),
             view,
-            value: value.map(f64::from),
             area: None,
         });
         execution(env.ext)?.append(command, extent, None, key)?;
@@ -1027,14 +1145,10 @@ pub(super) fn clear_color(env: &mut Env<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-fn clear_color_slices(
-    env: &Env<'_>,
-    pointer: u32,
-    view: ImageView,
-) -> Result<Vec<ImageView>, Error> {
+fn clear_slices(env: &Env<'_>, pointer: u32, view: ImageView) -> Result<Vec<ImageView>, Error> {
     let (_, desc) = context::owned(env, pointer).and_then(Object::view).unwrap();
     let layers = desc.attachment_layers().len();
-    if view.image().desc().dimension != adv_gpu::resource::Dimension::D3 || layers == 1 {
+    if layers == 1 {
         return Ok(vec![view]);
     }
     (0..layers as u32)
@@ -1049,12 +1163,15 @@ pub(super) fn clear_depth(env: &mut Env<'_>) -> Result<(), Error> {
     let (pointer, flags, depth, stencil) = (env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     let (view, key) = image_view(env, pointer, ViewKind::DepthStencil)?;
     let extent = view_rect(&view);
-    let command = Command::Transfer(ModernTransfer::ClearDepth {
-        view,
-        depth: (flags & 1 != 0).then(|| f32::from_bits(depth).clamp(0., 1.)),
-        stencil: (flags & 2 != 0).then_some(stencil & 255),
-    });
-    execution(env.ext)?.append(command, extent, None, key)
+    for view in clear_slices(env, pointer, view)? {
+        let command = Command::Transfer(ModernTransfer::ClearDepth {
+            view,
+            depth: (flags & 1 != 0).then(|| f32::from_bits(depth).clamp(0., 1.)),
+            stencil: (flags & 2 != 0).then_some(stencil & 255),
+        });
+        execution(env.ext)?.append(command, extent, None, key)?;
+    }
+    Ok(())
 }
 
 fn resolve_view(
@@ -1069,6 +1186,11 @@ fn resolve_view(
         return Err(Error::InvalidArgument);
     };
     let region = resource::region(&image, texture, location.subresource);
+    let format = if format == adv_gpu::Format::A8Unorm {
+        adv_gpu::Format::R8Unorm
+    } else {
+        format
+    };
     Ok(image.create_view(&adv_gpu::resource::ViewDesc {
         format: (image.desc().format != format).then_some(format),
         dimension: None,
@@ -1087,12 +1209,38 @@ pub(super) fn resolve(env: &mut Env<'_>) -> Result<(), Error> {
         return Err(Error::InvalidArgument);
     }
     let source = Location::new(env, env.arg(3), env.arg(4))?;
-    let format = resource::native_format(env.arg(5)).ok_or(Error::InvalidArgument)?;
+    let dxgi = env.arg(5);
+    let format = resource::backing_format(execution(env.ext)?.gpu.device().caps(), dxgi)
+        .ok_or(Error::InvalidArgument)?;
     let source_view = resolve_view(env, source, format)?;
     let destination = resolve_view(env, dest, format)?;
     let read = key(env, source.pointer, source.subresource);
     let write = key(env, dest.pointer, dest.subresource);
     let extent = view_rect(&destination);
+    let caps = execution(env.ext)?.gpu.device().caps();
+    if let Some(maxima) = resource::packed_resolve(caps, dxgi, format) {
+        use adv_device::gpu::{ModernDraw, SlotBindings};
+        let draw = ModernDraw::packed_resolve(destination, maxima)?;
+        return execution(env.ext)?.append(
+            Command::Draw {
+                draw: Box::new(draw),
+                vertex: SlotBindings::default(),
+                fragment: SlotBindings {
+                    images: vec![Some(source_view)],
+                    ..Default::default()
+                },
+                statistics: None,
+            },
+            extent,
+            Some(read),
+            write,
+        );
+    }
+    if cfg!(target_vendor = "apple") && resource::image_filter_needed(caps, format) {
+        let execution = execution(env.ext)?;
+        let pipeline = Arc::new(execution.gpu.prepare_image_filter(format, false, true)?);
+        return filter_image(execution, pipeline, source_view, destination, read, write);
+    }
     execution(env.ext)?.append(
         Command::Resolve {
             source: source_view,
@@ -1108,9 +1256,92 @@ pub(super) fn generate_mips(env: &mut Env<'_>) -> Result<(), Error> {
     if null_device(env)? {
         return Ok(());
     }
-    let (view, key) = image_view(env, env.arg(1), ViewKind::ShaderResource)?;
+    let pointer = env.arg(1);
+    let (mut view, key) = image_view(env, pointer, ViewKind::ShaderResource)?;
+    let format = view.format();
+    if resource::image_filter_needed(execution(env.ext)?.gpu.device().caps(), format) {
+        let (resource, desc) = context::owned(env, pointer).and_then(Object::view).unwrap();
+        let range = desc.subresources().clone();
+        let Resource::Texture(texture) = description(env, resource)? else {
+            unreachable!()
+        };
+        let image = view.image();
+        let dimension = image.desc().dimension;
+        let volume = dimension == adv_gpu::resource::Dimension::D3;
+        let pipeline = Arc::new(
+            execution(env.ext)?
+                .gpu
+                .prepare_image_filter(format, volume, false)?,
+        );
+        for layer in range.layers {
+            for mip in range.mips.start + 1..range.mips.end {
+                let slice = |mip| {
+                    image.create_view(&adv_gpu::resource::ViewDesc {
+                        format: (format != image.desc().format).then_some(format),
+                        dimension: (dimension == adv_gpu::resource::Dimension::Cube)
+                            .then_some(adv_gpu::resource::Dimension::D2),
+                        mips: mip..mip + 1,
+                        layers: layer..layer + 1,
+                        plane: 0,
+                    })
+                };
+                let subresource = layer * texture.levels() + mip;
+                let read = self::key(env, resource, subresource - 1);
+                let write = self::key(env, resource, subresource);
+                filter_image(
+                    execution(env.ext)?,
+                    pipeline.clone(),
+                    slice(mip - 1)?,
+                    slice(mip)?,
+                    read,
+                    write,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    if view.format() == adv_gpu::Format::A8Unorm {
+        let (_, desc) = context::owned(env, pointer).and_then(Object::view).unwrap();
+        view = resource::image_view(view.image(), desc, adv_gpu::Format::R8Unorm)?;
+    }
     let extent = view_rect(&view);
     execution(env.ext)?.append(Command::GenerateMips(view), extent, Some(key), key)
+}
+
+fn filter_image(
+    execution: &mut Execution,
+    pipeline: Arc<adv_device::gpu::Dispatch>,
+    source: ImageView,
+    destination: ImageView,
+    read: ResourceKey,
+    write: ResourceKey,
+) -> Result<(), Error> {
+    use adv_device::gpu::{DispatchArguments, SlotBindings, StorageBinding};
+    let size = destination.size();
+    let volume = destination.image().desc().dimension == adv_gpu::resource::Dimension::D3;
+    let group = if volume { 4 } else { 8 };
+    execution.append(
+        Command::Dispatch {
+            pipeline,
+            bindings: SlotBindings {
+                images: vec![Some(source)],
+                storage: vec![Some(StorageBinding::Image(destination))],
+                ..Default::default()
+            },
+            arguments: DispatchArguments::Direct([
+                size.width.div_ceil(group),
+                size.height.div_ceil(group),
+                if volume {
+                    size.depth_or_layers.div_ceil(4)
+                } else {
+                    1
+                },
+            ]),
+        },
+        extent_rect([size.width, size.height, 1]),
+        Some(read),
+        write,
+    )
 }
 
 pub(super) fn flush_shared(env: &mut Env<'_>) -> Result<(), Error> {
@@ -1366,14 +1597,14 @@ pub(super) fn clear_view(env: &mut Env<'_>) -> Result<(), Error> {
             })
             .collect()
     };
-    let views = clear_color_slices(env, pointer, view)?;
+    let views = clear_slices(env, pointer, view)?;
     let execution = execution(env.ext)?;
     for rect in rectangles.into_iter().filter(|rect| !rect.empty()) {
         for view in &views {
             let writes = [(key, false)];
             let command = Command::Transfer(ModernTransfer::ClearColor {
                 view: view.clone(),
-                value,
+                value: color_clear_value(view, value),
                 area: Some(rect.into()),
             });
             execution.recording.append(
@@ -1391,6 +1622,13 @@ pub(super) fn clear_view(env: &mut Env<'_>) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+fn color_clear_value(view: &ImageView, mut value: [f64; 4]) -> [f64; 4] {
+    if view.image().desc().format == adv_gpu::Format::A8Unorm {
+        value[0] = value[3];
+    }
+    value
 }
 
 pub(super) fn check(ext: &Ext) -> Result<(), Error> {
