@@ -3,7 +3,7 @@ use super::{
     desc::{Bind, Misc, Resource, Texture, TextureKind, View, ViewKind},
     ops::Error,
 };
-use adv_device::gpu::{Gpu, ImageRegion, TransferBuffer};
+use adv_device::gpu::{BufferRange, BufferWindow, Gpu, ImageRegion, TransferBuffer, UniformWindow};
 use adv_gpu::{
     Buffer, Extent, Format, Image, ImageView,
     resource::{BufferDesc, BufferUsage, Dimension, ImageDesc, Memory, Usage, ViewDesc},
@@ -12,19 +12,29 @@ use adv_gpu::{
 #[derive(Clone)]
 pub enum Backing {
     Buffer(Buffer),
+    Constant(UniformWindow),
     Image(Image),
 }
 
 impl Backing {
+    pub fn buffer_window(&self, range: std::ops::Range<u64>) -> BufferWindow {
+        match self {
+            Self::Buffer(buffer) => BufferRange {
+                buffer: buffer.clone(),
+                range,
+            }
+            .into(),
+            Self::Constant(window) => BufferWindow::Uniform(window.slice(range)),
+            Self::Image(_) => unreachable!(),
+        }
+    }
+
     pub fn new(gpu: &Gpu, resource: Resource) -> Result<Self, Error> {
         let bind = resource.bind();
         if let Resource::Buffer(buffer) = resource {
             let mut usage = BufferUsage::COPY_SRC | BufferUsage::COPY_DST;
             if bind.contains(Bind::INDEX) {
                 usage |= BufferUsage::INDEX;
-            }
-            if bind.contains(Bind::CONSTANT) {
-                usage |= BufferUsage::UNIFORM;
             }
             if [
                 Bind::VERTEX,

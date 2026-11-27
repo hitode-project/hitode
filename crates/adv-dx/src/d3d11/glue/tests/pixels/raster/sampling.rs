@@ -354,6 +354,44 @@ fn depth_raster(r: &mut Raster, bias: i32, slope: f32, clamp: f32, clip: bool) -
     )
 }
 
+// spec: GFX-REC-7
+#[test]
+fn guest_constant_buffer_offset_zero_fills_the_unbound_tail() {
+    let mut r = Raster::new();
+    let output = SampleOutput::new(&mut r);
+    let raster = depth_raster(&mut r, 0, 0., 0., true);
+    let (_, dsv, sampled, _) = depth_views(&mut r, 39, 40, 41, 0);
+    let mut constants = [0.75f32; 68];
+    constants[64..].fill(0.25);
+    let dynamic = buffer(&mut r.machine, r.device, Bind::CONSTANT, 272);
+    update_dynamic(&mut r.machine, r.context, dynamic, &constants);
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 272,
+            BindFlags: Bind::CONSTANT,
+            ..Default::default()
+        },
+    );
+    let default = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    r.call(47, &[default, dynamic]);
+    write_value(&mut r.machine, ARRAY, [default, 16u32, 16]);
+    r.call(123, &[0, 1, ARRAY, ARRAY + 4, ARRAY + 8]);
+    r.shader(15, 9, DEPTH_WRITE);
+    bind_depth(&mut r, dsv, 0, 0, [0., 1.]);
+    clear_depth(&mut r, dsv, 1, 1., 0);
+    r.draw(0..64, [0.; 4]);
+    bind_for_read(&mut r, &output, sampled, TEXEL_LOAD, raster);
+    let texels = output.draw(&mut r, [1., 0., 0., 0.], 64);
+    assert!(
+        texels[..4]
+            .iter()
+            .all(|pixel| pixel[0] == 0.25f32.to_bits())
+    );
+    assert!(texels[4..].iter().all(|pixel| pixel[0] == 0));
+}
+
 #[test]
 fn windows_depth_and_stencil_through_guest_vtables() {
     use adv_abi::types::{D3D11_DEPTH_STENCIL_DESC, D3D11_DEPTH_STENCILOP_DESC};

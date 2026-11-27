@@ -1189,14 +1189,19 @@ pub(super) fn map_subresource(
 
 fn unmap_resource(env: &mut Env<'_>) -> Outcome {
     #[cfg(feature = "gpu")]
-    if deferred::current(env).is_some() {
+    {
         let (resource, subresource) = (env.arg(1), env.arg(2));
-        return call(deferred::unmap_resource(env, resource, subresource));
+        call(if deferred::current(env).is_some() {
+            deferred::unmap_resource(env, resource, subresource)
+        } else {
+            gpu::unmap_constants(env, resource, subresource)
+        })
     }
     #[cfg(not(feature = "gpu"))]
-    let _ = env;
-    // Immediate draws capture dynamic ranges as they admit each draw.
-    Outcome::Return(0)
+    {
+        let _ = env;
+        Outcome::Return(0)
+    }
 }
 
 macro_rules! gpu_methods {

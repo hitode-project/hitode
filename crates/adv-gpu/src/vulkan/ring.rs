@@ -9,6 +9,7 @@ pub(super) struct RingCore {
     pub(super) state: Mutex<RingState>,
 }
 pub(super) struct RingState {
+    capacity: u64,
     head: u64,
     tail: u64,
     base_id: u64,
@@ -28,21 +29,27 @@ pub(crate) struct Span {
     retained: bool,
 }
 impl Device {
-    pub(crate) fn ring(&self, size: u64) -> Result<crate::Ring> {
+    pub(crate) fn ring(&self, size: u64, capacity: u64) -> Result<(crate::Ring, crate::Buffer)> {
         let buffer = self.create_buffer(&BufferDesc {
-            size,
+            size: capacity,
             usage: BufferUsage::VERTEX
                 | BufferUsage::INDEX
                 | BufferUsage::UNIFORM
                 | BufferUsage::STORAGE
                 | BufferUsage::COPY_SRC
-                | BufferUsage::INDIRECT,
+                | BufferUsage::INDIRECT
+                | if size != capacity {
+                    BufferUsage::COPY_DST
+                } else {
+                    BufferUsage::empty()
+                },
             memory: Memory::Upload,
             label: "upload ring",
         })?;
         let ring = Arc::new(RingCore {
-            buffer,
+            buffer: buffer.clone(),
             state: Mutex::new(RingState {
+                capacity: size,
                 head: 0,
                 tail: 0,
                 base_id: 0,
@@ -51,19 +58,22 @@ impl Device {
             }),
         });
         self.0.rings.lock().unwrap().push(Arc::downgrade(&ring));
-        Ok(crate::Ring {
-            inner: Ring(ring, std::marker::PhantomData),
-        })
+        Ok((
+            crate::Ring {
+                inner: Ring(ring, std::marker::PhantomData),
+            },
+            buffer,
+        ))
     }
 }
 impl Ring {
     pub(crate) fn reserve(&mut self, size: u64, align: u64) -> Result<crate::Span> {
         debug_assert!(align.is_power_of_two(), "ring alignment {align}");
-        let capacity = self.0.buffer.desc().size;
+        let mut state = self.0.state.lock().unwrap();
+        let capacity = state.capacity;
         if size > capacity {
             return Err(Error::Busy);
         }
-        let mut state = self.0.state.lock().unwrap();
         let offset = (state.head % capacity).next_multiple_of(align);
         let start = if offset + size <= capacity {
             state.head - state.head % capacity + offset

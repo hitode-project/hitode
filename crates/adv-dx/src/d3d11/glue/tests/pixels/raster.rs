@@ -930,6 +930,79 @@ fn geometry_stream_output_appends_and_drives_draw_auto_through_guest_vtables() {
     assert_eq!(r.read(target, staging, 4, 4), [0xff0000ff; 4]);
 }
 
+// spec: GFX-REC-7
+#[test]
+fn guest_constant_updates_keep_recorded_draws_in_order() {
+    const UPDATES: u32 = 24;
+    const DRAWS_PER_UPDATE: u32 = 8;
+    let width = UPDATES * DRAWS_PER_UPDATE;
+    let mut r = Raster::new();
+    r.shader(
+        15,
+        9,
+        include_bytes!("../../../../../tests/fixtures/d3d11/guest_color.dxbc"),
+    );
+    let (target, _, staging) = r.target(width, 28);
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            BindFlags: Bind::CONSTANT,
+            ..Default::default()
+        },
+    );
+    let default = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    let no_overwrite: Vec<_> = (0..UPDATES / 3)
+        .map(|_| buffer(&mut r.machine, r.device, Bind::CONSTANT, 16))
+        .collect();
+    let mut expected = Vec::new();
+    #[cfg(feature = "d3d9-counters")]
+    let before = gpu::traffic(&r.machine.ext).unwrap();
+    for update in 0..UPDATES {
+        let (color, pixel) = match (update / 3 + update % 3) % 3 {
+            0 => ([1.0f32, 0., 0., 1.], 0xff00_00ff),
+            1 => ([0.0, 1., 0., 1.], 0xff00_ff00),
+            _ => ([0.0, 0., 1., 1.], 0xffff_0000),
+        };
+        let constant = if update % 3 == 0 {
+            write_value(&mut r.machine, ARRAY + 16, color);
+            r.call(48, &[default, 0, 0, ARRAY + 16, 0, 0]);
+            default
+        } else {
+            let (constant, access) = if update % 3 == 1 {
+                (r.constants, 4)
+            } else {
+                (no_overwrite[(update / 3) as usize], 5)
+            };
+            let mapped = map(&mut r.machine, r.context, constant, access);
+            write_value(&mut r.machine, mapped.pData, color);
+            r.call(15, &[constant, 0]);
+            constant
+        };
+        write_value(&mut r.machine, ARRAY, constant);
+        r.call(16, &[0, 1, ARRAY]);
+        for draw in 0..DRAWS_PER_UPDATE {
+            let x = (update * DRAWS_PER_UPDATE + draw) as i32;
+            write_value(&mut r.machine, DESCRIPTOR, [x, 0, x + 1, 1]);
+            r.call(45, &[1, DESCRIPTOR]);
+            r.call(13, &[3, 0]);
+            expected.push(pixel);
+        }
+    }
+    assert_eq!(r.read(target, staging, width as usize, 4), expected);
+    #[cfg(feature = "d3d9-counters")]
+    {
+        let traffic = gpu::traffic(&r.machine.ext).unwrap();
+        let counters = gpu::frame_counters(&r.machine.ext).unwrap();
+        assert_eq!(
+            traffic.upload_bytes - before.upload_bytes,
+            u64::from(UPDATES) * 16
+        );
+        assert_eq!(counters.constant_time_maps, u64::from(UPDATES / 3) * 2);
+    }
+}
+
 // spec: GFX-STAGE-2
 #[test]
 fn shader_dispatch_indirect_consumes_recorded_group_counts() {

@@ -93,6 +93,24 @@ pub struct Expand {
 }
 
 impl Expand {
+    pub(super) fn retain_uniforms(&self, windows: &mut Vec<super::UniformWindow>) {
+        for slots in self
+            .prelude
+            .iter()
+            .map(|prelude| &prelude.slots)
+            .chain(self.programs.iter().map(|program| &program.slots))
+            .chain(
+                self.bins
+                    .iter()
+                    .flat_map(|bin| [&bin.vertex, &bin.fragment]),
+            )
+        {
+            for uniform in slots.uniforms.iter().flatten() {
+                uniform.retain(windows);
+            }
+        }
+    }
+
     fn window_items(&self, limits: &Limits) -> u32 {
         let Some(window) = &self.window else { return 1 };
         let align = u64::from(limits.storage_offset_alignment.max(4));
@@ -414,7 +432,7 @@ fn bind(
     for binding in expansion {
         match *binding {
             ExpansionBinding::Parameters { slot } => {
-                set(&mut slots.uniforms, slot, parameters.clone());
+                set(&mut slots.uniforms, slot, parameters.clone().into());
             }
             ExpansionBinding::Scratch { slot, region } => {
                 set(

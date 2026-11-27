@@ -714,10 +714,13 @@ pub fn draw_auto(
         range: 0..16,
     };
     let mut bindings = SlotBindings {
-        uniforms: vec![Some(BufferRange {
-            buffer: params,
-            range: 0..16,
-        })],
+        uniforms: vec![Some(
+            BufferRange {
+                buffer: params,
+                range: 0..16,
+            }
+            .into(),
+        )],
         ..Default::default()
     };
     bind_storage(&mut bindings, 0, cursor);

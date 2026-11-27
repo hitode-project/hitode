@@ -172,10 +172,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>,
         )?;
         let size = buffer.desc().size;
         let bindings = SlotBindings {
-            uniforms: vec![Some(BufferRange {
-                buffer: uniform,
-                range: 0..32,
-            })],
+            uniforms: vec![Some(
+                BufferRange {
+                    buffer: uniform,
+                    range: 0..32,
+                }
+                .into(),
+            )],
             storage: vec![Some(StorageBinding::Buffer(BufferRange {
                 buffer,
                 range: 0..size,
