@@ -934,6 +934,7 @@ struct Sampling {
     border_textures: Vec<BorderTexture>,
     depths: Vec<u32>,
     depths24: Vec<u32>,
+    color_comparison: Vec<u32>,
     unorm: Vec<(u32, [u8; 4])>,
     manual_filter: Vec<u32>,
     manual_samplers: Vec<BorderSampler>,
@@ -995,6 +996,12 @@ impl Sampling {
             let mips = &view.desc.subresources().mips;
             let minimum = minimum - mips.start as f32;
             let depth = view.desc.aspects().intersects(Aspects::DEPTH);
+            let color_comparison = !cfg!(target_vendor = "apple")
+                && !depth
+                && reflection.comparison_textures.contains(&binding.slot);
+            if color_comparison {
+                state.color_comparison.push(binding.slot);
+            }
             if resource::unfilterable_view(caps(env.ext).unwrap(), view.desc.format(), depth) {
                 state.manual_filter.push(binding.slot);
             }
@@ -1030,7 +1037,9 @@ impl Sampling {
             } else if view.desc.format() == 98 {
                 state.unorm.push((binding.slot, [8; 4]));
             }
-            if (!state.border_samplers.is_empty() || state.manual_filter.contains(&binding.slot))
+            if (color_comparison
+                || !state.border_samplers.is_empty()
+                || state.manual_filter.contains(&binding.slot))
                 && let Some(format) = format
             {
                 let channels = std::array::from_fn(|lane| {
@@ -1080,6 +1089,7 @@ impl Sampling {
             border_textures: &self.border_textures,
             depth_textures: &self.depths,
             depth24_textures: &self.depths24,
+            color_comparison: &self.color_comparison,
             exact_unorm: &self.unorm,
             manual_filter: &self.manual_filter,
             manual_samplers: &self.manual_samplers,

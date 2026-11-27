@@ -1,4 +1,4 @@
-//! Filter formats that can only be sampled with point filtering.
+//! Filter and compare samples using point taps.
 
 use super::*;
 
@@ -44,7 +44,8 @@ impl Writer<'_> {
         let ty = format!("vec{width}<f32>");
         let raw_ty = if cube { "vec3<f32>" } else { &ty };
         let comparison = matches!(op.opcode, SampleC | SampleCLz);
-        let depth = comparison || self.options.depth_textures.contains(&slot);
+        let depth = self.options.depth_textures.contains(&slot)
+            || (comparison && !self.options.color_comparison.contains(&slot));
         let state = self
             .options
             .manual_samplers
@@ -222,9 +223,14 @@ impl Writer<'_> {
         }
         let value = |texel: &str| {
             if comparison {
+                let channel = if depth {
+                    texel.to_owned()
+                } else {
+                    format!("({texel}).x")
+                };
                 format!(
                     "vec4<f32>({})",
-                    border::compare(state.comparison, &argument(1), texel)
+                    border::compare(state.comparison, &argument(1), &channel)
                 )
             } else if depth {
                 format!("vec4<f32>({texel}, 0.0, 0.0, 1.0)")

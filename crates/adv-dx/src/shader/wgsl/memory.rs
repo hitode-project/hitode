@@ -32,7 +32,7 @@ impl Writer<'_> {
         module: &Module,
         reflection: &Reflection,
     ) -> Result<(), Error> {
-        if !self.options.manual_filter.is_empty() {
+        if !self.options.manual_filter.is_empty() || !self.options.color_comparison.is_empty() {
             self.source.push_str(filter::CUBE);
         }
         let mut storage_slot = reflection
@@ -119,7 +119,8 @@ impl Writer<'_> {
                     };
                     let ty = scalar(returns[0])?;
                     let texture = if self.options.depth_textures.contains(&slot)
-                        || comparison_sample(&module.body, slot)
+                        || (reflection.comparison_textures.contains(&slot)
+                            && !self.options.color_comparison.contains(&slot))
                     {
                         format!("texture_depth_{dimension}")
                     } else {
@@ -880,6 +881,7 @@ impl Writer<'_> {
             .find(|border| border.slot == sampler)
             .copied();
         let manual = self.options.manual_filter.contains(&slot);
+        let color_comparison = self.options.color_comparison.contains(&slot);
         if matches!(op.opcode, Gather4 | Gather4C | Gather4Po | Gather4PoC) {
             if lod.is_some_and(|lod| lod.minimum >= 1.) {
                 return Ok(format!(
@@ -894,7 +896,7 @@ impl Writer<'_> {
                 );
             }
             let comparison = matches!(op.opcode, Gather4C | Gather4PoC);
-            let sampler = if manual && !comparison {
+            let native_sampler = if (manual && !comparison) || (comparison && color_comparison) {
                 self.sampler_variant(sampler, None, true)
             } else {
                 format!("s{sampler}")
@@ -905,11 +907,28 @@ impl Writer<'_> {
                 } else {
                     format!("{component}i, ")
                 };
-                format!("textureGather({component}{texture}, {sampler}, {coord}{suffix}{offset})")
+                format!(
+                    "textureGather({component}{texture}, {native_sampler}, {coord}{suffix}{offset})"
+                )
+            } else if color_comparison {
+                let comparison = self
+                    .options
+                    .manual_samplers
+                    .iter()
+                    .find(|state| state.slot == sampler)
+                    .ok_or(Error::Invalid("point sampler state"))?
+                    .comparison;
+                let reference = format!("bitcast<f32>({}.x)", args.last().unwrap());
+                let values = format!("cmp_gather_{}", self.serial);
+                self.line(&format!("let {values} = textureGather(0i, {texture}, {native_sampler}, {coord}{suffix}{offset});"));
+                let lanes = ["x", "y", "z", "w"].map(|lane| {
+                    border::compare(comparison, &reference, &format!("{values}.{lane}"))
+                });
+                format!("vec4<f32>({})", lanes.join(", "))
             } else {
                 let reference = args.last().unwrap();
                 format!(
-                    "textureGatherCompare({texture}, {sampler}, {coord}{suffix}, bitcast<f32>({reference}.x){offset})"
+                    "textureGatherCompare({texture}, {native_sampler}, {coord}{suffix}, bitcast<f32>({reference}.x){offset})"
                 )
             };
             if matches!(
@@ -961,7 +980,7 @@ impl Writer<'_> {
             }
             return Ok(format!("bitcast<vec4<u32>>({call})"));
         }
-        if manual {
+        if manual || (color_comparison && matches!(op.opcode, SampleC | SampleCLz)) {
             return self.filter_sample(filter::FilterSample {
                 op,
                 arguments: args,
@@ -1419,33 +1438,6 @@ fn binding(operand: &Operand) -> Result<(Register, u32), Error> {
         return Ok((register, slot));
     }
     Err(Error::Invalid("dynamic resource binding"))
-}
-
-fn comparison_sample(block: &Block, slot: u32) -> bool {
-    block.iter().any(|statement| match statement {
-        Statement::Execute(op) => {
-            matches!(
-                op.opcode,
-                Opcode::SampleC | Opcode::SampleCLz | Opcode::Gather4C | Opcode::Gather4PoC
-            ) && op
-                .sources
-                .iter()
-                .any(|arg| binding(arg) == Ok((Register::Resource, slot)))
-        }
-        Statement::If { accept, reject, .. } => {
-            comparison_sample(accept, slot)
-                || reject
-                    .as_ref()
-                    .is_some_and(|block| comparison_sample(block, slot))
-        }
-        Statement::Loop(block) => comparison_sample(block, slot),
-        Statement::Switch { cases, .. } => {
-            cases.iter().any(|case| comparison_sample(&case.body, slot))
-        }
-        Statement::Declare(_) | Statement::ImmediateConstants(_) | Statement::CustomData { .. } => {
-            false
-        }
-    })
 }
 
 pub(super) const LOD_HELPERS: &str = "

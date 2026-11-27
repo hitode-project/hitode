@@ -65,6 +65,8 @@ pub struct Options<'a> {
     pub border_textures: &'a [BorderTexture],
     pub depth_textures: &'a [u32],
     pub depth24_textures: &'a [u32],
+    /// Color views whose comparison operations compare regular sampled texels.
+    pub color_comparison: &'a [u32],
     pub exact_unorm: &'a [(u32, [u8; 4])],
     pub manual_filter: &'a [u32],
     pub manual_samplers: &'a [BorderSampler],
@@ -91,6 +93,7 @@ impl Default for Options<'_> {
             border_textures: &[],
             depth_textures: &[],
             depth24_textures: &[],
+            color_comparison: &[],
             exact_unorm: &[],
             manual_filter: &[],
             manual_samplers: &[],

@@ -545,7 +545,9 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 The shader-core fixture directory holds the token ledger, Windows shader-creation HRESULTs
 and measured readbacks. The guest tests execute captured geometry, hull, domain and class
 linkage programs. Residency feedback and double precision have Windows bytecode oracles. The shader core does not report tiled resources or emit
-64-bit floating-point operations.
+64-bit floating-point operations. Vulkan compares sampled color texels in the shader
+when a D3D11 comparison instruction uses a color view. Depth views use depth
+comparison sampling where the format supports it.
 
 ### GFX-SHADER-6 Expansion order
 

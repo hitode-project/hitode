@@ -16,6 +16,7 @@ pub struct Reflection {
     pub writes: HashMap<(Register, Option<u32>), u8>,
     pub atomic_bindings: HashSet<(Register, u32)>,
     pub counter_bindings: HashSet<u32>,
+    pub(crate) comparison_textures: HashSet<u32>,
     pub interpolation_queries: bool,
     pub sample_positions: bool,
     pub lod_queries: bool,
@@ -37,6 +38,7 @@ pub fn analyze(module: &Module) -> Reflection {
         writes: HashMap::new(),
         atomic_bindings: HashSet::new(),
         counter_bindings: HashSet::new(),
+        comparison_textures: HashSet::new(),
         interpolation_queries: false,
         sample_positions: false,
         lod_queries: false,
@@ -166,6 +168,14 @@ impl Reflection {
                 && let Some(slot) = slot.direct()
             {
                 self.counter_bindings.insert(slot);
+            }
+            if matches!(
+                op.opcode,
+                Opcode::SampleC | Opcode::SampleCLz | Opcode::Gather4C | Opcode::Gather4PoC
+            ) && let Some((Register::Resource, [slot])) = operand.register()
+                && let Some(slot) = slot.direct()
+            {
+                self.comparison_textures.insert(slot);
             }
             let selected = source_components(operand, lanes);
             self.operand(operand, selected, false);
