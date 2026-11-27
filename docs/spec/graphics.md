@@ -413,6 +413,13 @@ can share a packed window on devices without descriptor indexing.
 **Rule**: Reported format and multisample capabilities MUST require an executing path on the resource backing. Queries MUST apply the selected level's restrictions and return the Windows status and output for unsupported formats.
 **Verification**: Test
 
+An FL 11_0 required format row for 8x multisampling gates the feature level.
+Standard 8x requires the indexed standard sample locations and full raster
+coverage in every sample-frequency invocation before applying shader coverage
+output. Apple7 through Apple9 have up to four native samples, and Apple10 and
+newer support eight native samples. The current Metal and Vulkan paths report
+zero 8x quality levels and derive at most FL 10_1.
+
 ### GFX-CAP-6 Direct3D 7 capability derivation
 
 **Rule**: Direct3D 7 and legacy descriptors MUST report only the fixed-function paths admitted for that device. Texture and depth enumeration MUST use the same admitted paths.
