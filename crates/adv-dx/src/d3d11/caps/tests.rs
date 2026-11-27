@@ -76,6 +76,7 @@ impl Fixture {
                 | Features::TIMESTAMPS
                 | Features::DUAL_SOURCE_BLEND
                 | Features::DEPTH_CLAMP
+                | Features::FULL_SAMPLE_COVERAGE
                 | Features::STANDARD_SAMPLE_LOCATIONS,
             rgba: FormatCaps::COLOR
                 | FormatCaps::BLEND
@@ -85,6 +86,13 @@ impl Fixture {
             rgba_samples: 7,
             storage_read: true,
         }
+    }
+
+    fn native_8x() -> Self {
+        let mut result = Self::m1();
+        result.limits.sample_counts |= 8;
+        result.rgba_samples |= 8;
+        result
     }
 
     fn a12() -> Self {
@@ -106,13 +114,17 @@ impl Fixture {
         result.limits.push_constant_bytes = 128;
         result.limits.max_fragment_input_components = 112;
         result.limits.max_viewports = 1;
-        result.features.remove(Features::BC_TEXTURES);
+        result
+            .features
+            .remove(Features::BC_TEXTURES | Features::FULL_SAMPLE_COVERAGE);
         result
     }
 
     fn mali_r48() -> Self {
         // Report 51870 (Mali-G57 MC2, r48p0).
         let mut result = Self::m1();
+        result.limits.sample_counts = 1 | 4 | 8;
+        result.rgba_samples = result.limits.sample_counts;
         result.limits.max_image_layers = 4096;
         result.limits.max_sampled_images = 500_000;
         result.limits.max_storage_bindings = 500_000;
@@ -121,7 +133,9 @@ impl Fixture {
         result.limits.max_viewports = 1;
         result.limits.max_framebuffer_layers = 256;
         result.limits.max_fragment_input_components = 128;
-        result.features.remove(Features::BC_TEXTURES);
+        result
+            .features
+            .remove(Features::BC_TEXTURES | Features::FULL_SAMPLE_COVERAGE);
         result
     }
 
@@ -193,26 +207,47 @@ fn mandatory_rows_follow_device_and_coverage() {
         formats: &formats,
         features: FEATURES,
     };
-    for (name, fixture, level, compute) in [
-        ("M1", Fixture::m1(), FeatureLevel::L11_0, true),
-        ("A12", Fixture::a12(), FeatureLevel::L9_3, false),
+    for (name, fixture, level, compute, quality_8x) in [
+        ("Apple7", Fixture::m1(), FeatureLevel::L11_0, true, 0),
+        ("Apple8–9", Fixture::m1(), FeatureLevel::L11_0, true, 0),
+        (
+            "Apple10+",
+            Fixture {
+                features: Fixture::m1().features - Features::FULL_SAMPLE_COVERAGE,
+                ..Fixture::native_8x()
+            },
+            FeatureLevel::L11_0,
+            true,
+            0,
+        ),
+        (
+            "Native 8x",
+            Fixture::native_8x(),
+            FeatureLevel::L11_0,
+            true,
+            1,
+        ),
+        ("A12", Fixture::a12(), FeatureLevel::L9_3, false, 0),
         (
             "Adreno 610",
             Fixture::adreno_610(),
             FeatureLevel::L10_1,
             true,
+            0,
         ),
         (
             "Mali-G57 r48",
             Fixture::mali_r48(),
             FeatureLevel::L10_1,
             false,
+            0,
         ),
         (
             "Mali-G57 r21",
             Fixture::mali_r21(),
             FeatureLevel::L9_3,
             false,
+            0,
         ),
     ] {
         let report =
@@ -226,6 +261,11 @@ fn mandatory_rows_follow_device_and_coverage() {
             report.check_feature(4, 4, 0).unwrap().words(),
             &[u32::from(compute)]
         );
+        assert_eq!(report.multisample_quality(28, 8), Ok(quality_8x), "{name}");
+        for count in [1, 2, 4] {
+            let quality = u32::from(fixture.rgba_samples & count != 0);
+            assert_eq!(report.multisample_quality(28, count), Ok(quality), "{name}");
+        }
     }
 
     let without_fallbacks = Coverage {
@@ -362,7 +402,7 @@ fn feature_layouts_masks_and_creation_status() {
         formats: &formats,
         features: FEATURES,
     };
-    let high = Report::derive(&Fixture::m1().caps(), paths).unwrap();
+    let high = Report::derive(&Fixture::native_8x().caps(), paths).unwrap();
     let low = Report::derive_at_most(&Fixture::m1().caps(), paths, FeatureLevel::L9_3).unwrap();
     for feature in Feature::ALL {
         let path = feature.path();
@@ -446,7 +486,7 @@ fn formats_follow_the_backing_and_the_operation() {
         formats: &formats,
         features: FEATURES,
     };
-    let fixture = Fixture::m1();
+    let fixture = Fixture::native_8x();
     let report = Report::derive(&fixture.caps(), paths).unwrap();
     assert_ne!(report.check_format(28).unwrap() & 0xc000, 0);
     assert_eq!(report.check_format2(28).unwrap() & 0xc0, 0xc0);
@@ -464,27 +504,100 @@ fn formats_follow_the_backing_and_the_operation() {
         Err(Error::InvalidArgument)
     );
 
-    assert_eq!(report.multisample_quality(28, 8), Ok(0));
+    assert_eq!(report.multisample_quality(28, 8), Ok(1));
+    assert!(report.supports_multisample_quality(28, 8, 0xffffffff));
     let with_8x = Fixture {
         rgba_samples: 15,
-        ..fixture.clone()
+        ..Fixture::m1()
     };
     let report = Report::derive(&with_8x.caps(), paths).unwrap();
     assert_eq!(report.multisample_quality(28, 8), Ok(1));
+    assert_eq!(report.multisample_quality(45, 8), Ok(0));
+    assert_eq!(report.level, FeatureLevel::L11_0);
+    for missing in [
+        Features::STANDARD_SAMPLE_LOCATIONS,
+        Features::FULL_SAMPLE_COVERAGE,
+    ] {
+        let limited = Fixture {
+            features: with_8x.features - missing,
+            ..Fixture::native_8x()
+        };
+        let report = Report::derive(&limited.caps(), paths).unwrap();
+        assert_eq!(report.multisample_quality(28, 8), Ok(0));
+        assert_eq!(report.level, FeatureLevel::L11_0);
+    }
     let no_typed_load = Fixture {
         storage_read: false,
-        ..fixture.clone()
+        ..Fixture::native_8x()
     };
     let report = Report::derive(&no_typed_load.caps(), paths).unwrap();
     assert_eq!(report.level, FeatureLevel::L11_0);
     assert_eq!(report.check_format2(28).unwrap() & 0xc0, 0x80);
     let no_uav = Fixture {
         rgba: fixture.rgba - FormatCaps::STORAGE,
-        ..fixture
+        ..Fixture::native_8x()
     };
     let report = Report::derive(&no_uav.caps(), paths).unwrap();
     assert!(report.level < FeatureLevel::L11_0);
     assert_eq!(report.check_format(98), Err(Error::FormatUnsupported));
+}
+
+// spec: GFX-CAP-4 GFX-CAP-5
+#[test]
+fn sample_counts_only_affect_queries_and_texture_creation() {
+    use crate::d3d11::{abi::*, desc};
+
+    let paths = Coverage {
+        requirements: &requirements(),
+        emulated: EMULATED,
+        formats: &format::fixture_rows(),
+        features: FEATURES,
+    };
+    for samples in [1, 1 | 2, 1 | 4, 1 | 2 | 4] {
+        let mut fixture = Fixture::m1();
+        fixture.limits.sample_counts = samples;
+        fixture.rgba_samples = samples;
+        let report = Report::derive(&fixture.caps(), paths).unwrap();
+        // The device-wide 4x attachment requirement of FL 10_0 and above is the only count
+        // that decides the level.
+        let level = if samples & 4 != 0 {
+            FeatureLevel::L11_0
+        } else {
+            FeatureLevel::L9_3
+        };
+        assert_eq!(report.level, level);
+
+        for count in [1, 2, 4, 8] {
+            let supported = samples & count != 0;
+            for format in [28, 85] {
+                assert_eq!(
+                    report.multisample_quality(format, count),
+                    Ok(u32::from(supported))
+                );
+                let create = desc::Texture::new_2d(
+                    D3D11_TEXTURE2D_DESC {
+                        Width: 1,
+                        Height: 1,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: format as i32,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: count,
+                            Quality: 0,
+                        },
+                        BindFlags: desc::Bind::RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    false,
+                    &report,
+                );
+                assert_eq!(
+                    create.err(),
+                    (!supported).then_some(desc::Error::InvalidArgument)
+                );
+            }
+        }
+    }
 }
 
 // spec: GFX-DXGI-2
@@ -517,21 +630,13 @@ fn swap_models_use_present_paths_and_renderable_formats() {
 }
 
 pub(in crate::d3d11) fn fixture_report(maximum: FeatureLevel) -> Report {
-    fixture_report_samples(maximum, Fixture::m1().rgba_samples)
-}
-
-pub(in crate::d3d11) fn fixture_report_samples(maximum: FeatureLevel, rgba_samples: u32) -> Report {
     let paths = Coverage {
         requirements: &requirements(),
         emulated: EMULATED,
         formats: &format::fixture_rows(),
         features: FEATURES,
     };
-    let fixture = Fixture {
-        rgba_samples,
-        ..Fixture::m1()
-    };
-    let report = Report::derive_at_most(&fixture.caps(), paths, maximum).unwrap();
+    let report = Report::derive_at_most(&Fixture::native_8x().caps(), paths, maximum).unwrap();
     assert_eq!(report.level, maximum);
     report
 }

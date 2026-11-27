@@ -38,11 +38,21 @@ struct Pixel {
 
 impl Pixel {
     fn sample_offset(&self, index: u32) -> [f32; 2] {
-        assert_eq!(self.samples, MSAA_SAMPLES);
-        let [x, y] = [[-2, -6], [6, -2], [-6, 2], [2, 6]]
-            .get(index as usize)
-            .copied()
-            .unwrap_or([0; 2]);
+        let offsets: &[[i32; 2]] = match self.samples {
+            4 => &[[-2, -6], [6, -2], [-6, 2], [2, 6]],
+            8 => &[
+                [1, -3],
+                [-1, 3],
+                [5, 1],
+                [-3, -5],
+                [-5, 5],
+                [-7, -1],
+                [3, 7],
+                [7, -7],
+            ],
+            other => panic!("unexpected sample count {other}"),
+        };
+        let [x, y] = offsets.get(index as usize).copied().unwrap_or([0; 2]);
         [x as f32 / 16.0, y as f32 / 16.0]
     }
 }
@@ -198,7 +208,11 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                 && caps.format_sample_counts(format) & MSAA_SAMPLES != 0
         })
         .expect("4x multisampled float color format");
-    for (identity, (name, border, manual)) in [
+    let native_8x = caps.format_sample_counts(msaa_format) & 8 != 0
+        && caps
+            .features
+            .contains(adv_gpu::Features::STANDARD_SAMPLE_LOCATIONS);
+    for (identity, (name, border, manual, samples)) in [
         "raster_queries",
         "raster_samples",
         "level_query",
@@ -211,12 +225,28 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
         "texture_ops",
     ]
     .into_iter()
-    .map(|name| (name, false, false))
+    .map(|name| {
+        let samples = if matches!(name, "raster_queries" | "raster_samples") {
+            MSAA_SAMPLES
+        } else {
+            1
+        };
+        (name, false, false, samples)
+    })
     .chain([
-        ("dynamic_gather", true, false),
-        ("dynamic_gather_compare", true, false),
-        ("sample_modes", false, true),
+        ("dynamic_gather", true, false, 1),
+        ("dynamic_gather_compare", true, false, 1),
+        ("sample_modes", false, true, 1),
     ])
+    .chain(
+        native_8x
+            .then_some([
+                ("raster_queries", false, false, 8),
+                ("raster_samples", false, false, 8),
+            ])
+            .into_iter()
+            .flatten(),
+    )
     .enumerate()
     {
         let module = module(name);
@@ -251,11 +281,6 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
             },
             ..border_samplers[0]
         });
-        let samples = if matches!(name, "raster_queries" | "raster_samples") {
-            MSAA_SAMPLES
-        } else {
-            1
-        };
         let target_format = if samples > 1 {
             msaa_format
         } else {
@@ -604,7 +629,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
         let oracle: Vec<Vec<f32>> = include_str!("../../fixtures/shader-core/raster.tsv")
             .lines()
             .map(|line| line.split_once('\t').unwrap())
-            .filter(|&(fixture, _)| !border && !manual && fixture == name)
+            .filter(|&(fixture, _)| !border && !manual && samples != 8 && fixture == name)
             .map(|(_, row)| {
                 row.split('\t')
                     .skip(1)
@@ -643,7 +668,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
             if name == "raster_samples" {
                 inputs
                     .registers
-                    .insert((Register::InputCoverageMask, 0), [15; 4]);
+                    .insert((Register::InputCoverageMask, 0), [(1 << samples) - 1; 4]);
             }
             let result = run(
                 &module,
@@ -659,7 +684,10 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
             )
             .unwrap();
             if name == "raster_samples" {
-                assert_eq!(result.registers[&(Register::OutputCoverageMask, 0)][0], 15);
+                assert_eq!(
+                    result.registers[&(Register::OutputCoverageMask, 0)][0],
+                    (1 << samples) - 1
+                );
             }
             let expected = result.registers[&(Register::Output, 0)].map(f32::from_bits);
             if let Some(row) = oracle.get(i / WIDTH as usize) {

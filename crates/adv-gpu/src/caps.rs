@@ -67,6 +67,9 @@ bitflags::bitflags! {
         const PIPELINE_STATISTICS_QUERY = 1 << 21;
         const CLIP_DISTANCES = 1 << 22;
         const WIREFRAME = 1 << 23;
+        /// Sample-frequency fragments read the entire primitive coverage at
+        /// the pixel before applying the fragment shader's output mask.
+        const FULL_SAMPLE_COVERAGE = 1 << 24;
         // Reserved for D3D10/11 front ends. No backend sets these yet; Metal has
         // no geometry stage, so a front end emulates it with compute plus
         // indirect draws instead of waiting for this bit.
