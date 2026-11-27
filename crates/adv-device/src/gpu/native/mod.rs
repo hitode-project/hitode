@@ -173,8 +173,14 @@ impl Gpu {
             let uniforms = uniform::Pool::new(resident, TRANSIENT_BYTES);
             let (producer, commands) = stream::channel(ring);
             let gate = producer.gate();
-            let owner = owner::Owner::start(queue, commands, presenter)?;
-            let worker = record::WorkerHandle::start(device.clone(), producer, owner.wake.clone())?;
+            let worker_shared = Arc::new(record::WorkerShared::new());
+            let owner = owner::Owner::start(queue, commands, presenter, worker_shared.clone())?;
+            let worker = record::WorkerHandle::start(
+                device.clone(),
+                producer,
+                worker_shared,
+                owner.wake.clone(),
+            )?;
             let execution = std::rc::Rc::new(Execution {
                 device,
                 stream: stream::ExecutionStream(std::rc::Rc::new(std::cell::RefCell::new(gate))),

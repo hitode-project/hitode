@@ -746,8 +746,13 @@ pub(super) mod tests {
         let (producer, consumer) = stream::channel(ring);
         let gate = producer.gate();
         let owner = super::super::owner::Owner::unstarted();
-        let worker =
-            super::super::record::WorkerHandle::start(device.clone(), producer, None).unwrap();
+        let worker = super::super::record::WorkerHandle::start(
+            device.clone(),
+            producer,
+            Arc::new(super::super::record::WorkerShared::new()),
+            None,
+        )
+        .unwrap();
         let stream = stream::ExecutionStream(std::rc::Rc::new(std::cell::RefCell::new(gate)));
         let execution = std::rc::Rc::new(super::super::Execution {
             device: device.clone(),
