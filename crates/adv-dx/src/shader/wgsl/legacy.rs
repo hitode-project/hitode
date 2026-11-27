@@ -46,6 +46,11 @@ pub(crate) fn emit(module: &Module, library: &Library<'_>) -> Result<String, Err
     if library.guard_products {
         writer.source.push_str(GUARDED_PRODUCT);
     }
+    for statement in &module.body {
+        if let Statement::ImmediateConstants(values) = statement {
+            writer.immediate_constants(values);
+        }
+    }
     for (slot, row) in library.constants.iter().enumerate() {
         writer.line(&format!(
             "fn dx_cb{slot}(i: u32) -> vec4<u32> {{ return bitcast<vec4<u32>>({row}); }}"

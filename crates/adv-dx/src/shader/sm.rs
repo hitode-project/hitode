@@ -340,10 +340,34 @@ pub(crate) fn lower(shader: &Shader) -> Result<Lowered, Error> {
         let d = ins.destination.as_ref().expect("definition destination");
         definitions.insert((d.register.kind, d.register.index), value);
     }
+    // Relatively addressed float constants read defined values from a table:
+    // rows 0..n hold the values and rows n..2n flag the defined ones.
+    let relative = shader.instructions.iter().any(|i| {
+        i.sources
+            .iter()
+            .any(|s| s.register.kind == RegisterKind::Float && s.relative.is_some())
+    });
+    let defined: BTreeMap<u16, [u32; 4]> = definitions
+        .iter()
+        .filter(|((kind, _), _)| *kind == RegisterKind::Float)
+        .map(|((_, index), value)| (*index, *value))
+        .collect();
+    let defined_rows = match defined.last_key_value() {
+        Some((&last, _)) if relative => u32::from(last) + 1,
+        _ => 0,
+    };
+    let mut table = vec![[0; 4]; defined_rows as usize * 2];
+    if defined_rows != 0 {
+        for (&n, &value) in &defined {
+            table[usize::from(n)] = value;
+            table[defined_rows as usize + usize::from(n)] = [u32::MAX, 0, 0, 0];
+        }
+    }
     let scratch = FIRST_LOOP + loops;
     let mut lower = Lower {
         shader,
         definitions,
+        defined_rows,
         scratch,
         next: scratch,
         high: scratch,
@@ -391,6 +415,9 @@ pub(crate) fn lower(shader: &Shader) -> Result<Lowered, Error> {
         binding: None,
         interpolation: None,
     })];
+    if !table.is_empty() {
+        prologue.push(Statement::ImmediateConstants(table));
+    }
     for &n in &lower.outputs_read {
         prologue.push(Statement::Execute(instruction(
             ir::Opcode::Mov,
@@ -435,6 +462,8 @@ struct Lower<'a> {
     shader: &'a Shader,
     /// The last definition of each register in program order.
     definitions: HashMap<(RegisterKind, u16), [u32; 4]>,
+    /// Rows of the defined-constant table, zero without relative float reads.
+    defined_rows: u32,
     scratch: u32,
     next: u32,
     high: u32,
@@ -649,7 +678,7 @@ impl Lower<'_> {
         inside: &Value,
         last: u32,
         read: impl FnOnce(Box<ir::Operand>) -> OperandValue,
-    ) {
+    ) -> Value {
         let n = self.alloc();
         let clamped = Value::new(temp(n));
         self.exec(
@@ -673,6 +702,7 @@ impl Lower<'_> {
             vec![mask(temp(result), 15)],
             vec![Value::new(temp(result)).operand(), inside.lane(0)],
         );
+        clamped
     }
 
     fn float_bound(&self) -> u32 {
@@ -690,45 +720,36 @@ impl Lower<'_> {
     fn relative_float(&mut self, base: u32, rel: Relative) -> Lowering<Value> {
         let (index, inside) = self.bounded_index(base, rel, self.float_bound())?;
         let result = self.alloc();
-        let defined: BTreeMap<u16, [u32; 4]> = self
-            .definitions
-            .iter()
-            .filter(|((kind, _), _)| *kind == RegisterKind::Float)
-            .map(|((_, index), value)| (*index, *value))
-            .collect();
         let read = |register| OperandValue::Constant {
             slot: Index::Direct(u64::from(FLOATS)),
             byte_offset: Index::Relative { base: 0, register },
         };
-        if defined.is_empty() {
-            self.bounded_read(result, &index, &inside, 255, read);
+        let clamped = self.bounded_read(result, &index, &inside, 255, read);
+        let rows = self.defined_rows;
+        if rows == 0 {
             return Ok(Value::new(temp(result)));
         }
-        let mut cases = Vec::new();
-        for (n, value) in defined {
-            cases.push(ir::Case {
-                value: Some(u32::from(n)),
-                body: vec![
-                    Statement::Execute(instruction(
-                        ir::Opcode::Mov,
-                        vec![mask(temp(result), 15)],
-                        vec![bits(value).operand()],
-                    )),
-                    Statement::Execute(instruction(ir::Opcode::Break, vec![], vec![])),
-                ],
-            });
-        }
-        self.blocks.push(Vec::new());
-        self.bounded_read(result, &index, &inside, 255, read);
-        self.exec(ir::Opcode::Break, vec![], vec![]);
-        cases.push(ir::Case {
-            value: None,
-            body: self.blocks.pop().unwrap(),
-        });
-        self.push(Statement::Switch {
-            selector: index.lane(0),
-            cases,
-        });
+        // A defined register wins over the bound, as in the reference.
+        let table = |base: u32| OperandValue::Register {
+            register: ir::Register::ImmediateConstantBuffer,
+            indices: vec![Index::Relative {
+                base: u64::from(base),
+                register: Box::new(clamped.lane(0)),
+            }],
+        };
+        let flag = self.scratch(ir::Opcode::Mov, 1, vec![Value::new(table(rows)).lane(0)]);
+        let exact = self.scratch(ir::Opcode::Ieq, 1, vec![index.lane(0), clamped.lane(0)]);
+        let defined = self.scratch(ir::Opcode::And, 1, vec![flag.lane(0), exact.lane(0)]);
+        let current = Value::new(temp(result));
+        self.exec(
+            ir::Opcode::Movc,
+            vec![mask(temp(result), 15)],
+            vec![
+                defined.lane(0),
+                Value::new(table(0)).operand(),
+                current.operand(),
+            ],
+        );
         Ok(Value::new(temp(result)))
     }
 
@@ -736,7 +757,7 @@ impl Lower<'_> {
         let (index, inside) = self.bounded_index(base, rel, 16)?;
         self.inputs.extend(0..16);
         let result = self.alloc();
-        self.bounded_read(result, &index, &inside, 15, |register| {
+        let _ = self.bounded_read(result, &index, &inside, 15, |register| {
             OperandValue::Register {
                 register: ir::Register::Input,
                 indices: vec![Index::Relative { base: 0, register }],

@@ -482,3 +482,52 @@ fn run(
 ) -> Result<Outputs, Error> {
     Program::new(shader)?.run(input, constants, sampler)
 }
+#[test]
+// spec: GFX-NUM-1
+fn relative_reads_take_definitions_from_one_table() {
+    // aL runs 2, 3, 4: c[aL + 1] reads the defined c3, the bound c4 and the defined c5.
+    let mut body = Vec::new();
+    body.extend(instruction(
+        Opcode::Def,
+        &[dst(2, 3), 1f32.to_bits(), 0, 0, 0],
+    ));
+    body.extend(instruction(
+        Opcode::Def,
+        &[dst(2, 5), 4f32.to_bits(), 0, 0, 0],
+    ));
+    body.extend(instruction(Opcode::Defi, &[dst(7, 0), 3, 2, 1, 0]));
+    body.extend(instruction(Opcode::Mov, &[dst(0, 0), src(2, 0)]));
+    body.extend(instruction(Opcode::Loop, &[src(15, 0), src(7, 0)]));
+    body.extend(instruction(
+        Opcode::Add,
+        &[dst(0, 0), src(0, 0), src(2, 1) | 0x2000, reg(15, 0)],
+    ));
+    body.extend(instruction(Opcode::EndLoop, &[]));
+    body.extend(instruction(Opcode::Mov, &[dst(8, 0), src(0, 0)]));
+    let s = shader(Stage::Pixel, 3, 0, &body);
+    validate(&s);
+    let mut constants = Constants::default();
+    constants.f[3] = [100.0; 4];
+    constants.f[4] = [2.0; 4];
+    let out = run(&s, &Inputs::default(), &constants, &mut NoTextures).unwrap();
+    assert_eq!(out.colors[0][0], 7.0);
+
+    // Many definitions and relative reads stay within the translation size limit.
+    let mut body = instruction(Opcode::Dcl, &[0x80000000, dst(6, 0)]);
+    for n in 0..256 {
+        body.extend(instruction(Opcode::Def, &[dst(2, n), n, 0, 0, 0]));
+    }
+    body.extend(instruction(
+        Opcode::Mova,
+        &[(dst(3, 0) & !0xf0000) | 0x10000, src(2, 0)],
+    ));
+    for _ in 0..160 {
+        body.extend(instruction(
+            Opcode::Add,
+            &[dst(0, 0), src(0, 0), src(2, 0) | 0x2000, reg(3, 0)],
+        ));
+    }
+    body.extend(instruction(Opcode::Mov, &[dst(6, 0), src(0, 0)]));
+    let s = shader(Stage::Vertex, 3, 0, &body);
+    validate(&s);
+}

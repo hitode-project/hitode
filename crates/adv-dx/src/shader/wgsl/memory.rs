@@ -211,13 +211,7 @@ impl Writer<'_> {
         }
         for statement in &module.body {
             match statement {
-                Statement::ImmediateConstants(values) => {
-                    if !values.is_empty() {
-                        let rows: Vec<_> = values.iter().copied().map(vector).collect();
-                        self.line(&format!("const dx_immediate = array({});", rows.join(", ")));
-                        self.line(&format!("fn dx_icb(i: u32) -> vec4<u32> {{ if i < {}u {{ return dx_immediate[i]; }} return vec4<u32>(); }}", values.len()));
-                    }
-                }
+                Statement::ImmediateConstants(values) => self.immediate_constants(values),
                 Statement::Declare(declaration) => {
                     if let Some(binding) = declaration.binding
                         && binding.register == Register::ThreadGroupSharedMemory
@@ -252,6 +246,16 @@ impl Writer<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The immediate constant buffer, read as zero past its end.
+    pub(super) fn immediate_constants(&mut self, values: &[Vector]) {
+        if values.is_empty() {
+            return;
+        }
+        let rows: Vec<_> = values.iter().copied().map(vector).collect();
+        self.line(&format!("const dx_immediate = array({});", rows.join(", ")));
+        self.line(&format!("fn dx_icb(i: u32) -> vec4<u32> {{ if i < {}u {{ return dx_immediate[i]; }} return vec4<u32>(); }}", values.len()));
     }
 
     fn declare_buffer(&mut self, name: &str, slot: u32, writable: bool, atomic: bool) {
