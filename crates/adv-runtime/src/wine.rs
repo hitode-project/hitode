@@ -1,6 +1,6 @@
-//! Assembly of the graphics fronts on the Wine userland (issue #58): our
-//! DirectDraw and Direct3D 9 as PE images that Wine's loader maps, over the
-//! process surface store, with memory DCs that Wine's GDI draws into.
+//! Assembly of the graphics fronts on the Wine userland. Wine's loader maps
+//! their PE images over the process surface store. DirectDraw and Direct3D 9
+//! also supply memory DCs that Wine's GDI draws into.
 //!
 //! A surface's DC comes from `D3DKMTCreateDCFromMemory` over the surface's
 //! own pixels, called through the IAT of the front's image so that a guest
@@ -40,10 +40,19 @@ mod xaudio2;
 pub const GRAPHICS_DRIVER: &str = adv_drv::user::MODULE;
 
 /// The fronts' images, by the index their memory DCs are bound to.
-const IMAGES: [&str; 2] = ["ddraw.dll", "d3d9.dll"];
+const IMAGES: [&str; 6] = [
+    "ddraw.dll",
+    "d3d9.dll",
+    "dxgi.dll",
+    "d3d11.dll",
+    "d3d10core.dll",
+    "d3d10_1core.dll",
+];
 const DDRAW: usize = 0;
 #[cfg(feature = "gpu")]
 const D3D9: usize = 1;
+#[cfg(feature = "gpu")]
+const DXGI: usize = 2;
 const GDI32: &str = "gdi32.dll";
 const DDRAW_EXPORTS: [&str; 7] = [
     "DirectDrawCreate",
@@ -77,7 +86,11 @@ pub fn register(registry: &mut Registry) {
     winmm::register(registry);
     xaudio2::register(registry);
     #[cfg(feature = "gpu")]
-    adv_dx::d3d9::register(registry);
+    {
+        adv_dx::d3d9::register(registry);
+        adv_dx::dxgi::register(registry);
+        adv_dx::d3d11::register_children(registry);
+    }
     adv_drv::register(registry);
 }
 
@@ -132,6 +145,7 @@ pub fn install<B: Backend>(
     {
         adv_dx::d3d9::install(machine, d3d9_provider())?;
         install_image(machine, drive, D3D9, &D3D9_EXPORTS)?;
+        install_modern_graphics(machine, drive)?;
     }
     let provider = adv_drv::Provider {
         memory: guest_memory,
@@ -139,6 +153,73 @@ pub fn install<B: Backend>(
     };
     adv_drv::media::install(machine)?;
     adv_drv::install(machine, drive, provider)
+}
+
+#[cfg(feature = "gpu")]
+fn install_modern_graphics<B: Backend>(
+    machine: &mut Machine<B>,
+    drive: &Path,
+) -> Result<(), String> {
+    adv_dx::dxgi::install(
+        machine,
+        adv_dx::dxgi::Provider {
+            adapter: Default::default(),
+            display: adv_dx::dxgi::shared_display,
+            window_exists: |ext, _, hwnd| adv_drv::user::window(ext, hwnd).is_some(),
+            next_vblank: |ext| {
+                let vsync = ext.try_get::<std::sync::Arc<adv_sync::vsync::Vsync>>()?;
+                let (phase, period) = vsync.phase(std::time::Instant::now())?;
+                Some(period - phase)
+            },
+            devices: None,
+        },
+    )?;
+    adv_dx::d3d11::install_children(machine)?;
+    static EXPORTS: std::sync::OnceLock<Vec<Vec<(String, u16)>>> = std::sync::OnceLock::new();
+    let exports = EXPORTS.get_or_init(|| {
+        let mut registry = Registry::default();
+        adv_dx::dxgi::register(&mut registry);
+        adv_dx::d3d11::register_children(&mut registry);
+        IMAGES[DXGI..]
+            .iter()
+            .map(|module| graphics_exports(&registry, module))
+            .collect()
+    });
+    for (&module, exports) in IMAGES[DXGI..].iter().zip(exports) {
+        let exports: Vec<_> = exports
+            .iter()
+            .map(|(name, ordinal)| Export {
+                name,
+                ordinal: *ordinal,
+            })
+            .collect();
+        let built = ModuleImage::build(machine, module, &exports, &[])?;
+        adv_unix::builtin::install(drive, &built).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn graphics_exports(registry: &Registry, module: &str) -> Vec<(String, u16)> {
+    let names: Vec<_> = registry
+        .exports(module)
+        .into_iter()
+        .filter(|name| registry.is_implemented(module, name))
+        .collect();
+    let ordinals: HashMap<_, _> = adv_abi::ordinals::exports(module)
+        .map(|(ordinal, name)| (name, ordinal))
+        .collect();
+    let mut named_ordinals = (ordinals.values().copied().max().unwrap_or(0) + 1)..;
+    names
+        .into_iter()
+        .map(|name| {
+            let ordinal = ordinals
+                .get(name.as_str())
+                .copied()
+                .unwrap_or_else(|| named_ordinals.next().unwrap());
+            (name, ordinal)
+        })
+        .collect()
 }
 
 /// A thread that waits has ended its frame: publish the software frame it

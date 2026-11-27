@@ -11,14 +11,13 @@ build=$(cd "$2" && pwd)
 dist=$(cd "$3" && pwd)
 stripped=$(cd "$4" && pwd)
 # The graphics build updates only the two PE modules in an existing pair.
-modules="winegstreamer kernel32 dwrite ntdll dinput dinput8"
+modules="winegstreamer kernel32 dwrite ntdll dinput dinput8 d3d10 d3d10_1"
 if [ "${5-}" = d3d10 ]; then
     modules="d3d10 d3d10_1"
 fi
 for patch in "$tools"/patches/*.patch; do
     case "${patch##*/}: $modules " in
         d3d10-create-device.patch:*" d3d10 "*) ;;
-        d3d10-create-device.patch:*) continue ;;
         *:" d3d10 d3d10_1 ") continue ;;
     esac
     patch -d "$source" -p1 -R -s -f --dry-run < "$patch" >/dev/null 2>&1 ||

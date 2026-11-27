@@ -425,12 +425,6 @@ pub(super) fn link(source: &Path, target: &Path) -> Result<(), String> {
     std::os::unix::fs::symlink(source, target).map_err(|e| format!("{}: {e}", target.display()))
 }
 
-/// Wine modules backed by `wined3d`/OpenGL that Hitode does not serve.
-/// Exposing Wine's `dxgi.dll` in `system32` causes D3D9 titles that probe it
-/// (such as Microsoft's DirectX SDK / Unity VRAM detection) to load a DLL whose
-/// `CreateDXGIFactory` fails without GL instead of taking their non-DXGI fallback.
-const OMITTED_MODULES: &[&str] = &["dxgi.dll"];
-
 /// Create or refresh the prefix; returns it and drive C:.
 fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
     let prefix = config.prefix.to_owned();
@@ -489,9 +483,8 @@ fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
             let entry = entry.map_err(|e| e.to_string())?;
             let name = entry.file_name();
             if directory == MODULES
-                && OMITTED_MODULES
-                    .iter()
-                    .any(|&omitted| name.eq_ignore_ascii_case(omitted))
+                && !cfg!(feature = "gpu")
+                && name.eq_ignore_ascii_case("dxgi.dll")
             {
                 let target = windows.join("system32").join(&name);
                 if target
