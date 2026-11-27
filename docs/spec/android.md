@@ -111,4 +111,10 @@ Overlay controls in system gesture areas activate only on a completed tap.
 In the library, Android Back MUST dismiss only the top launcher layer, including a removal confirmation over the game management sheet.
 On launcher pages, Android Back MUST use the launcher's navigation stack. It MUST defer to the system when that stack has no destination or layer to dismiss.
 
+### AND-APP-19 Offline payloads
+
+**Rule**: The APK MUST store the Wine archive without compression and deflate the General MIDI bank. The player MUST read both through Android's asset manager.
+**Applies to**: Android
+**Verification**: Test — `tools/android/check-apk.py` verifies payload compression, with authored fixtures in `test_check_apk.py`.
+
 Withdrawn: AND-APP-5, AND-APP-6, AND-APP-7

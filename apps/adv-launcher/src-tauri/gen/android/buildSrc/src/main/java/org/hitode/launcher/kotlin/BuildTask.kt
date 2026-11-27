@@ -20,6 +20,8 @@ abstract class BuildTask : DefaultTask() {
     var target: String? = null
     @Input
     var release: Boolean? = null
+    @Input
+    lateinit var assetDir: String
 
     @TaskAction
     fun assemble() {
@@ -59,6 +61,7 @@ abstract class BuildTask : DefaultTask() {
 
         execOperations.exec {
             workingDir(File(projectDir, rootDirRel))
+            environment("HITODE_ANDROID_ASSET_DIR", assetDir)
             executable(executable)
             args(args)
             if (logger.isEnabled(LogLevel.DEBUG)) {

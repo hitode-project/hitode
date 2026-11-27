@@ -6,6 +6,8 @@ mod debug;
 mod execution;
 mod frame_pacer;
 mod frontend;
+#[cfg(target_os = "android")]
+pub use adv_device::android_asset;
 pub mod gamepad;
 mod heap;
 mod panic_report;
