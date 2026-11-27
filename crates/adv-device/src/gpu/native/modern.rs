@@ -3,7 +3,7 @@
 mod filter;
 
 use super::resources::gpu_error;
-use super::{Error, Gpu};
+use super::{BufferWindow, Error, Gpu, UniformWindow};
 use adv_gpu::encode::{Bind, IndexFormat, Load, Store};
 use adv_gpu::pipeline::{self as p, BindingKind, Stages};
 use adv_gpu::shader::{ShaderDesc, Source, Stage};
@@ -46,7 +46,7 @@ impl ImageAlias {
 /// number. Holes and bindings unused by the entry point are never visited.
 #[derive(Clone, Default)]
 pub struct SlotBindings {
-    pub uniforms: Vec<Option<BufferRange>>,
+    pub uniforms: Vec<Option<BufferWindow>>,
     pub images: Vec<Option<ImageView>>,
     pub samplers: Vec<Option<Sampler>>,
     pub storage: Vec<Option<StorageBinding>>,
@@ -323,7 +323,7 @@ fn storage_format(format: naga::StorageFormat) -> Result<adv_gpu::Format, Error>
 }
 
 enum Bound {
-    Uniform(BufferRange),
+    Uniform(BufferWindow),
     Sampled(ImageView),
     Sampler(Sampler),
     StorageBuffer(BufferRange),
@@ -337,9 +337,15 @@ pub(crate) struct BoundSlot {
 }
 
 impl BoundSlot {
+    pub(super) fn retain_uniform(&self, windows: &mut Vec<UniformWindow>) {
+        if let Bound::Uniform(window) = &self.resource {
+            window.retain(windows);
+        }
+    }
+
     pub fn binding(&self) -> Bind<'_> {
         match &self.resource {
-            Bound::Uniform(b) => Bind::Uniform(b.buffer.slice(b.range.clone())),
+            Bound::Uniform(b) => Bind::Uniform(b.binding()),
             Bound::Sampled(view) => Bind::Sampled(view),
             Bound::Sampler(sampler) => Bind::Sampler(sampler),
             Bound::StorageBuffer(b) => Bind::StorageBuffer(b.buffer.slice(b.range.clone())),
@@ -669,6 +675,10 @@ pub enum ModernTransfer {
         source: BufferRange,
         destination: Buffer,
         offset: u64,
+    },
+    CopyBufferWindow {
+        source: BufferWindow,
+        destination: BufferWindow,
     },
     FillBuffer {
         destination: BufferRange,

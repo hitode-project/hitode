@@ -32,18 +32,20 @@ pub(crate) struct Span {
 }
 
 impl Device {
-    pub(crate) fn ring(&self, size: u64) -> Result<crate::Ring> {
-        if size == 0 {
-            return Err(Error::Invalid("ring size must be nonzero".into()));
-        }
+    pub(crate) fn ring(&self, size: u64, capacity: u64) -> Result<(crate::Ring, crate::Buffer)> {
         let buffer = self.create_buffer(&BufferDesc {
-            size,
+            size: capacity,
             memory: Memory::Upload,
             usage: BufferUsage::COPY_SRC
                 | BufferUsage::VERTEX
                 | BufferUsage::INDEX
                 | BufferUsage::UNIFORM
-                | BufferUsage::STORAGE,
+                | BufferUsage::STORAGE
+                | if size != capacity {
+                    BufferUsage::COPY_DST
+                } else {
+                    BufferUsage::empty()
+                },
             label: "upload ring",
         })?;
         let state = Arc::new(Mutex::new(State {
@@ -55,14 +57,17 @@ impl Device {
             reservations: VecDeque::new(),
         }));
         self.0.rings.lock().unwrap().push(Arc::downgrade(&state));
-        Ok(crate::Ring {
-            inner: Ring {
-                buffer,
-                state,
-                completed: self.0.event.clone(),
-                _not_sync: std::marker::PhantomData,
+        Ok((
+            crate::Ring {
+                inner: Ring {
+                    buffer: buffer.clone(),
+                    state,
+                    completed: self.0.event.clone(),
+                    _not_sync: std::marker::PhantomData,
+                },
             },
-        })
+            buffer,
+        ))
     }
 }
 

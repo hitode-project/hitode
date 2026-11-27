@@ -124,6 +124,7 @@ struct State {
     target: Option<Attachments>,
     predicate_pipeline: Option<adv_gpu::ComputePipeline>,
     expansion: super::expand::Ring,
+    uniforms: Vec<super::UniformWindow>,
     timestamp_pipeline: Option<adv_gpu::ComputePipeline>,
     depths: Vec<Depth>,
     run: Run,
@@ -216,6 +217,7 @@ impl State {
             target: None,
             predicate_pipeline: None,
             expansion: super::expand::Ring::default(),
+            uniforms: Vec::new(),
             timestamp_pipeline: None,
             depths: Vec::new(),
             run: Run::default(),
@@ -381,7 +383,8 @@ impl State {
     fn transfer(&mut self, transfer: modern::ModernTransfer) {
         use adv_gpu::encode::{ColorAttachment, DepthAttachment, Load, RenderPassDesc, Store};
         use modern::ModernTransfer::*;
-        let encoder = self.encoder();
+        self.encoder();
+        let encoder = self.encoder.as_mut().unwrap();
         match transfer {
             CopyImage {
                 source,
@@ -424,6 +427,15 @@ impl State {
                 destination,
                 offset,
             } => encoder.copy_buffer(source.buffer.slice(source.range), &destination, offset),
+            CopyBufferWindow {
+                source,
+                destination,
+            } => {
+                source.retain(&mut self.uniforms);
+                destination.retain(&mut self.uniforms);
+                let destination = destination.binding();
+                encoder.copy_buffer(source.binding(), destination.buffer, destination.offset);
+            }
             FillBuffer { destination, value } => {
                 encoder.fill_buffer(destination.buffer.slice(destination.range), value)
             }
@@ -485,6 +497,7 @@ impl State {
             }
             Command::DrawModern(draw) => self.draw_modern(*draw)?,
             Command::Expand(work) => {
+                work.plan.retain_uniforms(&mut self.uniforms);
                 let device = self.queue.device().clone();
                 let mut expansion = std::mem::take(&mut self.expansion);
                 expansion.encode(&device, self.encoder(), *work)?;
@@ -492,6 +505,9 @@ impl State {
             }
             Command::Dispatch(work) => {
                 let work = *work;
+                for binding in &work.bindings {
+                    binding.retain_uniform(&mut self.uniforms);
+                }
                 for alias in work
                     .bindings
                     .iter()
@@ -765,6 +781,9 @@ impl State {
     }
     fn draw_modern(&mut self, render: modern::Render) -> adv_gpu::Result<()> {
         let draw = render.draw;
+        for binding in render.vertex.iter().chain(&render.fragment) {
+            binding.retain_uniform(&mut self.uniforms);
+        }
         let predicated = draw
             .predicate
             .as_ref()
@@ -907,6 +926,11 @@ impl State {
             *pending = token;
         }
         self.pending_uploads = 0;
+        if !self.uniforms.is_empty() {
+            let windows = std::mem::take(&mut self.uniforms);
+            self.queue
+                .on_complete(token, Box::new(move || drop(windows)));
+        }
         Ok(token)
     }
     fn render(&mut self, run: &Run) -> adv_gpu::Result<()> {

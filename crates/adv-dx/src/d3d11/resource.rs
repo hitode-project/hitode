@@ -3,7 +3,10 @@ use super::{
     desc::{Bind, Misc, Resource, Texture, TextureKind, View, ViewKind},
     ops::Error,
 };
-use adv_device::gpu::{Gpu, ImageAlias, ImageRegion, ModernTransfer, TransferBuffer};
+use adv_device::gpu::{
+    BufferRange, BufferWindow, Gpu, ImageAlias, ImageRegion, ModernTransfer, TransferBuffer,
+    UniformWindow,
+};
 use adv_gpu::{
     Buffer, Caps, Extent, Format, FormatCaps, Image, ImageView,
     resource::{
@@ -18,20 +21,30 @@ use blocks::Blocks;
 #[derive(Clone)]
 pub enum Backing {
     Buffer(Buffer),
+    Constant(UniformWindow),
     Image(Image),
     Blocks(Blocks),
 }
 
 impl Backing {
+    pub fn buffer_window(&self, range: std::ops::Range<u64>) -> BufferWindow {
+        match self {
+            Self::Buffer(buffer) => BufferRange {
+                buffer: buffer.clone(),
+                range,
+            }
+            .into(),
+            Self::Constant(window) => BufferWindow::Uniform(window.slice(range)),
+            Self::Image(_) | Self::Blocks(_) => unreachable!(),
+        }
+    }
+
     pub fn new(gpu: &Gpu, resource: Resource) -> Result<Self, Error> {
         let bind = resource.bind();
         if let Resource::Buffer(buffer) = resource {
             let mut usage = BufferUsage::COPY_SRC | BufferUsage::COPY_DST;
             if bind.contains(Bind::INDEX) {
                 usage |= BufferUsage::INDEX;
-            }
-            if bind.contains(Bind::CONSTANT) {
-                usage |= BufferUsage::UNIFORM;
             }
             if [
                 Bind::VERTEX,
@@ -144,7 +157,7 @@ impl Backing {
         let image = match self {
             Self::Image(image) => image,
             Self::Blocks(blocks) => return blocks.view(gpu, view),
-            Self::Buffer(_) => return Err(Error::InvalidArgument),
+            Self::Buffer(_) | Self::Constant(_) => return Err(Error::InvalidArgument),
         };
         let format = if view.format() == 65 && view.kind() != ViewKind::ShaderResource {
             Format::R8Unorm
@@ -185,7 +198,7 @@ impl Backing {
                 };
                 Ok(Some(texture_transfer(gpu, texture, destination, bytes)?))
             }
-            Self::Buffer(_) => unreachable!(),
+            Self::Buffer(_) | Self::Constant(_) => unreachable!(),
         }
     }
 }

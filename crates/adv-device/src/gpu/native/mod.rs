@@ -55,6 +55,7 @@ pub(crate) mod stream;
 #[cfg(feature = "test-support")]
 #[path = "../test_support/native.rs"]
 pub mod test_support;
+mod uniform;
 
 pub use compressed::{BlockTexture, decode_bc, decoded_bc_format};
 pub use expand::{
@@ -68,6 +69,7 @@ pub use modern::{
 };
 pub use record::Readback;
 pub use resources::{Depth, Image, ImageId, Staged, Target};
+pub use uniform::{BufferWindow, UniformWindow};
 
 use super::{Error, Rect, Stats};
 
@@ -164,8 +166,12 @@ impl Gpu {
                     Box::new(owner::Headless) as Box<dyn crate::frame::Presenter>,
                 )
             };
-            let (producer, commands) =
-                stream::channel(device.ring(64 << 20).map_err(record::gpu_error)?);
+            const TRANSIENT_BYTES: u64 = 64 << 20;
+            let (ring, resident) = device
+                .ring_with_resident(TRANSIENT_BYTES, uniform::PAGE_BYTES)
+                .map_err(record::gpu_error)?;
+            let uniforms = uniform::Pool::new(resident, TRANSIENT_BYTES);
+            let (producer, commands) = stream::channel(ring);
             let gate = producer.gate();
             let owner = owner::Owner::start(queue, commands, presenter)?;
             let worker = record::WorkerHandle::start(device.clone(), producer, owner.wake.clone())?;
@@ -174,6 +180,7 @@ impl Gpu {
                 stream: stream::ExecutionStream(std::rc::Rc::new(std::cell::RefCell::new(gate))),
                 worker,
                 owner,
+                uniforms,
                 #[cfg(feature = "test-support")]
                 capture: Default::default(),
             });
@@ -337,6 +344,7 @@ struct Execution {
     // `stream::Producer`) BEFORE `owner` joins `"GPU owner"`.
     worker: record::WorkerHandle,
     owner: owner::Owner,
+    uniforms: uniform::Pool,
     #[cfg(feature = "test-support")]
     capture: std::cell::RefCell<Option<std::rc::Rc<test_support::Frames>>>,
 }

@@ -689,7 +689,11 @@ pub(super) mod tests {
             }
             Err(error) => panic!("open native device: {error}"),
         };
-        let (producer, consumer) = stream::channel(device.ring(4 << 20).unwrap());
+        let (ring, resident) = device
+            .ring_with_resident(4 << 20, super::super::uniform::PAGE_BYTES)
+            .unwrap();
+        let uniforms = super::super::uniform::Pool::new(resident, 4 << 20);
+        let (producer, consumer) = stream::channel(ring);
         let gate = producer.gate();
         let owner = super::super::owner::Owner::unstarted();
         let worker =
@@ -700,6 +704,7 @@ pub(super) mod tests {
             stream: stream.clone(),
             worker,
             owner,
+            uniforms,
             #[cfg(feature = "test-support")]
             capture: Default::default(),
         });
