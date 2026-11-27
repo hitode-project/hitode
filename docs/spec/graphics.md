@@ -622,6 +622,13 @@ The overflow predicate compares storage needed with primitives written for its s
 **Rule**: Each primitive MUST use the viewport, scissor and attachment slice selected by the leading geometry shader output vertex. For a Texture3D render-target view, attachment indices MUST be relative to the view’s first W slice at its mip. A render-target clear MUST cover every W slice in the view.
 **Verification**: Test
 
+### GFX-STAGE-6 Output merger sample mask
+
+**Rule**: A draw MUST intersect raster coverage with the low bits of the output-merger sample mask for the bound sample count. Pixel shader input coverage includes the mask, and at one sample only bit 0 applies. Pixel shader output coverage further limits the written samples and disables alpha-to-coverage.
+**Verification**: Test — private D3D11 color, depth and coverage draws at one and four samples.
+
+Vulkan uses the pipeline sample mask. Lavapipe can report shader input coverage for a subset of the covered samples. Metal uses fragment output coverage for partial masks. Metal can narrow shader input coverage and run UAV operations on excluded samples. Forced early depth and stencil writes can precede the shader mask.
+
 ## Samplers
 
 ### GFX-SAMPLER-1 Addressing

@@ -64,6 +64,8 @@ pub struct Options<'a> {
     pub manual_filter: &'a [u32],
     pub manual_samplers: &'a [BorderSampler],
     pub raster_samples: u32,
+    /// Fragment coverage mask when the backend has no fixed-function mask.
+    pub raster_sample_mask: u32,
 }
 
 impl Default for Options<'_> {
@@ -88,6 +90,7 @@ impl Default for Options<'_> {
             manual_filter: &[],
             manual_samplers: &[],
             raster_samples: 1,
+            raster_sample_mask: u32::MAX,
         }
     }
 }
@@ -153,10 +156,7 @@ pub fn emit_variant(
     if interface.pulled || variant.storage_varyings() {
         return Err(Error::Invalid("pulled shader requires an expansion plan"));
     }
-    if variant.early_tests() {
-        reflection.global_flags |=
-            super::dxbc::fields::D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL;
-    }
+    set_early_tests(&mut reflection, variant.early_tests());
     emit_entry(
         module,
         reflection,
@@ -190,10 +190,7 @@ pub fn emit_expanded_fragment(
             registers,
         );
     }
-    if variant.early_tests() {
-        reflection.global_flags |=
-            super::dxbc::fields::D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL;
-    }
+    set_early_tests(&mut reflection, variant.early_tests());
     emit_entry(
         module,
         reflection,
@@ -203,6 +200,15 @@ pub fn emit_expanded_fragment(
         },
         Some(&interface),
     )
+}
+
+#[cfg(feature = "gpu")]
+fn set_early_tests(reflection: &mut Reflection, early: bool) {
+    use super::dxbc::fields::D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL as EARLY;
+    reflection.global_flags &= !EARLY;
+    if early {
+        reflection.global_flags |= EARLY;
+    }
 }
 
 fn emit_entry(

@@ -215,6 +215,7 @@ impl Gpu {
             colors: colors(format, None),
             depth_stencil: None,
             samples: 1,
+            sample_mask: u32::MAX,
             alpha_to_coverage: false,
             label: "solid",
         }
@@ -709,6 +710,7 @@ fn vertex_fetch_reads_storage_buffers_with_base_vertex() {
         colors: colors(Format::Rgba8Unorm, None),
         depth_stencil: None,
         samples: 1,
+        sample_mask: u32::MAX,
         alpha_to_coverage: false,
         label: "fetch",
     });
@@ -774,6 +776,7 @@ fn bindings_persist_across_pipelines_by_slot() {
         colors: colors(Format::Rgba8Unorm, None),
         depth_stencil: None,
         samples: 1,
+        sample_mask: u32::MAX,
         alpha_to_coverage: false,
         label: "sampled",
     });
@@ -1571,6 +1574,7 @@ fn cpu_yuv_pools_write_sample_and_release() {
         colors: colors(Format::Rgba8Unorm, None),
         depth_stencil: None,
         samples: 1,
+        sample_mask: u32::MAX,
         alpha_to_coverage: false,
         label: "sample YUV planes",
     });
@@ -1675,6 +1679,7 @@ fn cpu_yuv_pools_write_sample_and_release() {
             colors: colors(Format::Rgba8Unorm, None),
             depth_stencil: None,
             samples: 1,
+            sample_mask: u32::MAX,
             alpha_to_coverage: false,
             label: "sample YUV",
         };
@@ -1933,6 +1938,7 @@ fn vertex(i:u32, red:f32)->V {
         colors: colors(Format::Rgba8Unorm, None),
         depth_stencil: None,
         samples: 1,
+        sample_mask: u32::MAX,
         alpha_to_coverage: false,
         label: "per-stage samplers",
     };
@@ -2040,6 +2046,7 @@ vertex float4 vs(uint i [[vertex_id]], sampler s [[sampler(0)]]) {
         colors: ArrayVec::new(),
         depth_stencil: None,
         samples: 1,
+        sample_mask: u32::MAX,
         alpha_to_coverage: false,
         label: "colliding sampler slots",
     };
@@ -2150,6 +2157,7 @@ struct Block { tint: vec4<f32> }
         colors,
         depth_stencil: None,
         samples: 1,
+        sample_mask: u32::MAX,
         alpha_to_coverage: false,
         label: "dropped bindings",
     });
@@ -2307,6 +2315,7 @@ struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
         colors: colors(Format::Rgba8Unorm, None),
         depth_stencil: None,
         samples: 1,
+        sample_mask: u32::MAX,
         alpha_to_coverage: false,
         label: "solid blue",
     });
@@ -2333,6 +2342,7 @@ struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
         colors: colors(Format::Rgba8Unorm, None),
         depth_stencil: None,
         samples: 1,
+        sample_mask: u32::MAX,
         alpha_to_coverage: false,
         label: "sample mip1",
     });

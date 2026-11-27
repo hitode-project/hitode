@@ -529,6 +529,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                     .collect(),
                     depth_stencil: None,
                     samples,
+                    sample_mask: u32::MAX,
                     alpha_to_coverage: false,
                     label: name,
                 },

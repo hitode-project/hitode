@@ -1531,7 +1531,18 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         stream_output.push(declaration);
     }
     let indexed_strip = indexed && step < input_vertices && tessellation.is_none();
-    let alpha_to_coverage = blend.is_some_and(|blend| blend.AlphaToCoverageEnable != 0);
+    // Keep the unmasked pipeline and ignore bits beyond the attachment's sample count.
+    let active_samples = u32::MAX >> (u32::BITS - samples);
+    let sample_mask = if raster_stream.is_some() {
+        snapshot.om.sample_mask | !active_samples
+    } else {
+        u32::MAX
+    };
+    let metal_mask = if cfg!(target_vendor = "apple") {
+        sample_mask
+    } else {
+        u32::MAX
+    };
     let mut reads = Vec::new();
     let mut capture = IaCapture::default();
     let (index, vertices) = if indexed {
@@ -1558,6 +1569,8 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         expansion,
         captures,
         fetches,
+        alpha_to_coverage,
+        inexact_sample_mask,
     ) = {
         let caps = env
             .ext
@@ -1571,6 +1584,15 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         let vertex_shader =
             bound_shader(env, &snapshot, Stage::Vertex).ok_or(Error::InvalidArgument)?;
         let pixel_shader = raster_stream.and_then(|_| bound_shader(env, &snapshot, Stage::Pixel));
+        let alpha_to_coverage = blend.is_some_and(|blend| blend.AlphaToCoverageEnable != 0)
+            && pixel_shader.is_some_and(|shader| {
+                !shader
+                    .reflection()
+                    .signatures
+                    .output
+                    .iter()
+                    .any(|e| e.system_value == SystemValue::Coverage)
+            });
         let reflection = vertex_shader.reflection();
         let pixel_reflection = pixel_shader.map(|shader| (u64::from(pixel), shader.reflection()));
         let input_layout = context::owned(env, layout).and_then(Object::input_layout);
@@ -1646,6 +1668,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             clip_components,
             producer_identity: Some(u64::from(if geometry == 0 { vertex } else { geometry })),
             alpha_to_coverage,
+            emulated_sample_mask: metal_mask != u32::MAX,
             wireframe: raster.FillMode == 2,
             geometry: geometry_shader.is_some(),
             tessellated: tessellation.is_some(),
@@ -1838,7 +1861,9 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         } else {
             None
         };
-        let (pixel, pixel_code) = if let Some(shader) = pixel_shader {
+        let (pixel, pixel_code, inexact_sample_mask) = if let Some(shader) =
+            pixel_shader.filter(|_| metal_mask & active_samples != 0)
+        {
             let views = ShaderViews::new(env, &snapshot, Stage::Pixel, shader.reflection())?;
             views.writes(env, &mut writes);
             let variant = Variant::select(
@@ -1849,9 +1874,24 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 },
                 caps,
             );
+            let reflection = shader.reflection();
+            let inexact_sample_mask = metal_mask != u32::MAX
+                && (variant.early_tests() && depth.is_some()
+                    || samples > 1 && {
+                        let writes_uav = reflection
+                            .writes
+                            .keys()
+                            .any(|(register, _)| *register == Register::UnorderedAccessView);
+                        let reads_coverage = reflection
+                            .reads
+                            .contains_key(&(Register::InputCoverageMask, Some(0)));
+                        writes_uav
+                            || reads_coverage && (metal_mask & active_samples).count_ones() > 1
+                    });
             let sampling = Sampling::new(env, &snapshot, Stage::Pixel, shader.reflection());
             let options = Options {
                 raster_samples: samples,
+                raster_sample_mask: metal_mask,
                 alpha_targets,
                 image_atomics: true,
                 ..views.options(sampling.options())
@@ -1865,9 +1905,26 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             (
                 Some(modern_shader(&code, adv_gpu::shader::Stage::Fragment)?),
                 Some(code),
+                inexact_sample_mask,
+            )
+        } else if metal_mask != u32::MAX {
+            // Depth-only draws still need a mask output. An empty mask also
+            // suppresses the guest shader's side effects.
+            let source = format!(
+                "@fragment fn fragment_main() -> @builtin(sample_mask) u32 {{ return {metal_mask}u; }}"
+            );
+            (
+                Some(Arc::new(ModernShader::wgsl(
+                    xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
+                    &source,
+                    "fragment_main",
+                    adv_gpu::shader::Stage::Fragment,
+                )?)),
+                None,
+                false,
             )
         } else {
-            (None, None)
+            (None, None, false)
         };
         let vertex_code;
         let gs_reflection = geometry_shader.map(|shader| shader.reflection().clone());
@@ -1953,6 +2010,8 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             expanded,
             captures,
             fetches,
+            alpha_to_coverage && metal_mask & active_samples != 0,
+            inexact_sample_mask,
         )
     };
     if let DrawRange::Indirect(args, resource, _) = &args {
@@ -2109,6 +2168,8 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         color_slots: Some(color_slots),
         depth: depth.clone(),
         samples,
+        sample_mask,
+        inexact_sample_mask,
         alpha_to_coverage,
         primitive: p::Primitive {
             topology,

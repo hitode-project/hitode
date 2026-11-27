@@ -169,6 +169,7 @@ pub(super) struct Pipelines {
     jobs: Arc<Mutex<HashMap<[u8; 32], PipelineJob>>>,
     anticipated: u64,
     cache_hits: u64,
+    inexact_sample_mask_pipelines: u64,
     batch: Option<Compile<()>>,
     cache: Option<Arc<p::PipelineCache>>,
     store: Option<Archive>,
@@ -277,6 +278,9 @@ impl Pipelines {
         };
         let mut digest = JobDigest(Sha256::new_with_prefix(b"modern pipeline"));
         key.hash(&mut digest);
+        if draw.sample_mask != u32::MAX {
+            draw.sample_mask.hash(&mut digest);
+        }
         let hash = digest.0.finalize().into();
         let task = {
             let mut jobs = self.jobs.lock().unwrap();
@@ -284,6 +288,14 @@ impl Pipelines {
                 self.cache_hits += 1;
                 task.clone()
             } else {
+                if draw.inexact_sample_mask {
+                    self.inexact_sample_mask_pipelines += 1;
+                    log::warn!(
+                        "Metal output-merger mask {:#010x} at {} samples can change pixel input coverage, UAV effects or early depth/stencil writes",
+                        draw.sample_mask,
+                        draw.samples,
+                    );
+                }
                 let vertex = draw.vertex.clone();
                 let fragment = draw.fragment.clone();
                 let device = device.clone();
@@ -303,6 +315,7 @@ impl Pipelines {
                     ..d.state
                 });
                 let samples = draw.samples;
+                let sample_mask = draw.sample_mask;
                 let alpha_to_coverage = draw.alpha_to_coverage;
                 let color_slots = draw.color_slots;
                 let task = Compile::spawn(0, self.counters.clone(), move || {
@@ -318,6 +331,7 @@ impl Pipelines {
                             colors,
                             depth_stencil,
                             samples,
+                            sample_mask,
                             alpha_to_coverage,
                             label: "modern render pipeline",
                         };
@@ -627,6 +641,7 @@ impl Pipelines {
         let (waits, ns) = self.counters.snapshot();
         gpu::Stats {
             pipeline_cache_hits: self.cache_hits,
+            inexact_sample_mask_pipelines: self.inexact_sample_mask_pipelines,
             anticipated_pipeline_draws: self.anticipated,
             compile_waits: waits,
             compile_wait_ns: ns,
@@ -1029,6 +1044,7 @@ fn build(
                     depth_bias: false,
                 }),
                 samples: 1,
+                sample_mask: u32::MAX,
                 alpha_to_coverage: false,
                 label: "native executor",
             };

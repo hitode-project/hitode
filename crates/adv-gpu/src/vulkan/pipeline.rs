@@ -75,7 +75,7 @@ struct PipelinePassKey {
 
 #[derive(Default)]
 pub(super) struct Pipelines {
-    render: HashMap<RenderKey, Arc<Compiled>>,
+    render: HashMap<(RenderKey, u32), Arc<Compiled>>,
     compute: HashMap<ComputeKey, Arc<Compiled>>,
     passes: HashMap<PipelinePassKey, vk::RenderPass>,
     input_layouts: HashMap<u8, vk::DescriptorSetLayout>,
@@ -564,6 +564,9 @@ impl Device {
     pub(crate) fn pipeline_identity(&self, desc: &RenderPipelineDesc, slots: u8) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         RenderKey::new(desc, slots, self.caps().modern).hash(&mut hasher);
+        if desc.sample_mask != u32::MAX {
+            desc.sample_mask.hash(&mut hasher);
+        }
         hasher.finish()
     }
     pub(crate) fn create_render_pipeline(
@@ -606,6 +609,7 @@ impl Device {
     ) -> Result<crate::RenderPipeline> {
         let mut key = RenderKey::new(desc, slots, self.caps().modern);
         key.video = video.map(|v| v.resources.layout.as_raw());
+        let key = (key, desc.sample_mask);
         let mut pipelines = self.0.pipelines.lock().unwrap();
         let compiled = match pipelines.render.get(&key) {
             Some(compiled) => compiled.clone(),
@@ -643,7 +647,7 @@ impl Device {
                     None
                 };
                 let compiled = Arc::new(self.compile(
-                    &key.bindings,
+                    &key.0.bindings,
                     &entries,
                     video,
                     ordered,
@@ -908,9 +912,13 @@ impl Device {
             .front_face(winding(desc.primitive.front_ccw))
             .depth_bias_enable(desc.depth_stencil.is_some_and(|d| d.depth_bias))
             .line_width(1.0);
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        let sample_mask = [desc.sample_mask, u32::MAX];
+        let mut multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::from_raw(desc.samples))
             .alpha_to_coverage_enable(desc.alpha_to_coverage && reads & 1 == 0);
+        if desc.sample_mask != u32::MAX {
+            multisample = multisample.sample_mask(&sample_mask);
+        }
         let mut depth = vk::PipelineDepthStencilStateCreateInfo::default();
         if let Some(d) = desc.depth_stencil {
             depth = depth

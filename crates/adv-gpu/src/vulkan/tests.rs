@@ -642,6 +642,7 @@ fn binding_tiers_render_identical_pixels() {
             .collect(),
             depth_stencil: None,
             samples: 1,
+            sample_mask: u32::MAX,
             alpha_to_coverage: false,
             label: "binding tiers",
         };
@@ -1023,6 +1024,7 @@ fn storage_pipeline(device: &crate::Device, source: &str) -> crate::RenderPipeli
                 .collect(),
                 depth_stencil: None,
                 samples: 1,
+                sample_mask: u32::MAX,
                 alpha_to_coverage: false,
                 label: "storage addressing",
             },
@@ -1193,6 +1195,7 @@ fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
         .collect(),
         depth_stencil: None,
         samples: 1,
+        sample_mask: u32::MAX,
         alpha_to_coverage: false,
         label: "sixteen textures",
     };

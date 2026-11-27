@@ -84,7 +84,17 @@ impl Writer<'_> {
                     }
                 }
             }
-            let outputs = fields(module, &module.signatures.output, false, variant)?;
+            let mut outputs = fields(module, &module.signatures.output, false, variant)?;
+            let sample_mask = self.options.raster_sample_mask;
+            if sample_mask != u32::MAX && !outputs.iter().any(|f| f.register == "o_coverage") {
+                outputs.push(Field {
+                    name: "coverage".into(),
+                    attribute: "@builtin(sample_mask)".into(),
+                    ty: "u32",
+                    register: "",
+                    component: None,
+                });
+            }
             let vertex = self.stage == Stage::Vertex;
             let variant_inputs = variant.filter(|_| !vertex);
             let variant_outputs = variant.filter(|_| vertex);
@@ -142,7 +152,13 @@ impl Writer<'_> {
             let mut result: Vec<_> = outputs
                 .iter()
                 .map(|field| {
-                    let value = field.output();
+                    let value = match field.register {
+                        "" => format!("{sample_mask}u"),
+                        "o_coverage" if sample_mask != u32::MAX => {
+                            format!("o_coverage.x & {sample_mask}u")
+                        }
+                        _ => field.output(),
+                    };
                     let alpha = self.stage == Stage::Pixel
                         && (0..8).any(|slot| {
                             self.options.alpha_targets & (1 << slot) != 0
@@ -167,13 +183,16 @@ impl Writer<'_> {
             self.line(&format!("var o: array<vec4<u32>, {output_count}>;"));
             for field in &inputs {
                 if !field.register.is_empty() {
-                    self.line(&field.input());
+                    self.line(&field.input(sample_mask));
                 }
             }
             if let Some(variant) = variant_inputs {
                 self.variant_inputs(variant);
             }
             if reflection.interpolation_queries {
+                if !eval_coverage.is_empty() && sample_mask != u32::MAX {
+                    eval_coverage = format!("({eval_coverage} & {sample_mask}u)");
+                }
                 self.interpolation_planes(
                     module,
                     input_count,
@@ -371,7 +390,7 @@ impl Field {
         }
     }
 
-    fn input(&self) -> String {
+    fn input(&self, sample_mask: u32) -> String {
         let field = format!("input.{}", self.name);
         let value = if self.ty == "bool" {
             format!("select(0u, 0xffffffffu, {field})")
@@ -389,7 +408,9 @@ impl Field {
         };
         let register = self.location();
         if let Some(component) = self.component {
-            if self.register.starts_with("v_") {
+            if self.register == "v_coverage" && sample_mask != u32::MAX {
+                format!("let {register} = vec4<u32>({value} & {sample_mask}u);")
+            } else if self.register.starts_with("v_") {
                 format!("let {register} = vec4<u32>({value});")
             } else {
                 format!("{register}.{component} = {value};")
