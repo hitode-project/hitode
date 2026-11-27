@@ -429,6 +429,8 @@ Typed UAVs use the native storage view when the format supports the shader's ope
 
 Filtering can combine point samples from a format that lacks native linear filtering. Mip generation and resolve can combine texel or sample loads. Expanded packed resolves quantize their result to the guest channel widths.
 
+Vulkan float32 color attachments without native blending use ordered input attachment reads on supporting drivers. This path runs at one sample per pixel and preserves the attachment's float32 storage.
+
 ### GFX-CAP-6 Direct3D 7 capability derivation
 
 **Rule**: Direct3D 7 and legacy descriptors MUST report only the fixed-function paths admitted for that device. Texture and depth enumeration MUST use the same admitted paths.

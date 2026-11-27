@@ -159,6 +159,9 @@ bitflags::bitflags! {
         const BC_VOLUME = 1 << 10;
         /// Atomic operations on this storage image format.
         const STORAGE_ATOMIC = 1 << 11;
+        /// The compact fragment path can blend into this single-sample target
+        /// with an ordered input attachment read.
+        const ORDERED_BLEND = 1 << 12;
         const PRESENTABLE = 1 << 6;
         /// Presentable buffers of this format are losslessly compressed, so
         /// rendering into them costs what a private image costs.

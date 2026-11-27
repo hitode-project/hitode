@@ -91,6 +91,7 @@ struct SelectedAdapter {
     base: vk::PhysicalDeviceFeatures,
     support: QueriedSupport,
     float_image_exchange: bool,
+    ordered_color: Option<&'static CStr>,
 }
 
 impl Device {
@@ -536,6 +537,14 @@ impl Device {
             let mut eds2 = vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
             let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
             let mut atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
+            let mut ordered_color =
+                vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT::default();
+            let ordered_color_extension = [
+                ash::ext::rasterization_order_attachment_access::NAME,
+                ash::arm::rasterization_order_attachment_access::NAME,
+            ]
+            .into_iter()
+            .find(|name| has(name));
             let mut dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
             let mut matrix = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
             let mut matrix_nv = vk::PhysicalDeviceCooperativeMatrixFeaturesNV::default();
@@ -569,6 +578,9 @@ impl Device {
             }
             if has(ash::ext::shader_atomic_float::NAME) {
                 features = features.push_next(&mut atomic_float);
+            }
+            if ordered_color_extension.is_some() {
+                features = features.push_next(&mut ordered_color);
             }
             if api >= vk::API_VERSION_1_3 || has(ash::khr::shader_integer_dot_product::NAME) {
                 features = features.push_next(&mut dot);
@@ -691,6 +703,25 @@ impl Device {
                 base,
                 support,
                 float_image_exchange: atomic_float.shader_image_float32_atomics != 0,
+                ordered_color: ordered_color_extension.filter(|_| {
+                    ordered_color.rasterization_order_color_attachment_access != 0
+                        && float_controls.shader_signed_zero_inf_nan_preserve_float32 != 0
+                        && float_controls.shader_denorm_flush_to_zero_float32 != 0
+                        && float_controls.shader_rounding_mode_rte_float32 != 0
+                        && [Format::R32Float, Format::Rg32Float, Format::Rgba32Float]
+                            .into_iter()
+                            .any(|format| {
+                                let flags = instance
+                                    .get_physical_device_format_properties(
+                                        physical,
+                                        formats::vk(format),
+                                    )
+                                    .optimal_tiling_features;
+                                flags.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT)
+                                    && !flags
+                                        .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND)
+                            })
+                }),
             })
         }
     }
@@ -708,6 +739,7 @@ impl Device {
             let instance = inst.instance.as_ref().unwrap();
             let physical = adapter.physical;
             let base = adapter.base;
+            let ordered_color = adapter.ordered_color.filter(|_| plan.use_ieee_f32);
 
             // Enable only the Vulkan 1.0 feature bits our front ends and host
             // passes actually use, avoiding driver bugs in unused stages,
@@ -764,6 +796,9 @@ impl Device {
             let mut enabled_atomic_float =
                 vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
                     .shader_image_float32_atomics(true);
+            let mut enabled_ordered_color =
+                vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT::default()
+                    .rasterization_order_color_attachment_access(true);
             let mut enabled_dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
                 .shader_integer_dot_product(true);
             let mut enabled_matrix =
@@ -808,6 +843,9 @@ impl Device {
             if adapter.float_image_exchange {
                 device_features = device_features.push_next(&mut enabled_atomic_float);
             }
+            if ordered_color.is_some() {
+                device_features = device_features.push_next(&mut enabled_ordered_color);
+            }
             if plan.use_int8_dot {
                 device_features = device_features.push_next(&mut enabled_dot);
             }
@@ -841,6 +879,7 @@ impl Device {
                         .float_image_exchange
                         .then_some(ash::ext::shader_atomic_float::NAME),
                 )
+                .chain(ordered_color)
                 .map(CStr::as_ptr)
                 .collect::<Vec<_>>();
             let priorities = [1.0];
@@ -1068,6 +1107,16 @@ impl Device {
                     }
                     if f == Format::Bgra4Unorm && !plan.use_4444 {
                         caps = FormatCaps::empty();
+                    }
+                    if ordered_color.is_some()
+                        && matches!(
+                            f,
+                            Format::R32Float | Format::Rg32Float | Format::Rgba32Float
+                        )
+                        && caps.contains(FormatCaps::COLOR)
+                        && !caps.contains(FormatCaps::BLEND)
+                    {
+                        caps |= FormatCaps::ORDERED_BLEND;
                     }
                     #[cfg(target_os = "android")]
                     if f == present::FORMAT {

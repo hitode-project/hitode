@@ -381,6 +381,10 @@ impl Image {
             (FormatCaps::SAMPLED, vk::ImageUsageFlags::SAMPLED),
             (FormatCaps::COLOR, vk::ImageUsageFlags::COLOR_ATTACHMENT),
             (
+                FormatCaps::ORDERED_BLEND,
+                vk::ImageUsageFlags::INPUT_ATTACHMENT,
+            ),
+            (
                 FormatCaps::DEPTH_STENCIL,
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             ),
@@ -392,7 +396,8 @@ impl Image {
         }
         let mut view_usage = self.core.usage & allowed;
         if volume_slice {
-            view_usage &= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+            view_usage &=
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::INPUT_ATTACHMENT;
         }
         let swizzle_alpha =
             format == Format::A8Unorm && view_usage.contains(vk::ImageUsageFlags::SAMPLED);
@@ -670,6 +675,7 @@ impl Device {
         for (public, native) in [
             (Usage::SAMPLED, vk::ImageUsageFlags::SAMPLED),
             (Usage::COLOR, vk::ImageUsageFlags::COLOR_ATTACHMENT),
+            (Usage::INPUT_COLOR, vk::ImageUsageFlags::INPUT_ATTACHMENT),
             (
                 Usage::DEPTH_STENCIL,
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,

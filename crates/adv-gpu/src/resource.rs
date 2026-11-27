@@ -25,6 +25,8 @@ bitflags::bitflags! {
         /// `DontCare`. Falls back to ordinary memory without
         /// [`crate::Features::TRANSIENT_ATTACHMENTS`].
         const TRANSIENT = 1 << 6;
+        /// Color attachment read by ordered fragment blending.
+        const INPUT_COLOR = 1 << 7;
     }
 }
 

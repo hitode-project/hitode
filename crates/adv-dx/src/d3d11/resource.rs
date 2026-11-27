@@ -126,6 +126,14 @@ impl Backing {
         {
             usage |= Usage::STORAGE;
         }
+        if texture.samples() == 1
+            && usage.contains(Usage::COLOR)
+            && std::iter::once(format)
+                .chain(view_formats.iter().copied())
+                .any(|format| caps.format(format).contains(FormatCaps::ORDERED_BLEND))
+        {
+            usage |= Usage::INPUT_COLOR;
+        }
         if packed_resolve(caps, dxgi, format).is_some() {
             usage |= Usage::COLOR | Usage::SAMPLED;
         }

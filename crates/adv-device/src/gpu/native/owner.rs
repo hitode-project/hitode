@@ -1131,10 +1131,10 @@ pub(super) fn draw_modern_pass(
         alias.copy(encoder, false);
     }
     let desc = pass::modern_attachments(draw, chunk);
-    let mut pass = match draw.color_slots {
-        Some(slots) => encoder.render_pass_slots(&desc, slots),
-        None => encoder.render_pass(&desc),
-    };
+    let slots = draw
+        .color_slots
+        .unwrap_or_else(|| ((1u16 << desc.colors.len()) - 1) as u8);
+    let mut pass = encoder.render_pass_for_pipeline(&desc, slots, pipeline);
     pass.set_pipeline(pipeline);
     let [x, y, w, h, min, max] = draw.viewport;
     pass.set_viewport(x, y, w, h, min, max);

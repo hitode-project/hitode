@@ -11,6 +11,8 @@
 #[cfg(feature = "backend")]
 use crate::Result;
 
+#[cfg(all(feature = "backend", any(not(target_vendor = "apple"), test)))]
+pub(crate) mod blend;
 #[cfg(feature = "precompile")]
 pub(crate) mod compile;
 #[cfg(feature = "precompile")]

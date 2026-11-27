@@ -180,7 +180,7 @@ impl FormatOperation {
                 depth.contains(FormatCaps::SAMPLED | FormatCaps::DEPTH_STENCIL)
             }
             RenderTarget => features.contains(FormatCaps::COLOR),
-            Blend => features.contains(FormatCaps::BLEND),
+            Blend => features.contains(FormatCaps::COLOR | FormatCaps::BLEND),
             DepthStencil => features.contains(FormatCaps::DEPTH_STENCIL),
             Msaa4 | Msaa8 | MsaaOther => {
                 features.intersects(FormatCaps::COLOR | FormatCaps::DEPTH_STENCIL)
@@ -300,6 +300,8 @@ pub(in crate::d3d11) fn production(caps: &Caps) -> Vec<ProductionFormat> {
                 return None;
             }
             let packed = matches!(format, 85 | 86 | 115) && backing == Some(Format::Bgra8Unorm);
+            let ordered_blend = backing
+                .is_some_and(|backing| caps.format(backing).contains(FormatCaps::ORDERED_BLEND));
             let operations =
                 row.required
                     .iter()
@@ -314,14 +316,15 @@ pub(in crate::d3d11) fn production(caps: &Caps) -> Vec<ProductionFormat> {
                         Texture1d | Texture2d | Texture3d | TextureCube | Mip => backing.is_some(),
                         ShaderLoad | ShaderSample | ShaderComparison | Gather
                         | GatherComparison => true,
-                        MipAutogen | RenderTarget | Blend | Msaa4 | Msaa8 | MsaaOther => !packed,
+                        MipAutogen | RenderTarget | Blend => !packed,
+                        Msaa4 | Msaa8 | MsaaOther | MsaaLoad => !packed && !ordered_blend,
                         MsaaResolve => {
-                            !packed
-                                || backing.is_some_and(|backing| {
-                                    resource::packed_resolve(caps, format, backing).is_some()
-                                })
+                            !ordered_blend
+                                && (!packed
+                                    || backing.is_some_and(|backing| {
+                                        resource::packed_resolve(caps, format, backing).is_some()
+                                    }))
                         }
-                        MsaaLoad => !packed,
                         DepthStencil => matches!(format, 20 | 40 | 45 | 55),
                         Cast => crate::dxgi::formats::format_layout(format)
                             .unwrap()
@@ -350,6 +353,7 @@ pub(in crate::d3d11) fn production(caps: &Caps) -> Vec<ProductionFormat> {
                             ShaderSample => resource::unfilterable_view(caps, format, false),
                             MipAutogen => backing
                                 .is_some_and(|format| resource::image_filter_needed(caps, format)),
+                            Blend => ordered_blend,
                             StorageView | TypedStore | TypedLoad => {
                                 resource::storage_uses_buffer(caps, format, false)
                             }
@@ -359,11 +363,11 @@ pub(in crate::d3d11) fn production(caps: &Caps) -> Vec<ProductionFormat> {
                             }
                             Format | Buffer | VertexBuffer | IndexBuffer | StreamBuffer
                             | Texture1d | Texture2d | Texture3d | TextureCube | ShaderLoad
-                            | ShaderComparison | Mip | RenderTarget | Blend | DepthStencil
-                            | CpuLock | MsaaResolve | Display | Cast | Msaa4 | Msaa8
-                            | MsaaOther | MsaaLoad | Gather | BackBufferCast | GatherComparison
-                            | Decoder | VideoOutput | VideoInput | LogicOp | Tiled | Share
-                            | Raw | Structured => false,
+                            | ShaderComparison | Mip | RenderTarget | DepthStencil | CpuLock
+                            | MsaaResolve | Display | Cast | Msaa4 | Msaa8 | MsaaOther
+                            | MsaaLoad | Gather | BackBufferCast | GatherComparison | Decoder
+                            | VideoOutput | VideoInput | LogicOp | Tiled | Share | Raw
+                            | Structured => false,
                         }
                 })
                 .collect();
