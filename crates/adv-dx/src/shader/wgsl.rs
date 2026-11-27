@@ -24,6 +24,7 @@ pub struct BindingLocation {
     pub group: u32,
     pub binding: u32,
     pub sampler_min_lod_bits: Option<u32>,
+    pub point_sampler: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -42,11 +43,17 @@ pub struct Options<'a> {
     pub storage_formats: &'a [(u32, naga::StorageFormat)],
     /// Typed buffer SRV formats, keyed by their DXBC register slot.
     pub buffer_formats: &'a [(u32, naga::StorageFormat)],
+    /// Typed RGB buffer SRVs use three stored channels and an implicit alpha.
+    pub rgb_buffers: &'a [u32],
     /// Logical element counts of subword views, whose bindings include padding.
     pub buffer_elements: &'a [(Register, u32, u32)],
-    /// Buffer-backed R32 textures, keyed by UAV slot, with the view's XYZ extent.
-    pub storage_extents: &'a [(u32, [u32; 3])],
+    /// Linear UAV views keyed by slot, with XYZ extent and row pitch in texels.
+    pub storage_extents: &'a [(u32, [u32; 4])],
+    pub storage_slices: &'a [(u32, std::ops::Range<u32>)],
     pub image_atomics: bool,
+    /// A8 UAVs and color attachments use the backend's red channel.
+    pub alpha_uavs: u32,
+    pub alpha_targets: u32,
     pub lod_samplers: &'a [(u32, LodSampler)],
     pub texture_lods: &'a [TextureLod],
     pub border_samplers: &'a [BorderSampler],
@@ -54,6 +61,8 @@ pub struct Options<'a> {
     pub depth_textures: &'a [u32],
     pub depth24_textures: &'a [u32],
     pub exact_unorm: &'a [(u32, [u8; 4])],
+    pub manual_filter: &'a [u32],
+    pub manual_samplers: &'a [BorderSampler],
     pub raster_samples: u32,
 }
 
@@ -62,9 +71,13 @@ impl Default for Options<'_> {
         Self {
             storage_formats: &[],
             buffer_formats: &[],
+            rgb_buffers: &[],
             buffer_elements: &[],
             storage_extents: &[],
+            storage_slices: &[],
             image_atomics: false,
+            alpha_uavs: 0,
+            alpha_targets: 0,
             lod_samplers: &[],
             texture_lods: &[],
             border_samplers: &[],
@@ -72,6 +85,8 @@ impl Default for Options<'_> {
             depth_textures: &[],
             depth24_textures: &[],
             exact_unorm: &[],
+            manual_filter: &[],
+            manual_samplers: &[],
             raster_samples: 1,
         }
     }
@@ -269,7 +284,7 @@ impl<'a> Writer<'a> {
         if !self.options.exact_unorm.is_empty() || !self.options.depth24_textures.is_empty() {
             self.source.push_str(memory::EXACT_UNORM);
         }
-        if reflection.lod_queries {
+        if reflection.lod_queries || !self.options.manual_filter.is_empty() {
             self.source.push_str(memory::LOD_HELPERS);
         }
         if reflection.sample_positions || reflection.interpolation_queries {

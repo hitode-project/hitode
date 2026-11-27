@@ -1312,7 +1312,7 @@ impl BlockContext<'_> {
         coordinate: Handle<crate::Expression>,
         array_index: Option<Handle<crate::Expression>>,
         fun: crate::AtomicFunction,
-        value: Handle<crate::Expression>,
+        (value, result): (Handle<crate::Expression>, Option<Handle<crate::Expression>>),
         block: &mut Block,
     ) -> Result<(), Error> {
         let image_id = self.image_atomic_pointer(image, block)?;
@@ -1353,8 +1353,9 @@ impl BlockContext<'_> {
             crate::AtomicFunction::Min => spirv::Op::AtomicUMin,
             crate::AtomicFunction::Max if signed => spirv::Op::AtomicSMax,
             crate::AtomicFunction::Max => spirv::Op::AtomicUMax,
-            crate::AtomicFunction::Exchange { .. } => {
-                return Err(Error::Validation("Exchange atomics are not supported yet"))
+            crate::AtomicFunction::Exchange { compare: None } => spirv::Op::AtomicExchange,
+            crate::AtomicFunction::Exchange { compare: Some(_) } => {
+                spirv::Op::AtomicCompareExchange
             }
         };
         let result_type_id = self.get_expression_type_id(&self.fun_info[value].ty);
@@ -1365,7 +1366,7 @@ impl BlockContext<'_> {
         let semantics_id = self.get_index_constant(semantics.bits());
         let value_id = self.cached[value];
 
-        block.body.push(Instruction::image_atomic(
+        let mut instruction = Instruction::image_atomic(
             op,
             result_type_id,
             id,
@@ -1373,7 +1374,29 @@ impl BlockContext<'_> {
             scope_constant_id,
             semantics_id,
             value_id,
-        ));
+        );
+        if let crate::AtomicFunction::Exchange {
+            compare: Some(compare),
+        } = fun
+        {
+            instruction = Instruction::new(op);
+            instruction.set_type(result_type_id);
+            instruction.set_result(id);
+            for operand in [
+                pointer_id,
+                scope_constant_id,
+                semantics_id,
+                semantics_id,
+                value_id,
+                self.cached[compare],
+            ] {
+                instruction.add_operand(operand);
+            }
+        }
+        block.body.push(instruction);
+        if let Some(result) = result {
+            self.cached[result] = id;
+        }
 
         Ok(())
     }

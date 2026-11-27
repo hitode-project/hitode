@@ -231,6 +231,7 @@ pub struct VertexFormat {
     pub bytes: u32,
     pub bits: [u8; 4],
     pub kinds: [VertexComponent; 4],
+    pub offsets: [u8; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -381,7 +382,6 @@ fn emit_fetch(writer: &mut Writer<'_>, index: usize, fetch: VertexFetch) -> Resu
     writer.open(&format!(
         "if {address} <= {bound} && {bytes}u <= {bound} - {address}"
     ));
-    let mut bit = 0u32;
     let mut component = 0;
     for lane in 0..4 {
         if mask & (1 << lane) == 0 {
@@ -400,6 +400,7 @@ fn emit_fetch(writer: &mut Writer<'_>, index: usize, fetch: VertexFetch) -> Resu
                 "0u".into()
             }
         } else {
+            let bit = u32::from(format.offsets[component]);
             let first = bit / 8;
             let shift = bit % 8;
             let raw = (0..(bits + shift).div_ceil(8))
@@ -416,7 +417,6 @@ fn emit_fetch(writer: &mut Writer<'_>, index: usize, fetch: VertexFetch) -> Resu
             let raw = format!("((({raw}) >> {shift}u) & {maximum}u)");
             let sign = 32 - bits;
             let signed = format!("(bitcast<i32>({raw} << {sign}u) >> {sign}u)");
-            bit += bits;
             match format.kinds[component] {
                 Uint | Sint if bits == 32 => raw,
                 Uint => raw,

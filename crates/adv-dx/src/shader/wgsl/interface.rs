@@ -139,7 +139,22 @@ impl Writer<'_> {
                 format!(" -> {output_name}")
             };
             self.open(&format!("{attrib} fn {entry}({args}){returns}"));
-            let mut result: Vec<_> = outputs.iter().map(Field::output).collect();
+            let mut result: Vec<_> = outputs
+                .iter()
+                .map(|field| {
+                    let value = field.output();
+                    let alpha = self.stage == Stage::Pixel
+                        && (0..8).any(|slot| {
+                            self.options.alpha_targets & (1 << slot) != 0
+                                && field.attribute == format!("@location({slot})")
+                        });
+                    if alpha {
+                        format!("({value}).wyzw")
+                    } else {
+                        value
+                    }
+                })
+                .collect();
             if let Some(variant) = variant_outputs {
                 result.extend(super::variant_interface::variant_outputs(variant, "o"));
             }

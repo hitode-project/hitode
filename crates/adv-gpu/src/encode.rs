@@ -163,7 +163,26 @@ impl Encoder {
         desc: &RenderPassDesc<'_>,
         slots: u8,
     ) -> RenderPass<'e> {
-        self.inner.render_pass(desc, slots)
+        #[cfg(target_vendor = "apple")]
+        return self.inner.render_pass(desc, slots);
+        #[cfg(not(target_vendor = "apple"))]
+        self.inner.render_pass(desc, slots, 0)
+    }
+    /// Render one compact draw with the attachments required by its pipeline.
+    pub fn render_pass_for_pipeline<'e>(
+        &'e mut self,
+        desc: &RenderPassDesc<'_>,
+        slots: u8,
+        pipeline: &crate::RenderPipeline,
+    ) -> RenderPass<'e> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let _ = pipeline;
+            self.inner.render_pass(desc, slots)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        self.inner
+            .render_pass(desc, slots, pipeline.inner.attachment_reads())
     }
     pub fn compute_pass<'e>(&'e mut self, desc: &ComputePassDesc<'_>) -> ComputePass<'e> {
         self.inner.compute_pass(desc)

@@ -201,7 +201,6 @@ impl Requirement {
             Self::Bc1ThroughBc3 | Self::Bc4Bc5 | Self::Bc6hBc7 => {
                 features.contains(Features::BC_TEXTURES)
             }
-            Self::R32UavAtomics => features.contains(Features::IMAGE_ATOMICS),
             Self::QueryOcclusion => features.contains(Features::OCCLUSION_QUERIES),
             Self::QueryTimestampAndDisjoint => features.contains(Features::TIMESTAMPS),
             Self::ColorBytesPerSample => limits.max_color_bytes_per_sample >= value,
@@ -230,6 +229,7 @@ impl Requirement {
             | Self::FullNonPowerOfTwo
             | Self::TypedUavStores
             | Self::R32TypedUavLoads
+            | Self::R32UavAtomics
             | Self::UavCounters
             | Self::QueryPipelineStatistics
             | Self::QueryStreamOutputStatistics

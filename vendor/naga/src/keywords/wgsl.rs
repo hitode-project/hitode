@@ -238,6 +238,8 @@ pub const BUILTIN_IDENTIFIERS: &[&str] = &[
     "texture_cube_array",
     "texture_multisampled_2d",
     "texture_depth_multisampled_2d",
+    "texture_multisampled_2d_array",
+    "texture_depth_multisampled_2d_array",
     "texture_external",
     "texture_storage_1d",
     "texture_storage_2d",

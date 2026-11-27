@@ -1,8 +1,8 @@
 //! Lower immutable immediate-context bindings to the existing modern executor.
-use super::*;
+use super::{resource::storage_format, *};
 use crate::{
     d3d11::{
-        desc::{Aspects, Bind, InputRate, Misc},
+        desc::{Aspects, Bind, InputRate, Misc, TextureKind},
         state::{RENDER_TARGETS, STREAMS, Snapshot, Stage, VIEWPORTS, ViewSlot},
     },
     shader::{
@@ -462,12 +462,16 @@ fn capture_texture(
     }
     let execution = execution(env.ext)?;
     let backing = Backing::new(&execution.gpu, desc)?;
-    let Backing::Image(image) = &backing else {
-        unreachable!()
-    };
-    let destination = resource::region(image, texture, 0);
-    let upload = resource::texture_transfer(&execution.gpu, texture, destination, &bytes)?;
-    execution.gpu.transfer(upload)?;
+    if let Some(upload) = backing.upload_texture(
+        &execution.gpu,
+        texture,
+        0,
+        [0; 3],
+        [width, height, depth],
+        &bytes,
+    )? {
+        execution.gpu.transfer(upload)?;
+    }
     Ok(backing)
 }
 
@@ -559,19 +563,28 @@ fn slots_for(
             }
             Sampler => {
                 let mut desc = sampler_description(env, state.samplers[index]);
-                let shader_bias = round_point_mip(desc);
+                let shader_bias = location.point_sampler || round_point_mip(desc);
+                if location.point_sampler {
+                    desc.Filter = 0;
+                    desc.MinLOD = 0.;
+                    desc.MaxLOD = f32::MAX;
+                }
                 if let Some(minimum) = location.sampler_min_lod_bits.map(f32::from_bits) {
                     desc.MinLOD = desc.MinLOD.max(minimum);
                     desc.MaxLOD = desc.MaxLOD.max(desc.MinLOD);
                 }
-                let mode = reflection
-                    .bindings
-                    .iter()
-                    .find(|binding| {
-                        binding.register == Register::Sampler && binding.slot == location.slot
-                    })
-                    .unwrap()
-                    .kind;
+                let mode = if location.point_sampler {
+                    BindingKind::Sampler(SamplerMode::Default)
+                } else {
+                    reflection
+                        .bindings
+                        .iter()
+                        .find(|binding| {
+                            binding.register == Register::Sampler && binding.slot == location.slot
+                        })
+                        .unwrap()
+                        .kind
+                };
                 let sampler = execution(env.ext)?.gpu.device().sampler(&sampler_desc(
                     desc,
                     mode,
@@ -602,8 +615,38 @@ fn slots_for(
                     _ => backing(env, view.resource, desc)?,
                 };
                 match (backing, desc) {
-                    (Backing::Image(image), _) => {
-                        let view = Backing::Image(image).view(&view.desc)?;
+                    (Backing::Image(image), super::Resource::Texture(texture))
+                        if location.register == UnorderedAccessView
+                            && resource::storage_uses_buffer(
+                                execution(env.ext)?.gpu.device().caps(),
+                                view.desc.format(),
+                                reflection
+                                    .atomic_bindings
+                                    .contains(&(location.register, location.slot)),
+                            ) =>
+                    {
+                        let range = view.desc.subresources();
+                        reads.extend(range.layers.clone().map(|layer| {
+                            key(
+                                env,
+                                view.resource,
+                                layer * texture.levels() + range.mips.start,
+                            )
+                        }));
+                        let alias = resource::LinearStorage::new(texture, &view.desc).alias(
+                            &execution(env.ext)?.gpu,
+                            texture,
+                            &view.desc,
+                            &image,
+                        )?;
+                        set_slot(
+                            &mut slots.storage,
+                            binding,
+                            StorageBinding::ImageAlias(alias),
+                        );
+                    }
+                    (backing @ (Backing::Image(_) | Backing::Blocks(_)), _) => {
+                        let view = backing.view(&execution(env.ext)?.gpu, &view.desc)?;
                         if location.group == 1 {
                             set_slot(&mut slots.images, binding, view);
                         } else {
@@ -685,13 +728,22 @@ fn sampler_description(env: &Env<'_>, pointer: u32) -> D3D11_SAMPLER_DESC {
 #[derive(Default)]
 struct ShaderViews {
     storage_formats: Vec<(u32, naga::StorageFormat)>,
+    storage_extents: Vec<(u32, [u32; 4])>,
+    storage_slices: Vec<(u32, std::ops::Range<u32>)>,
+    alpha_uavs: u32,
     buffer_formats: Vec<(u32, naga::StorageFormat)>,
+    rgb_buffers: Vec<u32>,
     buffer_elements: Vec<(Register, u32, u32)>,
     writable: Vec<(u32, u32)>,
 }
 
 impl ShaderViews {
-    fn new(snapshot: &Snapshot, stage: Stage, reflection: &Reflection) -> Result<Self, Error> {
+    fn new(
+        env: &Env<'_>,
+        snapshot: &Snapshot,
+        stage: Stage,
+        reflection: &Reflection,
+    ) -> Result<Self, Error> {
         let mut views = Self::default();
         for binding in &reflection.bindings {
             let writable = binding.register == Register::UnorderedAccessView;
@@ -707,19 +759,46 @@ impl ShaderViews {
                 continue;
             };
             if writable {
-                views
-                    .writable
-                    .push((view.resource, view.desc.subresources().mips.start));
+                let range = view.desc.subresources();
+                if let super::Resource::Texture(texture) = description(env, view.resource)? {
+                    views.writable.extend(
+                        range.layers.clone().map(|layer| {
+                            (view.resource, layer * texture.levels() + range.mips.start)
+                        }),
+                    );
+                    let atomic = reflection
+                        .atomic_bindings
+                        .contains(&(binding.register, binding.slot));
+                    if resource::storage_uses_buffer(
+                        caps(env.ext).ok_or(Error::Device)?,
+                        view.desc.format(),
+                        atomic,
+                    ) {
+                        let extent = resource::LinearStorage::new(texture, &view.desc).extent;
+                        views.storage_extents.push((binding.slot, extent));
+                    } else if texture.kind() == TextureKind::D3 {
+                        views
+                            .storage_slices
+                            .push((binding.slot, view.desc.elements()));
+                    }
+                } else {
+                    views.writable.push((view.resource, 0));
+                }
             }
             if let BindingKind::Typed { dimension, .. } = binding.kind {
                 if writable {
                     views
                         .storage_formats
                         .push((binding.slot, storage_format(view.desc.format())?));
+                    if view.desc.format() == 65 {
+                        views.alpha_uavs |= 1 << binding.slot;
+                    }
                 } else if dimension == ResourceDimension::Buffer {
-                    views
-                        .buffer_formats
-                        .push((binding.slot, storage_format(view.desc.format())?));
+                    let (format, rgb) = resource::buffer_format(view.desc.format())?;
+                    views.buffer_formats.push((binding.slot, format));
+                    if rgb {
+                        views.rgb_buffers.push(binding.slot);
+                    }
                 }
                 if dimension == ResourceDimension::Buffer {
                     views.buffer_elements.push((
@@ -744,7 +823,11 @@ impl ShaderViews {
     fn options<'a>(&'a self, options: Options<'a>) -> Options<'a> {
         Options {
             storage_formats: &self.storage_formats,
+            storage_extents: &self.storage_extents,
+            storage_slices: &self.storage_slices,
+            alpha_uavs: self.alpha_uavs,
             buffer_formats: &self.buffer_formats,
+            rgb_buffers: &self.rgb_buffers,
             buffer_elements: &self.buffer_elements,
             ..options
         }
@@ -760,11 +843,13 @@ struct Sampling {
     depths: Vec<u32>,
     depths24: Vec<u32>,
     unorm: Vec<(u32, [u8; 4])>,
+    manual_filter: Vec<u32>,
+    manual_samplers: Vec<BorderSampler>,
 }
 
 impl Sampling {
     fn new(env: &Env<'_>, snapshot: &Snapshot, stage: Stage, reflection: &Reflection) -> Self {
-        use crate::dxgi::formats::Interpretation;
+        use crate::dxgi::formats::{Channel, Interpretation};
         let mut state = Self::default();
         for binding in &reflection.bindings {
             if binding.register != Register::Sampler {
@@ -789,16 +874,18 @@ impl Sampling {
             if reflection.lod_queries || lod.round_mip || lod.point || lod.linear_comparison {
                 state.samplers.push((slot, lod));
             }
+            let filter = BorderSampler {
+                slot,
+                axes: [sampler.AddressU, sampler.AddressV, sampler.AddressW]
+                    .map(|address| address == 4),
+                color: sampler.BorderColor,
+                linear: [0x10, 0x4, 0x1].map(|mask| sampler.Filter & mask != 0),
+                lod,
+                comparison: sampler.ComparisonFunc,
+            };
+            state.manual_samplers.push(filter);
             if custom_border(sampler) {
-                state.border_samplers.push(BorderSampler {
-                    slot,
-                    axes: [sampler.AddressU, sampler.AddressV, sampler.AddressW]
-                        .map(|address| address == 4),
-                    color: sampler.BorderColor,
-                    linear: [0x10, 0x4, 0x1].map(|mask| sampler.Filter & mask != 0),
-                    lod,
-                    comparison: sampler.ComparisonFunc,
-                });
+                state.border_samplers.push(filter);
             }
         }
         for binding in &reflection.bindings {
@@ -816,6 +903,9 @@ impl Sampling {
             let mips = &view.desc.subresources().mips;
             let minimum = minimum - mips.start as f32;
             let depth = view.desc.aspects().intersects(Aspects::DEPTH);
+            if resource::unfilterable_view(caps(env.ext).unwrap(), view.desc.format(), depth) {
+                state.manual_filter.push(binding.slot);
+            }
             if depth {
                 state.depths.push(binding.slot);
             }
@@ -823,17 +913,24 @@ impl Sampling {
                 state.depths24.push(binding.slot);
             }
             let format = crate::dxgi::formats::format_layout(view.desc.format());
+            let lanes = |format: &crate::dxgi::formats::FormatLayout, lane: usize| {
+                let channel = [Channel::R, Channel::G, Channel::B, Channel::A][lane];
+                format.channels.iter().position(|&value| value == channel)
+            };
             if !depth
                 && let Some(format) = format
                 && format.alignment == [1; 3]
             {
                 let widths = std::array::from_fn(|lane| {
-                    let bits = format.component_bits[lane];
-                    if format.interpretations[lane] == Interpretation::Unorm && bits <= 16 {
-                        bits
-                    } else {
-                        0
-                    }
+                    lanes(format, lane).map_or(0, |component| {
+                        let bits = format.component_bits[component];
+                        if format.interpretations[component] == Interpretation::Unorm && bits <= 16
+                        {
+                            bits
+                        } else {
+                            0
+                        }
+                    })
                 });
                 if widths != [0; 4] {
                     state.unorm.push((binding.slot, widths));
@@ -841,17 +938,19 @@ impl Sampling {
             } else if view.desc.format() == 98 {
                 state.unorm.push((binding.slot, [8; 4]));
             }
-            if !state.border_samplers.is_empty()
+            if (!state.border_samplers.is_empty() || state.manual_filter.contains(&binding.slot))
                 && let Some(format) = format
             {
                 let channels = std::array::from_fn(|lane| {
-                    let bits = format.component_bits[lane];
-                    match format.interpretations[lane] {
-                        _ if bits == 0 => BorderChannel::Missing,
-                        Interpretation::Unorm => BorderChannel::Unorm(bits),
-                        Interpretation::Snorm => BorderChannel::Snorm(bits),
-                        _ => BorderChannel::Float,
-                    }
+                    lanes(format, lane).map_or(BorderChannel::Missing, |component| {
+                        let bits = format.component_bits[component];
+                        match format.interpretations[component] {
+                            _ if bits == 0 => BorderChannel::Missing,
+                            Interpretation::Unorm => BorderChannel::Unorm(bits),
+                            Interpretation::Snorm => BorderChannel::Snorm(bits),
+                            _ => BorderChannel::Float,
+                        }
+                    })
                 });
                 state.border_textures.push(BorderTexture {
                     slot: binding.slot,
@@ -860,7 +959,7 @@ impl Sampling {
             }
             if minimum > 0. {
                 let format = format.unwrap();
-                let default_alpha = if format.component_bits[3] != 0 {
+                let default_alpha = if format.channels.contains(&Channel::A) {
                     0
                 } else if matches!(
                     format.interpretations[0],
@@ -890,6 +989,8 @@ impl Sampling {
             depth_textures: &self.depths,
             depth24_textures: &self.depths24,
             exact_unorm: &self.unorm,
+            manual_filter: &self.manual_filter,
+            manual_samplers: &self.manual_samplers,
             ..Default::default()
         }
     }
@@ -1001,7 +1102,12 @@ fn blend_component(src: i32, dst: i32, op: i32) -> p::BlendComponent {
         op,
     }
 }
-fn blend_color(desc: Option<D3D11_BLEND_DESC1>, slot: usize, view: ImageView) -> ModernColor {
+fn blend_color(
+    desc: Option<D3D11_BLEND_DESC1>,
+    slot: usize,
+    view: ImageView,
+    format: u32,
+) -> ModernColor {
     let target = desc.map(|desc| {
         desc.RenderTarget[if desc.IndependentBlendEnable != 0 {
             slot
@@ -1016,16 +1122,44 @@ fn blend_color(desc: Option<D3D11_BLEND_DESC1>, slot: usize, view: ImageView) ->
         blend: target
             .filter(|target| target.BlendEnable != 0)
             .map(|target| {
-                (
-                    blend_component(target.SrcBlend, target.DestBlend, target.BlendOp),
-                    blend_component(
-                        target.SrcBlendAlpha,
-                        target.DestBlendAlpha,
-                        target.BlendOpAlpha,
-                    ),
-                )
+                let mut rgb = blend_component(target.SrcBlend, target.DestBlend, target.BlendOp);
+                let alpha = blend_component(
+                    target.SrcBlendAlpha,
+                    target.DestBlendAlpha,
+                    target.BlendOpAlpha,
+                );
+                if format == 65 {
+                    let alpha_to_red = |factor| match factor {
+                        p::Factor::DstAlpha => p::Factor::Dst,
+                        p::Factor::OneMinusDstAlpha => p::Factor::OneMinusDst,
+                        p::Factor::SrcAlphaSaturated => p::Factor::One,
+                        factor => factor,
+                    };
+                    rgb = p::BlendComponent {
+                        src: alpha_to_red(alpha.src),
+                        dst: alpha_to_red(alpha.dst),
+                        op: alpha.op,
+                    };
+                } else if matches!(format, 88 | 93) {
+                    let opaque = |factor| match factor {
+                        p::Factor::DstAlpha => p::Factor::One,
+                        p::Factor::OneMinusDstAlpha | p::Factor::SrcAlphaSaturated => {
+                            p::Factor::Zero
+                        }
+                        factor => factor,
+                    };
+                    rgb.src = opaque(rgb.src);
+                    rgb.dst = opaque(rgb.dst);
+                }
+                (rgb, alpha)
             }),
-        write_mask: target.map_or(15, |target| target.RenderTargetWriteMask),
+        write_mask: target.map_or(if format == 65 { 1 } else { 15 }, |target| {
+            if format == 65 {
+                target.RenderTargetWriteMask >> 3 & 1
+            } else {
+                target.RenderTargetWriteMask
+            }
+        }),
     }
 }
 fn depth_stencil(
@@ -1235,13 +1369,17 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     };
     let mut colors = Vec::new();
     let mut color_slots = 0;
+    let mut alpha_targets = 0;
     let mut writes = Vec::new();
     for slot in 0..RENDER_TARGETS {
         let Some(bound) = snapshot.view(ViewSlot::rtv(slot).unwrap()) else {
             continue;
         };
         let (view, key) = image_view(env, bound.pointer, ViewKind::RenderTarget)?;
-        colors.push(blend_color(blend, slot, view));
+        colors.push(blend_color(blend, slot, view, bound.desc.format()));
+        if bound.desc.format() == 65 {
+            alpha_targets |= 1 << slot;
+        }
         color_slots |= 1 << slot;
         writes.push((key, false));
     }
@@ -1530,7 +1668,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         };
         let variant = Variant::select(reflection, &facts, caps);
         let sampling = Sampling::new(env, &snapshot, Stage::Vertex, reflection);
-        let views = ShaderViews::new(&snapshot, Stage::Vertex, reflection)?;
+        let views = ShaderViews::new(env, &snapshot, Stage::Vertex, reflection)?;
         let options = Options {
             raster_samples: samples,
             ..views.options(sampling.options())
@@ -1604,7 +1742,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 shader
                     .map(|shader| {
                         let reflection = shader.reflection();
-                        let views = ShaderViews::new(&snapshot, stage, reflection)?;
+                        let views = ShaderViews::new(env, &snapshot, stage, reflection)?;
                         views.writes(env, &mut writes);
                         Ok::<_, Error>((
                             Variant::select(
@@ -1701,7 +1839,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             None
         };
         let (pixel, pixel_code) = if let Some(shader) = pixel_shader {
-            let views = ShaderViews::new(&snapshot, Stage::Pixel, shader.reflection())?;
+            let views = ShaderViews::new(env, &snapshot, Stage::Pixel, shader.reflection())?;
             views.writes(env, &mut writes);
             let variant = Variant::select(
                 shader.reflection(),
@@ -1714,7 +1852,8 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             let sampling = Sampling::new(env, &snapshot, Stage::Pixel, shader.reflection());
             let options = Options {
                 raster_samples: samples,
-                image_atomics: caps.features.contains(adv_gpu::Features::IMAGE_ATOMICS),
+                alpha_targets,
+                image_atomics: true,
                 ..views.options(sampling.options())
             };
             let code = if let Some((programs, _)) = &expanded {
@@ -2220,7 +2359,7 @@ fn compute(
     let Some(shader) = bound_shader(env, &snapshot, Stage::Compute) else {
         return Ok(());
     };
-    let views = ShaderViews::new(&snapshot, Stage::Compute, shader.reflection())?;
+    let views = ShaderViews::new(env, &snapshot, Stage::Compute, shader.reflection())?;
     let mut writes = Vec::new();
     views.writes(env, &mut writes);
     let caps = env
@@ -2243,7 +2382,7 @@ fn compute(
         &variant,
         None,
         Options {
-            image_atomics: caps.features.contains(adv_gpu::Features::IMAGE_ATOMICS),
+            image_atomics: true,
             ..views.options(sampling.options())
         },
     )
@@ -2319,82 +2458,46 @@ fn compute(
     Ok(())
 }
 
-pub(super) fn storage_format(format: u32) -> Result<naga::StorageFormat, Error> {
-    use naga::StorageFormat::*;
-    Ok(match format {
-        2 => Rgba32Float,
-        3 => Rgba32Uint,
-        4 => Rgba32Sint,
-        10 => Rgba16Float,
-        11 => Rgba16Unorm,
-        12 => Rgba16Uint,
-        13 => Rgba16Snorm,
-        14 => Rgba16Sint,
-        16 => Rg32Float,
-        17 => Rg32Uint,
-        18 => Rg32Sint,
-        24 => Rgb10a2Unorm,
-        25 => Rgb10a2Uint,
-        26 => Rg11b10Ufloat,
-        28 => Rgba8Unorm,
-        30 => Rgba8Uint,
-        31 => Rgba8Snorm,
-        32 => Rgba8Sint,
-        34 => Rg16Float,
-        35 => Rg16Unorm,
-        36 => Rg16Uint,
-        37 => Rg16Snorm,
-        38 => Rg16Sint,
-        41 => R32Float,
-        42 => R32Uint,
-        43 => R32Sint,
-        49 => Rg8Unorm,
-        50 => Rg8Uint,
-        51 => Rg8Snorm,
-        52 => Rg8Sint,
-        54 => R16Float,
-        56 => R16Unorm,
-        57 => R16Uint,
-        58 => R16Snorm,
-        59 => R16Sint,
-        61 => R8Unorm,
-        62 => R8Uint,
-        63 => R8Snorm,
-        64 => R8Sint,
-        87 => Bgra8Unorm,
-        _ => return Err(Error::InvalidArgument),
-    })
-}
-
 fn vertex_format(format: &crate::dxgi::formats::FormatLayout) -> Result<VertexFormat, Error> {
-    use crate::dxgi::formats::Interpretation;
+    use crate::dxgi::formats::{Channel, Interpretation};
+    let mut widths = [0; 4];
+    let mut offsets = [0; 4];
     let mut kinds = [VertexComponent::Uint; 4];
-    for (index, (kind, bits)) in format
-        .interpretations
+    let mut offset = 0;
+    for ((channel, interpretation), bits) in format
+        .channels
         .iter()
+        .zip(format.interpretations)
         .zip(format.component_bits)
-        .enumerate()
     {
-        kinds[index] = match kind {
-            Interpretation::Float => VertexComponent::Float,
-            Interpretation::Sint => VertexComponent::Sint,
-            Interpretation::Snorm => VertexComponent::Snorm,
-            Interpretation::Uint => VertexComponent::Uint,
-            Interpretation::Unorm => VertexComponent::Unorm,
-            Interpretation::Fixed28 | Interpretation::Typeless | Interpretation::UnormSrgb
-                if bits == 0 =>
-            {
-                VertexComponent::Uint
-            }
-            Interpretation::Fixed28 | Interpretation::Typeless | Interpretation::UnormSrgb => {
-                return Err(Error::InvalidArgument);
-            }
+        let lane = match channel {
+            Channel::R => Some(0),
+            Channel::G => Some(1),
+            Channel::B => Some(2),
+            Channel::A => Some(3),
+            Channel::D | Channel::S | Channel::X => None,
         };
+        if let Some(lane) = lane {
+            widths[lane] = bits;
+            offsets[lane] = offset;
+            kinds[lane] = match interpretation {
+                Interpretation::Float => VertexComponent::Float,
+                Interpretation::Sint => VertexComponent::Sint,
+                Interpretation::Snorm => VertexComponent::Snorm,
+                Interpretation::Uint => VertexComponent::Uint,
+                Interpretation::Unorm => VertexComponent::Unorm,
+                Interpretation::Fixed28 | Interpretation::Typeless | Interpretation::UnormSrgb => {
+                    return Err(Error::InvalidArgument);
+                }
+            };
+        }
+        offset += bits;
     }
     Ok(VertexFormat {
         bytes: u32::from(format.aligned_unit_bytes),
-        bits: format.component_bits,
+        bits: widths,
         kinds,
+        offsets,
     })
 }
 
@@ -2417,6 +2520,7 @@ mod tests {
                 bytes: 16,
                 bits: [32; 4],
                 kinds: [VertexComponent::Float; 4],
+                offsets: [0, 32, 64, 96],
             },
         };
         assert_eq!(vertex_capture(fetch, 1024, &draw, Some(&(5..8))), 132..196);

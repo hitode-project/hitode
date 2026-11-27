@@ -777,13 +777,18 @@ impl super::Validator {
                 image,
                 coordinate,
                 array_index,
-                fun: _,
+                ref fun,
                 value,
+                result,
             } => {
                 validate_expr(image)?;
                 validate_expr(coordinate)?;
                 validate_expr_opt(array_index)?;
                 validate_expr(value)?;
+                if let crate::AtomicFunction::Exchange { compare } = *fun {
+                    validate_expr_opt(compare)?;
+                }
+                validate_expr_opt(result)?;
                 Ok(())
             }
             crate::Statement::WorkGroupUniformLoad { pointer, result } => {

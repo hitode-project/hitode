@@ -86,8 +86,9 @@ impl FunctionTracer<'_> {
                         image,
                         coordinate,
                         array_index,
-                        fun: _,
+                        ref fun,
                         value,
+                        result,
                     } => {
                         self.expressions_used.insert(image);
                         self.expressions_used.insert(coordinate);
@@ -95,6 +96,10 @@ impl FunctionTracer<'_> {
                             self.expressions_used.insert(array_index);
                         }
                         self.expressions_used.insert(value);
+                        self.trace_atomic_function(fun);
+                        if let Some(result) = result {
+                            self.expressions_used.insert(result);
+                        }
                     }
                     St::WorkGroupUniformLoad { pointer, result } => {
                         self.expressions_used.insert(pointer);
@@ -314,8 +319,9 @@ impl FunctionMap {
                         ref mut image,
                         ref mut coordinate,
                         ref mut array_index,
-                        fun: _,
+                        ref mut fun,
                         ref mut value,
+                        ref mut result,
                     } => {
                         adjust(image);
                         adjust(coordinate);
@@ -323,6 +329,10 @@ impl FunctionMap {
                             adjust(array_index);
                         }
                         adjust(value);
+                        self.adjust_atomic_function(fun);
+                        if let Some(ref mut result) = *result {
+                            adjust(result);
+                        }
                     }
                     St::WorkGroupUniformLoad {
                         ref mut pointer,

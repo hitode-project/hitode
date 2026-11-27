@@ -1134,8 +1134,9 @@ impl FunctionInfo {
                     image,
                     coordinate,
                     array_index,
-                    fun: _,
+                    ref fun,
                     value,
+                    result: _,
                 } => {
                     let _ = self.add_ref_impl(image, GlobalUse::ATOMIC);
                     let _ = self.add_ref(coordinate);
@@ -1143,6 +1144,12 @@ impl FunctionInfo {
                         let _ = self.add_ref(expr);
                     }
                     let _ = self.add_ref(value);
+                    if let crate::AtomicFunction::Exchange {
+                        compare: Some(compare),
+                    } = *fun
+                    {
+                        let _ = self.add_ref(compare);
+                    }
                     FunctionUniformity::new()
                 }
                 S::RayQuery { query, ref fun } => {
