@@ -420,7 +420,7 @@ can share a packed window on devices without descriptor indexing.
 
 ### GFX-CAP-5 Direct3D 11 format capabilities
 
-**Rule**: Reported format and multisample capabilities MUST require an executing path on the resource backing. Queries MUST apply the selected level's restrictions and return the Windows status and output for unsupported formats. Sample counts MUST affect only capability queries and resource validation.
+**Rule**: Reported format and multisample capabilities MUST require an executing path on the resource backing. Queries MUST apply the selected level's restrictions and return the Windows status and output for unsupported formats. Sample counts MUST affect only capability queries and resource validation, except the device-wide 4x attachment requirement of FL 10_0 and above.
 **Verification**: Test
 
 Standard 8x requires the indexed standard sample locations and full raster

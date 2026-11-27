@@ -459,7 +459,14 @@ fn sample_counts_only_affect_queries_and_texture_creation() {
         fixture.limits.sample_counts = samples;
         fixture.rgba_samples = samples;
         let report = Report::derive(&fixture.caps(), paths).unwrap();
-        assert_eq!(report.level, FeatureLevel::L11_0);
+        // The device-wide 4x attachment requirement of FL 10_0 and above is the only count
+        // that decides the level.
+        let level = if samples & 4 != 0 {
+            FeatureLevel::L11_0
+        } else {
+            FeatureLevel::L9_3
+        };
+        assert_eq!(report.level, level);
 
         for count in [1, 2, 4, 8] {
             let supported = samples & count != 0;

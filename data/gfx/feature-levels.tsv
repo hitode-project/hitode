@@ -67,5 +67,6 @@ framebuffer_layers	1	1	1	512	512	2048
 wireframe	0	0	0	1	1	1
 clip_distances	0	0	0	8	8	8
 cull_distances	0	0	0	1	1	1
+multisample_render_targets	0	0	0	4	4	4
 immediate_context	1	1	1	1	1	1
 deferred_context	1	1	1	1	1	1
