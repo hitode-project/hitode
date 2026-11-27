@@ -1047,3 +1047,367 @@ fn alt_enter_respects_window_association_and_toggles_exclusive_mode() {
     assert_eq!(method(&mut machine, chain, 2, &[]), 0);
     assert!(!crate::dxgi::has_swap_chain(&machine.ext, 1));
 }
+
+fn presented_device(
+    machine: &mut Machine<JitCpu>,
+) -> (
+    u32,
+    u32,
+    u32,
+    std::sync::mpsc::Receiver<adv_device::frame::test_support::CapturedFrame>,
+) {
+    use adv_abi::types::{DXGI_MODE_DESC, DXGI_SWAP_CHAIN_DESC};
+    use adv_device::frame::test_support::CapturePresenter;
+    let (presenter, frames) = CapturePresenter::new();
+    let (hardware, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+        software: !cfg!(target_vendor = "apple"),
+        validation: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let gpu = Gpu::request_with_presenter(hardware, queue, Box::new(presenter)).unwrap();
+    machine.ext.get_mut::<State>().execution = Some(gpu::Execution::new(gpu));
+    configure_swap_chains(
+        machine,
+        19045,
+        |_, _, window| {
+            (window == 1).then_some(crate::dxgi::swap::Window {
+                client: [32, 24],
+                minimized: false,
+            })
+        },
+        |_, _, _| Ok(()),
+    );
+    write_value(
+        machine,
+        DESCRIPTOR,
+        DXGI_SWAP_CHAIN_DESC {
+            BufferDesc: DXGI_MODE_DESC {
+                Width: 32,
+                Height: 24,
+                Format: 28,
+                ..Default::default()
+            },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: 32,
+            BufferCount: 1,
+            OutputWindow: 1,
+            Windowed: 1,
+            ..Default::default()
+        },
+    );
+    let create = machine
+        .resolve_import(DLL, "D3D11CreateDeviceAndSwapChain")
+        .unwrap();
+    assert_eq!(
+        guest_call(
+            machine,
+            create,
+            &[
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                7,
+                DESCRIPTOR,
+                OUT + 4,
+                OUT,
+                LEVEL,
+                CONTEXT
+            ]
+        ),
+        0
+    );
+    (
+        machine.cpu.read_u32(OUT + 4).unwrap(),
+        machine.cpu.read_u32(OUT).unwrap(),
+        machine.cpu.read_u32(CONTEXT).unwrap(),
+        frames,
+    )
+}
+
+// spec: GFX-REC-2 GFX-REC-3 GFX-REC-5 GFX-PACE-1
+#[test]
+fn guest_present_copies_damage_and_counts_unwritten_frames_without_publication() {
+    let mut machine = machine();
+    let (chain, device, context, frames) = presented_device(&mut machine);
+    let deadline = std::time::Duration::from_secs(20);
+    machine.cpu.write(IID, &IID_ID3D11TEXTURE2D).unwrap();
+    assert_eq!(method(&mut machine, chain, 9, &[0, IID, OUT]), 0);
+    let buffer = machine.cpu.read_u32(OUT).unwrap();
+    let rtv = create_object(&mut machine, device, 9, &[buffer, 0]);
+    write_value(&mut machine, DESCRIPTOR, [1.0f32, 0.0, 0.0, 1.0]);
+    assert_eq!(method(&mut machine, context, 50, &[rtv, DESCRIPTOR]), 0);
+    assert_eq!(method(&mut machine, chain, 8, &[0, 0]), 0);
+    let first = frames.recv_timeout(deadline).unwrap();
+    assert!(first.damage.is_whole());
+
+    assert_eq!(method(&mut machine, chain, 8, &[0, 0]), 0);
+    assert_eq!(method(&mut machine, chain, 17, &[OUT]), 0);
+    assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 2);
+
+    // An explicit Flush must preserve the recorded writes' contribution to damage.
+    write_value(
+        &mut machine,
+        DESCRIPTOR,
+        adv_abi::types::D3D11_BOX {
+            left: 10,
+            top: 11,
+            front: 0,
+            right: 12,
+            bottom: 13,
+            back: 1,
+        },
+    );
+    write_value(&mut machine, ARRAY, [[0u8, 255, 0, 255]; 4]);
+    assert_eq!(
+        method(
+            &mut machine,
+            context,
+            48,
+            &[buffer, 0, DESCRIPTOR, ARRAY, 8, 16]
+        ),
+        0
+    );
+    assert_eq!(method(&mut machine, context, 111, &[]), 0);
+    assert_eq!(method(&mut machine, chain, 8, &[0, 0]), 0);
+    let other = frames.recv_timeout(deadline).unwrap();
+    assert_eq!(other.pixels.frames, first.pixels.frames + 1);
+    assert_eq!(other.damage.area(), 64);
+    for y in 0..24 {
+        for x in 0..32 {
+            let n = 4 * (y * 32 + x);
+            let expected = if (10..12).contains(&x) && (11..13).contains(&y) {
+                [0, 255, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            assert_eq!(other.pixels.bgra[n..n + 4], expected);
+        }
+    }
+}
+
+// spec: GFX-DXGI-4 GFX-DXGI-5
+#[test]
+fn guest_output_ownership_gamma_surface_copy_and_duplication_share_the_display() {
+    use adv_abi::types::{
+        DXGI_GAMMA_CONTROL, DXGI_GAMMA_CONTROL_CAPABILITIES, DXGI_OUTDUPL_DESC,
+        DXGI_OUTDUPL_FRAME_INFO, DXGI_RGB,
+    };
+    use adv_device::surface::{Snapshot, SurfaceStore};
+    let mut machine = machine();
+    crate::ddraw::install(
+        &mut machine,
+        crate::ddraw::Provider {
+            dc: crate::interop::MemoryDc {
+                create: |_, _, _| unreachable!(),
+                flush: |_, _, _, _| unreachable!(),
+                release: |_, _, _| unreachable!(),
+                discard: |_, _| unreachable!(),
+            },
+            memory: |_| unreachable!(),
+            window: |_, _, _| None,
+            submitted: |_, _, _| (),
+            completed: |_, _| None,
+            released: |_, _| (),
+            vsync: |_| None,
+        },
+    )
+    .unwrap();
+    let (chain, device, context, frames) = presented_device(&mut machine);
+    machine
+        .ext
+        .insert(SurfaceStore::new(32, 24, 0x500000, 65536, Snapshot::default()).unwrap());
+    let gamma = machine
+        .sys
+        .vm
+        .alloc(&mut machine.cpu, 16384, Prot::RW)
+        .unwrap();
+    assert_eq!(method(&mut machine, chain, 15, &[OUT]), 0);
+    let output = machine.cpu.read_u32(OUT).unwrap();
+    assert_eq!(method(&mut machine, output, 13, &[gamma]), 0x887a0001);
+    assert_eq!(method(&mut machine, output, 11, &[device, 0]), 0x887a0022);
+    assert_eq!(method(&mut machine, output, 11, &[device, 1]), 0);
+    assert_eq!(method(&mut machine, chain, 10, &[1, output]), 0x887a0022);
+    assert_eq!(method(&mut machine, output, 12, &[]), 0);
+    assert_eq!(method(&mut machine, chain, 10, &[1, output]), 0);
+
+    assert_eq!(method(&mut machine, output, 13, &[gamma]), 0);
+    let caps: DXGI_GAMMA_CONTROL_CAPABILITIES = GuestPtr::new(gamma).read(&machine.cpu).unwrap();
+    assert_eq!(caps.NumGammaControlPoints, 1025);
+    assert_eq!(method(&mut machine, output, 15, &[gamma]), 0x887a0001);
+    let ramp = DXGI_GAMMA_CONTROL {
+        Scale: DXGI_RGB {
+            Red: 1.0,
+            Green: 1.0,
+            Blue: 1.0,
+        },
+        GammaCurve: [DXGI_RGB {
+            Red: 0.0,
+            Green: 1.0,
+            Blue: 0.0,
+        }; 1025],
+        ..Default::default()
+    };
+    write_value(&mut machine, gamma, ramp);
+    assert_eq!(method(&mut machine, output, 14, &[gamma]), 0);
+    assert_eq!(method(&mut machine, output, 15, &[gamma]), 0);
+    let stored: DXGI_GAMMA_CONTROL = GuestPtr::new(gamma).read(&machine.cpu).unwrap();
+    assert_eq!(stored.GammaCurve[1024].Green, 1.0);
+
+    machine.cpu.write(IID, &IID_ID3D11TEXTURE2D).unwrap();
+    assert_eq!(method(&mut machine, chain, 9, &[0, IID, OUT]), 0);
+    let buffer = machine.cpu.read_u32(OUT).unwrap();
+    let rtv = create_object(&mut machine, device, 9, &[buffer, 0]);
+    write_value(&mut machine, DESCRIPTOR, [1.0f32, 0.0, 0.0, 1.0]);
+    assert_eq!(method(&mut machine, context, 50, &[rtv, DESCRIPTOR]), 0);
+    machine.cpu.write(IID, &IID_IDXGISURFACE).unwrap();
+    assert_eq!(method(&mut machine, buffer, 0, &[IID, OUT]), 0);
+    let surface = machine.cpu.read_u32(OUT).unwrap();
+    assert_eq!(method(&mut machine, output, 16, &[surface]), 0);
+    let frame = frames
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .unwrap();
+    assert_eq!(frame.pixels.bgra[0..4], [0, 255, 0, 255]);
+
+    let staging = texture(&mut machine, device, 3, 0, 0x30000, 0, 2);
+    machine.cpu.write(IID, &IID_IDXGISURFACE).unwrap();
+    assert_eq!(method(&mut machine, staging, 0, &[IID, OUT]), 0);
+    let surface = machine.cpu.read_u32(OUT).unwrap();
+    assert_eq!(method(&mut machine, output, 17, &[surface]), 0);
+    let mapped = map(&mut machine, context, staging, 1);
+    assert_eq!(machine.cpu.read_u32(mapped.pData).unwrap(), 0xff00ff00);
+    assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
+
+    assert_eq!(method(&mut machine, output, 22, &[device, OUT]), 0);
+    let duplicate = machine.cpu.read_u32(OUT).unwrap();
+    check_vtable(
+        &mut machine,
+        duplicate,
+        "dxgi.dll",
+        "IDXGIOutputDuplication",
+    );
+    machine.cpu.write(IID, &IID_IDXGIOUTPUTDUPLICATION).unwrap();
+    assert_eq!(method(&mut machine, duplicate, 0, &[IID, OUT]), 0);
+    assert_eq!(machine.cpu.read_u32(OUT).unwrap(), duplicate);
+    assert_eq!(method(&mut machine, duplicate, 2, &[]), 1);
+    assert_eq!(method(&mut machine, output, 22, &[device, OUT]), 0x80070057);
+    assert_eq!(method(&mut machine, duplicate, 7, &[DESCRIPTOR]), 0);
+    let desc: DXGI_OUTDUPL_DESC = GuestPtr::new(DESCRIPTOR).read(&machine.cpu).unwrap();
+    assert_eq!(
+        (
+            desc.ModeDesc.Width,
+            desc.ModeDesc.Height,
+            desc.ModeDesc.Format
+        ),
+        (32, 24, 87)
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let status = method(&mut machine, duplicate, 8, &[0, DESCRIPTOR, OUT]);
+        if status == 0 {
+            break;
+        }
+        assert_eq!(status, 0x887a0027);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let resource = machine.cpu.read_u32(OUT).unwrap();
+    let info: DXGI_OUTDUPL_FRAME_INFO = GuestPtr::new(DESCRIPTOR).read(&machine.cpu).unwrap();
+    assert_eq!(info.TotalMetadataBufferSize, 16);
+    assert_eq!(
+        method(&mut machine, duplicate, 8, &[0, DESCRIPTOR, OUT]),
+        0x887a0001
+    );
+    assert_eq!(method(&mut machine, duplicate, 9, &[0, 0, OUT]), 0x887a0003);
+    assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 16);
+    assert_eq!(method(&mut machine, duplicate, 14, &[]), 0);
+    assert_eq!(
+        method(&mut machine, duplicate, 8, &[0, DESCRIPTOR, OUT]),
+        0x887a0027
+    );
+    assert_eq!(method(&mut machine, chain, 10, &[0, 0]), 0);
+    assert_eq!(
+        method(&mut machine, duplicate, 8, &[0, DESCRIPTOR, OUT]),
+        0x887a0026
+    );
+    assert_eq!(method(&mut machine, duplicate, 2, &[]), 0);
+    write_value(
+        &mut machine,
+        DESCRIPTOR,
+        D3D11_TEXTURE2D_DESC {
+            Width: 32,
+            Height: 24,
+            ArraySize: 1,
+            MipLevels: 1,
+            Format: 87,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: 3,
+            CPUAccessFlags: 0x20000,
+            ..Default::default()
+        },
+    );
+    let staging = create_object(&mut machine, device, 5, &[DESCRIPTOR, 0]);
+    assert_eq!(method(&mut machine, context, 47, &[staging, resource]), 0);
+    let mapped = map(&mut machine, context, staging, 1);
+    assert_eq!(machine.cpu.read_u32(mapped.pData).unwrap(), 0xff00ff00);
+    assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
+    assert_eq!(method(&mut machine, resource, 2, &[]), 0);
+    write_value(&mut machine, ARRAY, [87i32]);
+    assert_eq!(
+        method(&mut machine, output, 26, &[device, 0, 1, ARRAY, OUT]),
+        0
+    );
+}
+
+// spec: GFX-DXGI-2 GFX-DXGI-5
+#[test]
+fn guest_win32_factory_creates_a_windowless_composition_chain() {
+    use adv_abi::types::DXGI_SWAP_CHAIN_DESC1;
+    let mut machine = machine();
+    let (chain, device, _, frames) = presented_device(&mut machine);
+    machine.cpu.write(IID, &IID_IDXGIFACTORY2).unwrap();
+    assert_eq!(method(&mut machine, chain, 6, &[IID, OUT]), 0);
+    let factory = machine.cpu.read_u32(OUT).unwrap();
+    let desc = DXGI_SWAP_CHAIN_DESC1 {
+        Width: 32,
+        Height: 24,
+        Format: 28,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        BufferUsage: 32,
+        BufferCount: 2,
+        SwapEffect: 3,
+        ..Default::default()
+    };
+    write_value(&mut machine, DESCRIPTOR, desc);
+    assert_eq!(
+        method(
+            &mut machine,
+            factory,
+            16,
+            &[device, device, DESCRIPTOR, 0, OUT]
+        ),
+        0x887a0001
+    );
+    assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 0);
+    assert_eq!(
+        method(&mut machine, factory, 24, &[device, DESCRIPTOR, 0, OUT]),
+        0
+    );
+    let composition = machine.cpu.read_u32(OUT).unwrap();
+    assert_eq!(method(&mut machine, composition, 20, &[OUT]), 0x887a0001);
+    assert_eq!(method(&mut machine, composition, 15, &[OUT]), 0x887a0001);
+    assert_eq!(method(&mut machine, composition, 8, &[0, 0]), 0);
+    assert!(frames.try_recv().is_err());
+}

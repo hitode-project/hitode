@@ -107,7 +107,7 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_TEST_DISC` | Fixture | None; a read-only disc image must be given |
 | `ADV_TEXT_DIAGNOSTICS` | Diagnostic | Off |
 | `ADV_TIER1_CENSUS` | Diagnostic | Off; census of x87 exact-path forms |
-| `ADV_VERIFY_FRAMES` | Diagnostic | Off; `1` executes every D3D9 frame and asynchronously compares pixels outside computed damage with the previous readback |
+| `ADV_VERIFY_FRAMES` | Diagnostic | Off; `1` executes full D3D9 and D3D11 frames and asynchronously compares pixels outside computed damage with the previous readback |
 | `ADV_WINE_DIST` | Build / Fixture | The Wine installation embedded into the player; required for playable builds; `tools/macos/package_launcher.py` downloads the pinned build when unset. Unset: Wine integration tests skip and pass; set: it must be complete |
 | `ADV_WINE_PROBES` | Fixture | Set by device runners to probes the host built; elsewhere tests build them |
 | `HITODE_ANDROID_ID_SUFFIX` | Build | Unset: application ID `org.hitode.launcher`; set by `package_launcher.py --side-by-side` |

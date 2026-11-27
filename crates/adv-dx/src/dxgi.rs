@@ -12,6 +12,8 @@ mod ops;
 mod state;
 pub mod swap;
 
+#[cfg(feature = "gpu")]
+pub(crate) use glue::output::gamma as output_gamma;
 pub use glue::{
     adapter_kind, create_device_adapter, create_device_factory, install, query_adapter, register,
 };
@@ -24,6 +26,10 @@ pub use state::{DeviceCall, DeviceOperation, Devices, Provider, shared_display};
 pub enum Error {
     InvalidArgument,
     InvalidCall,
+    StillDrawing,
+    NotImplemented,
+    AccessLost,
+    WaitTimeout,
     NoInterface,
     NotFound,
     MoreData,
@@ -39,6 +45,10 @@ impl Error {
     pub fn hresult(self) -> u32 {
         match self {
             Self::InvalidArgument => 0x80070057,
+            Self::StillDrawing => 0x887a000a,
+            Self::NotImplemented => 0x80004001,
+            Self::AccessLost => 0x887a0026,
+            Self::WaitTimeout => 0x887a0027,
             Self::InvalidCall => 0x887a0001,
             Self::NoInterface => 0x80004002,
             Self::NotFound => 0x887a0002,

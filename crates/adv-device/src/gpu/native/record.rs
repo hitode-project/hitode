@@ -1616,7 +1616,7 @@ impl WorkerState {
         clip: Option<Rect>,
     ) -> Result<(), Error> {
         let coordinates = |src: u32, dst: u32| {
-            if dst <= src {
+            if filter == Filter::Nearest || dst <= src {
                 (0., 1.)
             } else if src == 1 {
                 (0.5, 0.5)
@@ -2316,6 +2316,17 @@ impl Gpu {
         }
         self.enqueue_blit(source, rectangle, destination, region, filter)
     }
+
+    /// Copy an output image to a different extent with point sampling.
+    pub fn point_copy(&mut self, source: &Image, destination: &Image) -> Result<(), Error> {
+        let (input, output) = (whole(source), whole(destination));
+        if (input.w, input.h) == (output.w, output.h) {
+            self.blit(source, input, destination, output, Filter::Nearest)
+        } else {
+            self.enqueue_blit(source, input, destination, output, Filter::Nearest)
+        }
+    }
+
     fn enqueue_blit(
         &mut self,
         source: &Image,
@@ -2413,6 +2424,34 @@ impl Gpu {
         if !self.wake.get() {
             self.execution.worker.admit_present(false)?;
         }
+        self.present_admitted(image, damage, serial, video, windows);
+        Ok(())
+    }
+
+    /// Check the shared present queue without waiting on its condition variable.
+    pub fn try_admit_present(&self) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
+        self.check()?;
+        self.execution.worker.admit_present(true)
+    }
+
+    /// Apply nonblocking worker admission for a presentation transaction.
+    pub fn with_nonblocking_admission<T>(&mut self, submit: impl FnOnce(&mut Self) -> T) -> T {
+        let wake = self.wake.replace(true);
+        let result = submit(self);
+        self.wake.set(wake);
+        result
+    }
+
+    pub fn present_admitted(
+        &mut self,
+        image: &Image,
+        damage: Region,
+        serial: u64,
+        video: std::sync::Arc<[crate::frame::VideoPlane]>,
+        windows: std::sync::Arc<[crate::frame::WindowLayer]>,
+    ) {
         self.execution.worker.push_present(WorkerItem::PresentSwap {
             image: image.clone(),
             damage,
@@ -2420,7 +2459,6 @@ impl Gpu {
             video,
             windows,
         });
-        Ok(())
     }
     /// D3D9 D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL ends the depth contents.
     pub fn discard_depth(&mut self, depth: &Depth) {
@@ -2440,7 +2478,7 @@ impl Gpu {
         image: &Image,
         wake: Option<Arc<adv_sync::WakeEvent>>,
     ) -> Result<Readback, Error> {
-        self.readback_inner(image, &[whole(image)], wake, false)
+        self.readback_inner(image, &[whole(image)], wake, false, None)
     }
 
     pub fn readback_regions(
@@ -2449,7 +2487,17 @@ impl Gpu {
         regions: &[Rect],
         wake: Option<Arc<adv_sync::WakeEvent>>,
     ) -> Result<Readback, Error> {
-        self.readback_inner(image, regions, wake, true)
+        self.readback_inner(image, regions, wake, true, None)
+    }
+
+    /// Observe the completed pixels on the GPU owner without waiting on the caller.
+    pub fn observe_readback(
+        &mut self,
+        image: &Image,
+        observe: impl FnOnce(Result<Vec<u8>, Error>) + Send + 'static,
+    ) -> Result<(), Error> {
+        self.readback_inner(image, &[whole(image)], None, false, Some(Box::new(observe)))?;
+        Ok(())
     }
 
     fn readback_inner(
@@ -2458,6 +2506,7 @@ impl Gpu {
         regions: &[Rect],
         wake: Option<Arc<adv_sync::WakeEvent>>,
         worker: bool,
+        observe: Option<ReadbackObserver>,
     ) -> Result<Readback, Error> {
         for &rect in regions {
             rectangle_in(image, rect)?;
@@ -2482,6 +2531,7 @@ impl Gpu {
             reservation: Some(reservation),
             wake: wake.clone(),
             device: self.device.clone(),
+            observe,
         };
         self.execution.worker.push_boundary(
             WorkerItem::Readback {
@@ -2554,7 +2604,10 @@ impl Drop for Reservation {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
+type ReadbackObserver = Box<dyn FnOnce(Result<Vec<u8>, Error>) + Send>;
+
 pub(super) struct Transfer {
+    observe: Option<ReadbackObserver>,
     completion: Arc<Completion>,
     reservation: Option<Reservation>,
     wake: Option<Arc<adv_sync::WakeEvent>>,
@@ -2562,6 +2615,15 @@ pub(super) struct Transfer {
 }
 impl Transfer {
     fn finish(&mut self, result: Result<ReadPixels, Error>) {
+        if let Some(observe) = self.observe.take() {
+            self.completion.finished.store(true, Ordering::Release);
+            self.reservation.take();
+            observe(result.map(|pixels| match pixels {
+                ReadPixels::Bytes(bytes) => bytes,
+                ReadPixels::Mapping(_) => unreachable!(),
+            }));
+            return;
+        }
         let mut output = self.completion.result.lock().unwrap();
         *output = Some(result);
         self.reservation.take();

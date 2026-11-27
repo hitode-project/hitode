@@ -360,13 +360,7 @@ impl<P> Recording<P> {
     }
 
     pub fn plan(&mut self, reason: Reason) -> Plan<P> {
-        let mut plan = Plan {
-            selected: None,
-            clipped: false,
-            promotions: [0; 2],
-            dead_passes: 0,
-            payload: PhantomData,
-        };
+        let mut plan = self.unclipped_plan();
         match reason {
             Reason::Present { slot, verify } => {
                 plan.clipped = !verify;
@@ -391,6 +385,16 @@ impl<P> Recording<P> {
             Reason::Query | Reason::Wait | Reason::CommandLimit => (),
         }
         plan
+    }
+
+    pub fn unclipped_plan(&self) -> Plan<P> {
+        Plan {
+            selected: None,
+            clipped: false,
+            promotions: [0; 2],
+            dead_passes: 0,
+            payload: PhantomData,
+        }
     }
 
     /// The cursor names the completed prefix and the completed scissors of
@@ -612,7 +616,23 @@ impl<P> Recording<P> {
         repeat: bool,
         counters: &mut Counters,
     ) -> bool {
-        let mismatch = self.previous.as_ref().is_some_and(|previous| {
+        let mismatch = Self::verify_pixels(
+            &mut self.previous,
+            pixels,
+            self.verify_region.as_ref().unwrap(),
+            repeat,
+        );
+        counters.verification_mismatches += u64::from(mismatch);
+        mismatch
+    }
+
+    pub fn verify_pixels(
+        previous: &mut Option<(u32, u32, Vec<u8>)>,
+        pixels: (u32, u32, Vec<u8>),
+        damage: &Region,
+        repeat: bool,
+    ) -> bool {
+        let mismatch = previous.as_ref().is_some_and(|previous| {
             previous.0 == pixels.0
                 && previous.1 == pixels.1
                 && pixels
@@ -624,17 +644,10 @@ impl<P> Recording<P> {
                     .enumerate()
                     .any(|(n, (a, b))| {
                         let (x, y) = (n as u32 % pixels.0, n as u32 / pixels.0);
-                        a != b
-                            && (repeat
-                                || !self
-                                    .verify_region
-                                    .as_ref()
-                                    .unwrap()
-                                    .intersects(Rect { x, y, w: 1, h: 1 }.into()))
+                        a != b && (repeat || !damage.intersects(Rect { x, y, w: 1, h: 1 }.into()))
                     })
         });
-        self.previous = Some(pixels);
-        counters.verification_mismatches += u64::from(mismatch);
+        *previous = Some(pixels);
         mismatch
     }
 

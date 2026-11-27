@@ -166,3 +166,55 @@ fn recorded_dispatch_finishes_before_the_draw_reads_its_image() {
     let bytes = unsafe { buffer.mapped().unwrap().as_ref() };
     assert_eq!(bytemuck::cast_slice::<_, u32>(bytes), &[37, 38, 39, 40]);
 }
+
+// spec: GFX-REC-3
+#[test]
+fn frame_verification_observes_pixels_outside_damage_after_present_returns() {
+    let mut gpu = Gpu::request(!cfg!(any(target_vendor = "apple", target_os = "android"))).unwrap();
+    let target = gpu.target(16, 16, false).unwrap().image;
+    let mut recording = Recording::default();
+    let mut damage = Region::empty((16, 16));
+    damage.add(
+        Rect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        }
+        .into(),
+    );
+    let all = Rect {
+        x: 0,
+        y: 0,
+        w: 16,
+        h: 16,
+    };
+    gpu.upload(&target, all, 64, &[0u8; 16 * 16 * 4]).unwrap();
+    recording
+        .verify(&mut gpu, &target, Region::whole((16, 16)))
+        .unwrap();
+    let changed = Rect {
+        x: 15,
+        y: 15,
+        w: 1,
+        h: 1,
+    };
+    gpu.upload(&target, changed, 4, &[255, 0, 0, 0]).unwrap();
+    recording.verify(&mut gpu, &target, damage).unwrap();
+
+    // Wait from the fixture after submitting both observations.
+    gpu.completion().unwrap().recv().unwrap();
+    let verification = recording.verification.as_ref().unwrap();
+    let progress = verification.progress.lock().unwrap();
+    assert_eq!(
+        progress.previous.as_ref().unwrap().2[1020..1024],
+        [255, 0, 0, 0]
+    );
+    #[cfg(feature = "d3d9-counters")]
+    assert_eq!(
+        verification
+            .mismatches
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
