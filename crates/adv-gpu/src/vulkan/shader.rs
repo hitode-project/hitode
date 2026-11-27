@@ -1179,18 +1179,28 @@ fn map_block(block: &mut naga::Block, map: &[H], starts: &[u32], arena: &naga::A
                 coordinate,
                 array_index,
                 value,
-            }
-            | S::ImageAtomic {
-                image,
-                coordinate,
-                array_index,
-                value,
-                ..
             } => {
                 m(image);
                 m(coordinate);
                 o(array_index);
                 m(value);
+            }
+            S::ImageAtomic {
+                image,
+                coordinate,
+                array_index,
+                fun,
+                value,
+                result,
+            } => {
+                m(image);
+                m(coordinate);
+                o(array_index);
+                m(value);
+                o(result);
+                if let naga::AtomicFunction::Exchange { compare } = fun {
+                    o(compare);
+                }
             }
             S::Atomic {
                 pointer,
