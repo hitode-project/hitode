@@ -207,8 +207,14 @@ jobs:
           read -r -a packages <<< "$WORKSPACE_PACKAGES"
           args=(--locked --lib --tests "${packages[@]}")
           if [[ -n "$WORKSPACE_FEATURES" ]]; then args+=(--features "$WORKSPACE_FEATURES"); fi
-          if [[ "$WORKSPACE_SLOW_TESTS" == true ]]; then args+=(--features adv-device/slow-tests); fi
           cargo build "${args[@]}" --keep-going --timings -v 2>&1 | tee "$RUNNER_TEMP/workspace-build.txt"
+          if [[ "$WORKSPACE_GROUP" == runtime-apps ]]; then
+            # GPU suites for adv-device and adv-dx run under `gpu (lavapipe)`;
+            # hosted macOS runners only expose Apple's paravirtual Mac2 GPU.
+            device_args=(--locked --lib --tests -p adv-device -p adv-dx --features adv-device/device,adv-dx/media)
+            if [[ "$WORKSPACE_SLOW_TESTS" == true ]]; then device_args+=(--features adv-device/slow-tests); fi
+            cargo build "${device_args[@]}" --keep-going --timings -v 2>&1 | tee -a "$RUNNER_TEMP/workspace-build.txt"
+          fi
       - name: Execute tests
         if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         timeout-minutes: 45
@@ -217,8 +223,12 @@ jobs:
           read -r -a packages <<< "$WORKSPACE_PACKAGES"
           args=(--locked --lib --tests "${packages[@]}")
           if [[ -n "$WORKSPACE_FEATURES" ]]; then args+=(--features "$WORKSPACE_FEATURES"); fi
-          if [[ "$WORKSPACE_SLOW_TESTS" == true ]]; then args+=(--features adv-device/slow-tests); fi
           cargo test "${args[@]}" --no-fail-fast -- --nocapture 2>&1 | tee "$RUNNER_TEMP/workspace-tests.txt"
+          if [[ "$WORKSPACE_GROUP" == runtime-apps ]]; then
+            device_args=(--locked --lib --tests -p adv-device -p adv-dx --features adv-device/device,adv-dx/media)
+            if [[ "$WORKSPACE_SLOW_TESTS" == true ]]; then device_args+=(--features adv-device/slow-tests); fi
+            cargo test "${device_args[@]}" --no-fail-fast -- --nocapture 2>&1 | tee -a "$RUNNER_TEMP/workspace-tests.txt"
+          fi
       # Behavior scenarios (docs/spec/README.md) judge this commit by the
       # latest master build the daily refresh cached, with that commit's own
       # scenarios and judge. Every master commit since then passed the same
@@ -294,7 +304,7 @@ jobs:
       CARGO_INCREMENTAL: '0'
       WORKSPACE_GROUP: runtime-apps
       WORKSPACE_PACKAGES: >-
-        -p adv-device -p adv-dx -p adv-runtime -p adv-shell -p adv-run
+        -p adv-runtime -p adv-shell -p adv-run
         -p adv-launcher -p adv-jit-helper -p tauri-plugin-storage
       WORKSPACE_FEATURES: adv-shell/gpu,adv-shell/media
       WORKSPACE_SLOW_TESTS: ${{ github.event.schedule == '17 3 * * 1' || inputs.slow-tests == true }}
