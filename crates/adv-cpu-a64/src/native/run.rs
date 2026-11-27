@@ -171,6 +171,12 @@ impl Native {
             );
         }
         self.code.sync();
+        let target = self
+            .resident_checkpoint
+            .take()
+            .filter(|&eip| eip == cpu.eip)
+            .and_then(|eip| self.code.resident(eip)?.checkpoint_entry())
+            .unwrap_or(entry.unit);
         self.prepare_inline(cpu, memory, fuel.max(budget), budget);
         self.runtime.row_suppressed = 0;
         let resumed_repeat = cpu.rep.take().map(|rep| {
@@ -206,7 +212,7 @@ impl Native {
             (*runtime).owner = &raw mut owner as u64;
             (*runtime).body.memory = owner.memory;
             let previous = ACTIVE.replace(Active::Owner(faults));
-            let returned = enter.run(runtime, entry.unit);
+            let returned = enter.run(runtime, target);
             ACTIVE.set(previous);
             returned
         };
@@ -361,7 +367,9 @@ impl Native {
         for sample in owner.internal_discovered {
             self.apply_back_edge_sample(memory, sample);
         }
-        if budget_exit {
+        if returned.deferred != 0 {
+            self.resident_checkpoint = Some(cpu.eip);
+        } else if budget_exit {
             self.sample(memory, cpu);
         }
         self.install_optimized(false);
@@ -2002,7 +2010,7 @@ impl Native {
 
     fn split_cost(&mut self, eip: u32, cpu: &CpuState, memory: &Memory) -> u64 {
         let job = self.plans.job(eip).unwrap();
-        if !job.splits || job.per_iteration.get().is_none() {
+        if !job.splits {
             return 0;
         }
         let proof = &self.worker_jobs[&eip].proof;

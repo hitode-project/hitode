@@ -1082,10 +1082,21 @@ impl Admission {
         cpu: &CpuState,
         memory: &Memory,
     ) -> Option<u32> {
+        self.loop_iterations(proof, cpu, memory, &[])
+            .filter(|&n| n >= 2)
+    }
+
+    fn loop_iterations(
+        &mut self,
+        proof: &Proof,
+        cpu: &CpuState,
+        memory: &Memory,
+        active: &[ActiveTask],
+    ) -> Option<u32> {
         self.sync_generation(memory);
         let alias = alias_base(memory);
         proof.split_iterations(cpu, &mut self.pricing, |addr| {
-            parameter(memory, &mut self.grants, alias, &[], addr)
+            parameter(memory, &mut self.grants, alias, active, addr)
         })
     }
 
@@ -1743,11 +1754,18 @@ impl<U, R> Computation<Option<ExecutionContext>> for Session<'_, U, R> {
         if let Some(plan) = plan
             && !done.completion.requires_owner
         {
-            let eip = done.completion.context.as_ref().unwrap().cpu().eip;
-            let iterations = match (eip == guest_entry, iteration) {
-                (false, _) => plan.iterations,
-                (true, true) => 1,
-                (true, false) => 0,
+            let end = done.completion.context.as_ref().unwrap().cpu();
+            let iterations = if end.eip != guest_entry {
+                plan.iterations
+            } else if iteration {
+                1
+            } else if done.deadline_recall {
+                // A whole job can return an exact prefix at its head.
+                self.admission
+                    .loop_iterations(&job.proof, end, self.memory, &self.active)
+                    .map_or(0, |left| plan.iterations - left)
+            } else {
+                0
             };
             JobPlan::learn(
                 policy,

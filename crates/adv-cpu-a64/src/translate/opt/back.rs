@@ -1247,14 +1247,14 @@ fn emit<'a>(
         let head = func.records[head.0 as usize].eip;
         for (i, [normal, checkpoint]) in std::mem::take(&mut e.normal).into_iter().enumerate() {
             let record = &func.records[i];
-            for (label, arrival) in [
-                (normal, resident && record.eip != head),
-                (checkpoint, false),
+            for (label, arrival, checkpoint) in [
+                (normal, resident && record.eip != head, false),
+                (checkpoint, false, true),
             ] {
                 if let Some(label) = label {
                     e.asm.bind(label);
                     e.mark(Part::Body, record.eip);
-                    e.inline_exit(record, assumed, bytes, arrival);
+                    e.inline_exit(record, assumed, bytes, (arrival, checkpoint));
                 }
             }
         }
@@ -1930,7 +1930,7 @@ impl<'a> Emitter<'a> {
             // budget exit does.
             let leave = self.asm.label();
             let defer_recall = self.func.head_exit.is_some() && !self.resident;
-            let recalled = if defer_recall {
+            let recalled = if defer_recall || self.resident {
                 self.asm.label()
             } else {
                 leave
@@ -1963,6 +1963,12 @@ impl<'a> Emitter<'a> {
                     and_imm(W, T, T, u64::from(runtime::RECALL_GRACE)),
                 ]);
                 self.asm.cbz(W, true, T, leave);
+            } else if self.resident {
+                self.asm.b(refill);
+                self.asm.bind(recalled);
+                self.asm
+                    .emit_all(&[movz(W, T, 1, 0), str(W, T, RT, runtime::DEFERRED)]);
+                self.asm.b(leave);
             }
             self.asm.bind(refill);
             let refund = self.func.records[record.0 as usize].refund;

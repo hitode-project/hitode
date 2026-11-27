@@ -86,7 +86,8 @@ pub struct Runtime {
     /// Nonzero: the proved form leaves when this many returns to its head
     /// have counted it down to zero.
     pub head_exit: u32,
-    /// Checkpoints that kept running past a recall to reach the head.
+    /// Worker checkpoints that deferred recall to the head. For the owner,
+    /// nonzero when a resident checkpoint left for pending work.
     pub deferred: u32,
     /// Optimized entry parameters, one 16-byte cell per `Func::entry` source.
     pub opt_params: u64,
@@ -127,6 +128,8 @@ pub struct Runtime {
     pub active_fpcr: u32,
     /// Ownership of live hardware FPSR sticky bits (`FPSR_CLEAN` or `FPSR_SSE_LIVE`).
     pub fpsr_owner: u8,
+    /// Canonical owner exit stub, used by interrupted resident checkpoints.
+    pub(crate) resident_checkpoint_exit: usize,
 }
 
 /// Generated-code FP counters owned by one execution `Runtime` (owner or worker).
@@ -187,6 +190,7 @@ impl Runtime {
             host_fpcr: 0,
             active_fpcr: 0,
             fpsr_owner: FPSR_CLEAN,
+            resident_checkpoint_exit: 0,
             cpu,
             window,
             shadow: 0,
@@ -712,6 +716,8 @@ pub(crate) const RECOVERY_CELLS: u32 = field(offset_of!(Runtime, recovery.cells)
 pub(crate) const RECOVERY_HEAD: u32 = field(offset_of!(Runtime, recovery.head));
 pub(crate) const OFFER_GATE: u32 = field(offset_of!(Runtime, offer_gate));
 pub(crate) const DEFERRED: u32 = field(offset_of!(Runtime, deferred));
+pub(crate) const RESIDENT_CHECKPOINT_EXIT: u32 =
+    field(offset_of!(Runtime, resident_checkpoint_exit));
 /// Inner checkpoints a recall waits through before it leaves where it is:
 /// a few outer iterations of a hot computation.
 pub(crate) use crate::policy::worker::{COMPUTATION_SLICE, RECALL_GRACE};

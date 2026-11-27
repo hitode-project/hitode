@@ -683,6 +683,7 @@ pub(crate) struct Native {
     pub(crate) unchecked_faults: u64,
     /// The run's wall deadline as a virtual counter value.
     pub(crate) deadline: Option<u64>,
+    resident_checkpoint: Option<u32>,
     /// Diagnostic counts of how runs end; see `Diagnostics`.
     pub(crate) diagnostics: Diagnostics,
     /// Per-region speculation failure and replay counts, keyed by region head EIP.
@@ -1014,6 +1015,7 @@ impl Native {
         let mut runtime = Box::new(Runtime::new(std::ptr::null_mut(), window as u64));
         runtime.table = table.as_mut_ptr() as u64;
         runtime.resident_access = (base + access_entry) as u64;
+        runtime.resident_checkpoint_exit = base + stubs.exit;
         runtime.plan_observation = plan_observation as *const () as u64;
         runtime.shadow_top = shadow.top();
         runtime.shadow = shadow.top();
@@ -1088,6 +1090,7 @@ impl Native {
             checks: Checks::Adaptive,
             unchecked_faults: 0,
             deadline: None,
+            resident_checkpoint: None,
             diagnostics: Diagnostics::default(),
             region_speculation: std::collections::BTreeMap::new(),
             classified_epoch: None,
@@ -1154,6 +1157,7 @@ impl Native {
             x87: Some(stubs.x87.at(base)),
         };
         self.runtime.resident_access = (base + access_entry) as u64;
+        self.runtime.resident_checkpoint_exit = base + stubs.exit;
         record_stubs(base, &stubs, access_entry);
         self.code.cache.sync();
     }
@@ -1725,6 +1729,41 @@ mod tests {
             .run(cpu, memory, stop, 4096, std::ptr::null_mut())
             .unwrap()
             .unwrap()
+    }
+
+    // spec: A64-CTL-8 A64-OPT-9
+    #[test]
+    fn interrupted_resident_head_resumes_through_its_entry() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (mut memory, mut native, stop) = resident_loop(STORE_LOOP);
+        native.count_resident_entries = true;
+        assert!(native.force_resident(&mut memory, HEAD));
+        memory.map(OUTPUT + 0x4000, 0x10000, READ | WRITE).unwrap();
+        let pending = Arc::new(AtomicU32::new(adv_sync::pending::DEADLINE));
+        native.interrupt = Some(pending.clone());
+        native.pending_mask = adv_sync::pending::DEADLINE;
+
+        let count = 20_000;
+        let mut state = resident_cpu(OUTSIDE, count);
+        let mut execute = |native: &mut Native, state: &mut CpuState| {
+            native
+                .run(state, &mut memory, stop, 2 * SLICE, std::ptr::null_mut())
+                .unwrap()
+                .unwrap()
+        };
+        let first = execute(&mut native, &mut state);
+        assert_eq!(state.eip, HEAD);
+        assert_eq!(first.retired, 2 + (count - state.regs[1]) * 4);
+        assert_eq!(native.diagnostics.resident_entries, 1);
+
+        native.code.resident(HEAD).unwrap().sample.set(1);
+        pending.store(0, Relaxed);
+        let second = execute(&mut native, &mut state);
+        assert_eq!(state.eip, stop);
+        assert_eq!(first.retired + second.retired, 2 + count * 4);
+        assert_eq!(native.diagnostics.resident_entries, 2);
+        assert_eq!(native.code.resident(HEAD).unwrap().sample.get(), 1);
     }
 
     fn outside_link(native: &Native, head: u32) -> &Linked {
@@ -2862,6 +2901,7 @@ mod tests {
     fn paced_offers_price_the_current_trip_count() {
         use adv_cpu_core::backend::{Completion, Pace, host_tick_hz};
         use adv_cpu_core::trap::ExecutionTrap;
+        use std::sync::atomic::Ordering::Relaxed;
         use std::time::Duration;
 
         struct FixedPace(OfferGate);
@@ -2872,7 +2912,11 @@ mod tests {
 
             fn pace(&self) -> Option<Pace> {
                 Some(Pace {
-                    limit_ns: 3_600_000_000_000,
+                    limit_ns: if self.0.split_over.load(Relaxed) != 0 {
+                        0
+                    } else {
+                        3_600_000_000_000
+                    },
                     ..Pace::default()
                 })
             }
@@ -2916,6 +2960,25 @@ mod tests {
             cliffs: Default::default(),
             scratch: Default::default(),
         };
+        for over in [0, 1, 0] {
+            bridge
+                .handler
+                .as_ref()
+                .unwrap()
+                .offer_gate()
+                .unwrap()
+                .split_over
+                .store(over, Relaxed);
+            let job = native.plans.job(HEAD).unwrap();
+            assert!(job.per_iteration.get().is_none());
+            job.reoffer.set(1);
+            let mut cpu = resident_cpu(HEAD, 1024);
+            let result = native
+                .run(&mut cpu, &mut memory, stop, 4096, (&raw mut bridge).cast())
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.exit == Exit::Computation, over != 0);
+        }
         for source in [HEAD, OUTSIDE] {
             for trained in [8, 1024] {
                 for trips in [8, 1024] {

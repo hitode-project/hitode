@@ -135,6 +135,15 @@ pub(super) struct RowEntry {
 
 impl<R> ResidentSite<R> {
     pub fn entry(&self) -> Option<usize> {
+        self.entry_address(|version| version.probe)
+    }
+
+    /// A root resume has no incoming link to sample or specialize.
+    pub fn checkpoint_entry(&self) -> Option<usize> {
+        self.entry_address(|version| version.entry)
+    }
+
+    fn entry_address(&self, address: impl FnOnce(&ResidentVersion<R>) -> usize) -> Option<usize> {
         if self.suspended {
             return None;
         }
@@ -142,7 +151,7 @@ impl<R> ResidentSite<R> {
             self.versions
                 .iter()
                 .find(|v| v.enabled && v.row_target.is_none())
-                .map(|v| v.probe)
+                .map(address)
         })
     }
 }
