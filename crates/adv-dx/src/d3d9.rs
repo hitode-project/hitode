@@ -340,6 +340,11 @@ pub use recording::trace::take_or_arm as frame_trace;
 pub fn frame_counters(ext: &Ext) -> Option<FrameCounters> {
     ext.try_get::<State>().map(|state| state.frames)
 }
+
+#[cfg(feature = "d3d9-counters")]
+pub fn traffic(ext: &Ext) -> Option<adv_device::gpu::Traffic> {
+    Some(ext.try_get::<State>()?.gpu.as_ref()?.traffic())
+}
 pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
     let state = ext.get::<State>();
     Diagnostics {

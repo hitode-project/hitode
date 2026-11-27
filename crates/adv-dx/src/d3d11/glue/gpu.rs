@@ -28,7 +28,7 @@ use std::sync::mpsc::TryRecvError;
 
 pub(super) struct Execution {
     gpu: Gpu,
-    recording: Recording,
+    pub(super) recording: Recording,
     active_queries: BTreeMap<(u64, u64), u32>,
     present_target: Option<adv_device::gpu::Image>,
 }
@@ -78,6 +78,29 @@ pub(super) fn execution(ext: &mut Ext) -> Result<&mut Execution, Error> {
         .execution
         .as_mut()
         .ok_or(Error::Device)
+}
+
+#[cfg(feature = "d3d9-counters")]
+pub(super) fn count_map(ext: &mut Ext, constant_time: bool) {
+    if let Ok(execution) = execution(ext) {
+        execution.recording.counters.mapped(constant_time);
+    }
+}
+
+#[cfg(feature = "d3d9-counters")]
+pub fn frame_counters(ext: &Ext) -> Option<crate::d3d9::FrameCounters> {
+    Some(
+        ext.try_get::<State>()?
+            .execution
+            .as_ref()?
+            .recording
+            .counters,
+    )
+}
+
+#[cfg(feature = "d3d9-counters")]
+pub fn traffic(ext: &Ext) -> Option<adv_device::gpu::Traffic> {
+    Some(ext.try_get::<State>()?.execution.as_ref()?.gpu.traffic())
 }
 
 fn context_device(env: &Env<'_>) -> Result<u32, Error> {
@@ -281,6 +304,10 @@ pub(super) fn download(
             .recv()
             .map_err(|_| Error::Device)?;
         let readback = buffer.mapped().unwrap();
+        #[cfg(feature = "d3d9-counters")]
+        execution
+            .gpu
+            .count_readback(u64::from(row) * u64::from(rect.h));
         // SAFETY: the transfer has finished and the readback allocation lives
         // through all copies into the guest shadow.
         let bytes = unsafe { readback.as_ref() };
@@ -979,6 +1006,8 @@ pub(super) fn present(
         rect,
         adv_device::gpu::Filter::Nearest,
     )?;
+    #[cfg(feature = "d3d9-counters")]
+    let damage_pixels = damage.area();
     execution.gpu.present(
         target,
         damage,
@@ -986,6 +1015,11 @@ pub(super) fn present(
         std::sync::Arc::new([]),
         std::sync::Arc::new([]),
     )?;
+    #[cfg(feature = "d3d9-counters")]
+    {
+        execution.recording.counters.presents += 1;
+        execution.recording.counters.damage_pixels += damage_pixels;
+    }
     Ok(())
 }
 

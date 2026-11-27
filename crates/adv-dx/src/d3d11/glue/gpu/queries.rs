@@ -204,6 +204,10 @@ pub(in crate::d3d11::glue) fn end_query(env: &mut Env<'_>) -> Result<(), Error> 
             }
             Some(buffer)
         };
+        #[cfg(feature = "d3d9-counters")]
+        if let Some(buffer) = &buffer {
+            execution.gpu.count_readback(buffer.desc().size);
+        }
         Pending {
             buffer,
             completion: Some(execution.gpu.completion()?),

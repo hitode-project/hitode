@@ -472,6 +472,8 @@ impl Gpu {
         let (buffer, len) = self.take_stage(pitch, rows)?;
         // SAFETY: the staging allocation has no GPU users or other writers.
         fill(unsafe { &mut buffer.mapped().unwrap().as_mut()[..len as usize] });
+        #[cfg(feature = "graphics-counters")]
+        self.count_upload(u64::from(len));
         Ok(Staged { buffer, pitch, len })
     }
 
@@ -499,6 +501,8 @@ impl Gpu {
             dst.copy_from_slice(chunk);
             inspect(chunk);
         }
+        #[cfg(feature = "graphics-counters")]
+        self.count_upload(u64::from(size));
         Ok(Staged {
             buffer,
             pitch: row_bytes,
@@ -520,10 +524,14 @@ impl Gpu {
             let at = y as usize * row_bytes as usize;
             bytes[at..at + row_bytes as usize].copy_from_slice(row);
         });
-        Ok(result.map(|()| Staged {
-            buffer,
-            pitch: row_bytes,
-            len: size,
+        Ok(result.map(|()| {
+            #[cfg(feature = "graphics-counters")]
+            self.count_upload(u64::from(size));
+            Staged {
+                buffer,
+                pitch: row_bytes,
+                len: size,
+            }
         }))
     }
     pub fn upload_staged(

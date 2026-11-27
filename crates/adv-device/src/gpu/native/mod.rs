@@ -299,6 +299,21 @@ impl Gpu {
     pub fn stats(&self) -> Stats {
         self.execution.worker.stats(self.facade_id)
     }
+
+    #[cfg(feature = "graphics-counters")]
+    pub fn traffic(&self) -> super::Traffic {
+        self.stream.0.borrow().traffic()
+    }
+
+    #[cfg(feature = "graphics-counters")]
+    pub fn count_upload(&self, bytes: u64) {
+        self.stream.0.borrow().count_upload(bytes);
+    }
+
+    #[cfg(feature = "graphics-counters")]
+    pub fn count_readback(&self, bytes: u64) {
+        self.stream.0.borrow().count_readback(bytes);
+    }
     /// Device loss or per-facade worker error, as reported by `"adv-gfx-worker"` or `"GPU owner"`.
     pub fn check(&self) -> Result<(), Error> {
         if let Some(failure) = self.execution.owner.failure.get() {

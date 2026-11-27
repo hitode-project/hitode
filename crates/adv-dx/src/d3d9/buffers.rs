@@ -352,6 +352,8 @@ fn lock(
         return INVALID;
     };
     b.locks = locks;
+    #[cfg(feature = "d3d9-counters")]
+    env.ext.get_mut::<State>().frames.mapped(true);
     0
 }
 fn unlock(env: &mut Env<'_>, this: u32, kind: Kind) -> u32 {

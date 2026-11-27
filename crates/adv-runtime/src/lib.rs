@@ -50,6 +50,11 @@ pub use adv_dx::d3d9::{
     FrameCounters as D3d9Counters, frame_counters as d3d9_counters, frame_trace as d3d9_frame,
 };
 pub use adv_dx::dsound::{AudioSourceStatus, PcmDigest};
+#[cfg(all(feature = "gpu", feature = "graphics-counters"))]
+pub use adv_dx::{
+    d3d9::traffic as d3d9_traffic,
+    d3d11::{frame_counters as d3d11_counters, traffic as d3d11_traffic},
+};
 pub use graphics::{
     FrameConsumer, FrameProducer, FrameView, GraphicsStats, PendingFrame, Presenter, Snapshot,
     VideoCursorRegion, frame_mailbox,
