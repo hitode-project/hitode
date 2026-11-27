@@ -393,7 +393,7 @@ A null window clears the association and restores default Alt+Enter handling.
 Software swap chains remain windowed and reject exclusive fullscreen.
 
 DXGI output ownership uses the same exclusive-mode owner as DirectDraw and DXGI fullscreen transitions. Output gamma and display-surface access follow that owner. A duplication object reads guest publications from the shared presenter and loses access when the display mode or fullscreen ownership changes.
-DXGI fullscreen gamma uses 256 equally spaced control points between zero and one without scale or offset. Desktop duplication rejects null metadata buffers with `E_INVALIDARG`.
+DXGI fullscreen gamma capabilities write 256 equally spaced control points between zero and one, preserving the unused positions. Gamma programming round-trips the full control structure. Scanout uses the first 256 points without scale or offset. Desktop duplication rejects null metadata buffers with `E_INVALIDARG` and preserves the required-size output.
 
 A Win32 desktop process can create a composition chain with a hardware or software device. Its buffers have no window until a compositor attaches the chain.
 
@@ -467,6 +467,7 @@ The adapter's `CreateDevice` callback writes the measured Direct3D and DXGI func
 **Verification**: Test
 
 `GetSharedHandle` succeeds with a null handle on private textures. It returns `E_INVALIDARG` on NT-only textures without writing the output. `CreateSharedHandle` requires the NT handle flag.
+A legacy handle retires with the last resource alias, as on RTX after a completed flush. WARP can retain an unreferenced legacy handle until creator-device release.
 `GetSharedResourceAdapterLuid` leaves the output untouched on null or unknown handles and returns `DXGI_ERROR_INVALID_CALL` or `D3DERR_INVALIDCALL`, respectively.
 
 Texture gathers use the top mip regardless of sampler filter. Two-dimensional gathers

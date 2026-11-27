@@ -1311,11 +1311,15 @@ fn legacy_shared_handle_keeps_cross_device_aliases_live() {
     for object in [view, dxgi, texture] {
         method(&mut r.machine, object, 2, &[]);
     }
+    r.call(110, &[]);
+    r.call(111, &[]);
     r.device = other;
     r.context = other_context;
     let staging = r.texture(2, 1, 28, 0, 0);
     assert_eq!(r.read(alias, staging, 2, 4), [0xff0000ff; 2]);
     assert_eq!(method(&mut r.machine, alias, 2, &[]), 0);
+    r.call(110, &[]);
+    r.call(111, &[]);
     assert_eq!(
         method(&mut r.machine, other, 28, &[handle, IID, OUT]),
         0x80070057

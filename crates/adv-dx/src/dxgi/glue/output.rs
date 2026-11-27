@@ -68,17 +68,19 @@ impl crate::dxgi::Devices for OutputDevices {
                 for (i, point) in positions[..256].iter_mut().enumerate() {
                     *point = i as f32 / 255.0;
                 }
-                write(
-                    env,
-                    first,
-                    DXGI_GAMMA_CONTROL_CAPABILITIES {
-                        ScaleAndOffsetSupported: 0,
-                        MaxConvertedValue: 1.0,
-                        MinConvertedValue: 0.0,
-                        NumGammaControlPoints: 256,
-                        ControlPointPositions: positions,
-                    },
-                )
+                let caps = DXGI_GAMMA_CONTROL_CAPABILITIES {
+                    ScaleAndOffsetSupported: 0,
+                    MaxConvertedValue: 1.0,
+                    MinConvertedValue: 0.0,
+                    NumGammaControlPoints: 256,
+                    ControlPointPositions: positions,
+                };
+                let written =
+                    std::mem::offset_of!(DXGI_GAMMA_CONTROL_CAPABILITIES, ControlPointPositions)
+                        + caps.NumGammaControlPoints as usize * size_of::<f32>();
+                env.cpu
+                    .write(first, &bytemuck::bytes_of(&caps)[..written])
+                    .map_err(|_| Error::InvalidCall)
             }),
             SetGammaControl => call(|| {
                 fullscreen_owner(env)?;
