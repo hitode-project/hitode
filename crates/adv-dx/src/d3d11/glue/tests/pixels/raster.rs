@@ -647,6 +647,113 @@ fn typed_uav_clear_preserves_subword_buffer_edges_and_image_bits() {
     }
 }
 
+// spec: GFX-REC-7
+#[test]
+fn structure_count_copy_refreshes_a_dynamic_constant_shadow() {
+    let mut r = Raster::new();
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            BindFlags: Bind::UNORDERED,
+            MiscFlags: Misc::STRUCTURED,
+            StructureByteStride: 4,
+            ..Default::default()
+        },
+    );
+    let output = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        adv_abi::types::D3D11_UNORDERED_ACCESS_VIEW_DESC {
+            Format: 0,
+            ViewDimension: 1,
+            Anonymous: bytemuck::cast([0u32, 4, 4]),
+        },
+    );
+    let view = create_object(&mut r.machine, r.device, 8, &[output, DESCRIPTOR]);
+    write_value(&mut r.machine, ARRAY, [view, 7]);
+    r.call(68, &[0, 1, ARRAY, ARRAY + 4]);
+    let constant = r.constants;
+    update_dynamic(&mut r.machine, r.context, constant, &[1u32, 2, 3, 4]);
+    r.call(49, &[constant, 4, view]);
+    let mapped = map(&mut r.machine, r.context, constant, 5);
+    assert_eq!(
+        GuestPtr::<[u32; 4]>::new(mapped.pData)
+            .read(&r.machine.cpu)
+            .unwrap(),
+        [1, 7, 3, 4]
+    );
+    r.call(15, &[constant, 0]);
+}
+
+// spec: GFX-REC-7
+#[test]
+fn dynamic_buffer_srv_uploads_keep_dispatches_in_order() {
+    let mut r = Raster::new();
+    r.shader(
+        18,
+        69,
+        include_bytes!("../../../../../tests/fixtures/shader-core/packed_buffer.dxbc"),
+    );
+    let input = buffer(&mut r.machine, r.device, Bind::SHADER, 8);
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        adv_abi::types::D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: 42,
+            ViewDimension: 1,
+            Anonymous: bytemuck::cast([0u32, 2, 0, 0]),
+        },
+    );
+    let srv = create_object(&mut r.machine, r.device, 7, &[input, DESCRIPTOR]);
+    write_value(&mut r.machine, ARRAY, srv);
+    r.call(67, &[0, 1, ARRAY]);
+    let mut outputs = Vec::new();
+    for words in [[11u32, 22], [33, 44]] {
+        update_dynamic(&mut r.machine, r.context, input, &words);
+        write_value(
+            &mut r.machine,
+            DESCRIPTOR,
+            D3D11_BUFFER_DESC {
+                ByteWidth: 8,
+                BindFlags: Bind::UNORDERED,
+                ..Default::default()
+            },
+        );
+        let output = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+        write_value(
+            &mut r.machine,
+            DESCRIPTOR,
+            adv_abi::types::D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                Format: 42,
+                ViewDimension: 1,
+                Anonymous: bytemuck::cast([0u32, 2, 0]),
+            },
+        );
+        let uav = create_object(&mut r.machine, r.device, 8, &[output, DESCRIPTOR]);
+        write_value(&mut r.machine, ARRAY, uav);
+        r.call(68, &[0, 1, ARRAY, 0]);
+        r.call(41, &[1, 1, 1]);
+        outputs.push((output, words));
+    }
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 8,
+            Usage: 3,
+            CPUAccessFlags: 0x20000,
+            ..Default::default()
+        },
+    );
+    let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    for (output, words) in outputs {
+        assert_eq!(r.read(output, staging, 2, 4), words);
+    }
+}
+
 #[test]
 fn legacy_shared_handle_keeps_cross_device_aliases_live() {
     let mut r = Raster::new();
@@ -928,6 +1035,17 @@ fn geometry_stream_output_appends_and_drives_draw_auto_through_guest_vtables() {
     r.clear(view, [0., 0., 0., 1.]);
     r.call(39, &[arguments, 0]);
     assert_eq!(r.read(target, staging, 4, 4), [0xff0000ff; 4]);
+
+    let vertices = buffer(&mut r.machine, r.device, Bind::VERTEX, 112);
+    r.call(47, &[vertices, output]);
+    let source = buffer(&mut r.machine, r.device, Bind::INDEX, 8);
+    update_dynamic(&mut r.machine, r.context, source, &[0u16, 1, 2, 0]);
+    r.call(47, &[indices, source]);
+    write_value(&mut r.machine, ARRAY, [vertices, 16, 16]);
+    r.call(18, &[0, 1, ARRAY, ARRAY + 4, ARRAY + 8]);
+    r.clear(view, [0., 0., 0., 1.]);
+    r.call(12, &[3, 0, 0]);
+    assert_eq!(r.read(target, staging, 4, 4), [0xff0000ff; 4]);
 }
 
 // spec: GFX-REC-7
@@ -998,6 +1116,11 @@ fn guest_constant_updates_keep_recorded_draws_in_order() {
         assert_eq!(
             traffic.upload_bytes - before.upload_bytes,
             u64::from(UPDATES) * 16
+        );
+        assert_eq!(traffic.submissions - before.submissions, 2);
+        assert_eq!(
+            traffic.readback_bytes - before.readback_bytes,
+            u64::from(width) * 4
         );
         assert_eq!(counters.constant_time_maps, u64::from(UPDATES / 3) * 2);
     }

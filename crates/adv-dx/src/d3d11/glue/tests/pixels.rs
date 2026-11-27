@@ -2,7 +2,10 @@ use super::*;
 
 mod raster;
 use crate::d3d11::desc::Misc;
-use adv_abi::types::{D3D11_INPUT_ELEMENT_DESC, D3D11_SUBRESOURCE_DATA};
+use adv_abi::types::{
+    D3D11_BOX, D3D11_INPUT_ELEMENT_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE1D_DESC,
+    D3D11_TEXTURE3D_DESC,
+};
 use adv_device::gpu::Gpu;
 
 const CODE_BYTES: u32 = 0x420000;
@@ -892,6 +895,211 @@ fn guest_staging_write_uploads_before_the_recorded_copy() {
         assert!(traffic.submissions > before.submissions);
         let counters = gpu::frame_counters(&machine.ext).unwrap();
         assert_eq!((counters.maps, counters.constant_time_maps), (2, 0));
+    }
+}
+
+// spec: GFX-REC-7
+#[test]
+fn gpu_copies_preserve_dynamic_buffer_bytes_across_no_overwrite() {
+    let mut machine = machine();
+    let gpu = Gpu::request(!cfg!(target_vendor = "apple")).unwrap();
+    machine.ext.get_mut::<State>().execution = Some(gpu::Execution::new(gpu));
+    let (device, context) = create(&mut machine, 1, 0, &[0xb000]);
+    write_value(
+        &mut machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            ..Default::default()
+        },
+    );
+    let source = create_object(&mut machine, device, 3, &[DESCRIPTOR, 0]);
+    write_value(
+        &mut machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            Usage: 3,
+            CPUAccessFlags: 0x20000,
+            ..Default::default()
+        },
+    );
+    let staging = create_object(&mut machine, device, 3, &[DESCRIPTOR, 0]);
+    write_value(&mut machine, ARRAY, [11u32, 22, 33, 44]);
+    assert_eq!(
+        method(&mut machine, context, 48, &[source, 0, 0, ARRAY, 0, 0]),
+        0
+    );
+    let box_address = ARRAY + 16;
+    write_value(
+        &mut machine,
+        box_address,
+        D3D11_BOX {
+            left: 4,
+            right: 12,
+            bottom: 1,
+            back: 1,
+            ..Default::default()
+        },
+    );
+    for bind in [Bind::CONSTANT, Bind::VERTEX, Bind::INDEX, Bind::SHADER] {
+        let dynamic = buffer(&mut machine, device, bind, 16);
+        update_dynamic(&mut machine, context, dynamic, &[1u32, 2, 3, 4]);
+        assert_eq!(
+            method(
+                &mut machine,
+                context,
+                46,
+                &[dynamic, 0, 4, 0, 0, source, 0, box_address]
+            ),
+            0
+        );
+        #[cfg(feature = "d3d9-counters")]
+        let before = gpu::traffic(&machine.ext).unwrap();
+        #[cfg(feature = "d3d9-counters")]
+        let before_maps = gpu::frame_counters(&machine.ext).unwrap();
+        let mapped = map(&mut machine, context, dynamic, 5);
+        let read = |machine: &Machine<JitCpu>, address| {
+            GuestPtr::<[u32; 4]>::new(address)
+                .read(&machine.cpu)
+                .unwrap()
+        };
+        assert_eq!(
+            read(&machine, mapped.pData),
+            [1, 22, 33, 4],
+            "bind {bind:#x}"
+        );
+        write_value(&mut machine, mapped.pData + 12, 55u32);
+        assert_eq!(method(&mut machine, context, 15, &[dynamic, 0]), 0);
+        assert_eq!(map(&mut machine, context, dynamic, 5).pData, mapped.pData);
+        assert_eq!(method(&mut machine, context, 15, &[dynamic, 0]), 0);
+        #[cfg(feature = "d3d9-counters")]
+        {
+            let traffic = gpu::traffic(&machine.ext).unwrap();
+            let counters = gpu::frame_counters(&machine.ext).unwrap();
+            assert_eq!(traffic.readback_bytes - before.readback_bytes, 16);
+            assert_eq!(counters.maps - before_maps.maps, 2);
+            assert_eq!(
+                counters.constant_time_maps - before_maps.constant_time_maps,
+                1
+            );
+        }
+        assert_eq!(method(&mut machine, context, 47, &[staging, dynamic]), 0);
+        let staged = map(&mut machine, context, staging, 1);
+        assert_eq!(
+            read(&machine, staged.pData),
+            [1, 22, 33, 55],
+            "bind {bind:#x}"
+        );
+        assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
+        assert_eq!(method(&mut machine, context, 47, &[dynamic, source]), 0);
+        let mapped = map(&mut machine, context, dynamic, 5);
+        assert_eq!(
+            read(&machine, mapped.pData),
+            [11, 22, 33, 44],
+            "bind {bind:#x}"
+        );
+        assert_eq!(method(&mut machine, context, 15, &[dynamic, 0]), 0);
+    }
+}
+
+// spec: GFX-REC-7
+#[test]
+fn gpu_copies_preserve_dynamic_texture_bytes_across_discard() {
+    let mut machine = machine();
+    let gpu = Gpu::request(!cfg!(target_vendor = "apple")).unwrap();
+    machine.ext.get_mut::<State>().execution = Some(gpu::Execution::new(gpu));
+    let (device, context) = create(&mut machine, 1, 0, &[0xb000]);
+    let pixels = [11u32, 22, 33, 44, 55, 66, 77, 88];
+    write_value(&mut machine, ARRAY, pixels);
+    let initial = ARRAY + 32;
+    for (slot, height, depth) in [(4, 1, 1), (5, 2, 1), (6, 2, 2)] {
+        write_value(
+            &mut machine,
+            initial,
+            D3D11_SUBRESOURCE_DATA {
+                pSysMem: ARRAY,
+                SysMemPitch: 8,
+                SysMemSlicePitch: 8 * height,
+            },
+        );
+        let mut make = |usage, bind, cpu, data| {
+            match slot {
+                4 => write_value(
+                    &mut machine,
+                    DESCRIPTOR,
+                    D3D11_TEXTURE1D_DESC {
+                        Width: 2,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: 28,
+                        Usage: usage,
+                        BindFlags: bind,
+                        CPUAccessFlags: cpu,
+                        ..Default::default()
+                    },
+                ),
+                5 => return texture(&mut machine, device, usage, bind, cpu, data, 2),
+                6 => write_value(
+                    &mut machine,
+                    DESCRIPTOR,
+                    D3D11_TEXTURE3D_DESC {
+                        Width: 2,
+                        Height: height,
+                        Depth: depth,
+                        MipLevels: 1,
+                        Format: 28,
+                        Usage: usage,
+                        BindFlags: bind,
+                        CPUAccessFlags: cpu,
+                        ..Default::default()
+                    },
+                ),
+                _ => unreachable!(),
+            }
+            create_object(&mut machine, device, slot, &[DESCRIPTOR, data])
+        };
+        let source = make(0, Bind::SHADER, 0, initial);
+        let dynamic = make(2, Bind::SHADER, 0x10000, 0);
+        let staging = make(3, 0, 0x20000, 0);
+        assert_eq!(method(&mut machine, context, 47, &[dynamic, source]), 0);
+        #[cfg(feature = "d3d9-counters")]
+        let before = gpu::traffic(&machine.ext).unwrap();
+        let mapped = map(&mut machine, context, dynamic, 4);
+        let addresses = |mapped: D3D11_MAPPED_SUBRESOURCE| {
+            (0..depth).flat_map(move |z| {
+                (0..height).flat_map(move |y| {
+                    let row = mapped.pData + z * mapped.DepthPitch + y * mapped.RowPitch;
+                    [row, row + 4]
+                })
+            })
+        };
+        for (address, value) in addresses(mapped).zip(pixels) {
+            assert_eq!(
+                machine.cpu.read_u32(address).unwrap(),
+                value,
+                "texture slot {slot}"
+            );
+        }
+        #[cfg(feature = "d3d9-counters")]
+        assert_eq!(
+            gpu::traffic(&machine.ext).unwrap().readback_bytes - before.readback_bytes,
+            u64::from(8 * height * depth)
+        );
+        write_value(&mut machine, mapped.pData, 99u32);
+        assert_eq!(method(&mut machine, context, 15, &[dynamic, 0]), 0);
+        assert_eq!(method(&mut machine, context, 47, &[staging, dynamic]), 0);
+        let staged = map(&mut machine, context, staging, 1);
+        for (address, value) in
+            addresses(staged).zip([99].into_iter().chain(pixels[1..].iter().copied()))
+        {
+            assert_eq!(
+                machine.cpu.read_u32(address).unwrap(),
+                value,
+                "texture slot {slot}"
+            );
+        }
+        assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
     }
 }
 
