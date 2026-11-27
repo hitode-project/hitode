@@ -71,7 +71,9 @@
 //!   | load/store op none | load and store |
 //!
 //!   Pipelines whose heap indices exceed the push-constant budget bind
-//!   through cached descriptor sets.
+//!   through cached descriptor sets. Compact shaders can use descriptor
+//!   indexing limits or one packed read-only storage window when the ordinary
+//!   descriptor layout fills.
 //!
 //!   Optional fast paths: cooperative matrices, int8 dot products, tile-local
 //!   reads (`dynamic_rendering_local_read`, `shader_tile_image`), descriptor
@@ -92,7 +94,8 @@
 //!   covers both tiers on lavapipe.
 //! - Metal requires Apple5 (A12): memoryless and losslessly compressed
 //!   targets, tile shaders and raster order groups. SIMD-group matrices from
-//!   Apple7.
+//!   Apple7. Compact shaders use Tier 2 argument buffers for resources that
+//!   overflow the native buffer and texture tables.
 //!
 //! Vertex fetch is shader code on both backends: front ends read vertex
 //! streams from storage buffers (the D3D9 translator emits the fetch), so no

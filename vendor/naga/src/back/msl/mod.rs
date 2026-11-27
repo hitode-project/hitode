@@ -118,6 +118,7 @@ pub struct BindTarget {
     pub texture: Option<Slot>,
     pub sampler: Option<BindSamplerTarget>,
     pub external_texture: Option<BindExternalTextureTarget>,
+    pub argument_buffer_index: Option<u32>,
     pub mutable: bool,
 }
 
@@ -158,6 +159,9 @@ pub struct EntryPointResources {
     pub resources: BindingMap,
 
     pub immediates_buffer: Option<Slot>,
+
+    /// Buffer slot for resources assigned an argument buffer member index.
+    pub argument_buffer: Option<Slot>,
 
     /// The slot of a buffer that contains an array of `u32`,
     /// one for the size of each bound buffer that contains a runtime array,

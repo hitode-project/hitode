@@ -18,6 +18,7 @@ struct ShaderCore {
     /// struct members precede it.
     storage_strides: Vec<HashMap<u32, (u32, bool)>>,
     storage_atomics: bool,
+    compact: bool,
     pipeline: Option<PipelineShader>,
 }
 impl Drop for ShaderCore {
@@ -50,6 +51,7 @@ impl Shader {
         layout: &binding::PushLayout,
         video_set: Option<u32>,
         heap: bool,
+        storage_window: &[u32],
     ) -> Result<ShaderStage<'a>> {
         let (module, temporary) = if let Some(shader) = &self.0.pipeline {
             let mut module = shader.module.clone();
@@ -70,6 +72,9 @@ impl Shader {
                     module.global_expressions[patch.init] = E::Literal(naga::Literal::U32(value));
                 }
             } else {
+                if !storage_window.is_empty() {
+                    rewrite_storage_window(&mut module, storage_window);
+                }
                 rewrite_bindings(&mut module);
             }
             let has_video = !shader.video.is_empty();
@@ -84,6 +89,9 @@ impl Shader {
                     .as_mut()
                     .unwrap()
                     .group = video_set.unwrap();
+            }
+            if !storage_window.is_empty() {
+                naga::compact::compact(&mut module, naga::compact::KeepUnused::No);
             }
             let mut words = lower(
                 &module,
@@ -127,6 +135,23 @@ impl Shader {
     pub(super) fn storage_strides(&self, index: u32) -> &HashMap<u32, (u32, bool)> {
         &self.0.storage_strides[index as usize]
     }
+    pub(super) fn compact(&self) -> bool {
+        self.0.compact
+    }
+
+    pub(super) fn window_register(&self, slot: u32) -> bool {
+        self.0.pipeline.as_ref().is_some_and(|pipeline| {
+            pipeline.module.global_variables.iter().any(|(_, global)| {
+                global.binding
+                    == Some(naga::ResourceBinding {
+                        group: 3,
+                        binding: slot,
+                    })
+                    && window_array(&pipeline.module, global)
+            })
+        })
+    }
+
     pub(super) fn storage_atomics(&self) -> bool {
         self.0.storage_atomics
     }
@@ -296,13 +321,14 @@ fn rewrite_bindings(module: &mut naga::Module) {
 
 impl Device {
     pub(crate) fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<crate::Shader> {
+        let compact = matches!(&desc.source, Source::CompactIr(_));
         let (mut module, precompiled) = match desc.source {
             Source::Wgsl(text) => (
                 naga::front::wgsl::parse_str(text)
                     .map_err(|e| Error::Compile(e.emit_to_string(text)))?,
                 None,
             ),
-            Source::Ir(module) => (*module, None),
+            Source::Ir(module) | Source::CompactIr(module) => (*module, None),
             Source::Precompiled { spirv, .. } => {
                 let module = crate::shader::compile::parse_spirv(spirv)?;
                 (module, Some(spirv))
@@ -380,7 +406,8 @@ impl Device {
                 .iter()
                 .all(|(_, g)| g.binding.is_none());
         // Heap and video shaders lower per pipeline, from the module kept here.
-        let per_pipeline = !already_lowered && (self.0.heap.is_some() || !video.is_empty());
+        let per_pipeline =
+            !already_lowered && (compact || self.0.heap.is_some() || !video.is_empty());
         if !already_lowered && !per_pipeline {
             rewrite_bindings(&mut module);
         }
@@ -413,6 +440,7 @@ impl Device {
             entries,
             storage_strides,
             storage_atomics,
+            compact,
             pipeline: per_pipeline.then_some(PipelineShader { module, video }),
         };
         // Dropping `core` on an error destroys the modules created so far.
@@ -428,6 +456,133 @@ impl Device {
             inner: Shader(Arc::new(core)),
         })
     }
+}
+
+fn window_array(module: &naga::Module, global: &naga::GlobalVariable) -> bool {
+    let TypeInner::Array {
+        base,
+        size: naga::ArraySize::Dynamic,
+        stride: 4,
+    } = module.types[global.ty].inner
+    else {
+        return false;
+    };
+    global.space
+        == (naga::AddressSpace::Storage {
+            access: naga::StorageAccess::LOAD,
+        })
+        && module.types[base].inner == TypeInner::Scalar(naga::Scalar::U32)
+}
+
+/// Read-only D3D buffer views and pulled streams are word arrays. A window
+/// starts with their individual word offsets and lengths, followed by the
+/// exact bytes of the bound ranges.
+fn rewrite_storage_window(module: &mut naga::Module, slots: &[u32]) {
+    let globals: HashMap<_, _> = module
+        .global_variables
+        .iter()
+        .filter_map(|(handle, global)| {
+            let binding = global.binding?;
+            if binding.group != 3 || !window_array(module, global) {
+                return None;
+            }
+            slots
+                .iter()
+                .position(|&slot| slot == binding.binding)
+                .map(|index| (handle, (index * 2) as u32))
+        })
+        .collect();
+    let Some((&first, _)) = globals.iter().next() else {
+        return;
+    };
+    let mut window = module.global_variables[first].clone();
+    window.name = Some("storage_window".into());
+    window.binding.as_mut().unwrap().binding = binding::STORAGE_WINDOW;
+    let window = module.global_variables.append(window, Span::UNDEFINED);
+    for (_, function) in module.functions.iter_mut() {
+        rewrite_window_function(function, window, &globals);
+    }
+    for entry in &mut module.entry_points {
+        rewrite_window_function(&mut entry.function, window, &globals);
+    }
+}
+
+fn rewrite_window_function(
+    function: &mut naga::Function,
+    window: Handle<naga::GlobalVariable>,
+    globals: &HashMap<Handle<naga::GlobalVariable>, u32>,
+) {
+    let old = std::mem::take(&mut function.expressions);
+    let arena = &mut function.expressions;
+    let window = arena.append(E::GlobalVariable(window), Span::UNDEFINED);
+    // Constant indices must stay outside the remapped Emit ranges.
+    let literals: HashMap<_, _> = old.iter().filter_map(|(handle, expr)| match *expr {
+        E::AccessIndex { base, index }
+            if matches!(old[base], E::GlobalVariable(g) if globals.contains_key(&g)) =>
+                Some((handle, arena.append(E::Literal(naga::Literal::U32(index)), Span::UNDEFINED))),
+        _ => None,
+    }).collect();
+    let mut map = Vec::with_capacity(old.len());
+    let mut starts = Vec::with_capacity(old.len());
+    for (handle, original) in old.iter() {
+        starts.push(arena.len() as u32);
+        let mut expr = original.clone();
+        map_expression(&mut expr, &map);
+        let base = match *original {
+            E::Access { base, .. } | E::AccessIndex { base, .. } | E::ArrayLength(base) => {
+                Some(base)
+            }
+            _ => None,
+        };
+        if let Some(E::GlobalVariable(global)) = base.map(|base| &old[base])
+            && let Some(&field) = globals.get(global)
+        {
+            let length = matches!(expr, E::ArrayLength(_));
+            let metadata = arena.append(
+                E::AccessIndex {
+                    base: window,
+                    index: field + u32::from(length),
+                },
+                Span::UNDEFINED,
+            );
+            expr = if length {
+                E::Load { pointer: metadata }
+            } else {
+                let offset = arena.append(E::Load { pointer: metadata }, Span::UNDEFINED);
+                let index = match expr {
+                    E::Access { index, .. } => arena.append(
+                        E::As {
+                            expr: index,
+                            kind: naga::ScalarKind::Uint,
+                            convert: Some(4),
+                        },
+                        Span::UNDEFINED,
+                    ),
+                    _ => literals[&handle],
+                };
+                let index = arena.append(
+                    E::Binary {
+                        op: naga::BinaryOperator::Add,
+                        left: offset,
+                        right: index,
+                    },
+                    Span::UNDEFINED,
+                );
+                E::Access {
+                    base: window,
+                    index,
+                }
+            };
+        }
+        map.push(arena.append(expr, Span::UNDEFINED));
+    }
+    for (_, local) in function.local_variables.iter_mut() {
+        if let Some(init) = &mut local.init {
+            *init = map[init.index()];
+        }
+    }
+    function.named_expressions.clear();
+    map_block(&mut function.body, &map, &starts, arena);
 }
 
 fn rewrite_heap(

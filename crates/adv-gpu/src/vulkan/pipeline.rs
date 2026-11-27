@@ -86,9 +86,11 @@ pub(super) struct Compiled {
     /// Sorted by `(group, slot)`.
     pub(super) bindings: Vec<Binding>,
     pub(super) push: binding::PushLayout,
+    pub(super) storage_window: Vec<u32>,
     /// On heap tiers, use cached descriptor sets for storage atomics or when
     /// the heap indices exceed the push-constant budget.
     pub(super) classic: bool,
+    pub(super) indexed_set: bool,
     /// Bindless tier: uniform slots, one bit each.
     pub(super) uniforms: u64,
     #[cfg(target_os = "android")]
@@ -295,11 +297,116 @@ impl Dynamic {
     }
 }
 
+fn exceeds_descriptor_limits(bindings: &[Binding], limits: &vk::PhysicalDeviceLimits) -> bool {
+    let counts = |stage: Stages| {
+        let mut counts = [0; 5];
+        for binding in bindings.iter().filter(|b| b.stages.intersects(stage)) {
+            let kind = match binding.kind {
+                BindingKind::UniformBuffer => 0,
+                BindingKind::SampledImage { .. } => 1,
+                BindingKind::Sampler { .. } => 2,
+                BindingKind::StorageImage { .. } => 3,
+                BindingKind::StorageBuffer { .. } => 4,
+            };
+            counts[kind] += 1;
+        }
+        counts
+    };
+    let exceeds = |counts: [u32; 5], limits: [u32; 5]| {
+        counts
+            .into_iter()
+            .zip(limits)
+            .any(|(count, limit)| count > limit)
+    };
+    exceeds(
+        counts(Stages::all()),
+        [
+            limits.max_descriptor_set_uniform_buffers,
+            limits.max_descriptor_set_sampled_images,
+            limits.max_descriptor_set_samplers,
+            limits.max_descriptor_set_storage_images,
+            limits.max_descriptor_set_storage_buffers,
+        ],
+    ) || [Stages::VERTEX, Stages::FRAGMENT, Stages::COMPUTE]
+        .into_iter()
+        .any(|stage| {
+            let counts = counts(stage);
+            exceeds(
+                counts,
+                [
+                    limits.max_per_stage_descriptor_uniform_buffers,
+                    limits.max_per_stage_descriptor_sampled_images,
+                    limits.max_per_stage_descriptor_samplers,
+                    limits.max_per_stage_descriptor_storage_images,
+                    limits.max_per_stage_descriptor_storage_buffers,
+                ],
+            ) || counts.into_iter().sum::<u32>() - counts[2] > limits.max_per_stage_resources
+        })
+}
+
+fn pack_storage(
+    bindings: &mut Vec<Binding>,
+    entries: &[&Entry],
+    limits: &vk::PhysicalDeviceLimits,
+) -> Vec<u32> {
+    let total = bindings
+        .iter()
+        .filter(|b| matches!(b.kind, BindingKind::StorageBuffer { .. }))
+        .count();
+    let mut overflow = if total > limits.max_descriptor_set_storage_buffers as usize {
+        Stages::all()
+    } else {
+        Stages::empty()
+    };
+    for stage in [Stages::VERTEX, Stages::FRAGMENT, Stages::COMPUTE] {
+        let stage_bindings = bindings.iter().filter(|b| b.stages.contains(stage));
+        let buffers = stage_bindings
+            .clone()
+            .filter(|b| matches!(b.kind, BindingKind::StorageBuffer { .. }));
+        if buffers.count() > limits.max_per_stage_descriptor_storage_buffers as usize
+            || stage_bindings
+                .filter(|b| !matches!(b.kind, BindingKind::Sampler { .. }))
+                .count()
+                > limits.max_per_stage_resources as usize
+        {
+            overflow |= stage;
+        }
+    }
+    if overflow.is_empty() {
+        return Vec::new();
+    }
+    let mut stages = Stages::empty();
+    let mut slots = Vec::new();
+    bindings.retain(|b| {
+        if b.stages.intersects(overflow)
+            && b.kind == (BindingKind::StorageBuffer { writable: false })
+            && entries
+                .iter()
+                .any(|e| e.shader.inner.window_register(b.slot))
+        {
+            stages |= b.stages;
+            slots.push(b.slot);
+            false
+        } else {
+            true
+        }
+    });
+    if !slots.is_empty() {
+        bindings.push(Binding {
+            slot: binding::STORAGE_WINDOW,
+            kind: BindingKind::StorageBuffer { writable: false },
+            stages,
+        });
+    }
+    slots
+}
+
 fn layouts(
     context: &Context,
     bindings: &[Binding],
     video: Option<&Arc<VideoPool>>,
     classic: bool,
+    indexed_set: bool,
 ) -> Result<(vk::PipelineLayout, vk::DescriptorSetLayout)> {
     let (mut sets, own) = if let Some(heap) = context.heap.as_ref().filter(|_| !classic) {
         let count = bindings
@@ -322,7 +429,9 @@ fn layouts(
                     .stage_flags(binding::stages(b.stages))
             })
             .collect();
-        let flags = if !classic && context.caps.modern.contains(Modern::PUSH_DESCRIPTORS) {
+        let flags = if indexed_set {
+            vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL
+        } else if !classic && context.caps.modern.contains(Modern::PUSH_DESCRIPTORS) {
             vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
         } else {
             vk::DescriptorSetLayoutCreateFlags::empty()
@@ -532,8 +641,32 @@ impl Device {
                 binding::PushLayout::new(bindings, heap, bytes, &strides)
             });
         let heap = push.is_some();
-        let classic = self.0.heap.is_some() && !heap;
         let push = push.unwrap_or_default();
+        let mut bindings = bindings.to_vec();
+        let compact = entries.iter().all(|e| e.shader.inner.compact());
+        let indexed_set = !heap
+            && compact
+            && self.0.heap.is_some()
+            && exceeds_descriptor_limits(&bindings, &self.0.native_limits);
+        let storage_window = if !heap && compact && !indexed_set {
+            pack_storage(&mut bindings, entries, &self.0.native_limits)
+        } else {
+            Vec::new()
+        };
+        if compact
+            && !heap
+            && !indexed_set
+            && exceeds_descriptor_limits(&bindings, &self.0.native_limits)
+        {
+            return Err(Error::Unsupported(
+                "compact pipeline exceeds the device descriptor limits".into(),
+            ));
+        }
+        let classic = !heap
+            && (self.0.heap.is_some()
+                || (compact
+                    && self.0.caps.modern.contains(Modern::PUSH_DESCRIPTORS)
+                    && bindings.len() as u32 > self.0.max_push_descriptors));
         let video = video.map(|pool| {
             let set = if heap {
                 1 + bindings
@@ -552,12 +685,17 @@ impl Device {
             .map(|e| {
                 e.shader
                     .inner
-                    .stage(e, &push, video.as_ref().map(|v| v.0), heap)
+                    .stage(e, &push, video.as_ref().map(|v| v.0), heap, &storage_window)
             })
             .collect::<Result<Vec<_>>>()?;
         let stages: Vec<_> = modules.iter().map(|m| m.info()).collect();
-        let (layout, set_layout) =
-            layouts(&self.0, bindings, video.as_ref().map(|v| &v.1), classic)?;
+        let (layout, set_layout) = layouts(
+            &self.0,
+            &bindings,
+            video.as_ref().map(|v| &v.1),
+            classic,
+            indexed_set,
+        )?;
         let handle = match build(layout, &stages) {
             Ok(handle) => handle,
             Err(error) => {
@@ -580,9 +718,11 @@ impl Device {
             handle,
             layout,
             set_layout,
-            bindings: bindings.to_vec(),
+            bindings,
             push,
+            storage_window,
             classic,
+            indexed_set,
             uniforms,
             #[cfg(target_os = "android")]
             video,

@@ -7167,17 +7167,20 @@ template <typename A>
                                     // We intentionally don't dereference binding_arrays here,
                                     // so that binding arrays fall to the buffer location.
 
-                                    match module.types[var.ty].inner {
-                                        crate::TypeInner::Image {
-                                            class: crate::ImageClass::External,
-                                            ..
-                                        } => target.external_texture.is_some(),
-                                        crate::TypeInner::Image { .. } => target.texture.is_some(),
-                                        crate::TypeInner::Sampler { .. } => {
-                                            target.sampler.is_some()
+                                    target.argument_buffer_index.is_some()
+                                        || match module.types[var.ty].inner {
+                                            crate::TypeInner::Image {
+                                                class: crate::ImageClass::External,
+                                                ..
+                                            } => target.external_texture.is_some(),
+                                            crate::TypeInner::Image { .. } => {
+                                                target.texture.is_some()
+                                            }
+                                            crate::TypeInner::Sampler { .. } => {
+                                                target.sampler.is_some()
+                                            }
+                                            _ => target.buffer.is_some(),
                                         }
-                                        _ => target.buffer.is_some(),
-                                    }
                                 }
                                 None => false,
                             };
@@ -7483,6 +7486,49 @@ template <typename A>
             } else {
                 fun_name.clone()
             };
+            let argument_buffer = options
+                .per_entry_point_map
+                .get(&ep.name)
+                .and_then(|resources| resources.argument_buffer);
+            let mut indirect = Vec::new();
+            let argument_buffer_name = if let Some(slot) = argument_buffer {
+                let ty_name = self.namer.call("_nagaArgumentBuffer");
+                let name = self.namer.call("_naga_arguments");
+                writeln!(self.out, "struct {ty_name} {{")?;
+                for (handle, var) in module.global_variables.iter() {
+                    let Some(id) = var
+                        .binding
+                        .as_ref()
+                        .and_then(|binding| options.get_resource_binding_target(ep, binding))
+                        .and_then(|target| target.argument_buffer_index)
+                    else {
+                        continue;
+                    };
+                    let parts = TypedGlobalVariable {
+                        module,
+                        names: &self.names,
+                        handle,
+                        usage: fun_info[handle],
+                        reference: true,
+                    }
+                    .to_parts()?;
+                    let (member_ty, deref) = match parts.ty_name.strip_suffix('&') {
+                        Some(pointee) => (format!("{pointee}*"), "*"),
+                        None => (parts.ty_name.clone(), ""),
+                    };
+                    writeln!(
+                        self.out,
+                        "{}{member_ty} {} [[id({id})]];",
+                        back::INDENT,
+                        parts.var_name
+                    )?;
+                    indirect.push((parts, deref));
+                }
+                writeln!(self.out, "}};")?;
+                Some((ty_name, name, slot))
+            } else {
+                None
+            };
 
             // https://web.archive.org/web/20181029003926/https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
             if ep.stage == crate::ShaderStage::Compute && options.lang_version >= (2, 1) {
@@ -7504,6 +7550,14 @@ template <typename A>
             writeln!(self.out, "{result_type_name} {nested_fun_name}(")?;
 
             let mut args = Vec::new();
+            if let Some((ref ty, ref name, slot)) = argument_buffer_name {
+                args.push(EntryPointArgument {
+                    ty_name: format!("constant {ty}&"),
+                    name: name.clone(),
+                    binding: format!(" [[buffer({slot})]]"),
+                    init: None,
+                });
+            }
 
             // If we have produced a struct holding the `EntryPoint`'s
             // `Function`'s arguments' varyings, pass that struct first.
@@ -7722,7 +7776,10 @@ template <typename A>
                 };
                 if let Some(ref resolved) = resolved {
                     // Inline samplers are be defined in the EP body
-                    if resolved.as_inline_sampler(options).is_some() {
+                    if resolved.as_inline_sampler(options).is_some()
+                        || matches!(resolved, super::ResolvedBinding::Resource(target)
+                            if target.argument_buffer_index.is_some())
+                    {
                         continue;
                     }
                 }
@@ -7912,6 +7969,18 @@ template <typename A>
             writeln!(self.out, ") {{")?;
 
             // Starting the function body.
+            if let Some((_, ref name, _)) = argument_buffer_name {
+                for (parts, deref) in indirect {
+                    writeln!(
+                        self.out,
+                        "{}{} {} = {deref}{name}.{};",
+                        back::INDENT,
+                        parts.ty_name,
+                        parts.var_name,
+                        parts.var_name
+                    )?;
+                }
+            }
             if do_vertex_pulling {
                 // Provide zero values for all the attributes, which we will overwrite with
                 // real data from the vertex attribute buffers, if the indices are in-bounds.

@@ -1976,3 +1976,210 @@ fn sampling_probe_depth_bias_clip_and_viewport_depth() {
         }
     }
 }
+
+// spec: GFX-CAP-4
+#[test]
+fn maximum_textures_samplers_constants_and_uavs_execute_together() {
+    use adv_gpu::resource::{Address, Filter};
+    use std::fmt::Write;
+
+    let Some(mut gpu) = executor() else { return };
+    let constants = buffer(&gpu, 14 * 65536, BufferUsage::UNIFORM, Memory::Upload);
+    let mut slots = SlotBindings::default();
+    let mut source = String::new();
+    let mut sum = String::from("var value = 0u;\n");
+    let mut expected = 0;
+    for i in 0..14 {
+        let first = i * 65536;
+        let last = first + 65536;
+        let value = 100 + i as u32;
+        // SAFETY: no commands reference the upload buffer until dispatch.
+        unsafe {
+            constants.mapped().unwrap().as_mut()[(last - 16) as usize..(last - 12) as usize]
+                .copy_from_slice(&value.to_ne_bytes());
+        }
+        slots.uniforms.push(Some(BufferRange {
+            buffer: constants.clone(),
+            range: first..last,
+        }));
+        writeln!(
+            source,
+            "@group(0) @binding({i}) var<uniform> c{i}: array<vec4<u32>, 4096>;"
+        )
+        .unwrap();
+        let weight = i as u32 + 1;
+        writeln!(sum, "value += {weight}u * c{i}[4095].x;").unwrap();
+        expected += weight * value;
+    }
+    constants.flush(std::iter::once(0..14 * 65536));
+
+    for i in 0..128 {
+        let input = image(
+            &gpu,
+            1,
+            1,
+            Format::Rgba8Unorm,
+            1,
+            1,
+            Usage::SAMPLED | Usage::COPY_DST,
+        );
+        upload(&mut gpu, &input, 0, 4, 1, &[i as u8 + 1, 0, 0, 255]);
+        slots.images.push(Some(input.view().clone()));
+        writeln!(source, "@group(1) @binding({i}) var t{i}: texture_2d<f32>;").unwrap();
+        if i < 16 {
+            slots
+                .samplers
+                .push(Some(sampler(&gpu, Address::Clamp, Filter::Nearest, None)));
+            writeln!(source, "@group(2) @binding({i}) var s{i}: sampler;").unwrap();
+        }
+        let weight = i + 1;
+        if i < 16 || (88..96).contains(&i) {
+            writeln!(
+                sum,
+                "value += {weight}u * u32(round(textureSampleLevel(t{i}, s{}, vec2(0.5), 0.).x * 255.));",
+                i % 16
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                sum,
+                "value += {weight}u * u32(round(textureLoad(t{i}, vec2(0), 0).x * 255.));"
+            )
+            .unwrap();
+        }
+        expected += weight * weight;
+    }
+
+    let outputs: Vec<_> = (0..8)
+        .map(|i| {
+            let output = image(
+                &gpu,
+                1,
+                1,
+                Format::R32Uint,
+                1,
+                1,
+                Usage::STORAGE | Usage::COPY_SRC,
+            );
+            slots
+                .storage
+                .push(Some(StorageBinding::Image(output.view().clone())));
+            writeln!(
+                source,
+                "@group(3) @binding({i}) var u{i}: texture_storage_2d<r32uint, write>;"
+            )
+            .unwrap();
+            writeln!(sum, "textureStore(u{i}, vec2(0), vec4(value + {i}u));").unwrap();
+            output
+        })
+        .collect();
+    writeln!(source, "@compute @workgroup_size(1) fn main() {{ {sum} }}").unwrap();
+
+    let dispatch = gpu
+        .prepare_dispatch(shader(&source, Stage::Compute))
+        .unwrap();
+    gpu.dispatch(&dispatch, &slots, DispatchArguments::Direct([1; 3]))
+        .unwrap();
+    for (i, output) in outputs.iter().enumerate() {
+        assert_eq!(
+            read_image(&mut gpu, output, 0, 4),
+            (expected + i as u32).to_le_bytes()
+        );
+    }
+}
+
+// spec: GFX-CAP-4
+#[test]
+fn vertex_streams_buffer_srvs_and_constant_buffers_keep_their_offsets_and_lengths() {
+    use std::fmt::Write;
+
+    let Some(mut gpu) = executor() else { return };
+    let stride = u64::from(gpu.device().caps().limits.storage_offset_alignment).max(256);
+    const CONSTANTS: u64 = 14;
+    const STREAMS: u64 = 32;
+    const BUFFER_SRVS: u64 = 128;
+    let ranges = CONSTANTS + STREAMS + BUFFER_SRVS;
+    let data = buffer(
+        &gpu,
+        stride * ranges,
+        BufferUsage::STORAGE | BufferUsage::UNIFORM | BufferUsage::COPY_SRC,
+        Memory::Upload,
+    );
+    let mut slots = SlotBindings::default();
+    let mut source = String::new();
+    let mut sum = String::from("var value = 0u;\n");
+    for i in 0..ranges {
+        let offset = stride * i;
+        // SAFETY: the bindings have no GPU users yet.
+        unsafe {
+            data.mapped().unwrap().as_mut()[offset as usize..offset as usize + 4]
+                .copy_from_slice(&(i as u32 + 1).to_ne_bytes());
+        }
+        if i < CONSTANTS {
+            slots.uniforms.push(Some(BufferRange {
+                buffer: data.clone(),
+                range: offset..offset + 16,
+            }));
+            writeln!(
+                source,
+                "@group(0) @binding({i}) var<uniform> c{i}: vec4<u32>;"
+            )
+            .unwrap();
+            writeln!(sum, "value += c{i}.x;").unwrap();
+        } else {
+            let register = i - CONSTANTS;
+            slots.storage.push(Some(StorageBinding::Buffer(BufferRange {
+                buffer: data.clone(),
+                range: offset..offset + (register % STREAMS + 1) * 4,
+            })));
+            writeln!(
+                source,
+                "@group(3) @binding({register}) var<storage, read> data{register}: array<u32>;"
+            )
+            .unwrap();
+            writeln!(
+                sum,
+                "value += data{register}[0] + arrayLength(&data{register});"
+            )
+            .unwrap();
+        }
+    }
+    data.flush(std::iter::once(0..stride * ranges));
+    writeln!(
+        source,
+        "
+struct Output {{
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) value: u32,
+}}
+@vertex fn main(@builtin(vertex_index) id: u32) -> Output {{
+    {sum}
+    let p = array(vec2(-1., -1.), vec2(3., -1.), vec2(-1., 3.));
+    return Output(vec4(p[id], 0., 1.), value);
+}}"
+    )
+    .unwrap();
+
+    let output = target(&gpu, 1, 1, Format::R32Uint);
+    let fragment = shader(
+        "@fragment fn main(@location(0) @interpolate(flat) value: u32) -> @location(0) u32 { return value; }",
+        Stage::Fragment,
+    );
+    gpu.draw_modern(
+        draw(
+            1,
+            1,
+            shader(&source, Stage::Vertex),
+            fragment,
+            [color(&output, Load::DontCare)],
+        ),
+        &slots,
+        &SlotBindings::default(),
+    )
+    .unwrap();
+    let expected = (1..=ranges).sum::<u64>() + 5 * (1..=STREAMS).sum::<u64>();
+    assert_eq!(
+        read_image(&mut gpu, &output, 0, 4),
+        (expected as u32).to_le_bytes()
+    );
+}

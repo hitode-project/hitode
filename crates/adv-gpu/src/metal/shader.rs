@@ -1,5 +1,7 @@
 use super::*;
-pub(super) use crate::shader::compile::{SIZES, Used, binding_group, compile_error, index};
+pub(super) use crate::shader::compile::{
+    ARGUMENTS, Location, Register, Remap, SIZES, Used, binding_group, compile_error, index,
+};
 
 #[derive(Clone)]
 pub(crate) struct Shader(Arc<ShaderData>);
@@ -20,6 +22,12 @@ pub(super) struct Function {
     /// Storage buffer index of each entry in naga's byte-size table at
     /// `buffer(SIZES)`; `None` for runtime arrays the entry does not use.
     pub sizes: Option<Box<[Option<u8>]>>,
+    pub remap: Option<Arc<Remapped>>,
+}
+
+pub(super) struct Remapped {
+    pub layout: Remap,
+    pub function: Object<dyn MTLFunction>,
 }
 
 fn version() -> (u8, u8) {
@@ -47,10 +55,11 @@ impl Device {
         self.check()?;
         // These synchronous calls stay on the caller (the compile pool).
         objc2::rc::autoreleasepool(|_| {
+            let compact = matches!(&desc.source, Source::CompactIr(_));
             let module = match desc.source {
                 Source::Wgsl(source) => naga::front::wgsl::parse_str(source)
                     .map_err(|e| compile_error("WGSL", e.emit_to_string(source)))?,
-                Source::Ir(module) => *module,
+                Source::Ir(module) | Source::CompactIr(module) => *module,
                 Source::Precompiled {
                     metal,
                     entries: names,
@@ -85,6 +94,7 @@ impl Device {
                             threadgroup: entry.threadgroup.into(),
                             used: None,
                             sizes: None,
+                            remap: None,
                         });
                     }
                     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -153,6 +163,9 @@ impl Device {
                     crate::shader::compile::Options {
                         version,
                         textures: self.caps().limits.max_sampled_images,
+                        compact,
+                        argument_buffers: compact
+                            && self.0.raw.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2,
                         bounds: naga::proc::BoundsCheckPolicies {
                             index: naga::proc::BoundsCheckPolicy::Restrict,
                             buffer: naga::proc::BoundsCheckPolicy::Restrict,
@@ -172,6 +185,12 @@ impl Device {
                 entries.push(Function {
                     name: ep.name.clone(),
                     stage,
+                    remap: entry.remap.map(|layout| {
+                        Arc::new(Remapped {
+                            layout,
+                            function: raw.clone(),
+                        })
+                    }),
                     raw,
                     workgroup: module.entry_points[0].workgroup_size,
                     threadgroup: lowered.threadgroup.into_iter().next().unwrap().into(),
