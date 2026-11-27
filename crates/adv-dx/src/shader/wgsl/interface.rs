@@ -84,6 +84,11 @@ impl Writer<'_> {
                     }
                 }
             }
+            let election = (self.elect_uav || self.elect_counter).then(|| {
+                let sample = builtin_input(&mut inputs, "sample_index", "dx_sample_index", "u32");
+                let coverage = builtin_input(&mut inputs, "sample_mask", "dx_coverage", "u32");
+                format!("let dx_elected_sample = {sample} == firstTrailingBit({coverage});")
+            });
             let mut outputs = fields(module, &module.signatures.output, false, variant)?;
             let sample_mask = self.options.raster_sample_mask;
             if sample_mask != u32::MAX && !outputs.iter().any(|f| f.register == "o_coverage") {
@@ -149,6 +154,9 @@ impl Writer<'_> {
                 format!(" -> {output_name}")
             };
             self.open(&format!("{attrib} fn {entry}({args}){returns}"));
+            if let Some(election) = election {
+                self.line(&election);
+            }
             let mut result: Vec<_> = outputs
                 .iter()
                 .map(|field| {

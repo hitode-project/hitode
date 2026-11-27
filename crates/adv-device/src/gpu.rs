@@ -314,7 +314,7 @@ pub struct Stats {
     pub pipeline_cache_hits: u64,
     /// Compiled pipelines subject to Metal sample-mask emulation limits.
     pub inexact_sample_mask_pipelines: u64,
-    /// Metal multisample pipelines whose pixel shaders write or atomically update UAVs.
+    /// Metal multisample pipelines retaining native execution for dependent pixel UAV effects.
     pub per_sample_uav_pipelines: u64,
     /// Draws using a pipeline first compiled by a creation-time prediction.
     pub anticipated_pipeline_draws: u64,

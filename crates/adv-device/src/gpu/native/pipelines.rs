@@ -301,11 +301,7 @@ impl Pipelines {
                 let per_sample_uav_shader = draw
                     .fragment
                     .as_ref()
-                    .filter(|shader| {
-                        cfg!(target_vendor = "apple")
-                            && draw.samples > 1
-                            && shader.has_guest_uav_effects()
-                    })
+                    .filter(|shader| shader.has_per_sample_uav_effects())
                     .map(|shader| shader.identity());
                 let fragment = draw.fragment.clone();
                 let device = device.clone();

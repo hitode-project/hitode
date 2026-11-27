@@ -39,8 +39,14 @@ impl Writer<'_> {
 
     pub(super) fn variant_inputs(&mut self, variant: &Interface) {
         if variant.count_fragments {
+            if self.elect_counter {
+                self.open("if dx_elected_sample");
+            }
             self.line("let dx_previous = atomicAdd(&dx_statistics[0], 1u);");
             self.line("if dx_previous == 0xffffffffu { atomicAdd(&dx_statistics[1], 1u); }");
+            if self.elect_counter {
+                self.close();
+            }
         }
         if let Some(storage) = &variant.storage {
             self.storage_inputs(storage);

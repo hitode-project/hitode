@@ -1669,6 +1669,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             producer_identity: Some(u64::from(if geometry == 0 { vertex } else { geometry })),
             alpha_to_coverage,
             emulated_sample_mask: metal_mask != u32::MAX,
+            raster_samples: samples,
             wireframe: raster.FillMode == 2,
             geometry: geometry_shader.is_some(),
             tessellated: tessellation.is_some(),
@@ -1902,11 +1903,10 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 wgsl::emit_variant(shader.module(), &variant, None, options)
             }
             .map_err(shader_error)?;
-            let effects = writes_uav || !reflection.counter_bindings.is_empty();
             (
                 Some(Arc::new(
                     modern_shader(&code, adv_gpu::shader::Stage::Fragment)?
-                        .with_guest_uav_effects(effects),
+                        .with_per_sample_uav_effects(code.per_sample_uav_effects),
                 )),
                 Some(code),
                 inexact_sample_mask,

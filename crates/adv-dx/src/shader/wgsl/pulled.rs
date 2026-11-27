@@ -303,6 +303,7 @@ pub fn vertex(
         reflection,
         locations: pulled.locations,
         counters: pulled.counters,
+        per_sample_uav_effects: false,
     })
 }
 
