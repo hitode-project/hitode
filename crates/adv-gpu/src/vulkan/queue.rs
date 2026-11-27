@@ -16,6 +16,7 @@ pub(super) struct Shared {
     timeline: vk::Semaphore,
     pub(super) state: Mutex<State>,
     pub(super) descriptors: Mutex<Vec<binding::DescriptorArena>>,
+    pub(super) storage_window: Mutex<Option<crate::Buffer>>,
 }
 pub(super) struct State {
     next: u64,
@@ -61,6 +62,7 @@ impl Queue {
             context,
             timeline,
             descriptors: Mutex::new(Vec::new()),
+            storage_window: Mutex::new(None),
             state: Mutex::new(State {
                 next: 1,
                 completed: 0,

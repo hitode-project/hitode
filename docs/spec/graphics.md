@@ -287,8 +287,8 @@ A GPU write makes that shadow stale, and the next map refreshes it at an
 ordered, counted readback. Maps with a current shadow take constant time.
 Sampling a GPU-backed dynamic texture records an upload from pooled staging
 memory when the shadow is newer. Uploads update the same GPU image in draw
-order, so earlier draws still read their original contents. Metal keeps native
-views by description for the lifetime of their texture.
+order, so earlier draws still read their original contents. Metal and Vulkan
+keep native views by description for the lifetime of their texture.
 ResolveSubresource requires a default-usage destination.
 
 ### GFX-REC-8 Frontend work counters
@@ -297,8 +297,12 @@ ResolveSubresource requires a default-usage destination.
 **Verification**: Test
 
 The diagnostic Cargo feature is `adv-dx/d3d9-counters`. Retained payloads are counted per command, including shared snapshots; cumulative recorded bytes do not measure resident memory or memory traffic. Recording limits continue to use the logical upload size. The D3D11 report
-also counts shadow bytes copied into the ring, captures reused, and Metal buffer
-and view creations on the shared GPU device since D3D11 attachment.
+also counts shadow bytes copied into the ring, captures reused, and buffer, image
+view, and device-memory creations on the shared GPU device since D3D11 attachment.
+On Vulkan it counts newly allocated descriptor sets, descriptor update calls
+and descriptor push calls. Metal counts memory backing owned buffers, textures
+and presentable surfaces. Vulkan counts new allocator blocks and imported
+device memory.
 
 ### GFX-REC-9 Dead target writes
 

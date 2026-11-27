@@ -43,16 +43,9 @@ pub(crate) use shader::Shader;
 #[derive(Clone)]
 pub(crate) struct Device(Arc<DeviceState>);
 
-#[cfg(feature = "counters")]
-#[derive(Default)]
-struct ResourceCreations {
-    buffers: std::sync::atomic::AtomicU64,
-    views: std::sync::atomic::AtomicU64,
-}
-
 struct DeviceState {
     #[cfg(feature = "counters")]
-    creations: Arc<ResourceCreations>,
+    creations: Arc<crate::queue::CreationCounters>,
     raw: Object<dyn MTLDevice>,
     caps: Caps,
     event: Object<dyn MTLSharedEvent>,
@@ -67,12 +60,25 @@ struct DeviceState {
 
 impl Device {
     #[cfg(feature = "counters")]
-    pub(crate) fn resource_creations(&self) -> (u64, u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        (
-            self.0.creations.buffers.load(Relaxed),
-            self.0.creations.views.load(Relaxed),
-        )
+    pub(crate) fn resource_creations(&self) -> crate::queue::ResourceCreations {
+        self.0.creations.read()
+    }
+
+    #[cfg(feature = "counters")]
+    fn count_device_memory(&self) {
+        self.0
+            .creations
+            .device_memory
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn new_texture(&self, desc: &MTLTextureDescriptor) -> Option<Object<dyn MTLTexture>> {
+        let texture = self.0.raw.newTextureWithDescriptor(desc)?;
+        #[cfg(feature = "counters")]
+        if desc.storageMode() != MTLStorageMode::Memoryless {
+            self.count_device_memory();
+        }
+        Some(texture)
     }
 
     fn new_buffer(
@@ -86,6 +92,8 @@ impl Device {
             .creations
             .buffers
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "counters")]
+        self.count_device_memory();
         Some(buffer)
     }
 

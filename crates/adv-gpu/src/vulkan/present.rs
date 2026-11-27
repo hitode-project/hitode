@@ -147,6 +147,11 @@ impl PresentBuffer {
             )?,
             Err(error) => return Err(error),
         };
+        #[cfg(feature = "counters")]
+        context
+            .creations
+            .device_memory
+            .fetch_add(1, Ordering::Relaxed);
         if let Some(format) = format
             && format.external != context.video_format.unwrap().external
         {
@@ -185,6 +190,7 @@ impl PresentBuffer {
             conversion: video.map(|pool| pool.resources.conversion),
             video: video.cloned(),
             allocation: Some(ImageAllocation::Present(memory)),
+            views: Default::default(),
             states: Mutex::new(vec![ImageState {
                 layout: if desc.format == Format::Nv21 {
                     vk::ImageLayout::GENERAL

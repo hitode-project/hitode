@@ -48,6 +48,8 @@ impl PresentBuffer {
         );
         let surface =
             unsafe { IOSurfaceRef::new(properties.as_opaque()) }.ok_or(Error::OutOfMemory)?;
+        #[cfg(feature = "counters")]
+        device.count_device_memory();
         // Tagged sRGB, so Core Animation color-manages it as the old stack did.
         let srgb = objc2_core_graphics::CGColorSpace::with_name(Some(unsafe {
             objc2_core_graphics::kCGColorSpaceSRGB
@@ -131,6 +133,8 @@ impl PresentBuffer {
         );
         let surface =
             unsafe { IOSurfaceRef::new(properties.as_opaque()) }.ok_or(Error::OutOfMemory)?;
+        #[cfg(feature = "counters")]
+        device.count_device_memory();
         let color = desc.color.unwrap();
         unsafe {
             let matrix = match color {

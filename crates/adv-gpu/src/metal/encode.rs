@@ -161,9 +161,7 @@ impl Encoder {
                     texture.setUsage(MTLTextureUsage::RenderTarget);
                     let scratch = self
                         .device
-                        .0
-                        .raw
-                        .newTextureWithDescriptor(&texture)
+                        .new_texture(&texture)
                         .expect("Metal bounded resolve");
                     attachment.setResolveTexture(Some(&scratch));
                     resolves.push((scratch, resolve.inner.raw.clone()));

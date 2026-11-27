@@ -13,7 +13,7 @@ pub(super) struct ImageData {
     desc: ImageDesc,
     views: Mutex<HashMap<(ViewDesc, ViewLayout), View>>,
     #[cfg(feature = "counters")]
-    creations: Arc<ResourceCreations>,
+    creations: Arc<crate::queue::CreationCounters>,
     lost: Arc<OnceLock<String>>,
 }
 
@@ -68,11 +68,7 @@ impl Device {
             ));
         }
         let d = self.texture_descriptor(desc)?;
-        let raw = self
-            .0
-            .raw
-            .newTextureWithDescriptor(&d)
-            .ok_or(Error::OutOfMemory)?;
+        let raw = self.new_texture(&d).ok_or(Error::OutOfMemory)?;
         Ok(self.wrap_image(raw, desc))
     }
     /// The texture descriptor for `desc`, after checking it against the caps.
@@ -527,7 +523,7 @@ impl Image {
         #[cfg(feature = "counters")]
         self.data
             .creations
-            .views
+            .image_views
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let size = Extent {
             width: (image.size.width >> desc.mips.start).max(1),

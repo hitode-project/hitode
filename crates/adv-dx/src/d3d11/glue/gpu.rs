@@ -47,7 +47,9 @@ pub(super) struct Execution {
     #[cfg(feature = "d3d9-counters")]
     captures: std::cell::Cell<CaptureCounters>,
     #[cfg(feature = "d3d9-counters")]
-    initial_metal_creations: (u64, u64),
+    initial_creations: adv_gpu::queue::ResourceCreations,
+    #[cfg(feature = "d3d9-counters")]
+    initial_descriptor_work: (u64, u64, u64),
 }
 
 impl Execution {
@@ -59,7 +61,9 @@ impl Execution {
     pub(super) fn new(gpu: Gpu) -> Self {
         Self {
             #[cfg(feature = "d3d9-counters")]
-            initial_metal_creations: gpu.device().metal_resource_creations(),
+            initial_creations: gpu.device().resource_creations(),
+            #[cfg(feature = "d3d9-counters")]
+            initial_descriptor_work: gpu.device().descriptor_work(),
             gpu,
             wake: None,
             events: Vec::new(),
@@ -310,17 +314,28 @@ pub fn variant_counters(ext: &Ext) -> Option<VariantCounters> {
 pub struct CaptureCounters {
     pub ring_bytes: u64,
     pub captures_reused: u64,
-    pub metal_buffers_created: u64,
-    pub metal_views_created: u64,
+    pub buffers_created: u64,
+    pub image_views_created: u64,
+    pub device_memory_created: u64,
+    pub descriptor_sets_allocated: u64,
+    pub descriptor_set_updates: u64,
+    pub descriptor_pushes: u64,
 }
 
 #[cfg(feature = "d3d9-counters")]
 pub fn capture_counters(ext: &Ext) -> Option<CaptureCounters> {
     let execution = ext.try_get::<State>()?.execution.as_ref()?;
     let mut counters = execution.captures.get();
-    let (buffers, views) = execution.gpu.device().metal_resource_creations();
-    counters.metal_buffers_created = buffers - execution.initial_metal_creations.0;
-    counters.metal_views_created = views - execution.initial_metal_creations.1;
+    let creations = execution.gpu.device().resource_creations();
+    let initial = execution.initial_creations;
+    counters.buffers_created = creations.buffers - initial.buffers;
+    counters.image_views_created = creations.image_views - initial.image_views;
+    counters.device_memory_created = creations.device_memory - initial.device_memory;
+    let (sets, updates, pushes) = execution.gpu.device().descriptor_work();
+    let (initial_sets, initial_updates, initial_pushes) = execution.initial_descriptor_work;
+    counters.descriptor_sets_allocated = sets - initial_sets;
+    counters.descriptor_set_updates = updates - initial_updates;
+    counters.descriptor_pushes = pushes - initial_pushes;
     Some(counters)
 }
 

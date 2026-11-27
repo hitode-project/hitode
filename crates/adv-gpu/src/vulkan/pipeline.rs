@@ -94,6 +94,9 @@ pub(super) struct Compiled {
     /// the heap indices exceed the push-constant budget.
     pub(super) classic: bool,
     pub(super) indexed_set: bool,
+    pub(super) descriptor_types: Vec<vk::DescriptorType>,
+    /// Indices into bindings, in Vulkan binding-number order.
+    pub(super) dynamic_bindings: Vec<usize>,
     /// Bindless tier: uniform slots, one bit each.
     pub(super) uniforms: u64,
     pub(super) ordered: Option<OrderedColor>,
@@ -473,6 +476,7 @@ fn pack_storage(
 fn layouts(
     context: &Context,
     bindings: &[Binding],
+    descriptor_types: &[vk::DescriptorType],
     video: Option<&Arc<VideoPool>>,
     classic: bool,
     indexed_set: bool,
@@ -491,11 +495,12 @@ fn layouts(
     } else {
         let native: Vec<_> = bindings
             .iter()
-            .map(|b| {
+            .zip(descriptor_types)
+            .map(|(b, &ty)| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(b.slot * 4 + binding::group(b.kind))
                     .descriptor_count(1)
-                    .descriptor_type(binding::descriptor(b.kind))
+                    .descriptor_type(ty)
                     .stage_flags(binding::stages(b.stages))
             })
             .collect();
@@ -816,6 +821,37 @@ impl Device {
                 || (compact
                     && self.0.caps.modern.contains(Modern::PUSH_DESCRIPTORS)
                     && bindings.len() as u32 > self.0.max_push_descriptors));
+        let mut descriptor_types: Vec<_> = bindings
+            .iter()
+            .map(|b| binding::descriptor(b.kind))
+            .collect();
+        let mut dynamic_bindings = Vec::new();
+        let cached_sets = classic || !self.0.caps.modern.contains(Modern::PUSH_DESCRIPTORS);
+        if compact && !heap && !indexed_set && cached_sets {
+            // Dynamic offsets let ring windows share a descriptor while retaining
+            // each binding's range. Push and indexed layouts use ordinary types.
+            let limits = &self.0.native_limits;
+            let mut uniforms = limits.max_descriptor_set_uniform_buffers_dynamic;
+            let mut storage = limits.max_descriptor_set_storage_buffers_dynamic;
+            for (index, ty) in descriptor_types.iter_mut().enumerate() {
+                match *ty {
+                    vk::DescriptorType::UNIFORM_BUFFER if uniforms != 0 => {
+                        *ty = vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC;
+                        uniforms -= 1;
+                    }
+                    vk::DescriptorType::STORAGE_BUFFER if storage != 0 => {
+                        *ty = vk::DescriptorType::STORAGE_BUFFER_DYNAMIC;
+                        storage -= 1;
+                    }
+                    _ => continue,
+                }
+                dynamic_bindings.push(index);
+            }
+            dynamic_bindings.sort_unstable_by_key(|&index| {
+                let binding = bindings[index];
+                binding.slot * 4 + super::binding::group(binding.kind)
+            });
+        }
         let video = video.map(|pool| {
             let set = if heap {
                 1 + bindings
@@ -846,6 +882,7 @@ impl Device {
         let (layout, set_layout) = layouts(
             &self.0,
             &bindings,
+            &descriptor_types,
             video.as_ref().map(|v| &v.1),
             classic,
             indexed_set,
@@ -878,6 +915,8 @@ impl Device {
             storage_window,
             classic,
             indexed_set,
+            descriptor_types,
+            dynamic_bindings,
             uniforms,
             ordered: ordered_layout,
             #[cfg(target_os = "android")]

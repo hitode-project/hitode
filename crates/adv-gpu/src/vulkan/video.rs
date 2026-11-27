@@ -157,6 +157,7 @@ impl VideoPool {
         })))
     }
     pub(super) fn allocate(self: &Arc<Self>, view: vk::ImageView) -> Result<VideoSet> {
+        let context = self.context.upgrade().unwrap();
         // One descriptor pool per buffer lets trimming retire its set without
         // consuming capacity needed by a later buffer allocation.
         let sizes = [vk::DescriptorPoolSize {
@@ -174,7 +175,7 @@ impl VideoPool {
         .map_err(|e| vk_error_at(e, "video descriptor pool"))?;
         let layouts = [self.resources.layout];
         let handle = match unsafe {
-            self.device.allocate_descriptor_sets(
+            context.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(descriptors)
                     .set_layouts(&layouts),
@@ -192,18 +193,15 @@ impl VideoPool {
             .image_view(view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         unsafe {
-            self.device.update_descriptor_sets(
-                &[vk::WriteDescriptorSet::default()
-                    .dst_set(handle)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&images)],
-                &[],
-            );
+            context.update_descriptor_sets(&[vk::WriteDescriptorSet::default()
+                .dst_set(handle)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&images)]);
         }
         Ok(VideoSet {
             pool: self.clone(),
-            context: self.context.upgrade().unwrap(),
+            context,
             descriptors,
             handle,
         })

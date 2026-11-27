@@ -307,7 +307,7 @@ impl Heap {
             write = write.image_info(&images);
         }
         unsafe {
-            context.device.update_descriptor_sets(&[write], &[]);
+            context.update_descriptor_sets(&[write]);
         }
         Ok(index)
     }
@@ -332,7 +332,7 @@ impl Heap {
     ) -> Result<vk::DescriptorSet> {
         let _lock = self.state.lock().unwrap();
         let set = context.result(unsafe {
-            context.device.allocate_descriptor_sets(
+            context.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(self.uniforms)
                     .set_layouts(&[self.uniform_layout]),
@@ -342,13 +342,10 @@ impl Heap {
             .buffer(buffer)
             .range(size)];
         unsafe {
-            context.device.update_descriptor_sets(
-                &[vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
-                    .buffer_info(&info)],
-                &[],
-            );
+            context.update_descriptor_sets(&[vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .buffer_info(&info)]);
         }
         Ok(set)
     }
@@ -435,7 +432,7 @@ pub(super) fn bind_input_attachments(
                         .image_info(std::slice::from_ref(info))
                 })
                 .collect();
-            device.update_descriptor_sets(&writes, &[]);
+            encoder.shared.context.update_descriptor_sets(&writes);
         }
         device.cmd_bind_descriptor_sets(
             encoder.command,
@@ -478,6 +475,7 @@ pub(super) struct Bindings {
     changed: bool,
     pushed_layout: vk::PipelineLayout,
     values: Vec<Bound>,
+    dynamic_offsets: Vec<u32>,
 }
 /// The portable group-3 slot after both compact storage register ranges.
 pub(super) const STORAGE_WINDOW: u32 = 2 * crate::pipeline::VERTEX_BINDING_BASES[3];
@@ -584,11 +582,11 @@ impl Bindings {
                 let sampled = matches!(resource, Bind::Sampled(_));
                 let core = &view.inner.0;
                 debug_assert!(
-                    !sampled || core.image.inner.core.conversion.is_none(),
+                    !sampled || view.image().inner.core.conversion.is_none(),
                     "YCbCr images need a combined immutable sampler"
                 );
                 let layout = if sampled {
-                    sampled_layout(core.format, core.image.inner.core.desc.usage)
+                    sampled_layout(core.format, view.image().desc().usage)
                 } else {
                     vk::ImageLayout::GENERAL
                 };
@@ -635,7 +633,7 @@ impl Bindings {
         if let Bind::Sampled(view) | Bind::StorageImage(view) = resource {
             let layout = vk::ImageLayout::from_raw(bound.layout);
             let desc = &view.inner.0.desc;
-            let core = &view.inner.0.image.inner.core;
+            let core = &view.image().inner.core;
             let states = core.states.lock().unwrap();
             let stale = desc.layers.clone().any(|layer| {
                 desc.mips
@@ -733,12 +731,23 @@ impl Bindings {
             }
             words.extend([(start / 4) as u32, size as u32]);
         }
-        let buffer = Device(context.clone()).create_buffer(&BufferDesc {
-            size: end,
-            usage: BufferUsage::STORAGE | BufferUsage::COPY_DST,
-            memory: Memory::Device,
-            label: "packed storage window",
-        })?;
+        // Every copy and draw is ordered on this queue. The barriers below
+        // protect reuse even within one submission.
+        let buffer = {
+            let mut window = encoder.shared.storage_window.lock().unwrap();
+            if window
+                .as_ref()
+                .is_none_or(|buffer| buffer.desc().size < end)
+            {
+                *window = Some(Device(context.clone()).create_buffer(&BufferDesc {
+                    size: end,
+                    usage: BufferUsage::STORAGE | BufferUsage::COPY_DST,
+                    memory: Memory::Device,
+                    label: "packed storage window",
+                })?);
+            }
+            window.as_ref().unwrap().clone()
+        };
         let window = buffer.inner.0.handle;
         encoder.synced = false;
         encoder.memory_barrier();
@@ -772,7 +781,7 @@ impl Bindings {
             encoder,
             Some(compiled),
             STORAGE_WINDOW,
-            Bind::StorageBuffer(buffer.slice(0..end)),
+            Bind::StorageBuffer(buffer.slice(0..buffer.desc().size)),
             |_| None,
         );
         Ok(())
@@ -888,6 +897,13 @@ impl Bindings {
                 self.values
                     .push(self.slots[group(b.kind) as usize][b.slot as usize]);
             }
+            self.dynamic_offsets.clear();
+            for &index in &compiled.dynamic_bindings {
+                let offset = &mut self.values[index + 1].offset;
+                // Vulkan takes 32-bit dynamic offsets. The descriptor retains the high bits.
+                self.dynamic_offsets.push(*offset as u32);
+                *offset &= !u64::from(u32::MAX);
+            }
             let (set, new) =
                 encoder.descriptor_set(compiled.set_layout, &self.values, compiled.indexed_set)?;
             if !new {
@@ -898,7 +914,7 @@ impl Bindings {
                         compiled.layout,
                         0,
                         &[set],
-                        &[],
+                        &self.dynamic_offsets,
                     );
                 }
                 self.changed = false;
@@ -907,7 +923,7 @@ impl Bindings {
             set
         };
         let context = &encoder.shared.context;
-        let written = compiled.bindings.iter().filter(|b| {
+        let written = compiled.bindings.iter().enumerate().filter(|&(_, b)| {
             all || self.dirty[group(b.kind) as usize][(b.slot / 128) as usize]
                 & (1 << (b.slot % 128))
                 != 0
@@ -915,15 +931,19 @@ impl Bindings {
         // Fixed-size batches keep the descriptor infos on the stack.
         let mut buffers = ArrayVec::<vk::DescriptorBufferInfo, 32>::new();
         let mut images = ArrayVec::<vk::DescriptorImageInfo, 32>::new();
-        let mut batch = ArrayVec::<&Binding, 32>::new();
+        let mut batch = ArrayVec::<(usize, &Binding), 32>::new();
         let mut written = written.peekable();
         while written.peek().is_some() {
             batch.clear();
             buffers.clear();
             images.clear();
             batch.extend(written.by_ref().take(32));
-            for b in &batch {
-                let bound = &self.slots[group(b.kind) as usize][b.slot as usize];
+            for &(index, b) in &batch {
+                let bound = if push {
+                    &self.slots[group(b.kind) as usize][b.slot as usize]
+                } else {
+                    &self.values[index + 1]
+                };
                 match b.kind {
                     BindingKind::UniformBuffer | BindingKind::StorageBuffer { .. } => {
                         buffers.push(bound.buffer_info())
@@ -934,11 +954,11 @@ impl Bindings {
             let (mut nb, mut ni) = (0, 0);
             let writes: ArrayVec<_, 32> = batch
                 .iter()
-                .map(|b| {
+                .map(|&(index, b)| {
                     let write = vk::WriteDescriptorSet::default()
                         .dst_set(set)
                         .dst_binding(b.slot * 4 + group(b.kind))
-                        .descriptor_type(descriptor(b.kind));
+                        .descriptor_type(compiled.descriptor_types[index]);
                     match b.kind {
                         BindingKind::UniformBuffer | BindingKind::StorageBuffer { .. } => {
                             nb += 1;
@@ -960,8 +980,10 @@ impl Bindings {
                         0,
                         &writes,
                     );
+                    #[cfg(feature = "counters")]
+                    context.descriptor_pushes.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    context.device.update_descriptor_sets(&writes, &[]);
+                    context.update_descriptor_sets(&writes);
                 }
             }
         }
@@ -973,7 +995,7 @@ impl Bindings {
                     compiled.layout,
                     0,
                     &[set],
-                    &[],
+                    &self.dynamic_offsets,
                 );
             }
         }
@@ -1020,7 +1042,7 @@ impl DescriptorArena {
             return Ok((set, false));
         }
         let allocate = |pool| unsafe {
-            context.device.allocate_descriptor_sets(
+            context.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
                     .set_layouts(&[layout]),
@@ -1046,6 +1068,8 @@ impl DescriptorArena {
             vk::DescriptorType::STORAGE_IMAGE,
             vk::DescriptorType::STORAGE_BUFFER,
             vk::DescriptorType::INPUT_ATTACHMENT,
+            vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+            vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
         ]
         .map(|ty| vk::DescriptorPoolSize {
             ty,

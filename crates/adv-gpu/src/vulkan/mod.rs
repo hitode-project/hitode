@@ -51,12 +51,34 @@ pub(crate) use video::VideoPool;
 pub(crate) struct Device(pub(crate) Arc<Context>);
 
 impl Device {
+    #[cfg(feature = "counters")]
+    pub(crate) fn resource_creations(&self) -> ResourceCreations {
+        self.0.creations.read()
+    }
+
+    #[cfg(feature = "counters")]
+    pub(crate) fn descriptor_work(&self) -> (u64, u64, u64) {
+        (
+            self.0.descriptor_allocations.load(Ordering::Relaxed),
+            self.0.descriptor_updates.load(Ordering::Relaxed),
+            self.0.descriptor_pushes.load(Ordering::Relaxed),
+        )
+    }
+
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
 pub(crate) struct Context {
+    #[cfg(feature = "counters")]
+    creations: CreationCounters,
+    #[cfg(feature = "counters")]
+    descriptor_allocations: AtomicU64,
+    #[cfg(feature = "counters")]
+    descriptor_updates: AtomicU64,
+    #[cfg(feature = "counters")]
+    descriptor_pushes: AtomicU64,
     _entry: ash::Entry,
     instance: ash::Instance,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -194,6 +216,23 @@ impl Eds {
 const LOST: &str = "Vulkan device lost";
 
 impl Context {
+    unsafe fn allocate_descriptor_sets(
+        &self,
+        info: &vk::DescriptorSetAllocateInfo<'_>,
+    ) -> std::result::Result<Vec<vk::DescriptorSet>, vk::Result> {
+        let sets = unsafe { self.device.allocate_descriptor_sets(info) }?;
+        #[cfg(feature = "counters")]
+        self.descriptor_allocations
+            .fetch_add(sets.len() as u64, Ordering::Relaxed);
+        Ok(sets)
+    }
+
+    unsafe fn update_descriptor_sets(&self, writes: &[vk::WriteDescriptorSet<'_>]) {
+        unsafe { self.device.update_descriptor_sets(writes, &[]) };
+        #[cfg(feature = "counters")]
+        self.descriptor_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Device loss is reported by submit, wait and poll only.
     fn check(&self) -> Result<()> {
         if self.lost.load(Ordering::Relaxed) {
@@ -369,11 +408,11 @@ impl Context {
         if lazy {
             prefer(vk::MemoryPropertyFlags::LAZILY_ALLOCATED);
         }
-        self.allocator
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
+        let mut allocator = self.allocator.lock().unwrap();
+        let allocator = allocator.as_mut().unwrap();
+        #[cfg(feature = "counters")]
+        let capacity = allocator.capacity();
+        let allocation = allocator
             .allocate(&AllocationCreateDesc {
                 name,
                 requirements,
@@ -384,7 +423,13 @@ impl Context {
             .map_err(|error| match error {
                 gpu_allocator::AllocationError::OutOfMemory => Error::OutOfMemory,
                 _ => Error::Unavailable(format!("memory allocation: {error}")),
-            })
+            })?;
+        // A successful suballocation adds at most one block. Frees use the same lock.
+        #[cfg(feature = "counters")]
+        if allocator.capacity() > capacity {
+            self.creations.device_memory.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(allocation)
     }
     fn free(&self, allocation: Allocation) {
         let _ = self

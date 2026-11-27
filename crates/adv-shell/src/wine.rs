@@ -632,12 +632,17 @@ fn report(
             fields.push(format!(
                 concat!(
                     "\"d3d11_captures\": {{\"ring_bytes\": {}, \"captures_reused\": {}, ",
-                    "\"metal_buffers_created\": {}, \"metal_views_created\": {}}}"
+                    "\"buffers_created\": {}, \"image_views_created\": {}, \"device_memory_created\": {}, ",
+                    "\"descriptor_sets_allocated\": {}, \"descriptor_set_updates\": {}, \"descriptor_pushes\": {}}}"
                 ),
                 counts.ring_bytes,
                 counts.captures_reused,
-                counts.metal_buffers_created,
-                counts.metal_views_created,
+                counts.buffers_created,
+                counts.image_views_created,
+                counts.device_memory_created,
+                counts.descriptor_sets_allocated,
+                counts.descriptor_set_updates,
+                counts.descriptor_pushes,
             ));
         }
         if let Some(counts) = adv_runtime::d3d11_variant_counters(ext) {

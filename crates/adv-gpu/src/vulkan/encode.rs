@@ -479,7 +479,7 @@ impl Encoder {
         stage: vk::PipelineStageFlags2,
     ) {
         self.transition(
-            &view.0.image.inner.core,
+            &view.image().inner.core,
             view.0.desc.mips.clone(),
             view.0.desc.layers.clone(),
             layout,
@@ -567,10 +567,10 @@ impl Encoder {
                 if matches!(color.load, Load::Clear(_)) || color.resolve.is_some() {
                     needs_empty_pass = true;
                 }
-                attachment_handles.push(view.0.image.inner.core.handle);
+                attachment_handles.push(view.image().inner.core.handle);
                 self.push_transition(
                     &mut barriers,
-                    &view.0.image.inner.core,
+                    &view.image().inner.core,
                     view.0.desc.mips.clone(),
                     view.0.desc.layers.clone(),
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -604,10 +604,10 @@ impl Encoder {
                     .clear_value(clear);
                 if let Some(resolve) = color.resolve {
                     let view = &resolve.inner;
-                    attachment_handles.push(view.0.image.inner.core.handle);
+                    attachment_handles.push(view.image().inner.core.handle);
                     self.push_transition(
                         &mut barriers,
-                        &view.0.image.inner.core,
+                        &view.image().inner.core,
                         view.0.desc.mips.clone(),
                         view.0.desc.layers.clone(),
                         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -653,10 +653,10 @@ impl Encoder {
                     } else {
                         vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
                     };
-                attachment_handles.push(view.0.image.inner.core.handle);
+                attachment_handles.push(view.image().inner.core.handle);
                 self.push_transition(
                     &mut barriers,
-                    &view.0.image.inner.core,
+                    &view.image().inner.core,
                     view.0.desc.mips.clone(),
                     view.0.desc.layers.clone(),
                     layout,
@@ -730,10 +730,10 @@ impl Encoder {
                 if matches!(color.load, Load::Clear(_)) || color.resolve.is_some() {
                     needs_empty_pass = true;
                 }
-                attachment_handles.push(view.0.image.inner.core.handle);
+                attachment_handles.push(view.image().inner.core.handle);
                 self.push_transition(
                     &mut barriers,
-                    &view.0.image.inner.core,
+                    &view.image().inner.core,
                     view.0.desc.mips.clone(),
                     view.0.desc.layers.clone(),
                     layout,
@@ -775,10 +775,10 @@ impl Encoder {
                 };
                 if let Some(resolve) = color.resolve {
                     let view = &resolve.inner;
-                    attachment_handles.push(view.0.image.inner.core.handle);
+                    attachment_handles.push(view.image().inner.core.handle);
                     self.push_transition(
                         &mut barriers,
-                        &view.0.image.inner.core,
+                        &view.image().inner.core,
                         view.0.desc.mips.clone(),
                         view.0.desc.layers.clone(),
                         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -829,10 +829,10 @@ impl Encoder {
                     } else {
                         vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
                     };
-                attachment_handles.push(view.0.image.inner.core.handle);
+                attachment_handles.push(view.image().inner.core.handle);
                 self.push_transition(
                     &mut barriers,
-                    &view.0.image.inner.core,
+                    &view.image().inner.core,
                     view.0.desc.mips.clone(),
                     view.0.desc.layers.clone(),
                     layout,

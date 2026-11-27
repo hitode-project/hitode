@@ -82,10 +82,13 @@ draws and transfers for the GPU worker. Each device reuses translated stages
 and parsed WGSL while the corresponding shader objects live. Draw offsets,
 strides and expansion counts travel through the upload ring. Dynamic vertex and index
 captures use the same ring and reuse their windows within a frame until the
-shadow changes. Dynamic textures use pooled staging uploads in draw order,
-and Metal reuses views for each texture. D3D10 and D3D10.1 use the same device
-core. The Wine session derives feature levels from the attached backend and
-supplies DXGI with window geometry and the shared surface store. DXGI swap
+shadow changes. Dynamic textures use pooled staging uploads in draw order.
+Metal and Vulkan keep views for the life of each texture. Vulkan cached sets
+for compact shaders use dynamic offsets for buffer windows within the device's
+dynamic descriptor limits. Vulkan reuses the queue's packed storage buffer
+when resource bindings exceed the native storage descriptor limit. D3D10 and
+D3D10.1 use the same device core. The Wine session derives feature levels from
+the attached backend and supplies DXGI with window geometry and the shared surface store. DXGI swap
 chains use D3D11 resources for back buffers and publish through the same
 presenter as Direct3D 9.
 

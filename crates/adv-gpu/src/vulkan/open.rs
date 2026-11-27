@@ -1258,6 +1258,14 @@ impl Device {
             let device = device_guard.into_inner();
             let (entry, instance, debug) = inst.into_parts();
             let context = Arc::new(Context {
+                #[cfg(feature = "counters")]
+                creations: CreationCounters::default(),
+                #[cfg(feature = "counters")]
+                descriptor_allocations: AtomicU64::new(u64::from(heap.is_some())),
+                #[cfg(feature = "counters")]
+                descriptor_updates: AtomicU64::new(0),
+                #[cfg(feature = "counters")]
+                descriptor_pushes: AtomicU64::new(0),
                 eds,
                 pipelines: Mutex::new(pipeline::Pipelines::default()),
                 heap,
