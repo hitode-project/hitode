@@ -6,6 +6,177 @@ fn query_face(machine: &mut Machine<JitCpu>, object: u32, iid: Iid) -> u32 {
     machine.cpu.read_u32(OUT).unwrap()
 }
 
+// spec: GFX-INTEROP-1
+#[test]
+fn open_adapter_callbacks_return_windows_versions_caps_and_tables() {
+    let mut machine = machine();
+    let open = machine.resolve_import(DLL, "OpenAdapter10_2").unwrap();
+    let args = DATA + 0x800;
+    let table = DATA + 0x820;
+    let count = DATA + 0x840;
+    let output = DATA + 0x850;
+    let request = DATA + 0x8b0;
+    let sentinel = 0xa5a5a5a5u32;
+    machine
+        .cpu
+        .write(
+            args,
+            bytemuck::bytes_of(&[0, 0, 0xb000b, 0x20000, 0, table]),
+        )
+        .unwrap();
+    assert_eq!(guest_call(&mut machine, open, &[args]), 0);
+    let handle = machine.cpu.read_u32(args + 4).unwrap();
+    assert_eq!(handle, 0xf07);
+    let versions = machine.cpu.read_u32(table + 12).unwrap();
+    let caps = machine.cpu.read_u32(table + 16).unwrap();
+    assert_eq!(guest_call(&mut machine, versions, &[handle, count, 0]), 0);
+    assert_eq!(machine.cpu.read_u32(count).unwrap(), 9);
+    machine
+        .cpu
+        .write(output, bytemuck::bytes_of(&[sentinel; 20]))
+        .unwrap();
+    machine.cpu.write_u32(count, 8).unwrap();
+    assert_eq!(
+        guest_call(&mut machine, versions, &[handle, count, output]),
+        0x8007007a
+    );
+    assert_eq!(machine.cpu.read_u32(count).unwrap(), 8);
+    assert_eq!(
+        GuestPtr::<[u32; 20]>::new(output)
+            .read(&machine.cpu)
+            .unwrap(),
+        [sentinel; 20]
+    );
+    machine.cpu.write_u32(count, 10).unwrap();
+    assert_eq!(
+        guest_call(&mut machine, versions, &[handle, count, output]),
+        0
+    );
+    assert_eq!(machine.cpu.read_u32(count).unwrap(), 9);
+    assert_eq!(
+        GuestPtr::<[u64; 10]>::new(output)
+            .read(&machine.cpu)
+            .unwrap(),
+        [
+            0x000b0022_00020000,
+            0x000b0020_00090000,
+            0x000b0010_00010000,
+            0x000b000f_00000000,
+            0x000b000a_00020000,
+            0x000a0002_00010000,
+            0x000a0007_00000000,
+            0x000a0001_00040000,
+            0x000a0006_00000000,
+            0xa5a5a5a5_a5a5a5a5,
+        ]
+    );
+    let rows: &[(u32, &[u32])] = &[
+        (128, &[7]),
+        (129, &[0x73]),
+        (130, &[0x18f]),
+        (131, &[1, 1]),
+        (132, &[0]),
+        (134, &[0, 0]),
+        (136, &[7]),
+        (137, &[2]),
+        (144, &[0; 4]),
+        (145, &[0, 0]),
+        (152, &[1]),
+        (156, &[0; 4]),
+    ];
+    for kind in 127..=165 {
+        let words = rows.iter().find(|row| row.0 == kind).map(|row| row.1);
+        for size in (0..=36).step_by(4) {
+            let mut expected = [sentinel; 10];
+            let status = match words {
+                Some(words) if size as usize == size_of_val(words) => {
+                    expected[..words.len()].copy_from_slice(words);
+                    0
+                }
+                Some(_) => 0x8000ffff,
+                None if kind == 149 => 0x8000ffff,
+                None => 0x80004001,
+            };
+            machine
+                .cpu
+                .write(output, bytemuck::bytes_of(&[sentinel; 10]))
+                .unwrap();
+            machine
+                .cpu
+                .write(request, bytemuck::bytes_of(&[kind, 0, output, size]))
+                .unwrap();
+            assert_eq!(guest_call(&mut machine, caps, &[handle, request]), status);
+            assert_eq!(
+                GuestPtr::<[u32; 10]>::new(output)
+                    .read(&machine.cpu)
+                    .unwrap(),
+                expected,
+                "capability {kind} at {size} bytes"
+            );
+        }
+    }
+    let create = machine.cpu.read_u32(table + 4).unwrap();
+    let device_table = DATA + 0xb00;
+    let dxgi_table = DATA + 0xe00;
+    for (interface, device_slots, dxgi_slots) in [
+        (0, 101, 8),
+        (0xa0001, 101, 8),
+        (0xa0002, 103, 8),
+        (0xa0003, 101, 8),
+        (0xa0004, 101, 8),
+        (0xa0006, 101, 8),
+        (0xa0007, 101, 8),
+        (0xa0009, 101, 8),
+        (0xa000a, 101, 8),
+        (0xb0009, 101, 8),
+        (0xb000a, 150, 8),
+        (0xb000b, 101, 8),
+        (0xb000e, 101, 8),
+        (0xb000f, 155, 8),
+        (0xb0010, 164, 18),
+        (0xb0011, 101, 18),
+        (0xb0020, 168, 18),
+        (0xb0021, 101, 18),
+        (0xb0022, 170, 18),
+        (u32::MAX, 101, 18),
+    ] {
+        let arguments = [0, interface, 0x20000, 0, device_table, 0, 0, dxgi_table];
+        machine
+            .cpu
+            .write(args, bytemuck::bytes_of(&arguments))
+            .unwrap();
+        for (address, length) in [(device_table, 171), (dxgi_table, 19)] {
+            machine
+                .cpu
+                .write(address, bytemuck::cast_slice(&[sentinel; 171][..length]))
+                .unwrap();
+        }
+        assert_eq!(guest_call(&mut machine, create, &[handle, args]), 0);
+        let callback = machine.cpu.read_u32(device_table).unwrap();
+        assert_ne!(callback, sentinel);
+        assert_ne!(callback, 0);
+        for (address, length, written, empty) in [
+            (device_table, 171, device_slots, &[166][..]),
+            (dxgi_table, 19, dxgi_slots, &[13, 15][..]),
+        ] {
+            for slot in 0..length {
+                let expected = if slot >= written {
+                    sentinel
+                } else if empty.contains(&slot) {
+                    0
+                } else {
+                    callback
+                };
+                assert_eq!(
+                    machine.cpu.read_u32(address + slot * 4).unwrap(),
+                    expected,
+                    "interface {interface:#x}, table {address:#x}, slot {slot}"
+                );
+            }
+        }
+    }
+}
+
 // spec: GFX-CTX-1
 #[test]
 fn deferred_context_at_9_3_finishes_and_restores_state() {

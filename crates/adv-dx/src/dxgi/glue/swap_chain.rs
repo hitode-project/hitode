@@ -116,7 +116,7 @@ pub(super) fn create(env: &mut Env<'_>, invocation: DeviceCall) -> Option<Outcom
                     return Err(Error::NotImplemented);
                 }
                 let backend = services(env)?;
-                if backend.adapter(env, device)? != Adapter::Hardware {
+                if backend.adapter(env, device)? == Adapter::Null {
                     return Err(Error::Unsupported);
                 }
                 let desc: DXGI_SWAP_CHAIN_DESC1 = read(env, desc)?;
@@ -455,8 +455,16 @@ fn change_fullscreen(env: &mut Env<'_>, this: u32, full: bool, target: u32) -> R
     if !full && target != 0 {
         return Err(Error::InvalidCall);
     }
-    let device = services(env)?.identity(env, chain.device)?;
+    let backend = services(env)?;
+    let device = backend.identity(env, chain.device)?;
     if full {
+        if backend.adapter(env, device)? == Adapter::Software {
+            return Err(if target == 0 {
+                Error::Unsupported
+            } else {
+                Error::InvalidCall
+            });
+        }
         ops::claim_output(env, this, device, false)?;
     } else {
         ops::release_output(env, this, &mut Vec::new());

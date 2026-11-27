@@ -26,13 +26,9 @@ impl Pass {
         size: (u32, u32),
         gamma: DXGI_GAMMA_CONTROL,
     ) -> Result<Self, Error> {
-        let curve = gamma.GammaCurve.map(|value| {
-            [
-                value.Red * gamma.Scale.Red + gamma.Offset.Red,
-                value.Green * gamma.Scale.Green + gamma.Offset.Green,
-                value.Blue * gamma.Scale.Blue + gamma.Offset.Blue,
-                0.0,
-            ]
+        let curve = std::array::from_fn::<_, 256, _>(|i| {
+            let value = gamma.GammaCurve[i];
+            [value.Red, value.Green, value.Blue, 0.0]
         });
         let bytes = bytemuck::cast_slice(&curve);
         let buffer = resource::upload(gpu, bytes, BufferUsage::STORAGE, bytes.len() as u64)?;
@@ -66,12 +62,12 @@ impl Pass {
             )?,
             fragment: shader(
                 "@group(1) @binding(0) var source: texture_2d<f32>;
-                 @group(3) @binding(0) var<storage, read> curve: array<vec4<f32>, 1025>;
+                 @group(3) @binding(0) var<storage, read> curve: array<vec4<f32>, 256>;
                  @fragment fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
                     let color = textureLoad(source, vec2<i32>(p.xy), 0);
-                    let index = clamp(color.rgb, vec3(0.0), vec3(1.0)) * 1024.0;
+                    let index = clamp(color.rgb, vec3(0.0), vec3(1.0)) * 255.0;
                     let i = vec3<u32>(index);
-                    let j = min(i + vec3(1u), vec3(1024u));
+                    let j = min(i + vec3(1u), vec3(255u));
                     let lower = vec3(curve[i.r].r, curve[i.g].g, curve[i.b].b);
                     let upper = vec3(curve[j.r].r, curve[j.g].g, curve[j.b].b);
                     return vec4(mix(lower, upper, fract(index)), color.a);

@@ -362,7 +362,6 @@ pub(super) fn associate_window(
     flags: u32,
 ) -> Result<(), Error> {
     if flags & !7 != 0
-        || (window == 0 && flags != 0)
         || (window != 0
             && !(env.ext.get::<State>().provider.window_exists)(env.ext, &env.sys.objects, window))
     {
@@ -371,8 +370,8 @@ pub(super) fn associate_window(
     let Kind::Factory(factory) = &mut object_mut(env, this)?.kind else {
         return Err(Error::InvalidCall);
     };
-    factory.window = Some(window);
-    factory.window_flags = flags;
+    factory.window = (window != 0).then_some(window);
+    factory.window_flags = if window == 0 { 0 } else { flags };
     Ok(())
 }
 
@@ -592,7 +591,7 @@ pub(super) fn device_unavailable(operation: DeviceOperation) -> Outcome {
         | DeviceOperation::CreateSwapChainForComposition
         | DeviceOperation::DuplicateOutput
         | DeviceOperation::DuplicateOutput1 => Error::InvalidArgument,
-        DeviceOperation::GetSharedResourceAdapterLuid => Error::InvalidCall,
+        DeviceOperation::GetSharedResourceAdapterLuid => Error::InvalidSharedHandle,
         DeviceOperation::ReleaseOwnership => return Outcome::Return(0),
         DeviceOperation::TakeOwnership
         | DeviceOperation::GetGammaControlCapabilities

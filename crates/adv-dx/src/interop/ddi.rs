@@ -5,6 +5,7 @@ use adv_cpu::backend::{Fault, FaultKind, GuestExt, Reg};
 const INVALID_PARAMETER: u32 = 0xc000000d;
 const UNSUCCESSFUL: u32 = 0xc0000001;
 const E_INVALIDARG: u32 = 0x80070057;
+const E_UNEXPECTED: u32 = 0x8000ffff;
 
 const ADAPTER_CALLBACKS: [(&str, u8, Handler); 5] = [
     ("OpenAdapter10::CalcPrivateDeviceSize", 2, |_| {
@@ -202,55 +203,60 @@ fn access_violation(env: &mut Env<'_>) -> Outcome {
 
 fn create_device(env: &mut Env<'_>) -> Outcome {
     let args = env.arg(1);
-    let slots = match env.cpu.read_u32(args + 4) {
-        Ok(0x000a0001 | 0x000a0003 | 0x000a0006 | 0x000a0009) => 101,
-        Ok(0x000a0002 | 0x000a0004 | 0x000a0007 | 0x000a000a) => 103,
-        Ok(0x000b0009..=0x000b000b) => 150,
-        Ok(0x000b000e | 0x000b000f) => 155,
-        Ok(0x000b0010) => 164,
-        Ok(0x000b0011 | 0x000b0020) => 176,
-        _ => return Outcome::Return(E_INVALIDARG),
-    };
     let module = env.sys.thunks.get(env.thunk).module.clone();
     let result = (|| {
+        let interface = env.cpu.read_u32(args + 4)?;
+        let slots = match interface {
+            0x000a0002 => 103,
+            0x000b000a => 150,
+            0x000b000f => 155,
+            0x000b0010 => 164,
+            0x000b0020 => 168,
+            0x000b0022 => 170,
+            _ => 101,
+        };
         let table = env.cpu.read_u32(args + 16)?;
+        let dxgi = env.cpu.read_u32(args + 28)?;
         let callback = env
             .sys
             .thunks
             .publish(env.cpu, &module, "OpenAdapter10::DeviceMethod")?;
+        let mut methods = [callback; 170];
+        methods[166] = 0;
+        let mut dxgi_methods = [callback; 18];
+        dxgi_methods[13] = 0;
+        dxgi_methods[15] = 0;
+        let dxgi_slots = if interface >= 0x000b0010 { 18 } else { 8 };
         env.cpu
-            .write(table, bytemuck::cast_slice(&[callback; 176][..slots]))
+            .write(table, bytemuck::cast_slice(&methods[..slots]))?;
+        env.cpu
+            .write(dxgi, bytemuck::cast_slice(&dxgi_methods[..dxgi_slots]))
     })();
     Outcome::Return(result.map_or(E_INVALIDARG, |()| 0))
 }
 
 fn versions(env: &mut Env<'_>) -> Outcome {
-    // D3D10UMDDI supported-version constants. The Windows order awaits a value capture.
     const VERSIONS: [u64; 9] = [
-        0x000a0001_00040000,
-        0x000a0002_00010000,
-        0x000b000a_00020000,
-        0x000a0006_00000000,
-        0x000a0007_00000000,
-        0x000a0009_00000000,
-        0x000a000a_00000000,
-        0x000b000b_00020000,
+        0x000b0022_00020000,
+        0x000b0020_00090000,
+        0x000b0010_00010000,
         0x000b000f_00000000,
+        0x000b000a_00020000,
+        0x000a0002_00010000,
+        0x000a0007_00000000,
+        0x000a0001_00040000,
+        0x000a0006_00000000,
     ];
     let (entries, output) = (env.arg(1), env.arg(2));
     let result: Result<u32, adv_cpu::backend::MemFault> = (|| {
-        let count = if output == 0 {
-            0
-        } else {
-            env.cpu.read_u32(entries)?
-        };
-        env.cpu.write_u32(entries, VERSIONS.len() as u32)?;
+        let count = VERSIONS.len() as u32;
         if output != 0 {
-            if count < VERSIONS.len() as u32 {
+            if env.cpu.read_u32(entries)? < count {
                 return Ok(0x8007007a);
             }
             env.cpu.write(output, bytemuck::bytes_of(&VERSIONS))?;
         }
+        env.cpu.write_u32(entries, count)?;
         Ok(0)
     })();
     Outcome::Return(result.unwrap_or(E_INVALIDARG))
@@ -258,20 +264,24 @@ fn versions(env: &mut Env<'_>) -> Outcome {
 
 fn caps(env: &mut Env<'_>) -> Outcome {
     let args = env.arg(1);
-    // Published DDI structures and flags. The Windows values await capture.
     let data: &[u32] = match env.cpu.read_u32(args) {
-        Ok(128) => &[5],
-        Ok(129) => &[2],
-        Ok(130) => &[0x77],
-        Ok(131 | 134) => &[0, 0],
-        Ok(132 | 137) => &[0],
+        Ok(128 | 136) => &[7],
+        Ok(129) => &[0x73],
+        Ok(130) => &[0x18f],
+        Ok(131) => &[1, 1],
+        Ok(132) => &[0],
+        Ok(134 | 145) => &[0, 0],
+        Ok(137) => &[2],
+        Ok(144 | 156) => &[0; 4],
+        Ok(149) => return Outcome::Return(E_UNEXPECTED),
+        Ok(152) => &[1],
         _ => return Outcome::Return(0x80004001),
     };
     let result: Result<u32, adv_cpu::backend::MemFault> = (|| {
         let output = env.cpu.read_u32(args + 8)?;
         let size = env.cpu.read_u32(args + 12)?;
         if size != size_of_val(data) as u32 {
-            return Ok(E_INVALIDARG);
+            return Ok(E_UNEXPECTED);
         }
         env.cpu.write(output, bytemuck::cast_slice(data))?;
         Ok(0)

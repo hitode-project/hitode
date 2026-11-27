@@ -16,11 +16,6 @@ struct NtHandle {
 }
 
 pub(super) fn legacy_handle(env: &mut Env<'_>, pointer: u32) -> Result<u32, Error> {
-    let object = ops::object(env, table(env), pointer)?;
-    let misc = object.resource().unwrap().misc();
-    if !misc.shared() || misc.contains(Misc::SHARED_NTHANDLE) {
-        return Err(dxgi::Error::InvalidCall.into());
-    }
     Ok(share(env, pointer)?.handle)
 }
 
@@ -133,7 +128,7 @@ pub(super) fn create_shared_handle(env: &mut Env<'_>) -> Outcome {
         }
         let description = ops::object(env, table(env), resource)?.resource().unwrap();
         if !description.misc().contains(Misc::SHARED_NTHANDLE) {
-            return Err(dxgi::Error::InvalidCall.into());
+            return Err(Error::InvalidArgument);
         }
         let inherit = if attributes == 0 {
             0

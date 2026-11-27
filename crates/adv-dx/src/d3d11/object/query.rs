@@ -64,7 +64,7 @@ pub enum Sample {
 
 impl Kind {
     fn is_predicate(self) -> bool {
-        matches!(self, Self::OcclusionPredicate | Self::StreamOverflow(_))
+        matches!(self, Self::OcclusionPredicate | Self::StreamOverflow(None))
     }
 }
 
