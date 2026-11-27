@@ -466,6 +466,195 @@ fn windows_alpha_and_destination_blending_use_guest_state() {
     }
 }
 
+// spec: GFX-STAGE-6
+#[test]
+fn om_sample_mask_controls_guest_color_and_coverage() {
+    const COLOR: &[u8] = include_bytes!("../../../../../tests/fixtures/d3d11/guest_color.dxbc");
+    const READ: &[u8] = include_bytes!("../../../../../tests/fixtures/d3d11/guest_read_mask.dxbc");
+    const WRITE: &[u8] =
+        include_bytes!("../../../../../tests/fixtures/d3d11/guest_write_mask.dxbc");
+    const READ_WRITE: &[u8] =
+        include_bytes!("../../../../../tests/fixtures/d3d11/guest_read_write_mask.dxbc");
+
+    let mut r = Raster::new();
+    let mut blend = D3D11_BLEND_DESC {
+        AlphaToCoverageEnable: 1,
+        ..Default::default()
+    };
+    blend.RenderTarget[0].RenderTargetWriteMask = 15;
+    let alpha_to_coverage = r.object(20, blend);
+    let resolved = r.texture(1, 1, 28, Bind::RENDER_TARGET, 0);
+    let staging = r.texture(1, 1, 28, 0, 0);
+    for samples in [1, 4] {
+        let all = (1u32 << samples) - 1;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 1,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: 28,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: samples,
+                Quality: 0,
+            },
+            BindFlags: Bind::RENDER_TARGET,
+            ..Default::default()
+        };
+        let image = r.image(desc, 0);
+        let view = create_object(&mut r.machine, r.device, 9, &[image, 0]);
+        r.targets(1, &[view]);
+        let read = |r: &mut Raster| {
+            let resource = if samples > 1 {
+                r.call(57, &[resolved, 0, image, 0, 28]);
+                resolved
+            } else {
+                image
+            };
+            r.read(resource, staging, 1, 4)[0].to_le_bytes()
+        };
+        let check =
+            |r: &mut Raster, state, mask, color, expected_red: u8, alternate_red, written: u32| {
+                r.call(35, &[state, 0, mask]);
+                r.clear(view, [0.; 4]);
+                r.draw(0..1, color);
+                let [red, green, _, _] = read(r);
+                assert!(
+                    red == expected_red || Some(red) == alternate_red,
+                    "{samples}x mask {mask:#x}: coverage value {red}, expected {expected_red}"
+                );
+                let expected_green = (255 * written.count_ones() + samples / 2) / samples;
+                assert!(
+                    u32::from(green).abs_diff(expected_green) <= 1,
+                    "{samples}x mask {mask:#x}: green {green}, expected {expected_green}"
+                );
+            };
+        r.shader(15, 9, COLOR);
+        for mask in [u32::MAX, all, 0, 1, 2, 4, 8] {
+            check(&mut r, 0, mask, [0., 1., 0., 1.], 0, None, all & mask);
+        }
+        let stats = |r: &Raster| {
+            r.machine
+                .ext
+                .get::<State>()
+                .execution
+                .as_ref()
+                .unwrap()
+                .gpu_stats()
+        };
+        let pipeline_hits = stats(&r).pipeline_cache_hits;
+        check(&mut r, 0, all, [0., 1., 0., 1.], 0, None, all);
+        check(&mut r, 0, u32::MAX, [0., 1., 0., 1.], 0, None, all);
+        assert_eq!(stats(&r).pipeline_cache_hits - pipeline_hits, 2);
+        for (mask, alpha) in [(0, 1.), (1, 0.), (1, 1.), (2, 1.)] {
+            check(
+                &mut r,
+                alpha_to_coverage,
+                mask,
+                [0., 1., 0., alpha],
+                0,
+                None,
+                if alpha == 0. { 0 } else { all & mask },
+            );
+        }
+        r.shader(15, 9, WRITE);
+        for (mask, output) in [(u32::MAX, 1u32), (1, 0), (1, 1), (2, 1), (3, 2)] {
+            // Guest coverage disables alpha-to-coverage, even at alpha zero.
+            check(
+                &mut r,
+                alpha_to_coverage,
+                mask,
+                [0., 1., f32::from_bits(output), 0.],
+                0,
+                None,
+                all & mask & output,
+            );
+        }
+        r.shader(15, 9, READ);
+        for mask in [u32::MAX, 0, 1, 2, 4, 5] {
+            let covered = all & mask;
+            let red = covered * 4 * covered.count_ones() / samples;
+            // Lavapipe can report coverage in groups 0x3 and 0xc at 4x.
+            let alternate = match (cfg!(target_vendor = "apple"), samples, mask) {
+                (false, 4, u32::MAX) => Some(30),
+                (false, 4, 5) => Some(5),
+                _ => None,
+            };
+            check(
+                &mut r,
+                0,
+                mask,
+                [0., 0., 0., 1.],
+                red as u8,
+                alternate,
+                covered,
+            );
+        }
+        if samples == 4 {
+            // Metal partitions the input into masks 0x5 and 0xa when the PS
+            // writes sample_mask. With OM mask 3 the surviving samples see 1 and 2.
+            let metal = cfg!(target_vendor = "apple");
+            let inexact = stats(&r).inexact_sample_mask_pipelines;
+            check(&mut r, 0, 3, [0., 0., 0., 1.], 6, metal.then_some(3), 3);
+            check(&mut r, 0, 3, [0., 0., 0., 1.], 6, metal.then_some(3), 3);
+            assert_eq!(
+                stats(&r).inexact_sample_mask_pipelines - inexact,
+                u64::from(metal)
+            );
+            r.shader(15, 9, READ_WRITE);
+            check(
+                &mut r,
+                0,
+                3,
+                [0., 0., f32::from_bits(1), 1.],
+                3,
+                metal.then_some(1),
+                1,
+            );
+        }
+
+        let depth = r.image(
+            D3D11_TEXTURE2D_DESC {
+                Format: 40,
+                BindFlags: Bind::DEPTH_STENCIL,
+                ..desc
+            },
+            0,
+        );
+        let depth_view = create_object(&mut r.machine, r.device, 10, &[depth, 0]);
+        write_value(&mut r.machine, ARRAY, view);
+        r.call(33, &[1, ARRAY, depth_view]);
+        for early in [false, true] {
+            for mask in [0, 1, 2, u32::MAX] {
+                r.call(53, &[depth_view, 1, 1f32.to_bits(), 0]);
+                r.call(35, &[0, 0, mask]);
+                if early {
+                    r.shader(
+                        15,
+                        9,
+                        include_bytes!(
+                            "../../../../../tests/fixtures/d3d11/guest_early_color.dxbc"
+                        ),
+                    );
+                } else {
+                    r.call(9, &[0, 0, 0]);
+                }
+                r.draw(0..1, [0.; 4]);
+                r.clear(view, [0.; 4]);
+                r.call(35, &[0, 0, u32::MAX]);
+                r.shader(15, 9, COLOR);
+                r.draw(0..1, [0., 1., 0., 1.]);
+                let [_, green, _, _] = read(&mut r);
+                let surviving = (all & !mask).count_ones();
+                let expected = (255 * surviving + samples / 2) / samples;
+                assert!(
+                    u32::from(green).abs_diff(expected) <= 1,
+                    "{samples}x depth mask {mask:#x}, early {early}: green {green}, expected {expected}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn windows_multisample_coverage_uses_guest_resolve() {
     let mut r = Raster::new();

@@ -92,6 +92,8 @@ fn draw(
         colors: colors.into_iter().collect(),
         depth: None,
         samples: 1,
+        sample_mask: u32::MAX,
+        inexact_sample_mask: false,
         alpha_to_coverage: false,
         primitive: Primitive {
             topology: Topology::Triangles,

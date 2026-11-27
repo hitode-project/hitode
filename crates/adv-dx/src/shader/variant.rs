@@ -43,6 +43,7 @@ pub struct DrawFacts<'a> {
     pub tessellated: bool,
     pub stream_output: bool,
     pub alpha_to_coverage: bool,
+    pub emulated_sample_mask: bool,
     pub statistics: bool,
     pub software_statistics: bool,
     /// Rasterization is disabled by SO without a rasterized stream, or by a
@@ -125,7 +126,14 @@ impl Variant {
                 .any(|(register, _)| *register == Register::UnorderedAccessView);
         set(
             FORCE_EARLY_TESTS,
-            reflection.stage == Stage::Pixel && (early || count_fragments && can_force),
+            reflection.stage == Stage::Pixel
+                && if facts.emulated_sample_mask {
+                    // Let the emulated mask reach depth/stencil when the two
+                    // test orders have the same guest-visible effects.
+                    early && !can_force
+                } else {
+                    early || count_fragments && can_force
+                },
         );
         let cull = raster
             && producer

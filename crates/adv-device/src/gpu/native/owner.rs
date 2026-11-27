@@ -1497,6 +1497,7 @@ struct Color {rgba:vec4<f32>}
                     .collect(),
                     depth_stencil: None,
                     samples: 1,
+                    sample_mask: u32::MAX,
                     alpha_to_coverage: false,
                     label: "owner draw",
                 },

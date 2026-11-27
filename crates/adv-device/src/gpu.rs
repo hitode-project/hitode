@@ -311,6 +311,8 @@ pub struct Stats {
     pub last_flush_buffer_writes: u64,
     pub bind_group_creations: u64,
     pub pipeline_cache_hits: u64,
+    /// Compiled pipelines subject to Metal sample-mask emulation limits.
+    pub inexact_sample_mask_pipelines: u64,
     /// Draws using a pipeline first compiled by a creation-time prediction.
     pub anticipated_pipeline_draws: u64,
     pub compile_waits: u64,

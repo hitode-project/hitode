@@ -375,6 +375,8 @@ pub struct ModernDraw {
     pub color_slots: Option<u8>,
     pub depth: Option<ModernDepth>,
     pub samples: u32,
+    pub sample_mask: u32,
+    pub inexact_sample_mask: bool,
     pub alpha_to_coverage: bool,
     pub primitive: p::Primitive,
     pub area: Rect,

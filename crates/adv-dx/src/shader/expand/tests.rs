@@ -341,6 +341,8 @@ fn draw(image: &Image, vertex: Arc<ModernShader>, fragment: Arc<ModernShader>) -
         .collect(),
         depth: None,
         samples: image.desc().samples,
+        sample_mask: u32::MAX,
+        inexact_sample_mask: false,
         alpha_to_coverage: false,
         primitive: Primitive {
             topology: pipeline::Topology::TriangleStrip,

@@ -247,6 +247,8 @@ pub struct RenderPipelineDesc {
     pub colors: ArrayVec<ColorTarget, MAX_COLOR_TARGETS>,
     pub depth_stencil: Option<DepthStencil>,
     pub samples: u32,
+    /// Vulkan sample mask. Metal callers apply coverage in the fragment shader.
+    pub sample_mask: u32,
     pub alpha_to_coverage: bool,
     pub label: &'static str,
 }

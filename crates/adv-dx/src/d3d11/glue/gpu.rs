@@ -40,6 +40,11 @@ pub(super) struct Execution {
 }
 
 impl Execution {
+    #[cfg(test)]
+    pub(super) fn gpu_stats(&self) -> adv_device::gpu::Stats {
+        self.gpu.stats()
+    }
+
     pub(super) fn new(gpu: Gpu) -> Self {
         Self {
             gpu,

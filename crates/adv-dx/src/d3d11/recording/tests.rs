@@ -93,6 +93,8 @@ fn recorded_dispatch_finishes_before_the_draw_reads_its_image() {
             .collect(),
             depth: None,
             samples: 1,
+            sample_mask: u32::MAX,
+            inexact_sample_mask: false,
             alpha_to_coverage: false,
             primitive: Primitive {
                 topology: Topology::Triangles,
