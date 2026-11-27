@@ -6,14 +6,16 @@ use super::super::{
 };
 use super::{
     Calls, Face, INVALID, OUT_OF_MEMORY, Object, decode,
-    process::{Processor, TL_SIZE, tl_layout},
-    read, write,
+    process::{LegacyViewport, Processor, TL_SIZE, tl_layout},
+    read,
+    render::ExecuteDraw,
+    write,
 };
 use crate::{
     argument::{Arguments, CallError},
     fixed::{Setting, tnl},
 };
-use adv_abi::{Env, Outcome, types::*};
+use adv_abi::types::*;
 
 const EXECUTE_LOCKED: u32 = 0x887602ca;
 const EXECUTE_FAILED: u32 = 0x887602cc;
@@ -112,15 +114,7 @@ impl Calls<'_> {
                     buffer.execute = read(self.memory, args[1])?;
                 }
             }
-            "Optimize" => {
-                if buffer.locked {
-                    return Ok(EXECUTE_LOCKED);
-                }
-                let bytes = self.memory.arg_read(buffer.data, buffer.size as usize)?;
-                if execute::decode(&bytes, buffer.execute).is_err() {
-                    return Ok(EXECUTE_FAILED);
-                }
-            }
+            "Validate" | "Optimize" => return Ok(0x80004001),
             _ => unreachable!(),
         }
         Ok(0)
@@ -153,9 +147,7 @@ impl Calls<'_> {
             return Ok(INVALID);
         }
         let data = buffer.execute;
-        if (data.dwVertexOffset as usize + data.dwVertexCount as usize * TL_SIZE)
-            > buffer.size as usize
-        {
+        if data.dwVertexCount as usize * TL_SIZE > buffer.size as usize {
             return Ok(EXECUTE_FAILED);
         }
         let bytes = self
@@ -170,8 +162,17 @@ impl Calls<'_> {
             return Ok(hr);
         }
         let mut vertices = vec![0u8; data.dwVertexCount as usize * TL_SIZE];
-        let mut status = data.dsStatus;
-        let mut extent = None::<D3DRECT>;
+        let dev = device(self.draw, self.objects, this).unwrap();
+        let mut status = dev.legacy.execute_status;
+        let mut extent = dev.legacy.execute_extent;
+        let view = dev.state.as_ref().unwrap().fixed.viewport.rect;
+        let Object::Viewport { value, value2, .. } =
+            com.get::<Object>(self.objects, viewport).unwrap()
+        else {
+            unreachable!()
+        };
+        let viewport = LegacyViewport::new(*value, *value2);
+        let mut copied = false;
         let mut pc = 0;
         let mut picked = Vec::new();
         while let Some(instruction) = instructions.get(pc) {
@@ -183,6 +184,11 @@ impl Calls<'_> {
             for (record_index, record) in instruction
                 .records
                 .chunks_exact(instruction.size)
+                .take(if instruction.opcode == 12 {
+                    1
+                } else {
+                    usize::MAX
+                })
                 .enumerate()
             {
                 let word = |i: usize| u32::from_le_bytes(record[i * 4..][..4].try_into().unwrap());
@@ -190,7 +196,7 @@ impl Calls<'_> {
                     u32::from(u16::from_le_bytes(record[i * 2..][..2].try_into().unwrap()))
                 };
                 let hr = match instruction.opcode {
-                    1 | 13 => {
+                    1 => {
                         indices.extend(short(1)..short(1) + short(0));
                         0
                     }
@@ -198,7 +204,8 @@ impl Calls<'_> {
                         indices.extend((0..if instruction.opcode == 2 { 2 } else { 3 }).map(short));
                         0
                     }
-                    4..=6 => {
+                    4 => return Ok(0x80004005),
+                    5 | 6 => {
                         let dev = device_mut(self.draw, self.objects, this).unwrap();
                         let matrices = &mut dev.legacy.matrices;
                         let Some(&matrix) = matrices.get(&word(1)) else {
@@ -247,42 +254,64 @@ impl Calls<'_> {
                         })
                         .unwrap();
                         let dev = device_mut(self.draw, self.objects, this).unwrap();
-                        let Ok(processor) =
-                            Processor::new(&dev.state.as_ref().unwrap().fixed, operation == 0)
-                        else {
+                        let Ok(processor) = Processor::new(
+                            &dev.state.as_ref().unwrap().fixed,
+                            operation == 0,
+                            Some(viewport),
+                        ) else {
                             return Ok(EXECUTE_FAILED);
                         };
-                        let source =
-                            data.dwVertexOffset as usize + usize::from(op.wStart) * TL_SIZE;
+                        copied = operation == 2;
+                        let source = usize::from(op.wStart) * TL_SIZE;
                         let dest = usize::from(op.wDest) * TL_SIZE;
                         let mut union = 0;
-                        let mut intersection = 0x3f;
+                        let mut intersection = 0xfff;
+                        let mut bounds = None;
                         for i in 0..op.dwCount as usize {
                             let src = &bytes[source + i * TL_SIZE..][..TL_SIZE];
                             let dst = &mut vertices[dest + i * TL_SIZE..][..TL_SIZE];
-                            let (_, clip) = processor.vertex(
+                            let ([mut x, mut y, _, _], clip) = processor.vertex(
                                 src,
                                 layout,
                                 dst,
                                 tl_layout(),
                                 op.dwFlags & 16 == 0,
                             );
+                            if !copied && flags == 2 {
+                                x = x.clamp(view.x as f32, (view.x + view.w) as f32);
+                                y = y.clamp(view.y as f32, (view.y + view.h) as f32);
+                                dst[..4].copy_from_slice(&x.to_le_bytes());
+                                dst[4..8].copy_from_slice(&y.to_le_bytes());
+                            }
+                            let clip = if flags == 1 { clip } else { 0 };
                             union |= clip;
                             intersection &= clip;
-                        }
-                        if operation != 2 && flags == 1 && op.dwCount != 0 {
-                            status.dwStatus =
-                                (status.dwStatus & !0x3f03f) | union | intersection << 12;
-                        }
-                        if op.dwFlags & 8 != 0 {
-                            update_extent(
-                                &mut extent,
-                                vertices[dest..][..op.dwCount as usize * TL_SIZE]
-                                    .as_chunks::<TL_SIZE>()
-                                    .0
-                                    .iter()
-                                    .map(<[u8; TL_SIZE]>::as_slice),
+                            let (x, y) = (x.round() as i32, y.round() as i32);
+                            merge_extent(
+                                &mut bounds,
+                                D3DRECT {
+                                    x1: x,
+                                    y1: y,
+                                    x2: x,
+                                    y2: y,
+                                },
                             );
+                        }
+                        if op.dwCount != 0 {
+                            status |= union;
+                            status &= !0x00ff_f000 | intersection << 12;
+                            if copied {
+                                if let Some(bounds) = bounds {
+                                    merge_extent(&mut extent, pad_extent(bounds, view));
+                                }
+                            } else {
+                                if intersection == 0
+                                    && let Some(bounds) = bounds
+                                {
+                                    merge_extent(&mut extent, pad_extent(bounds, view));
+                                }
+                                extent = extent.map(|rect| pad_extent(rect, view));
+                            }
                         }
                         dev.legacy.stats[4] += op.dwCount;
                         0
@@ -298,7 +327,7 @@ impl Calls<'_> {
                         self.load_texture(dst, src, 0, 0, 0)?
                     }
                     12 => {
-                        if ((status.dwStatus & word(0)) == word(1)) != (word(2) != 0) {
+                        if ((status & word(0)) == word(1)) != (word(2) != 0) {
                             if word(3) == 0 {
                                 pc = instructions.len();
                             } else {
@@ -314,13 +343,14 @@ impl Calls<'_> {
                     14 => {
                         let value: D3DSTATUS = bytemuck::pod_read_unaligned(record);
                         if value.dwFlags & 1 != 0 {
-                            status.dwStatus = value.dwStatus;
+                            status = value.dwStatus;
                         }
                         if value.dwFlags & 2 != 0 {
-                            extent = Some(value.drExtent);
+                            extent = Some(pad_extent(value.drExtent, view));
                         }
                         0
                     }
+                    13 => 0, // SPAN has no raster effect on the Windows runtime.
                     _ => unreachable!(),
                 };
                 if hr != 0 {
@@ -338,14 +368,20 @@ impl Calls<'_> {
                 }
             }
             if pick.is_none() && !indices.is_empty() {
-                update_extent(
-                    &mut extent,
-                    indices
-                        .iter()
-                        .map(|&i| &vertices[i as usize * TL_SIZE..][..TL_SIZE]),
-                );
+                if !copied {
+                    let (counter, count) = match instruction.opcode {
+                        1 => (2, indices.len()),
+                        2 => (1, indices.len() / 2),
+                        3 => (0, indices.len() / 3),
+                        _ => unreachable!(),
+                    };
+                    device_mut(self.draw, self.objects, this)
+                        .unwrap()
+                        .legacy
+                        .stats[counter] += count as u32;
+                }
                 let primitive = match instruction.opcode {
-                    1 | 13 => 1,
+                    1 => 1,
                     2 => 2,
                     3 => 4,
                     _ => unreachable!(),
@@ -368,24 +404,32 @@ impl Calls<'_> {
                         vertices: vertices.clone(),
                         indices: Some(indices),
                     },
-                    edges.as_deref(),
+                    Some(ExecuteDraw {
+                        edges: edges.as_deref(),
+                    }),
                 )?;
                 if hr != 0 {
                     return Ok(hr);
                 }
             }
         }
-        if let Some(extent) = extent {
-            status.drExtent = extent;
+        let dev = device_mut(self.draw, self.objects, this).unwrap();
+        dev.legacy.execute_status = status;
+        dev.legacy.execute_extent = extent;
+        if pick.is_some() {
+            dev.legacy.picked = picked;
         }
         if let Some(Object::ExecuteBuffer(buffer)) = com.get_mut::<Object>(self.objects, pointer) {
-            buffer.execute.dsStatus = status;
-        }
-        if pick.is_some() {
-            device_mut(self.draw, self.objects, this)
-                .unwrap()
-                .legacy
-                .picked = picked;
+            buffer.execute.dsStatus = D3DSTATUS {
+                dwFlags: 0,
+                dwStatus: status,
+                drExtent: extent.unwrap_or(D3DRECT {
+                    x1: 2047,
+                    y1: 2047,
+                    x2: 1,
+                    y2: 1,
+                }),
+            };
         }
         Ok(0)
     }
@@ -408,65 +452,27 @@ impl Calls<'_> {
     }
 }
 
-pub(super) fn validate(env: &mut Env<'_>, args: &[u32]) -> Outcome {
-    use crate::ddraw::front;
-    use adv_cpu::backend::Prot;
-    let state = env.ext.get::<front::State>();
-    let Some(Object::ExecuteBuffer(buffer)) = state
-        .draw
-        .com
-        .unwrap()
-        .get::<Object>(&env.sys.objects, args[0])
-    else {
-        return Outcome::Return(INVALID);
-    };
-    if buffer.locked {
-        return Outcome::Return(EXECUTE_LOCKED);
-    }
-    let mut bytes = vec![0; buffer.size as usize];
-    if env.cpu.read(buffer.data, &mut bytes).is_err() {
-        return Outcome::Return(INVALID);
-    }
-    if args[4] != 0 || (args[2] != 0 && !env.cpu.accessible(args[2], 1, Prot::EXEC)) {
-        return Outcome::Return(INVALID);
-    }
-    let Err(offset) = execute::decode(&bytes, buffer.execute) else {
-        return Outcome::Return(0);
-    };
-    if args[1] != 0 && env.cpu.write(args[1], &offset.to_le_bytes()).is_err() {
-        return Outcome::Return(INVALID);
-    }
-    if args[2] == 0 {
-        Outcome::Return(EXECUTE_FAILED)
-    } else {
-        Outcome::call(args[2], vec![args[3], offset], |_, _| {
-            Outcome::Return(EXECUTE_FAILED)
-        })
-    }
+fn merge_extent(extent: &mut Option<D3DRECT>, next: D3DRECT) {
+    *extent = Some(extent.map_or(next, |old| D3DRECT {
+        x1: old.x1.min(next.x1),
+        y1: old.y1.min(next.y1),
+        x2: old.x2.max(next.x2),
+        y2: old.y2.max(next.y2),
+    }));
 }
 
-fn update_extent<'a>(extent: &mut Option<D3DRECT>, vertices: impl Iterator<Item = &'a [u8]>) {
-    for raw in vertices {
-        let v: D3DTLVERTEX = bytemuck::pod_read_unaligned(raw);
-        if !v.sx.is_finite() || !v.sy.is_finite() {
-            continue;
-        }
-        let next = D3DRECT {
-            x1: (v.sx.floor() as i32).saturating_sub(1),
-            y1: (v.sy.floor() as i32).saturating_sub(1),
-            x2: (v.sx.ceil() as i32).saturating_add(1),
-            y2: (v.sy.ceil() as i32).saturating_add(1),
-        };
-        *extent = Some(if let Some(old) = extent {
-            D3DRECT {
-                x1: old.x1.min(next.x1),
-                y1: old.y1.min(next.y1),
-                x2: old.x2.max(next.x2),
-                y2: old.y2.max(next.y2),
-            }
-        } else {
-            next
-        });
+fn pad_extent(extent: D3DRECT, viewport: adv_device::surface::Rect) -> D3DRECT {
+    D3DRECT {
+        x1: extent.x1.saturating_sub(1).max(viewport.x as i32),
+        y1: extent.y1.saturating_sub(1).max(viewport.y as i32),
+        x2: extent
+            .x2
+            .saturating_add(1)
+            .min((viewport.x + viewport.w) as i32),
+        y2: extent
+            .y2
+            .saturating_add(1)
+            .min((viewport.y + viewport.h) as i32),
     }
 }
 
@@ -474,7 +480,7 @@ fn pick_record(opcode: u8, record: &[u8], vertices: &[u8], rect: D3DRECT) -> Opt
     let short =
         |i: usize| usize::from(u16::from_le_bytes(record[i * 2..][..2].try_into().unwrap()));
     let indices = match opcode {
-        1 | 13 => short(1)..short(1) + short(0),
+        1 => short(1)..short(1) + short(0),
         2 => 0..2,
         3 => 0..3,
         _ => return None,

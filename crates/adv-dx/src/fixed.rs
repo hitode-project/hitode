@@ -153,6 +153,7 @@ pub(crate) struct Registers {
 pub(crate) enum Setting {
     Fvf(u32),
     Render(Render, u32),
+    RenderRegister(i32, u32),
     Stage(Stage, u32),
     StageRegister(usize, Stage, u32),
     Sampler(Sampler, u32),
@@ -178,7 +179,7 @@ pub(crate) enum Slot {
     Material,
     Light(u32),
     LightEnable(u32),
-    Render(Render),
+    Render(i32),
     Stage(Stage),
     StageRegister(usize, Stage),
     Sampler(Sampler),
@@ -333,8 +334,12 @@ impl State {
         let (slot, changed) = match setting {
             Setting::Fvf(value) => (Slot::Fvf, replace(&mut self.fvf, value)),
             Setting::Render(kind, value) => (
-                Slot::Render(kind),
+                Slot::Render(kind as i32),
                 self.render.insert(kind as i32, value) != Some(value),
+            ),
+            Setting::RenderRegister(slot, value) => (
+                Slot::Render(slot),
+                self.render.insert(slot, value) != Some(value),
             ),
             Setting::Stage(kind, value) => (
                 Slot::Stage(kind),
