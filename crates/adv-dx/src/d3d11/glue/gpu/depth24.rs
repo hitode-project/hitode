@@ -53,10 +53,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     gpu.dispatch(
         &pipeline,
         &SlotBindings {
-            uniforms: vec![Some(BufferRange {
-                buffer: uniform,
-                range: 0..32,
-            })],
+            uniforms: vec![Some(
+                BufferRange {
+                    buffer: uniform,
+                    range: 0..32,
+                }
+                .into(),
+            )],
             images: vec![Some(view(2)?), Some(view(1)?)],
             storage: vec![Some(StorageBinding::Buffer(BufferRange {
                 buffer,

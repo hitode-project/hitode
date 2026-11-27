@@ -497,15 +497,9 @@ fn slots_for(
                     .max(16);
                 let selected = length.min(constant.count.saturating_mul(16));
                 let offset = u64::from(constant.first) * 16;
-                let gpu_buffer = if constant.buffer == 0 {
-                    resource::upload(
-                        &execution(env.ext)?.gpu,
-                        &[],
-                        BufferUsage::UNIFORM,
-                        u64::from(length),
-                    )?
-                } else {
-                    reads.push(key(env, constant.buffer, 0));
+                let length = u64::from(length);
+                let mut window = None;
+                if constant.buffer != 0 {
                     let desc = description(env, constant.buffer)?;
                     let super::Resource::Buffer(buf) = desc else {
                         unreachable!()
@@ -513,72 +507,50 @@ fn slots_for(
                     let available = u64::from(buf.size())
                         .saturating_sub(offset)
                         .min(u64::from(selected));
-                    if desc.usage() == Usage::Dynamic
-                        || available < u64::from(length)
-                        || offset != 0
-                    {
-                        let source = if desc.usage() == Usage::Dynamic {
-                            let table = table(env);
-                            let pointer = table
-                                .get_mut(&mut env.sys.objects, constant.buffer)
-                                .unwrap()
-                                .mapping()
-                                .unwrap()
-                                .pointer();
-                            Some(array::<u8>(
-                                env,
-                                pointer
-                                    .checked_add(offset as u32)
-                                    .ok_or(Error::InvalidArgument)?,
-                                available as u32,
-                            )?)
-                        } else {
-                            None
-                        };
-                        let gpu = &execution(env.ext)?.gpu;
-                        let buffer = resource::upload(
-                            gpu,
-                            source.as_deref().unwrap_or_default(),
-                            BufferUsage::UNIFORM | BufferUsage::COPY_DST,
-                            u64::from(length),
-                        )?;
-                        if source.is_none() && available != 0 {
-                            let Backing::Buffer(native) = backing(env, constant.buffer, desc)?
-                            else {
-                                unreachable!()
-                            };
-                            let transfer = ModernTransfer::CopyBuffer {
-                                source: BufferRange {
-                                    buffer: native,
-                                    range: offset..offset + available,
-                                },
-                                destination: buffer.clone(),
-                                offset: 0,
-                            };
-                            let read_key = key(env, constant.buffer, 0);
-                            execution(env.ext)?.append(
-                                Command::Transfer(transfer),
-                                extent_rect([length, 1, 1]),
-                                Some(read_key),
-                                read_key,
-                            )?;
-                        }
-                        buffer
-                    } else {
-                        let Backing::Buffer(buffer) = backing(env, constant.buffer, desc)? else {
+                    if available != 0 {
+                        let key = key(env, constant.buffer, 0);
+                        reads.push(key);
+                        let Backing::Constant(buffer) = backing(env, constant.buffer, desc)? else {
                             unreachable!()
                         };
-                        buffer
+                        window = Some(if available == length {
+                            buffer.slice(offset..offset + length)
+                        } else {
+                            let execution = execution(env.ext)?;
+                            let padded = execution.gpu.uniform_window(length as u32, |out| {
+                                out[available as usize..].fill(0);
+                                Ok::<_, Error>(())
+                            })?;
+                            execution.append(
+                                Command::Transfer(ModernTransfer::CopyBufferWindow {
+                                    source: BufferWindow::Uniform(
+                                        buffer.slice(offset..offset + available),
+                                    ),
+                                    destination: BufferWindow::Uniform(padded.clone()),
+                                }),
+                                extent_rect([length as u32, 1, 1]),
+                                Some(key),
+                                key,
+                            )?;
+                            padded
+                        });
+                    }
+                }
+                let window = match window {
+                    Some(window) => window,
+                    None => {
+                        let execution = execution(env.ext)?;
+                        if execution.zero_constants.is_none() {
+                            execution.zero_constants =
+                                Some(execution.gpu.uniform_window(65536, |out| {
+                                    out.fill(0);
+                                    Ok::<_, Error>(())
+                                })?);
+                        }
+                        execution.zero_constants.as_ref().unwrap().slice(0..length)
                     }
                 };
-                set_slot(
-                    &mut slots.uniforms,
-                    binding,
-                    BufferRange {
-                        buffer: gpu_buffer,
-                        range: 0..u64::from(length),
-                    },
-                );
+                set_slot(&mut slots.uniforms, binding, BufferWindow::Uniform(window));
             }
             Sampler => {
                 let mut desc = sampler_description(env, state.samplers[index]);
