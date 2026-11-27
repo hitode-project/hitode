@@ -3634,6 +3634,22 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) alpha:f32 }
             received.push(rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap());
         }
         assert_eq!(received, (1..=50).collect::<Vec<_>>());
+        // Wait for frame 50's owner-side retirement before saturating the counter.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while gpu
+            .execution
+            .worker
+            .shared
+            .in_flight_frames
+            .load(Ordering::Acquire)
+            != 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "frame 50 did not retire"
+            );
+            std::thread::yield_now();
+        }
 
         // Verify backpressure with WakeEvent: artificially saturate in_flight_frames,
         // verify admit_present returns Error::Busy without blocking, and wake signals on drain.
