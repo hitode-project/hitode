@@ -291,6 +291,12 @@ impl Encoder {
         if !self.ready() {
             return;
         }
+        // A 2D attachment view of a volume still transitions the full mip.
+        let layers = if core.desc.dimension == Dimension::D3 {
+            0..1
+        } else {
+            layers
+        };
         let mut states = core.states.lock().unwrap();
         let written = access.intersects(WRITES);
         match self

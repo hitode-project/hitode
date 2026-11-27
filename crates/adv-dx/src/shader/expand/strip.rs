@@ -48,7 +48,7 @@ pub(super) fn prepare(
         writeln!(source, "let count = {count}u; let first = {first}u;").unwrap();
     }
     source.push_str(
-        "var run = 0u; var written = 0u;
+        "var run = 0u; var written = 0u; var vertices = 0u;
         for (var p = 0u; p < count; p++) {
             let at = first + p;\n",
     );
@@ -60,14 +60,14 @@ pub(super) fn prepare(
         if vertex_id == {cut}u {{
             run = 0u;
         }} else {{
-            run++;
+            run++; vertices++;
             if run >= {width}u && (run - {width}u) % {step}u == 0u {{
                 dx_strip[1u + written] = vec2<u32>(at + 1u - {width}u, (run - {width}u) / {step}u);
                 written++;
             }}
         }}
     }}
-    dx_strip[0] = vec2<u32>(written, 0u);
+    dx_strip[0] = vec2<u32>(written, vertices);
 }}"
     )
     .unwrap();

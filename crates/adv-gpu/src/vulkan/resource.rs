@@ -310,15 +310,22 @@ impl Image {
                 "image view format not declared in view_formats".into(),
             ));
         }
-        let layers = layers(&self.core.desc);
+        let image = &self.core.desc;
+        let dimension = desc.dimension.unwrap_or(image.dimension);
+        let volume_slice = image.dimension == Dimension::D3 && dimension == Dimension::D2;
+        let layer_count = if volume_slice && desc.mips.end <= image.mips {
+            (image.size.depth_or_layers >> desc.mips.start).max(1)
+        } else {
+            layers(image)
+        };
         if desc.mips.is_empty()
             || desc.mips.end > self.core.desc.mips
             || desc.layers.is_empty()
-            || desc.layers.end > layers
+            || desc.layers.end > layer_count
+            || (volume_slice && (desc.mips.len() != 1 || desc.layers.len() != 1))
         {
             return Err(Error::Invalid("image view subresources".into()));
         }
-        let dimension = desc.dimension.unwrap_or(self.core.desc.dimension);
         let view_type = match dimension {
             Dimension::D1 => {
                 if desc.layers.len() > 1 {
@@ -374,6 +381,9 @@ impl Image {
             }
         }
         let mut view_usage = self.core.usage & allowed;
+        if volume_slice {
+            view_usage &= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        }
         let swizzle_alpha =
             format == Format::A8Unorm && view_usage.contains(vk::ImageUsageFlags::SAMPLED);
         if (!planar && desc.plane != 0) || swizzle_alpha {
@@ -495,7 +505,9 @@ impl ImageView {
         Extent {
             width: (width >> self.0.desc.mips.start).max(1),
             height: (height >> self.0.desc.mips.start).max(1),
-            depth_or_layers: if desc.dimension == Dimension::D3 {
+            depth_or_layers: if desc.dimension == Dimension::D3
+                && self.0.desc.dimension != Some(Dimension::D2)
+            {
                 (desc.size.depth_or_layers >> self.0.desc.mips.start).max(1)
             } else {
                 self.0.desc.layers.end - self.0.desc.layers.start
@@ -684,6 +696,10 @@ impl Device {
         }
         if desc.dimension == Dimension::Cube {
             flags |= vk::ImageCreateFlags::CUBE_COMPATIBLE;
+        }
+        if desc.dimension == Dimension::D3 && usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        {
+            flags |= vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE;
         }
         let image_type = match desc.dimension {
             Dimension::D1 => vk::ImageType::TYPE_1D,

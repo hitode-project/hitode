@@ -476,13 +476,22 @@ linkage programs. Residency feedback and double precision have Windows bytecode 
 
 ### GFX-SHADER-6 Expansion order
 
-**Rule**: Expansion MUST preserve primitive order, the leading vertex and winding. It MUST append complete stream-output primitives in order and derive filled sizes from the append scan.
+**Rule**: Expansion MUST preserve primitive order, the leading vertex and winding. It MUST append complete stream-output primitives in order and derive filled sizes from the append scan. Tessellated draws MUST preserve that order across scratch chunks without reading mesh counts back to the CPU.
 **Verification**: Test
 
 ### GFX-SHADER-7 Pipeline statistics
 
-**Rule**: Pipeline statistics MUST combine recorded work with raster and expansion counts. Rasterization-disabled draws MUST contribute zero clipping and fragment counts.
+**Rule**: Pipeline statistics MUST combine recorded work with raster and expansion counts. Rasterization-disabled draws MUST contribute zero clipping and fragment counts. Programmable-stage counts MUST account for the work in the table below.
 **Verification**: Test
+
+| Stage | Work counted |
+|---|---|
+| Vertex | Invocations within the Direct3D cache bounds |
+| Hull | Submitted patches |
+| Domain | Shaded domain points |
+| Geometry | Shader instances and emitted primitives |
+| Pixel | Invocations within the Direct3D depth and stencil bounds |
+| Compute | Threads in direct and indirect dispatches |
 
 ## Tessellation
 
@@ -550,8 +559,11 @@ Pretransformed draws MUST retain index order.
 
 ### GFX-STAGE-1 Stream output
 
-**Rule**: Each stream output buffer MUST track its own filled byte size and preserve it on append bindings. Stream-output statistics MUST count storage needed for all declared output, treating an unbound target as full when determining which primitives were written. `DrawAuto` MUST consume the filled byte size using the input assembler offset and stride from slot zero.
+**Rule**: Each stream output buffer MUST track its own filled byte size and preserve it on append bindings. Stream-output queries MUST distinguish complete primitives written from those that exceed available storage. `DrawAuto` MUST consume the filled byte size using the input assembler offset and stride from slot zero.
 **Verification**: Test
+
+An unbound target counts as full when calculating primitives written.
+The overflow predicate compares storage needed with primitives written for its selected stream or for every stream in the unqualified query.
 
 ### GFX-STAGE-2 Indirect dispatch
 
@@ -560,7 +572,7 @@ Pretransformed draws MUST retain index order.
 
 ### GFX-STAGE-3 Class linkage
 
-**Rule**: Each bound class instance MUST select the interface function table supported by its class. Draws MUST use the class instances captured at shader binding.
+**Rule**: Each draw MUST use the class instances captured at shader binding to select the interface function tables. Reads through `this[]` MUST use the constant, texture and sampler offsets of the bound instances. Named array elements MUST advance each offset by its class stride.
 **Verification**: Test
 
 ### GFX-STAGE-4 Output merger UAVs
@@ -570,7 +582,7 @@ Pretransformed draws MUST retain index order.
 
 ### GFX-STAGE-5 Geometry shader raster routing
 
-**Rule**: The rasterizer MUST take viewport and render-target array indices from the leading vertex emitted by the geometry shader. A primitive MUST use the selected viewport, scissor, and attachment slice.
+**Rule**: Each primitive MUST use the viewport, scissor and attachment slice selected by the leading geometry shader output vertex. For a Texture3D render-target view, attachment indices MUST be relative to the view’s first W slice at its mip. A render-target clear MUST cover every W slice in the view.
 **Verification**: Test
 
 ## Samplers

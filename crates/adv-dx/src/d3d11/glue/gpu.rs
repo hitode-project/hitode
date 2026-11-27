@@ -782,12 +782,30 @@ pub(super) fn clear_color(env: &mut Env<'_>) -> Result<(), Error> {
     let (pointer, value) = (env.arg(1), read::<[f32; 4]>(env, env.arg(2))?);
     let (view, key) = image_view(env, pointer, ViewKind::RenderTarget)?;
     let extent = view_rect(&view);
-    let command = Command::Transfer(ModernTransfer::ClearColor {
-        view,
-        value: value.map(f64::from),
-        area: None,
-    });
-    execution(env.ext)?.append(command, extent, None, key)
+    for view in clear_color_slices(env, pointer, view)? {
+        let command = Command::Transfer(ModernTransfer::ClearColor {
+            view,
+            value: value.map(f64::from),
+            area: None,
+        });
+        execution(env.ext)?.append(command, extent, None, key)?;
+    }
+    Ok(())
+}
+
+fn clear_color_slices(
+    env: &Env<'_>,
+    pointer: u32,
+    view: ImageView,
+) -> Result<Vec<ImageView>, Error> {
+    let (_, desc) = context::owned(env, pointer).and_then(Object::view).unwrap();
+    let layers = desc.attachment_layers().len();
+    if view.image().desc().dimension != adv_gpu::resource::Dimension::D3 || layers == 1 {
+        return Ok(vec![view]);
+    }
+    (0..layers as u32)
+        .map(|layer| draw::attachment_layer(&view, desc, layer))
+        .collect()
 }
 
 pub(super) fn clear_depth(env: &mut Env<'_>) -> Result<(), Error> {
@@ -1004,26 +1022,29 @@ pub(super) fn clear_view(env: &mut Env<'_>) -> Result<(), Error> {
             })
             .collect()
     };
+    let views = clear_color_slices(env, pointer, view)?;
     let execution = execution(env.ext)?;
     for rect in rectangles.into_iter().filter(|rect| !rect.empty()) {
-        let writes = [(key, false)];
-        let command = Command::Transfer(ModernTransfer::ClearColor {
-            view: view.clone(),
-            value,
-            area: Some(rect.into()),
-        });
-        execution.recording.append(
-            &mut execution.gpu,
-            command,
-            Effects {
-                extent,
-                bounds: rect,
-                key: 0,
-                reads: &[],
-                writes: &writes,
-                retained_bytes: 0,
-            },
-        )?;
+        for view in &views {
+            let writes = [(key, false)];
+            let command = Command::Transfer(ModernTransfer::ClearColor {
+                view: view.clone(),
+                value,
+                area: Some(rect.into()),
+            });
+            execution.recording.append(
+                &mut execution.gpu,
+                command,
+                Effects {
+                    extent,
+                    bounds: rect,
+                    key: 0,
+                    reads: &[],
+                    writes: &writes,
+                    retained_bytes: 0,
+                },
+            )?;
+        }
     }
     Ok(())
 }

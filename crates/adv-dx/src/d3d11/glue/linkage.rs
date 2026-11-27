@@ -28,15 +28,9 @@ pub(super) fn create_instance(env: &mut Env<'_>) -> Outcome {
         let class = device::semantic_name(env, name)?;
         let obj = ops::object(env, table(env), linkage)?;
         let definitions = obj.class_linkage().ok_or(Error::InvalidArgument)?;
-        let (id, ty) = definitions
+        let ty = definitions
             .iter()
-            .find_map(|shader| {
-                shader
-                    .classes
-                    .iter()
-                    .enumerate()
-                    .find(|(_, ty)| ty.name == class)
-            })
+            .find_map(|shader| shader.classes.iter().find(|ty| ty.name == class))
             .ok_or(Error::InvalidArgument)?;
         if (ty.constants != 0
             && (cb >= 14 || vector.saturating_add(u32::from(ty.constants)) > 4096))
@@ -50,7 +44,7 @@ pub(super) fn create_instance(env: &mut Env<'_>) -> Outcome {
             class,
             name: Vec::new(),
             desc: D3D11_CLASS_INSTANCE_DESC {
-                TypeId: id as u32,
+                TypeId: u32::from(ty.id),
                 ConstantBuffer: cb,
                 BaseConstantBufferOffset: vector,
                 BaseTexture: texture,
@@ -75,16 +69,23 @@ pub(super) fn get_instance(env: &mut Env<'_>) -> Outcome {
                 shader
                     .instances
                     .iter()
-                    .filter(|instance| instance.name == name)
-                    .nth(index as usize)
+                    .find(|instance| instance.name == name && index < u32::from(instance.count))
                     .map(|instance| (shader, instance))
             })
             .ok_or(Error::InvalidArgument)?;
-        let class = shader
-            .classes
-            .get(usize::from(instance.class))
-            .ok_or(Error::InvalidArgument)?;
+        let class = shader.class(instance.class).ok_or(Error::InvalidArgument)?;
         let [cb, vector, texture, sampler] = instance.offsets;
+        let vector = vector + index * u32::from(class.constants);
+        let texture = if class.textures == 0 {
+            127
+        } else {
+            texture + index * u32::from(class.textures)
+        };
+        let sampler = if class.samplers == 0 {
+            15
+        } else {
+            sampler + index * u32::from(class.samplers)
+        };
         let instance = ClassInstance {
             linkage,
             class: class.name.clone(),
@@ -137,7 +138,13 @@ pub(super) fn instance_name(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn type_name(env: &mut Env<'_>) -> Outcome {
-    name(env, |instance| &instance.class)
+    name(env, |instance| {
+        if instance.desc.Created != 0 {
+            &[]
+        } else {
+            &instance.class
+        }
+    })
 }
 
 fn name(env: &mut Env<'_>, select: impl FnOnce(&ClassInstance) -> &[u8]) -> Outcome {

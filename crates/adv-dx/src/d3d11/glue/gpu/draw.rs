@@ -1161,6 +1161,9 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     } else {
         0
     };
+    let statistics_active = queries::active_statistics(env)?;
+    let bound_predicate = queries::predicate(env, snapshot.predication.predicate);
+    let predicate_value = snapshot.predication.value;
     let layout = snapshot.ia.layout;
     let raster = match pipeline(env, snapshot.rs.state) {
         Some(PipelineState::Rasterizer(desc)) => *desc,
@@ -1291,8 +1294,15 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             })
         })
         .unwrap_or_default();
-    let raster_stream = raster_stream
-        .filter(|_| snapshot.rs.viewport_count != 0 && (pixel != 0 || depth.is_some()));
+    let raster_stream = raster_stream.filter(|_| {
+        snapshot.rs.viewport_count != 0
+            && (pixel != 0
+                || depth.as_ref().is_some_and(|depth| {
+                    depth.state.depth_compare != p::Compare::Always
+                        || depth.state.depth_write
+                        || depth.state.stencil.is_some()
+                }))
+    });
     let viewport_count = if viewport_index {
         snapshot.rs.viewport_count
     } else {
@@ -1325,7 +1335,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         layer_count = (0..RENDER_TARGETS)
             .filter_map(|slot| snapshot.view(ViewSlot::rtv(slot).unwrap()))
             .chain(snapshot.view(ViewSlot::DSV))
-            .map(|bound| bound.desc.subresources().layers.len())
+            .map(|bound| bound.desc.attachment_layers().len())
             .min()
             .unwrap_or(1);
     }
@@ -1374,7 +1384,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     }
     let raster_stream = raster_stream.filter(|_| !raster_bins.is_empty());
     if raster_stream.is_none() {
-        if so_declarations.is_empty() && counted_streams == 0 {
+        if so_declarations.is_empty() && counted_streams == 0 && !statistics_active {
             return Ok(());
         }
         writes.clear();
@@ -1400,6 +1410,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         writes.push((key(env, pointer, 0), false));
         stream_output.push(declaration);
     }
+    let indexed_strip = indexed && step < input_vertices && tessellation.is_none();
     let alpha_to_coverage = blend.is_some_and(|blend| blend.AlphaToCoverageEnable != 0);
     let mut reads = Vec::new();
     let mut capture = IaCapture::default();
@@ -1520,9 +1531,20 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             tessellated: tessellation.is_some(),
             stream_output: !stream_output.is_empty() || counted_streams != 0,
             rasterization_disabled: raster_stream.is_none(),
+            statistics: statistics_active,
+            software_statistics: pixel_shader.is_none(),
             viewport_count: if viewport_index { VIEWPORTS as u32 } else { 1 },
             layer_count: layer_count as u32,
             ..Default::default()
+        };
+        let variant = Variant::select(reflection, &facts, caps);
+        let expand = variant.pulled()
+            || input_vertices > input_topology.vertices()
+            || raster_stream.is_none()
+            || (statistics_active && indexed_strip);
+        let facts = DrawFacts {
+            software_statistics: facts.software_statistics || expand,
+            ..facts
         };
         let variant = Variant::select(reflection, &facts, caps);
         let sampling = Sampling::new(env, &snapshot, Stage::Vertex, reflection);
@@ -1531,7 +1553,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             raster_samples: samples,
             ..views.options(sampling.options())
         };
-        let expanded = if variant.pulled() || input_vertices > input_topology.vertices() {
+        let expanded = if expand {
             let (first, count, base_vertex, first_instance, instance_count, indirect) = match &args
             {
                 DrawRange::Direct {
@@ -1575,6 +1597,8 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 }
             };
             let assembly = expand::Assembly {
+                count_statistics: statistics_active,
+                predicate: bound_predicate.as_ref().map(|_| !predicate_value),
                 first,
                 count,
                 base_vertex,
@@ -1847,34 +1871,105 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             StorageBinding::Buffer(BufferRange { buffer, range }),
         );
     }
-    let (vertices, primitives) = match &args {
-        DrawRange::Direct {
+    let (occlusion, statistics) =
+        queries::draw_slots(env, raster_stream.is_some(), expansion.is_none())?;
+    let gpu_statistics = if statistics_active && expansion.is_some() {
+        let counters = queries::counter_buffer(
+            &execution(env.ext)?.gpu,
+            (expand::statistics::GPU_WORDS * 4) as u64,
+        )?;
+        queries::record_statistics(
+            env,
+            [0; 11],
+            Some((
+                counters.clone(),
+                crate::d3d11::object::query::Sample::Expansion,
+            )),
+        )?;
+        Some(counters)
+    } else {
+        None
+    };
+    let native_args = args.arguments();
+    let gated_args = if let Some(buffer) = &bound_predicate
+        && (expansion.is_none() || statistics_active && !indexed_strip)
+    {
+        let words = match &native_args {
+            DrawArguments::Direct {
+                vertices,
+                instances,
+                base_vertex,
+            } => {
+                let mut words = vec![
+                    vertices.len() as u32,
+                    instances.len() as u32,
+                    vertices.start,
+                ];
+                if indexed {
+                    words.push(*base_vertex as u32);
+                }
+                words.push(instances.start);
+                queries::ArgumentWords::Direct(words)
+            }
+            DrawArguments::Indirect(arguments) => {
+                queries::ArgumentWords::Indirect(arguments.clone())
+            }
+        };
+        Some(queries::gate_arguments(
+            env.ext,
+            buffer,
+            predicate_value,
+            words,
+            &reads,
+        )?)
+    } else {
+        None
+    };
+    if statistics_active && !indexed_strip {
+        use expand::statistics::{AssemblyTopology, Indirect, Rasterization};
+        let width = tessellation.map_or(input_vertices, |layout| layout.input_points);
+        let assembly = if step < width {
+            AssemblyTopology::Strip(width, step)
+        } else {
+            AssemblyTopology::List(width)
+        };
+        let count_kind = Indirect::Draw {
+            topology: assembly,
+            gs_instances: 0,
+            hull: tessellation.is_some(),
+            rasterization: Rasterization::select(
+                raster_stream.is_some() && expansion.is_none(),
+                pixel != 0,
+                depth.is_some(),
+            ),
+        };
+        if let Some(arguments) = gated_args.as_ref().or(match &native_args {
+            DrawArguments::Indirect(arguments) => Some(arguments),
+            _ => None,
+        }) {
+            queries::count_indirect(env, arguments, count_kind, &reads)?;
+        } else if let DrawRange::Direct {
             vertices,
             instances,
             ..
-        } => {
-            let count = vertices.len() as u64;
-            let instances = instances.len() as u64;
-            let primitives = match topology {
-                p::Topology::Points => count,
-                p::Topology::Lines => count / 2,
-                p::Topology::LineStrip => count.saturating_sub(1),
-                p::Topology::Triangles => count / 3,
-                p::Topology::TriangleStrip => count.saturating_sub(2),
-                _ => unreachable!(),
-            };
-            let primitives =
-                tessellation.map_or(primitives, |layout| count / u64::from(layout.input_points));
-            (count * instances, primitives * instances)
+        } = &args
+        {
+            let count = vertices.len() as u32;
+            let vertices = u64::from(count) * instances.len() as u64;
+            let primitives = u64::from(assembly.primitives(count)) * instances.len() as u64;
+            let mut counters = [0; 11];
+            counters[0] = vertices;
+            counters[1] = primitives;
+            counters[2] = vertices;
+            if raster_stream.is_some() && expansion.is_none() {
+                counters[5] = primitives;
+            }
+            if tessellation.is_some() {
+                counters[8] = primitives;
+            }
+            queries::record_statistics(env, counters, None)?;
         }
-        DrawRange::Indirect(..) => (0, 0),
-    };
-    let (occlusion, statistics) = queries::draw_slots(env, vertices, primitives)?;
-    let predicate = queries::predicate(
-        env,
-        snapshot.predication.predicate,
-        snapshot.predication.value,
-    );
+    }
     let indices = index.as_ref().map(|(index, _)| BufferRange {
         buffer: index.buffer.clone(),
         range: 0..index.buffer.desc().size,
@@ -1916,10 +2011,12 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             raster.SlopeScaledDepthBias,
             raster.DepthBiasClamp,
         ],
-        arguments: args.arguments(),
+        arguments: gated_args
+            .clone()
+            .map_or_else(|| native_args.clone(), DrawArguments::Indirect),
         index: index.clone(),
         occlusion,
-        predicate: predicate.clone(),
+        predicate: None,
     };
     let command = if let Some((programs, primitives)) = expansion {
         let mut bins = Vec::new();
@@ -1927,7 +2024,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             let (occlusion, statistics) = if i == 0 {
                 (occlusion.clone(), statistics.clone())
             } else {
-                queries::draw_slots(env, 0, 0)?
+                queries::draw_slots(env, true, false)?
             };
             let mut draw = make_draw(programs.vertex_shader(i)?, viewport, bounds, occlusion);
             if layer_count > 1 {
@@ -1967,7 +2064,8 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                     }),
                     _ => None,
                 },
-                statistics: None,
+                statistics: gpu_statistics,
+                predicate: bound_predicate,
                 stream_output: stream_targets,
                 stream_statistics,
             },
@@ -2002,13 +2100,21 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     Ok(())
 }
 
-fn attachment_layer(view: &ImageView, desc: &View, layer: u32) -> Result<ImageView, Error> {
+pub(super) fn attachment_layer(
+    view: &ImageView,
+    desc: &View,
+    layer: u32,
+) -> Result<ImageView, Error> {
     let image = view.image();
     let range = desc.subresources();
-    let layer = range.layers.start + layer;
+    let layer = desc.attachment_layers().start + layer;
     Ok(image.create_view(&r::ViewDesc {
         format: (view.format() != image.desc().format).then_some(view.format()),
-        dimension: (image.desc().dimension == r::Dimension::Cube).then_some(r::Dimension::D2),
+        dimension: matches!(
+            image.desc().dimension,
+            r::Dimension::Cube | r::Dimension::D3
+        )
+        .then_some(r::Dimension::D2),
         mips: range.mips.clone(),
         layers: layer..layer + 1,
         plane: 0,
@@ -2159,7 +2265,49 @@ fn compute(
     .map_err(shader_error)?;
     let mut reads = Vec::new();
     reads.extend(indirect_read);
+    let threads = shader
+        .reflection()
+        .workgroup_size
+        .unwrap()
+        .into_iter()
+        .product::<u32>();
     let bindings = slots_for(env, &snapshot, Stage::Compute, bindings(&code), &mut reads)?;
+    let mut arguments = arguments;
+    if let Some(buffer) = queries::predicate(env, snapshot.predication.predicate) {
+        let words = match arguments {
+            DispatchArguments::Direct(groups) => queries::ArgumentWords::Direct(groups.to_vec()),
+            DispatchArguments::Indirect(arguments) => queries::ArgumentWords::Indirect(arguments),
+        };
+        arguments = DispatchArguments::Indirect(queries::gate_arguments(
+            env.ext,
+            &buffer,
+            snapshot.predication.value,
+            words,
+            &reads,
+        )?);
+    }
+    if queries::active_statistics(env)? {
+        match &arguments {
+            DispatchArguments::Direct(groups) => {
+                let mut counters = [0; 11];
+                counters[10] = groups
+                    .iter()
+                    .copied()
+                    .chain([threads])
+                    .map(u64::from)
+                    .product();
+                queries::record_statistics(env, counters, None)?;
+            }
+            DispatchArguments::Indirect(arguments) => queries::count_indirect(
+                env,
+                arguments,
+                expand::statistics::Indirect::Dispatch {
+                    threads_per_group: threads,
+                },
+                &reads,
+            )?,
+        }
+    }
     let execution = execution(env.ext)?;
     let pipeline = Arc::new(
         execution

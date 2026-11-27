@@ -28,6 +28,7 @@ pub(crate) struct ImageView {
     pub(super) raw: Object<dyn MTLTexture>,
     image: crate::Image,
     size: Extent,
+    pub(super) depth_plane: usize,
     format: Format,
 }
 
@@ -338,6 +339,7 @@ impl Image {
                         inner: self.clone(),
                     },
                     size: self.desc().size,
+                    depth_plane: 0,
                     format: self.desc().format,
                 },
             })
@@ -364,6 +366,7 @@ impl Image {
                 inner: ImageView {
                     raw: planes[plane].clone(),
                     format: [Format::R8Unorm, Format::Rg8Unorm][plane],
+                    depth_plane: 0,
                     image: crate::Image {
                         inner: self.clone(),
                     },
@@ -399,11 +402,28 @@ impl Image {
                 .ok_or_else(|| Error::Invalid("image view format".into()))?
         };
         let dimension = desc.dimension.unwrap_or(image.dimension);
-        let ty = texture_type(dimension, desc.layers.len() as u32, image.samples);
+        let volume_slice = image.dimension == Dimension::D3 && dimension == Dimension::D2;
+        if volume_slice
+            && (desc.mips.len() != 1
+                || desc.layers.len() != 1
+                || desc.layers.end > (image.size.depth_or_layers >> desc.mips.start).max(1))
+        {
+            return Err(Error::Invalid("3D color attachment slice".into()));
+        }
+        let raw_dimension = if volume_slice {
+            Dimension::D3
+        } else {
+            dimension
+        };
+        let ty = texture_type(raw_dimension, desc.layers.len() as u32, image.samples);
         let mips = NSRange::new(desc.mips.start as usize, desc.mips.len());
         let layers = NSRange::new(
-            desc.layers.start as usize,
-            if dimension == Dimension::D3 {
+            if volume_slice {
+                0
+            } else {
+                desc.layers.start as usize
+            },
+            if raw_dimension == Dimension::D3 {
                 1
             } else {
                 desc.layers.len()
@@ -454,6 +474,11 @@ impl Image {
                 },
                 size,
                 format: view_format,
+                depth_plane: if volume_slice {
+                    desc.layers.start as usize
+                } else {
+                    0
+                },
             },
         })
     }

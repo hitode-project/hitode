@@ -1,5 +1,6 @@
 //! Semantic lowering shared by shader execution and emission.
 
+mod interface_members;
 pub(crate) mod variant;
 
 use super::*;
@@ -103,12 +104,25 @@ fn instructions(block: &mut Block, f: &mut impl FnMut(&mut Instruction)) {
 
 const FUNCTION_BODY: u64 = 1 << 32;
 
-/// Replace interface calls with the class instance's selected function body.
-pub fn specialize_interfaces(module: &Module, tables: &[u32]) -> Result<Module, Error> {
+pub struct InterfaceBinding {
+    pub table: u32,
+    pub offsets: Vector,
+    pub sizes: [u32; 3],
+}
+
+/// Replace interface calls and link the members used by the selected instances.
+pub fn specialize_interfaces(
+    module: &Module,
+    bindings: &[InterfaceBinding],
+) -> Result<Module, Error> {
     verify(module)?;
     let mut module = module.clone();
     let temporary_count = analyze(&module).temporary_count;
-    inline_calls(&mut module, temporary_count, Some(tables))?;
+    let tables: Vec<_> = bindings.iter().map(|binding| binding.table).collect();
+    inline_calls(&mut module, temporary_count, Some(&tables))?;
+    module.body.retain(|statement| !matches!(statement, Statement::Declare(decl)
+        if matches!(decl.opcode, Opcode::DclInterface | Opcode::DclFunctionBody | Opcode::DclFunctionTable)));
+    interface_members::lower(&mut module, bindings)?;
     verify(&module)?;
     Ok(module)
 }
@@ -172,10 +186,6 @@ fn inline_calls(module: &mut Module, flag: u32, tables: Option<&[u32]>) -> Resul
                 interpolation: None,
             }),
         );
-    }
-    if tables.is_some() {
-        body.retain(|statement| !matches!(statement, Statement::Declare(decl)
-            if matches!(decl.opcode, Opcode::DclInterface | Opcode::DclFunctionBody | Opcode::DclFunctionTable)));
     }
     module.body = body;
     Ok(true)
@@ -299,9 +309,15 @@ impl CallInliner<'_> {
                     .into_iter()
                     .enumerate()
                     .map(|(index, target)| {
+                        let mut body = self.body(target)?;
+                        body.push(Statement::Execute(call_instruction(
+                            Opcode::Break,
+                            Vec::new(),
+                            Vec::new(),
+                        )));
                         Ok(Case {
                             value: Some((index as u32).wrapping_sub(*base as u32)),
-                            body: self.body(target)?,
+                            body,
                         })
                     })
                     .collect::<Result<_, Error>>()?;

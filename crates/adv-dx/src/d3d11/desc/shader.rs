@@ -217,13 +217,13 @@ impl Shader {
         Ok(shader)
     }
 
-    pub fn specialize(&self, classes: &[&[u8]]) -> Result<Self, Error> {
-        let tables = self
+    pub fn specialize(&self, classes: &[(&[u8], [u32; 4])]) -> Result<Self, Error> {
+        let bindings = self
             .linkage
             .as_ref()
-            .and_then(|linkage| linkage.tables(classes))
+            .and_then(|linkage| linkage.bind(classes))
             .ok_or(Error::InvalidArgument)?;
-        let module = crate::shader::ir::passes::specialize_interfaces(&self.module, &tables)
+        let module = crate::shader::ir::passes::specialize_interfaces(&self.module, &bindings)
             .map_err(|_| Error::InvalidArgument)?;
         let reflection = crate::shader::analysis::analyze(&module);
         Ok(Self {

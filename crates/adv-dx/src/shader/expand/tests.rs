@@ -381,6 +381,7 @@ fn inputs(gpu: &Gpu, index: &[u32]) -> Inputs {
         indirect: None,
         stream_statistics: None,
         statistics: None,
+        predicate: None,
         stream_output: Vec::new(),
     }
 }
@@ -602,7 +603,10 @@ fn geometry_cuts_instances_and_stream_output_keep_primitive_order() {
     }
     expected.extend([0xcccc_cccc; 4]);
     assert_eq!(actual, expected);
-    assert_eq!(words(&stats.buffer), [0, 0, 8, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        words(&stats.buffer),
+        [0, 0, 8, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
+    );
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -841,6 +845,7 @@ fn domain_points_are_shaded_once_and_streamed_as_a_list() {
         indirect: None,
         stream_statistics: None,
         statistics: None,
+        predicate: None,
         stream_output: vec![(target.clone(), filled.clone())],
     };
     let command = plan.command(&gpu, input, vec![]).unwrap();
@@ -947,7 +952,9 @@ fn recorded_counts_match_authored_statistics_shapes() {
         None,
         Rasterization::select(false, true, true),
     );
-    stats.record_gpu([0, 0, 2, 0, 0, 0, 0, 0], true);
+    let mut counters = [0; statistics::GPU_WORDS];
+    counters[2] = 2;
+    stats.record_gpu(counters, true);
     check_stats("stream_only", stats);
     let mut stats = Stats::default();
     stats.record_draw(

@@ -19,13 +19,15 @@ use super::variant::Variant;
 use super::wgsl::{BindingLocation, Options, STATISTICS_SLOT, Translation, pulled};
 use adv_device::gpu::{
     BufferRange, Expand, ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude,
-    ExpansionRegion, Gpu, ModernDraw, ModernShader, QuerySlot, SlotBindings, StorageBinding,
+    ExpansionRegion, ExpansionWindow, Gpu, ModernDraw, ModernShader, QuerySlot, SlotBindings,
+    StorageBinding,
 };
 use std::fmt::Write;
 use std::sync::Arc;
 
 const WORKGROUP: u32 = 64;
 const PARAMETERS: u32 = 32;
+const PREDICATE_SLOT: u32 = 184;
 const INPUT_SLOT: u32 = 161;
 const INDEX_SLOT: u32 = 162;
 const SOURCE_SLOT: u32 = 163;
@@ -100,6 +102,8 @@ pub enum Source<'a> {
 /// A direct IA draw is expanded in API primitive order.
 #[derive(Clone, Copy)]
 pub struct Assembly {
+    pub count_statistics: bool,
+    pub predicate: Option<bool>,
     pub first: u32,
     pub count: u32,
     pub base_vertex: i32,
@@ -141,12 +145,15 @@ impl Assembly {
     }
 
     fn active(self, input_vertices: u32) -> &'static str {
-        if self.indirect.is_some() {
-            "dx_schedule[0]"
-        } else if self.strip(input_vertices) {
-            "dx_strip_active()"
-        } else {
-            "dx_params.y"
+        match (
+            self.predicate.is_some(),
+            self.indirect.is_some(),
+            self.strip(input_vertices),
+        ) {
+            (true, _, _) => "dx_predicated_count()",
+            (_, true, _) => "dx_schedule[0]",
+            (_, _, true) => "dx_strip_active()",
+            _ => "dx_params.y",
         }
     }
 
@@ -167,6 +174,15 @@ impl Assembly {
                 )
                 .unwrap();
             }
+        }
+        if let Some(value) = self.predicate {
+            storage(source, PREDICATE_SLOT, "dx_predicate", "array<u32>", false);
+            let count = Self {
+                predicate: None,
+                ..self
+            }
+            .active(input_vertices);
+            writeln!(source, "fn dx_predicated_count() -> u32 {{ return select(0u, {count}, (dx_predicate[0] != 0u) == {value}); }}").unwrap();
         }
     }
 
@@ -365,6 +381,7 @@ pub struct Programs {
     domain: Option<(u32, u32)>,
     assembled: bool,
     tessellation: Option<tessellation::Programs>,
+    window_regions: std::ops::Range<usize>,
     assembly: Option<(Assembly, u32)>,
 }
 
@@ -381,6 +398,7 @@ pub struct Inputs {
     pub indirect: Option<BufferRange>,
     pub stream_statistics: Option<BufferRange>,
     pub statistics: Option<BufferRange>,
+    pub predicate: Option<BufferRange>,
     /// Targets and their filled byte sizes, in declaration order.
     pub stream_output: Vec<(BufferRange, BufferRange)>,
 }
@@ -468,6 +486,7 @@ impl Programs {
             indirect,
             stream_statistics,
             statistics,
+            predicate,
             stream_output,
         } = inputs;
         let mut strip_buffer = None;
@@ -515,11 +534,9 @@ impl Programs {
         };
         if let Some(statistics) = &statistics {
             bind_storage(&mut geometry, STATISTICS_SLOT, statistics.clone());
+            bind_storage(&mut domain, STATISTICS_SLOT, statistics.clone());
         }
         let mut programs = Vec::new();
-        if let Some(initialize) = &self.initialize {
-            programs.push(initialize.dispatch(gpu, SlotBindings::default())?);
-        }
         if let Some(tessellation) = &self.tessellation {
             programs.push(tessellation.vertex.dispatch(gpu, vertex)?);
             programs.push(tessellation.hull.dispatch(gpu, std::mem::take(&mut hull))?);
@@ -529,6 +546,10 @@ impl Programs {
             programs.push(self.source.dispatch(gpu, std::mem::take(&mut domain))?);
         } else if self.domain.is_none() {
             programs.push(self.source.dispatch(gpu, vertex)?);
+        }
+        let first_output = programs.len();
+        if let Some(initialize) = &self.initialize {
+            programs.push(initialize.dispatch(gpu, SlotBindings::default())?);
         }
         programs.push(self.primitive.dispatch(gpu, geometry)?);
         let mut stream = SlotBindings::default();
@@ -547,6 +568,11 @@ impl Programs {
         }
         if let Some(write) = &self.write {
             programs.push(write.dispatch(gpu, stream)?);
+        }
+        if let Some(predicate) = predicate {
+            for program in &mut programs {
+                bind_storage(&mut program.slots, PREDICATE_SLOT, predicate.clone());
+            }
         }
         let bins = bins
             .into_iter()
@@ -581,6 +607,7 @@ impl Programs {
             })
             .collect();
         let mut regions = self.regions.clone();
+        let mut first_output = first_output;
         if let Some((assembly, input_vertices)) = self
             .assembly
             .filter(|(assembly, _)| assembly.indirect.is_some())
@@ -592,8 +619,9 @@ impl Programs {
                 (indirect.unwrap(), strip_buffer),
                 &mut regions,
                 &mut programs,
-                usize::from(self.initialize.is_some()),
+                self.initialize.as_ref().map(|_| first_output),
             )?;
+            first_output += 1;
         }
         Ok(Expand {
             primitives,
@@ -601,6 +629,11 @@ impl Programs {
             regions,
             programs,
             bins,
+            window: self.tessellation.as_ref().map(|programs| ExpansionWindow {
+                first_program: first_output,
+                regions: self.window_regions.clone(),
+                maximum: programs.output.maximum,
+            }),
         })
     }
 }
@@ -786,6 +819,7 @@ impl Plan<'_> {
             input_registers,
             tessellation.as_ref().map(|programs| programs.output),
         )?;
+        let window_start = regions.len();
         let topology = program.raster_topology();
         let (initialize, raster_region, argument_region, raster) = match &self.raster {
             Some(raster) if program.raster_slots() != 0 => {
@@ -861,6 +895,7 @@ impl Plan<'_> {
             let (prefix, write) = program.stream_output(stream, scan_region);
             (Some(prefix), write)
         });
+        let window_end = regions.len();
         Ok(Programs {
             source,
             primitive,
@@ -884,6 +919,7 @@ impl Plan<'_> {
             assembled: matches!(self.source, Source::Vertex(_)),
             assembly: self.assembly(),
             tessellation,
+            window_regions: window_start..window_end,
         })
     }
 

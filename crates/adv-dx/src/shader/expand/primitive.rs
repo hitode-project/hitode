@@ -195,7 +195,7 @@ impl<'a> Emitter<'a> {
         );
         let input = if tessellated.is_some() {
             format!(
-                "dx_indices[primitive * {}u + corner]",
+                "dx_indices[(dx_params.w + primitive) * {}u + corner]",
                 self.plan.input_vertices
             )
         } else if domain {
@@ -278,12 +278,39 @@ impl<'a> Emitter<'a> {
         self.primitive_output(&mut source, raster.is_some(), stream.is_some());
 
         entry(&mut source, "primitive_main", WORKGROUP);
-        writeln!(
-            source,
-            "let primitive = id.x; if primitive >= {} {{ return; }}",
-            self.count()
-        )
-        .unwrap();
+        source.push_str("let primitive = id.x;\n");
+        if let Some((assembly, width)) = self.plan.assembly()
+            && assembly.strip(width)
+            && assembly.count_statistics
+        {
+            let instances = if assembly.indirect.is_some() {
+                "dx_schedule[5]".to_owned()
+            } else {
+                format!("dx_params.z / {}u", assembly.primitives(width))
+            };
+            let predicate = assembly.predicate.map_or_else(
+                || "true".into(),
+                |value| format!("(dx_predicate[0] != 0u) == {value}"),
+            );
+            writeln!(
+                source,
+                "if primitive == 0u && dx_params.x == 0u && {predicate} {{
+                dx_add_count(6u, dx_strip[0].y * ({instances}));
+                dx_add_count(7u, dx_strip[0].x * ({instances}));
+            }}"
+            )
+            .unwrap();
+        }
+        writeln!(source, "if primitive >= {} {{ return; }}", self.count()).unwrap();
+        if self.count_expanded && self.geometry.is_some() {
+            writeln!(
+                source,
+                "if primitive == 0u {{ dx_add_count(4u, {} * {}u); }}",
+                self.count(),
+                self.instances
+            )
+            .unwrap();
+        }
         if raster.is_some() {
             writeln!(
                 source,
@@ -400,7 +427,7 @@ impl<'a> Emitter<'a> {
                 format!("{}u", output.count)
             };
             format!(
-                "(dx_params.x + dx_points[dx_indices[primitive * {}u]].w) % {count}",
+                "(dx_params.x + dx_points[dx_indices[(dx_params.w + primitive) * {}u]].w) % {count}",
                 output.arity
             )
         } else if let Source::InputAssembler { assembly, .. } = self.plan.source {

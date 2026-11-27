@@ -285,10 +285,27 @@ impl Tessellation {
             "array<DxOutput>",
             true,
         );
+        if assembly.count_statistics {
+            storage(
+                &mut ds_code,
+                STATISTICS_SLOT,
+                "dx_stats",
+                "array<atomic<u32>>",
+                true,
+            );
+            ds_code.push_str(statistics::ADD_COUNTER);
+        }
         entry(&mut ds_code, "domain_main", WORKGROUP);
+        let statistics = if assembly.count_statistics {
+            "if id.x == 0u { dx_add_count(5u, last.z + last.x); }"
+        } else {
+            ""
+        };
         writeln!(
             ds_code,
-            "let last = dx_ranges[{active} - 1u];
+            "if {active} == 0u {{ return; }}
+            let last = dx_ranges[{active} - 1u];
+            {statistics}
             if id.x >= last.z + last.x {{ return; }}
             let point = dx_points[id.x];
             let result = dx_hull_output[point.w];
@@ -423,7 +440,7 @@ pub(super) struct Output {
 impl Output {
     pub fn declare(self, source: &mut String, expansion: &mut Vec<ExpansionBinding>, active: &str) {
         storage(source, RANGES, "dx_ranges", "array<vec4<u32>>", false);
-        writeln!(source, "fn dx_count() -> u32 {{ let last = dx_ranges[{active} - 1u]; return (last.w + last.y) / {}u; }}", self.arity).unwrap();
+        writeln!(source, "fn dx_count() -> u32 {{ if {active} == 0u {{ return 0u; }} let last = dx_ranges[{active} - 1u]; let total = (last.w + last.y) / {}u; return min(dx_params.z, max(total, dx_params.w) - dx_params.w); }}", self.arity).unwrap();
         expansion.push(scratch(RANGES, self.ranges));
     }
 }

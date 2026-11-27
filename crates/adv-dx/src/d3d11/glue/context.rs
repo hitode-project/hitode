@@ -521,17 +521,26 @@ fn set_shader(env: &mut Env<'_>, stage: Stage) -> Outcome {
             let shader = object.shader().unwrap();
             if shader.linkage.is_some() {
                 let linkage = object.shader_linkage().unwrap();
-                let names = classes
+                let bindings = classes
                     .iter()
                     .map(|&pointer| {
                         let instance = owned(env, pointer)
                             .and_then(Object::class_instance)
                             .filter(|instance| instance.linkage == linkage)
                             .ok_or(Error::InvalidArgument)?;
-                        Ok(instance.class.as_slice())
+                        let desc = instance.desc;
+                        Ok((
+                            instance.class.as_slice(),
+                            [
+                                desc.ConstantBuffer,
+                                desc.BaseConstantBufferOffset,
+                                desc.BaseTexture,
+                                desc.BaseSampler,
+                            ],
+                        ))
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
-                Some(std::sync::Arc::new(shader.specialize(&names)?))
+                Some(std::sync::Arc::new(shader.specialize(&bindings)?))
             } else {
                 if !classes.is_empty() {
                     return Err(Error::InvalidArgument);

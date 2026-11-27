@@ -4,7 +4,7 @@ use super::*;
 use crate::shader::wgsl::pulled::DRAW_ARGUMENTS_SLOT;
 
 pub(super) const SLOT: u32 = 185;
-const HEADER_WORDS: u32 = 5;
+const HEADER_WORDS: u32 = 6;
 
 #[derive(Clone, Copy)]
 pub struct Indirect {
@@ -19,14 +19,14 @@ pub(super) fn insert(
     (arguments, strip): (BufferRange, Option<BufferRange>),
     regions: &mut Vec<ExpansionRegion>,
     programs: &mut Vec<ExpansionDispatch>,
-    first: usize,
+    initialize: Option<usize>,
 ) -> Result<(), adv_device::gpu::Error> {
     let Indirect {
         first_word: word,
         instances,
     } = assembly.indirect.unwrap();
     let region = regions.len();
-    let words = HEADER_WORDS + (programs.len() - first) as u32 * 3;
+    let words = HEADER_WORDS + programs.len() as u32 * 3;
     regions.push(ExpansionRegion {
         bytes_per_primitive: 0,
         fixed_bytes: words * 4,
@@ -72,13 +72,18 @@ pub(super) fn insert(
          dx_schedule[1] = per_draw;
          dx_schedule[2] = dx_draw[{}u];
          dx_schedule[3] = {base_vertex};
-         dx_schedule[4] = dx_draw[{instance_word}u];",
+         dx_schedule[4] = dx_draw[{instance_word}u];
+         dx_schedule[5] = min(dx_draw[{}u], {instances}u);",
         word + 1,
-        word + 2
+        word + 2,
+        word + 1,
     )
     .unwrap();
 
-    for (index, program) in programs[first..].iter_mut().enumerate() {
+    for (index, program) in programs.iter_mut().enumerate() {
+        if initialize == Some(index) {
+            continue;
+        }
         let start = HEADER_WORDS + index as u32 * 3;
         let groups = match program.workgroup_size {
             Some(group) => format!(
@@ -114,6 +119,6 @@ pub(super) fn insert(
     if let Some(strip) = strip {
         bind_storage(&mut bindings, super::strip::SLOT, strip);
     }
-    programs.insert(first, schedule.dispatch(gpu, bindings)?);
+    programs.insert(0, schedule.dispatch(gpu, bindings)?);
     Ok(())
 }

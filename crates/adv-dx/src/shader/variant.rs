@@ -44,6 +44,7 @@ pub struct DrawFacts<'a> {
     pub stream_output: bool,
     pub alpha_to_coverage: bool,
     pub statistics: bool,
+    pub software_statistics: bool,
     /// Rasterization is disabled by SO without a rasterized stream, or by a
     /// null PS with both depth and stencil disabled.
     pub rasterization_disabled: bool,
@@ -100,8 +101,9 @@ impl Variant {
             CLIP_NATIVE,
             raster && producer && facts.clip_components != 0 && !emulate_clip,
         );
-        let count =
-            facts.statistics && !caps.features.contains(Features::PIPELINE_STATISTICS_QUERY);
+        let count = facts.statistics
+            && (facts.software_statistics
+                || !caps.features.contains(Features::PIPELINE_STATISTICS_QUERY));
         let count_fragments = raster && count && reflection.stage == Stage::Pixel;
         set(COUNT_FRAGMENTS, count_fragments);
         let early = reflection.global_flags & D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL != 0;
@@ -138,10 +140,7 @@ impl Variant {
         set(WIREFRAME, wireframe);
         set(BIN, bin);
         set(COUNT_CLIPPED, raster && producer && count);
-        set(
-            COUNT_EXPANDED,
-            reflection.stage == Stage::Geometry && facts.statistics,
-        );
+        set(COUNT_EXPANDED, producer && facts.statistics);
         set(
             PULL,
             producer

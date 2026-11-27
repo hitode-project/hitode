@@ -416,6 +416,15 @@ impl View {
         self.elements.clone()
     }
 
+    #[cfg(feature = "gpu")]
+    pub fn attachment_layers(&self) -> Range<u32> {
+        if self.kind == ViewKind::RenderTarget && self.desc.dimension == 8 {
+            self.elements()
+        } else {
+            self.range.layers.clone()
+        }
+    }
+
     pub fn aspects(&self) -> Aspects {
         self.aspects
     }

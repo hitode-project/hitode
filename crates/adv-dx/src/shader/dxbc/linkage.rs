@@ -3,6 +3,7 @@
 use super::{Container, ParseError};
 
 pub struct ClassType {
+    pub id: u16,
     pub name: Vec<u8>,
     pub constants: u16,
     pub textures: u16,
@@ -12,6 +13,7 @@ pub struct ClassType {
 pub struct ClassInstance {
     pub name: Vec<u8>,
     pub class: u16,
+    pub count: u16,
     pub offsets: [u32; 4],
 }
 
@@ -49,14 +51,17 @@ impl Linkage {
         let class_count = word(bytes, 4)? as usize;
         let slot_records = word(bytes, 8)? as usize;
         let slot_count = word(bytes, 12)? as usize;
+        let instances_at = word(bytes, 16)? as usize;
         let classes_at = word(bytes, 20)? as usize;
         let slots_at = word(bytes, 24)? as usize;
-        bytes.get(classes_at..classes_at + class_count * 12 + instance_count * 16)?;
+        bytes.get(classes_at..classes_at + class_count * 12)?;
+        bytes.get(instances_at..instances_at + instance_count * 16)?;
         bytes.get(slots_at..slots_at + slot_records * 16)?;
 
         let mut classes = Vec::new();
-        for at in (classes_at..).step_by(12).take(class_count) {
+        for (id, at) in (classes_at..).step_by(12).take(class_count).enumerate() {
             classes.push(ClassType {
+                id: id as u16,
                 name: name(bytes, at)?,
                 constants: half(bytes, at + 6)?,
                 textures: half(bytes, at + 8)?,
@@ -64,13 +69,11 @@ impl Linkage {
             });
         }
         let mut instances = Vec::new();
-        for at in (classes_at + class_count * 12..)
-            .step_by(16)
-            .take(instance_count)
-        {
+        for at in (instances_at..).step_by(16).take(instance_count) {
             instances.push(ClassInstance {
                 name: name(bytes, at)?,
                 class: half(bytes, at + 4)?,
+                count: half(bytes, at + 6)?,
                 offsets: [
                     u32::from(half(bytes, at + 8)?),
                     u32::from(half(bytes, at + 10)?),
@@ -107,20 +110,30 @@ impl Linkage {
         })
     }
 
-    pub fn tables(&self, instances: &[&[u8]]) -> Option<Vec<u32>> {
+    pub fn class(&self, id: u16) -> Option<&ClassType> {
+        self.classes.iter().find(|ty| ty.id == id)
+    }
+
+    pub fn bind(
+        &self,
+        instances: &[(&[u8], [u32; 4])],
+    ) -> Option<Vec<super::super::ir::passes::InterfaceBinding>> {
         let mut instances = instances.iter();
-        let mut tables = Vec::new();
+        let mut bindings = Vec::new();
         for (count, entries) in &self.slots {
             for _ in 0..*count {
-                let class = instances.next()?;
-                let (_, table) = entries.iter().find(|(id, _)| {
-                    self.classes
-                        .get(usize::from(*id))
-                        .is_some_and(|ty| &ty.name.as_slice() == class)
+                let (class, offsets) = instances.next()?;
+                let (ty, table) = entries.iter().find_map(|(id, table)| {
+                    let ty = self.class(*id)?;
+                    (ty.name == *class).then_some((ty, table))
                 })?;
-                tables.push(*table);
+                bindings.push(super::super::ir::passes::InterfaceBinding {
+                    table: *table,
+                    offsets: *offsets,
+                    sizes: [ty.constants, ty.textures, ty.samplers].map(u32::from),
+                });
             }
         }
-        instances.next().is_none().then_some(tables)
+        instances.next().is_none().then_some(bindings)
     }
 }

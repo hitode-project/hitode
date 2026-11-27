@@ -145,6 +145,35 @@ impl Raster {
         self.call(44, &[1, DESCRIPTOR]);
     }
 
+    fn query(&mut self, kind: i32, predicate: bool) -> u32 {
+        self.object(
+            if predicate { 25 } else { 24 },
+            adv_abi::types::D3D11_QUERY_DESC {
+                Query: kind,
+                MiscFlags: 0,
+            },
+        )
+    }
+
+    fn query_data<T: Pod>(&mut self, query: u32) -> T {
+        self.call(111, &[]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let status = method(
+                &mut self.machine,
+                self.context,
+                29,
+                &[query, DESCRIPTOR, size_of::<T>() as u32, 0],
+            );
+            if status == 0 {
+                return GuestPtr::new(DESCRIPTOR).read(&self.machine.cpu).unwrap();
+            }
+            assert_eq!(status, 1);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
     fn clear(&mut self, view: u32, color: [f32; 4]) {
         write_value(&mut self.machine, DESCRIPTOR, color);
         self.call(50, &[view, DESCRIPTOR]);
@@ -937,7 +966,13 @@ fn shader_dispatch_indirect_consumes_recorded_group_counts() {
     let indirect = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
     write_value(&mut r.machine, ARRAY, [99u32, 2, 1, 1]);
     r.call(48, &[indirect, 0, 0, ARRAY, 0, 0]);
+    let query = r.query(4, false);
+    r.call(27, &[query]);
     r.call(42, &[indirect, 4]);
+    r.call(41, &[1, 1, 1]);
+    r.call(28, &[query]);
+    let stats: [u64; 11] = r.query_data(query);
+    assert_eq!(stats, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24]);
 
     write_value(
         &mut r.machine,
@@ -979,6 +1014,139 @@ fn class_instances_select_interface_bodies_through_guest_vtables() {
         method(&mut r.machine, instance, 2, &[]);
         r.draw(0..1, [0.; 4]);
         assert_eq!(r.read(target, staging, 4, 4), expected.map(f32::to_bits));
+    }
+}
+
+// spec: GFX-STAGE-3
+#[test]
+fn class_instances_bind_named_array_members_and_explicit_offsets() {
+    use adv_abi::types::D3D11_CLASS_INSTANCE_DESC;
+    let mut r = Raster::new();
+    let linkage = create_object(&mut r.machine, r.device, 19, &[]);
+    let bytecode = include_bytes!("../../../../../tests/fixtures/d3d11/stage_members.dxbc");
+    r.machine.cpu.write(CODE_BYTES, bytecode).unwrap();
+    let shader = create_object(
+        &mut r.machine,
+        r.device,
+        15,
+        &[CODE_BYTES, bytecode.len() as u32, linkage],
+    );
+    let names = ARRAY + 0x100;
+    r.machine
+        .cpu
+        .write(names, b"namedTint\0StageTint\0")
+        .unwrap();
+    let named0 = create_object(&mut r.machine, linkage, 7, &[names, 0]);
+    let named1 = create_object(&mut r.machine, linkage, 7, &[names, 1]);
+    let created = create_object(&mut r.machine, linkage, 8, &[names + 10, 3, 4, 5, 2]);
+    for (instance, offsets, created, index) in [
+        (named0, [0, 0, 0, 0], 0, 0),
+        (named1, [0, 1, 1, 1], 0, 1),
+        (created, [3, 4, 5, 2], 1, 0),
+    ] {
+        assert_eq!(method(&mut r.machine, instance, 8, &[DESCRIPTOR]), 0);
+        let desc: D3D11_CLASS_INSTANCE_DESC =
+            GuestPtr::new(DESCRIPTOR).read(&r.machine.cpu).unwrap();
+        assert_eq!(
+            [
+                desc.ConstantBuffer,
+                desc.BaseConstantBufferOffset,
+                desc.BaseTexture,
+                desc.BaseSampler
+            ],
+            offsets
+        );
+        assert_eq!(
+            (desc.InstanceIndex, desc.TypeId, desc.Created),
+            (index, 0, created)
+        );
+        if created == 0 {
+            for (slot, name) in [
+                (9, b"namedTint\0".as_slice()),
+                (10, b"StageTint\0".as_slice()),
+            ] {
+                assert_eq!(method(&mut r.machine, instance, slot, &[0, DESCRIPTOR]), 0);
+                assert_eq!(
+                    r.machine.cpu.read_u32(DESCRIPTOR).unwrap(),
+                    name.len() as u32
+                );
+                assert_eq!(
+                    method(&mut r.machine, instance, slot, &[ARRAY, DESCRIPTOR]),
+                    0
+                );
+                let mut bytes = vec![0; name.len()];
+                r.machine.cpu.read(ARRAY, &mut bytes).unwrap();
+                assert_eq!(bytes, name);
+            }
+        }
+    }
+    let (target, _, staging) = r.target(1, 28);
+    let constants = buffer(&mut r.machine, r.device, Bind::CONSTANT, 32);
+    let instance_constants = buffer(&mut r.machine, r.device, Bind::CONSTANT, 80);
+    update_dynamic(
+        &mut r.machine,
+        r.context,
+        constants,
+        &[1.0f32, 0., 0., 1., 0., 1., 0., 1.],
+    );
+    update_dynamic(
+        &mut r.machine,
+        r.context,
+        instance_constants,
+        &[
+            0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 1.0f32, 1.,
+        ],
+    );
+    write_value(&mut r.machine, ARRAY, [constants, 0, 0, instance_constants]);
+    r.call(16, &[0, 4, ARRAY]);
+    let resources = [0xff00ffffu32, 0xffffff00, 0xffff00ff].map(|color| {
+        write_value(&mut r.machine, ARRAY + 32, color);
+        write_value(
+            &mut r.machine,
+            ARRAY + 48,
+            D3D11_SUBRESOURCE_DATA {
+                pSysMem: ARRAY + 32,
+                SysMemPitch: 4,
+                SysMemSlicePitch: 4,
+            },
+        );
+        let texture = r.texture(1, 1, 28, Bind::SHADER, ARRAY + 48);
+        create_object(&mut r.machine, r.device, 7, &[texture, 0])
+    });
+    write_value(
+        &mut r.machine,
+        ARRAY,
+        [resources[0], resources[1], 0, 0, 0, resources[2]],
+    );
+    r.call(8, &[0, 6, ARRAY]);
+    let sampler = r.object(
+        23,
+        D3D11_SAMPLER_DESC {
+            AddressU: 3,
+            AddressV: 3,
+            AddressW: 3,
+            ComparisonFunc: 1,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        },
+    );
+    write_value(&mut r.machine, ARRAY, [sampler; 3]);
+    r.call(10, &[0, 3, ARRAY]);
+    let selection = buffer(&mut r.machine, r.device, Bind::CONSTANT, 16);
+    write_value(&mut r.machine, ARRAY, selection);
+    r.call(16, &[4, 1, ARRAY]);
+    for (instances, index, pixel) in [
+        ([named0, named1], 0u32, 0xff0000ff),
+        ([named0, named1], 1, 0xff00ff00),
+        ([created, named1], 0, 0xffff0000),
+    ] {
+        update_dynamic(&mut r.machine, r.context, selection, &[index, 0, 0, 0]);
+        write_value(&mut r.machine, ARRAY, instances);
+        r.call(9, &[shader, ARRAY, 2]);
+        write_value(&mut r.machine, DESCRIPTOR, [0i32, 0, 1, 1]);
+        r.call(45, &[1, DESCRIPTOR]);
+        r.call(13, &[3, 0]);
+        assert_eq!(r.read(target, staging, 1, 4), [pixel]);
     }
 }
 
@@ -1249,6 +1417,285 @@ fn instanced_geometry_streams_each_instance_in_order() {
     );
     let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
     assert_eq!(r.read(output, staging, 4, 4), [0, 0, 1, 1]);
+}
+
+// spec: GFX-SHADER-6 GFX-SHADER-7
+#[test]
+fn tessellated_geometry_streams_a_patch_across_scratch_windows() {
+    use crate::shader::tessellator::{Domain, Partitioning, SurfaceOutput, tessellate};
+    use adv_abi::types::D3D11_SO_DECLARATION_ENTRY;
+    let mut r = Raster::new();
+    r.shader(
+        16,
+        60,
+        include_bytes!("../../../../../tests/fixtures/d3d11/stage_wide_hull.dxbc"),
+    );
+    r.shader(
+        17,
+        64,
+        include_bytes!("../../../../../tests/fixtures/shader-core/ds_5_0.dxbc"),
+    );
+    let gs = include_bytes!("../../../../../tests/fixtures/d3d11/stage_wide_geometry.dxbc");
+    r.machine.cpu.write(CODE_BYTES, gs).unwrap();
+    r.machine.cpu.write(ARRAY, b"SV_Position\0").unwrap();
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_SO_DECLARATION_ENTRY {
+            SemanticName: ARRAY,
+            ComponentCount: 4,
+            ..Default::default()
+        },
+    );
+    write_value(&mut r.machine, ARRAY + 16, 16u32);
+    let shader = create_object(
+        &mut r.machine,
+        r.device,
+        14,
+        &[
+            CODE_BYTES,
+            gs.len() as u32,
+            DESCRIPTOR,
+            1,
+            ARRAY + 16,
+            1,
+            u32::MAX,
+            0,
+        ],
+    );
+    r.call(23, &[shader, 0, 0]);
+    r.call(24, &[35]);
+    let mesh = tessellate(
+        Domain::Tri {
+            edges: [64.; 3],
+            inside: 64.,
+            output: SurfaceOutput::TriangleCw,
+        },
+        Partitioning::FractionalEven,
+    );
+    let count = mesh.indices.len() * 4;
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: count as u32 * 4,
+        BindFlags: Bind::STREAM_OUTPUT,
+        ..Default::default()
+    };
+    write_value(&mut r.machine, DESCRIPTOR, desc);
+    let output = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            Usage: 3,
+            CPUAccessFlags: 0x20000,
+            BindFlags: 0,
+            ..desc
+        },
+    );
+    let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    write_value(&mut r.machine, ARRAY, [output, 0]);
+    r.call(37, &[1, ARRAY, ARRAY + 4]);
+    let query = r.query(4, false);
+    let so = r.query(6, false);
+    r.call(27, &[so]);
+    r.call(27, &[query]);
+    r.call(13, &[3, 0]);
+    r.call(28, &[query]);
+    r.call(28, &[so]);
+    let actual = r.read(output, staging, count, 4);
+    for (&index, vertex) in mesh.indices.iter().zip(actual.as_chunks::<4>().0) {
+        let [u, v, w] = mesh.points[index as usize];
+        assert_eq!(
+            *vertex,
+            [3. * v - u - w, u + v - 3. * w, 0.5, 1.].map(f32::to_bits)
+        );
+    }
+    let primitives = mesh.indices.len() as u64 / 3;
+    assert_eq!(r.query_data::<[u64; 2]>(so), [primitives; 2]);
+    let stats: [u64; 11] = r.query_data(query);
+    assert_eq!(
+        stats,
+        [
+            3,
+            1,
+            3,
+            primitives,
+            primitives,
+            0,
+            0,
+            0,
+            1,
+            mesh.points.len() as u64,
+            0
+        ]
+    );
+}
+
+// spec: GFX-STAGE-5 GFX-SHADER-7
+#[test]
+fn volume_views_clear_and_route_to_mip_relative_w_slices() {
+    use adv_abi::types::{D3D11_RENDER_TARGET_VIEW_DESC, D3D11_TEXTURE3D_DESC};
+    let mut r = Raster::new();
+    r.shader(
+        15,
+        9,
+        include_bytes!("../../../../../tests/fixtures/d3d11/guest_color.dxbc"),
+    );
+    let desc = D3D11_TEXTURE3D_DESC {
+        Width: 8,
+        Height: 2,
+        Depth: 8,
+        MipLevels: 2,
+        Format: 28,
+        BindFlags: Bind::RENDER_TARGET,
+        ..Default::default()
+    };
+    write_value(&mut r.machine, DESCRIPTOR, desc);
+    let texture = create_object(&mut r.machine, r.device, 6, &[DESCRIPTOR, 0]);
+    let mut view = |first, count| {
+        write_value(
+            &mut r.machine,
+            DESCRIPTOR,
+            D3D11_RENDER_TARGET_VIEW_DESC {
+                Format: 28,
+                ViewDimension: 8,
+                Anonymous: bytemuck::cast([1u32, first, count]),
+            },
+        );
+        create_object(&mut r.machine, r.device, 9, &[texture, DESCRIPTOR])
+    };
+    let whole = view(0, u32::MAX);
+    let partial = view(1, 2);
+    r.clear(whole, [0., 0., 1., 1.]);
+    r.clear(partial, [0., 1., 0., 1.]);
+    r.targets(4, &[partial]);
+    r.draw(0..4, [1., 0., 0., 1.]);
+    r.shader(13, 23, &crate::shader::dxbc::geometry_routing_fixture());
+    let viewport = D3D11_VIEWPORT {
+        Width: 4.,
+        Height: 1.,
+        MaxDepth: 1.,
+        ..Default::default()
+    };
+    write_value(&mut r.machine, DESCRIPTOR, [viewport; 2]);
+    r.call(44, &[2, DESCRIPTOR]);
+    write_value(&mut r.machine, DESCRIPTOR, [[0i32, 0, 4, 1]; 2]);
+    r.call(45, &[2, DESCRIPTOR]);
+    update_dynamic(
+        &mut r.machine,
+        r.context,
+        r.constants,
+        &[1.0f32, 1., 0., 1.],
+    );
+    let query = r.query(4, false);
+    r.call(27, &[query]);
+    r.call(13, &[3, 0]);
+    r.call(28, &[query]);
+    let stats: [u64; 11] = r.query_data(query);
+    assert_eq!(stats, [3, 1, 3, 1, 1, 1, 1, 4, 0, 0, 0]);
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_TEXTURE3D_DESC {
+            Width: 4,
+            Height: 1,
+            Depth: 4,
+            MipLevels: 1,
+            Usage: 3,
+            CPUAccessFlags: 0x20000,
+            BindFlags: 0,
+            ..desc
+        },
+    );
+    let staging = create_object(&mut r.machine, r.device, 6, &[DESCRIPTOR, 0]);
+    r.call(46, &[staging, 0, 0, 0, 0, texture, 1, 0]);
+    let mapped = map(&mut r.machine, r.context, staging, 1);
+    for (slice, expected) in [0xffff0000u32, 0xff0000ff, 0xff00ffff, 0xffff0000]
+        .into_iter()
+        .enumerate()
+    {
+        let actual: [u32; 4] = GuestPtr::new(mapped.pData + slice as u32 * mapped.DepthPitch)
+            .read(&r.machine.cpu)
+            .unwrap();
+        assert_eq!(actual, [expected; 4], "W slice {slice}");
+    }
+    r.call(15, &[staging, 0]);
+}
+
+// spec: GFX-STAGE-1
+#[test]
+fn stream_overflow_predicates_gate_expanded_draws() {
+    use adv_abi::types::D3D11_SO_DECLARATION_ENTRY;
+    let mut r = Raster::new();
+    let gs = include_bytes!("../../../../../tests/fixtures/d3d11/stage_wide_geometry.dxbc");
+    r.machine.cpu.write(CODE_BYTES, gs).unwrap();
+    r.machine.cpu.write(ARRAY, b"SV_Position\0").unwrap();
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_SO_DECLARATION_ENTRY {
+            SemanticName: ARRAY,
+            ComponentCount: 4,
+            ..Default::default()
+        },
+    );
+    write_value(&mut r.machine, ARRAY + 16, 16u32);
+    let shader = create_object(
+        &mut r.machine,
+        r.device,
+        14,
+        &[
+            CODE_BYTES,
+            gs.len() as u32,
+            DESCRIPTOR,
+            1,
+            ARRAY + 16,
+            1,
+            u32::MAX,
+            0,
+        ],
+    );
+    r.call(23, &[shader, 0, 0]);
+    let predicates = [7, 9, 11, 13, 15].map(|kind| r.query(kind, true));
+    let so = r.query(6, false);
+    for query in predicates.into_iter().chain([so]) {
+        r.call(27, &[query]);
+    }
+    r.call(13, &[3, 0]);
+    for query in predicates.into_iter().chain([so]) {
+        r.call(28, &[query]);
+    }
+    for (query, expected) in predicates.into_iter().zip([1u32, 1, 0, 0, 0]) {
+        assert_eq!(r.query_data::<u32>(query), expected);
+    }
+    assert_eq!(r.query_data::<[u64; 2]>(so), [0, 1]);
+    let stats = r.query(4, false);
+    r.call(27, &[stats]);
+    r.call(30, &[predicates[0], 1]);
+    r.call(13, &[3, 0]);
+    r.call(30, &[predicates[0], 0]);
+    r.call(13, &[3, 0]);
+    r.call(30, &[0, 0]);
+    r.call(28, &[stats]);
+    assert_eq!(
+        r.query_data::<[u64; 11]>(stats),
+        [3, 1, 3, 1, 1, 0, 0, 0, 0, 0, 0]
+    );
+
+    r.call(23, &[0, 0, 0]);
+    r.shader(
+        15,
+        9,
+        include_bytes!("../../../../../tests/fixtures/d3d11/guest_color.dxbc"),
+    );
+    let (target, view, staging) = r.target(1, 28);
+    r.clear(view, [0., 0., 1., 1.]);
+    r.call(30, &[predicates[0], 1]);
+    r.draw(0..1, [1., 0., 0., 1.]);
+    assert_eq!(r.read(target, staging, 1, 4), [0xffff0000]);
+    r.call(30, &[predicates[0], 0]);
+    r.draw(0..1, [1., 0., 0., 1.]);
+    assert_eq!(r.read(target, staging, 1, 4), [0xff0000ff]);
+    r.call(30, &[0, 0]);
 }
 
 // spec: GFX-INTEROP-2
