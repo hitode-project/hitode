@@ -509,6 +509,8 @@ Owners and show order do not choose the base. Toolkits own every window by one h
 **Verification**: Test
 **Basis**: DirectDraw and GDI interoperability on the display surface.
 
+Exclusive-mode DirectDraw frames retain non-shared base ownership and display mode geometry across window surface flushes until the device leaves exclusive mode.
+
 ## Input
 
 ### WINE-IN-1 Presented window coordinates

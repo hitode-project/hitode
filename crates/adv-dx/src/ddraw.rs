@@ -356,6 +356,14 @@ impl DirectDraw {
         if chain.iter().any(|&sid| surfaces[sid].locked.is_some()) {
             return Ok(BUSY);
         }
+        let head = &surfaces[chain[0]];
+        let layout = (head.width, head.height, head.pitch, head.format);
+        if chain[1..].iter().any(|&sid| {
+            let s = &surfaces[sid];
+            (s.width, s.height, s.pitch, s.format) != layout
+        }) {
+            return Err("DirectDraw flip chain surfaces have mismatched geometry".into());
+        }
         surfaces.flush(m, surface::FlushReason::Immediate)?;
         let front = surfaces[chain[0]].pixels;
         for pair in chain.windows(2) {
@@ -540,6 +548,18 @@ impl DirectDraw {
     /// Screen origin of the window a clipper names; primary-surface blits are relative to it.
     pub fn configure_clipper(&mut self, clipper: u32, origin: (i32, i32)) {
         self.clipper_origins.insert(clipper, origin);
+    }
+
+    /// Whether `surface` belongs to the live exclusive-mode device rather than
+    /// sharing window content with GDI (WINE-GFX-11).
+    pub(super) fn is_exclusive_surface(&self, surface: u32) -> bool {
+        self.exclusive_owner
+            .is_some_and(|owner| self.surface_owners.get(&surface) == Some(&owner))
+    }
+
+    /// Whether `surface` belongs to a multi-buffer flip chain.
+    pub(super) fn is_flippable(&self, surface: u32) -> bool {
+        self.flip_chain(surface).len() > 1
     }
 }
 
@@ -974,6 +994,7 @@ impl DirectDraw {
                 }
                 if self.exclusive_owner == Some(destroyed.value.device_id) {
                     self.exclusive_owner = None;
+                    surfaces.set_exclusive_display_mode(false);
                     if let Some(display) = &mut self.display {
                         display.requested = display.desktop;
                         display.suspended = false;
@@ -1311,10 +1332,12 @@ impl DirectDraw {
                     if exclusive {
                         device_state.was_exclusive = true;
                         self.exclusive_owner = Some(device_id);
+                        surfaces.set_exclusive_display_mode(true);
                     } else {
                         device_state.was_exclusive = false;
                         if self.exclusive_owner == Some(device_id) {
                             self.exclusive_owner = None;
+                            surfaces.set_exclusive_display_mode(false);
                         }
                     }
                     if leaving && let Some(display) = &mut self.display {
@@ -1544,6 +1567,7 @@ impl DirectDraw {
                             .changed_exclusive_mode = true;
                         self.lose_video_surfaces(Loss::Mode);
                     }
+                    surfaces.set_exclusive_display_mode(true);
                     return Ok(0);
                 }
                 if surfaces.primary_id().is_some() {
@@ -1557,11 +1581,16 @@ impl DirectDraw {
                 } else {
                     PixelFormat::Bgra32
                 };
+                surfaces.set_exclusive_display_mode(true);
                 0
             }
             api::RESTORE_MODE => {
                 if !matches!(kind, Kind::Device) {
                     return Ok(INVALID);
+                }
+                if self.exclusive_owner.is_none() || self.exclusive_owner == Some(object.device_id)
+                {
+                    surfaces.set_exclusive_display_mode(false);
                 }
                 if self.exclusive_owner == Some(object.device_id)
                     && let Some(display) = &mut self.display
