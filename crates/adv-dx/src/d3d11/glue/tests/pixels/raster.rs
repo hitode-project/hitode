@@ -781,6 +781,228 @@ fn windows_multisample_coverage_uses_guest_resolve() {
     }
 }
 
+// spec: GFX-STAGE-4
+#[test]
+fn multisample_pixel_uav_invocations_and_pipeline_count() {
+    use crate::shader::dxbc::{
+        fields::{
+            D3D10_SB_INTERPOLATION_LINEAR, D3D10_SB_INTERPOLATION_LINEAR_CENTROID,
+            D3D10_SB_INTERPOLATION_LINEAR_SAMPLE,
+        },
+        pixel_atomic_fixture,
+    };
+
+    let mut r = Raster::new();
+    let vs = include_bytes!("../../../../../tests/fixtures/shader-core/vs_5_0.dxbc");
+    r.shader(12, 11, vs);
+    r.machine.cpu.write(ARRAY, b"POSITION\0TEXCOORD\0").unwrap();
+    let elements = [
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: ARRAY,
+            Format: 2,
+            ..Default::default()
+        },
+        D3D11_INPUT_ELEMENT_DESC {
+            SemanticName: ARRAY + 9,
+            Format: 16,
+            AlignedByteOffset: 16,
+            ..Default::default()
+        },
+    ];
+    write_value(&mut r.machine, DESCRIPTOR, elements);
+    let layout = create_object(
+        &mut r.machine,
+        r.device,
+        11,
+        &[DESCRIPTOR, 2, CODE_BYTES, vs.len() as u32],
+    );
+    r.call(17, &[layout]);
+    let vb = buffer(&mut r.machine, r.device, Bind::VERTEX, 3 * 24);
+    let vs_constants = buffer(&mut r.machine, r.device, Bind::CONSTANT, 32);
+    update_dynamic(
+        &mut r.machine,
+        r.context,
+        vb,
+        &[
+            [0.0f32, 0., 0.5, 1., 0., 0.],
+            [2., 0., 0.5, 1., 2., 0.],
+            [0., 2., 0.5, 1., 0., 2.],
+        ],
+    );
+    write_value(&mut r.machine, ARRAY + 16, [vb, 24, 0, vs_constants]);
+    r.call(18, &[0, 1, ARRAY + 16, ARRAY + 20, ARRAY + 24]);
+    r.call(7, &[0, 1, ARRAY + 28]);
+
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 4,
+            Usage: 3,
+            CPUAccessFlags: 0x20000,
+            ..Default::default()
+        },
+    );
+    let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
+    let resolved = r.texture(1, 1, 28, Bind::RENDER_TARGET, 0);
+    let colors = r.texture(1, 1, 28, 0, 0);
+    let stats = |r: &Raster| {
+        r.machine
+            .ext
+            .get::<State>()
+            .execution
+            .as_ref()
+            .unwrap()
+            .gpu_stats()
+    };
+    write_value(&mut r.machine, ARRAY + 64, 0u32);
+    write_value(
+        &mut r.machine,
+        ARRAY + 80,
+        adv_abi::types::D3D11_SUBRESOURCE_DATA {
+            pSysMem: ARRAY + 64,
+            SysMemPitch: 0,
+            SysMemSlicePitch: 0,
+        },
+    );
+    let metal = cfg!(target_vendor = "apple");
+    for samples in [1, 4] {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 1,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: 28,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: samples,
+                Quality: 0,
+            },
+            BindFlags: Bind::RENDER_TARGET,
+            ..Default::default()
+        };
+        let image = r.image(desc, 0);
+        let view = create_object(&mut r.machine, r.device, 9, &[image, 0]);
+        let depth = r.image(
+            D3D11_TEXTURE2D_DESC {
+                Format: 40,
+                BindFlags: Bind::DEPTH_STENCIL,
+                ..desc
+            },
+            0,
+        );
+        let dsv = create_object(&mut r.machine, r.device, 10, &[depth, 0]);
+        let read_color = |r: &mut Raster| {
+            let resource = if samples > 1 {
+                r.call(57, &[resolved, 0, image, 0, 28]);
+                resolved
+            } else {
+                image
+            };
+            r.read(resource, colors, 1, 4)[0].to_le_bytes()
+        };
+        for viewport in [4.0f32, 1.] {
+            // Both viewports cover the sole pixel. The smaller clip volume splits the
+            // triangle into two raster primitives on lavapipe.
+            let scale = 2. / viewport;
+            update_dynamic(
+                &mut r.machine,
+                r.context,
+                vs_constants,
+                &[scale, -scale, 1., 1., -1., 1., 0., 0.],
+            );
+            r.targets(1, &[view]);
+            write_value(
+                &mut r.machine,
+                DESCRIPTOR,
+                D3D11_VIEWPORT {
+                    Width: viewport,
+                    Height: viewport,
+                    MaxDepth: 1.,
+                    ..Default::default()
+                },
+            );
+            r.call(44, &[1, DESCRIPTOR]);
+            let before = stats(&r).per_sample_uav_pipelines;
+            r.shader(
+                15,
+                9,
+                include_bytes!("../../../../../tests/fixtures/d3d11/guest_color.dxbc"),
+            );
+            r.draw(0..1, [1.; 4]);
+            assert_eq!(read_color(&mut r), [255; 4]);
+            assert_eq!(stats(&r).per_sample_uav_pipelines, before);
+            for interpolation in [
+                None,
+                Some(D3D10_SB_INTERPOLATION_LINEAR),
+                Some(D3D10_SB_INTERPOLATION_LINEAR_CENTROID),
+                Some(D3D10_SB_INTERPOLATION_LINEAR_SAMPLE),
+            ] {
+                r.shader(15, 9, &pixel_atomic_fixture(interpolation));
+                for depth in [0, dsv] {
+                    write_value(
+                        &mut r.machine,
+                        DESCRIPTOR,
+                        D3D11_BUFFER_DESC {
+                            ByteWidth: 4,
+                            BindFlags: Bind::UNORDERED,
+                            MiscFlags: Misc::STRUCTURED,
+                            StructureByteStride: 4,
+                            ..Default::default()
+                        },
+                    );
+                    let counter =
+                        create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, ARRAY + 80]);
+                    let uav = create_object(&mut r.machine, r.device, 8, &[counter, 0]);
+                    write_value(&mut r.machine, ARRAY, [view, uav]);
+                    let bind = [1, ARRAY, depth, 1, 1, ARRAY + 4, 0];
+                    let unbind = [0, 0, 0, 1, 1, ARRAY + 64, 0];
+                    r.call(34, &bind);
+                    r.clear(view, [0.; 4]);
+                    if depth != 0 {
+                        r.call(53, &[depth, 1, 1.0f32.to_bits(), 0]);
+                    }
+                    let before = stats(&r).per_sample_uav_pipelines;
+                    r.draw(0..1, [0.; 4]);
+                    r.call(34, &unbind);
+                    let count = r.read(counter, staging, 1, 4)[0];
+                    let expected = if metal
+                        || samples == 1
+                        || interpolation == Some(D3D10_SB_INTERPOLATION_LINEAR_SAMPLE)
+                    {
+                        samples
+                    } else if viewport == 1. {
+                        2
+                    } else {
+                        1
+                    };
+                    assert_eq!(
+                        count, expected,
+                        "{samples}x, {viewport}x{viewport} viewport, interpolation {interpolation:?}, depth {depth}"
+                    );
+                    let color = read_color(&mut r);
+                    if interpolation.is_none() && viewport == 4. {
+                        // Metal resolves four distinct atomic-result colors at 4x.
+                        let red = if count == 4 { 160 } else { 64 };
+                        assert_eq!(color, [red, 128, 0, 255]);
+                    } else {
+                        assert_eq!(&color[2..], &[0, 255]);
+                    }
+                    let pipelines = before + u64::from(metal && samples > 1 && viewport == 4.);
+                    assert_eq!(stats(&r).per_sample_uav_pipelines, pipelines);
+                    if interpolation.is_none() && depth == 0 && viewport == 4. {
+                        r.call(34, &bind);
+                        r.draw(0..1, [0.; 4]);
+                        r.call(34, &unbind);
+                        assert_eq!(r.read(counter, staging, 1, 4)[0], count * 2);
+                        assert_eq!(stats(&r).per_sample_uav_pipelines, pipelines);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(stats(&r).inexact_sample_mask_pipelines, 0);
+}
+
 #[test]
 fn typed_uav_clear_preserves_subword_buffer_edges_and_image_bits() {
     let mut r = Raster::new();

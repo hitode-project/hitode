@@ -1875,13 +1875,13 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 caps,
             );
             let reflection = shader.reflection();
+            let writes_uav = reflection
+                .writes
+                .keys()
+                .any(|(register, _)| *register == Register::UnorderedAccessView);
             let inexact_sample_mask = metal_mask != u32::MAX
                 && (variant.early_tests() && depth.is_some()
                     || samples > 1 && {
-                        let writes_uav = reflection
-                            .writes
-                            .keys()
-                            .any(|(register, _)| *register == Register::UnorderedAccessView);
                         let reads_coverage = reflection
                             .reads
                             .contains_key(&(Register::InputCoverageMask, Some(0)));
@@ -1902,8 +1902,12 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 wgsl::emit_variant(shader.module(), &variant, None, options)
             }
             .map_err(shader_error)?;
+            let effects = writes_uav || !reflection.counter_bindings.is_empty();
             (
-                Some(modern_shader(&code, adv_gpu::shader::Stage::Fragment)?),
+                Some(Arc::new(
+                    modern_shader(&code, adv_gpu::shader::Stage::Fragment)?
+                        .with_guest_uav_effects(effects),
+                )),
                 Some(code),
                 inexact_sample_mask,
             )
@@ -1976,7 +1980,10 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             )
             .map_err(shader_error)?;
             (
-                Some(modern_shader(&vertex_code, adv_gpu::shader::Stage::Vertex)?),
+                Some(Arc::new(modern_shader(
+                    &vertex_code,
+                    adv_gpu::shader::Stage::Vertex,
+                )?)),
                 bindings(&vertex_code),
                 None,
             )
@@ -2380,17 +2387,14 @@ fn shader_error(error: crate::shader::ir::Error) -> Error {
     Error::InvalidArgument
 }
 
-fn modern_shader(
-    code: &Translation,
-    stage: adv_gpu::shader::Stage,
-) -> Result<Arc<ModernShader>, Error> {
+fn modern_shader(code: &Translation, stage: adv_gpu::shader::Stage) -> Result<ModernShader, Error> {
     let id = xxhash_rust::xxh3::xxh3_64(code.source.as_bytes());
-    Ok(Arc::new(ModernShader::wgsl(
+    Ok(ModernShader::wgsl(
         id,
         &code.source,
         code.entry_point,
         stage,
-    )?))
+    )?)
 }
 
 pub(in crate::d3d11::glue) fn dispatch(env: &mut Env<'_>) -> Result<(), Error> {
@@ -2494,11 +2498,10 @@ fn compute(
         }
     }
     let execution = execution(env.ext)?;
-    let pipeline = Arc::new(
-        execution
-            .gpu
-            .prepare_dispatch(modern_shader(&code, adv_gpu::shader::Stage::Compute)?)?,
-    );
+    let pipeline = Arc::new(execution.gpu.prepare_dispatch(Arc::new(modern_shader(
+        &code,
+        adv_gpu::shader::Stage::Compute,
+    )?))?);
     let extent = extent_rect([1, 1, 1]);
     execution.recording.append(
         &mut execution.gpu,

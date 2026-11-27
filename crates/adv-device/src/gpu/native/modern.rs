@@ -59,6 +59,7 @@ pub struct ModernShader {
     stage: Stage,
     bindings: Vec<(u32, p::Binding)>,
     writes: Vec<u32>,
+    guest_uav_effects: bool,
 }
 
 impl ModernShader {
@@ -137,6 +138,7 @@ impl ModernShader {
             stage,
             bindings,
             writes,
+            guest_uav_effects: false,
         })
     }
 
@@ -144,6 +146,15 @@ impl ModernShader {
         let module = naga::front::wgsl::parse_str(source)
             .map_err(|e| Error::Invalid(e.emit_to_string(source)))?;
         Self::new(identity, module, name, stage)
+    }
+
+    pub fn with_guest_uav_effects(mut self, effects: bool) -> Self {
+        self.guest_uav_effects = effects;
+        self
+    }
+
+    pub(super) fn has_guest_uav_effects(&self) -> bool {
+        self.guest_uav_effects
     }
 
     pub(super) fn identity(&self) -> u64 {

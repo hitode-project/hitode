@@ -537,6 +537,123 @@ pub(crate) fn pixel_uav_fixture() -> Vec<u8> {
     container(&[(*b"SHEX", &code)])
 }
 
+#[cfg(feature = "gpu")]
+pub(crate) fn pixel_atomic_fixture(interpolation: Option<u32>) -> Vec<u8> {
+    const RED_STEP: [u32; 1] = [(64.0f32 / 255.0).to_bits()];
+    let mask = |kind, slot, lanes: u32| {
+        register(
+            kind,
+            D3D10_SB_OPERAND_4_COMPONENT,
+            encode_operand_4_component_mask(lanes << D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT),
+            Some(slot),
+        )
+    };
+    let output = |lanes| mask(D3D10_SB_OPERAND_TYPE_OUTPUT, 0, lanes);
+    let uav = |components, controls| {
+        register(
+            D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW,
+            components,
+            controls,
+            Some(1),
+        )
+    };
+    let mut instructions = vec![
+        declaration(D3D10_SB_OPCODE_DCL_OUTPUT, Some(output(15)), &[]),
+        declaration(
+            D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED,
+            Some(uav(0, 0)),
+            &[4],
+        ),
+    ];
+    if let Some(mode) = interpolation {
+        let mut input = declaration(
+            D3D10_SB_OPCODE_DCL_INPUT_PS,
+            Some(mask(D3D10_SB_OPERAND_TYPE_INPUT, 1, 3)),
+            &[],
+        );
+        if let Instruction::Operation { controls, .. } = &mut input {
+            *controls = encode_input_interpolation_mode(mode);
+        }
+        instructions.insert(0, input);
+        instructions.push(op(
+            D3D11_SB_OPCODE_ATOMIC_IADD,
+            vec![uav(2, 0x10), immediate(&[0]), immediate(&[1])],
+        ));
+        let input = register(
+            D3D10_SB_OPERAND_TYPE_INPUT,
+            D3D10_SB_OPERAND_4_COMPONENT,
+            encode_operand_4_component_selection_mode(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE)
+                | (0xe4 << 4),
+            Some(1),
+        );
+        instructions.push(op(D3D10_SB_OPCODE_MOV, vec![output(3), input]));
+    } else {
+        instructions.extend([
+            declaration(D3D10_SB_OPCODE_DCL_TEMPS, None, &[1]),
+            op(
+                D3D11_SB_OPCODE_IMM_ATOMIC_IADD,
+                vec![
+                    destination(0, 1),
+                    uav(2, 0x10),
+                    immediate(&[0]),
+                    immediate(&[1]),
+                ],
+            ),
+            op(D3D10_SB_OPCODE_UTOF, vec![destination(0, 1), temp(0, 0)]),
+            // Successive invocations yield red values 64, 128, 192 and 255.
+            op(
+                D3D10_SB_OPCODE_MAD,
+                vec![
+                    output(1),
+                    temp(0, 0),
+                    immediate(&RED_STEP),
+                    immediate(&RED_STEP),
+                ],
+            ),
+            op(
+                D3D10_SB_OPCODE_MOV,
+                vec![output(2), immediate(&[0x3f00_0000])],
+            ),
+        ]);
+    }
+    instructions.extend([
+        op(D3D10_SB_OPCODE_MOV, vec![output(4), immediate(&[0])]),
+        op(
+            D3D10_SB_OPCODE_MOV,
+            vec![output(8), immediate(&[0x3f80_0000])],
+        ),
+        op(D3D10_SB_OPCODE_RET, Vec::new()),
+    ]);
+    let code: Vec<_> = Program {
+        version: Version {
+            stage: 0,
+            major: 5,
+            minor: 0,
+            reserved: 0,
+        },
+        instructions,
+    }
+    .encode()
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    let signature = |name: &[u8], slot, mask| {
+        let mut bytes: Vec<_> = [1u32, 8, 32, 0, 0, 3, slot, mask]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        bytes.extend_from_slice(name);
+        bytes
+    };
+    let input = signature(b"TEXCOORD\0", 1, 0x303);
+    let output = signature(b"SV_Target\0", 0, 0xf);
+    let mut chunks = vec![(*b"OSGN", output.as_slice()), (*b"SHEX", code.as_slice())];
+    if interpolation.is_some() {
+        chunks.push((*b"ISGN", &input));
+    }
+    container(&chunks)
+}
+
 #[test]
 #[ignore = "exports inputs for the Windows opcode oracle"]
 fn export_encoded_opcode_fixtures() {

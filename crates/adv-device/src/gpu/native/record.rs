@@ -1207,6 +1207,7 @@ impl WorkerState {
                     let cache = f.pipelines.stats();
                     stats.pipeline_cache_hits += cache.pipeline_cache_hits;
                     stats.inexact_sample_mask_pipelines = cache.inexact_sample_mask_pipelines;
+                    stats.per_sample_uav_pipelines = cache.per_sample_uav_pipelines;
                     stats.anticipated_pipeline_draws += cache.anticipated_pipeline_draws;
                     stats.compile_waits += cache.compile_waits;
                     stats.compile_wait_ns += cache.compile_wait_ns;
