@@ -404,8 +404,109 @@ pub(super) struct SwapBuffers;
 
 #[cfg(feature = "gpu")]
 impl dxgi::swap::Buffers for SwapBuffers {
-    fn validate_device(&self, env: &Env<'_>, device: u32) -> Result<(), dxgi::Error> {
-        device_state(env, device).map(|_| ())
+    fn identity(&self, env: &Env<'_>, device: u32) -> Result<u32, dxgi::Error> {
+        device_state(env, device)?;
+        table(env)
+            .canonical(&env.sys.objects, device)
+            .ok_or(dxgi::Error::InvalidArgument)
+    }
+
+    fn adapter(&self, env: &Env<'_>, device: u32) -> Result<Adapter, dxgi::Error> {
+        dxgi::adapter_kind(env, device_state(env, device)?.adapter)
+    }
+
+    fn surface_owner(&self, env: &Env<'_>, pointer: u32) -> Result<(u32, u32), dxgi::Error> {
+        let table = table(env);
+        let surface = table
+            .canonical(&env.sys.objects, pointer)
+            .ok_or(dxgi::Error::InvalidCall)?;
+        let object = table.get(&env.sys.objects, surface).unwrap();
+        if !matches!(object.resource(), Some(Resource::Texture(texture)) if texture.kind() == TextureKind::D2)
+        {
+            return Err(dxgi::Error::InvalidCall);
+        }
+        Ok((surface, object.device().unwrap()))
+    }
+
+    fn scanout(&self, env: &mut Env<'_>, surface: u32, serial: u64) -> Result<(), dxgi::Error> {
+        let Some(Resource::Texture(texture)) = table(env)
+            .get(&env.sys.objects, surface)
+            .and_then(Object::resource)
+        else {
+            return Err(dxgi::Error::InvalidCall);
+        };
+        let [width, height, _] = texture.extent(0);
+        self.present(env, surface, [width, height], serial, true, false)
+            .map(|_| ())
+    }
+
+    fn capture(&self, env: &mut Env<'_>) -> Result<adv_device::frame::Waker, dxgi::Error> {
+        gpu::capture(env.ext).map_err(|_| dxgi::Error::Unavailable)
+    }
+
+    fn copy_display(&self, env: &mut Env<'_>, surface: u32) -> Result<(), dxgi::Error> {
+        let resource = table(env)
+            .get(&env.sys.objects, surface)
+            .unwrap()
+            .resource()
+            .unwrap();
+        if !resource.cpu_access().write() {
+            return Err(dxgi::Error::InvalidCall);
+        }
+        let frame = self
+            .capture(env)?
+            .capture()
+            .recv()
+            .map_err(|_| dxgi::Error::Unavailable)?
+            .map_err(|_| dxgi::Error::Unavailable)?;
+        gpu::copy_capture(env, surface, resource, &frame).map_err(capture_error)
+    }
+
+    fn desktop_resource(
+        &self,
+        env: &mut Env<'_>,
+        device: u32,
+        mode: adv_abi::types::DXGI_MODE_DESC,
+        frame: &adv_device::frame::Captured,
+    ) -> Result<u32, dxgi::Error> {
+        let report = device::report(env, device).map_err(capture_error)?;
+        let texture = super::super::desc::Texture::new_2d(
+            D3D11_TEXTURE2D_DESC {
+                Width: mode.Width,
+                Height: mode.Height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: mode.Format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BindFlags: super::super::desc::Bind::SHADER,
+                ..Default::default()
+            },
+            false,
+            report,
+        )
+        .map_err(Error::from)
+        .map_err(capture_error)?;
+        let description = Resource::Texture(texture);
+        let resource = attach_resource(env, device, description).map_err(com_error)?;
+        let table = table(env);
+        let result = gpu::copy_capture(env, resource, description, frame)
+            .map_err(capture_error)
+            .and_then(|()| {
+                table
+                    .query(&mut env.sys.objects, resource, IID_IDXGIRESOURCE)
+                    .map_err(com_error)
+            });
+        let released = table.release(&mut env.sys.objects, resource);
+        retire(env, released);
+        result
+    }
+
+    fn drop_device_ref(&self, env: &mut Env<'_>, device: u32) {
+        let released = table(env).release(&mut env.sys.objects, device);
+        retire(env, released);
     }
 
     fn caps<'a>(&self, ext: &'a adv_machine::Ext) -> Result<&'a adv_gpu::Caps, dxgi::Error> {
@@ -503,7 +604,8 @@ impl dxgi::swap::Buffers for SwapBuffers {
         size: [u32; 2],
         serial: u64,
         first: bool,
-    ) -> Result<(), dxgi::Error> {
+        composition: bool,
+    ) -> Result<bool, dxgi::Error> {
         if device_state(
             env,
             table(env)
@@ -513,9 +615,17 @@ impl dxgi::swap::Buffers for SwapBuffers {
         )?
         .null_device
         {
-            return Ok(());
+            return Ok(false);
         }
-        gpu::present(env, resource, size, serial, first).map_err(|_| dxgi::Error::Unavailable)
+        if composition {
+            return gpu::flush_shared(env)
+                .map(|()| false)
+                .map_err(|_| dxgi::Error::Unavailable);
+        }
+        gpu::present(env, resource, size, serial, first).map_err(|error| match error {
+            adv_device::gpu::Error::Busy => dxgi::Error::StillDrawing,
+            _ => dxgi::Error::Unavailable,
+        })
     }
 
     fn latency(&self, env: &Env<'_>, device: u32) -> u32 {
@@ -529,6 +639,14 @@ impl dxgi::swap::Buffers for SwapBuffers {
     fn output(&self, env: &mut Env<'_>, device: u32) -> Result<u32, dxgi::Error> {
         let adapter = device_state(env, device)?.adapter;
         dxgi::device_output(env, adapter)
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn capture_error(error: Error) -> dxgi::Error {
+    match error {
+        Error::Device => dxgi::Error::Unavailable,
+        _ => dxgi::Error::InvalidCall,
     }
 }
 

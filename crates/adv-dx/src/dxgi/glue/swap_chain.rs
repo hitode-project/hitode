@@ -100,8 +100,46 @@ pub(super) fn create(env: &mut Env<'_>, invocation: DeviceCall) -> Option<Outcom
             },
             out,
         ),
-        CreateSwapChainForCoreWindow | CreateSwapChainForComposition => {
-            return Some(Outcome::Return(Error::Unsupported.hresult()));
+        CreateSwapChainForCoreWindow => {
+            let build = env.ext.get::<Services>().reported_build;
+            return Some(Outcome::Return(if build < 9200 {
+                Error::NotImplemented.hresult()
+            } else {
+                // A Win32 caller has no CoreWindow to associate with the chain.
+                Error::InvalidCall.hresult()
+            }));
+        }
+        CreateSwapChainForComposition => {
+            let [device, desc, restrict, out, ..] = invocation.arguments;
+            return Some(call(|| {
+                if env.ext.get::<Services>().reported_build < 9200 {
+                    return Err(Error::NotImplemented);
+                }
+                let backend = services(env)?;
+                if backend.adapter(env, device)? != Adapter::Hardware {
+                    return Err(Error::Unsupported);
+                }
+                let desc: DXGI_SWAP_CHAIN_DESC1 = read(env, desc)?;
+                if desc.SwapEffect != 3 || desc.Scaling != 0 || desc.Width == 0 || desc.Height == 0
+                {
+                    return Err(Error::InvalidCall);
+                }
+                if restrict != 0 {
+                    ops::output_display(env, restrict)?;
+                }
+                create_chain(
+                    env,
+                    invocation.this,
+                    device,
+                    Destination::Composition(restrict),
+                    desc,
+                    DXGI_SWAP_CHAIN_FULLSCREEN_DESC {
+                        Windowed: 1,
+                        ..Default::default()
+                    },
+                    out,
+                )
+            }));
         }
         GetSharedResourceAdapterLuid
         | TakeOwnership
@@ -120,7 +158,7 @@ pub(super) fn create(env: &mut Env<'_>, invocation: DeviceCall) -> Option<Outcom
             env,
             invocation.this,
             device,
-            window,
+            Destination::Window(window),
             desc?,
             fullscreen?,
             out,
@@ -157,22 +195,31 @@ pub(super) fn create_legacy(
         env,
         factory,
         device,
-        legacy.OutputWindow,
+        Destination::Window(legacy.OutputWindow),
         modern,
         fullscreen,
         output,
     )
 }
 
+enum Destination {
+    Window(u32),
+    Composition(u32),
+}
+
 fn create_chain(
     env: &mut Env<'_>,
     factory: u32,
     device: u32,
-    window: u32,
+    destination: Destination,
     desc: DXGI_SWAP_CHAIN_DESC1,
     fullscreen: DXGI_SWAP_CHAIN_FULLSCREEN_DESC,
     output: u32,
 ) -> Result<(), Error> {
+    let (window, composition) = match destination {
+        Destination::Window(window) => (window, None),
+        Destination::Composition(restrict) => (0, Some(restrict)),
+    };
     let backend = services(env)?;
     backend.validate_device(env, device)?;
     let build = env.ext.get::<Services>().reported_build;
@@ -201,6 +248,7 @@ fn create_chain(
         buffers,
         description,
         window,
+        composition,
         fullscreen: DXGI_SWAP_CHAIN_FULLSCREEN_DESC {
             Windowed: 1,
             ..fullscreen
@@ -210,6 +258,11 @@ fn create_chain(
         queue: Default::default(),
         background: [0.0; 4],
         rotation: 1,
+        matrix: DXGI_MATRIX_3X2_F {
+            _11: 1.0,
+            _22: 1.0,
+            ..Default::default()
+        },
         source: [actual.Width, actual.Height],
         waitable,
         latency: 1,
@@ -227,6 +280,9 @@ fn create_chain(
         Some(factory),
         base.into_iter().chain(extended),
     )?;
+    if let Some(restrict) = composition.filter(|&restrict| restrict != 0) {
+        ops::add_ref(env, restrict);
+    }
     if window != 0 {
         env.ext
             .get_mut::<State>()
@@ -247,13 +303,17 @@ fn create_chain(
 fn chain<'a>(env: &'a Env<'_>, this: u32) -> Result<&'a Chain, Error> {
     match &ops::object(env, this)?.kind {
         Kind::SwapChain(chain) => Ok(chain),
-        Kind::Factory(_) | Kind::Adapter(_) | Kind::Output => Err(Error::InvalidCall),
+        Kind::Factory(_) | Kind::Adapter(_) | Kind::Output | Kind::Duplication(_) => {
+            Err(Error::InvalidCall)
+        }
     }
 }
 fn chain_mut<'a>(env: &'a mut Env<'_>, this: u32) -> Result<&'a mut Chain, Error> {
     match &mut ops::object_mut(env, this)?.kind {
         Kind::SwapChain(chain) => Ok(chain),
-        Kind::Factory(_) | Kind::Adapter(_) | Kind::Output => Err(Error::InvalidCall),
+        Kind::Factory(_) | Kind::Adapter(_) | Kind::Output | Kind::Duplication(_) => {
+            Err(Error::InvalidCall)
+        }
     }
 }
 
@@ -301,7 +361,8 @@ fn present_call(env: &mut Env<'_>, this: u32, interval: u32, flags: u32) -> Outc
         let backend = services(env)?;
         let device = chain.device;
         let buffer = chain.buffers[0];
-        let first = chain.generation == 0 || raw.SwapEffect >= 3;
+        let first = chain.generation == 0;
+        let composition = chain.composition.is_some();
         let hz = chain.fullscreen.RefreshRate;
         let hz = if hz.Numerator == 0 || hz.Denominator == 0 {
             60
@@ -325,8 +386,19 @@ fn present_call(env: &mut Env<'_>, this: u32, interval: u32, flags: u32) -> Outc
                 present_call(env, this, interval, flags)
             }));
         }
-        let serial = u64::from(chain_mut(env, this)?.queue.count) + 1;
-        backend.present(env, buffer, source, serial, first)?;
+        let serial = env.ext.get::<State>().presentation + 1;
+        match backend.present(env, buffer, source, serial, first, composition) {
+            Ok(true) => env.ext.get_mut::<State>().presentation = serial,
+            Ok(false) => (),
+            Err(Error::StillDrawing) if flags & 8 == 0 => {
+                let deadline = now + 1000;
+                env.sys.keep_exact_deadline();
+                return Ok(Outcome::block(Wait::Until(deadline), move |env, _| {
+                    present_call(env, this, interval, flags)
+                }));
+            }
+            Err(error) => return Err(error),
+        }
         let chain = chain_mut(env, this)?;
         chain.queue.submit(now, interval, hz);
         chain.generation = serial;
@@ -373,7 +445,7 @@ pub fn alt_enter(env: &mut Env<'_>, window: u32) -> bool {
 
 fn change_fullscreen(env: &mut Env<'_>, this: u32, full: bool, target: u32) -> Result<(), Error> {
     let chain = chain(env, this)?;
-    if full && (chain.window == 0 || chain.waitable != 0) {
+    if chain.composition.is_some() || full && (chain.window == 0 || chain.waitable != 0) {
         return Err(Error::InvalidCall);
     }
     let old = chain.target;
@@ -383,8 +455,11 @@ fn change_fullscreen(env: &mut Env<'_>, this: u32, full: bool, target: u32) -> R
     if !full && target != 0 {
         return Err(Error::InvalidCall);
     }
-    if !crate::ddraw::front::modes::set_modern_exclusive(env.ext, this, full) {
-        return Err(Error::Unavailable);
+    let device = services(env)?.identity(env, chain.device)?;
+    if full {
+        ops::claim_output(env, this, device, false)?;
+    } else {
+        ops::release_output(env, this, &mut Vec::new());
     }
     let state = chain_mut(env, this)?;
     state.fullscreen.Windowed = i32::from(!full);
@@ -473,12 +548,21 @@ fn core_window(env: &mut Env<'_>) -> Outcome {
     let out = env.arg(2);
     call(|| {
         write(env, out, 0u32)?;
+        if chain(env, env.arg(0))?.composition.is_some() {
+            return Err(Error::InvalidCall);
+        }
         Err(Error::NoInterface)
     })
 }
 fn restrict_output(env: &mut Env<'_>) -> Outcome {
     let out = env.arg(1);
-    call(|| write(env, out, 0u32))
+    interface_out(env, out, |env| {
+        let pointer = chain(env, env.arg(0))?.composition.unwrap_or(0);
+        if pointer != 0 {
+            ops::add_ref(env, pointer);
+        }
+        Ok(pointer)
+    })
 }
 
 fn resize_buffers(env: &mut Env<'_>) -> Outcome {
@@ -528,13 +612,20 @@ fn resize_target(env: &mut Env<'_>) -> Outcome {
     let (this, raw) = (env.arg(0), read::<DXGI_MODE_DESC>(env, env.arg(1)));
     call(|| {
         let raw = raw?;
-        let window = chain(env, this)?.window;
+        let chain = chain(env, this)?;
+        if chain.composition.is_some() {
+            return Err(Error::InvalidCall);
+        }
+        let window = chain.window;
         let resize = env.ext.get::<Services>().resize;
         resize(env, window, raw)?;
         let fullscreen = &mut chain_mut(env, this)?.fullscreen;
         fullscreen.RefreshRate = raw.RefreshRate;
         fullscreen.ScanlineOrdering = raw.ScanlineOrdering;
         fullscreen.Scaling = raw.Scaling;
+        if fullscreen.Windowed == 0 {
+            ops::output_mode_changed(env.ext);
+        }
         Ok(())
     })
 }
@@ -542,8 +633,11 @@ fn resize_target(env: &mut Env<'_>) -> Outcome {
 fn containing_output(env: &mut Env<'_>) -> Outcome {
     let (this, out) = (env.arg(0), env.arg(1));
     interface_out(env, out, |env| {
-        let device = chain(env, this)?.device;
-        services(env)?.output(env, device)
+        let chain = chain(env, this)?;
+        if chain.composition.is_some() {
+            return Err(Error::InvalidCall);
+        }
+        services(env)?.output(env, chain.device)
     })
 }
 
@@ -674,11 +768,22 @@ fn waitable(env: &mut Env<'_>) -> Outcome {
 
 fn set_matrix(env: &mut Env<'_>) -> Outcome {
     call(|| {
-        read::<DXGI_MATRIX_3X2_F>(env, env.arg(1))?;
-        Err(Error::InvalidCall)
+        let matrix = read::<DXGI_MATRIX_3X2_F>(env, env.arg(1))?;
+        let chain = chain_mut(env, env.arg(0))?;
+        if chain.composition.is_none() || matrix._12 != 0.0 || matrix._21 != 0.0 {
+            return Err(Error::InvalidCall);
+        }
+        chain.matrix = matrix;
+        Ok(())
     })
 }
 
-fn matrix(_: &mut Env<'_>) -> Outcome {
-    Outcome::Return(Error::InvalidCall.hresult())
+fn matrix(env: &mut Env<'_>) -> Outcome {
+    call(|| {
+        let chain = chain(env, env.arg(0))?;
+        if chain.composition.is_none() {
+            return Err(Error::InvalidCall);
+        }
+        write(env, env.arg(1), chain.matrix)
+    })
 }
