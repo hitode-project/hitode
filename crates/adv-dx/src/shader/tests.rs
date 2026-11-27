@@ -1,4 +1,4 @@
-use super::interpreter::*;
+use super::sm::*;
 use super::*;
 fn reg(kind: u32, index: u32) -> u32 {
     0x80000000 | ((kind & 7) << 28) | ((kind & 24) << 8) | index
@@ -422,4 +422,63 @@ fn vs1_implicit_relative_address_rounds_before_read() {
             .position,
         constants.f[5]
     );
+}
+#[test]
+// spec: GFX-NUM-1
+fn predication_lit_pow_and_saturate_follow_reference() {
+    let mut body = Vec::new();
+    for (register, usage) in [(0, 0), (1, 5), (2, 10)] {
+        body.extend(instruction(
+            Opcode::Dcl,
+            &[0x80000000 | usage, dst(6, register)],
+        ));
+    }
+    let mut setp = instruction(Opcode::Setp, &[dst(19, 0), src(2, 1), src(2, 0)]);
+    setp[0] |= 1 << 16;
+    body.extend(setp);
+    body.extend(instruction(Opcode::Mov, &[dst(0, 0), src(2, 2)]));
+    let mut predicated = instruction(Opcode::Mov, &[dst(0, 0), src(19, 0), src(2, 3)]);
+    predicated[0] |= 0x10000000;
+    body.extend(predicated);
+    body.extend(instruction(Opcode::Mov, &[dst(6, 0), src(0, 0)]));
+    body.extend(instruction(Opcode::Lit, &[dst(6, 1), src(2, 4)]));
+    body.extend(instruction(
+        Opcode::Pow,
+        &[dst(0, 1), reg(2, 5), reg(2, 5) | 0x550000],
+    ));
+    body.extend(instruction(
+        Opcode::Mov,
+        &[(dst(0, 1) & !0xf0000) | 0x120000, reg(2, 6)],
+    ));
+    body.extend(instruction(
+        Opcode::Mov,
+        &[(dst(6, 2) & !0xf0000) | 0x30000, src(0, 1)],
+    ));
+    let s = shader(Stage::Vertex, 3, 0, &body);
+    validate(&s);
+    let mut constants = Constants::default();
+    constants.f[1] = [1.0, 0.0, 1.0, 0.0];
+    constants.f[2] = [5.0; 4];
+    constants.f[3] = [7.0; 4];
+    constants.f[4] = [1.0, -1.0, 0.0, 0.0];
+    constants.f[6] = [f32::NAN; 4];
+    let out = s
+        .program()
+        .unwrap()
+        .run(&Inputs::default(), &constants, &mut NoTextures)
+        .unwrap();
+    // Predication selects per component, lit leaves z zero unless y > 0,
+    // pow(0, 0) is one and saturate maps NaN to zero.
+    assert_eq!(out.position, [7.0, 5.0, 7.0, 5.0]);
+    assert_eq!(out.texcoords[0], [1.0, 1.0, 0.0, 1.0]);
+    assert_eq!(out.colors[0][..2], [1.0, 0.0]);
+}
+
+fn run(
+    shader: &Shader,
+    input: &Inputs,
+    constants: &Constants,
+    sampler: &mut dyn Sampler,
+) -> Result<Outputs, Error> {
+    Program::new(shader)?.run(input, constants, sampler)
 }

@@ -323,6 +323,9 @@ impl Writer<'_> {
         op: &Instruction,
         args: &[String],
     ) -> Result<Option<String>, Error> {
+        if let Some(library) = self.legacy {
+            return self.legacy_sample(library, op, args).map(Some);
+        }
         let (dst_types, src_types) = op.opcode.types();
         let mut resource = None;
         let mut sampler = None;

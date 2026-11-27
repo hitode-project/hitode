@@ -158,7 +158,7 @@ fn programmable_corpus_emits_valid_wgsl() {
                 ir::interpreter::run(
                     &module,
                     &Default::default(),
-                    &Default::default(),
+                    &ir::interpreter::Constants::default(),
                     &mut ir::interpreter::NoTextures
                 ),
                 Err(ir::Error::DoublePrecision)

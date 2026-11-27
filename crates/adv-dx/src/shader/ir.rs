@@ -44,6 +44,15 @@ pub enum Model {
     Sm50,
     Level91,
     Level93,
+    /// Direct3D 9 shader models 1 to 3, lowered from their own bytecode.
+    Legacy,
+}
+
+impl Model {
+    /// DXBC arithmetic flushes denormal inputs and results; Direct3D 9 keeps them.
+    pub fn flushes_denormals(self) -> bool {
+        self != Self::Legacy
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

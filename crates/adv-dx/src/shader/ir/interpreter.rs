@@ -13,6 +13,20 @@ pub struct Inputs {
 
 pub type Constants = HashMap<u32, Vec<Vector>>;
 
+/// Constant buffer rows by slot; a row outside the buffer reads as zero.
+pub trait ConstantBuffers {
+    fn row(&self, slot: u32, row: u32) -> Vector;
+}
+
+impl ConstantBuffers for Constants {
+    fn row(&self, slot: u32, row: u32) -> Vector {
+        self.get(&slot)
+            .and_then(|rows| rows.get(row as usize))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Outputs {
     pub registers: HashMap<(Register, u32), Vector>,
@@ -74,28 +88,54 @@ impl Resources for NoTextures {
 pub fn run(
     module: &Module,
     inputs: &Inputs,
-    constants: &Constants,
+    constants: &impl ConstantBuffers,
     resources: &mut impl Resources,
 ) -> Result<Outputs, Error> {
-    if matches!(module.stage, Stage::Geometry | Stage::Hull | Stage::Domain) {
-        return Err(Error::UnsupportedStage(module.stage));
+    Prepared::new(module)?.run(inputs, constants, resources)
+}
+
+/// A module after the shared semantic passes, for repeated execution.
+#[derive(Clone, Debug)]
+pub struct Prepared {
+    module: Module,
+    temporary_count: u32,
+}
+
+impl Prepared {
+    pub fn new(module: &Module) -> Result<Self, Error> {
+        if matches!(module.stage, Stage::Geometry | Stage::Hull | Stage::Domain) {
+            return Err(Error::UnsupportedStage(module.stage));
+        }
+        let (module, reflection) = passes::prepare(module)?;
+        if reflection.doubles {
+            return Err(Error::DoublePrecision);
+        }
+        Ok(Self {
+            module,
+            temporary_count: reflection.temporary_count,
+        })
     }
-    let (module, reflection) = passes::prepare(module)?;
-    if reflection.doubles {
-        return Err(Error::DoublePrecision);
+
+    pub fn run(
+        &self,
+        inputs: &Inputs,
+        constants: &impl ConstantBuffers,
+        resources: &mut impl Resources,
+    ) -> Result<Outputs, Error> {
+        let mut machine = Machine {
+            inputs,
+            constants,
+            resources,
+            temps: vec![[0; 4]; self.temporary_count as usize],
+            arrays: HashMap::new(),
+            immediate: &[],
+            outputs: Outputs::default(),
+            fuel: crate::shader::MAX_EXECUTION_STEPS,
+            flush: self.module.model.flushes_denormals(),
+        };
+        let _ = machine.block(&self.module.body)?;
+        Ok(machine.outputs)
     }
-    let mut machine = Machine {
-        inputs,
-        constants,
-        resources,
-        temps: vec![[0; 4]; reflection.temporary_count as usize],
-        arrays: HashMap::new(),
-        immediate: &[],
-        outputs: Outputs::default(),
-        fuel: crate::shader::MAX_EXECUTION_STEPS,
-    };
-    let _ = machine.block(&module.body)?;
-    Ok(machine.outputs)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,18 +145,19 @@ enum Branch {
     Continue,
 }
 
-struct Machine<'a, R> {
+struct Machine<'a, C: ?Sized, R> {
     inputs: &'a Inputs,
-    constants: &'a Constants,
+    constants: &'a C,
     resources: &'a mut R,
     temps: Vec<Vector>,
     arrays: HashMap<u32, Vec<Vector>>,
     immediate: &'a [Vector],
     outputs: Outputs,
     fuel: usize,
+    flush: bool,
 }
 
-impl<'a, R: Resources> Machine<'a, R> {
+impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
     fn tick(&mut self) -> Result<(), Error> {
         self.fuel = self.fuel.checked_sub(1).ok_or(Error::ExecutionLimit)?;
         Ok(())
@@ -356,11 +397,7 @@ impl<'a, R: Resources> Machine<'a, R> {
             OperandValue::Constant { slot, byte_offset } => {
                 let slot = self.index(slot, 1)?;
                 let row = self.index(byte_offset, 16)?;
-                self.constants
-                    .get(&slot)
-                    .and_then(|rows| rows.get(row as usize))
-                    .copied()
-                    .unwrap_or_default()
+                self.constants.row(slot, row)
             }
             OperandValue::Register {
                 register: Register::IndexableTemp,
@@ -407,7 +444,7 @@ impl<'a, R: Resources> Machine<'a, R> {
         let swizzle = operand.components.swizzle();
         Ok(std::array::from_fn(|lane| {
             let value = vector[swizzle[lane] as usize];
-            let value = alu::modify(value, operand.modifier, ty);
+            let value = alu::modify(value, operand.modifier, ty, self.flush);
             if flush && ty == ValueType::Float {
                 alu::flush(value)
             } else {

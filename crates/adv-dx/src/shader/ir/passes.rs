@@ -13,7 +13,9 @@ pub(crate) fn prepare(module: &Module) -> Result<(Module, Reflection), Error> {
     if inline_calls(&mut module, reflection.temporary_count, None)? {
         reflection = analyze(&module);
     }
-    flush_denormals(&mut module, &reflection);
+    if module.model.flushes_denormals() {
+        flush_denormals(&mut module, &reflection);
+    }
     lower_half_conversion(&mut module, &reflection);
     Ok((module, reflection))
 }

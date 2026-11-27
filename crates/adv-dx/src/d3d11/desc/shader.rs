@@ -258,12 +258,13 @@ fn accepts(stage: Stage, model: Model, report: &Report) -> bool {
     match stage {
         Stage::Vertex | Stage::Pixel => match model {
             Model::Level91 | Model::Level93 => true,
+            Model::Legacy => false,
             Model::Sm40 => report.level >= L10_0,
             Model::Sm41 => report.level >= L10_1,
             Model::Sm50 => report.level >= L11_0,
         },
         Stage::Compute => match model {
-            Model::Level91 | Model::Level93 => false,
+            Model::Level91 | Model::Level93 | Model::Legacy => false,
             Model::Sm40 => report.level >= L11_0 || (report.level >= L10_0 && report.compute_4x),
             Model::Sm41 => report.level >= L11_0 || (report.level >= L10_1 && report.compute_4x),
             Model::Sm50 => report.level >= L11_0,
@@ -272,7 +273,7 @@ fn accepts(stage: Stage, model: Model, report: &Report) -> bool {
             Model::Sm40 => report.level >= L10_0,
             Model::Sm41 => report.level >= L10_1,
             Model::Sm50 => report.level >= L11_0,
-            Model::Level91 | Model::Level93 => false,
+            Model::Level91 | Model::Level93 | Model::Legacy => false,
         },
         Stage::Hull | Stage::Domain => model == Model::Sm50 && report.level >= L11_0,
     }

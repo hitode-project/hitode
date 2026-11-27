@@ -28,7 +28,7 @@ pub(super) fn parse(tokens: &[u32]) -> Result<Shader, Error> {
         inputs: Vec::new(),
         outputs: Vec::new(),
         tokens: Vec::new(),
-        flow: Vec::new(),
+        program: std::sync::OnceLock::new(),
     };
     let mut cursor = 1;
     let mut executable = false;
@@ -278,7 +278,7 @@ pub(super) fn parse(tokens: &[u32]) -> Result<Shader, Error> {
             immediate,
         });
     }
-    result.flow = validate_flow(&result.instructions)?;
+    validate_flow(&result.instructions)?;
     if stage == Stage::Vertex {
         for ins in &result.instructions {
             for source in &ins.sources {
@@ -670,7 +670,7 @@ fn validate_opcode(op: Opcode, stage: Stage, v: Version, offset: usize) -> Resul
     }
     Ok(())
 }
-fn validate_flow(instructions: &[Instruction]) -> Result<Vec<Flow>, Error> {
+fn validate_flow(instructions: &[Instruction]) -> Result<(), Error> {
     let mut flow = vec![Flow::default(); instructions.len()];
     let mut stack: Vec<(Opcode, usize, Option<usize>)> = Vec::new();
     let mut labels = BTreeMap::new();
@@ -795,7 +795,7 @@ fn validate_flow(instructions: &[Instruction]) -> Result<Vec<Flow>, Error> {
             )?;
         }
     }
-    Ok(flow)
+    Ok(())
 }
 fn reg_name(r: Register, stage: Stage) -> String {
     use RegisterKind::*;
