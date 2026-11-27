@@ -199,7 +199,7 @@ fn setup(jit: bool, legacy: bool, mut registry: Registry) -> (Machine<JitCpu>, u
             },
             memory,
             window: |_, _, _| None,
-            submitted: |_, _, _| {},
+            submitted: |_, _, _, _| {},
             completed: |_, _| None,
             released: |_, _| {},
             vsync: |_| None,
@@ -892,7 +892,7 @@ fn windowed_primary_screen_rectangles(cooperative_window: u32) {
     let (mut m, device) = setup(false, false, Registry::default());
     m.ext.insert(ClientOrigin(100, 50));
     m.ext.insert(std::cell::Cell::new(0u32));
-    m.ext.get_mut::<front::State>().provider.submitted = |ext, hwnd, _| {
+    m.ext.get_mut::<front::State>().provider.submitted = |ext, hwnd, _, _| {
         ext.get::<std::cell::Cell<u32>>().set(hwnd);
     };
     m.ext.get_mut::<front::State>().provider.window = |ext, _, hwnd| {
@@ -1424,3 +1424,173 @@ fn inaccessible_argument_pointers_answer_invalid_params() {
 }
 
 mod blt;
+
+#[test]
+// spec: WINE-GFX-11 GFX-DDRAW-6 GFX-DDRAW-16
+fn exclusive_mode_submits_non_shared_and_preserves_flip_chain_geometry() {
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct Events {
+        submitted: RefCell<Vec<(u32, u32, bool)>>,
+        released: RefCell<Vec<u32>>,
+    }
+
+    let mut m = Machine::new(
+        JitCpu::new(PARK_ADDR, false).unwrap(),
+        Registry::default(),
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    m.cpu.map(CODE, 4096, Prot::RX).unwrap();
+    m.cpu.map(DATA, 4096, Prot::RW).unwrap();
+    m.cpu.map(0x500000, 65536, Prot::RW).unwrap();
+    #[cfg(feature = "gpu")]
+    m.ext.insert(SurfaceCapture::new().unwrap());
+    m.ext
+        .insert(SurfaceStore::new(800, 600, 0x500000, 65536, Snapshot::default()).unwrap());
+    m.ext.insert(Events::default());
+    front::install(
+        &mut m,
+        front::Provider {
+            dc: crate::interop::MemoryDc {
+                create: |_, _, _| unreachable!(),
+                flush: |_, _, _, _| unreachable!(),
+                release: |_, _, _| unreachable!(),
+                discard: |_, _| unreachable!(),
+            },
+            memory,
+            window: |_, _, hwnd| {
+                (hwnd == 7).then_some(front::WindowGeometry {
+                    hwnd: 7,
+                    width: 64,
+                    height: 48,
+                    origin: (0, 0),
+                })
+            },
+            submitted: |ext, hwnd, surface, shared| {
+                ext.get::<Events>()
+                    .submitted
+                    .borrow_mut()
+                    .push((hwnd, surface, shared));
+            },
+            completed: |_, _| None,
+            released: |ext, surface| {
+                ext.get::<Events>().released.borrow_mut().push(surface);
+            },
+            vsync: |_| None,
+        },
+    )
+    .unwrap();
+    m.cpu.write(DATA + 128, &IID_DDRAW7).unwrap();
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::DD_CREATE, &[0, DATA, DATA + 128, 0]),
+        Outcome::Return(0)
+    ));
+    let device = m.cpu.read_u32(DATA).unwrap();
+
+    // Enter exclusive fullscreen mode and set a 16-bit 32×24 mode smaller than the 64×48 window.
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::COOPERATIVE, &[device, 7, 0x11]),
+        Outcome::Return(0)
+    ));
+    assert!(matches!(
+        front::call(
+            &mut env(&mut m),
+            api::DISPLAY_MODE,
+            &[device, 32, 24, 16, 60, 0]
+        ),
+        Outcome::Return(0)
+    ));
+    assert!(m.ext.get::<SurfaceStore>().exclusive_display_mode());
+
+    // A GDI window size sync before CreateSurface must not overwrite the exclusive mode.
+    m.ext
+        .get_mut::<SurfaceStore>()
+        .sync_window_size(64, 48)
+        .unwrap();
+    assert_eq!(
+        (
+            m.ext.get::<SurfaceStore>().width,
+            m.ext.get::<SurfaceStore>().height
+        ),
+        (32, 24)
+    );
+
+    // Create a primary + 1 backbuffer flip chain at 32×24×16.
+    let mut desc = [0u8; 124];
+    desc[..4].copy_from_slice(&124u32.to_le_bytes());
+    desc[4..8].copy_from_slice(&(0x1u32 | 0x20).to_le_bytes()); // DDSD_CAPS | DDSD_BACKBUFFERCOUNT
+    desc[20..24].copy_from_slice(&1u32.to_le_bytes());
+    desc[104..108].copy_from_slice(&(0x200u32 | 0x10 | 0x8).to_le_bytes()); // PRIMARY | FLIP | COMPLEX
+    m.cpu.write(DATA + 256, &desc).unwrap();
+    assert!(matches!(
+        front::call(
+            &mut env(&mut m),
+            api::CREATE_SURFACE,
+            &[device, DATA + 256, DATA + 4, 0]
+        ),
+        Outcome::Return(0)
+    ));
+    let primary = m.cpu.read_u32(DATA + 4).unwrap();
+    let primary_sid = m.ext.get::<SurfaceStore>().primary_id().unwrap();
+
+    // A color-fill Blt on the exclusive primary submits non-shared ownership.
+    let mut fx = [0u8; 100];
+    fx[..4].copy_from_slice(&100u32.to_le_bytes());
+    fx[80..84].copy_from_slice(&0xf800u32.to_le_bytes());
+    m.cpu.write(DATA + 512, &fx).unwrap();
+    assert!(matches!(
+        front::call(
+            &mut env(&mut m),
+            api::BLT,
+            &[primary, 0, 0, 0, 0x0100_0400, DATA + 512]
+        ),
+        Outcome::Return(0)
+    ));
+    assert_eq!(
+        *m.ext.get::<Events>().submitted.borrow(),
+        vec![(7, primary_sid, false)]
+    );
+
+    // A GDI window size sync after CreateSurface leaves primary and flip chain intact.
+    m.ext
+        .get_mut::<SurfaceStore>()
+        .sync_window_size(64, 48)
+        .unwrap();
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::FLIP, &[primary, 0, 1]),
+        Outcome::Return(0)
+    ));
+    {
+        let store = m.ext.get::<SurfaceStore>();
+        assert_eq!(
+            (store[primary_sid].width, store[primary_sid].height),
+            (32, 24)
+        );
+        assert_eq!(store[primary_sid].pitch, 64);
+    }
+
+    // Leaving exclusive mode clears the lock and releases non-shared front ownership.
+    assert!(matches!(
+        front::call(&mut env(&mut m), api::COOPERATIVE, &[device, 7, 8]),
+        Outcome::Return(0)
+    ));
+    assert!(!m.ext.get::<SurfaceStore>().exclusive_display_mode());
+    assert_eq!(*m.ext.get::<Events>().released.borrow(), vec![primary_sid]);
+
+    // Windowed DirectDraw submissions continue to share content with GDI (WINE-GFX-11).
+    m.ext.get::<Events>().submitted.borrow_mut().clear();
+    assert!(matches!(
+        front::call(
+            &mut env(&mut m),
+            api::BLT,
+            &[primary, 0, 0, 0, 0x0100_0400, DATA + 512]
+        ),
+        Outcome::Return(0)
+    ));
+    assert_eq!(
+        *m.ext.get::<Events>().submitted.borrow(),
+        vec![(7, primary_sid, true)]
+    );
+}

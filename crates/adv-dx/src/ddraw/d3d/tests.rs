@@ -66,7 +66,7 @@ impl Fixture {
                 },
                 memory,
                 window: |_, _, _| None,
-                submitted: |_, _, _| {},
+                submitted: |_, _, _, _| {},
                 completed: |_, _| None,
                 released: |_, _| {},
                 vsync: |_| None,

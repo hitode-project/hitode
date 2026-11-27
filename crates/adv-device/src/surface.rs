@@ -1375,6 +1375,8 @@ pub struct Surfaces<P: Presenter> {
     pub height: u32,
     /// Format of the primary surface and of surfaces that do not name one.
     pub display_format: PixelFormat,
+    /// True while an exclusive graphics front owns the display mode.
+    exclusive_display_mode: bool,
     arena: Arena,
     /// Next id; surfaces and device contexts share the numbering.
     next: u32,
@@ -1458,6 +1460,7 @@ impl<P: Presenter> Surfaces<P> {
             width,
             height,
             display_format: PixelFormat::Bgra32,
+            exclusive_display_mode: false,
             arena: Arena::new(arena, len)?,
             next: 16,
             surfaces: BTreeMap::new(),
@@ -2008,6 +2011,24 @@ impl<P: Presenter> Surfaces<P> {
         // The former foreground can keep producing its local pending frame.
         self.deferred_presentation = true;
         Ok(transferred)
+    }
+    /// Mark whether an exclusive front owns the display mode and geometry.
+    pub fn set_exclusive_display_mode(&mut self, exclusive: bool) {
+        self.exclusive_display_mode = exclusive;
+    }
+    /// Whether an exclusive front currently owns the display mode.
+    pub fn exclusive_display_mode(&self) -> bool {
+        self.exclusive_display_mode
+    }
+    /// Update the default window size for GDI presentation without modifying
+    /// an active primary surface or an exclusive display mode.
+    pub fn sync_window_size(&mut self, width: u32, height: u32) -> Result<(), String> {
+        size(width, height)?;
+        if self.primary.is_none() && !self.exclusive_display_mode {
+            self.width = width;
+            self.height = height;
+        }
+        Ok(())
     }
     /// Resize the display; an existing primary surface keeps its overlapping pixels.
     pub fn configure_window(

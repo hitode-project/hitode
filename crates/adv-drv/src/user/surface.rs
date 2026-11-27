@@ -654,9 +654,7 @@ fn attach(env: &mut Env<'_>, address: u32, dirty: [i32; 4]) -> Result<Option<(u3
         }
     };
     let store = env.ext.get_mut::<SurfaceStore>();
-    if (store.width, store.height) != (width, height) {
-        store.configure_window(width, height, &mut memory)?;
-    }
+    store.sync_window_size(width, height)?;
     Ok(Some((sid, damage)))
 }
 
@@ -903,6 +901,115 @@ mod tests {
             super::super::input::front_window(&m.ext, Some(video)),
             Some(hwnd)
         );
+    }
+
+    // spec: WINE-GFX-4 WINE-GFX-10 WINE-GFX-11
+    #[test]
+    fn gdi_flush_preserves_exclusive_display_mode_and_primary_geometry() {
+        use adv_abi::{Env, Registry};
+        use adv_cpu::{
+            JitCpu,
+            backend::{Guest, Prot},
+        };
+        use adv_device::surface::{
+            MemoryOperations, MemoryView, PixelFormat, Snapshot, SurfaceStore,
+        };
+        use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+        use std::borrow::Cow;
+        fn memory(cpu: &mut dyn Guest) -> MemoryView<'_, dyn Guest + '_> {
+            MemoryView::new(
+                cpu,
+                MemoryOperations {
+                    read: |cpu, at, len| {
+                        let mut bytes = vec![0; len];
+                        cpu.read(at, &mut bytes).map_err(|e| e.to_string())?;
+                        Ok(Cow::Owned(bytes))
+                    },
+                    write: |cpu, at, bytes| cpu.write(at, bytes).map_err(|e| e.to_string()),
+                    writable: |cpu, at, len| {
+                        adv_abi::guest::check_range(cpu, at, len as u32, Prot::WRITE)
+                            .map_err(|e| e.to_string())
+                    },
+                    copy: |cpu, src, dst, len| {
+                        cpu.copy_memory(src, dst, len).map_err(|e| e.to_string())
+                    },
+                },
+            )
+        }
+        let mut m = Machine::new(
+            JitCpu::new(PARK_ADDR, false).unwrap(),
+            Registry::default(),
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        m.cpu.map(0x410000, 4096, Prot::RW).unwrap();
+        m.cpu.map(0x500000, 65536, Prot::RW).unwrap();
+        m.ext.insert(crate::Provider {
+            memory,
+            completed: |_, _| None,
+        });
+        let mut store = SurfaceStore::new(4, 2, 0x500000, 65536, Snapshot::default()).unwrap();
+        store.set_exclusive_display_mode(true);
+        m.ext.insert(store);
+        let hwnd = 9;
+        m.ext.get_or_default::<super::super::Windows>().0.insert(
+            hwnd,
+            super::super::Window {
+                visible: true,
+                client: [0, 0, 16, 8],
+                extent: [0, 0, 16, 8],
+                origin: (0, 0),
+                ..Default::default()
+            },
+        );
+        let address = 0x2200;
+        m.ext.get_or_default::<super::Surfaces>().0.insert(
+            address,
+            super::Surface {
+                hwnd,
+                pixels: 0x410000,
+                width: 16,
+                height: 8,
+                view: None,
+                drawn: true,
+                layered: false,
+            },
+        );
+        m.ext.get_or_default::<super::super::input::Presentation>();
+        let compose = |m: &mut Machine<JitCpu>, drawn| {
+            super::compose(
+                &mut Env {
+                    context: m.sys.current,
+                    cpu: &mut m.cpu,
+                    sys: &mut m.sys,
+                    ext: &mut m.ext,
+                    thunk: 0,
+                },
+                drawn,
+            )
+            .unwrap();
+        };
+        // A GDI flush before primary creation keeps the exclusive display mode size.
+        compose(&mut m, Some((address, [0, 0, 16, 8])));
+        assert_eq!(
+            (
+                m.ext.get::<SurfaceStore>().width,
+                m.ext.get::<SurfaceStore>().height
+            ),
+            (4, 2)
+        );
+        // Once a primary surface exists, GDI flushes never resize it.
+        let primary = {
+            let mut mem = memory(&mut m.cpu);
+            let store = m.ext.get_mut::<SurfaceStore>();
+            store.display_format = PixelFormat::Rgb565;
+            store.primary(&mut mem).unwrap()
+        };
+        compose(&mut m, Some((address, [0, 0, 16, 8])));
+        let store = m.ext.get::<SurfaceStore>();
+        assert_eq!((store.width, store.height), (4, 2));
+        assert_eq!((store[primary].width, store[primary].height), (4, 2));
+        assert_eq!(store[primary].pitch, 8);
     }
 
     // spec: WINE-GFX-10
