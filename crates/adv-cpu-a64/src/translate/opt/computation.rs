@@ -2293,8 +2293,8 @@ impl Proof {
         Some(self.scope_frame.as_ref()?.latch)
     }
 
-    /// Quote a split against its current trip count before evaluating its
-    /// complete access plan at admission.
+    /// Read the split loop's current trip count without evaluating its full
+    /// access plan. This also prices a prefix that recalled at the head.
     pub(crate) fn split_iterations(
         &self,
         cpu: &CpuState,
@@ -2304,7 +2304,6 @@ impl Proof {
         let count = self.outer.filter(|outer| outer.split)?.count;
         scratch.reset_entry(count + 1);
         self.value(count, cpu, scratch, &mut read)
-            .filter(|&n| n >= 2)
     }
 
     /// After a successful `evaluate`, the head loop's iterations if every

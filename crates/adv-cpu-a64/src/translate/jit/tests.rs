@@ -220,7 +220,7 @@ fn whole_unit_emission_matches_baseline() {
             "switch" => (48, 0x1b76e4b83d612bcd),
             "loop" => (119, 0x648442f8babf1b84),
             "worker" => (180, 0xeb38467e1876adf7),
-            "resident" => (598, 0xa14c1c6657430c61),
+            "resident" => (620, 0x64b5bee0ff004e38),
             _ => unreachable!(),
         };
         assert_eq!((words.len(), digest), baseline, "{name}");

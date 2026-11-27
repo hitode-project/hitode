@@ -14,7 +14,7 @@ use super::{
 };
 use crate::translate::lower::fp_state;
 use crate::translate::lower::stubs;
-use crate::translate::lower::{emit_link_point, emit_link_transition};
+use crate::translate::lower::{emit_link_point, emit_link_transition, emit_target};
 
 const CPU: Reg = Reg::new(0);
 const FLAGS: Reg = Reg::new(1);
@@ -498,7 +498,7 @@ impl Emitter<'_> {
         ir: &IrRecord,
         assumed: &Assumed,
         bytes: u64,
-        arrival: bool,
+        (arrival, checkpoint): (bool, bool),
     ) {
         let start = self.asm.offset();
         let record = recovery::lower_record(ir, &self.locations);
@@ -574,6 +574,18 @@ impl Emitter<'_> {
                 }
             });
             probation.exit(&mut self.asm, record.eip, rows);
+        }
+        if checkpoint {
+            let tier1 = self.asm.label();
+            self.asm.emit(ldr(W, T, RT, runtime::DEFERRED));
+            self.asm.cbz(W, false, T, tier1);
+            self.asm.emit(movz(W, CPU, runtime::Exit::Budget.word(), 0));
+            emit_target(&mut self.asm, record.eip);
+            self.asm.emit_all(&[
+                ldr(X, T, RT, runtime::RESIDENT_CHECKPOINT_EXIT),
+                crate::encode::br(T),
+            ]);
+            self.asm.bind(tier1);
         }
         let point = self.asm.offset();
         self.links.push((point, record.eip));
