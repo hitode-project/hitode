@@ -93,6 +93,24 @@ impl SharedReadView for View {
     }
 }
 
+// spec: DEV-AUDIO-2
+#[test]
+fn source_capacity_grows_without_callback_allocation_or_destruction() {
+    let control = AudioControl::new(false);
+    let mut reader = control.stream().device_reader(44100, 2).unwrap();
+    let view = sine(44100, 440.0, 512);
+    for source in 1..=513 {
+        add(&control, source, view.clone(), 44100, vec![]);
+    }
+    assert!(control.play_ring(1, true, 1));
+    assert!(control.play_ring(513, true, 1));
+    let mut output = [0.0; 512];
+    no_alloc(|| {
+        reader.read(&mut output, 0);
+    });
+    assert!(output.iter().any(|&sample| sample > 0.7));
+}
+
 #[test]
 fn shared_process_audio_keeps_notices_and_retires_only_the_exiting_owner() {
     use adv_device::{AudioEvent, mixer::PcmBlock};

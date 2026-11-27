@@ -27,6 +27,15 @@ fn retirement_wake(wake: Waker) -> Box<dyn FnOnce() + Send> {
     Box::new(move || drop(wake))
 }
 
+struct OwnerExit(Option<Arc<super::record::WorkerShared>>);
+impl Drop for OwnerExit {
+    fn drop(&mut self) {
+        if let Some(worker) = &self.0 {
+            worker.close_owner();
+        }
+    }
+}
+
 pub(super) struct Owner {
     join: Option<std::thread::JoinHandle<()>>,
     pub failure: Arc<OnceLock<String>>,
@@ -45,6 +54,7 @@ impl Owner {
         queue: Queue,
         commands: Consumer,
         presenter: Box<dyn Presenter>,
+        worker: Arc<super::record::WorkerShared>,
     ) -> Result<Self, super::super::Error> {
         let wake = Some(commands.waker());
         let failure = Arc::new(OnceLock::new());
@@ -52,7 +62,7 @@ impl Owner {
         let join = std::thread::Builder::new()
             .name("GPU owner".into())
             .spawn(move || {
-                if let Err(error) = run(queue, commands, presenter) {
+                if let Err(error) = run(queue, commands, presenter, Some(worker)) {
                     let _ = owner_failure.set(error.to_string());
                 }
             })
@@ -118,6 +128,7 @@ struct Attachments {
 
 struct State {
     wake: super::stream::Waker,
+    worker: Option<Arc<super::record::WorkerShared>>,
     queue: Queue,
     encoder: Option<Encoder>,
     presenter: Box<dyn Presenter>,
@@ -149,9 +160,11 @@ pub(super) fn run(
     queue: Queue,
     commands: Consumer,
     presenter: Box<dyn Presenter>,
+    worker: Option<Arc<super::record::WorkerShared>>,
 ) -> adv_gpu::Result<()> {
+    let _exit = OwnerExit(worker.clone());
     high_priority()?;
-    let mut state = State::new(queue, presenter, commands.waker());
+    let mut state = State::new_with_worker(queue, presenter, commands.waker(), worker);
     let wake = commands.waker();
     state.presenter.service(&mut state.queue, Some(&wake));
     loop {
@@ -208,9 +221,19 @@ pub(super) fn run(
     Ok(())
 }
 impl State {
+    #[cfg(test)]
     fn new(queue: Queue, presenter: Box<dyn Presenter>, wake: super::stream::Waker) -> Self {
+        Self::new_with_worker(queue, presenter, wake, None)
+    }
+    fn new_with_worker(
+        queue: Queue,
+        presenter: Box<dyn Presenter>,
+        wake: super::stream::Waker,
+        worker: Option<Arc<super::record::WorkerShared>>,
+    ) -> Self {
         Self {
             wake,
+            worker,
             queue,
             encoder: None,
             presenter,
@@ -762,6 +785,9 @@ impl State {
                     },
                 );
                 self.end_frame();
+                if let Some(worker) = &self.worker {
+                    worker.retire_frame();
+                }
             }
             Command::Present {
                 base,
@@ -784,6 +810,9 @@ impl State {
                     },
                 );
                 self.end_frame();
+                if let Some(worker) = &self.worker {
+                    worker.retire_frame();
+                }
             }
             Command::Clear { .. } | Command::Draw(_) => unreachable!(),
         }
@@ -1794,7 +1823,7 @@ struct Color {rgba:vec4<f32>}
         });
         assert_eq!(events.recv_timeout(TIMEOUT).unwrap(), 1);
         assert!(events.recv_timeout(Duration::from_millis(20)).is_err());
-        let owner = std::thread::spawn(move || run(queue, consumer, Box::new(Headless)));
+        let owner = std::thread::spawn(move || run(queue, consumer, Box::new(Headless), None));
         assert_eq!(events.recv_timeout(TIMEOUT).unwrap(), 2);
         producer_thread.join().unwrap();
         owner.join().unwrap().unwrap();
@@ -1810,7 +1839,13 @@ struct Color {rgba:vec4<f32>}
         let (mut producer, consumer) =
             super::super::stream::channel(device.ring(128 << 10).unwrap());
         let gate = producer.gate();
-        let owner = Owner::start(queue, consumer, Box::new(Headless)).unwrap();
+        let owner = Owner::start(
+            queue,
+            consumer,
+            Box::new(Headless),
+            Arc::new(super::super::record::WorkerShared::new()),
+        )
+        .unwrap();
         producer.push(color(&image));
         producer.push(clear(rect(0, 0, 256, 128), [1., 0., 0., 1.]));
         producer.push(Command::Submit);
@@ -1962,7 +1997,7 @@ struct Color {rgba:vec4<f32>}
             display: display.clone(),
             notify: Some(notify),
         };
-        let owner = std::thread::spawn(move || run(queue, consumer, Box::new(presenter)));
+        let owner = std::thread::spawn(move || run(queue, consumer, Box::new(presenter), None));
         producer.push(color(&image));
         for serial in 1..=4 {
             producer.push(clear(rect(0, 0, 4, 4), [0., 0., serial as f64 / 4., 1.]));

@@ -361,11 +361,12 @@ pub(super) struct WorkerShared {
     queued_cmds: AtomicUsize,
     queued_bytes: AtomicUsize,
     in_flight_frames: AtomicUsize,
+    owner_closed: AtomicBool,
     wakes: Mutex<Vec<(u64, Arc<adv_sync::WakeEvent>)>>,
 }
 
 impl WorkerShared {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             queue: Mutex::new(WorkerQueue::default()),
             work_cv: Condvar::new(),
@@ -373,8 +374,21 @@ impl WorkerShared {
             queued_cmds: AtomicUsize::new(0),
             queued_bytes: AtomicUsize::new(0),
             in_flight_frames: AtomicUsize::new(0),
+            owner_closed: AtomicBool::new(false),
             wakes: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(super) fn retire_frame(&self) {
+        self.in_flight_frames.fetch_sub(1, Ordering::AcqRel);
+        self.space_cv.notify_all();
+        self.signal_wake();
+    }
+
+    pub(super) fn close_owner(&self) {
+        self.owner_closed.store(true, Ordering::Release);
+        self.space_cv.notify_all();
+        self.signal_wake();
     }
 
     fn signal_wake(&self) {
@@ -439,9 +453,9 @@ impl WorkerHandle {
     pub(super) fn start(
         device: adv_gpu::Device,
         producer: Producer,
+        shared: Arc<WorkerShared>,
         owner_waker: Option<super::stream::Waker>,
     ) -> Result<Self, Error> {
-        let shared = Arc::new(WorkerShared::new());
         let worker_shared = shared.clone();
         let join = std::thread::Builder::new()
             .name("adv-gfx-worker".into())
@@ -552,10 +566,16 @@ impl WorkerHandle {
 
     pub(super) fn admit_present(&self, nonblocking: bool) -> Result<(), Error> {
         loop {
+            if self.shared.owner_closed.load(Ordering::Acquire) {
+                return Err(Error::Device("GPU owner stopped".into()));
+            }
             if self.shared.in_flight_frames.load(Ordering::Acquire) < MAX_IN_FLIGHT_FRAMES {
                 return Ok(());
             }
             self.flush_batch();
+            if self.shared.owner_closed.load(Ordering::Acquire) {
+                return Err(Error::Device("GPU owner stopped".into()));
+            }
             if self.shared.in_flight_frames.load(Ordering::Acquire) < MAX_IN_FLIGHT_FRAMES {
                 return Ok(());
             }
@@ -568,6 +588,9 @@ impl WorkerHandle {
             let q = self.shared.queue.lock().unwrap();
             if q.closed {
                 return Err(Error::Device("adv-gfx-worker stopped".into()));
+            }
+            if self.shared.owner_closed.load(Ordering::Acquire) {
+                return Err(Error::Device("GPU owner stopped".into()));
             }
             if self.shared.in_flight_frames.load(Ordering::Acquire) < MAX_IN_FLIGHT_FRAMES {
                 return Ok(());
@@ -1100,6 +1123,8 @@ impl WorkerState {
                 video,
                 windows,
             } => {
+                // Frame retirement happens on "GPU owner" after presentation
+                // so the unbounded stream cannot accumulate frames ahead of display.
                 self.stream.push(Command::PresentSwap {
                     image,
                     damage,
@@ -1107,9 +1132,6 @@ impl WorkerState {
                     video,
                     windows,
                 });
-                self.shared.in_flight_frames.fetch_sub(1, Ordering::AcqRel);
-                self.shared.space_cv.notify_all();
-                self.shared.signal_wake();
             }
             WorkerItem::PresentSoftware {
                 base,
@@ -1123,9 +1145,6 @@ impl WorkerState {
                     windows,
                     serial,
                 });
-                self.shared.in_flight_frames.fetch_sub(1, Ordering::AcqRel);
-                self.shared.space_cv.notify_all();
-                self.shared.signal_wake();
             }
             WorkerItem::Flush => {
                 self.stream.push(Command::Submit);
@@ -3615,6 +3634,22 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) alpha:f32 }
             received.push(rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap());
         }
         assert_eq!(received, (1..=50).collect::<Vec<_>>());
+        // Wait for frame 50's owner-side retirement before saturating the counter.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while gpu
+            .execution
+            .worker
+            .shared
+            .in_flight_frames
+            .load(Ordering::Acquire)
+            != 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "frame 50 did not retire"
+            );
+            std::thread::yield_now();
+        }
 
         // Verify backpressure with WakeEvent: artificially saturate in_flight_frames,
         // verify admit_present returns Error::Busy without blocking, and wake signals on drain.
@@ -3907,5 +3942,100 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) alpha:f32 }
                 0
             );
         }
+    }
+
+    // spec: DEV-FRAME-1, GFX-REC-1
+    #[test]
+    fn in_flight_frame_budget_waits_for_gpu_owner_presentation() {
+        struct GatedPresenter {
+            entered: mpsc::Sender<u64>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl crate::frame::Presenter for GatedPresenter {
+            fn presentable(&self, _: u32, _: u32) -> bool {
+                false
+            }
+            fn present(&mut self, _: &mut adv_gpu::Queue, frame: crate::frame::Frame) {
+                let _ = self.entered.send(frame.serial);
+                let _ = self.release.lock().unwrap().recv();
+            }
+            fn service(&mut self, _: &mut adv_gpu::Queue, _: Option<&crate::frame::Waker>) {}
+        }
+        let (device, queue) = match adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+            ..Default::default()
+        }) {
+            Ok(opened) => opened,
+            Err(adv_gpu::Error::Unavailable(_))
+                if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>
+            {
+                return;
+            }
+            Err(error) => panic!("open device: {error}"),
+        };
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut gpu = Gpu::request_with_presenter(
+            device,
+            queue,
+            Box::new(GatedPresenter {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+        )
+        .unwrap();
+        let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
+        gpu.set_wake(Some(wake.clone()));
+        let target = gpu.presentation_target(2, 2, false).unwrap();
+        let damage = Region::whole((2, 2));
+
+        for serial in 1..=(MAX_IN_FLIGHT_FRAMES as u64) {
+            gpu.admit_present().unwrap();
+            gpu.clear(&target, Some([0., 0., 1., 1.]), None).unwrap();
+            gpu.present_admitted(
+                &target.image,
+                damage.clone(),
+                serial,
+                Arc::from([]),
+                Arc::from([]),
+            );
+        }
+        // Draining the worker moves every PresentSwap into the owner's stream,
+        // yet the owner is still blocked presenting frame 1.
+        gpu.drain_worker();
+        assert_eq!(
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            1
+        );
+        // TestGate holds its submissions mutex while owner::run executes a
+        // chunk under test-support, so check worker admission directly while
+        // the presenter is blocked inside frame 1.
+        assert_eq!(
+            gpu.execution
+                .worker
+                .shared
+                .in_flight_frames
+                .load(Ordering::Acquire),
+            MAX_IN_FLIGHT_FRAMES
+        );
+        assert!(matches!(
+            gpu.execution.worker.admit_present(true),
+            Err(Error::Busy)
+        ));
+
+        let _ = wake.wait(Some(std::time::Duration::ZERO));
+        let gen_before = wake.generation();
+        release_tx.send(()).unwrap();
+        assert!(wake.wait(Some(std::time::Duration::from_secs(10))).unwrap());
+        assert_ne!(wake.generation(), gen_before);
+        gpu.execution.worker.admit_present(true).unwrap();
+
+        for _ in 1..MAX_IN_FLIGHT_FRAMES {
+            release_tx.send(()).unwrap();
+        }
+        gpu.admit_present().unwrap();
+        gpu.set_wake(None);
     }
 }

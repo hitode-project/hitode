@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Check native libraries in an APK for AND-APP-2, using only the standard library.
+"""Check native library alignment and payload compression in the launcher APK.
 
 Usage: python tools/android/check-apk.py <apk>
-Input: an APK ZIP containing ELF shared libraries (32/64-bit, either byte order).
+Input: an APK ZIP containing ELF shared libraries and the player assets.
 Output: library/LOAD-segment counts; exit 1 for misaligned libraries,
-invalid ELF/ZIP data, or an APK without shared libraries. No extraction is needed.
+invalid ELF/ZIP data, or missing or incorrectly compressed payloads.
 """
 import argparse
 import struct
@@ -12,6 +12,10 @@ import sys
 import zipfile
 
 PAGE = 16 * 1024
+PAYLOADS = {
+    "assets/wine.xz": zipfile.ZIP_STORED,
+    "assets/FluidR3Mono_GM.sf3": zipfile.ZIP_DEFLATED,
+}
 
 
 def check_elf(data):
@@ -40,7 +44,7 @@ def check_elf(data):
 
 
 def check_apk(path):
-    """Check ELF alignment, and ZIP offsets of stored libraries; return (libraries, LOADs)."""
+    """Check ELF alignment, ZIP offsets of stored libraries, and payload compression."""
     libraries = loads = 0
     with zipfile.ZipFile(path) as archive, open(path, "rb") as raw:
         for entry in archive.infolist():
@@ -58,8 +62,16 @@ def check_apk(path):
                 if start % PAGE:
                     raise ValueError("shared library ZIP data is not 16 KiB aligned")
             loads += check_elf(archive.read(entry))
-    if not libraries:
-        raise ValueError("APK has no shared libraries")
+        if not libraries:
+            raise ValueError("APK has no shared libraries")
+        for name, compression in PAYLOADS.items():
+            try:
+                entry = archive.getinfo(name)
+            except KeyError:
+                raise ValueError(f"APK is missing {name}") from None
+            if entry.compress_type != compression:
+                expected = "stored" if compression == zipfile.ZIP_STORED else "deflated"
+                raise ValueError(f"{name} must be {expected}")
     return libraries, loads
 
 
@@ -72,7 +84,7 @@ def main():
     except (OSError, ValueError, struct.error, zipfile.BadZipFile) as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 1
-    print(f"OK: {libraries} shared libraries, {loads} LOAD segments; 16 KiB aligned")
+    print(f"OK: {libraries} shared libraries, {loads} LOAD segments, 16 KiB aligned, payload compression verified")
     return 0
 
 

@@ -466,6 +466,20 @@ struct Outcome {
     screenshot_error: Option<String>,
 }
 
+fn audio_report(session: &Session, output: &super::audio::AudioOutput) -> String {
+    let failures = session
+        .directsound_create_failures()
+        .into_iter()
+        .map(|(reason, count)| format!("\"{reason}\": {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\"audio\": {{{}, \"directsound_create_failures\": {{{}}}}}",
+        output.json_fields(),
+        failures
+    )
+}
+
 fn report(
     options: &Options,
     session: &Session,
@@ -544,7 +558,7 @@ fn report(
         ),
         session.machine.cpu.report_fields(),
         format!("\"performance\": {}", metrics.performance.json()),
-        format!("\"audio\": {}", metrics.audio.json()),
+        audio_report(session, &metrics.audio),
         format!("\"scene_gate\": {}", metrics.gate.json()),
         format!("\"wine_boundaries\": {}", session.boundaries().json(24)),
     ];

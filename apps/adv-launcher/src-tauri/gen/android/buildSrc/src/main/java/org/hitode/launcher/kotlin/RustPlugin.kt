@@ -24,8 +24,14 @@ open class RustPlugin : Plugin<Project> {
         val archList = (findProperty("archList") as? String)?.split(',') ?: defaultArchList
 
         val targetsList = (findProperty("targetList") as? String)?.split(',') ?: listOf("aarch64")
+        val assetsByProfile = listOf("debug", "release").associateWith { profile ->
+            layout.buildDirectory.dir("generated/rustAssets/$profile").get().asFile
+        }
 
         extensions.configure<ApplicationExtension> {
+            for ((profile, assets) in assetsByProfile) {
+                sourceSets.getByName(profile).assets.srcDir(assets)
+            }
             @Suppress("UnstableApiUsage")
             flavorDimensions.add("abi")
             productFlavors {
@@ -47,7 +53,7 @@ open class RustPlugin : Plugin<Project> {
         }
 
         afterEvaluate {
-            for (profile in listOf("debug", "release")) {
+            for ((profile, assets) in assetsByProfile) {
                 val profileCapitalized = profile.replaceFirstChar { it.uppercase() }
                 val buildTask = tasks.maybeCreate(
                     "rustBuildUniversal$profileCapitalized",
@@ -58,6 +64,7 @@ open class RustPlugin : Plugin<Project> {
                 }
 
                 tasks["mergeUniversal${profileCapitalized}JniLibFolders"].dependsOn(buildTask)
+                tasks["mergeUniversal${profileCapitalized}Assets"].dependsOn(buildTask)
 
                 for (targetPair in targetsList.withIndex()) {
                     val targetName = targetPair.value
@@ -73,10 +80,14 @@ open class RustPlugin : Plugin<Project> {
                         projectDir = project.projectDir.path
                         target = targetName
                         release = profile == "release"
+                        assetDir = assets.absolutePath
                     }
 
                     buildTask.dependsOn(targetBuildTask)
                     tasks["merge$targetArchCapitalized${profileCapitalized}JniLibFolders"].dependsOn(
+                        targetBuildTask
+                    )
+                    tasks["merge$targetArchCapitalized${profileCapitalized}Assets"].dependsOn(
                         targetBuildTask
                     )
                 }

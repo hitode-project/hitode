@@ -60,9 +60,11 @@ android {
     buildFeatures {
         buildConfig = true
     }
+    androidResources {
+        noCompress += "xz"
+    }
     packaging {
-        // Releases are downloaded directly: compressing the library halves the APK,
-        // and its Wine archive is unpacked to app data either way.
+        // Compress native code to keep direct downloads small.
         jniLibs.useLegacyPackaging = true
     }
 }

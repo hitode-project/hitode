@@ -1,6 +1,8 @@
 //! Device layer: the audio engine (with execution/audio ownership transfer) and the
 //! software surfaces every graphics front draws into.
 mod actor;
+#[cfg(target_os = "android")]
+pub mod android_asset;
 #[cfg(feature = "device")]
 mod capture;
 pub mod clock;

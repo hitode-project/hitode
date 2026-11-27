@@ -294,7 +294,7 @@ teardown saves the registry and releases every client before the finish callback
 The host provisions and boots the prefix once per server, then installs game
 fonts without loading them in wineboot. System font discovery is reused between
 sessions; each session applies its own Text resources and font overrides.
-The execution owner blocks between games. The launcher prepares the embedded Wine
+The execution owner blocks between games. The launcher prepares the bundled Wine
 distribution off the UI thread; native views and input keep the same shell channels.
 
 On macOS, guest menus appear in the native menu bar and guest dialogs become child windows of the game window. Quitting first asks the game to close and waits for it; a second quit forces the stop. Sleep releases the audio stream, and wake rebuilds it. After a run, the launcher can save an anonymous compatibility report whose format `adv-report` defines ([docs/spec/report.md](docs/spec/report.md)). The host contracts are in [docs/spec/host.md](docs/spec/host.md).

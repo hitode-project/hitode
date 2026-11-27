@@ -43,6 +43,8 @@ class ApkTests(unittest.TestCase):
                 add_library(archive, "lib/arm64-v8a/first.so", elf())
                 add_library(archive, "lib/arm64-v8a/second.so", elf(65536))
                 add_library(archive, "lib/arm64-v8a/third.so", elf(), aligned=False, compressed=True)
+                for name, compression in checker.PAYLOADS.items():
+                    archive.writestr(name, b"fixture", compress_type=compression)
             self.assertEqual(checker.check_apk(path), (3, 3))
 
     # spec: AND-APP-2
@@ -76,6 +78,23 @@ class ApkTests(unittest.TestCase):
                 archive.writestr("classes.dex", b"fixture")
             with self.assertRaises(ValueError):
                 checker.check_apk(path)
+
+    # spec: AND-APP-19
+    def test_payloads_must_be_present_with_expected_compression(self):
+        for name, expected in checker.PAYLOADS.items():
+            wrong_method = zipfile.ZIP_DEFLATED if expected == zipfile.ZIP_STORED else zipfile.ZIP_STORED
+            for compression in (None, wrong_method):
+                with self.subTest(name=name, compression=compression), tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "fixture.apk"
+                    with zipfile.ZipFile(path, "w") as archive:
+                        add_library(archive, "lib/arm64-v8a/game.so", elf())
+                        for payload, method in checker.PAYLOADS.items():
+                            if payload != name:
+                                archive.writestr(payload, b"fixture", compress_type=method)
+                            elif compression is not None:
+                                archive.writestr(payload, b"fixture", compress_type=compression)
+                    with self.assertRaisesRegex(ValueError, name):
+                        checker.check_apk(path)
 
 
 if __name__ == "__main__":

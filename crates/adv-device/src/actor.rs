@@ -22,7 +22,7 @@ use std::{
     },
 };
 
-const SOURCES: usize = 256;
+const INITIAL_SOURCES: usize = 256;
 /// Maximum lag between the mixer write head and the published guest playback
 /// clock when a native backend buffers a deep downstream FIFO (such as Android
 /// Legacy/Bluetooth AudioTrack). Keeping guest refill clocks within 10 ms of
@@ -182,11 +182,10 @@ pub(crate) enum Retired {
     Pcm(PcmBlock),
     Converter(Converter),
     Notices(Vec<(u32, u32)>),
+    Slots(Vec<Option<Voice>>),
 }
 enum Command {
-    XAudio(u64, Box<crate::xaudio2::Graph>),
-    Ring(u64, Box<RingVoice>, Arc<RingState>),
-    Owned(u64, Box<OwnedVoice>, u64),
+    Insert(Voice, Option<Vec<Option<Voice>>>),
     Pcm(PcmBlock, u64),
     Play(u64, bool, u64, u64, Option<u32>),
     Epoch(u64, u64),
@@ -203,7 +202,7 @@ enum Command {
     Remove(u64),
     Suspend(bool),
 }
-enum Voice {
+pub(crate) enum Voice {
     XAudio {
         source: u64,
         graph: Box<crate::xaudio2::Graph>,
@@ -300,6 +299,7 @@ struct Control {
     backlog: VecDeque<Command>,
     formats: BTreeMap<u64, (u32, Arc<SourceState>)>,
     rings: BTreeMap<u64, (u32, u32)>,
+    voice_capacity: usize,
     output_rate: u32,
     pending_events: VecDeque<AudioEvent>,
     retired_owners: BTreeSet<u32>,
@@ -358,7 +358,7 @@ impl AudioControl {
             commands: commands_rx,
             events: events_tx,
             retired: retired_tx,
-            voices: (0..SOURCES).map(|_| None).collect(),
+            voices: (0..INITIAL_SOURCES).map(|_| None).collect(),
             suspended: false,
             cursor_us: 0.0,
             virtual_us: 0,
@@ -380,6 +380,7 @@ impl AudioControl {
                 backlog: VecDeque::with_capacity(4096),
                 formats: BTreeMap::new(),
                 rings: BTreeMap::new(),
+                voice_capacity: INITIAL_SOURCES,
                 output_rate: 44100,
                 pending_events: VecDeque::new(),
                 retired_owners: BTreeSet::new(),
@@ -398,9 +399,35 @@ impl AudioControl {
     fn send(&self, command: Command) -> bool {
         self.try_send(command).is_ok()
     }
+    fn insert_voice(&self, voice: Voice) -> Result<(), Voice> {
+        let local = self.local.borrow();
+        let source = voice.source();
+        let count = local.rings.len()
+            + local.formats.len()
+            + usize::from(
+                !local.rings.contains_key(&source) && !local.formats.contains_key(&source),
+            );
+        let capacity = local.voice_capacity;
+        drop(local);
+        let growth = (count > capacity).then(|| (0..capacity * 2).map(|_| None).collect());
+        let grows = growth.is_some();
+        if let Err(command) = self.try_send(Command::Insert(voice, growth)) {
+            let Command::Insert(voice, _) = command else {
+                unreachable!("source insertion command")
+            };
+            return Err(voice);
+        }
+        if grows {
+            self.local.borrow_mut().voice_capacity *= 2;
+        }
+        Ok(())
+    }
     #[allow(clippy::result_large_err)] // SPSC transfers inline commands without allocating an envelope.
     fn try_send(&self, command: Command) -> Result<(), Command> {
-        self.maintain();
+        // Source admission has already serviced the lane. Preserve its checked slot.
+        if !matches!(command, Command::Insert(..)) {
+            self.maintain();
+        }
         self.local
             .borrow_mut()
             .enqueue(command, &self.stream.shared.pending_commands)?;
@@ -423,6 +450,7 @@ impl AudioControl {
                 Retired::Pcm(v) => drop(v),
                 Retired::Converter(v) => drop(v),
                 Retired::Notices(v) => drop(v),
+                Retired::Slots(v) => drop(v),
             }
         }
         while let Some(event) = local.events.pop() {
@@ -435,10 +463,10 @@ impl AudioControl {
         if rate != local.output_rate {
             for command in &mut local.backlog {
                 match command {
-                    Command::Ring(_, voice, _) => {
+                    Command::Insert(Voice::Ring { voice, .. }, _) => {
                         let _ = voice.prepare(rate, false);
                     }
-                    Command::Owned(_, voice, _) => {
+                    Command::Insert(Voice::Owned { voice, .. }, _) => {
                         let _ = voice.prepare(rate, false);
                     }
                     Command::Retune(_, frequency, converter, _) if converter.rate != rate => {
@@ -543,6 +571,13 @@ impl AudioControl {
     pub fn active(&self) -> bool {
         self.stream.active()
     }
+    /// A source insertion takes one command. The execution owner is the only
+    /// producer, so a guest can park before creating a buffer when this is full.
+    pub fn can_insert_source(&self) -> bool {
+        self.maintain();
+        let local = self.local.borrow();
+        local.backlog.len() < local.backlog.capacity()
+    }
     pub fn suspend(&self, suspended: bool) -> bool {
         self.stream.shared.clock.suspend_device(suspended);
         self.stream
@@ -552,7 +587,17 @@ impl AudioControl {
         self.send(Command::Suspend(suspended))
     }
     pub fn add_ring(&self, source: u64, config: RingConfig) -> Result<Arc<RingState>, String> {
-        self.insert_ring(source, config, true)
+        self.maintain();
+        self.add_ring_with_gain(source, config, [1.0; 2])
+    }
+    /// Publish a prepared ring in the command slot checked by `can_insert_source`.
+    pub fn add_ring_with_gain(
+        &self,
+        source: u64,
+        config: RingConfig,
+        gain: [f32; 2],
+    ) -> Result<Arc<RingState>, String> {
+        self.insert_ring(source, config, true, gain)
     }
     /// Add a shared PCM ring whose caller owns packet holding (such as WASAPI
     /// `IAudioRenderClient`), without pre-staging DirectSound write-cursor lead.
@@ -561,29 +606,38 @@ impl AudioControl {
         source: u64,
         config: RingConfig,
     ) -> Result<Arc<RingState>, String> {
-        self.insert_ring(source, config, false)
+        self.maintain();
+        self.insert_ring(source, config, false, [1.0; 2])
     }
     fn insert_ring(
         &self,
         source: u64,
         mut config: RingConfig,
         stage_lead: bool,
+        gain: [f32; 2],
     ) -> Result<Arc<RingState>, String> {
         let local = self.local.borrow();
         if local.retired_owners.contains(&((source >> 32) as u32)) {
             return Err("audio process owner has exited".into());
         }
-        if !local.rings.contains_key(&source) && local.rings.len() + local.formats.len() >= SOURCES
-        {
-            return Err("audio source limit".into());
-        }
         drop(local);
         config.output_rate = self.stream.shared.rate.load(Ordering::Acquire);
         let frequency = config.frequency;
         let align = u32::from(config.channels) * u32::from(config.bits) / 8;
-        let voice = RingVoice::with_staging(config, stage_lead)?;
+        let mut voice = RingVoice::with_staging(config, stage_lead)?;
+        if gain != [1.0; 2] {
+            voice.set_gain(gain);
+        }
         let state = Arc::new(RingState::default());
-        if !self.send(Command::Ring(source, voice, state.clone())) {
+        if self
+            .insert_voice(Voice::Ring {
+                source,
+                voice,
+                state: state.clone(),
+                generation: 0,
+            })
+            .is_err()
+        {
             return Err("audio command limit".into());
         }
         self.local
@@ -730,8 +784,12 @@ impl AudioControl {
         true
     }
     pub fn add_xaudio(&self, source: u64, graph: Box<crate::xaudio2::Graph>) -> bool {
+        self.maintain();
+        if self.insert_voice(Voice::XAudio { source, graph }).is_err() {
+            return false;
+        }
         self.local.borrow_mut().rings.insert(source, (0, 0));
-        self.send(Command::XAudio(source, graph))
+        true
     }
     pub fn push_pcm(&self, mut block: PcmBlock) -> Result<(), PcmBlock> {
         if self
@@ -771,7 +829,7 @@ impl AudioControl {
         let source = block.stream_id;
         let existing = self.local.borrow().formats.get(&source).cloned();
         let queue_us;
-        let command = if let Some((frequency, state)) = existing {
+        if let Some((frequency, state)) = existing {
             if frequency != block.sample_rate
                 || state.queued_blocks.load(Ordering::Acquire) >= 128
                 || state.queued_us.load(Ordering::Relaxed) + duration > 2_000_000
@@ -780,17 +838,21 @@ impl AudioControl {
             }
             queue_us = state.queued_us.fetch_add(duration, Ordering::Relaxed) + duration;
             state.queued_blocks.fetch_add(1, Ordering::Release);
-            Command::Pcm(block, refill_us)
-        } else {
-            if self.local.borrow().formats.len() + self.local.borrow().rings.len() >= SOURCES {
+            if let Err(command) = self.try_send(Command::Pcm(block, refill_us)) {
+                let Command::Pcm(block, _) = command else {
+                    unreachable!("PCM command")
+                };
+                state.queued_us.fetch_sub(duration, Ordering::Relaxed);
+                state.queued_blocks.fetch_sub(1, Ordering::Release);
                 return Err(block);
             }
+        } else {
             let frequency = block.sample_rate;
             queue_us = duration;
             let state = Arc::new(SourceState::default());
             state.queued_us.store(duration, Ordering::Relaxed);
             state.queued_blocks.store(1, Ordering::Relaxed);
-            let voice = match OwnedVoice::new(
+            let mut voice = match OwnedVoice::new(
                 state.clone(),
                 self.stream.shared.rate.load(Ordering::Acquire),
                 block,
@@ -798,30 +860,18 @@ impl AudioControl {
                 Ok(voice) => voice,
                 Err((_, block)) => return Err(block),
             };
+            voice.lead.refill(refill_us);
+            self.maintain();
+            if let Err(voice) = self.insert_voice(Voice::Owned { source, voice }) {
+                let Voice::Owned { mut voice, .. } = voice else {
+                    unreachable!("owned PCM source")
+                };
+                return Err(voice.take_initial());
+            }
             self.local
                 .borrow_mut()
                 .formats
                 .insert(source, (frequency, state));
-            Command::Owned(source, voice, refill_us)
-        };
-        let new_source = matches!(&command, Command::Owned(..));
-        if let Err(command) = self.try_send(command) {
-            return match command {
-                Command::Pcm(block, _) => {
-                    if let Some((_, state)) = self.local.borrow().formats.get(&source) {
-                        state.queued_us.fetch_sub(duration, Ordering::Relaxed);
-                        state.queued_blocks.fetch_sub(1, Ordering::Release);
-                    }
-                    Err(block)
-                }
-                Command::Owned(_, mut voice, _) => {
-                    self.local.borrow_mut().formats.remove(&source);
-                    Err(voice.take_initial())
-                }
-                _ => unreachable!("PCM command"),
-            };
-        }
-        if new_source {
             self.stream
                 .shared
                 .counters
@@ -879,10 +929,8 @@ impl Engine {
             };
             processed += 1;
             let source = match &command {
-                Command::XAudio(id, ..)
-                | Command::Ring(id, ..)
-                | Command::Owned(id, ..)
-                | Command::Play(id, ..)
+                Command::Insert(voice, _) => Some(voice.source()),
+                Command::Play(id, ..)
                 | Command::Epoch(id, ..)
                 | Command::Stop(id, ..)
                 | Command::Position(id, ..)
@@ -904,19 +952,15 @@ impl Engine {
                     .position(|v| v.as_ref().is_some_and(|v| v.source() == id))
             });
             match command {
-                Command::XAudio(source, graph) => self.insert(Voice::XAudio { source, graph }, at),
-                Command::Ring(source, voice, state) => self.insert(
-                    Voice::Ring {
-                        source,
-                        voice,
-                        state,
-                        generation: 0,
-                    },
-                    at,
-                ),
-                Command::Owned(source, mut voice, refill_us) => {
-                    voice.lead.refill(refill_us);
-                    self.insert(Voice::Owned { source, voice }, at);
+                Command::Insert(voice, growth) => {
+                    if let Some(mut slots) = growth {
+                        for (new, old) in slots.iter_mut().zip(&mut self.voices) {
+                            *new = old.take();
+                        }
+                        let old = std::mem::replace(&mut self.voices, slots);
+                        self.retire(Retired::Slots(old));
+                    }
+                    self.insert(voice, at);
                 }
                 Command::Pcm(block, refill_us) => {
                     if let Some(Voice::Owned { voice, .. }) =

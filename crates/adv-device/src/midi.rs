@@ -33,10 +33,16 @@ pub struct Synth {
 }
 impl Synth {
     pub fn new() -> Result<Self, String> {
+        #[cfg(target_os = "android")]
+        let font = crate::android_asset::with_bytes(c"FluidR3Mono_GM.sf3", |bytes| {
+            SoundFont::load(&mut Cursor::new(bytes))
+        })
+        .map_err(|error| format!("MIDI SoundFont: {error}"))?;
+        #[cfg(not(target_os = "android"))]
         let font = SoundFont::load(&mut Cursor::new(include_bytes!(
             "../../../vendor/fluidr3mono/FluidR3Mono_GM.sf3"
-        )))
-        .map_err(|error| format!("MIDI SoundFont: {error:?}"))?;
+        )));
+        let font = font.map_err(|error| format!("MIDI SoundFont: {error:?}"))?;
         let mut engine = Engine::new(SynthDescriptor {
             polyphony: 128,
             sample_rate: SAMPLE_RATE as f32,

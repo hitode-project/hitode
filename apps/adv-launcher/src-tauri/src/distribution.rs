@@ -1,4 +1,4 @@
-//! The same embedded Wine installation on desktop and mobile. Only file
+//! The same bundled Wine installation on desktop and mobile. Only file
 //! preparation lives here; execution and prefix policy belong to adv-shell.
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,10 +21,16 @@ pub(crate) fn prepare(root: &Path) -> Result<(), String> {
         return Err("Wine runtime is missing from this player build".into());
     }
     let _guard = PREPARING.lock().unwrap();
-    unpack(root, FILES, ARCHIVE).map_err(|e| format!("prepare Wine distribution: {e}"))
+    #[cfg(target_os = "android")]
+    let result =
+        adv_shell::android_asset::with_bytes(c"wine.xz", |archive| unpack(root, FILES, archive))
+            .and_then(|result| result);
+    #[cfg(not(target_os = "android"))]
+    let result = unpack(root, FILES, ARCHIVE);
+    result.map_err(|e| format!("prepare Wine distribution: {e}"))
 }
 
-/// Prepares the embedded Wine runtime under `<data_dir>/runtime/<ID>` and
+/// Prepares the bundled Wine runtime under `<data_dir>/runtime/<ID>` and
 /// prunes obsolete runtime revisions beside it.
 pub(crate) fn prepare_in(data_dir: &Path) -> Result<PathBuf, String> {
     let root = path(data_dir);

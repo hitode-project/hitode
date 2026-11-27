@@ -73,6 +73,8 @@ Authored fixtures and generators for one area:
 | Fixed core exports, ordinals and API set forwarders | `tools/abi/system_exports.py` | Reads PE export and namespace metadata only. |
 | SDK ordinal import identity | `tools/abi/import_ordinals.py --check` | |
 
+The local `--report` audio section counts `CreateSoundBuffer` failures by reason.
+
 ### Traces
 
 - `--trace` writes one line per call: `ctx  frame  module!name  args  ret`, separated by tabs. It changes timing, so it is never used for timing.
