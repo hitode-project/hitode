@@ -87,7 +87,7 @@ impl Backing {
                 usage |= flag;
             }
         }
-        if bind.contains(Bind::RENDER_TARGET) || format == Format::Depth24UnormStencil8 {
+        if bind.contains(Bind::RENDER_TARGET) {
             usage |= Usage::SAMPLED;
         }
         let image = gpu.device().create_image(&ImageDesc {

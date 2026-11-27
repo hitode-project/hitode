@@ -629,6 +629,11 @@ pub enum ModernTransfer {
         source: ImageRegion,
         destination: TransferBuffer,
     },
+    DownloadDepthStencil {
+        source: ImageRegion,
+        depth: TransferBuffer,
+        stencil: TransferBuffer,
+    },
     CopyBuffer {
         source: BufferRange,
         destination: Buffer,

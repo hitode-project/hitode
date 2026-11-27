@@ -337,64 +337,56 @@ pub(super) fn download(
         let pitch = row.next_multiple_of(256);
         let packed_depth = matches!(backing, Backing::Image(image)
             if image.desc().format == adv_gpu::Format::Depth24UnormStencil8);
+        let depth_size = u64::from(pitch) * u64::from(rect.h);
+        let stencil_pitch = if packed_depth {
+            rect.w.next_multiple_of(256)
+        } else {
+            0
+        };
         let buffer = execution.gpu.device().create_buffer(&BufferDesc {
-            size: u64::from(pitch) * u64::from(rect.h),
-            usage: if packed_depth {
-                BufferUsage::STORAGE
-            } else {
-                BufferUsage::COPY_DST
-            },
+            size: depth_size + u64::from(stencil_pitch) * u64::from(rect.h),
+            usage: BufferUsage::COPY_DST,
             memory: Memory::Readback,
             label: "D3D11 Map readback",
         })?;
-        match (backing, resource) {
+        let destination = |offset, row_pitch| TransferBuffer {
+            buffer: buffer.clone(),
+            offset,
+            row_pitch,
+            rows: rect.h,
+        };
+        let transfer = match (backing, resource) {
+            (Backing::Buffer(source), Resource::Buffer(_)) => ModernTransfer::CopyBuffer {
+                source: BufferRange {
+                    buffer: source.clone(),
+                    range: rect.x as u64..rect.x as u64 + u64::from(rect.w),
+                },
+                destination: buffer.clone(),
+                offset: 0,
+            },
+            (Backing::Constant(_), Resource::Buffer(_)) => ModernTransfer::CopyBufferWindow {
+                source: backing
+                    .buffer_window(u64::from(rect.x)..u64::from(rect.x) + u64::from(rect.w)),
+                destination: BufferRange {
+                    buffer: buffer.clone(),
+                    range: 0..u64::from(row),
+                }
+                .into(),
+            },
             (Backing::Image(image), Resource::Texture(texture)) if packed_depth => {
-                depth24::pack(
-                    &mut execution.gpu,
-                    resource::region(image, texture, subresource),
-                    rect,
-                    pitch,
-                    buffer.clone(),
-                )?;
+                ModernTransfer::DownloadDepthStencil {
+                    source: pixel_region(image, texture, subresource, slice, rect),
+                    depth: destination(0, pitch),
+                    stencil: destination(depth_size, stencil_pitch),
+                }
             }
-            _ => {
-                let transfer = match (backing, resource) {
-                    (Backing::Buffer(source), Resource::Buffer(_)) => ModernTransfer::CopyBuffer {
-                        source: BufferRange {
-                            buffer: source.clone(),
-                            range: rect.x as u64..rect.x as u64 + u64::from(rect.w),
-                        },
-                        destination: buffer.clone(),
-                        offset: 0,
-                    },
-                    (Backing::Constant(_), Resource::Buffer(_)) => {
-                        ModernTransfer::CopyBufferWindow {
-                            source: backing.buffer_window(
-                                u64::from(rect.x)..u64::from(rect.x) + u64::from(rect.w),
-                            ),
-                            destination: BufferRange {
-                                buffer: buffer.clone(),
-                                range: 0..u64::from(row),
-                            }
-                            .into(),
-                        }
-                    }
-                    (Backing::Image(image), Resource::Texture(texture)) => {
-                        ModernTransfer::Download {
-                            source: pixel_region(image, texture, subresource, slice, rect),
-                            destination: TransferBuffer {
-                                buffer: buffer.clone(),
-                                offset: 0,
-                                row_pitch: pitch,
-                                rows: rect.h,
-                            },
-                        }
-                    }
-                    _ => unreachable!(),
-                };
-                execution.gpu.transfer(transfer)?;
-            }
-        }
+            (Backing::Image(image), Resource::Texture(texture)) => ModernTransfer::Download {
+                source: pixel_region(image, texture, subresource, slice, rect),
+                destination: destination(0, pitch),
+            },
+            _ => unreachable!(),
+        };
+        execution.gpu.transfer(transfer)?;
         execution
             .gpu
             .completion()?
@@ -408,12 +400,18 @@ pub(super) fn download(
         // SAFETY: the transfer has finished and the readback allocation lives
         // through all copies into the guest shadow.
         let bytes = unsafe { readback.as_ref() };
+        let mut packed = packed_depth.then(|| vec![0; row as usize]);
         for line in 0..rect.h {
             let src = (line * pitch) as usize;
             let dst =
                 layout.slice(base, slice) + (rect.y + line) * layout.row_pitch() + rect.x * unit;
-            cpu.write(dst, &bytes[src..src + row as usize])
-                .map_err(|_| Error::InvalidArgument)?;
+            let mut texels = &bytes[src..src + row as usize];
+            if let Some(packed) = &mut packed {
+                let stencil = (depth_size + u64::from(line) * u64::from(stencil_pitch)) as usize;
+                depth24::pack_row(texels, &bytes[stencil..stencil + rect.w as usize], packed);
+                texels = packed;
+            }
+            cpu.write(dst, texels).map_err(|_| Error::InvalidArgument)?;
         }
     }
     Ok(())

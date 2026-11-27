@@ -444,7 +444,7 @@ output. The Metal and Vulkan paths report zero 8x quality levels.
 
 ### GFX-INTEROP-2 Direct3D resource interoperability
 
-**Rule**: Shared textures opened within an execution MUST alias one backing allocation. Legacy and NT handles MUST retain their respective lifetimes, and keyed mutexes MUST grant access only after a matching key is released. Packed D24S8 CPU transfers MUST preserve both aspects.
+**Rule**: Shared textures opened within an execution MUST alias one backing allocation. Legacy and NT handles MUST retain their respective lifetimes, and keyed mutexes MUST grant access only after a matching key is released. Packed D24S8 CPU round trips MUST preserve the 24-bit depth code and the 8-bit stencil value exactly.
 **Verification**: Test
 
 Texture gathers use the top mip regardless of sampler filter. Two-dimensional gathers

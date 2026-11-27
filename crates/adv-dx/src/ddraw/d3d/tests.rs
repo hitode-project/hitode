@@ -2128,7 +2128,8 @@ fn device7_admits_documented_raster_states_and_rejects_retired_selectors() {
     assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 1, 2]), 0);
     assert_eq!(f.device_call(dev, "SetRenderState", &[8, 3]), 0);
     let mut seam = quad(0., 0., 8., 8., u32::MAX);
-    for (vertex, u) in seam.iter_mut().zip([0.875f32, 0.125, 0.875, 0.125]) {
+    // Keep the sampled UV inside each expected texel, away from point-filter ties.
+    for (vertex, u) in seam.iter_mut().zip([0.90625f32, 0.15625, 0.90625, 0.15625]) {
         vertex[6] = u.to_bits();
     }
     for (wrap, expected) in [(0, 0x0000ff), (1, 0xff0000)] {

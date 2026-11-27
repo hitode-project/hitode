@@ -232,6 +232,8 @@ fn dynamic_texture_sampling_sees_gpu_copies_before_mapping() {
 
 #[test]
 fn windows_sampler_lod_and_resource_clamp_through_guest_vtables() {
+    // D3D11.3 §7.18.16.2 allows filtering at the format's precision.
+    const LINEAR_UNORM8_TOLERANCE: f32 = 1. / 255.;
     let mut r = Raster::new();
     let output = SampleOutput::new(&mut r);
     let levels: Vec<_> = (0..7)
@@ -246,7 +248,7 @@ fn windows_sampler_lod_and_resource_clamp_through_guest_vtables() {
             1,
             [0., 0., 1000.],
             0.,
-            0.5 / 255.,
+            LINEAR_UNORM8_TOLERANCE,
         ),
         ("lod-mip-point-bias1", 0, [1., 0., 1000.], 0., 0.),
         (
@@ -254,7 +256,7 @@ fn windows_sampler_lod_and_resource_clamp_through_guest_vtables() {
             1,
             [0., 1.5, 3.],
             0.,
-            0.5 / 255.,
+            LINEAR_UNORM8_TOLERANCE,
         ),
         ("lod-mip-point-bias-0.25", 0, [-0.25, 0., 1000.], 0., 0.),
         (
@@ -262,7 +264,7 @@ fn windows_sampler_lod_and_resource_clamp_through_guest_vtables() {
             1,
             [0., 0., 1000.],
             1. / 64.,
-            0.5 / 255.,
+            LINEAR_UNORM8_TOLERANCE,
         ),
     ] {
         sampler(&mut r, filter, 3, lod);
