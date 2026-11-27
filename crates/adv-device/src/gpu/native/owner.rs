@@ -874,6 +874,8 @@ impl State {
         } else {
             self.queue.submit(encoder)?
         };
+        #[cfg(feature = "graphics-counters")]
+        self.wake.submitted();
         for (pending, _) in self.uploads.iter_mut().rev().take(self.pending_uploads) {
             *pending = token;
         }

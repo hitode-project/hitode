@@ -1,6 +1,6 @@
 #!/bin/sh
 # Wine 11.0, i386 with scalar SSE: PE media side plus a decode-free Unix build.
-# Usage: build-media.sh SOURCE BUILD DIST STRIPPED_DIST
+# Usage: build-media.sh SOURCE BUILD DIST STRIPPED_DIST [d3d10]
 # SOURCE gets tools/wine/patches applied once. Existing builds retain every
 # installed binary except the modules listed in $modules.
 set -eu
@@ -10,12 +10,20 @@ mkdir -p "$2" "$3" "$4"
 build=$(cd "$2" && pwd)
 dist=$(cd "$3" && pwd)
 stripped=$(cd "$4" && pwd)
+# The graphics build updates only the two PE modules in an existing pair.
+modules="winegstreamer kernel32 dwrite ntdll dinput dinput8"
+if [ "${5-}" = d3d10 ]; then
+    modules="d3d10 d3d10_1"
+fi
 for patch in "$tools"/patches/*.patch; do
+    case "${patch##*/}: $modules " in
+        d3d10-create-device.patch:*" d3d10 "*) ;;
+        d3d10-create-device.patch:*) continue ;;
+        *:" d3d10 d3d10_1 ") continue ;;
+    esac
     patch -d "$source" -p1 -R -s -f --dry-run < "$patch" >/dev/null 2>&1 ||
         patch -d "$source" -p1 -s < "$patch"
 done
-# winegstreamer is the added PE module; the rest change with the patches.
-modules="winegstreamer kernel32 dwrite ntdll dinput dinput8"
 cd "$build"
 if [ ! -f Makefile ]; then
     # A relative source path keeps the builder's directories out of __FILE__.
@@ -35,9 +43,13 @@ if [ ! -f Makefile ]; then
     make -j"$(nproc)"
     make -j"$(nproc)" install-lib DESTDIR="$dist"
 fi
-PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig \
-    enable_winegstreamer=yes ./config.status --recheck
-./config.status
+case " $modules " in
+    *" winegstreamer "*)
+        PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig \
+            enable_winegstreamer=yes ./config.status --recheck
+        ./config.status
+        ;;
+esac
 # Do not build winegstreamer.so; its interface is supplied by the host.
 for name in $modules; do
     make -j"$(nproc)" "dlls/$name/i386-windows/$name.dll"
@@ -59,4 +71,8 @@ else
         i686-w64-mingw32-objcopy --strip-debug --file-alignment=512 "$stripped/$module"
     done
 fi
-python3 "$tools/identity.py" "$dist" "$stripped"
+if [ "${5-}" = d3d10 ]; then
+    python3 "$tools/identity.py" "$dist" "$stripped" d3d10.dll d3d10_1.dll
+else
+    python3 "$tools/identity.py" "$dist" "$stripped"
+fi

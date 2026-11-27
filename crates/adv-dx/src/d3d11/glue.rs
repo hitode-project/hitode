@@ -19,6 +19,8 @@ mod device;
 mod dxgi;
 #[cfg(feature = "gpu")]
 mod gpu;
+#[cfg(all(feature = "gpu", feature = "d3d9-counters"))]
+pub use gpu::{frame_counters, traffic};
 mod linkage;
 
 const DLL: &str = "d3d11.dll";
@@ -97,6 +99,7 @@ pub(super) struct State {
     table: Table,
     pub(super) layers: Vec<[u32; 4]>,
     devices: device::CreateDevices,
+    force_d3d9: bool,
     #[cfg(feature = "gpu")]
     execution: Option<gpu::Execution>,
     #[cfg(feature = "gpu")]
@@ -179,6 +182,7 @@ pub fn install_children<B: Backend>(machine: &mut Machine<B>) -> Result<(), Stri
         layers: Vec::new(),
         vtables,
         devices: Default::default(),
+        force_d3d9: std::env::var_os("ADV_FORCE_D3D9").is_some_and(|value| value == "1"),
         #[cfg(feature = "gpu")]
         execution: None,
         #[cfg(feature = "gpu")]
