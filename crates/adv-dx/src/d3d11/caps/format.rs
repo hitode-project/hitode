@@ -1,7 +1,7 @@
 //! Format gates from the published FL 11_0 table and measured downlevel masks.
 use super::{Coverage, Error, FeatureLevel};
 use crate::dxgi::{caps::present_format, formats::FORMATS};
-use adv_gpu::{Caps, Format, FormatCaps};
+use adv_gpu::{Caps, Features, Format, FormatCaps};
 use std::{collections::BTreeMap, sync::OnceLock};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -401,6 +401,10 @@ pub(super) fn derive(
     level: FeatureLevel,
     compute: bool,
 ) -> Option<BTreeMap<u32, FormatSupport>> {
+    let native_8x = caps
+        .features
+        .contains(Features::STANDARD_SAMPLE_LOCATIONS | Features::FULL_SAMPLE_COVERAGE);
+    let sample_mask = if native_8x { u32::MAX } else { !8 };
     let mut result = BTreeMap::new();
     for row in table() {
         let downlevel = (level != FeatureLevel::L11_0).then(|| row.downlevel[level.column()]);
@@ -440,20 +444,22 @@ pub(super) fn derive(
             } else {
                 path.and_then(|path| path.backing)
                     .map_or(0, |format| caps.format_sample_counts(format))
+            } & sample_mask;
+            let count = if matches!(bit, MsaaLoad | MsaaResolve) {
+                !1
+            } else {
+                bit.sample_count()
             };
-            let count = bit.sample_count();
             let mask = samples & count;
             let available = resolve_path(caps, path, bit, row.format) && (count == 0 || mask != 0);
             if available {
                 support.allow(bit);
-                support.sample_counts |= if matches!(bit, MsaaLoad | MsaaResolve) {
-                    samples & !1
-                } else {
-                    mask
-                };
+                support.sample_counts |= mask;
             } else if required
-                && !matches!(bit, Share | Msaa8)
-                && (bit != MsaaOther || level == FeatureLevel::L11_0)
+                && !matches!(
+                    bit,
+                    Share | Msaa4 | Msaa8 | MsaaOther | MsaaLoad | MsaaResolve
+                )
                 && class == FormatClass::Resource
                 && !(matches!(bit, Display | BackBufferCast)
                     && present_format(row.format).is_none())

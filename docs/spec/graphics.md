@@ -420,7 +420,7 @@ can share a packed window on devices without descriptor indexing.
 
 ### GFX-CAP-5 Direct3D 11 format capabilities
 
-**Rule**: Reported format and multisample capabilities MUST require an executing path on the resource backing. Queries MUST apply the selected level's restrictions and return the Windows status and output for unsupported formats.
+**Rule**: Reported format and multisample capabilities MUST require an executing path on the resource backing. Queries MUST apply the selected level's restrictions and return the Windows status and output for unsupported formats. Sample counts MUST affect only capability queries and resource validation, except the device-wide 4x attachment requirement of FL 10_0 and above.
 **Verification**: Test
 
 Device creation derives format support from the same backing selection used for resource allocation. Typed views reinterpret the stored bits or decode the stored blocks in the view's format. Texture transfers preserve the guest's texel or block layout when the physical backing differs.
@@ -430,6 +430,10 @@ Typed UAVs use the native storage view when the format supports the shader's ope
 Filtering can combine point samples from a format that lacks native linear filtering. Mip generation and resolve can combine texel or sample loads. Expanded packed resolves quantize their result to the guest channel widths.
 
 Vulkan float32 color attachments without native blending use ordered input attachment reads on supporting drivers. This path runs at one sample per pixel and preserves the attachment's float32 storage.
+
+Standard 8x requires the indexed standard sample locations and full raster
+coverage in every sample-frequency invocation before applying shader coverage
+output. The Metal and Vulkan paths report zero 8x quality levels.
 
 ### GFX-CAP-6 Direct3D 7 capability derivation
 
