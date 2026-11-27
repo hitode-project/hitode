@@ -2004,7 +2004,7 @@ fn storage_binding_limits(indexed: bool) {
     let mut body = String::from("var value = 0u;\n");
     let mut bindings = Vec::new();
     let mut expected = 0;
-    for slot in 0..128 {
+    for slot in 0..128u32 {
         let len = slot % 4 + 1;
         let start = (u64::from(slot) * stride) as usize;
         // SAFETY: the input buffer has no GPU users yet.

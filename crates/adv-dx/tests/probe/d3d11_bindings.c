@@ -65,13 +65,13 @@ static HRESULT dispatch_limits(ID3D11Device *device, ID3D11DeviceContext *ctx)
     CHECK("staging", ID3D11Device_CreateTexture2D(device, &desc, NULL, &staging));
     at += sprintf(at, "[numthreads(1,1,1)] void main() { uint total = 0;\n");
     for (unsigned i = 0; i < CBS; ++i)
-        at += sprintf(at, "total += c%u[4095].x;\n", i);
+        at += sprintf(at, "total += %u * c%u[4095].x;\n", i + 1, i);
     for (unsigned i = 0; i < SRVS; ++i) {
         if (i < SAMPLERS || (i >= 88 && i < 96))
-            at += sprintf(at, "total += (uint)round(t%u.SampleLevel(s%u, float2(.5,.5), 0).r * 255);\n",
-                i, i % SAMPLERS);
+            at += sprintf(at, "total += %u * (uint)round(t%u.SampleLevel(s%u, float2(.5,.5), 0).r * 255);\n",
+                i + 1, i, i % SAMPLERS);
         else
-            at += sprintf(at, "total += (uint)round(t%u.Load(int3(0,0,0)).r * 255);\n", i);
+            at += sprintf(at, "total += %u * (uint)round(t%u.Load(int3(0,0,0)).r * 255);\n", i + 1, i);
     }
     for (unsigned i = 0; i < UAVS; ++i)
         at += sprintf(at, "u%u[uint2(0,0)] = total + %u;\n", i, i);

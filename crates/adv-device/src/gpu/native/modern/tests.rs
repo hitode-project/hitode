@@ -2007,8 +2007,9 @@ fn maximum_textures_samplers_constants_and_uavs_execute_together() {
             "@group(0) @binding({i}) var<uniform> c{i}: array<vec4<u32>, 4096>;"
         )
         .unwrap();
-        writeln!(sum, "value += c{i}[4095].x;").unwrap();
-        expected += value;
+        let weight = i as u32 + 1;
+        writeln!(sum, "value += {weight}u * c{i}[4095].x;").unwrap();
+        expected += weight * value;
     }
     constants.flush(std::iter::once(0..14 * 65536));
 
@@ -2031,21 +2032,22 @@ fn maximum_textures_samplers_constants_and_uavs_execute_together() {
                 .push(Some(sampler(&gpu, Address::Clamp, Filter::Nearest, None)));
             writeln!(source, "@group(2) @binding({i}) var s{i}: sampler;").unwrap();
         }
+        let weight = i + 1;
         if i < 16 || (88..96).contains(&i) {
             writeln!(
                 sum,
-                "value += u32(round(textureSampleLevel(t{i}, s{}, vec2(0.5), 0.).x * 255.));",
+                "value += {weight}u * u32(round(textureSampleLevel(t{i}, s{}, vec2(0.5), 0.).x * 255.));",
                 i % 16
             )
             .unwrap();
         } else {
             writeln!(
                 sum,
-                "value += u32(round(textureLoad(t{i}, vec2(0), 0).x * 255.));"
+                "value += {weight}u * u32(round(textureLoad(t{i}, vec2(0), 0).x * 255.));"
             )
             .unwrap();
         }
-        expected += i + 1;
+        expected += weight * weight;
     }
 
     let outputs: Vec<_> = (0..8)
