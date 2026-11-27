@@ -37,16 +37,7 @@ fn machine() -> Machine<JitCpu> {
         .flat_map(|(_, slots)| slots.iter())
         .filter_map(|&(name, _, level)| (level == ImplementationLevel::SafeFail).then_some(name))
         .collect();
-    assert_eq!(
-        excluded,
-        [
-            "ID3D11Device1::CreateGeometryShader",
-            "ID3D11Device1::CreateGeometryShaderWithStreamOutput",
-            "ID3D11Device1::CreateHullShader",
-            "ID3D11Device1::CreateDomainShader",
-            "ID3D11Device1::CreateClassLinkage",
-        ]
-    );
+    assert!(excluded.is_empty());
     assert!(registry.signature_conflicts().is_empty());
     crate::dxgi::register(&mut registry);
     #[cfg(feature = "gpu")]

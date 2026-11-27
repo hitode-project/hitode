@@ -9,15 +9,17 @@ pub enum Kind {
     Timestamp,
     Disjoint,
     PipelineStatistics,
+    StreamStatistics(u8),
+    StreamOverflow(Option<u8>),
     OcclusionPredicate,
 }
 
 impl Kind {
     pub fn size(self) -> u32 {
         match self {
-            Self::Event | Self::OcclusionPredicate => 4,
+            Self::Event | Self::OcclusionPredicate | Self::StreamOverflow(_) => 4,
             Self::Occlusion | Self::Timestamp => 8,
-            Self::Disjoint => 16,
+            Self::Disjoint | Self::StreamStatistics(_) => 16,
             Self::PipelineStatistics => 88,
         }
     }
@@ -37,6 +39,7 @@ pub struct Query {
 #[derive(Default)]
 pub struct Active {
     pub slots: Vec<adv_device::gpu::QuerySlot>,
+    pub samples: Vec<(adv_device::gpu::BufferRange, Sample)>,
     pub counters: [u64; 11],
 }
 
@@ -45,7 +48,24 @@ pub struct Pending {
     pub buffer: Option<adv_gpu::Buffer>,
     pub completion: Option<std::sync::mpsc::Receiver<()>>,
     pub words: [u64; 11],
-    pub last: Option<adv_device::gpu::QuerySlot>,
+    pub samples: Vec<Sample>,
+    pub native_count: usize,
+    pub predicate: Option<adv_device::gpu::BufferRange>,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy)]
+pub enum Sample {
+    Stream,
+    Predicate,
+    Expansion,
+    Indirect,
+}
+
+impl Kind {
+    fn is_predicate(self) -> bool {
+        matches!(self, Self::OcclusionPredicate | Self::StreamOverflow(_))
+    }
 }
 
 impl Query {
@@ -57,11 +77,15 @@ impl Query {
             3 => Kind::Disjoint,
             4 => Kind::PipelineStatistics,
             5 => Kind::OcclusionPredicate,
+            6 => Kind::StreamStatistics(0),
+            7 => Kind::StreamOverflow(None),
+            n @ (8 | 10 | 12 | 14) => Kind::StreamStatistics((n as u8 - 8) / 2),
+            n @ (9 | 11 | 13 | 15) => Kind::StreamOverflow(Some((n as u8 - 9) / 2)),
             _ => return Err(Error::InvalidArgument),
         };
         if desc.MiscFlags & !1 != 0
             || (desc.MiscFlags != 0 && kind != Kind::OcclusionPredicate)
-            || (predicate && kind != Kind::OcclusionPredicate)
+            || (predicate && !kind.is_predicate())
         {
             return Err(Error::InvalidArgument);
         }

@@ -13,6 +13,7 @@ pub(super) struct Emitter<'a> {
     max_vertices: u32,
     instances: u32,
     count_expanded: bool,
+    tessellation: Option<tessellation::Output>,
 }
 
 impl<'a> Emitter<'a> {
@@ -20,6 +21,7 @@ impl<'a> Emitter<'a> {
         plan: &'a Plan<'a>,
         input_ir: &'a Module,
         input_registers: u32,
+        tessellation: Option<tessellation::Output>,
     ) -> Result<Self, Error> {
         let (output_ir, outputs, geometry, topology, max_vertices, instances, variant) =
             if let Some(shader) = plan.geometry {
@@ -51,14 +53,17 @@ impl<'a> Emitter<'a> {
                     shader.ir,
                     pulled.outputs,
                     Some(pulled),
-                    Topology::from_geometry(topology)?,
+                    Topology::from_geometry(decode_gs_output_primitive_topology(topology))?,
                     max_vertices,
                     instances,
                     shader.variant,
                 )
             } else {
                 let shader = match plan.source {
-                    Source::Vertex(shader) | Source::Domain { shader, .. } => shader,
+                    Source::Vertex(shader)
+                    | Source::InputAssembler { shader, .. }
+                    | Source::Domain { shader, .. } => shader,
+                    Source::Tessellated { domain, .. } => *domain,
                 };
                 (
                     input_ir,
@@ -81,7 +86,23 @@ impl<'a> Emitter<'a> {
             max_vertices,
             instances,
             count_expanded: variant.count_expanded(),
+            tessellation,
         })
+    }
+
+    pub fn items(&self) -> u32 {
+        self.tessellation
+            .map_or(1, |tessellation| tessellation.maximum)
+    }
+
+    fn count(&self) -> &'static str {
+        if self.tessellation.is_some() {
+            "dx_count()"
+        } else {
+            self.plan
+                .assembly()
+                .map_or("dx_params.y", |(assembly, width)| assembly.active(width))
+        }
     }
 
     pub fn wireframe(&self) -> bool {
@@ -119,12 +140,41 @@ impl<'a> Emitter<'a> {
             .map(|g| g.source.clone())
             .unwrap_or_else(|| format!("alias DxOutput = array<vec4<u32>, {}>;\n", self.outputs));
         let mut expansion = vec![params()];
-        if matches!(self.plan.source, Source::Domain { .. }) {
+        let tessellated = self.tessellation;
+        let domain = matches!(self.plan.source, Source::Domain { .. });
+        if domain || tessellated.is_some() {
             storage(&mut source, INDEX_SLOT, "dx_indices", "array<u32>", false);
-        } else {
-            expansion.push(scratch(SOURCE_SLOT, 0));
         }
         parameters(&mut source);
+        if let Some((assembly, width)) = self.plan.assembly() {
+            assembly.schedule(&mut source, width);
+        }
+        if let Some(output) = tessellated {
+            expansion.extend([
+                scratch(SOURCE_SLOT, output.vertices),
+                scratch(INDEX_SLOT, output.indices),
+            ]);
+            output.declare(
+                &mut source,
+                &mut expansion,
+                self.plan
+                    .assembly()
+                    .map(|(assembly, width)| assembly.active(width))
+                    .unwrap(),
+            );
+            if self.geometry.is_some() {
+                storage(
+                    &mut source,
+                    tessellation::POINTS,
+                    "dx_points",
+                    "array<vec4<u32>>",
+                    false,
+                );
+                expansion.push(scratch(tessellation::POINTS, output.points));
+            }
+        } else if !domain {
+            expansion.push(scratch(SOURCE_SLOT, 0));
+        }
         let input_type = if self.geometry.is_some() {
             writeln!(
                 source,
@@ -143,7 +193,12 @@ impl<'a> Emitter<'a> {
             &format!("array<{input_type}>"),
             false,
         );
-        let input = if matches!(self.plan.source, Source::Domain { .. }) {
+        let input = if tessellated.is_some() {
+            format!(
+                "dx_indices[(dx_params.w + primitive) * {}u + corner]",
+                self.plan.input_vertices
+            )
+        } else if domain {
             format!(
                 "dx_indices[(dx_params.x + primitive) * {}u + corner]",
                 self.plan.input_vertices
@@ -223,7 +278,39 @@ impl<'a> Emitter<'a> {
         self.primitive_output(&mut source, raster.is_some(), stream.is_some());
 
         entry(&mut source, "primitive_main", WORKGROUP);
-        writeln!(source, "{PRIMITIVE_INDEX}").unwrap();
+        source.push_str("let primitive = id.x;\n");
+        if let Some((assembly, width)) = self.plan.assembly()
+            && assembly.strip(width)
+            && assembly.count_statistics
+        {
+            let instances = if assembly.indirect.is_some() {
+                "dx_schedule[5]".to_owned()
+            } else {
+                format!("dx_params.z / {}u", assembly.primitives(width))
+            };
+            let predicate = assembly.predicate.map_or_else(
+                || "true".into(),
+                |value| format!("(dx_predicate[0] != 0u) == {value}"),
+            );
+            writeln!(
+                source,
+                "if primitive == 0u && dx_params.x == 0u && {predicate} {{
+                dx_add_count(6u, dx_strip[0].y * ({instances}));
+                dx_add_count(7u, dx_strip[0].x * ({instances}));
+            }}"
+            )
+            .unwrap();
+        }
+        writeln!(source, "if primitive >= {} {{ return; }}", self.count()).unwrap();
+        if self.count_expanded && self.geometry.is_some() {
+            writeln!(
+                source,
+                "if primitive == 0u {{ dx_add_count(4u, {} * {}u); }}",
+                self.count(),
+                self.instances
+            )
+            .unwrap();
+        }
         if raster.is_some() {
             writeln!(
                 source,
@@ -262,7 +349,14 @@ impl<'a> Emitter<'a> {
         } else {
             let arity = self.topology.vertices();
             let values = (0..arity)
-                .map(|j| format!("dx_input(primitive, {j}u)"))
+                .map(|j| {
+                    let corner = match self.plan.input_vertices {
+                        4 if arity == 2 => j + 1,
+                        6 if arity == 3 => j * 2,
+                        _ => j,
+                    };
+                    format!("dx_input(primitive, {corner}u)")
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             writeln!(
@@ -285,6 +379,7 @@ impl<'a> Emitter<'a> {
                 .map_or_else(Vec::new, |g| g.counters.clone()),
             expansion,
             workgroup_size: Some(WORKGROUP),
+            items_per_primitive: self.items(),
         }
     }
 
@@ -324,11 +419,35 @@ impl<'a> Emitter<'a> {
         }
         let arity = self.topology.vertices();
         let per_instance = self.topology.fixed_slots(self.max_vertices);
+        let primitive_id = if let Some(output) = self.tessellation {
+            let (assembly, _) = self.plan.assembly().unwrap();
+            let count = if assembly.indirect.is_some() {
+                "dx_schedule[1]".into()
+            } else {
+                format!("{}u", output.count)
+            };
+            format!(
+                "(dx_params.x + dx_points[dx_indices[(dx_params.w + primitive) * {}u]].w) % {count}",
+                output.arity
+            )
+        } else if let Source::InputAssembler { assembly, .. } = self.plan.source {
+            let count = if assembly.indirect.is_some() {
+                "dx_schedule[1]".into()
+            } else if assembly.strip(self.plan.input_vertices) {
+                "dx_strip[0].x".into()
+            } else {
+                format!("{}u", assembly.primitives(self.plan.input_vertices))
+            };
+            format!("(dx_params.x + primitive) % {count}")
+        } else {
+            "dx_params.x + primitive".into()
+        };
+
         writeln!(
             source,
             "}}
             for (var instance = 0u; instance < {}u; instance += 1u) {{
-                dx_run(input, vec4<u32>(dx_params.x + primitive), vec4<u32>(instance));
+                dx_run(input, vec4<u32>({primitive_id}), vec4<u32>(instance));
                 var strip: array<u32, 4>;
                 var old: array<vec2<u32>, 4>;
                 var emitted = 0u;
@@ -492,11 +611,19 @@ impl<'a> Emitter<'a> {
                     |(register, lane)| format!("list[0][{register}][{lane}]"),
                 )
             };
+            let viewport = read_index(SystemValue::ViewportArrayIndex);
+            let layer = read_index(SystemValue::RenderTargetArrayIndex);
+            let layers = raster
+                .bins
+                .iter()
+                .map(|variant| u32::from(variant.bin().first_layer) + 1)
+                .max()
+                .unwrap_or(1);
             writeln!(
                 source,
-                "let viewport = {}; let layer = {};",
-                read_index(SystemValue::ViewportArrayIndex),
-                read_index(SystemValue::RenderTargetArrayIndex)
+                "let raw_viewport = {viewport}; let raw_layer = {layer};
+                 let viewport = select(0u, raw_viewport, raw_viewport < 16u);
+                 let layer = select(0u, raw_layer, raw_layer < {layers}u);"
             )
             .unwrap();
             for (index, variant) in raster.bins.iter().enumerate() {
@@ -511,8 +638,9 @@ impl<'a> Emitter<'a> {
                 };
                 writeln!(
                     source,
-                    "if {condition} {{ atomicStore(&dx_args[{}u], dx_params.y * {}u); }}",
+                    "if {condition} {{ atomicStore(&dx_args[{}u], {} * {}u); }}",
                     index * 4,
+                    self.count(),
                     self.raster_slots()
                 )
                 .unwrap();
@@ -533,11 +661,18 @@ impl<'a> Emitter<'a> {
         source.push_str("}\n");
     }
 
-    pub fn stream_output(&self, stream: usize, scan: usize) -> (ComputeProgram, ComputeProgram) {
+    pub fn stream_output(
+        &self,
+        stream: usize,
+        scan: Option<usize>,
+    ) -> (ComputeProgram, Option<ComputeProgram>) {
         let target_count = self.plan.stream_output.len();
         let args = |write: bool| {
             let mut source = String::new();
             parameters(&mut source);
+            if let Some((assembly, width)) = self.plan.assembly() {
+                assembly.schedule(&mut source, width);
+            }
             storage(
                 &mut source,
                 STREAM_SLOT,
@@ -545,7 +680,9 @@ impl<'a> Emitter<'a> {
                 &format!("array<array<vec4<u32>, {}>>", self.outputs + 1),
                 false,
             );
-            storage(&mut source, SCAN_SLOT, "dx_offsets", "array<u32>", !write);
+            if scan.is_some() {
+                storage(&mut source, SCAN_SLOT, "dx_offsets", "array<u32>", !write);
+            }
             for i in 0..target_count {
                 storage(
                     &mut source,
@@ -557,15 +694,53 @@ impl<'a> Emitter<'a> {
             }
             source
         };
+        let mut expansion = vec![params(), scratch(STREAM_SLOT, stream)];
+        if let Some(scan) = scan {
+            expansion.push(scratch(SCAN_SLOT, scan));
+        }
         let mut prefix = args(false);
-        storage(&mut prefix, FILLED_SLOT, "dx_filled", "array<u32>", true);
+        for i in 0..target_count {
+            storage(
+                &mut prefix,
+                FILLED_BASE + i as u32,
+                &format!("filled{i}"),
+                "array<u32>",
+                true,
+            );
+        }
+        if let Some(output) = self.tessellation {
+            output.declare(
+                &mut prefix,
+                &mut expansion,
+                self.plan
+                    .assembly()
+                    .map(|(assembly, width)| assembly.active(width))
+                    .unwrap(),
+            );
+        }
+        if self.plan.stream_statistics != 0 {
+            storage(
+                &mut prefix,
+                STREAM_STATISTICS,
+                "dx_so_stats",
+                "array<u32>",
+                true,
+            );
+            prefix.push_str(
+                "fn dx_increment(at: u32) {
+                dx_so_stats[at] += 1u;
+                if dx_so_stats[at] == 0u { dx_so_stats[at + 1u] += 1u; }
+            }\n",
+            );
+        }
         entry(&mut prefix, "prefix_main", 1);
         let arity = self.topology.vertices();
         let slots = self.list_slots();
         writeln!(
             prefix,
-            "for (var at = 0u; at < dx_params.y * {slots}u; at += {arity}u) {{
+            "for (var at = 0u; at < {} * {slots}u; at += {arity}u) {{
             let tag = dx_stream[at][{}];",
+            self.count(),
             self.outputs
         )
         .unwrap();
@@ -575,6 +750,12 @@ impl<'a> Emitter<'a> {
                 "dx_offsets[at * {target_count}u + {i}u] = 0xffffffffu;"
             )
             .unwrap();
+        }
+        if self.plan.stream_statistics != 0 {
+            writeln!(prefix,
+                "if tag.w != 0u && ({}u & (1u << tag.z)) != 0u {{ dx_increment(4u * tag.z + 2u); }}",
+                self.plan.stream_statistics
+            ).unwrap();
         }
         let mut streams: Vec<_> = self
             .plan
@@ -596,7 +777,7 @@ impl<'a> Emitter<'a> {
                 .iter()
                 .map(|(i, target)| {
                     format!(
-                        "dx_filled[{i}] / 4u + {}u <= arrayLength(&target{i})",
+                        "filled{i}[0] / 4u + {}u <= arrayLength(&target{i})",
                         arity as usize * target.elements.len(),
                     )
                 })
@@ -607,12 +788,15 @@ impl<'a> Emitter<'a> {
                 fits.join(" && ")
             )
             .unwrap();
+            if self.plan.stream_statistics & (1 << stream) != 0 {
+                writeln!(prefix, "dx_increment(4u * {stream}u);").unwrap();
+            }
             for (i, target) in targets {
                 let stride = target.elements.len();
                 writeln!(
                     prefix,
-                    "dx_offsets[at * {target_count}u + {i}u] = dx_filled[{i}] / 4u;
-                    dx_filled[{i}] += {}u;",
+                    "dx_offsets[at * {target_count}u + {i}u] = filled{i}[0] / 4u;
+                    filled{i}[0] += {}u;",
                     4 * stride * arity as usize
                 )
                 .unwrap();
@@ -620,14 +804,39 @@ impl<'a> Emitter<'a> {
             prefix.push_str("}\n");
         }
         prefix.push_str("}\n}\n");
+        let prefix = ComputeProgram {
+            source: prefix,
+            entry: "prefix_main",
+            bindings: Vec::new(),
+            counters: Vec::new(),
+            expansion: expansion.clone(),
+            workgroup_size: None,
+            items_per_primitive: 1,
+        };
+        if scan.is_none() {
+            return (prefix, None);
+        }
 
         let mut write = args(true);
+        let mut write_expansion = expansion;
+        if let Some(output) = self.tessellation {
+            write_expansion.pop();
+            output.declare(
+                &mut write,
+                &mut write_expansion,
+                self.plan
+                    .assembly()
+                    .map(|(assembly, width)| assembly.active(width))
+                    .unwrap(),
+            );
+        }
         entry(&mut write, "stream_main", WORKGROUP);
         writeln!(
             write,
-            "{PRIMITIVE_INDEX}
+            "let primitive = id.x; if primitive >= {} {{ return; }}
             for (var j = 0u; j < {slots}u; j += {arity}u) {{
-                let at = primitive * {slots}u + j;"
+                let at = primitive * {slots}u + j;",
+            self.count()
         )
         .unwrap();
         for (slot, target) in self.plan.stream_output.iter().enumerate() {
@@ -652,28 +861,17 @@ impl<'a> Emitter<'a> {
             write.push_str("}\n}\n}\n");
         }
         write.push_str("}\n}\n");
-        let expansion = vec![
-            params(),
-            scratch(STREAM_SLOT, stream),
-            scratch(SCAN_SLOT, scan),
-        ];
         (
-            ComputeProgram {
-                source: prefix,
-                entry: "prefix_main",
-                bindings: Vec::new(),
-                counters: Vec::new(),
-                expansion: expansion.clone(),
-                workgroup_size: None,
-            },
-            ComputeProgram {
+            prefix,
+            Some(ComputeProgram {
                 source: write,
                 entry: "stream_main",
                 bindings: Vec::new(),
                 counters: Vec::new(),
-                expansion,
+                expansion: write_expansion,
                 workgroup_size: Some(WORKGROUP),
-            },
+                items_per_primitive: self.items(),
+            }),
         )
     }
 }
@@ -699,5 +897,6 @@ pub(super) fn initialize(bins: usize, argument_region: usize) -> ComputeProgram 
         counters: Vec::new(),
         expansion: vec![scratch(ARGUMENTS_SLOT, argument_region)],
         workgroup_size: None,
+        items_per_primitive: 1,
     }
 }

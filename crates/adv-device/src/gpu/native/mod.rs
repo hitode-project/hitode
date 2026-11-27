@@ -59,6 +59,7 @@ pub mod test_support;
 pub use compressed::BlockTexture;
 pub use expand::{
     Expand, ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude, ExpansionRegion,
+    ExpansionWindow,
 };
 pub use modern::{
     BufferRange, Dispatch, DispatchArguments, DrawArguments, ImageRegion, ModernColor, ModernDepth,

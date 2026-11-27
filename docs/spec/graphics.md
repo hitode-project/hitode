@@ -2,7 +2,7 @@
 
 ID prefix: GFX
 
-This spec covers shared CPU compositing, the DirectDraw and Direct3D 9 API front ends, and the Direct3D 11 fixed-function tessellation core. It includes capabilities, shaders, vertex input, samplers, buffers, caches and numerical behavior. `adv-dx` and the GPU renderer in `adv-device` implement them.
+This spec covers shared CPU compositing, the DirectDraw and Direct3D 9 API front ends, and the private Direct3D 11 API front end. It includes capabilities, shaders, vertex input, samplers, buffers, caches and numerical behavior. `adv-dx` and the GPU renderer in `adv-device` implement them.
 
 ## DirectDraw
 
@@ -256,7 +256,7 @@ Hot state setters, getters, scene boundaries, and unchanged bindings or state bl
 
 Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices and indices use 128-bit content keys. Whole-image upload snapshots hash their texels during capture unless a large texture's sampled probe changed from its previous upload. Partial uploads, changed probes, and fills use admission identities. Insufficient storage wraps before the complete binding window exceeds the buffer. Immutable snapshots retain only used registers, reuse unchanged captures across writes to unused registers and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
 
-Direct3D 11 captures the dynamic index window and the vertex and instance windows determined at draw admission. GPU-resident index and indirect-argument buffers keep their data on the GPU.
+Direct3D 11 captures the dynamic index window and the vertex and instance windows determined at draw admission. GPU-resident index buffers and indirect arguments with resource bounds stay on the GPU. Expanded indirect draws read arguments at an ordered boundary when one or both dimensions lack a resource bound and report the readback in diagnostic builds.
 
 ### GFX-REC-8 Frontend work counters
 
@@ -470,20 +470,28 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 **Verification**: Test
 
 The shader-core fixture directory holds the token ledger, Windows shader-creation HRESULTs
-and measured readbacks. GS, HS and DS execution belongs to expansion and programmable stages
-(T8 and T15). Class linkage execution belongs to T15. Residency feedback and double precision
-have Windows bytecode oracles. The shader core does not report tiled resources or emit
+and measured readbacks. The guest tests execute captured geometry, hull, domain and class
+linkage programs. Residency feedback and double precision have Windows bytecode oracles. The shader core does not report tiled resources or emit
 64-bit floating-point operations.
 
 ### GFX-SHADER-6 Expansion order
 
-**Rule**: Expansion MUST preserve primitive order, the leading vertex and winding. It MUST append complete stream-output primitives in order and derive filled sizes from the append scan.
+**Rule**: Expansion MUST preserve primitive order, the leading vertex and winding. It MUST append complete stream-output primitives in order and derive filled sizes from the append scan. Tessellated draws MUST preserve that order across scratch chunks without reading mesh counts back to the CPU.
 **Verification**: Test
 
 ### GFX-SHADER-7 Pipeline statistics
 
-**Rule**: Pipeline statistics MUST combine recorded work with raster and expansion counts. Rasterization-disabled draws MUST contribute zero clipping and fragment counts.
+**Rule**: Pipeline statistics MUST combine recorded work with raster and expansion counts. Rasterization-disabled draws MUST contribute zero clipping and fragment counts. Programmable-stage counts MUST account for the work in the table below.
 **Verification**: Test
+
+| Stage | Work counted |
+|---|---|
+| Vertex | Invocations within the Direct3D cache bounds |
+| Hull | Submitted patches |
+| Domain | Shaded domain points |
+| Geometry | Shader instances and emitted primitives |
+| Pixel | Invocations within the Direct3D depth and stencil bounds |
+| Compute | Threads in direct and indirect dispatches |
 
 ## Tessellation
 
@@ -492,6 +500,9 @@ have Windows bytecode oracles. The shader core does not report tiled resources o
 **Rule**: The tessellator MUST cull a patch if any edge factor is zero, negative or NaN. It MUST match the Direct3D 11 reference for domain-location bits, primitive counts, connectivity and winding. Primitive order and the first vertex of each triangle MAY vary.
 **Verification**: Test
 **Basis**: [Direct3D 11.3 functional specification §11.7](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#TessellationPattern)
+
+The GPU path counts and emits domain points and indices from the hull shader's output.
+The domain shader consumes those points in the same expansion chunk.
 
 ## Vertex and raster input
 
@@ -543,6 +554,36 @@ Pretransformed draws MUST retain index order.
 **Rule**: SetFVF MUST store any nonzero FVF as state, replacing a bound declaration, and zero MUST succeed without change. After SetFVF, GetVertexDeclaration MUST return one device-retained declaration per FVF, built by the D3D9 FVF element mapping. Draws MUST reject an FVF without a supported layout.
 **Verification**: Test
 **Basis**: Wine d3d9 `test_fvf_decl_conversion` and `test_fvf_decl_management`, which pass on Windows.
+
+## Direct3D 11 stages
+
+### GFX-STAGE-1 Stream output
+
+**Rule**: Each stream output buffer MUST track its own filled byte size and preserve it on append bindings. Stream-output queries MUST distinguish complete primitives written from those that exceed available storage. `DrawAuto` MUST consume the filled byte size using the input assembler offset and stride from slot zero.
+**Verification**: Test
+
+An unbound target counts as full when calculating primitives written.
+The overflow predicate compares storage needed with primitives written for its selected stream or for every stream in the unqualified query.
+
+### GFX-STAGE-2 Indirect dispatch
+
+**Rule**: Indirect dispatch MUST consume its group counts at execution in recording order.
+**Verification**: Test
+
+### GFX-STAGE-3 Class linkage
+
+**Rule**: Each draw MUST use the class instances captured at shader binding to select the interface function tables. Reads through `this[]` MUST use the constant, texture and sampler offsets of the bound instances. Named array elements MUST advance each offset by its class stride.
+**Verification**: Test
+
+### GFX-STAGE-4 Output merger UAVs
+
+**Rule**: At feature level 11_0 a pixel shader MUST access its bound output-merger UAVs. Pixel UAV writes MUST execute when neither color nor depth attachments are bound.
+**Verification**: Test
+
+### GFX-STAGE-5 Geometry shader raster routing
+
+**Rule**: Each primitive MUST use the viewport, scissor and attachment slice selected by the leading geometry shader output vertex. For a Texture3D render-target view, attachment indices MUST be relative to the view’s first W slice at its mip. A render-target clear MUST cover every W slice in the view.
+**Verification**: Test
 
 ## Samplers
 

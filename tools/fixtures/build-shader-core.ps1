@@ -130,6 +130,9 @@ Compile shader-core.hlsl diagnostic_pixel ps_5_0 diagnostic_pixel
 Compile shader-core.hlsl min_precision cs_5_0 min_precision
 Compile shader-core.hlsl instanced_geometry gs_5_0 instanced_geometry
 Compile dxbc.hlsl limited_hull hs_5_0 limited_hull
+Compile d3d11-stages.hlsl stage_members ps_5_0 stage_members
+Compile d3d11-stages.hlsl stage_wide_hull hs_5_0 stage_wide_hull
+Compile d3d11-stages.hlsl stage_wide_geometry gs_5_0 stage_wide_geometry
 
 if ($Encoded) {
     $rows = @("fixture`thardware_create`twarp_create`tdisassemble")

@@ -53,19 +53,20 @@ pub struct Assembly {
 
 /// The paired low and high words of each counter are contiguous in storage.
 /// The first four counters are written by the pixel and expansion programs.
-pub const GPU_WORDS: usize = 8;
+pub const GPU_WORDS: usize = 16;
+pub const GPU_COUNTERS: [usize; GPU_WORDS / 2] = [7, 4, 5, 6, 3, 9, 0, 1];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssemblyTopology {
     List(u32),
-    Strip(u32),
+    Strip(u32, u32),
 }
 
 impl AssemblyTopology {
     pub fn primitives(self, vertices: u32) -> u32 {
         match self {
             Self::List(width) => vertices / width,
-            Self::Strip(width) => vertices.saturating_sub(width - 1),
+            Self::Strip(width, step) => vertices.checked_sub(width).map_or(0, |n| 1 + n / step),
         }
     }
 }
@@ -149,8 +150,12 @@ impl PipelineStatistics {
 
 pub(super) const ADD_COUNTER: &str = "
 fn dx_add_counter(counter: u32) {
+    dx_add_count(counter, 1u);
+}
+fn dx_add_count(counter: u32, count: u32) {
     let index = counter * 2u;
-    if atomicAdd(&dx_stats[index], 1u) == 0xffffffffu {
+    let previous = atomicAdd(&dx_stats[index], count);
+    if previous + count < previous {
         atomicAdd(&dx_stats[index + 1u], 1u);
     }
 }
@@ -176,6 +181,10 @@ impl Indirect {
     /// Emit a single-thread helper for the argument layout shared by direct
     /// and indexed indirect draws. Strip-cut counts come from the assembly.
     pub fn compute(&self) -> String {
+        self.compute_at(0)
+    }
+
+    pub fn compute_at(&self, offset: u64) -> String {
         let body = match *self {
             Self::Draw {
                 topology,
@@ -185,8 +194,10 @@ impl Indirect {
             } => {
                 let primitives = match topology {
                     AssemblyTopology::List(width) => format!("vertices / {width}u"),
-                    AssemblyTopology::Strip(width) => {
-                        format!("max(vertices, {}u) - {}u", width - 1, width - 1)
+                    AssemblyTopology::Strip(width, step) => {
+                        format!(
+                            "select(0u, 1u + (vertices - {width}u) / {step}u, vertices >= {width}u)"
+                        )
                     }
                 };
                 let mut body = format!(
@@ -214,7 +225,7 @@ impl Indirect {
         let counters = STATISTICS_SLOT;
         format!(
             "
-@group(3) @binding({INDIRECT_ARGUMENTS_SLOT}) var<storage, read> dx_arguments: array<u32>;
+@group(3) @binding({INDIRECT_ARGUMENTS_SLOT}) var<storage, read> dx_argument_words: array<u32>;
 @group(3) @binding({counters}) var<storage, read_write> dx_stats: array<atomic<u32>>;
 fn dx_add_product(counter: u32, a: u32, b: u32) {{
     let a0 = a & 0xffffu;
@@ -231,6 +242,7 @@ fn dx_add_product(counter: u32, a: u32, b: u32) {{
     atomicAdd(&dx_stats[at + 1u], high + select(0u, 1u, prior + low < prior));
 }}
 @compute @workgroup_size(1) fn indirect_statistics() {{
+    let dx_arguments = vec3<u32>(dx_argument_words[{offset}u], dx_argument_words[{offset}u + 1u], dx_argument_words[{offset}u + 2u]);
     {body}
 }}
 "

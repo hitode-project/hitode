@@ -8,7 +8,7 @@ opcode	5	callc	encoded_callc	shader core
 opcode	6	case	control	shader core
 opcode	7	continue	branches	shader core
 opcode	8	continuec	encoded_flow	shader core
-opcode	9	cut	gs_4_0	T8/T15 programmable stages
+opcode	9	cut	gs_4_0	guest geometry and stream output
 opcode	10	default	control	shader core
 opcode	11	deriv_rtx	derivatives_4_0	Windows value readback pending
 opcode	12	deriv_rty	derivatives_4_0	Windows value readback pending
@@ -18,8 +18,8 @@ opcode	15	dp2	float_ops	shader core
 opcode	16	dp3	integer_ops	shader core
 opcode	17	dp4	integer_ops	shader core
 opcode	18	else	branches	shader core
-opcode	19	emit	encoded_emit_cut	T8/T15 programmable stages
-opcode	20	emitthencut	encoded_emit_cut	T8/T15 programmable stages
+opcode	19	emit	encoded_emit_cut	guest geometry and stream output
+opcode	20	emitthencut	encoded_emit_cut	guest geometry and stream output
 opcode	21	endif	branches	shader core
 opcode	22	endloop	branches	shader core
 opcode	23	endswitch	control	shader core
@@ -49,7 +49,7 @@ opcode	46	ldms	multisample_queries	Windows value readback pending
 opcode	47	log	float_ops	shader core
 opcode	48	loop	branches	shader core
 opcode	49	lt	discard_pixel	shader core
-opcode	50	mad	ds_5_0	T8/T15 programmable stages
+opcode	50	mad	ds_5_0	guest tessellation
 opcode	51	min	float_ops	shader core
 opcode	52	max	float_ops	shader core
 opcode	53	customdata	ps_4_0	shader core
@@ -88,21 +88,21 @@ opcode	85	ushr	bit_ops	shader core
 opcode	86	utof	bit_ops	shader core
 opcode	87	xor	arithmetic	shader core
 declaration	88	dcl_resource	buffer_views	shader core
-declaration	89	dcl_constant_buffer	encoded_hull_join	T8/T15 programmable stages
+declaration	89	dcl_constant_buffer	encoded_hull_join	guest tessellation
 declaration	90	dcl_sampler	dynamic_gather	shader core
-declaration	91	dcl_index_range	encoded_hull_join	T8/T15 programmable stages
-declaration	92	dcl_gs_output_primitive_topology	encoded_emit_cut	T8/T15 programmable stages
-declaration	93	dcl_gs_input_primitive	encoded_emit_cut	T8/T15 programmable stages
-declaration	94	dcl_max_output_vertex_count	encoded_emit_cut	T8/T15 programmable stages
+declaration	91	dcl_index_range	encoded_hull_join	guest tessellation
+declaration	92	dcl_gs_output_primitive_topology	encoded_emit_cut	guest geometry and stream output
+declaration	93	dcl_gs_input_primitive	encoded_emit_cut	guest geometry and stream output
+declaration	94	dcl_max_output_vertex_count	encoded_emit_cut	guest geometry and stream output
 declaration	95	dcl_input	arithmetic	shader core
 declaration	96	dcl_input_sgv	vertex_sample	shader core
-declaration	97	dcl_input_siv	encoded_emit_cut	T8/T15 programmable stages
+declaration	97	dcl_input_siv	encoded_emit_cut	guest geometry and stream output
 declaration	98	dcl_input_ps	derivative_queries	Windows value readback pending
 declaration	99	dcl_input_ps_sgv	coverage	shader core
 declaration	100	dcl_input_ps_siv	color	shader core
 declaration	101	dcl_output	color	shader core
-declaration	102	dcl_output_sgv	instanced_geometry	T8/T15 programmable stages
-declaration	103	dcl_output_siv	ds_5_0	T8/T15 programmable stages
+declaration	102	dcl_output_sgv	instanced_geometry	guest geometry and stream output
+declaration	103	dcl_output_siv	ds_5_0	guest tessellation
 declaration	104	dcl_temps	arithmetic	shader core
 declaration	105	dcl_indexable_temp	indexed_inputs	shader core
 declaration	106	dcl_global_flags	arithmetic	shader core
@@ -110,14 +110,14 @@ opcode	108	lod	level_query	shader core
 opcode	109	gather4	texture_ops	Windows value readback pending
 opcode	110	samplepos	multisample_queries	Windows value readback pending
 opcode	111	sampleinfo	coverage	shader core
-opcode	113	hs_decls	encoded_hull_join	T8/T15 programmable stages
-opcode	114	hs_control_point_phase	encoded_hull_join	T8/T15 programmable stages
-opcode	115	hs_fork_phase	encoded_hull_join	T8/T15 programmable stages
-opcode	116	hs_join_phase	encoded_hull_join	T8/T15 programmable stages
-opcode	117	emit_stream	encoded_emit_cut_stream	T8/T15 programmable stages
-opcode	118	cut_stream	gs_5_0	T8/T15 programmable stages
-opcode	119	emitthencut_stream	encoded_emit_cut_stream	T8/T15 programmable stages
-opcode	120	fcall	linkage	T15 class linkage
+opcode	113	hs_decls	encoded_hull_join	guest tessellation
+opcode	114	hs_control_point_phase	encoded_hull_join	guest tessellation
+opcode	115	hs_fork_phase	encoded_hull_join	guest tessellation
+opcode	116	hs_join_phase	encoded_hull_join	guest tessellation
+opcode	117	emit_stream	encoded_emit_cut_stream	guest geometry and stream output
+opcode	118	cut_stream	gs_5_0	guest geometry and stream output
+opcode	119	emitthencut_stream	encoded_emit_cut_stream	guest geometry and stream output
+opcode	120	fcall	linkage	guest class linkage
 opcode	121	bufinfo	buffer_views	shader core
 opcode	122	deriv_rtx_coarse	derivative_queries	Windows value readback pending
 opcode	123	deriv_rtx_fine	derivative_queries	Windows value readback pending
@@ -140,18 +140,18 @@ opcode	139	ibfe	bit_ops	shader core
 opcode	140	bfi	bit_ops	shader core
 opcode	141	bfrev	arithmetic	shader core
 opcode	142	swapc	swap_values	shader core
-declaration	143	dcl_stream	encoded_emit_cut_stream	T8/T15 programmable stages
-declaration	144	dcl_function_body	linkage	T15 class linkage
-declaration	145	dcl_function_table	linkage	T15 class linkage
-declaration	146	dcl_interface	linkage	T15 class linkage
-declaration	147	dcl_input_control_point_count	ds_5_0	T8/T15 programmable stages
-declaration	148	dcl_output_control_point_count	encoded_hull_join	T8/T15 programmable stages
-declaration	149	dcl_tess_domain	ds_5_0	T8/T15 programmable stages
-declaration	150	dcl_tess_partitioning	encoded_hull_join	T8/T15 programmable stages
-declaration	151	dcl_tess_output_primitive	encoded_hull_join	T8/T15 programmable stages
-declaration	152	dcl_hs_max_tessfactor	limited_hull	T8/T15 programmable stages
-declaration	153	dcl_hs_fork_phase_instance_count	encoded_hull_join	T8/T15 programmable stages
-declaration	154	dcl_hs_join_phase_instance_count	encoded_hull_join	T8/T15 programmable stages
+declaration	143	dcl_stream	encoded_emit_cut_stream	guest geometry and stream output
+declaration	144	dcl_function_body	linkage	guest class linkage
+declaration	145	dcl_function_table	linkage	guest class linkage
+declaration	146	dcl_interface	linkage	guest class linkage
+declaration	147	dcl_input_control_point_count	ds_5_0	guest tessellation
+declaration	148	dcl_output_control_point_count	encoded_hull_join	guest tessellation
+declaration	149	dcl_tess_domain	ds_5_0	guest tessellation
+declaration	150	dcl_tess_partitioning	encoded_hull_join	guest tessellation
+declaration	151	dcl_tess_output_primitive	encoded_hull_join	guest tessellation
+declaration	152	dcl_hs_max_tessfactor	limited_hull	guest tessellation
+declaration	153	dcl_hs_fork_phase_instance_count	encoded_hull_join	guest tessellation
+declaration	154	dcl_hs_join_phase_instance_count	encoded_hull_join	guest tessellation
 declaration	155	dcl_thread_group	arithmetic	shader core
 declaration	156	dcl_unordered_access_view_typed	buffer_views	shader core
 declaration	157	dcl_unordered_access_view_raw	raw	shader core
@@ -203,7 +203,7 @@ opcode	202	ftod	doubles	double precision excluded
 opcode	203	eval_snapped	raster_queries	shader core
 opcode	204	eval_sample_index	raster_queries	shader core
 opcode	205	eval_centroid	raster_queries	shader core
-declaration	206	dcl_gs_instance_count	instanced_geometry	T8/T15 programmable stages
+declaration	206	dcl_gs_instance_count	instanced_geometry	guest geometry and stream output
 opcode	207	abort	encoded_abort	diagnostic instruction
 opcode	208	debug_break	encoded_debug_break	diagnostic instruction
 opcode	210	ddiv	doubles	double precision excluded

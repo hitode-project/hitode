@@ -3,7 +3,7 @@ use crate::record;
 pub use crate::record::ResourceKey;
 use adv_device::{
     gpu::{
-        Dispatch, DispatchArguments, Error, Gpu, ModernDraw, ModernTransfer, QuerySlot,
+        Dispatch, DispatchArguments, Error, Expand, Gpu, ModernDraw, ModernTransfer, QuerySlot,
         SlotBindings,
     },
     surface::Rect,
@@ -18,6 +18,7 @@ pub enum Command {
         fragment: SlotBindings,
         statistics: Option<QuerySlot>,
     },
+    Expand(Box<Expand>),
     Dispatch {
         pipeline: Arc<Dispatch>,
         bindings: SlotBindings,
@@ -63,6 +64,7 @@ impl record::Front for Front {
                 ),
                 None => gpu.draw_modern((**draw).clone(), vertex, fragment),
             },
+            Command::Expand(expansion) => gpu.expand((**expansion).clone()),
             Command::Dispatch {
                 pipeline,
                 bindings,
@@ -100,9 +102,22 @@ pub struct Effects<'a> {
 #[derive(Default)]
 pub struct Recording {
     inner: record::Recording<Command>,
+    #[cfg(feature = "d3d9-counters")]
+    counters: record::Counters,
 }
 
 impl Recording {
+    #[cfg(feature = "d3d9-counters")]
+    pub fn count_indirect_readback(&mut self, bytes: u64) {
+        self.counters.readback_bytes += bytes;
+        self.counters.flushes[1] += 1;
+        log::debug!(
+            "D3D11 indirect argument readbacks: {}; readback bytes: {}",
+            self.counters.flushes[1],
+            self.counters.readback_bytes
+        );
+    }
+
     pub fn append(
         &mut self,
         gpu: &mut Gpu,
@@ -111,7 +126,7 @@ impl Recording {
     ) -> Result<(), Error> {
         let op = |payload| {
             let kind = match &payload {
-                Command::Draw { .. } => record::Kind::Draw,
+                Command::Draw { .. } | Command::Expand(_) => record::Kind::Draw,
                 Command::Resolve { .. } => record::Kind::Copy,
                 Command::Dispatch { .. } | Command::GenerateMips(_) | Command::Transfer(_) => {
                     record::Kind::Upload

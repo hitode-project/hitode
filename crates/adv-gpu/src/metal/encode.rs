@@ -129,6 +129,7 @@ impl Encoder {
                 continue;
             }
             attachment.setTexture(Some(&color.view.inner.raw));
+            attachment.setDepthPlane(color.view.inner.depth_plane);
             let bounded = partial(desc.area, color.view.size());
             let memoryless = color.view.inner.raw.storageMode() == MTLStorageMode::Memoryless;
             attachment.setLoadAction(load(color.load, bounded && !memoryless));

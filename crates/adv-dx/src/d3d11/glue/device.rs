@@ -1,4 +1,5 @@
 //! Device creation and resource factory entry points.
+use super::linkage::create_linkage;
 use super::*;
 use crate::d3d11::{
     caps::{Coverage, DeviceAdapter, DeviceRequest, Driver, FeatureLevel, Report},
@@ -31,13 +32,13 @@ pub(super) const FACE: (&str, &[Slot]) = methods!(
     CreateDepthStencilView => dsv Implement,
     CreateInputLayout => input_layout Implement,
     CreateVertexShader => vertex_shader Implement,
-    CreateGeometryShader => excluded_stage SafeFail,
-    CreateGeometryShaderWithStreamOutput => excluded_so_shader SafeFail,
+    CreateGeometryShader => geometry_shader Implement,
+    CreateGeometryShaderWithStreamOutput => stream_output_shader Implement,
     CreatePixelShader => pixel_shader Implement,
-    CreateHullShader => excluded_stage SafeFail,
-    CreateDomainShader => excluded_stage SafeFail,
+    CreateHullShader => hull_shader Implement,
+    CreateDomainShader => domain_shader Implement,
     CreateComputeShader => compute_shader Implement,
-    CreateClassLinkage => excluded_linkage SafeFail,
+    CreateClassLinkage => create_linkage Implement,
     CreateBlendState => blend Implement,
     CreateDepthStencilState => depth_stencil Implement,
     CreateRasterizerState => rasterizer Implement,
@@ -389,21 +390,7 @@ fn input_layout(env: &mut Env<'_>) -> Outcome {
         }
         let entries = array::<D3D11_INPUT_ELEMENT_DESC>(env, elements, count)?
             .into_iter()
-            .map(|entry| {
-                let mut name = Vec::new();
-                for offset in 0..256 {
-                    let address = entry
-                        .SemanticName
-                        .checked_add(offset)
-                        .ok_or(Error::InvalidArgument)?;
-                    let byte: u8 = read(env, address)?;
-                    if byte == 0 {
-                        return Ok((name, entry));
-                    }
-                    name.push(byte);
-                }
-                Err(Error::InvalidArgument)
-            })
+            .map(|entry| semantic_name(env, entry.SemanticName).map(|name| (name, entry)))
             .collect::<Result<Vec<_>, Error>>()?;
         let signature = array::<u8>(env, bytecode, size)?;
         let layout = InputLayout::new(entries, &signature, report(env, device)?)?;
@@ -418,6 +405,19 @@ fn input_layout(env: &mut Env<'_>) -> Outcome {
             Ok(pointer)
         })
     })())
+}
+
+pub(super) fn semantic_name(env: &Env<'_>, pointer: u32) -> Result<Vec<u8>, Error> {
+    let mut name = Vec::new();
+    for offset in 0..256 {
+        let address = pointer.checked_add(offset).ok_or(Error::InvalidArgument)?;
+        let byte: u8 = read(env, address)?;
+        if byte == 0 {
+            return Ok(name);
+        }
+        name.push(byte);
+    }
+    Err(Error::InvalidArgument)
 }
 
 fn view<T: Pod + Into<ViewDesc>>(env: &mut Env<'_>, kind: ViewKind) -> Outcome {
@@ -456,18 +456,85 @@ fn shader(env: &mut Env<'_>, stage: Stage, face: &str) -> Outcome {
     let (device, bytes, length, linkage, out) =
         (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
     status((|| {
+        validate_linkage(env, device, linkage)?;
         let bytecode = array::<u8>(env, bytes, length)?;
         let shader = Shader::new(stage, &bytecode, linkage != 0, report(env, device)?)?;
-        output(env, out, |env| {
-            let pointer = alloc(env, face)?;
-            if let Err(error) =
-                table(env).attach_shader(&mut env.sys.objects, pointer, device, shader)
-            {
-                free(env, pointer);
-                return Err(error.into());
-            }
-            Ok(pointer)
-        })
+        attach_shader(env, device, out, face, shader, linkage)
+    })())
+}
+
+fn validate_linkage(env: &Env<'_>, device: u32, linkage: u32) -> Result<(), Error> {
+    if linkage != 0
+        && !table(env)
+            .get(&env.sys.objects, linkage)
+            .is_some_and(|object| {
+                object.device() == Some(device) && object.class_linkage().is_some()
+            })
+    {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
+fn attach_shader(
+    env: &mut Env<'_>,
+    device: u32,
+    out: u32,
+    face: &str,
+    shader: Shader,
+    linkage: u32,
+) -> Result<u32, Error> {
+    output(env, out, |env| {
+        let pointer = alloc(env, face)?;
+        if let Err(error) =
+            table(env).attach_shader(&mut env.sys.objects, pointer, device, shader, linkage)
+        {
+            free(env, pointer);
+            return Err(error.into());
+        }
+        Ok(pointer)
+    })
+}
+
+fn stream_output_shader(env: &mut Env<'_>) -> Outcome {
+    use adv_abi::types::D3D11_SO_DECLARATION_ENTRY;
+    let [
+        device,
+        bytecode,
+        size,
+        entries,
+        count,
+        strides,
+        stride_count,
+        rasterized,
+        linkage,
+        out,
+    ] = std::array::from_fn(|index| env.arg(index as u32));
+    status((|| {
+        if count > 512 || stride_count > 4 {
+            return Err(Error::InvalidArgument);
+        }
+        validate_linkage(env, device, linkage)?;
+        let entries = array::<D3D11_SO_DECLARATION_ENTRY>(env, entries, count)?
+            .into_iter()
+            .map(|entry| {
+                let name = (entry.SemanticName != 0)
+                    .then(|| semantic_name(env, entry.SemanticName))
+                    .transpose()?;
+                Ok((name, entry))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let bytes = array::<u8>(env, bytecode, size)?;
+        let strides = array::<u32>(env, strides, stride_count)?;
+        let shader = Shader::with_stream_output(
+            &bytes,
+            linkage != 0,
+            report(env, device)?,
+            &entries,
+            &strides,
+            rasterized,
+        )?;
+        attach_shader(env, device, out, "ID3D11GeometryShader", shader, linkage)
     })())
 }
 
@@ -476,6 +543,15 @@ fn vertex_shader(env: &mut Env<'_>) -> Outcome {
 }
 fn pixel_shader(env: &mut Env<'_>) -> Outcome {
     shader(env, Stage::Pixel, "ID3D11PixelShader")
+}
+fn geometry_shader(env: &mut Env<'_>) -> Outcome {
+    shader(env, Stage::Geometry, "ID3D11GeometryShader")
+}
+fn hull_shader(env: &mut Env<'_>) -> Outcome {
+    shader(env, Stage::Hull, "ID3D11HullShader")
+}
+fn domain_shader(env: &mut Env<'_>) -> Outcome {
+    shader(env, Stage::Domain, "ID3D11DomainShader")
 }
 fn compute_shader(env: &mut Env<'_>) -> Outcome {
     shader(env, Stage::Compute, "ID3D11ComputeShader")
@@ -603,6 +679,7 @@ fn device_state<'a>(env: &'a Env<'_>) -> Result<&'a super::super::object::Device
         .ok_or(Error::InvalidArgument)
 }
 
+#[cfg(not(feature = "gpu"))]
 fn unsupported_output(env: &mut Env<'_>, slot: u32, error: u32) -> Outcome {
     let output = env.arg(slot);
     if output != 0 {
@@ -611,15 +688,6 @@ fn unsupported_output(env: &mut Env<'_>, slot: u32, error: u32) -> Outcome {
     Outcome::Return(error)
 }
 
-fn excluded_stage(env: &mut Env<'_>) -> Outcome {
-    unsupported_output(env, 4, 0x80070057)
-}
-fn excluded_so_shader(env: &mut Env<'_>) -> Outcome {
-    unsupported_output(env, 9, 0x80070057)
-}
-fn excluded_linkage(env: &mut Env<'_>) -> Outcome {
-    unsupported_output(env, 1, 0x80004001)
-}
 fn open_shared(env: &mut Env<'_>) -> Outcome {
     let (device, handle, iid, out) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     call((|| {

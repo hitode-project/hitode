@@ -404,6 +404,7 @@ pub(crate) struct Render {
     pub fragment: Vec<BoundSlot>,
 }
 
+#[derive(Clone)]
 pub struct Dispatch {
     pub(super) pipeline: adv_gpu::ComputePipeline,
     pub(super) shader: Arc<ModernShader>,

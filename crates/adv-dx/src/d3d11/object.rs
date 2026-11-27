@@ -69,7 +69,12 @@ enum Kind {
     Context(Box<Context>),
     ContextState(ContextStateObject),
     CommandList(Box<CommandList>),
-    Shader(Box<Shader>),
+    Shader {
+        desc: Box<Shader>,
+        linkage: u32,
+    },
+    ClassLinkage(Vec<Arc<crate::shader::dxbc::linkage::Linkage>>),
+    ClassInstance(Box<ClassInstance>),
     InputLayout(Box<super::desc::InputLayout>),
     Query(Box<query::Query>),
     Resource {
@@ -83,6 +88,8 @@ enum Kind {
         #[cfg(feature = "gpu")]
         backing: Option<super::resource::Backing>,
         #[cfg(feature = "gpu")]
+        stream_cursor: Option<adv_gpu::Buffer>,
+        #[cfg(feature = "gpu")]
         shared: Option<Arc<Shared>>,
         #[cfg(feature = "gpu")]
         pending: BTreeMap<u32, std::sync::mpsc::Receiver<()>>,
@@ -94,6 +101,13 @@ enum Kind {
         counter: Option<adv_gpu::Buffer>,
     },
     Pipeline(Box<PipelineState>),
+}
+
+pub(super) struct ClassInstance {
+    pub linkage: u32,
+    pub class: Vec<u8>,
+    pub name: Vec<u8>,
+    pub desc: adv_abi::types::D3D11_CLASS_INSTANCE_DESC,
 }
 
 #[derive(Default)]
@@ -159,13 +173,17 @@ impl Kind {
                 &[IID_ID3D11DEVICECHILD, IID_ID3D11ASYNCHRONOUS],
             ),
             Self::InputLayout(_) => (IID_ID3D11INPUTLAYOUT, DEVICE_CHILD),
-            Self::Shader(shader) => {
+            Self::ClassLinkage(_) => (IID_ID3D11CLASSLINKAGE, DEVICE_CHILD),
+            Self::ClassInstance(_) => (IID_ID3D11CLASSINSTANCE, DEVICE_CHILD),
+            Self::Shader { desc: shader, .. } => {
                 use crate::shader::ir::Stage;
-                let iid = match shader.module().stage {
+                let iid = match shader.stage {
                     Stage::Vertex => IID_ID3D11VERTEXSHADER,
                     Stage::Pixel => IID_ID3D11PIXELSHADER,
                     Stage::Compute => IID_ID3D11COMPUTESHADER,
-                    Stage::Geometry | Stage::Hull | Stage::Domain => unreachable!(),
+                    Stage::Geometry => IID_ID3D11GEOMETRYSHADER,
+                    Stage::Hull => IID_ID3D11HULLSHADER,
+                    Stage::Domain => IID_ID3D11DOMAINSHADER,
                 };
                 (iid, DEVICE_CHILD)
             }
@@ -417,9 +435,38 @@ impl Object {
         }
     }
 
+    #[cfg(feature = "gpu")]
+    pub(super) fn stream_cursor(&mut self) -> Option<&mut Option<adv_gpu::Buffer>> {
+        match &mut self.kind {
+            Kind::Resource { stream_cursor, .. } => Some(stream_cursor),
+            _ => None,
+        }
+    }
+
     pub fn shader(&self) -> Option<&Shader> {
         match &self.kind {
-            Kind::Shader(shader) => Some(shader),
+            Kind::Shader { desc, .. } => Some(desc),
+            _ => None,
+        }
+    }
+
+    pub(super) fn shader_linkage(&self) -> Option<u32> {
+        match &self.kind {
+            Kind::Shader { linkage, .. } if *linkage != 0 => Some(*linkage),
+            _ => None,
+        }
+    }
+
+    pub(super) fn class_linkage(&self) -> Option<&[Arc<crate::shader::dxbc::linkage::Linkage>]> {
+        match &self.kind {
+            Kind::ClassLinkage(shaders) => Some(shaders),
+            _ => None,
+        }
+    }
+
+    pub(super) fn class_instance(&self) -> Option<&ClassInstance> {
+        match &self.kind {
+            Kind::ClassInstance(instance) => Some(instance),
             _ => None,
         }
     }
@@ -611,6 +658,36 @@ impl Table {
         }
     }
 
+    pub(super) fn attach_class_linkage(
+        self,
+        objects: &mut Objects,
+        pointer: u32,
+        device: u32,
+    ) -> Result<(), Error> {
+        self.attach(objects, pointer, device, Kind::ClassLinkage(Vec::new()))
+    }
+
+    pub(super) fn attach_class_instance(
+        self,
+        objects: &mut Objects,
+        pointer: u32,
+        device: u32,
+        instance: ClassInstance,
+    ) -> Result<(), Error> {
+        let linkage = instance.linkage;
+        self.retain_bound(objects, linkage)?;
+        let result = self.attach(
+            objects,
+            pointer,
+            device,
+            Kind::ClassInstance(Box::new(instance)),
+        );
+        if result.is_err() {
+            self.release_internal(objects, linkage, &mut Release::default());
+        }
+        result
+    }
+
     pub(super) fn register_separate_face(
         self,
         objects: &mut Objects,
@@ -632,8 +709,32 @@ impl Table {
         pointer: u32,
         device: u32,
         shader: Shader,
+        linkage: u32,
     ) -> Result<(), Error> {
-        self.attach(objects, pointer, device, Kind::Shader(Box::new(shader)))
+        if linkage != 0 {
+            self.retain_bound(objects, linkage)?;
+        }
+        let metadata = shader.linkage.clone();
+        let result = self.attach(
+            objects,
+            pointer,
+            device,
+            Kind::Shader {
+                desc: Box::new(shader),
+                linkage,
+            },
+        );
+        if linkage != 0 {
+            if result.is_err() {
+                self.release_internal(objects, linkage, &mut Release::default());
+            } else if let Some(metadata) = metadata
+                && let Kind::ClassLinkage(shaders) =
+                    &mut self.get_mut(objects, linkage).unwrap().kind
+            {
+                shaders.push(metadata);
+            }
+        }
+        result
     }
 
     pub fn attach_resource(
@@ -658,6 +759,8 @@ impl Table {
                 pub_dc: 0,
                 #[cfg(feature = "gpu")]
                 backing: None,
+                #[cfg(feature = "gpu")]
+                stream_cursor: None,
                 #[cfg(feature = "gpu")]
                 shared: None,
                 #[cfg(feature = "gpu")]
@@ -966,7 +1069,14 @@ impl Table {
                 }
             }
             Kind::CommandList(list) => self.destroy_list(objects, *list, result),
-            Kind::Shader(_)
+            Kind::ClassInstance(instance) => {
+                self.release_internal(objects, instance.linkage, result)
+            }
+            Kind::Shader { linkage, .. } if linkage != 0 => {
+                self.release_internal(objects, linkage, result)
+            }
+            Kind::Shader { .. }
+            | Kind::ClassLinkage(_)
             | Kind::InputLayout(_)
             | Kind::Query(_)
             | Kind::Resource { mapping: None, .. } => (),

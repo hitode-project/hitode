@@ -3,6 +3,7 @@ mod checksum;
 mod container;
 mod disassemble;
 pub use disassemble::disassemble;
+pub mod linkage;
 mod lower;
 pub use container::{Container, ParseError, parse};
 pub mod fields;
@@ -275,3 +276,5 @@ fn take_word(words: &mut &[u32]) -> Result<u32, Error> {
 
 #[cfg(test)]
 mod coverage;
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) use coverage::{geometry_routing_fixture, pixel_uav_fixture};

@@ -194,7 +194,7 @@ fn geometry() -> Module {
     let mut body = vec![
         declaration(
             Opcode::DclGsOutputPrimitiveTopology,
-            D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            encode_gs_output_primitive_topology(D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP),
             vec![],
         ),
         declaration(Opcode::DclMaxOutputVertexCount, 0, vec![8]),
@@ -369,12 +369,20 @@ fn draw(image: &Image, vertex: Arc<ModernShader>, fragment: Arc<ModernShader>) -
 fn inputs(gpu: &Gpu, index: &[u32]) -> Inputs {
     Inputs {
         primitives: index.len() as u32 / 3,
-        vertices: upload(gpu, &[0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]),
-        indices: upload(gpu, index),
+        vertices: Some(upload(
+            gpu,
+            &[0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+        )),
+        indices: Some(upload(gpu, index)),
         vertex: SlotBindings::default(),
         geometry: SlotBindings::default(),
+        hull: SlotBindings::default(),
+        domain: SlotBindings::default(),
+        indirect: None,
+        stream_statistics: None,
         statistics: None,
-        stream_output: None,
+        predicate: None,
+        stream_output: Vec::new(),
     }
 }
 
@@ -484,6 +492,7 @@ fn native_vertex_and_expansion_render_identical_pixels() {
                 depth_clip: true,
             }),
             stream_output: &[],
+            stream_statistics: 0,
         }
         .emit()
         .unwrap();
@@ -553,6 +562,7 @@ fn geometry_cuts_instances_and_stream_output_keep_primitive_order() {
             options: Options::default(),
         }),
         raster: None,
+        stream_statistics: 0,
         stream_output: &[StreamOutput {
             stream: 0,
             elements: vec![Some((0, 0)), Some((0, 1)), Some((1, 0)), None],
@@ -574,7 +584,7 @@ fn geometry_cuts_instances_and_stream_output_keep_primitive_order() {
         Memory::Readback,
     );
     let mut inputs = inputs(&gpu, &[0, 1, 2]);
-    inputs.stream_output = Some((vec![target.clone()], filled.clone()));
+    inputs.stream_output = vec![(target.clone(), filled.clone())];
     inputs.statistics = Some(stats.clone());
     let command = plan.command(&gpu, inputs, Vec::new()).unwrap();
     gpu.expand(command).unwrap();
@@ -593,7 +603,10 @@ fn geometry_cuts_instances_and_stream_output_keep_primitive_order() {
     }
     expected.extend([0xcccc_cccc; 4]);
     assert_eq!(actual, expected);
-    assert_eq!(words(&stats.buffer), [0, 0, 8, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        words(&stats.buffer),
+        [0, 0, 8, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
+    );
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -727,6 +740,7 @@ fn packed_and_storage_varyings_match() {
             depth_clip: true,
         }),
         stream_output: &[],
+        stream_statistics: 0,
     }
     .emit()
     .unwrap();
@@ -797,6 +811,7 @@ fn domain_points_are_shaded_once_and_streamed_as_a_list() {
         input_vertices: 3,
         geometry: None,
         raster: None,
+        stream_statistics: 0,
         stream_output: &[StreamOutput {
             stream: 0,
             elements: vec![Some((1, 0)), Some((1, 1)), Some((1, 2))],
@@ -821,12 +836,17 @@ fn domain_points_are_shaded_once_and_streamed_as_a_list() {
     let filled = buffer(&gpu, &[0], BufferUsage::STORAGE, Memory::Readback);
     let input = Inputs {
         primitives: indices.len() as u32 / 3,
-        vertices: upload(&gpu, bytemuck::cast_slice(&vertices)),
-        indices: upload(&gpu, &indices),
+        vertices: Some(upload(&gpu, bytemuck::cast_slice(&vertices))),
+        indices: Some(upload(&gpu, &indices)),
         vertex: SlotBindings::default(),
         geometry: SlotBindings::default(),
+        hull: SlotBindings::default(),
+        domain: SlotBindings::default(),
+        indirect: None,
+        stream_statistics: None,
         statistics: None,
-        stream_output: Some((vec![target.clone()], filled.clone())),
+        predicate: None,
+        stream_output: vec![(target.clone(), filled.clone())],
     };
     let command = plan.command(&gpu, input, vec![]).unwrap();
     assert_eq!(command.prelude.as_ref().unwrap().groups, [1, 1, 1]);
@@ -932,7 +952,9 @@ fn recorded_counts_match_authored_statistics_shapes() {
         None,
         Rasterization::select(false, true, true),
     );
-    stats.record_gpu([0, 0, 2, 0, 0, 0, 0, 0], true);
+    let mut counters = [0; statistics::GPU_WORDS];
+    counters[2] = 2;
+    stats.record_gpu(counters, true);
     check_stats("stream_only", stats);
     let mut stats = Stats::default();
     stats.record_draw(
@@ -1045,6 +1067,7 @@ fn bins_draw_only_matching_primitives_across_chunks() {
             depth_clip: true,
         }),
         stream_output: &[],
+        stream_statistics: 0,
     }
     .emit()
     .unwrap();
@@ -1260,6 +1283,7 @@ fn counted_fragments_obey_early_depth_and_sample_frequency() {
                 depth_clip: true,
             }),
             stream_output: &[],
+            stream_statistics: 0,
         }
         .emit()
         .unwrap();

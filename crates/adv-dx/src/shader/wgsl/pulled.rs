@@ -1,5 +1,8 @@
 //! Shared IR writer entries called by expansion compute shaders.
 
+mod hull;
+pub(crate) use hull::hull;
+
 use super::interface::register_count;
 use super::*;
 use crate::shader::variant::Variant;
@@ -247,8 +250,7 @@ pub fn vertex(
     fetches: &[VertexFetch],
     start: DrawStart,
 ) -> Result<Translation, Error> {
-    use std::collections::BTreeSet;
-    let pulled = emit(module, &variant.pull_input(), Invocation::Vertex, options)?;
+    let pulled = fetched(module, variant, options, fetches)?;
     let mut module = module.clone();
     let reflection = super::super::analysis::analyze(&module);
     let interface = passes::variant::apply(&mut module, &reflection, variant, fragment)?;
@@ -264,18 +266,6 @@ pub fn vertex(
         writer.line("enable clip_distances;");
     }
     writer.source.push_str(&pulled.source);
-    let streams: BTreeSet<_> = fetches.iter().map(|fetch| fetch.stream).collect();
-    for stream in streams {
-        let binding = VERTEX_STREAM_BASE + stream;
-        writer.line(&format!(
-            "@group(3) @binding({binding}) var<storage, read> dx_stream_{stream}: array<u32>;"
-        ));
-        writer.open(&format!("fn dx_byte_{stream}(at: u32) -> u32"));
-        writer.line(&format!(
-            "return (dx_stream_{stream}[at / 4u] >> ((at % 4u) * 8u)) & 255u;"
-        ));
-        writer.close();
-    }
     let (vertex_start, instance_start) = match start {
         DrawStart::Direct { vertex, instance } => (format!("{vertex}u"), format!("{instance}u")),
         DrawStart::Indirect {
@@ -299,11 +289,50 @@ pub fn vertex(
     writer.close();
     writer.open("@vertex fn vertex_main(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> DxPulledVertex");
     writer.line(&format!("let instance_start = {instance_start};"));
+    writer.line(&format!(
+        "let o = dx_fetch(vertex_id, instance_id, {vertex_start}, instance_start);"
+    ));
+    let mut outputs = vec![format!("bitcast<vec4<f32>>(o[{position}])")];
+    outputs.extend(super::variant_interface::variant_outputs(&interface, "o"));
+    writer.line(&format!("return DxPulledVertex({});", outputs.join(", ")));
+    writer.close();
+    Ok(Translation {
+        source: writer.source,
+        entry_point: "vertex_main",
+        reflection,
+        locations: pulled.locations,
+        counters: pulled.counters,
+    })
+}
+
+pub(crate) fn fetched(
+    module: &Module,
+    variant: &Variant,
+    options: Options<'_>,
+    fetches: &[VertexFetch],
+) -> Result<Pulled, Error> {
+    let mut pulled = emit(module, &variant.pull_input(), Invocation::Vertex, options)?;
+    let reflection = super::super::analysis::analyze(module);
+    let mut writer = Writer::new(module, &reflection, options);
+    writer.source = std::mem::take(&mut pulled.source);
+    let streams: std::collections::BTreeSet<_> = fetches.iter().map(|fetch| fetch.stream).collect();
+    for stream in streams {
+        let binding = VERTEX_STREAM_BASE + stream;
+        writer.line(&format!(
+            "@group(3) @binding({binding}) var<storage, read> dx_stream_{stream}: array<u32>;"
+        ));
+        writer.open(&format!("fn dx_byte_{stream}(at: u32) -> u32"));
+        writer.line(&format!(
+            "return (dx_stream_{stream}[at / 4u] >> ((at % 4u) * 8u)) & 255u;"
+        ));
+        writer.close();
+    }
+    writer.open("fn dx_fetch(vertex_id: u32, instance_id: u32, vertex_start: u32, instance_start: u32) -> DxOutput");
     writer.line(&format!("var v: array<vec4<u32>, {}>;", pulled.inputs));
     for input in &reflection.signatures.input {
         match input.system_value {
             SystemValue::VertexId => writer.line(&format!(
-                "v[{}].x = vertex_id - {vertex_start};",
+                "v[{}].x = vertex_id - vertex_start;",
                 input.register
             )),
             SystemValue::InstanceId => writer.line(&format!(
@@ -316,18 +345,10 @@ pub fn vertex(
     for (index, fetch) in fetches.iter().enumerate() {
         emit_fetch(&mut writer, index, *fetch)?;
     }
-    writer.line("let o = dx_run(v);");
-    let mut outputs = vec![format!("bitcast<vec4<f32>>(o[{position}])")];
-    outputs.extend(super::variant_interface::variant_outputs(&interface, "o"));
-    writer.line(&format!("return DxPulledVertex({});", outputs.join(", ")));
+    writer.line("return dx_run(v);");
     writer.close();
-    Ok(Translation {
-        source: writer.source,
-        entry_point: "vertex_main",
-        reflection,
-        locations: pulled.locations,
-        counters: pulled.counters,
-    })
+    pulled.source = writer.source;
+    Ok(pulled)
 }
 
 fn emit_fetch(writer: &mut Writer<'_>, index: usize, fetch: VertexFetch) -> Result<(), Error> {

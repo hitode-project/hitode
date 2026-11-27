@@ -405,27 +405,136 @@ fn encoded_cases() -> impl Iterator<Item = (&'static str, Vec<u8>)> {
             .into_iter()
             .flat_map(u32::to_le_bytes)
             .collect();
-        let chunks: Vec<_> = original.chunks().collect();
-        let mut bytes = Vec::from(*b"DXBC");
-        bytes.extend([0; 16]);
-        bytes.extend(1u32.to_le_bytes());
-        bytes.extend(0u32.to_le_bytes());
-        bytes.extend((chunks.len() as u32).to_le_bytes());
-        bytes.resize(32 + 4 * chunks.len(), 0);
-        for (i, (kind, data)) in chunks.into_iter().enumerate() {
-            let offset = (bytes.len() as u32).to_le_bytes();
-            bytes[32 + 4 * i..36 + 4 * i].copy_from_slice(&offset);
-            let data = if tag == kind { &code } else { data };
-            bytes.extend(kind);
-            bytes.extend((data.len() as u32).to_le_bytes());
-            bytes.extend(data);
-        }
-        let length = (bytes.len() as u32).to_le_bytes();
-        bytes[24..28].copy_from_slice(&length);
-        let digest = checksum(&bytes[20..]);
-        bytes[4..20].copy_from_slice(&digest);
-        (name, bytes)
+        let chunks: Vec<_> = original
+            .chunks()
+            .map(|(kind, data)| (kind, if kind == tag { code.as_slice() } else { data }))
+            .collect();
+        (name, container(&chunks))
     })
+}
+
+fn container(chunks: &[([u8; 4], &[u8])]) -> Vec<u8> {
+    let mut bytes = Vec::from(*b"DXBC");
+    bytes.extend([0; 16]);
+    bytes.extend(1u32.to_le_bytes());
+    bytes.extend(0u32.to_le_bytes());
+    bytes.extend((chunks.len() as u32).to_le_bytes());
+    bytes.resize(32 + 4 * chunks.len(), 0);
+    for (i, (kind, data)) in chunks.iter().enumerate() {
+        let offset = (bytes.len() as u32).to_le_bytes();
+        bytes[32 + 4 * i..36 + 4 * i].copy_from_slice(&offset);
+        bytes.extend(kind);
+        bytes.extend((data.len() as u32).to_le_bytes());
+        bytes.extend(*data);
+    }
+    let length = (bytes.len() as u32).to_le_bytes();
+    bytes[24..28].copy_from_slice(&length);
+    let digest = checksum(&bytes[20..]);
+    bytes[4..20].copy_from_slice(&digest);
+    bytes
+}
+
+#[cfg(feature = "gpu")]
+pub(crate) fn geometry_routing_fixture() -> Vec<u8> {
+    let bytes = fixture("gs_5_0");
+    let original = Container::decode(&bytes).unwrap();
+    let tokens = words(original.chunks().find(|(tag, _)| tag == b"SHEX").unwrap().1);
+    let mut program = Program::decode(&tokens).unwrap();
+    let output = |slot| {
+        register(
+            D3D10_SB_OPERAND_TYPE_OUTPUT,
+            D3D10_SB_OPERAND_4_COMPONENT,
+            encode_operand_4_component_mask(1 << D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT),
+            Some(slot),
+        )
+    };
+    let first_move = program
+        .instructions
+        .iter()
+        .position(|instruction| opcode(instruction) == D3D10_SB_OPCODE_MOV)
+        .unwrap();
+    program.instructions.splice(
+        first_move..first_move,
+        [
+            declaration(D3D10_SB_OPCODE_DCL_OUTPUT_SIV, Some(output(2)), &[5]),
+            declaration(D3D10_SB_OPCODE_DCL_OUTPUT_SIV, Some(output(3)), &[4]),
+        ],
+    );
+    for index in (0..program.instructions.len()).rev() {
+        if opcode(&program.instructions[index]) == D3D11_SB_OPCODE_EMIT_STREAM {
+            program.instructions.splice(
+                index..index,
+                [
+                    op(D3D10_SB_OPCODE_MOV, vec![output(2), immediate(&[1])]),
+                    op(D3D10_SB_OPCODE_MOV, vec![output(3), immediate(&[1])]),
+                ],
+            );
+        }
+    }
+    let code: Vec<_> = program
+        .encode()
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let mut strings = Vec::new();
+    let mut signature = vec![4, 8];
+    for (slot, (name, system, ty, mask)) in [
+        ("SV_Position", 1, 3, 15),
+        ("TEXCOORD", 0, 3, 3),
+        ("SV_ViewportArrayIndex", 5, 1, 1),
+        ("SV_RenderTargetArrayIndex", 4, 1, 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        signature.extend([
+            0,
+            120 + strings.len() as u32,
+            0,
+            system,
+            ty,
+            slot as u32,
+            mask,
+        ]);
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+    }
+    let mut signature: Vec<_> = signature.into_iter().flat_map(u32::to_le_bytes).collect();
+    signature.extend(strings);
+    let input = original.chunks().find(|(tag, _)| tag == b"ISGN").unwrap().1;
+    container(&[(*b"ISGN", input), (*b"OSG5", &signature), (*b"SHEX", &code)])
+}
+
+#[cfg(feature = "gpu")]
+pub(crate) fn pixel_uav_fixture() -> Vec<u8> {
+    let program = Program {
+        version: Version {
+            stage: 0,
+            major: 5,
+            minor: 0,
+            reserved: 0,
+        },
+        instructions: vec![
+            declaration(
+                D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED,
+                Some(register(
+                    D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW,
+                    0,
+                    0,
+                    Some(0),
+                )),
+                &[4],
+            ),
+            store(immediate(&[0]), immediate(&[17])),
+            op(D3D10_SB_OPCODE_RET, Vec::new()),
+        ],
+    };
+    let code: Vec<_> = program
+        .encode()
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    container(&[(*b"SHEX", &code)])
 }
 
 #[test]
@@ -590,7 +699,14 @@ fn coverage_ledger() -> String {
         use std::fmt::Write;
         if let Some(fixture) = covered.get(&(key, token)) {
             let scope = match fixture.as_str() {
-                "linkage" => "T15 class linkage",
+                "linkage" => "guest class linkage",
+                "ds_5_0" | "hs_5_0" | "limited_hull" | "encoded_hull_join" => "guest tessellation",
+                "gs_4_0"
+                | "gs_4_1"
+                | "gs_5_0"
+                | "instanced_geometry"
+                | "encoded_emit_cut"
+                | "encoded_emit_cut_stream" => "guest geometry and stream output",
                 "residency" => "tiled resources excluded",
                 "doubles" | "encoded_dmov" => "double precision excluded",
                 "encoded_abort" | "encoded_debug_break" => "diagnostic instruction",
@@ -599,16 +715,6 @@ fn coverage_ledger() -> String {
                 | "multisample_queries"
                 | "sample_modes"
                 | "texture_ops" => "Windows value readback pending",
-                "ds_5_0"
-                | "gs_4_0"
-                | "gs_4_1"
-                | "gs_5_0"
-                | "hs_5_0"
-                | "instanced_geometry"
-                | "limited_hull"
-                | "encoded_hull_join"
-                | "encoded_emit_cut"
-                | "encoded_emit_cut_stream" => "T8/T15 programmable stages",
                 _ => "shader core",
             };
             writeln!(ledger, "{category}\t{token}\t{name}\t{fixture}\t{scope}").unwrap();

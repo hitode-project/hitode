@@ -26,9 +26,15 @@ impl Backing {
             if bind.contains(Bind::CONSTANT) {
                 usage |= BufferUsage::UNIFORM;
             }
-            if [Bind::VERTEX, Bind::SHADER, Bind::UNORDERED]
-                .into_iter()
-                .any(|bit| bind.contains(bit))
+            if [
+                Bind::VERTEX,
+                Bind::INDEX,
+                Bind::STREAM_OUTPUT,
+                Bind::SHADER,
+                Bind::UNORDERED,
+            ]
+            .into_iter()
+            .any(|bit| bind.contains(bit))
             {
                 usage |= BufferUsage::STORAGE;
             }
@@ -117,14 +123,23 @@ impl Backing {
             (true, ViewKind::ShaderResource, 21 | 46) => 2,
             _ => 0,
         };
-        let dimension = (image.desc().dimension == Dimension::Cube
-            && view.kind() != ViewKind::ShaderResource)
+        let volume_target =
+            image.desc().dimension == Dimension::D3 && view.kind() == ViewKind::RenderTarget;
+        let dimension = (volume_target
+            || (image.desc().dimension == Dimension::Cube
+                && view.kind() != ViewKind::ShaderResource))
             .then_some(Dimension::D2);
+        let layers = if volume_target {
+            let start = view.attachment_layers().start;
+            start..start + 1
+        } else {
+            range.layers.clone()
+        };
         Ok(image.create_view(&ViewDesc {
             format: (plane == 0 && format != image.desc().format).then_some(format),
             dimension,
             mips: range.mips.clone(),
-            layers: range.layers.clone(),
+            layers,
             plane,
         })?)
     }
