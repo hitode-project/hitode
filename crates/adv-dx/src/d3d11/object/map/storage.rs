@@ -1,4 +1,4 @@
-//! Guest shadow layouts and staging coherence for each mapped subresource.
+//! Guest shadow layouts and coherence for each mapped subresource.
 use super::{Access, Error, Map};
 use crate::d3d11::{
     abi::D3D11_MAPPED_SUBRESOURCE,
@@ -116,6 +116,7 @@ impl Layouts {
             .into_iter()
             .map(|layout| Subresource {
                 layout,
+                dynamic: DynamicResidency::Current,
                 staging: if coherent(self.resource) {
                     (0..layout.depth).map(|_| Residency::cpu()).collect()
                 } else {
@@ -133,7 +134,15 @@ impl Layouts {
 
 struct Subresource {
     layout: Layout,
+    dynamic: DynamicResidency,
     staging: Box<[Residency<u32>]>,
+}
+
+#[derive(PartialEq, Eq)]
+enum DynamicResidency {
+    Current,
+    CpuNewer,
+    GpuNewer,
 }
 
 pub struct Storage {
@@ -185,7 +194,47 @@ impl Storage {
             };
             return self.cpu_access(subresource, access, &mut download);
         }
+        let entry = &mut self.subresources[subresource as usize];
+        if entry.dynamic == DynamicResidency::GpuNewer {
+            let layout = entry.layout;
+            for slice in 0..layout.depth {
+                download(layout, slice, &[layout.full()])?;
+            }
+        }
+        entry.dynamic = DynamicResidency::CpuNewer;
         Ok(self.mapped(subresource))
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(in crate::d3d11) fn dynamic_shadow_stale(&self, subresource: u32) -> bool {
+        self.subresources[subresource as usize].dynamic == DynamicResidency::GpuNewer
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(in crate::d3d11) fn dynamic_gpu_write(&mut self, subresource: u32) {
+        self.subresources[subresource as usize].dynamic = DynamicResidency::GpuNewer;
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(in crate::d3d11) fn dynamic_uploaded(&mut self, subresource: u32) {
+        self.subresources[subresource as usize].dynamic = DynamicResidency::Current;
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(in crate::d3d11) fn sync_dynamic<E>(
+        &mut self,
+        subresource: u32,
+        mut upload: impl FnMut(Layout, u32, &[Rect]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let entry = &mut self.subresources[subresource as usize];
+        if entry.dynamic == DynamicResidency::CpuNewer {
+            let layout = entry.layout;
+            for slice in 0..layout.depth {
+                upload(layout, slice, &[layout.full()])?;
+            }
+            entry.dynamic = DynamicResidency::Current;
+        }
+        Ok(())
     }
 
     fn mapped(&self, subresource: u32) -> D3D11_MAPPED_SUBRESOURCE {

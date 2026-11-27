@@ -263,6 +263,11 @@ zero-padded window in that ring.
 
 Direct3D 11 captures the dynamic index window and the vertex and instance windows determined at draw admission. GPU-resident index buffers and indirect arguments with resource bounds stay on the GPU. Expanded indirect draws read arguments at an ordered boundary when one or both dimensions lack a resource bound and report the readback in diagnostic builds.
 
+Direct3D 11 dynamic maps preserve untouched bytes in a fixed guest shadow.
+A GPU write makes that shadow stale, and the next map refreshes it at an
+ordered, counted readback. Maps with a current shadow take constant time.
+ResolveSubresource requires a default-usage destination.
+
 ### GFX-REC-8 Frontend work counters
 
 **Rule**: Diagnostic counter builds MUST report retained bytes and lookups per draw, entries per successful StateBlock Apply, and dead frame/pass eliminations. They MUST report publication damage, queue submissions, upload and readback bytes, and constant-time maps for front-end comparisons. Ordinary builds MUST compile out work instrumentation.

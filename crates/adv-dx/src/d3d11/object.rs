@@ -273,6 +273,14 @@ impl Object {
         }
     }
 
+    #[cfg(feature = "gpu")]
+    pub(super) fn dynamic_shadow_stale(&self) -> bool {
+        let Kind::Resource { mapping, .. } = &self.kind else {
+            unreachable!();
+        };
+        mapping.as_ref().unwrap().dynamic_shadow_stale(0)
+    }
+
     pub fn initial_data(&self, subresource: u32) -> Option<&[u8]> {
         match &self.kind {
             Kind::Resource { initial, .. } => initial.get(subresource as usize).map(Vec::as_slice),

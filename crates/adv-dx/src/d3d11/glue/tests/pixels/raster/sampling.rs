@@ -214,6 +214,22 @@ fn windows_sampler_addressing_and_srgb_through_guest_vtables() {
     );
 }
 
+// spec: GFX-REC-7
+#[test]
+fn dynamic_texture_sampling_sees_gpu_copies_before_mapping() {
+    let mut r = Raster::new();
+    let output = SampleOutput::new(&mut r);
+    let source = sampled(&mut r, 28, [2, 2], &[vec![0xff00_00ff; 4]], 0);
+    let dynamic = texture(&mut r.machine, r.device, 2, Bind::SHADER, 0x10000, 0, 2);
+    let view = create_object(&mut r.machine, r.device, 7, &[dynamic, 0]);
+    write_value(&mut r.machine, ARRAY, view);
+    r.call(8, &[0, 1, ARRAY]);
+    r.shader(15, 9, TEXEL_LOAD);
+    r.call(47, &[dynamic, source]);
+    let pixels = output.draw(&mut r, [0., 0., 0., 0.], 1);
+    assert_eq!(pixels, [[1.0f32, 0., 0., 1.].map(f32::to_bits)]);
+}
+
 #[test]
 fn windows_sampler_lod_and_resource_clamp_through_guest_vtables() {
     let mut r = Raster::new();

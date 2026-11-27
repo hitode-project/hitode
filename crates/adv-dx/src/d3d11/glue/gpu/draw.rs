@@ -285,7 +285,8 @@ fn ensure_index(
     {
         return Err(Error::InvalidArgument);
     }
-    if desc.usage() == Usage::Dynamic
+    let capture_shadow = captures_shadow(env, binding.buffer, desc);
+    if capture_shadow
         && let DrawRange::Direct {
             vertices,
             base_vertex,
@@ -344,7 +345,7 @@ fn ensure_index(
         binding.offset..buffer.size(),
         capture,
     )?;
-    let native = if desc.usage() == Usage::Dynamic {
+    let native = if capture_shadow {
         0..u64::from(buffer.size() - binding.offset)
     } else {
         u64::from(binding.offset)..u64::from(buffer.size())
@@ -359,6 +360,10 @@ fn ensure_index(
         ),
         vertices: None,
     })
+}
+
+fn captures_shadow(env: &Env<'_>, pointer: u32, desc: Resource) -> bool {
+    desc.usage() == Usage::Dynamic && !context::owned(env, pointer).unwrap().dynamic_shadow_stale()
 }
 
 fn shadow_bytes(env: &mut Env<'_>, pointer: u32, range: Range<u32>) -> Result<Vec<u8>, Error> {
@@ -379,7 +384,7 @@ fn capture_buffer(
     let Resource::Buffer(_) = desc else {
         return Err(Error::InvalidArgument);
     };
-    if desc.usage() == Usage::Dynamic {
+    if captures_shadow(env, pointer, desc) {
         let bytes = shadow_bytes(env, pointer, range.clone())?;
         capture.record(pointer, &range, &bytes);
         let size = bytes.len();
@@ -586,8 +591,13 @@ fn slots_for(
                 let desc = description(env, view.resource)?;
                 reads.push(key(env, view.resource, view.desc.subresources().mips.start));
                 let backing = match desc {
-                    super::Resource::Texture(texture) if desc.usage() == Usage::Dynamic => {
+                    super::Resource::Texture(texture)
+                        if captures_shadow(env, view.resource, desc) =>
+                    {
                         capture_texture(env, view.resource, desc, texture)?
+                    }
+                    super::Resource::Buffer(_) if desc.usage() == Usage::Dynamic => {
+                        Location::new(env, view.resource, 0)?.acquire(env, true)?
                     }
                     _ => backing(env, view.resource, desc)?,
                 };
@@ -1458,7 +1468,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             let Resource::Buffer(buffer) = desc else {
                 return Err(Error::InvalidArgument);
             };
-            if desc.usage() == Usage::Dynamic {
+            if captures_shadow(env, bound.buffer, desc) {
                 let range = vertex_capture(fetch, buffer.size(), &args, vertices.as_ref());
                 if !range.is_empty() {
                     let captured = captures[entry.slot].get_or_insert_with(|| range.clone());

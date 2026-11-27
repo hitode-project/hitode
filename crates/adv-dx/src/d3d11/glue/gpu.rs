@@ -200,6 +200,9 @@ fn replace_constants(env: &mut Env<'_>, pointer: u32, window: UniformWindow) {
     let object = table.get_mut(&mut env.sys.objects, pointer).unwrap();
     object.take_initial_data();
     *object.backing().unwrap() = Some(Backing::Constant(window));
+    if let Some(shadow) = object.mapping() {
+        shadow.dynamic_uploaded(0);
+    }
 }
 
 pub(super) fn unmap_constants(
@@ -322,7 +325,7 @@ pub(super) fn download(
                 BufferUsage::COPY_DST
             },
             memory: Memory::Readback,
-            label: "D3D11 staging readback",
+            label: "D3D11 Map readback",
         })?;
         match (backing, resource) {
             (Backing::Image(image), Resource::Texture(texture)) if packed_depth => {
@@ -344,6 +347,18 @@ pub(super) fn download(
                         destination: buffer.clone(),
                         offset: 0,
                     },
+                    (Backing::Constant(_), Resource::Buffer(_)) => {
+                        ModernTransfer::CopyBufferWindow {
+                            source: backing.buffer_window(
+                                u64::from(rect.x)..u64::from(rect.x) + u64::from(rect.w),
+                            ),
+                            destination: BufferRange {
+                                buffer: buffer.clone(),
+                                range: 0..u64::from(row),
+                            }
+                            .into(),
+                        }
+                    }
                     (Backing::Image(image), Resource::Texture(texture)) => {
                         ModernTransfer::Download {
                             source: pixel_region(image, texture, subresource, slice, rect),
@@ -510,19 +525,56 @@ impl Location {
     fn acquire(self, env: &mut Env<'_>, read: bool) -> Result<Backing, Error> {
         let backing = backing(env, self.pointer, self.resource)?;
         if read {
-            staging_access(
-                env,
-                self.pointer,
-                self.resource,
-                self.subresource,
-                &backing,
-                Access::Read,
-            )?;
+            if self.resource.usage() == Usage::Dynamic
+                && !self.resource.bind().contains(Bind::CONSTANT)
+            {
+                let table = table(env);
+                let shadow = table
+                    .get_mut(&mut env.sys.objects, self.pointer)
+                    .unwrap()
+                    .mapping()
+                    .unwrap();
+                let base = shadow.pointer();
+                shadow.sync_dynamic(self.subresource, |layout, slice, parts| {
+                    upload_shadow(
+                        env.ext,
+                        env.cpu,
+                        &backing,
+                        self.resource,
+                        self.subresource,
+                        Shadow {
+                            base,
+                            layout,
+                            slice,
+                        },
+                        parts,
+                    )
+                })?;
+            } else {
+                staging_access(
+                    env,
+                    self.pointer,
+                    self.resource,
+                    self.subresource,
+                    &backing,
+                    Access::Read,
+                )?;
+            }
         }
         Ok(backing)
     }
 
     fn written(self, env: &mut Env<'_>, backing: &Backing, whole: bool) -> Result<(), Error> {
+        if self.resource.usage() == Usage::Dynamic {
+            let table = table(env);
+            table
+                .get_mut(&mut env.sys.objects, self.pointer)
+                .unwrap()
+                .mapping()
+                .unwrap()
+                .dynamic_gpu_write(self.subresource);
+            return Ok(());
+        }
         if !map::coherent(self.resource) {
             return Ok(());
         }
@@ -735,7 +787,14 @@ pub(super) fn write_dynamic(
         _ => unreachable!(),
     };
     let write = key(env, pointer, subresource);
-    execution(env.ext)?.append(Command::Transfer(transfer), extent_rect(size), None, write)
+    execution(env.ext)?.append(Command::Transfer(transfer), extent_rect(size), None, write)?;
+    table
+        .get_mut(&mut env.sys.objects, pointer)
+        .unwrap()
+        .mapping()
+        .unwrap()
+        .dynamic_uploaded(subresource);
+    Ok(())
 }
 
 fn box_extent(input: D3D11_BOX) -> ([u32; 3], [u32; 3]) {
@@ -977,6 +1036,9 @@ pub(super) fn resolve(env: &mut Env<'_>) -> Result<(), Error> {
         return Ok(());
     }
     let dest = Location::new(env, env.arg(1), env.arg(2))?;
+    if dest.resource.usage() != Usage::Default {
+        return Err(Error::InvalidArgument);
+    }
     let source = Location::new(env, env.arg(3), env.arg(4))?;
     let format = resource::native_format(env.arg(5)).ok_or(Error::InvalidArgument)?;
     let source_view = resolve_view(env, source, format)?;
@@ -1316,19 +1378,16 @@ pub(super) fn copy_structure_count(env: &mut Env<'_>) -> Result<(), Error> {
     }
     let location = Location::new(env, destination, 0)?;
     let backing = location.acquire(env, true)?;
-    let Backing::Buffer(buffer) = &backing else {
-        unreachable!()
-    };
     let counter = counter_buffer(env, view)?;
     let source = key(env, view, 0);
     let target = key(env, destination, 0);
-    let command = Command::Transfer(ModernTransfer::CopyBuffer {
+    let command = Command::Transfer(ModernTransfer::CopyBufferWindow {
         source: BufferRange {
             buffer: counter,
             range: 0..4,
-        },
-        destination: buffer.clone(),
-        offset: u64::from(offset),
+        }
+        .into(),
+        destination: backing.buffer_window(u64::from(offset)..u64::from(offset) + 4),
     });
     execution(env.ext)?.append(
         command,

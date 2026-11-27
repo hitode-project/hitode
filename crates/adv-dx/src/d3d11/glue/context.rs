@@ -1160,6 +1160,8 @@ pub(super) fn map_subresource(
     let backing = object.backing().and_then(|backing| backing.clone());
     let storage = object.mapping().ok_or(Error::InvalidArgument)?;
     let base = storage.pointer();
+    #[cfg(all(feature = "gpu", feature = "d3d9-counters"))]
+    let constant_time = request == map::Map::Dynamic && !storage.dynamic_shadow_stale(subresource);
     let mapped = storage.map(subresource, mode, flags, false, |layout, slice, parts| {
         #[cfg(feature = "gpu")]
         if let Some(backing) = &backing {
@@ -1183,7 +1185,7 @@ pub(super) fn map_subresource(
         Ok(())
     })?;
     #[cfg(all(feature = "gpu", feature = "d3d9-counters"))]
-    gpu::count_map(env.ext, request == map::Map::Dynamic);
+    gpu::count_map(env.ext, constant_time);
     Ok(mapped)
 }
 
