@@ -1395,7 +1395,22 @@ impl super::Validator {
                                             }
                                         }
                                         crate::StorageFormat::R32Sint
-                                        | crate::StorageFormat::R32Uint => {
+                                        | crate::StorageFormat::R32Uint
+                                        | crate::StorageFormat::R32Float => {
+                                            if format == crate::StorageFormat::R32Float
+                                                && fun
+                                                    != (crate::AtomicFunction::Exchange {
+                                                        compare: None,
+                                                    })
+                                            {
+                                                return Err(
+                                                    FunctionError::InvalidImageAtomicFunction(fun)
+                                                        .with_span_handle(
+                                                            image,
+                                                            context.expressions,
+                                                        ),
+                                                );
+                                            }
                                             if !self
                                                 .capabilities
                                                 .intersects(super::Capabilities::TEXTURE_ATOMIC)

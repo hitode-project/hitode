@@ -90,6 +90,7 @@ struct SelectedAdapter {
     cache_prefix: [u8; 28],
     base: vk::PhysicalDeviceFeatures,
     support: QueriedSupport,
+    float_image_exchange: bool,
 }
 
 impl Device {
@@ -534,6 +535,7 @@ impl Device {
             let mut eds1 = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
             let mut eds2 = vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
             let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+            let mut atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
             let mut dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
             let mut matrix = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
             let mut matrix_nv = vk::PhysicalDeviceCooperativeMatrixFeaturesNV::default();
@@ -564,6 +566,9 @@ impl Device {
             }
             if api >= vk::API_VERSION_1_2 || has(ash::khr::shader_float16_int8::NAME) {
                 features = features.push_next(&mut float16);
+            }
+            if has(ash::ext::shader_atomic_float::NAME) {
+                features = features.push_next(&mut atomic_float);
             }
             if api >= vk::API_VERSION_1_3 || has(ash::khr::shader_integer_dot_product::NAME) {
                 features = features.push_next(&mut dot);
@@ -685,6 +690,7 @@ impl Device {
                 cache_prefix,
                 base,
                 support,
+                float_image_exchange: atomic_float.shader_image_float32_atomics != 0,
             })
         }
     }
@@ -755,6 +761,9 @@ impl Device {
                 .extended_dynamic_state2(true);
             let mut enabled_float16 =
                 vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
+            let mut enabled_atomic_float =
+                vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
+                    .shader_image_float32_atomics(true);
             let mut enabled_dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
                 .shader_integer_dot_product(true);
             let mut enabled_matrix =
@@ -796,6 +805,9 @@ impl Device {
             if plan.use_shader_f16 {
                 device_features = device_features.push_next(&mut enabled_float16);
             }
+            if adapter.float_image_exchange {
+                device_features = device_features.push_next(&mut enabled_atomic_float);
+            }
             if plan.use_int8_dot {
                 device_features = device_features.push_next(&mut enabled_dot);
             }
@@ -820,8 +832,17 @@ impl Device {
                     .push_next(&mut enabled_imageless);
             }
 
-            let names: Vec<*const std::ffi::c_char> =
-                plan.extensions.iter().map(|c| c.as_ptr()).collect();
+            let names = plan
+                .extensions
+                .iter()
+                .copied()
+                .chain(
+                    adapter
+                        .float_image_exchange
+                        .then_some(ash::ext::shader_atomic_float::NAME),
+                )
+                .map(CStr::as_ptr)
+                .collect::<Vec<_>>();
             let priorities = [1.0];
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(adapter.family)
@@ -1019,7 +1040,8 @@ impl Device {
                     {
                         caps |= FormatCaps::STORAGE_READ;
                     }
-                    if matches!(f, Format::R32Uint | Format::R32Sint)
+                    if (matches!(f, Format::R32Uint | Format::R32Sint)
+                        || (f == Format::R32Float && adapter.float_image_exchange))
                         && flags.contains(vk::FormatFeatureFlags::STORAGE_IMAGE_ATOMIC)
                     {
                         caps |= FormatCaps::STORAGE_ATOMIC;
