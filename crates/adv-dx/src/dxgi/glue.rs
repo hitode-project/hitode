@@ -793,8 +793,11 @@ device_glue!(
 );
 fn shared_resource_luid(env: &mut Env<'_>) -> Outcome {
     let (this, handle, out) = (env.arg(0), env.arg(1), env.arg(2));
-    if let Err(error) = device_required(env, 1).and_then(|()| result_pointer::<LUID>(env, 2)) {
+    if let Err(error) = result_pointer::<LUID>(env, 2) {
         return Outcome::Return(error.hresult());
+    }
+    if handle == 0 {
+        return Outcome::Return(Error::InvalidCall.hresult());
     }
     let Some(services) = env.ext.try_get::<super::swap::Services>() else {
         return ops::device(

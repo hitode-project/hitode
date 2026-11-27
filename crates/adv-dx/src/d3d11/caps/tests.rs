@@ -606,7 +606,7 @@ fn sample_counts_only_affect_queries_and_texture_creation() {
         };
         assert_eq!(report.level, level);
 
-        for count in [1, 2, 4, 8] {
+        for count in [1, 2, 4, 8, 32] {
             let supported = samples & count != 0;
             for format in [28, 85] {
                 assert_eq!(

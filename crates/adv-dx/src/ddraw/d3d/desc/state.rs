@@ -31,9 +31,37 @@ pub(in crate::ddraw::d3d) fn defaults(width: u32, height: u32, depth: bool) -> S
     state
 }
 
+pub(in crate::ddraw::d3d) fn device7_render(slot: u32) -> bool {
+    matches!(
+        slot,
+        2 | 4 | 7..=10 | 14..=16 | 19..=20 | 22..=30 | 33..=38 | 40..=42
+            | 47..=48 | 50 | 52..=63 | 96..=153
+    )
+}
+
+pub(in crate::ddraw::d3d) fn device7_render_value(state: &State, slot: u32) -> Result<u32, u32> {
+    if !device7_render(slot) {
+        return Err(INVALID);
+    }
+    Ok(state.render.get(&(slot as i32)).copied().unwrap_or({
+        if matches!(slot, 42 | 50 | 61..=63 | 96..=127 | 149..=150 | 153) {
+            u32::MAX
+        } else {
+            0
+        }
+    }))
+}
+
+pub(in crate::ddraw::d3d) fn retired_zero(rgb: bool, slot: u32) -> bool {
+    if rgb {
+        matches!(slot, 5 | 6 | 11 | 31 | 32 | 39 | 64..=95)
+    } else {
+        matches!(slot, 13)
+    }
+}
+
 pub(in crate::ddraw::d3d) fn render(slot: u32, value: u32) -> Result<Setting, u32> {
-    // Device7 rejects the retired selectors that remain in the SDK enum for
-    // the older interfaces. Optional raster modes require a corresponding cap.
+    // Translate the render states shared by the legacy device faces.
     let valid = match slot {
         2 | 10 | 40 => value == 0,
         7 => value <= 1,

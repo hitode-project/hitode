@@ -1,6 +1,6 @@
 //! Capability answers and ordered COM enumerations.
 use super::{Face, INVALID, caps};
-use adv_abi::{Env, Outcome};
+use adv_abi::{Env, Outcome, types::D3DDEVICEDESC};
 use adv_cpu::backend::{Prot, Reg};
 use adv_device::surface::SurfaceStore;
 
@@ -86,12 +86,44 @@ pub(super) fn derive(store: &SurfaceStore, device: Device) -> Report {
     )
 }
 
-pub(super) fn legacy_caps(store: &SurfaceStore, device: Device) -> Report {
+pub(super) fn legacy_caps(store: &SurfaceStore, device: Device, face: Face) -> Report {
     const EXECUTE_SYSTEM_MEMORY: u32 = 0x10;
     let mut report = derive(store, device);
+    let early_rgb = matches!(
+        face,
+        Face::Direct3D | Face::Direct3D2 | Face::Device1 | Face::Device2
+    );
     match device {
-        Device::Rgb => report.software.dwDevCaps |= EXECUTE_SYSTEM_MEMORY,
-        Device::Hal | Device::TnlHal => report.hardware.dwDevCaps |= EXECUTE_SYSTEM_MEMORY,
+        Device::Rgb => {
+            report.software.dwDevCaps |= EXECUTE_SYSTEM_MEMORY;
+            report.software.dwMaxVertexCount = 2021;
+            if early_rgb {
+                report.software.dwFlags &= !0x20;
+                report.software.dwDevCaps |= 0xa;
+                report.software.dwMinTextureWidth = 0;
+                report.software.dwMinTextureHeight = 0;
+                report.software.dwMaxTextureWidth = 0;
+                report.software.dwMaxTextureHeight = 0;
+            } else {
+                report.software.wMaxTextureBlendStages =
+                    report.software.wMaxTextureBlendStages.min(2);
+                report.software.wMaxSimultaneousTextures =
+                    report.software.wMaxSimultaneousTextures.min(2);
+            }
+        }
+        Device::Hal | Device::TnlHal => {
+            report.hardware.dwDevCaps |= EXECUTE_SYSTEM_MEMORY;
+            let count = if face == Face::Device1 { 65534 } else { 32768 };
+            report.hardware.dwMaxVertexCount = report.hardware.dwMaxVertexCount.min(count);
+            report.software.dcmColorModel = 0;
+            report.software.dwMaxVertexCount = report.hardware.dwMaxVertexCount;
+        }
+    }
+    for desc in [&mut report.hardware, &mut report.software] {
+        desc.dtcTransformCaps.dwSize = 8;
+        desc.dlcLightingCaps.dwSize = 16;
+        desc.dpcLineCaps.dwSize = 56;
+        desc.dpcTriCaps.dwSize = 56;
     }
     report
 }
@@ -113,6 +145,16 @@ pub(super) fn enumerate(env: &mut Env<'_>, face: Face, method: &str, args: &[u32
             derive(store, device.kind)
                 .texture_formats
                 .into_iter()
+                .filter(|format| {
+                    if matches!(face, Face::Device1 | Face::Device2) {
+                        matches!(format.dwFlags, 0x40 | 0x41)
+                            && (device.kind != Device::Rgb
+                                || format.dwRGBAlphaBitMask != 0x8000
+                                    && format.dwRGBAlphaBitMask != 0xf000)
+                    } else {
+                        true
+                    }
+                })
                 .map(|format| {
                     if matches!(face, Face::Device1 | Face::Device2) {
                         let mut desc = [0u32; 27];
@@ -140,7 +182,8 @@ pub(super) fn enumerate(env: &mut Env<'_>, face: Face, method: &str, args: &[u32
             if env.cpu.read(args[1], &mut guid).is_err() {
                 return Outcome::Return(INVALID);
             }
-            let Some(device) = DEVICES.into_iter().find(|d| d.guid() == guid) else {
+            let count = if face == Face::Direct3D7 { 3 } else { 2 };
+            let Some(device) = DEVICES.into_iter().take(count).find(|d| d.guid() == guid) else {
                 return Outcome::Return(INVALID);
             };
             (
@@ -163,7 +206,7 @@ pub(super) fn enumerate(env: &mut Env<'_>, face: Face, method: &str, args: &[u32
                     let report = if modern {
                         derive(store, device)
                     } else {
-                        legacy_caps(store, device)
+                        legacy_caps(store, device, face)
                     };
                     if !modern {
                         row.push(&device.guid());
@@ -173,8 +216,17 @@ pub(super) fn enumerate(env: &mut Env<'_>, face: Face, method: &str, args: &[u32
                     if modern {
                         row.push(bytemuck::bytes_of(&report.device));
                     } else {
-                        row.push(bytemuck::bytes_of(&report.hardware));
-                        row.push(bytemuck::bytes_of(&report.software));
+                        let size = if face == Face::Direct3D {
+                            172
+                        } else if face == Face::Direct3D2 {
+                            204
+                        } else {
+                            size_of::<D3DDEVICEDESC>()
+                        };
+                        for mut desc in [report.hardware, report.software] {
+                            desc.dwSize = size as u32;
+                            row.push(&bytemuck::bytes_of(&desc)[..size]);
+                        }
                     }
                     row
                 })

@@ -61,46 +61,20 @@ pub(super) fn get_instance(env: &mut Env<'_>) -> Outcome {
     let [linkage, name, index, out] = std::array::from_fn(|slot| env.arg(slot as u32));
     status((|| {
         let name = device::semantic_name(env, name)?;
-        let obj = ops::object(env, table(env), linkage)?;
-        let definitions = obj.class_linkage().ok_or(Error::InvalidArgument)?;
-        let (shader, instance) = definitions
-            .iter()
-            .find_map(|shader| {
-                shader
-                    .instances
-                    .iter()
-                    .find(|instance| instance.name == name && index < u32::from(instance.count))
-                    .map(|instance| (shader, instance))
-            })
-            .ok_or(Error::InvalidArgument)?;
-        let class = shader.class(instance.class).ok_or(Error::InvalidArgument)?;
-        let [cb, vector, texture, sampler] = instance.offsets;
-        let vector = vector + index * u32::from(class.constants);
-        let texture = if class.textures == 0 {
-            127
-        } else {
-            texture + index * u32::from(class.textures)
-        };
-        let sampler = if class.samplers == 0 {
-            15
-        } else {
-            sampler + index * u32::from(class.samplers)
-        };
+        let object = ops::object_mut(env, table(env), linkage)?;
+        let id = object.class_name_id(&name).ok_or(Error::InvalidArgument)?;
+        let device = object.device().unwrap();
         let instance = ClassInstance {
             linkage,
-            class: class.name.clone(),
+            class: Vec::new(),
             name,
             desc: D3D11_CLASS_INSTANCE_DESC {
+                InstanceId: id,
                 InstanceIndex: index,
-                TypeId: u32::from(instance.class),
-                ConstantBuffer: cb,
-                BaseConstantBufferOffset: vector,
-                BaseTexture: texture,
-                BaseSampler: sampler,
                 ..Default::default()
             },
         };
-        attach(env, obj.device().unwrap(), out, instance)
+        attach(env, device, out, instance)
     })())
 }
 
@@ -138,13 +112,7 @@ pub(super) fn instance_name(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn type_name(env: &mut Env<'_>) -> Outcome {
-    name(env, |instance| {
-        if instance.desc.Created != 0 {
-            &[]
-        } else {
-            &instance.class
-        }
-    })
+    name(env, |instance| &instance.class)
 }
 
 fn name(env: &mut Env<'_>, select: impl FnOnce(&ClassInstance) -> &[u8]) -> Outcome {
@@ -155,12 +123,17 @@ fn name(env: &mut Env<'_>, select: impl FnOnce(&ClassInstance) -> &[u8]) -> Outc
                 .class_instance()
                 .ok_or(Error::InvalidArgument)?,
         );
-        let bytes = [value, &[0]].concat();
-        if out != 0 && read::<u32>(env, size)? >= bytes.len() as u32 {
-            env.cpu
-                .write(out, &bytes)
-                .map_err(|_| Error::InvalidArgument)?;
+        let mut bytes = [value, &[0]].concat();
+        let required = bytes.len() as u32;
+        if out != 0 {
+            let capacity = read::<u32>(env, size)?.min(required) as usize;
+            if capacity != 0 {
+                bytes[capacity - 1] = 0;
+                env.cpu
+                    .write(out, &bytes[..capacity])
+                    .map_err(|_| Error::InvalidArgument)?;
+            }
         }
-        write(env, size, bytes.len() as u32)
+        write(env, size, required)
     })())
 }

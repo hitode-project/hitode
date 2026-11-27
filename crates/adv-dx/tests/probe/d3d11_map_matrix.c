@@ -34,7 +34,6 @@ static void test(ID3D11Device *device, ID3D11DeviceContext *context, const char 
     ID3D11Resource_Release(res);
 }
 
-/* Supplemental rows pending hardware and WARP capture. */
 static void test_buffer_copies(ID3D11Device *device, ID3D11DeviceContext *context, UINT bind)
 {
     const UINT old[] = {1, 2, 3, 4}, fresh[] = {11, 22, 33, 44};

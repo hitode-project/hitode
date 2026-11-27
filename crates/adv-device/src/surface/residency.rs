@@ -250,7 +250,7 @@ impl<P: Presenter> Surfaces<P> {
     }
 
     /// Obtain the current GPU copy, uploading only the requested stale cells.
-    /// Packed render targets use BGRA color. Other packed layouts retain their raw bits.
+    /// Packed render targets use a blendable packed attachment or BGRA backing.
     #[cfg(feature = "gpu")]
     pub fn gpu_access(
         &mut self,
@@ -262,24 +262,42 @@ impl<P: Presenter> Surfaces<P> {
         let entry = self.surfaces.get_mut(&id).ok_or("unknown surface")?;
         let layout = &entry.layout;
         if entry.residency.gpu.is_none() {
-            let image = self
+            let image = match self
                 .gpu
-                .target(layout.width, layout.height, false)
+                .packed_target(layout.width, layout.height, entry.packed_color)
                 .map_err(gpu_error)?
-                .image;
+            {
+                Some(image) => image,
+                None => {
+                    self.gpu
+                        .target(layout.width, layout.height, false)
+                        .map_err(gpu_error)?
+                        .image
+                }
+            };
             entry
                 .residency
                 .attach_gpu((layout.width, layout.height), image);
         }
         entry.residency.gpu_access(rect, access, |image, parts| {
             let bytes = layout.format.bytes() as usize;
+            let native = image.packed_attachment_format();
+            let pitch = if native.is_some() { 2 } else { 4 };
             let mut pixels = Vec::new();
             for part in parts {
                 pixels.clear();
                 for y in part.y..part.y + part.h {
                     let row = layout.read_pixels(memory, part.x, y, part.w)?;
                     for pixel in row.chunks_exact(bytes) {
-                        if entry.packed_color[0] != 0 {
+                        if let Some(format) = native {
+                            let raw = u16::from_le_bytes(pixel.try_into().unwrap());
+                            let native = if format == adv_gpu::Format::Abgr4Unorm {
+                                raw.rotate_left(4)
+                            } else {
+                                raw
+                            };
+                            pixels.extend_from_slice(&native.to_le_bytes());
+                        } else if entry.packed_color[0] != 0 {
                             let raw = u16::from_le_bytes(pixel.try_into().unwrap());
                             pixels.extend_from_slice(&super::render::unpack_color(
                                 raw,
@@ -292,7 +310,7 @@ impl<P: Presenter> Surfaces<P> {
                     }
                 }
                 self.gpu
-                    .upload(image, *part, part.w * 4, &pixels)
+                    .upload(image, *part, part.w * pitch, &pixels)
                     .map_err(gpu_error)?;
             }
             Ok::<(), String>(())

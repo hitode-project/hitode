@@ -96,7 +96,7 @@ impl Members {
                 self.light_enable.insert(i);
             }
             Slot::Render(i) => {
-                self.render.insert(i as i32);
+                self.render.insert(i);
             }
             Slot::Stage(i) => {
                 self.stage.insert(i as i32);

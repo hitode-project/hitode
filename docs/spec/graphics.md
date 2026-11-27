@@ -120,13 +120,18 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 ### GFX-D3D7-2 Device classes
 
 **Rule**: Device7 MUST enumerate RGB, HAL and T&L HAL in that order, and legacy Direct3D MUST enumerate RGB then HAL. The RGB device MUST retain its texture limit, point rounding, terminal line pixel and combiner decisions while sharing HAL rasterization. An unsupported RGB texture cascade MUST return D3DERR_UNSUPPORTEDCOLORARG from ValidateDevice and report one pass.
+Legacy EnumDevices MUST return the descriptor layout for its interface version. GetCaps MUST report the runtime descriptor size while writing only to the caller's declared extent.
 **Verification**: Test
 **Basis**: Windows Direct3D7 semantics and pixel probes
 
 ### GFX-D3D7-3 Fixed-function state
 
-**Rule**: Device7 MUST translate API state into shared fixed-function registers, return API values from getters, and reject retired selectors with DDERR_INVALIDPARAMS. State blocks MUST capture and apply only their member slots, and legacy faces MUST translate vertex types, handles and viewport-owned lights into the shared registers. Execute buffers MUST provide a stable guest address, reject execution while locked, and process state, vertices, branches and primitives in instruction order.
+**Rule**: Device7 MUST preserve raw render-state values and use the measured selector acceptance rules for its device class. State blocks MUST capture and apply only their member slots. Legacy faces MUST translate vertex types, handles and viewport-owned lights into the shared registers.
+RGB MUST apply line stipple in least-significant-bit order and respect LASTPIXEL. HAL and T&L HAL MUST retain the line pattern value without stippling.
+Legacy viewport transforms MUST preserve the caller's screen XYZ fields for clipped vertices. Unclipped calls MUST preserve the caller's clip flags and homogeneous output.
+Execute buffers MUST provide a stable guest address, reject execution while locked, and process state, vertices, branches and primitives in instruction order. SPAN MUST leave pixels unchanged. Execute MUST report the device's clip status and extent after successful playback.
 **Verification**: Test
+**Basis**: Windows Direct3D legacy and Direct3D7 semantics probes
 
 ### GFX-D3D7-4 Texture color keys
 
@@ -137,7 +142,7 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 ### GFX-D3D7-5 Shared surface access
 
 **Rule**: Device7 MUST admit immutable draw inputs and access shared surface residency for every texture read and render-target write. DirectDraw locks MUST see recorded GPU writes.
-Packed 16-bit targets MUST blend in resident BGRA and round to the nearest packed color at surface access, independent of `DITHERENABLE`.
+Packed targets MUST use native blendable attachments where available. The BGRA fallback MUST convert to the packed precision at surface access. HAL MUST preserve the `DITHERENABLE` value without changing the packed blend result.
 **Verification**: Test
 
 ### GFX-D3D7-6 Surface loss and restoration
@@ -384,10 +389,13 @@ retain their answer until reissued; later recorded work does not delay them.
 **Verification**: Test
 
 Alt+Enter on an associated swap-chain window uses the shared exclusive-mode owner. Either DXGI window-association flag that disables Alt+Enter handling leaves the event to the application.
+A null window clears the association and restores default Alt+Enter handling.
+Software swap chains remain windowed and reject exclusive fullscreen.
 
 DXGI output ownership uses the same exclusive-mode owner as DirectDraw and DXGI fullscreen transitions. Output gamma and display-surface access follow that owner. A duplication object reads guest publications from the shared presenter and loses access when the display mode or fullscreen ownership changes.
+DXGI fullscreen gamma capabilities write 256 equally spaced control points between zero and one, preserving the unused positions. Gamma programming round-trips the full control structure. Scanout uses the first 256 points without scale or offset. Desktop duplication rejects null metadata buffers with `E_INVALIDARG` and preserves the required-size output.
 
-A valid hardware composition chain can be created on a Win32 desktop process. Its buffers have no window until a compositor attaches the chain.
+A Win32 desktop process can create a composition chain with a hardware or software device. Its buffers have no window until a compositor attaches the chain.
 
 ## Capabilities
 
@@ -450,10 +458,17 @@ output. The Metal and Vulkan paths report zero 8x quality levels.
 **Rule**: The D3D10 and D3D10.1 library creation calls MUST use the D3D11 core and return their own interface over the created device. The private core exports MUST use the measured x86 conventions, layer argument handling, and return values. WARP and REFERENCE MUST use the software adapter, and NULL devices MUST validate creation, preserve staging CPU contents, and complete queries without GPU work.
 **Verification**: Test
 
+`OpenAdapter10_2` returns nine versions in runtime order and preserves the caller's count and array when the array is too small. Fixed-size capability requests with a mismatched size return `E_UNEXPECTED` without writing the payload.
+The adapter's `CreateDevice` callback writes the measured Direct3D and DXGI function-table spans and null entries for the requested interface.
+
 ### GFX-INTEROP-2 Direct3D resource interoperability
 
 **Rule**: Shared textures opened within an execution MUST alias one backing allocation. Legacy and NT handles MUST retain their respective lifetimes, and keyed mutexes MUST grant access only after a matching key is released. Packed D24S8 CPU round trips MUST preserve the 24-bit depth code and the 8-bit stencil value exactly.
 **Verification**: Test
+
+`GetSharedHandle` succeeds with a null handle on private textures. It returns `E_INVALIDARG` on NT-only textures without writing the output. `CreateSharedHandle` requires the NT handle flag.
+A legacy handle retires with the last resource alias, as on RTX after a completed flush. WARP can retain an unreferenced legacy handle until creator-device release.
+`GetSharedResourceAdapterLuid` leaves the output untouched on null or unknown handles and returns `DXGI_ERROR_INVALID_CALL` or `D3DERR_INVALIDCALL`, respectively.
 
 Texture gathers use the top mip regardless of sampler filter. Two-dimensional gathers
 apply the border color per tap, and cube gathers address across face boundaries.
@@ -604,6 +619,7 @@ Pretransformed draws MUST retain index order.
 
 An unbound target counts as full when calculating primitives written.
 The overflow predicate compares storage needed with primitives written for its selected stream or for every stream in the unqualified query.
+Stream-specific overflow selectors are accepted by `CreateQuery` and refused by `CreatePredicate`.
 
 ### GFX-STAGE-2 Indirect dispatch
 
@@ -614,6 +630,8 @@ The overflow predicate compares storage needed with primitives written for its s
 
 **Rule**: Each draw MUST use the class instances captured at shader binding to select the interface function tables. Reads through `this[]` MUST use the constant, texture and sampler offsets of the bound instances. Named array elements MUST advance each offset by its class stride.
 **Verification**: Test
+
+Named lookup returns a name and index even without a matching shader declaration. A named instance reports zero offsets and an empty type name. Binding resolves its class and offsets against the selected shader. Name getters terminate truncated strings and report the full size including the terminator.
 
 ### GFX-STAGE-4 Output merger UAVs
 
@@ -635,6 +653,8 @@ A shader is dependent when a UAV load or atomic result influences an output, a d
 **Verification**: Test — private D3D11 color, depth and coverage draws at one and four samples.
 
 Vulkan uses the pipeline sample mask. Lavapipe can report shader input coverage for a subset of the covered samples. Metal uses fragment output coverage for partial masks. Metal can narrow shader input coverage and run UAV operations on excluded samples. Forced early depth and stencil writes can precede the shader mask.
+
+A clipped primitive can execute whole or in pieces. Each invocation sees the coverage of its piece. Half-coverage UNORM8 resolves permit either adjacent integer result.
 
 ## Samplers
 

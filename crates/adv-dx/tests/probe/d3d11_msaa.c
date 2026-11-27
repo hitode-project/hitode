@@ -1,4 +1,4 @@
-/* Pending Windows hardware and WARP rows: 8x format quality levels,
+/* Windows hardware and WARP rows: 8x format quality levels,
  * CreateTexture2D HRESULT for counts with zero quality levels, standard and
  * center creation, sample index and coverage, attribute evaluation,
  * per-sample depth, copy, MS SRV load and sample positions, and resolve.

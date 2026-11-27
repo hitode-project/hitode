@@ -568,10 +568,10 @@ fn om_sample_mask_controls_guest_color_and_coverage() {
         for mask in [u32::MAX, 0, 1, 2, 4, 5] {
             let covered = all & mask;
             let red = covered * 4 * covered.count_ones() / samples;
-            // Lavapipe can report coverage in groups 0x3 and 0xc at 4x.
-            let alternate = match (cfg!(target_vendor = "apple"), samples, mask) {
-                (false, 4, u32::MAX) => Some(30),
-                (false, 4, 5) => Some(5),
+            // A clipped primitive can rasterize whole or in groups 0x3 and 0xc.
+            let alternate = match (samples, mask) {
+                (4, u32::MAX) => Some(30),
+                (4, 5) => Some(5),
                 _ => None,
             };
             check(
@@ -589,22 +589,14 @@ fn om_sample_mask_controls_guest_color_and_coverage() {
             // writes sample_mask. With OM mask 3 the surviving samples see 1 and 2.
             let metal = cfg!(target_vendor = "apple");
             let inexact = stats(&r).inexact_sample_mask_pipelines;
-            check(&mut r, 0, 3, [0., 0., 0., 1.], 6, metal.then_some(3), 3);
-            check(&mut r, 0, 3, [0., 0., 0., 1.], 6, metal.then_some(3), 3);
+            check(&mut r, 0, 3, [0., 0., 0., 1.], 6, Some(3), 3);
+            check(&mut r, 0, 3, [0., 0., 0., 1.], 6, Some(3), 3);
             assert_eq!(
                 stats(&r).inexact_sample_mask_pipelines - inexact,
                 u64::from(metal)
             );
             r.shader(15, 9, READ_WRITE);
-            check(
-                &mut r,
-                0,
-                3,
-                [0., 0., f32::from_bits(1), 1.],
-                3,
-                metal.then_some(1),
-                1,
-            );
+            check(&mut r, 0, 3, [0., 0., f32::from_bits(1), 1.], 3, Some(1), 1);
         }
 
         let depth = r.image(
@@ -1121,7 +1113,7 @@ fn typed_uav_clear_preserves_subword_buffer_edges_and_image_bits() {
     };
     write_value(&mut r.machine, DESCRIPTOR, desc);
     let view = create_object(&mut r.machine, r.device, 8, &[buffer, DESCRIPTOR]);
-    write_value(&mut r.machine, DESCRIPTOR, [0x1aau32, 0x1bb, 0x2cc, 0x2dd]);
+    write_value(&mut r.machine, DESCRIPTOR, [0x12au32, 0x134, 0, 0]);
     r.call(51, &[view, DESCRIPTOR]);
     write_value(
         &mut r.machine,
@@ -1134,7 +1126,7 @@ fn typed_uav_clear_preserves_subword_buffer_edges_and_image_bits() {
         },
     );
     let staging = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, 0]);
-    assert_eq!(r.read(buffer, staging, 2, 4), [0xbbaa6655, 0x4433bbaa]);
+    assert_eq!(r.read(buffer, staging, 2, 4), [0x342a6655, 0x4433342a]);
 
     let image = r.texture(3, 1, 41, Bind::UNORDERED, 0);
     let view = create_object(&mut r.machine, r.device, 8, &[image, 0]);
@@ -1253,10 +1245,40 @@ fn dynamic_buffer_srv_uploads_keep_dispatches_in_order() {
     }
 }
 
+// spec: GFX-INTEROP-2
 #[test]
 fn legacy_shared_handle_keeps_cross_device_aliases_live() {
     let mut r = Raster::new();
     let (other, other_context) = create(&mut r.machine, 1, 0, &[0xb000]);
+    let private = r.texture(2, 1, 28, Bind::RENDER_TARGET, 0);
+    r.machine.cpu.write(IID, &IID_IDXGIRESOURCE1).unwrap();
+    assert_eq!(method(&mut r.machine, private, 0, &[IID, OUT]), 0);
+    let resource = r.machine.cpu.read_u32(OUT).unwrap();
+    r.machine.cpu.write_u32(OUT, 0x1234).unwrap();
+    assert_eq!(method(&mut r.machine, resource, 8, &[OUT]), 0);
+    assert_eq!(r.machine.cpu.read_u32(OUT).unwrap(), 0);
+    assert_eq!(
+        method(&mut r.machine, resource, 13, &[0, 0x80000000, 0, OUT]),
+        0x80070057
+    );
+
+    r.machine.cpu.write(IID, &IID_IDXGIDEVICE).unwrap();
+    assert_eq!(method(&mut r.machine, r.device, 0, &[IID, OUT]), 0);
+    let dxgi_device = r.machine.cpu.read_u32(OUT).unwrap();
+    assert_eq!(method(&mut r.machine, dxgi_device, 7, &[OUT]), 0);
+    let adapter = r.machine.cpu.read_u32(OUT).unwrap();
+    r.machine.cpu.write(IID, &IID_IDXGIFACTORY2).unwrap();
+    assert_eq!(method(&mut r.machine, adapter, 6, &[IID, OUT]), 0);
+    let factory = r.machine.cpu.read_u32(OUT).unwrap();
+    for (handle, status) in [(0, 0x887a0001), (0x1234, 0x88760873)] {
+        let sentinel = [0x1234u32, 0x5678];
+        write_value(&mut r.machine, OUT, sentinel);
+        assert_eq!(method(&mut r.machine, factory, 17, &[handle, OUT]), status);
+        assert_eq!(
+            GuestPtr::<[u32; 2]>::new(OUT).read(&r.machine.cpu).unwrap(),
+            sentinel
+        );
+    }
     let texture = r.image(
         D3D11_TEXTURE2D_DESC {
             Width: 2,
@@ -1289,11 +1311,15 @@ fn legacy_shared_handle_keeps_cross_device_aliases_live() {
     for object in [view, dxgi, texture] {
         method(&mut r.machine, object, 2, &[]);
     }
+    r.call(110, &[]);
+    r.call(111, &[]);
     r.device = other;
     r.context = other_context;
     let staging = r.texture(2, 1, 28, 0, 0);
     assert_eq!(r.read(alias, staging, 2, 4), [0xff0000ff; 2]);
     assert_eq!(method(&mut r.machine, alias, 2, &[]), 0);
+    r.call(110, &[]);
+    r.call(111, &[]);
     assert_eq!(
         method(&mut r.machine, other, 28, &[handle, IID, OUT]),
         0x80070057
@@ -1729,15 +1755,23 @@ fn class_instances_bind_named_array_members_and_explicit_offsets() {
     let names = ARRAY + 0x100;
     r.machine
         .cpu
-        .write(names, b"namedTint\0StageTint\0")
+        .write(names, b"namedTint\0StageTint\0missing\0")
         .unwrap();
     let named0 = create_object(&mut r.machine, linkage, 7, &[names, 0]);
     let named1 = create_object(&mut r.machine, linkage, 7, &[names, 1]);
+    let named2 = create_object(&mut r.machine, linkage, 7, &[names, 2]);
+    let missing = create_object(&mut r.machine, linkage, 7, &[names + 20, 3]);
     let created = create_object(&mut r.machine, linkage, 8, &[names + 10, 3, 4, 5, 2]);
-    for (instance, offsets, created, index) in [
-        (named0, [0, 0, 0, 0], 0, 0),
-        (named1, [0, 1, 1, 1], 0, 1),
-        (created, [3, 4, 5, 2], 1, 0),
+    let named = b"namedTint\0".as_slice();
+    let empty = b"\0".as_slice();
+    let missing_name = b"missing\0".as_slice();
+    let class_name = b"StageTint\0".as_slice();
+    for (instance, offsets, created, id, index, name, ty) in [
+        (named0, [0; 4], 0, 0, 0, named, empty),
+        (named1, [0; 4], 0, 0, 1, named, empty),
+        (named2, [0; 4], 0, 0, 2, named, empty),
+        (missing, [0; 4], 0, 1, 3, missing_name, empty),
+        (created, [3, 4, 5, 2], 1, 0, 0, empty, class_name),
     ] {
         assert_eq!(method(&mut r.machine, instance, 8, &[DESCRIPTOR]), 0);
         let desc: D3D11_CLASS_INSTANCE_DESC =
@@ -1752,27 +1786,47 @@ fn class_instances_bind_named_array_members_and_explicit_offsets() {
             offsets
         );
         assert_eq!(
-            (desc.InstanceIndex, desc.TypeId, desc.Created),
-            (index, 0, created)
+            (
+                desc.InstanceId,
+                desc.InstanceIndex,
+                desc.TypeId,
+                desc.Created
+            ),
+            (id, index, 0, created)
         );
-        if created == 0 {
-            for (slot, name) in [
-                (9, b"namedTint\0".as_slice()),
-                (10, b"StageTint\0".as_slice()),
-            ] {
-                assert_eq!(method(&mut r.machine, instance, slot, &[0, DESCRIPTOR]), 0);
-                assert_eq!(
-                    r.machine.cpu.read_u32(DESCRIPTOR).unwrap(),
-                    name.len() as u32
-                );
-                assert_eq!(
-                    method(&mut r.machine, instance, slot, &[ARRAY, DESCRIPTOR]),
-                    0
-                );
-                let mut bytes = vec![0; name.len()];
-                r.machine.cpu.read(ARRAY, &mut bytes).unwrap();
-                assert_eq!(bytes, name);
-            }
+        for (slot, text) in [(9, name), (10, ty)] {
+            assert_eq!(method(&mut r.machine, instance, slot, &[0, DESCRIPTOR]), 0);
+            assert_eq!(
+                r.machine.cpu.read_u32(DESCRIPTOR).unwrap(),
+                text.len() as u32
+            );
+            assert_eq!(
+                method(&mut r.machine, instance, slot, &[ARRAY, DESCRIPTOR]),
+                0
+            );
+            let mut bytes = vec![0; text.len()];
+            r.machine.cpu.read(ARRAY, &mut bytes).unwrap();
+            assert_eq!(bytes, text);
+            r.machine.cpu.write(ARRAY, &[0xa5; 3]).unwrap();
+            write_value(&mut r.machine, DESCRIPTOR, 2u32);
+            assert_eq!(
+                method(&mut r.machine, instance, slot, &[ARRAY, DESCRIPTOR]),
+                0
+            );
+            assert_eq!(
+                r.machine.cpu.read_u32(DESCRIPTOR).unwrap(),
+                text.len() as u32
+            );
+            let mut bytes = [0; 3];
+            r.machine.cpu.read(ARRAY, &mut bytes).unwrap();
+            assert_eq!(
+                bytes,
+                if text.len() > 1 {
+                    [text[0], 0, 0xa5]
+                } else {
+                    [0, 0xa5, 0xa5]
+                }
+            );
         }
     }
     let (target, _, staging) = r.target(1, 28);
@@ -2350,24 +2404,40 @@ fn stream_overflow_predicates_gate_expanded_draws() {
         ],
     );
     r.call(23, &[shader, 0, 0]);
-    let predicates = [7, 9, 11, 13, 15].map(|kind| r.query(kind, true));
+    let predicate = r.query(7, true);
+    let streams = [9, 11, 13, 15].map(|kind| {
+        write_value(
+            &mut r.machine,
+            DESCRIPTOR,
+            adv_abi::types::D3D11_QUERY_DESC {
+                Query: kind,
+                MiscFlags: 0,
+            },
+        );
+        assert_eq!(
+            method(&mut r.machine, r.device, 25, &[DESCRIPTOR, OUT]),
+            0x80070057
+        );
+        r.query(kind, false)
+    });
     let so = r.query(6, false);
-    for query in predicates.into_iter().chain([so]) {
+    for query in streams.into_iter().chain([predicate, so]) {
         r.call(27, &[query]);
     }
     r.call(13, &[3, 0]);
-    for query in predicates.into_iter().chain([so]) {
+    for query in streams.into_iter().chain([predicate, so]) {
         r.call(28, &[query]);
     }
-    for (query, expected) in predicates.into_iter().zip([1u32, 1, 0, 0, 0]) {
+    assert_eq!(r.query_data::<u32>(predicate), 1);
+    for (query, expected) in streams.into_iter().zip([1u32, 0, 0, 0]) {
         assert_eq!(r.query_data::<u32>(query), expected);
     }
     assert_eq!(r.query_data::<[u64; 2]>(so), [0, 1]);
     let stats = r.query(4, false);
     r.call(27, &[stats]);
-    r.call(30, &[predicates[0], 1]);
+    r.call(30, &[predicate, 1]);
     r.call(13, &[3, 0]);
-    r.call(30, &[predicates[0], 0]);
+    r.call(30, &[predicate, 0]);
     r.call(13, &[3, 0]);
     r.call(30, &[0, 0]);
     r.call(28, &[stats]);
@@ -2384,10 +2454,10 @@ fn stream_overflow_predicates_gate_expanded_draws() {
     );
     let (target, view, staging) = r.target(1, 28);
     r.clear(view, [0., 0., 1., 1.]);
-    r.call(30, &[predicates[0], 1]);
+    r.call(30, &[predicate, 1]);
     r.draw(0..1, [1., 0., 0., 1.]);
     assert_eq!(r.read(target, staging, 1, 4), [0xffff0000]);
-    r.call(30, &[predicates[0], 0]);
+    r.call(30, &[predicate, 0]);
     r.draw(0..1, [1., 0., 0., 1.]);
     assert_eq!(r.read(target, staging, 1, 4), [0xff0000ff]);
     r.call(30, &[0, 0]);
@@ -2423,6 +2493,9 @@ fn nt_shared_texture_survives_handle_duplication_and_keyed_handoff() {
     };
     let keyed = query(&mut r.machine, texture, IID_IDXGIKEYEDMUTEX);
     let resource = query(&mut r.machine, texture, IID_IDXGIRESOURCE1);
+    r.machine.cpu.write_u32(OUT, 0x1234).unwrap();
+    assert_eq!(method(&mut r.machine, resource, 8, &[OUT]), 0x80070057);
+    assert_eq!(r.machine.cpu.read_u32(OUT).unwrap(), 0x1234);
     let name = ARRAY + 0x100;
     let wide: Vec<_> = "Local\\T14Texture".encode_utf16().chain([0]).collect();
     r.machine

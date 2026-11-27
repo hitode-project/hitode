@@ -21,15 +21,40 @@ struct Saved {
 pub(super) type BindingChanges = [(u32, u32); 8];
 
 impl State {
-    pub fn new(width: u32, height: u32, depth: bool) -> Self {
+    pub fn new(width: u32, height: u32, depth: bool, device7: Option<super::caps::Device>) -> Self {
+        let mut fixed = desc::state::defaults(width, height, depth);
+        if let Some(device) = device7 {
+            for slot in (1..=153).filter(|&slot| desc::state::device7_render(slot)) {
+                let value = desc::state::device7_render_value(&fixed, slot).unwrap();
+                fixed.render.insert(slot as i32, value);
+            }
+            if device != super::caps::Device::Rgb {
+                for slot in [2, 40] {
+                    fixed.render.insert(slot, u32::MAX);
+                }
+            }
+        }
         Self {
-            fixed: desc::state::defaults(width, height, depth),
+            fixed,
             recording: None,
             blocks: BTreeMap::new(),
             next_block: 1,
             scene: false,
             textures: [0; 8],
-            clip_status: [0; 8],
+            clip_status: if device7.is_some() {
+                [
+                    2,
+                    0x01ff_f000,
+                    2048f32.to_bits(),
+                    0,
+                    2048f32.to_bits(),
+                    0,
+                    0,
+                    0,
+                ]
+            } else {
+                [0; 8]
+            },
         }
     }
 
@@ -93,7 +118,7 @@ impl State {
             return Err(INVALID);
         }
         for &slot in fixed.render.keys() {
-            if desc::state::render_value(fixed, slot as u32).is_ok()
+            if desc::state::device7_render(slot as u32)
                 && (kind == 1 || (kind == 3) == vertex_render(slot))
             {
                 members.render.insert(slot);
@@ -146,7 +171,9 @@ impl State {
         if self.recording.is_some() {
             return Err(0x88760835);
         }
-        let block = self.blocks.get(&handle).ok_or(0x88760834u32)?;
+        let Some(block) = self.blocks.get(&handle) else {
+            return Ok([(0, 0); 8]);
+        };
         block.fixed.apply(&mut self.fixed, &block.fixed.members);
         Ok(std::array::from_fn(|slot| {
             block.textures[slot].map_or((0, 0), |texture| {
