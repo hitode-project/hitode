@@ -53,9 +53,9 @@
 
 ## 能玩哪些游戏
 
-Hitode 不针对某个游戏或引擎做适配，而是实现 32 位 Windows 视觉小说常用的系统功能：GDI、DirectDraw、Direct3D 9、DirectSound、DirectInput，以及 DirectShow、Windows Media 和 VfW 视频。只要游戏建立在这些功能之上，不论是商业引擎、引擎的哪个版本，还是品牌自研的引擎，都有机会直接运行。
+Hitode 不针对某个游戏或引擎做适配，而是实现 32 位 Windows 视觉小说常用的系统功能：GDI、DirectDraw、Direct3D 7 / 9 / 10 / 11（含 DXGI）、DirectSound、DirectMusic（MIDI）、DirectInput，以及 DirectShow、Windows Media 和 VfW 视频。只要游戏建立在这些功能之上，不论是商业引擎、引擎的哪个版本，还是品牌自研的引擎，都有机会直接运行。
 
-不支持：64 位程序；使用 Direct3D 10 及以上或 OpenGL 的程序；需要绕过保护壳或 DRM 才能运行的程序。
+不支持：64 位程序；使用 Direct3D 12、Vulkan 或 OpenGL 的程序；需要绕过保护壳或 DRM 才能运行的程序。
 
 想知道自己的游戏能不能玩，直接导入试试就好。进不去、卡死、闪退、卡顿或者耗电异常，欢迎[告诉我们](https://github.com/hitode-project/hitode/issues/new?template=game-issue.yml)哪款游戏、出了什么问题，附上启动器生成的匿名报告更好。我们会把同一原因的问题归到一起，修复放进通用行为，一处修好，同类游戏都会受益。已知问题见 [issue 列表](https://github.com/hitode-project/hitode/issues?q=label%3Acompatibility)；能玩的游戏欢迎到 [Discussions](https://github.com/hitode-project/hitode/discussions) 分享。
 
@@ -83,7 +83,7 @@ Hitode 分为两部分：一个运行 Windows 程序的**运行时核心**，以
 
 思路借鉴主机模拟器：游戏自己的代码原样运行，Hitode 只提供它期待的“硬件”，也就是 Windows 的一个子集、图形音频视频设备、时间和线程。
 
-Windows 行为来自随 Hitode 一起构建的 Wine，它的模块作为 guest 代码运行，负责长尾兼容。玩家能感受到的部分全部是宿主代码：混音、MIDI、视频解码、DirectDraw 和 Direct3D 9，以及它们的计时。NT 内核、Wine server 和驱动都在同一个进程里，层与层直接调用。字节经过校验、确认未被改动的 Wine 函数，可以由原生函数体以宿主代码执行，结果完全相同。
+Windows 行为来自随 Hitode 一起构建的 Wine，它的模块作为 guest 代码运行，负责长尾兼容。玩家能感受到的部分全部是宿主代码：混音、MIDI、视频解码、DirectDraw 与 Direct3D（7、9、10、11），以及它们的计时。NT 内核、Wine server 和驱动都在同一个进程里，层与层直接调用。字节经过校验、确认未被改动的 Wine 函数，可以由原生函数体以宿主代码执行，结果完全相同。
 
 核心也可以脱离启动器单独运行，`adv-run` 是它的命令行入口，便于调试和自动化测试。
 
@@ -167,7 +167,7 @@ Hitode 以 [GNU 通用公共许可证第 3 版或任何更新版本](COPYING)发
 第三方部分保留各自的许可证：
 
 - `crates/adv-cpu-core/softfloat`：Berkeley SoftFloat 3e，BSD-3-Clause。
-- `vendor/cpal`（Apache-2.0）和 `vendor/symphonia-codec-adpcm`（MPL-2.0）：打过补丁的上游代码。
+- `vendor/cpal`（Apache-2.0）、`vendor/naga`（Apache-2.0 OR MIT）和 `vendor/symphonia-codec-adpcm`（MPL-2.0）：打过补丁的上游代码。
 - `vendor/libtheora`：Xiph libtheora 1.2.0 解码部分，BSD-3-Clause，有本地修改，见其 `NOTICE`。
 - `vendor/wine`：Wine 11.0 的服务端及其包含的头文件、服务端启动时加载的 `l_intl.nls`，以及 `ntsyscalls.h` 系统调用表，LGPL-2.1-or-later，未修改，见其 `NOTICE`。
 - `crates/adv-unix/freetype`：FreeType 的 ftgrays 光栅器，按 FreeType License（FTL）使用，见其 `LICENSE.TXT`。
