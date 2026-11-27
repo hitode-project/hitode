@@ -1987,7 +1987,7 @@ fn storage_binding_limits(indexed: bool) {
     let input = device
         .create_buffer(&BufferDesc {
             size: stride * 128,
-            usage: BufferUsage::STORAGE | BufferUsage::COPY_DST,
+            usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
             memory: Memory::Upload,
             label: "storage SRVs",
         })
