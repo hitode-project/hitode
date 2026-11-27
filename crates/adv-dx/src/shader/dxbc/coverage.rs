@@ -538,7 +538,11 @@ pub(crate) fn pixel_uav_fixture() -> Vec<u8> {
 }
 
 #[cfg(feature = "gpu")]
-pub(crate) fn pixel_atomic_fixture(interpolation: Option<u32>) -> Vec<u8> {
+pub(crate) fn pixel_atomic_fixture(
+    interpolation: Option<u32>,
+    dependent: bool,
+    early: bool,
+) -> Vec<u8> {
     const RED_STEP: [u32; 1] = [(64.0f32 / 255.0).to_bits()];
     let mask = |kind, slot, lanes: u32| {
         register(
@@ -565,6 +569,13 @@ pub(crate) fn pixel_atomic_fixture(interpolation: Option<u32>) -> Vec<u8> {
             &[4],
         ),
     ];
+    if early {
+        let mut flags = declaration(D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS, None, &[]);
+        if let Instruction::Operation { controls, .. } = &mut flags {
+            *controls = encode_global_flags(D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL);
+        }
+        instructions.insert(0, flags);
+    }
     if let Some(mode) = interpolation {
         let mut input = declaration(
             D3D10_SB_OPCODE_DCL_INPUT_PS,
@@ -599,22 +610,31 @@ pub(crate) fn pixel_atomic_fixture(interpolation: Option<u32>) -> Vec<u8> {
                     immediate(&[1]),
                 ],
             ),
-            op(D3D10_SB_OPCODE_UTOF, vec![destination(0, 1), temp(0, 0)]),
-            // Successive invocations yield red values 64, 128, 192 and 255.
-            op(
-                D3D10_SB_OPCODE_MAD,
-                vec![
-                    output(1),
-                    temp(0, 0),
-                    immediate(&RED_STEP),
-                    immediate(&RED_STEP),
-                ],
-            ),
             op(
                 D3D10_SB_OPCODE_MOV,
                 vec![output(2), immediate(&[0x3f00_0000])],
             ),
         ]);
+        if dependent {
+            instructions.extend([
+                op(D3D10_SB_OPCODE_UTOF, vec![destination(0, 1), temp(0, 0)]),
+                // Successive invocations yield red values 64, 128, 192 and 255.
+                op(
+                    D3D10_SB_OPCODE_MAD,
+                    vec![
+                        output(1),
+                        temp(0, 0),
+                        immediate(&RED_STEP),
+                        immediate(&RED_STEP),
+                    ],
+                ),
+            ]);
+        } else {
+            instructions.push(op(
+                D3D10_SB_OPCODE_MOV,
+                vec![output(1), immediate(&[0x3f00_0000])],
+            ));
+        }
     }
     instructions.extend([
         op(D3D10_SB_OPCODE_MOV, vec![output(4), immediate(&[0])]),

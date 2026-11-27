@@ -11,7 +11,10 @@ mod variant_interface;
 pub(crate) use memory::clear_pattern;
 pub use variant_interface::STATISTICS_SLOT;
 
-use super::{analysis::Reflection, ir::*};
+use super::{
+    analysis::{Reflection, uav},
+    ir::*,
+};
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write,
@@ -35,6 +38,8 @@ pub struct Translation {
     pub locations: Vec<BindingLocation>,
     /// UAV slot and group 3 binding of each separate 32-bit counter.
     pub counters: Vec<(u32, u32)>,
+    #[cfg(feature = "gpu")]
+    pub(crate) per_sample_uav_effects: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -228,7 +233,16 @@ fn emit_entry(
             return Err(Error::UnsupportedStage(module.stage));
         }
     };
+    let pixel_frequency_msaa = cfg!(target_vendor = "apple")
+        && module.stage == Stage::Pixel
+        && options.raster_samples > 1
+        && interface.is_some()
+        && !reflection.sample_frequency();
+    let guest_uav = pixel_frequency_msaa && reflection.writes_uav();
+    let per_sample_uav_effects = guest_uav && uav::effects_depend_on_uav(&module);
     let mut writer = Writer::new(&module, &reflection, options);
+    writer.elect_uav = guest_uav && !per_sample_uav_effects;
+    writer.elect_counter = pixel_frequency_msaa && interface.is_some_and(|i| i.count_fragments);
     if module.stage == Stage::Vertex && interface.is_some_and(|i| i.native_clip) {
         writer.source.push_str("enable clip_distances;\n");
     }
@@ -253,6 +267,8 @@ fn emit_entry(
         reflection,
         locations,
         counters,
+        #[cfg(feature = "gpu")]
+        per_sample_uav_effects,
     })
 }
 
@@ -265,6 +281,8 @@ struct Writer<'a> {
     locations: Vec<BindingLocation>,
     counters: Vec<(u32, u32)>,
     options: Options<'a>,
+    elect_uav: bool,
+    elect_counter: bool,
     atomic_bindings: &'a HashSet<(Register, u32)>,
     depth: usize,
 }
@@ -280,6 +298,8 @@ impl<'a> Writer<'a> {
             locations: Vec::new(),
             counters: Vec::new(),
             options,
+            elect_uav: false,
+            elect_counter: false,
             atomic_bindings: &reflection.atomic_bindings,
             depth: 0,
         }

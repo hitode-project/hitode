@@ -59,7 +59,7 @@ pub struct ModernShader {
     stage: Stage,
     bindings: Vec<(u32, p::Binding)>,
     writes: Vec<u32>,
-    guest_uav_effects: bool,
+    per_sample_uav_effects: bool,
 }
 
 impl ModernShader {
@@ -138,7 +138,7 @@ impl ModernShader {
             stage,
             bindings,
             writes,
-            guest_uav_effects: false,
+            per_sample_uav_effects: false,
         })
     }
 
@@ -148,13 +148,13 @@ impl ModernShader {
         Self::new(identity, module, name, stage)
     }
 
-    pub fn with_guest_uav_effects(mut self, effects: bool) -> Self {
-        self.guest_uav_effects = effects;
+    pub fn with_per_sample_uav_effects(mut self, effects: bool) -> Self {
+        self.per_sample_uav_effects = effects;
         self
     }
 
-    pub(super) fn has_guest_uav_effects(&self) -> bool {
-        self.guest_uav_effects
+    pub(super) fn has_per_sample_uav_effects(&self) -> bool {
+        self.per_sample_uav_effects
     }
 
     pub(super) fn identity(&self) -> u64 {

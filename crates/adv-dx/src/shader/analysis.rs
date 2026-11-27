@@ -1,5 +1,7 @@
 //! Binding and component use of a verified shader module.
 
+pub(crate) mod uav;
+
 use super::dxbc::fields::D3D11_SB_GLOBAL_FLAG_ENABLE_DOUBLE_PRECISION_FLOAT_OPS;
 use super::ir::*;
 use std::collections::{HashMap, HashSet};
@@ -52,6 +54,27 @@ pub fn analyze(module: &Module) -> Reflection {
 }
 
 impl Reflection {
+    pub(crate) fn sample_frequency(&self) -> bool {
+        self.signatures
+            .input
+            .iter()
+            .any(|input| input.system_value == SystemValue::SampleIndex)
+            || self.interpolation.values().any(|mode| {
+                matches!(
+                    mode,
+                    Interpolation::PerspectiveSample | Interpolation::LinearSample
+                )
+            })
+    }
+
+    pub(crate) fn writes_uav(&self) -> bool {
+        !self.counter_bindings.is_empty()
+            || self
+                .writes
+                .keys()
+                .any(|(register, _)| *register == Register::UnorderedAccessView)
+    }
+
     fn block(&mut self, block: &Block) {
         for statement in block {
             match statement {
@@ -144,14 +167,7 @@ impl Reflection {
             {
                 self.counter_bindings.insert(slot);
             }
-            let selected = operand
-                .components
-                .swizzle()
-                .into_iter()
-                .enumerate()
-                .fold(0, |mask, (lane, source)| {
-                    mask | (((lanes >> lane) & 1) << source)
-                });
+            let selected = source_components(operand, lanes);
             self.operand(operand, selected, false);
         }
     }
@@ -187,4 +203,15 @@ impl Reflection {
             self.operand(register, register.components.mask(), false);
         }
     }
+}
+
+fn source_components(operand: &Operand, lanes: u8) -> u8 {
+    operand
+        .components
+        .swizzle()
+        .into_iter()
+        .enumerate()
+        .fold(0, |mask, (lane, source)| {
+            mask | (((lanes >> lane) & 1) << source)
+        })
 }

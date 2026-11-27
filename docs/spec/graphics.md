@@ -518,7 +518,8 @@ linkage programs. Residency feedback and double precision have Windows bytecode 
 
 ### GFX-SHADER-7 Pipeline statistics
 
-**Rule**: Pipeline statistics MUST combine recorded work with raster and expansion counts. Rasterization-disabled draws MUST contribute zero clipping and fragment counts. Programmable-stage counts MUST account for the work in the table below.
+**Rule**: Pipeline statistics MUST combine recorded work with raster and expansion counts for the stages below. Rasterization-disabled draws MUST contribute zero clipping and fragment counts.
+On Metal, multisampled pixel-frequency shaders MUST elect the lowest covered sample of each rasterized primitive piece for the fragment count.
 **Verification**: Test
 
 | Stage | Work counted |
@@ -529,6 +530,8 @@ linkage programs. Residency feedback and double precision have Windows bytecode 
 | Geometry | Shader instances and emitted primitives |
 | Pixel | Invocations within the Direct3D depth and stencil bounds |
 | Compute | Threads in direct and indirect dispatches |
+
+Metal keeps query-only tests late for the election. Guest-forced early tests can undercount when the elected sample fails and another covered sample passes.
 
 ## Tessellation
 
@@ -614,9 +617,12 @@ The overflow predicate compares storage needed with primitives written for its s
 
 ### GFX-STAGE-4 Output merger UAVs
 
-**Rule**: At feature level 11_0 a pixel shader MUST access its bound output-merger UAVs. Pixel UAV writes MUST execute when neither color nor depth attachments are bound.
-Metal multisample pipelines with pixel shader UAV writes or atomics MUST retain native per-sample execution and be counted and warned once per pipeline.
+**Rule**: At feature level 11_0 pixel shaders MUST access their bound output-merger UAVs and execute UAV writes even without color or depth attachments.
+Independent Metal multisample pixel-frequency shaders MUST restrict UAV stores and atomics to the lowest covered sample of each rasterized primitive piece.
+Dependent Metal multisample pixel-frequency pipelines MUST retain native UAV execution and be counted and warned once.
 **Verification**: Test
+
+A shader is dependent when a UAV load or atomic result influences an output, a discard or a later UAV operation.
 
 ### GFX-STAGE-5 Geometry shader raster routing
 

@@ -781,7 +781,7 @@ fn windows_multisample_coverage_uses_guest_resolve() {
     }
 }
 
-// spec: GFX-STAGE-4
+// spec: GFX-STAGE-4 GFX-SHADER-7
 #[test]
 fn multisample_pixel_uav_invocations_and_pipeline_count() {
     use crate::shader::dxbc::{
@@ -791,6 +791,8 @@ fn multisample_pixel_uav_invocations_and_pipeline_count() {
         },
         pixel_atomic_fixture,
     };
+
+    const COLOR: &[u8] = include_bytes!("../../../../../tests/fixtures/d3d11/guest_color.dxbc");
 
     let mut r = Raster::new();
     let vs = include_bytes!("../../../../../tests/fixtures/shader-core/vs_5_0.dxbc");
@@ -819,16 +821,6 @@ fn multisample_pixel_uav_invocations_and_pipeline_count() {
     r.call(17, &[layout]);
     let vb = buffer(&mut r.machine, r.device, Bind::VERTEX, 3 * 24);
     let vs_constants = buffer(&mut r.machine, r.device, Bind::CONSTANT, 32);
-    update_dynamic(
-        &mut r.machine,
-        r.context,
-        vb,
-        &[
-            [0.0f32, 0., 0.5, 1., 0., 0.],
-            [2., 0., 0.5, 1., 2., 0.],
-            [0., 2., 0.5, 1., 0., 2.],
-        ],
-    );
     write_value(&mut r.machine, ARRAY + 16, [vb, 24, 0, vs_constants]);
     r.call(18, &[0, 1, ARRAY + 16, ARRAY + 20, ARRAY + 24]);
     r.call(7, &[0, 1, ARRAY + 28]);
@@ -865,6 +857,7 @@ fn multisample_pixel_uav_invocations_and_pipeline_count() {
             SysMemSlicePitch: 0,
         },
     );
+    let query = r.query(4, false);
     let metal = cfg!(target_vendor = "apple");
     for samples in [1, 4] {
         let desc = D3D11_TEXTURE2D_DESC {
@@ -900,10 +893,27 @@ fn multisample_pixel_uav_invocations_and_pipeline_count() {
             };
             r.read(resource, colors, 1, 4)[0].to_le_bytes()
         };
-        for viewport in [4.0f32, 1.] {
-            // Both viewports cover the sole pixel. The smaller clip volume splits the
-            // triangle into two raster primitives on lavapipe.
+        for (viewport, left) in [(4.0f32, 0.0f32), (1., 0.), (4., 0.5)] {
+            if samples == 1 && left != 0. {
+                continue;
+            }
+            // The 1x1 viewport clips the triangle into two pieces. Moving
+            // the left edge to the pixel center covers only two samples.
+            let clipped = viewport == 1.;
+            let partial = left != 0.;
+            let pieces = if samples > 1 && clipped { 2 } else { 1 };
+            let covered = if partial { 2 } else { samples };
             let scale = 2. / viewport;
+            update_dynamic(
+                &mut r.machine,
+                r.context,
+                vb,
+                &[
+                    [left, 0., 0.5, 1., left, 0.],
+                    [left + 2., 0., 0.5, 1., left + 2., 0.],
+                    [left, 2., 0.5, 1., left, 2.],
+                ],
+            );
             update_dynamic(
                 &mut r.machine,
                 r.context,
@@ -923,22 +933,51 @@ fn multisample_pixel_uav_invocations_and_pipeline_count() {
             );
             r.call(44, &[1, DESCRIPTOR]);
             let before = stats(&r).per_sample_uav_pipelines;
-            r.shader(
-                15,
-                9,
-                include_bytes!("../../../../../tests/fixtures/d3d11/guest_color.dxbc"),
-            );
+            r.shader(15, 9, COLOR);
+            r.clear(view, [0.; 4]);
+            r.call(27, &[query]);
             r.draw(0..1, [1.; 4]);
-            assert_eq!(read_color(&mut r), [255; 4]);
+            r.call(28, &[query]);
+            let color_only: [u64; 11] = r.query_data(query);
+            if metal {
+                assert_eq!(color_only, [3, 1, 3, 0, 0, 1, 1, pieces.into(), 0, 0, 0]);
+            }
+            assert_eq!(read_color(&mut r), [if partial { 128 } else { 255 }; 4]);
             assert_eq!(stats(&r).per_sample_uav_pipelines, before);
-            for interpolation in [
-                None,
-                Some(D3D10_SB_INTERPOLATION_LINEAR),
-                Some(D3D10_SB_INTERPOLATION_LINEAR_CENTROID),
-                Some(D3D10_SB_INTERPOLATION_LINEAR_SAMPLE),
+            let mixed_depth = metal && samples == 4 && !clipped && !partial;
+            let seed_depth = |r: &mut Raster| {
+                r.call(53, &[dsv, 1, 1.0f32.to_bits(), 0]);
+                r.call(9, &[0, 0, 0]);
+                r.call(35, &[0, 0, 1]);
+                r.draw(0..1, [0.; 4]);
+                r.call(35, &[0, 0, u32::MAX]);
+                r.clear(view, [0.; 4]);
+            };
+            if mixed_depth {
+                write_value(&mut r.machine, ARRAY, view);
+                r.call(33, &[1, ARRAY, dsv]);
+                seed_depth(&mut r);
+                r.shader(15, 9, COLOR);
+                r.call(27, &[query]);
+                r.draw(0..1, [1.; 4]);
+                r.call(28, &[query]);
+                assert_eq!(r.query_data::<[u64; 11]>(query), color_only);
+                assert_eq!(read_color(&mut r), [191; 4]);
+            }
+            for (interpolation, dependent, early) in [
+                (None, true, false),
+                (None, false, false),
+                (Some(D3D10_SB_INTERPOLATION_LINEAR), false, false),
+                (Some(D3D10_SB_INTERPOLATION_LINEAR_CENTROID), false, false),
+                (Some(D3D10_SB_INTERPOLATION_LINEAR_SAMPLE), false, false),
+                (None, false, true),
             ] {
-                r.shader(15, 9, &pixel_atomic_fixture(interpolation));
+                let sample_frequency = interpolation == Some(D3D10_SB_INTERPOLATION_LINEAR_SAMPLE);
+                let shader = pixel_atomic_fixture(interpolation, dependent, early);
                 for depth in [0, dsv] {
+                    if early && (!mixed_depth || depth == 0) {
+                        continue;
+                    }
                     write_value(
                         &mut r.machine,
                         DESCRIPTOR,
@@ -958,43 +997,92 @@ fn multisample_pixel_uav_invocations_and_pipeline_count() {
                     let unbind = [0, 0, 0, 1, 1, ARRAY + 64, 0];
                     r.call(34, &bind);
                     r.clear(view, [0.; 4]);
-                    if depth != 0 {
+                    if early {
+                        seed_depth(&mut r);
+                    } else if depth != 0 {
                         r.call(53, &[depth, 1, 1.0f32.to_bits(), 0]);
                     }
+                    r.shader(15, 9, &shader);
                     let before = stats(&r).per_sample_uav_pipelines;
+                    r.call(27, &[query]);
                     r.draw(0..1, [0.; 4]);
+                    r.call(28, &[query]);
                     r.call(34, &unbind);
+                    let query_stats: [u64; 11] = r.query_data(query);
                     let count = r.read(counter, staging, 1, 4)[0];
-                    let expected = if metal
-                        || samples == 1
-                        || interpolation == Some(D3D10_SB_INTERPOLATION_LINEAR_SAMPLE)
-                    {
-                        samples
-                    } else if viewport == 1. {
-                        2
-                    } else {
-                        1
-                    };
-                    assert_eq!(
-                        count, expected,
-                        "{samples}x, {viewport}x{viewport} viewport, interpolation {interpolation:?}, depth {depth}"
-                    );
                     let color = read_color(&mut r);
-                    if interpolation.is_none() && viewport == 4. {
-                        // Metal resolves four distinct atomic-result colors at 4x.
-                        let red = if count == 4 { 160 } else { 64 };
-                        assert_eq!(color, [red, 128, 0, 255]);
+                    let row = format!(
+                        "{samples}x clipped={clipped} partial={partial} {interpolation:?} dependent={dependent} early={early} depth={}",
+                        depth != 0
+                    );
+                    // Guest-forced early depth can kill the elected sample alone.
+                    let expected = if early {
+                        0
+                    } else if sample_frequency || metal && dependent {
+                        covered
                     } else {
-                        assert_eq!(&color[2..], &[0, 255]);
+                        pieces
+                    };
+                    assert_eq!(count, expected, "{row}");
+                    let mut expected_stats = color_only;
+                    if early {
+                        expected_stats[7] = 0;
+                    } else if sample_frequency {
+                        expected_stats[7] = covered.into();
                     }
-                    let pipelines = before + u64::from(metal && samples > 1 && viewport == 4.);
-                    assert_eq!(stats(&r).per_sample_uav_pipelines, pipelines);
-                    if interpolation.is_none() && depth == 0 && viewport == 4. {
+                    assert_eq!(query_stats, expected_stats, "{row}");
+
+                    let centroid = interpolation == Some(D3D10_SB_INTERPOLATION_LINEAR_CENTROID);
+                    let expected_color = if early {
+                        [96, 96, 0, 191]
+                    } else if partial {
+                        let (red, green) = if dependent {
+                            (if metal { 48 } else { 32 }, 64)
+                        } else if centroid {
+                            (112, 48)
+                        } else if sample_frequency {
+                            (96, 80)
+                        } else {
+                            (64, 64)
+                        };
+                        [red, green, 0, 128]
+                    } else if dependent {
+                        let red = match count {
+                            4 => 160,
+                            2 => 96,
+                            _ => 64,
+                        };
+                        [red, 128, 0, 255]
+                    } else if centroid && samples == 4 && clipped {
+                        if metal {
+                            [160, 64, 0, 255]
+                        } else {
+                            [64, 96, 0, 255]
+                        }
+                    } else {
+                        [128, 128, 0, 255]
+                    };
+                    assert_eq!(color, expected_color, "{row}");
+
+                    let new_pipeline = metal && samples > 1 && dependent && !clipped && !partial;
+                    let pipelines = before + u64::from(new_pipeline);
+                    assert_eq!(stats(&r).per_sample_uav_pipelines, pipelines, "{row}");
+                    if interpolation.is_none() && depth == 0 && !clipped && !partial {
+                        // Reuse the counting pipeline, then exercise the same guest PS
+                        // without a statistics query.
                         r.call(34, &bind);
+                        r.call(27, &[query]);
+                        r.draw(0..1, [0.; 4]);
+                        r.call(28, &[query]);
+                        r.query_data::<[u64; 11]>(query);
+                        assert_eq!(stats(&r).per_sample_uav_pipelines, pipelines);
                         r.draw(0..1, [0.; 4]);
                         r.call(34, &unbind);
-                        assert_eq!(r.read(counter, staging, 1, 4)[0], count * 2);
-                        assert_eq!(stats(&r).per_sample_uav_pipelines, pipelines);
+                        assert_eq!(r.read(counter, staging, 1, 4)[0], count * 3);
+                        assert_eq!(
+                            stats(&r).per_sample_uav_pipelines,
+                            pipelines + u64::from(new_pipeline)
+                        );
                     }
                 }
             }

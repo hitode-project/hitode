@@ -44,6 +44,7 @@ pub struct DrawFacts<'a> {
     pub stream_output: bool,
     pub alpha_to_coverage: bool,
     pub emulated_sample_mask: bool,
+    pub raster_samples: u32,
     pub statistics: bool,
     pub software_statistics: bool,
     /// Rasterization is disabled by SO without a rasterized stream, or by a
@@ -124,6 +125,11 @@ impl Variant {
                 .writes
                 .keys()
                 .any(|(register, _)| *register == Register::UnorderedAccessView);
+        // Forced early tests can kill the elected sample even when another
+        // sample in the pixel passes. Keep the query's own tests late there.
+        let elect_counter = cfg!(target_vendor = "apple")
+            && facts.raster_samples > 1
+            && !reflection.sample_frequency();
         set(
             FORCE_EARLY_TESTS,
             reflection.stage == Stage::Pixel
@@ -132,7 +138,7 @@ impl Variant {
                     // test orders have the same guest-visible effects.
                     early && !can_force
                 } else {
-                    early || count_fragments && can_force
+                    early || count_fragments && can_force && !elect_counter
                 },
         );
         let cull = raster

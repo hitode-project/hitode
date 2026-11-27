@@ -345,6 +345,14 @@ impl Writer<'_> {
             }
         }
         let (register, slot) = resource.ok_or(Error::UnsupportedOpcode(op.opcode))?;
+        let elect = self.elect_uav && uav::writes_uav(op);
+        let local = format!("resource_{}", self.serial);
+        if elect {
+            if dst_types.iter().any(|ty| *ty != ValueType::Binding) {
+                self.line(&format!("var {local}: vec4<u32>;"));
+            }
+            self.open("if dx_elected_sample");
+        }
         let expression = if register == Register::Rasterizer {
             Some(self.sample_query(op, &format!("{}u", self.options.raster_samples), args)?)
         } else if op.opcode.is_counter() {
@@ -389,11 +397,15 @@ impl Writer<'_> {
             .into_iter()
             .map(|lane| LANES.as_bytes()[lane as usize] as char)
             .collect();
-        Ok(expression.map(|value| {
-            let local = format!("resource_{}", self.serial);
-            self.line(&format!("let {local} = ({value}).{lanes};"));
+        let result = expression.map(|value| {
+            let declaration = if elect { "" } else { "let " };
+            self.line(&format!("{declaration}{local} = ({value}).{lanes};"));
             local
-        }))
+        });
+        if elect {
+            self.close();
+        }
+        Ok(result)
     }
 
     fn buffer_instruction(
