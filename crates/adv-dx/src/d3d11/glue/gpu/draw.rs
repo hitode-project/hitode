@@ -2,7 +2,7 @@
 use super::{resource::storage_format, *};
 use crate::{
     d3d11::{
-        desc::{Aspects, Bind, InputRate, Misc},
+        desc::{Aspects, Bind, InputRate, Misc, TextureKind},
         state::{RENDER_TARGETS, STREAMS, Snapshot, Stage, VIEWPORTS, ViewSlot},
     },
     shader::{
@@ -586,19 +586,28 @@ fn slots_for(
             }
             Sampler => {
                 let mut desc = sampler_description(env, state.samplers[index]);
-                let shader_bias = round_point_mip(desc);
+                let shader_bias = location.point_sampler || round_point_mip(desc);
+                if location.point_sampler {
+                    desc.Filter = 0;
+                    desc.MinLOD = 0.;
+                    desc.MaxLOD = f32::MAX;
+                }
                 if let Some(minimum) = location.sampler_min_lod_bits.map(f32::from_bits) {
                     desc.MinLOD = desc.MinLOD.max(minimum);
                     desc.MaxLOD = desc.MaxLOD.max(desc.MinLOD);
                 }
-                let mode = reflection
-                    .bindings
-                    .iter()
-                    .find(|binding| {
-                        binding.register == Register::Sampler && binding.slot == location.slot
-                    })
-                    .unwrap()
-                    .kind;
+                let mode = if location.point_sampler {
+                    BindingKind::Sampler(SamplerMode::Default)
+                } else {
+                    reflection
+                        .bindings
+                        .iter()
+                        .find(|binding| {
+                            binding.register == Register::Sampler && binding.slot == location.slot
+                        })
+                        .unwrap()
+                        .kind
+                };
                 let sampler = execution(env.ext)?.gpu.device().sampler(&sampler_desc(
                     desc,
                     mode,
@@ -624,6 +633,36 @@ fn slots_for(
                     _ => backing(env, view.resource, desc)?,
                 };
                 match (backing, desc) {
+                    (Backing::Image(image), super::Resource::Texture(texture))
+                        if location.register == UnorderedAccessView
+                            && resource::storage_uses_buffer(
+                                execution(env.ext)?.gpu.device().caps(),
+                                view.desc.format(),
+                                reflection
+                                    .atomic_bindings
+                                    .contains(&(location.register, location.slot)),
+                            ) =>
+                    {
+                        let range = view.desc.subresources();
+                        reads.extend(range.layers.clone().map(|layer| {
+                            key(
+                                env,
+                                view.resource,
+                                layer * texture.levels() + range.mips.start,
+                            )
+                        }));
+                        let alias = resource::LinearStorage::new(texture, &view.desc).alias(
+                            &execution(env.ext)?.gpu,
+                            texture,
+                            &view.desc,
+                            &image,
+                        )?;
+                        set_slot(
+                            &mut slots.storage,
+                            binding,
+                            StorageBinding::ImageAlias(alias),
+                        );
+                    }
                     (backing @ (Backing::Image(_) | Backing::Blocks(_)), _) => {
                         let view = backing.view(&execution(env.ext)?.gpu, &view.desc)?;
                         if location.group == 1 {
@@ -707,6 +746,9 @@ fn sampler_description(env: &Env<'_>, pointer: u32) -> D3D11_SAMPLER_DESC {
 #[derive(Default)]
 struct ShaderViews {
     storage_formats: Vec<(u32, naga::StorageFormat)>,
+    storage_extents: Vec<(u32, [u32; 4])>,
+    storage_slices: Vec<(u32, std::ops::Range<u32>)>,
+    alpha_uavs: u32,
     buffer_formats: Vec<(u32, naga::StorageFormat)>,
     rgb_buffers: Vec<u32>,
     buffer_elements: Vec<(Register, u32, u32)>,
@@ -714,7 +756,12 @@ struct ShaderViews {
 }
 
 impl ShaderViews {
-    fn new(snapshot: &Snapshot, stage: Stage, reflection: &Reflection) -> Result<Self, Error> {
+    fn new(
+        env: &Env<'_>,
+        snapshot: &Snapshot,
+        stage: Stage,
+        reflection: &Reflection,
+    ) -> Result<Self, Error> {
         let mut views = Self::default();
         for binding in &reflection.bindings {
             let writable = binding.register == Register::UnorderedAccessView;
@@ -730,15 +777,40 @@ impl ShaderViews {
                 continue;
             };
             if writable {
-                views
-                    .writable
-                    .push((view.resource, view.desc.subresources().mips.start));
+                let range = view.desc.subresources();
+                if let super::Resource::Texture(texture) = description(env, view.resource)? {
+                    views.writable.extend(
+                        range.layers.clone().map(|layer| {
+                            (view.resource, layer * texture.levels() + range.mips.start)
+                        }),
+                    );
+                    let atomic = reflection
+                        .atomic_bindings
+                        .contains(&(binding.register, binding.slot));
+                    if resource::storage_uses_buffer(
+                        caps(env.ext).ok_or(Error::Device)?,
+                        view.desc.format(),
+                        atomic,
+                    ) {
+                        let extent = resource::LinearStorage::new(texture, &view.desc).extent;
+                        views.storage_extents.push((binding.slot, extent));
+                    } else if texture.kind() == TextureKind::D3 {
+                        views
+                            .storage_slices
+                            .push((binding.slot, view.desc.elements()));
+                    }
+                } else {
+                    views.writable.push((view.resource, 0));
+                }
             }
             if let BindingKind::Typed { dimension, .. } = binding.kind {
                 if writable {
                     views
                         .storage_formats
                         .push((binding.slot, storage_format(view.desc.format())?));
+                    if view.desc.format() == 65 {
+                        views.alpha_uavs |= 1 << binding.slot;
+                    }
                 } else if dimension == ResourceDimension::Buffer {
                     let (format, rgb) = resource::buffer_format(view.desc.format())?;
                     views.buffer_formats.push((binding.slot, format));
@@ -769,6 +841,9 @@ impl ShaderViews {
     fn options<'a>(&'a self, options: Options<'a>) -> Options<'a> {
         Options {
             storage_formats: &self.storage_formats,
+            storage_extents: &self.storage_extents,
+            storage_slices: &self.storage_slices,
+            alpha_uavs: self.alpha_uavs,
             buffer_formats: &self.buffer_formats,
             rgb_buffers: &self.rgb_buffers,
             buffer_elements: &self.buffer_elements,
@@ -786,6 +861,8 @@ struct Sampling {
     depths: Vec<u32>,
     depths24: Vec<u32>,
     unorm: Vec<(u32, [u8; 4])>,
+    manual_filter: Vec<u32>,
+    manual_samplers: Vec<BorderSampler>,
 }
 
 impl Sampling {
@@ -815,16 +892,18 @@ impl Sampling {
             if reflection.lod_queries || lod.round_mip || lod.point || lod.linear_comparison {
                 state.samplers.push((slot, lod));
             }
+            let filter = BorderSampler {
+                slot,
+                axes: [sampler.AddressU, sampler.AddressV, sampler.AddressW]
+                    .map(|address| address == 4),
+                color: sampler.BorderColor,
+                linear: [0x10, 0x4, 0x1].map(|mask| sampler.Filter & mask != 0),
+                lod,
+                comparison: sampler.ComparisonFunc,
+            };
+            state.manual_samplers.push(filter);
             if custom_border(sampler) {
-                state.border_samplers.push(BorderSampler {
-                    slot,
-                    axes: [sampler.AddressU, sampler.AddressV, sampler.AddressW]
-                        .map(|address| address == 4),
-                    color: sampler.BorderColor,
-                    linear: [0x10, 0x4, 0x1].map(|mask| sampler.Filter & mask != 0),
-                    lod,
-                    comparison: sampler.ComparisonFunc,
-                });
+                state.border_samplers.push(filter);
             }
         }
         for binding in &reflection.bindings {
@@ -842,6 +921,9 @@ impl Sampling {
             let mips = &view.desc.subresources().mips;
             let minimum = minimum - mips.start as f32;
             let depth = view.desc.aspects().intersects(Aspects::DEPTH);
+            if resource::unfilterable_view(caps(env.ext).unwrap(), view.desc.format(), depth) {
+                state.manual_filter.push(binding.slot);
+            }
             if depth {
                 state.depths.push(binding.slot);
             }
@@ -874,7 +956,7 @@ impl Sampling {
             } else if view.desc.format() == 98 {
                 state.unorm.push((binding.slot, [8; 4]));
             }
-            if !state.border_samplers.is_empty()
+            if (!state.border_samplers.is_empty() || state.manual_filter.contains(&binding.slot))
                 && let Some(format) = format
             {
                 let channels = std::array::from_fn(|lane| {
@@ -925,6 +1007,8 @@ impl Sampling {
             depth_textures: &self.depths,
             depth24_textures: &self.depths24,
             exact_unorm: &self.unorm,
+            manual_filter: &self.manual_filter,
+            manual_samplers: &self.manual_samplers,
             ..Default::default()
         }
     }
@@ -1062,7 +1146,19 @@ fn blend_color(
                     target.DestBlendAlpha,
                     target.BlendOpAlpha,
                 );
-                if matches!(format, 88 | 93) {
+                if format == 65 {
+                    let alpha_to_red = |factor| match factor {
+                        p::Factor::DstAlpha => p::Factor::Dst,
+                        p::Factor::OneMinusDstAlpha => p::Factor::OneMinusDst,
+                        p::Factor::SrcAlphaSaturated => p::Factor::One,
+                        factor => factor,
+                    };
+                    rgb = p::BlendComponent {
+                        src: alpha_to_red(alpha.src),
+                        dst: alpha_to_red(alpha.dst),
+                        op: alpha.op,
+                    };
+                } else if matches!(format, 88 | 93) {
                     let opaque = |factor| match factor {
                         p::Factor::DstAlpha => p::Factor::One,
                         p::Factor::OneMinusDstAlpha | p::Factor::SrcAlphaSaturated => {
@@ -1075,8 +1171,13 @@ fn blend_color(
                 }
                 (rgb, alpha)
             }),
-        write_mask: target.map_or(15, |target| target.RenderTargetWriteMask)
-            & if format == 65 { 8 } else { 15 },
+        write_mask: target.map_or(if format == 65 { 1 } else { 15 }, |target| {
+            if format == 65 {
+                target.RenderTargetWriteMask >> 3 & 1
+            } else {
+                target.RenderTargetWriteMask
+            }
+        }),
     }
 }
 fn depth_stencil(
@@ -1286,6 +1387,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     };
     let mut colors = Vec::new();
     let mut color_slots = 0;
+    let mut alpha_targets = 0;
     let mut writes = Vec::new();
     for slot in 0..RENDER_TARGETS {
         let Some(bound) = snapshot.view(ViewSlot::rtv(slot).unwrap()) else {
@@ -1293,6 +1395,9 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         };
         let (view, key) = image_view(env, bound.pointer, ViewKind::RenderTarget)?;
         colors.push(blend_color(blend, slot, view, bound.desc.format()));
+        if bound.desc.format() == 65 {
+            alpha_targets |= 1 << slot;
+        }
         color_slots |= 1 << slot;
         writes.push((key, false));
     }
@@ -1581,7 +1686,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
         };
         let variant = Variant::select(reflection, &facts, caps);
         let sampling = Sampling::new(env, &snapshot, Stage::Vertex, reflection);
-        let views = ShaderViews::new(&snapshot, Stage::Vertex, reflection)?;
+        let views = ShaderViews::new(env, &snapshot, Stage::Vertex, reflection)?;
         let options = Options {
             raster_samples: samples,
             ..views.options(sampling.options())
@@ -1655,7 +1760,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
                 shader
                     .map(|shader| {
                         let reflection = shader.reflection();
-                        let views = ShaderViews::new(&snapshot, stage, reflection)?;
+                        let views = ShaderViews::new(env, &snapshot, stage, reflection)?;
                         views.writes(env, &mut writes);
                         Ok::<_, Error>((
                             Variant::select(
@@ -1752,7 +1857,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             None
         };
         let (pixel, pixel_code) = if let Some(shader) = pixel_shader {
-            let views = ShaderViews::new(&snapshot, Stage::Pixel, shader.reflection())?;
+            let views = ShaderViews::new(env, &snapshot, Stage::Pixel, shader.reflection())?;
             views.writes(env, &mut writes);
             let variant = Variant::select(
                 shader.reflection(),
@@ -1765,7 +1870,8 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             let sampling = Sampling::new(env, &snapshot, Stage::Pixel, shader.reflection());
             let options = Options {
                 raster_samples: samples,
-                image_atomics: caps.features.contains(adv_gpu::Features::IMAGE_ATOMICS),
+                alpha_targets,
+                image_atomics: true,
                 ..views.options(sampling.options())
             };
             let code = if let Some((programs, _)) = &expanded {
@@ -2271,7 +2377,7 @@ fn compute(
     let Some(shader) = bound_shader(env, &snapshot, Stage::Compute) else {
         return Ok(());
     };
-    let views = ShaderViews::new(&snapshot, Stage::Compute, shader.reflection())?;
+    let views = ShaderViews::new(env, &snapshot, Stage::Compute, shader.reflection())?;
     let mut writes = Vec::new();
     views.writes(env, &mut writes);
     let caps = env
@@ -2294,7 +2400,7 @@ fn compute(
         &variant,
         None,
         Options {
-            image_atomics: caps.features.contains(adv_gpu::Features::IMAGE_ATOMICS),
+            image_atomics: true,
             ..views.options(sampling.options())
         },
     )

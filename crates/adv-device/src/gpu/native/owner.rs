@@ -492,6 +492,13 @@ impl State {
             }
             Command::Dispatch(work) => {
                 let work = *work;
+                for alias in work
+                    .bindings
+                    .iter()
+                    .filter_map(modern::BoundSlot::image_alias)
+                {
+                    alias.copy(self.encoder(), false);
+                }
                 let mut pass = self
                     .encoder()
                     .compute_pass(&adv_gpu::encode::ComputePassDesc {
@@ -507,6 +514,14 @@ impl State {
                     modern::DispatchArguments::Indirect(buffer) => {
                         pass.dispatch_indirect(buffer.buffer.slice(buffer.range));
                     }
+                }
+                drop(pass);
+                for alias in work
+                    .bindings
+                    .iter()
+                    .filter_map(modern::BoundSlot::image_alias)
+                {
+                    alias.copy(self.encoder(), true);
                 }
             }
             Command::Resolve {
@@ -1087,6 +1102,10 @@ pub(super) fn draw_modern_pass(
 ) {
     #[cfg(target_vendor = "apple")]
     let _ = statistics;
+    let aliases = || fragment.iter().filter_map(modern::BoundSlot::image_alias);
+    for alias in aliases() {
+        alias.copy(encoder, false);
+    }
     let desc = pass::modern_attachments(draw, chunk);
     let mut pass = match draw.color_slots {
         Some(slots) => encoder.render_pass_slots(&desc, slots),
@@ -1141,6 +1160,10 @@ pub(super) fn draw_modern_pass(
     }
     if draw.occlusion.is_some() {
         pass.end_occlusion();
+    }
+    drop(pass);
+    for alias in aliases() {
+        alias.copy(encoder, true);
     }
 }
 

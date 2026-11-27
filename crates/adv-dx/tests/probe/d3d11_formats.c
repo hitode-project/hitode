@@ -104,13 +104,14 @@ static void exercise(ID3D11Device *device, ID3D11DeviceContext *ctx, DXGI_FORMAT
     ID3D11Texture2D_Release(texture);
 }
 
-static void alpha_uav(ID3D11Device *device, ID3D11DeviceContext *ctx)
+static void typed_uav(ID3D11Device *device, ID3D11DeviceContext *ctx,
+                      DXGI_FORMAT format, const char *hlsl, const D3D_SHADER_MACRO *macros)
 {
-    static const char hlsl[] =
-        "RWTexture2D<float4> target : register(u0);"
-        "[numthreads(1,1,1)] void main() { target[uint2(1,0)] = float4(1,.5,.25,0); }";
+    const BOOL integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
+    const UINT width = integer ? 10 : 2;
+    const UINT unit = format == DXGI_FORMAT_A8_UNORM ? 1 : 4;
     D3D11_TEXTURE2D_DESC desc = {
-        .Width = 2, .Height = 1, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_A8_UNORM,
+        .Width = width, .Height = 1, .MipLevels = 1, .ArraySize = 1, .Format = format,
         .SampleDesc = {1, 0}, .BindFlags = D3D11_BIND_UNORDERED_ACCESS,
     };
     ID3D11Texture2D *image = NULL, *staging = NULL;
@@ -118,19 +119,24 @@ static void alpha_uav(ID3D11Device *device, ID3D11DeviceContext *ctx)
     ID3D11ComputeShader *shader = NULL;
     ID3DBlob *code = NULL;
     HRESULT hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &image);
-    printf("a8-uav-texture\t%08lx\n", (unsigned long)hr);
+    printf("typed-uav-texture\t%u\t%08lx\n", format, (unsigned long)hr);
     if (FAILED(hr)) goto done;
     hr = ID3D11Device_CreateUnorderedAccessView(device, (ID3D11Resource *)image, NULL, &uav);
-    printf("a8-uav-view\t%08lx\n", (unsigned long)hr);
+    printf("typed-uav-view\t%u\t%08lx\n", format, (unsigned long)hr);
     if (FAILED(hr)) goto done;
-    hr = D3DCompile(hlsl, sizeof(hlsl)-1, NULL, NULL, NULL, "main", "cs_5_0", 0, 0, &code, NULL);
+    hr = D3DCompile(hlsl, strlen(hlsl), NULL, macros, NULL, "main", "cs_5_0", 0, 0, &code, NULL);
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreateComputeShader(device, ID3D10Blob_GetBufferPointer(code),
                                               ID3D10Blob_GetBufferSize(code), NULL, &shader);
-    printf("a8-uav-shader\t%08lx\n", (unsigned long)hr);
+    printf("typed-uav-shader\t%u\t%08lx\n", format, (unsigned long)hr);
     if (FAILED(hr)) goto done;
-    const float clear[4] = {0.125f, 0.25f, 0.5f, 1.0f};
-    ID3D11DeviceContext_ClearUnorderedAccessViewFloat(ctx, uav, clear);
+    if (integer) {
+        const UINT clear[4] = {5, 0, 0, 0};
+        ID3D11DeviceContext_ClearUnorderedAccessViewUint(ctx, uav, clear);
+    } else {
+        const float clear[4] = {1.5f, 0.25f, 0.5f, 1.0f};
+        ID3D11DeviceContext_ClearUnorderedAccessViewFloat(ctx, uav, clear);
+    }
     ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1, &uav, NULL);
     ID3D11DeviceContext_CSSetShader(ctx, shader, NULL, 0);
     ID3D11DeviceContext_Dispatch(ctx, 1, 1, 1);
@@ -147,17 +153,53 @@ static void alpha_uav(ID3D11Device *device, ID3D11DeviceContext *ctx)
         hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map);
         if (SUCCEEDED(hr)) {
             const BYTE *texels = (const BYTE *)map.pData;
-            printf("a8-uav-bytes\t%02x\t%02x\n", texels[0], texels[1]);
+            printf("typed-uav-bytes\t%u\t", format);
+            for (UINT i = 0; i < unit * width; ++i) printf("%02x", texels[i]);
+            puts("");
             ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
         }
     }
-    printf("a8-uav-readback\t%08lx\n", (unsigned long)hr);
+    printf("typed-uav-readback\t%u\t%08lx\n", format, (unsigned long)hr);
 done:
     if (staging) ID3D11Texture2D_Release(staging);
     if (shader) ID3D11ComputeShader_Release(shader);
     if (code) ID3D10Blob_Release(code);
     if (uav) ID3D11UnorderedAccessView_Release(uav);
     if (image) ID3D11Texture2D_Release(image);
+}
+
+static void typed_uav_rows(ID3D11Device *device, ID3D11DeviceContext *ctx)
+{
+    static const char alpha[] =
+        "RWTexture2D<float4> t : register(u0);"
+        "[numthreads(1,1,1)] void main() { t[uint2(1,0)] = float4(1,.5,0,.25); }";
+    static const char fp32[] =
+        "RWTexture2D<float> t : register(u0);"
+        "[numthreads(1,1,1)] void main() {"
+        " float old; InterlockedExchange(t[uint2(0,0)],2.5f,old); t[uint2(1,0)]=old; }";
+    static const char integer[] =
+        "RWTexture2D<SCALAR> t : register(u0);"
+        "[numthreads(1,1,1)] void main() {"
+        " uint2 p=uint2(0,0); SCALAR old;"
+        " InterlockedAdd(t[p],3,old); t[uint2(1,0)]=old;"
+        " InterlockedAnd(t[p],7,old); t[uint2(2,0)]=old;"
+        " InterlockedOr(t[p],8,old); t[uint2(3,0)]=old;"
+        " InterlockedXor(t[p],4,old); t[uint2(4,0)]=old;"
+        " InterlockedMin(t[p],SCALAR(MINIMUM),old); t[uint2(5,0)]=old;"
+        " InterlockedMax(t[p],SCALAR(6),old); t[uint2(6,0)]=old;"
+        " InterlockedExchange(t[p],2,old); t[uint2(7,0)]=old;"
+        " InterlockedCompareExchange(t[p],2,3,old); t[uint2(8,0)]=old;"
+        " InterlockedCompareExchange(t[p],1,7,old); t[uint2(9,0)]=old;"
+        " InterlockedCompareStore(t[p],3,8); InterlockedCompareStore(t[p],3,99);"
+        " InterlockedAdd(t[p],4); InterlockedAnd(t[p],13); InterlockedOr(t[p],2);"
+        " InterlockedXor(t[p],4); InterlockedMin(t[p],SCALAR(9));"
+        " InterlockedMax(t[p],SCALAR(7)); }";
+    static const D3D_SHADER_MACRO uint_macros[] = {{"SCALAR", "uint"}, {"MINIMUM", "5"}, {0}};
+    static const D3D_SHADER_MACRO sint_macros[] = {{"SCALAR", "int"}, {"MINIMUM", "-2"}, {0}};
+    typed_uav(device, ctx, DXGI_FORMAT_A8_UNORM, alpha, NULL);
+    typed_uav(device, ctx, DXGI_FORMAT_R32_FLOAT, fp32, NULL);
+    typed_uav(device, ctx, DXGI_FORMAT_R32_UINT, integer, uint_macros);
+    typed_uav(device, ctx, DXGI_FORMAT_R32_SINT, integer, sint_macros);
 }
 
 static void arrays(ID3D11Device *device)
@@ -249,7 +291,18 @@ int main(void)
         for (unsigned i = 0; i < sizeof(cases)/sizeof(*cases); ++i)
             exercise(device, ctx, cases[i].source, cases[i].views, cases[i].count, cases[i].depth);
         arrays(device);
-        if (levels[level] == D3D_FEATURE_LEVEL_11_0) alpha_uav(device, ctx);
+        if (levels[level] == D3D_FEATURE_LEVEL_11_0) {
+            static const DXGI_FORMAT format_rows[] = {
+                DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
+                DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R11G11B10_FLOAT,
+                DXGI_FORMAT_R9G9B9E5_SHAREDEXP, DXGI_FORMAT_B5G6R5_UNORM,
+                DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_B4G4R4A4_UNORM,
+            };
+            for (unsigned i = 0; i < sizeof(format_rows)/sizeof(*format_rows); ++i)
+                support_row(device, format_rows[i]);
+            typed_uav_rows(device, ctx);
+        }
         ID3D11DeviceContext_Release(ctx);
         ID3D11Device_Release(device);
     }

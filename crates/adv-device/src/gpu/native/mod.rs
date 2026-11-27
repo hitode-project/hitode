@@ -62,9 +62,9 @@ pub use expand::{
     ExpansionWindow,
 };
 pub use modern::{
-    BufferRange, Dispatch, DispatchArguments, DrawArguments, ImageRegion, ModernColor, ModernDepth,
-    ModernDraw, ModernShader, ModernTransfer, Predicate, QuerySlot, SlotBindings, StorageBinding,
-    TimestampDisjoint, TransferBuffer,
+    BufferRange, Dispatch, DispatchArguments, DrawArguments, ImageAlias, ImageRegion, ModernColor,
+    ModernDepth, ModernDraw, ModernShader, ModernTransfer, Predicate, QuerySlot, SlotBindings,
+    StorageBinding, TimestampDisjoint, TransferBuffer,
 };
 pub use record::Readback;
 pub use resources::{Depth, Image, ImageId, Staged, Target};

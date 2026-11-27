@@ -29,8 +29,8 @@ pub use native::test_support;
 pub use native::{
     BlockTexture, BufferRange, Depth, Dispatch, DispatchArguments, DrawArguments, Expand,
     ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude, ExpansionRegion,
-    ExpansionWindow, Gpu, Image, ImageId, ImageRegion, ModernColor, ModernDepth, ModernDraw,
-    ModernShader, ModernTransfer, Predicate, QuerySlot, Readback, SlotBindings, Staged,
+    ExpansionWindow, Gpu, Image, ImageAlias, ImageId, ImageRegion, ModernColor, ModernDepth,
+    ModernDraw, ModernShader, ModernTransfer, Predicate, QuerySlot, Readback, SlotBindings, Staged,
     StorageBinding, Target, TimestampDisjoint, TransferBuffer, decode_bc, decoded_bc_format,
 };
 pub use programmable::{

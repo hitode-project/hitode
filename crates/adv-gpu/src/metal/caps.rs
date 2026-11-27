@@ -23,7 +23,7 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
     if apple || mac {
         features |= Features::MULTIPLE_VIEWPORTS;
     }
-    if apple6 && objc2::available!(macos = 14.0, ios = 17.0) {
+    if (apple6 || mac) && objc2::available!(macos = 14.0, ios = 17.0) {
         features |= Features::IMAGE_ATOMICS;
     }
     if apple {
@@ -51,7 +51,12 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
     let formats = FORMATS
         .iter()
         .map(|&f| {
-            let caps = format_caps(raw, f, apple, bc);
+            let mut caps = format_caps(raw, f, apple, bc);
+            if features.contains(Features::IMAGE_ATOMICS)
+                && matches!(f, Format::R32Uint | Format::R32Sint)
+            {
+                caps |= FormatCaps::STORAGE_ATOMIC;
+            }
             let samples = if !caps.intersects(FormatCaps::COLOR | FormatCaps::DEPTH_STENCIL) {
                 0
             } else if apple

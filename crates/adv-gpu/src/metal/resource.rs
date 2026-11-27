@@ -147,6 +147,11 @@ impl Device {
         }
         if desc.usage.contains(Usage::STORAGE) {
             usage |= MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite;
+            if objc2::available!(macos = 15.0, ios = 18.0)
+                && supported.contains(FormatCaps::STORAGE_ATOMIC)
+            {
+                usage |= MTLTextureUsage::ShaderAtomic;
+            }
         }
         if desc.usage.intersects(Usage::COLOR | Usage::DEPTH_STENCIL) {
             usage |= MTLTextureUsage::RenderTarget;

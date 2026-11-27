@@ -1019,6 +1019,11 @@ impl Device {
                     {
                         caps |= FormatCaps::STORAGE_READ;
                     }
+                    if matches!(f, Format::R32Uint | Format::R32Sint)
+                        && flags.contains(vk::FormatFeatureFlags::STORAGE_IMAGE_ATOMIC)
+                    {
+                        caps |= FormatCaps::STORAGE_ATOMIC;
+                    }
                     if f.is_bc() && base.texture_compression_bc == 0 {
                         caps = FormatCaps::empty();
                     }

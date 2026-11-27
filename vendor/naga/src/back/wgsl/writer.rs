@@ -884,9 +884,23 @@ impl<W: Write> Writer<W> {
                 array_index,
                 ref fun,
                 value,
+                result,
             } => {
                 write!(self.out, "{level}")?;
-                let fun_str = fun.to_wgsl();
+                if let Some(result) = result {
+                    let name = Baked(result).to_string();
+                    self.start_named_expr(module, result, func_ctx, &name)?;
+                    self.named_expressions.insert(result, name);
+                }
+                let compare = match *fun {
+                    crate::AtomicFunction::Exchange { compare } => compare,
+                    _ => None,
+                };
+                let fun_str = if compare.is_some() {
+                    "CompareExchange"
+                } else {
+                    fun.to_wgsl()
+                };
                 write!(self.out, "textureAtomic{fun_str}(")?;
                 self.write_expr(module, image, func_ctx)?;
                 write!(self.out, ", ")?;
@@ -894,6 +908,10 @@ impl<W: Write> Writer<W> {
                 if let Some(array_index_expr) = array_index {
                     write!(self.out, ", ")?;
                     self.write_expr(module, array_index_expr, func_ctx)?;
+                }
+                if let Some(compare) = compare {
+                    write!(self.out, ", ")?;
+                    self.write_expr(module, compare, func_ctx)?;
                 }
                 write!(self.out, ", ")?;
                 self.write_expr(module, value, func_ctx)?;

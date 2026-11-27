@@ -2286,6 +2286,8 @@ pub enum Statement {
 
         /// The value with which to perform the atomic operation.
         value: Handle<Expression>,
+        /// The scalar texel value observed by the operation.
+        result: Option<Handle<Expression>>,
     },
     /// Load uniformly from a uniform pointer in the workgroup address space.
     ///

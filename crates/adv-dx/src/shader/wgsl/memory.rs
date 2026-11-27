@@ -1,4 +1,5 @@
 mod border;
+mod filter;
 mod typed_buffer;
 
 #[cfg(feature = "gpu")]
@@ -31,6 +32,9 @@ impl Writer<'_> {
         module: &Module,
         reflection: &Reflection,
     ) -> Result<(), Error> {
+        if !self.options.manual_filter.is_empty() {
+            self.source.push_str(filter::CUBE);
+        }
         let mut storage_slot = reflection
             .bindings
             .iter()
@@ -146,28 +150,23 @@ impl Writer<'_> {
                     self.check_typed_format(returns[0], format)?;
                     let atomic = self.atomic_bindings.contains(&(binding.register, slot));
                     if self.storage_extent(slot).is_some() {
-                        if !matches!(
-                            format,
-                            naga::StorageFormat::R32Uint
-                                | naga::StorageFormat::R32Sint
-                                | naga::StorageFormat::R32Float
-                        ) {
-                            return Err(Error::Invalid("buffer-backed UAV format"));
-                        }
-                        self.declare_buffer(&name, slot, true, atomic);
+                        self.declare_buffer(
+                            &name,
+                            slot,
+                            true,
+                            atomic || typed_buffer::Layout::new(format)?.bits < 32,
+                        );
                         self.locations.push(BindingLocation {
                             register: binding.register,
                             slot,
                             group: 3,
                             binding: slot,
                             sampler_min_lod_bits: None,
+                            point_sampler: false,
                         });
                         continue;
                     }
-                    if atomic
-                        && (!self.options.image_atomics
-                            || dimension != ResourceDimension::Texture2D)
-                    {
+                    if atomic && !self.options.image_atomics {
                         return Err(Error::MissingStorageExtent(slot));
                     }
                     let dimension = storage_dimension(dimension)
@@ -196,6 +195,7 @@ impl Writer<'_> {
                 group,
                 binding: physical_slot,
                 sampler_min_lod_bits: None,
+                point_sampler: false,
             });
         }
         for binding in &reflection.bindings {
@@ -548,7 +548,7 @@ impl Writer<'_> {
             .ok_or(Error::MissingStorageFormat(slot))
     }
 
-    fn storage_extent(&self, slot: u32) -> Option<[u32; 3]> {
+    fn storage_extent(&self, slot: u32) -> Option<[u32; 4]> {
         self.options
             .storage_extents
             .iter()
@@ -590,11 +590,33 @@ impl Writer<'_> {
                     args[0], args[0]
                 ),
             ),
-            ResourceDimension::Texture3D => (
-                format!("bitcast<vec3<i32>>({}.xyz)", args[0]),
-                String::new(),
-                format!("all({}.xyz < textureDimensions({name}))", args[0]),
-            ),
+            ResourceDimension::Texture3D => {
+                let (coordinate, condition) = if let Some((_, slices)) = self
+                    .options
+                    .storage_slices
+                    .iter()
+                    .find(|(index, _)| *index == slot)
+                {
+                    (
+                        format!(
+                            "bitcast<vec3<i32>>({}.xyz + vec3<u32>(0u, 0u, {}u))",
+                            args[0], slices.start
+                        ),
+                        format!(
+                            "all({}.xy < textureDimensions({name}).xy) && {}.z < {}u",
+                            args[0],
+                            args[0],
+                            slices.len()
+                        ),
+                    )
+                } else {
+                    (
+                        format!("bitcast<vec3<i32>>({}.xyz)", args[0]),
+                        format!("all({}.xyz < textureDimensions({name}))", args[0]),
+                    )
+                };
+                (coordinate, String::new(), condition)
+            }
             ResourceDimension::Buffer
             | ResourceDimension::Texture2DMs
             | ResourceDimension::TextureCube
@@ -607,9 +629,14 @@ impl Writer<'_> {
         };
         if op.opcode == Opcode::StoreUavTyped {
             let scalar = scalar_name(self.storage_format(slot)?);
+            let lanes = if self.options.alpha_uavs & (1 << slot) != 0 {
+                ".wxyz"
+            } else {
+                ""
+            };
             self.open(&format!("if {condition}"));
             self.line(&format!(
-                "textureStore({name}, {coordinate}{layer}, bitcast<vec4<{scalar}>>({}));",
+                "textureStore({name}, {coordinate}{layer}, bitcast<vec4<{scalar}>>({}{lanes}));",
                 args[1]
             ));
             self.close();
@@ -618,33 +645,70 @@ impl Writer<'_> {
             let result = format!("typed_result_{}", self.serial);
             self.line(&format!("var {result}: vec4<u32>;"));
             self.open(&format!("if {condition}"));
-            self.line(&format!(
-                "{result} = bitcast<vec4<u32>>(textureLoad({name}, {coordinate}{layer}));"
-            ));
+            let load = format!("textureLoad({name}, {coordinate}{layer})");
+            let load = if self.options.alpha_uavs & (1 << slot) != 0 {
+                format!("vec4<f32>(0.0, 0.0, 0.0, {load}.x)")
+            } else {
+                load
+            };
+            self.line(&format!("{result} = bitcast<vec4<u32>>({load});"));
             self.close();
             Ok(Some(result))
         } else if op.opcode.is_atomic() {
             use Opcode::*;
             let format = self.storage_format(slot)?;
-            let builtin = match op.opcode {
-                AtomicAnd => "And",
-                AtomicOr => "Or",
-                AtomicXor => "Xor",
-                AtomicIadd => "Add",
-                AtomicImax if format == naga::StorageFormat::R32Sint => "Max",
-                AtomicImin if format == naga::StorageFormat::R32Sint => "Min",
-                AtomicUmax if format == naga::StorageFormat::R32Uint => "Max",
-                AtomicUmin if format == naga::StorageFormat::R32Uint => "Min",
-                _ => return Err(Error::MissingStorageExtent(slot)),
+            let signed = format == naga::StorageFormat::R32Sint;
+            let (builtin, other_type) = match op.opcode {
+                AtomicAnd | ImmAtomicAnd => ("And", None),
+                AtomicOr | ImmAtomicOr => ("Or", None),
+                AtomicXor | ImmAtomicXor => ("Xor", None),
+                AtomicIadd | ImmAtomicIadd => ("Add", None),
+                AtomicImax | ImmAtomicImax => ("Max", (!signed).then_some("i32")),
+                AtomicImin | ImmAtomicImin => ("Min", (!signed).then_some("i32")),
+                AtomicUmax | ImmAtomicUmax => ("Max", signed.then_some("u32")),
+                AtomicUmin | ImmAtomicUmin => ("Min", signed.then_some("u32")),
+                ImmAtomicExch => ("Exchange", None),
+                AtomicCmpStore | ImmAtomicCmpExch => ("CompareExchange", None),
+                _ => return Err(Error::UnsupportedOpcode(op.opcode)),
             };
             let scalar = scalar_name(format);
+            let result = format!("atomic_result_{}", self.serial);
+            let returning = op.destinations.len() > 1;
+            if returning {
+                self.line(&format!("var {result} = 0u;"));
+            }
+            let location = format!("{name}, {coordinate}{layer}");
+            let value = format!("bitcast<{scalar}>({}.x)", args[1]);
             self.open(&format!("if {condition}"));
-            self.line(&format!(
-                "textureAtomic{builtin}({name}, {coordinate}{layer}, bitcast<{scalar}>({}.x));",
-                args[1]
-            ));
+            let call = if let Some(other_type) = other_type {
+                let operation = if builtin == "Max" { "max" } else { "min" };
+                self.line(&format!(
+                    "var observed = textureAtomicOr({location}, {scalar}(0));"
+                ));
+                self.open("loop");
+                self.line(&format!("let update = bitcast<{scalar}>({operation}(bitcast<{other_type}>(observed), bitcast<{other_type}>({}.x)));", args[1]));
+                self.line(&format!(
+                    "let previous = textureAtomicCompareExchange({location}, observed, update);"
+                ));
+                self.line("if previous == observed { break; }");
+                self.line("observed = previous;");
+                self.close();
+                "observed".into()
+            } else if builtin == "CompareExchange" {
+                format!(
+                    "textureAtomicCompareExchange({location}, {value}, bitcast<{scalar}>({}.x))",
+                    args[2]
+                )
+            } else {
+                format!("textureAtomic{builtin}({location}, {value})")
+            };
+            if returning {
+                self.line(&format!("{result} = bitcast<u32>({call});"));
+            } else if other_type.is_none() {
+                self.line(&format!("{call};"));
+            }
             self.close();
-            Ok(None)
+            Ok(returning.then(|| format!("vec4<u32>({result})")))
         } else {
             Err(Error::UnsupportedOpcode(op.opcode))
         }
@@ -803,6 +867,7 @@ impl Writer<'_> {
             .iter()
             .find(|border| border.slot == sampler)
             .copied();
+        let manual = self.options.manual_filter.contains(&slot);
         if matches!(op.opcode, Gather4 | Gather4C | Gather4Po | Gather4PoC) {
             if lod.is_some_and(|lod| lod.minimum >= 1.) {
                 return Ok(format!(
@@ -817,17 +882,22 @@ impl Writer<'_> {
                 );
             }
             let comparison = matches!(op.opcode, Gather4C | Gather4PoC);
+            let sampler = if manual && !comparison {
+                self.sampler_variant(sampler, None, true)
+            } else {
+                format!("s{sampler}")
+            };
             let mut call = if matches!(op.opcode, Gather4 | Gather4Po) {
                 let component = if self.options.depth_textures.contains(&slot) {
                     String::new()
                 } else {
                     format!("{component}i, ")
                 };
-                format!("textureGather({component}{texture}, s{sampler}, {coord}{suffix}{offset})")
+                format!("textureGather({component}{texture}, {sampler}, {coord}{suffix}{offset})")
             } else {
                 let reference = args.last().unwrap();
                 format!(
-                    "textureGatherCompare({texture}, s{sampler}, {coord}{suffix}, bitcast<f32>({reference}.x){offset})"
+                    "textureGatherCompare({texture}, {sampler}, {coord}{suffix}, bitcast<f32>({reference}.x){offset})"
                 )
             };
             if matches!(
@@ -879,6 +949,19 @@ impl Writer<'_> {
             }
             return Ok(format!("bitcast<vec4<u32>>({call})"));
         }
+        if manual {
+            return self.filter_sample(filter::FilterSample {
+                op,
+                arguments: args,
+                texture,
+                slot,
+                sampler,
+                dimension,
+                coordinate: &coord,
+                layer: &suffix,
+                lod,
+            });
+        }
         let sampling = self
             .options
             .lod_samplers
@@ -886,7 +969,7 @@ impl Writer<'_> {
             .find_map(|(slot, mode)| (*slot == sampler).then_some(*mode));
         let mip = sampling.filter(|mode| mode.round_mip);
         let sampler = if let Some(lod) = lod {
-            self.clamped_sampler(sampler, lod.minimum)
+            self.sampler_variant(sampler, Some(lod.minimum.to_bits()), false)
         } else {
             format!("s{sampler}")
         };
@@ -1042,12 +1125,12 @@ impl Writer<'_> {
         format!("vec4<f32>({channels})")
     }
 
-    fn clamped_sampler(&mut self, slot: u32, minimum: f32) -> String {
-        let bits = Some(minimum.to_bits());
+    fn sampler_variant(&mut self, slot: u32, bits: Option<u32>, point: bool) -> String {
         if let Some(location) = self.locations.iter().find(|location| {
             location.register == Register::Sampler
                 && location.slot == slot
                 && location.sampler_min_lod_bits == bits
+                && location.point_sampler == point
         }) {
             return format!("dx_s{}", location.binding);
         }
@@ -1055,7 +1138,9 @@ impl Writer<'_> {
             + self
                 .locations
                 .iter()
-                .filter(|location| location.sampler_min_lod_bits.is_some())
+                .filter(|location| {
+                    location.sampler_min_lod_bits.is_some() || location.point_sampler
+                })
                 .count() as u32;
         self.locations.push(BindingLocation {
             register: Register::Sampler,
@@ -1063,16 +1148,18 @@ impl Writer<'_> {
             group: 2,
             binding,
             sampler_min_lod_bits: bits,
+            point_sampler: point,
         });
         format!("dx_s{binding}")
     }
 
     pub(super) fn clamped_sampler_declarations(&mut self) {
         for location in &self.locations {
-            if location.sampler_min_lod_bits.is_some() {
+            if location.sampler_min_lod_bits.is_some() || location.point_sampler {
                 let binding = location.binding;
-                let ty = if self.bindings[&(Register::Sampler, location.slot)]
-                    == BindingKind::Sampler(SamplerMode::Comparison)
+                let ty = if !location.point_sampler
+                    && self.bindings[&(Register::Sampler, location.slot)]
+                        == BindingKind::Sampler(SamplerMode::Comparison)
                 {
                     "sampler_comparison"
                 } else {

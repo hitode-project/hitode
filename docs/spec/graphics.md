@@ -415,6 +415,10 @@ can share a packed window on devices without descriptor indexing.
 
 Device creation derives format support from the same backing selection used for resource allocation. Typed views reinterpret the stored bits or decode the stored blocks in the view's format. Texture transfers preserve the guest's texel or block layout when the physical backing differs.
 
+Typed UAVs use the native storage view when the format supports the shader's operations. The executor copies between the selected image subresources and a linear buffer around dispatches and draws that require it. An A8 storage view writes alpha through the physical red channel.
+
+Filtering can combine point samples from a format that lacks native linear filtering. Mip generation and resolve can combine texel or sample loads. Expanded packed resolves quantize their result to the guest channel widths.
+
 ### GFX-CAP-6 Direct3D 7 capability derivation
 
 **Rule**: Direct3D 7 and legacy descriptors MUST report only the fixed-function paths admitted for that device. Texture and depth enumeration MUST use the same admitted paths.

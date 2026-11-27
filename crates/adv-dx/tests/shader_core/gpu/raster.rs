@@ -33,6 +33,7 @@ struct Pixel {
     samples: u32,
     fixture: &'static str,
     border: bool,
+    linear: bool,
 }
 
 impl Pixel {
@@ -69,9 +70,19 @@ impl Resources for Pixel {
             Opcode::LdMs => [0.25, 0.5, 0.75, 1.0],
             Opcode::Sample | Opcode::SampleB | Opcode::SampleD | Opcode::SampleL => {
                 let [u, v, ..] = args[0].map(f32::from_bits);
-                let x = (u * 8.0).floor() as u32 % 8;
-                let y = (v * 8.0).floor() as u32 % 8;
-                [0.0, (x + 8 * y) as f32 / 64.0, 0.0, 1.0]
+                let value = |x: f32, y: f32| {
+                    ((x as i32).rem_euclid(8) + 8 * (y as i32).rem_euclid(8)) as f32 / 64.0
+                };
+                let green = if self.linear {
+                    let (u, v) = (u * 8.0 - 0.5, v * 8.0 - 0.5);
+                    let (x, y) = (u.floor(), v.floor());
+                    let (a, b) = (u - x, v - y);
+                    ((1.0 - a) * value(x, y) + a * value(x + 1.0, y)) * (1.0 - b)
+                        + ((1.0 - a) * value(x, y + 1.0) + a * value(x + 1.0, y + 1.0)) * b
+                } else {
+                    value((u * 8.0).floor(), (v * 8.0).floor())
+                };
+                [0.0, green, 0.0, 1.0]
             }
             Opcode::SampleC | Opcode::SampleCLz => {
                 [f32::from(f32::from_bits(args[1][0]) <= 0.5); 4]
@@ -187,7 +198,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                 && caps.format_sample_counts(format) & MSAA_SAMPLES != 0
         })
         .expect("4x multisampled float color format");
-    for (identity, (name, border)) in [
+    for (identity, (name, border, manual)) in [
         "raster_queries",
         "raster_samples",
         "level_query",
@@ -200,8 +211,12 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
         "texture_ops",
     ]
     .into_iter()
-    .map(|name| (name, false))
-    .chain([("dynamic_gather", true), ("dynamic_gather_compare", true)])
+    .map(|name| (name, false, false))
+    .chain([
+        ("dynamic_gather", true, false),
+        ("dynamic_gather_compare", true, false),
+        ("sample_modes", false, true),
+    ])
     .enumerate()
     {
         let module = module(name);
@@ -226,6 +241,16 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
             slot,
             channels: [wgsl::BorderChannel::Float; 4],
         }];
+        let manual_samplers = [0, 1].map(|slot| wgsl::BorderSampler {
+            slot,
+            axes: [false; 3],
+            linear: [true, true, false],
+            lod: wgsl::LodSampler {
+                max_anisotropy: 1,
+                ..border_samplers[0].lod
+            },
+            ..border_samplers[0]
+        });
         let samples = if matches!(name, "raster_queries" | "raster_samples") {
             MSAA_SAMPLES
         } else {
@@ -242,6 +267,8 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                 raster_samples: samples,
                 border_samplers: if border { &border_samplers } else { &[] },
                 border_textures: if border { &border_textures } else { &[] },
+                manual_filter: if manual { &[0, 1] } else { &[] },
+                manual_samplers: if manual { &manual_samplers } else { &[] },
                 lod_samplers: &[(
                     0,
                     wgsl::LodSampler {
@@ -283,6 +310,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
         let mut encoder = gpu.queue.encoder(name);
         let mut images = [None, None];
         let mut samplers = [None, None];
+        let mut point_samplers = [None, None];
         for location in &translation.locations {
             let slot = location.slot as usize;
             let depth = slot == 1;
@@ -401,7 +429,13 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                     }
                 }
                 Register::Sampler => {
-                    samplers[slot] = Some(
+                    let comparison = depth && !location.point_sampler;
+                    let slots = if location.point_sampler {
+                        &mut point_samplers
+                    } else {
+                        &mut samplers
+                    };
+                    slots[slot] = Some(
                         gpu.device
                             .sampler(&SamplerDesc {
                                 min: if border {
@@ -429,11 +463,11 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                                 lod_min: 0,
                                 lod_max: u16::MAX,
                                 anisotropy: if border { 16 } else { 1 },
-                                compare: depth.then_some(Compare::LessEqual),
+                                compare: comparison.then_some(Compare::LessEqual),
                             })
                             .unwrap(),
                     );
-                    GpuBinding::Sampler { comparison: depth }
+                    GpuBinding::Sampler { comparison }
                 }
                 register => panic!("unexpected register {register:?}"),
             };
@@ -533,9 +567,14 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                         Bind::Sampled(images[location.slot as usize].as_ref().unwrap().view()),
                     );
                 } else {
+                    let slots = if location.point_sampler {
+                        &point_samplers
+                    } else {
+                        &samplers
+                    };
                     pass.bind(
                         location.binding,
-                        Bind::Sampler(samplers[location.slot as usize].as_ref().unwrap()),
+                        Bind::Sampler(slots[location.slot as usize].as_ref().unwrap()),
                     );
                 }
             }
@@ -565,7 +604,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
         let oracle: Vec<Vec<f32>> = include_str!("../../fixtures/shader-core/raster.tsv")
             .lines()
             .map(|line| line.split_once('\t').unwrap())
-            .filter(|&(fixture, _)| !border && fixture == name)
+            .filter(|&(fixture, _)| !border && !manual && fixture == name)
             .map(|(_, row)| {
                 row.split('\t')
                     .skip(1)
@@ -615,6 +654,7 @@ fn raster_queries_and_dynamic_gathers_match_scalar_ir() {
                     samples: if multisampled { MSAA_SAMPLES } else { samples },
                     fixture: name,
                     border,
+                    linear: manual,
                 },
             )
             .unwrap();

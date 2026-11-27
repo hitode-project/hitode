@@ -1,7 +1,7 @@
 //! Format gates from the published FL 11_0 table and measured downlevel masks.
 use super::{Coverage, Error, FeatureLevel};
 use crate::dxgi::{caps::present_format, formats::FORMATS};
-use adv_gpu::{Caps, Features, Format, FormatCaps};
+use adv_gpu::{Caps, Format, FormatCaps};
 use std::{collections::BTreeMap, sync::OnceLock};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,7 @@ impl FormatSupport {
     pub(super) fn contains(self, bit: FormatOperation) -> bool {
         let (one, two) = bit.flags();
         if bit.sample_count() != 0 {
-            self.sample_counts & bit.sample_count() != 0
+            self.support & one == one && self.sample_counts & bit.sample_count() != 0
         } else {
             (one != 0 || two != 0) && self.support & one == one && self.support2 & two == two
         }
@@ -200,10 +200,7 @@ impl FormatOperation {
                 backing.is_some_and(|host| caps.format(host).contains(FormatCaps::STORAGE_READ))
             }
             AtomicAdd | AtomicBitwise | AtomicCompare | AtomicExchange | AtomicSigned
-            | AtomicUnsigned => {
-                features.contains(FormatCaps::STORAGE)
-                    && caps.features.contains(Features::IMAGE_ATOMICS)
-            }
+            | AtomicUnsigned => features.contains(FormatCaps::STORAGE_ATOMIC),
             Decoder | VideoOutput | VideoInput | LogicOp | Tiled => false,
             Format | Buffer | VertexBuffer | IndexBuffer | StreamBuffer | CpuLock | Cast
             | BackBufferCast | Share | Raw | Structured => true,
@@ -274,6 +271,7 @@ pub(in crate::d3d11) struct ProductionFormat {
     format: u32,
     backing: Option<Format>,
     operations: Vec<FormatOperation>,
+    emulated: Vec<FormatOperation>,
 }
 
 #[cfg(feature = "gpu")]
@@ -283,7 +281,7 @@ impl ProductionFormat {
             format: self.format,
             backing: self.backing,
             native: &self.operations,
-            emulated: &[],
+            emulated: &self.emulated,
         }
     }
 }
@@ -316,8 +314,13 @@ pub(in crate::d3d11) fn production(caps: &Caps) -> Vec<ProductionFormat> {
                         Texture1d | Texture2d | Texture3d | TextureCube | Mip => backing.is_some(),
                         ShaderLoad | ShaderSample | ShaderComparison | Gather
                         | GatherComparison => true,
-                        MipAutogen | RenderTarget | Blend | MsaaResolve | Msaa4 | Msaa8
-                        | MsaaOther => !packed,
+                        MipAutogen | RenderTarget | Blend | Msaa4 | Msaa8 | MsaaOther => !packed,
+                        MsaaResolve => {
+                            !packed
+                                || backing.is_some_and(|backing| {
+                                    resource::packed_resolve(caps, format, backing).is_some()
+                                })
+                        }
                         MsaaLoad => !packed,
                         DepthStencil => matches!(format, 20 | 40 | 45 | 55),
                         Cast => crate::dxgi::formats::format_layout(format)
@@ -330,17 +333,45 @@ pub(in crate::d3d11) fn production(caps: &Caps) -> Vec<ProductionFormat> {
                             resource::storage_format(format).is_ok()
                         }
                         AtomicAdd | AtomicBitwise | AtomicSigned | AtomicUnsigned
-                        | AtomicCompare | AtomicExchange => false,
+                        | AtomicCompare | AtomicExchange => matches!(format, 41..=43),
                         Share => backing.is_some(),
                         Raw => format == 39,
                         Structured => format == 0,
                         Decoder | VideoOutput | VideoInput | LogicOp | Tiled => false,
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+            let emulated = row
+                .required
+                .iter()
+                .copied()
+                .filter(|bit| {
+                    operations.contains(bit)
+                        && match bit {
+                            ShaderSample => resource::unfilterable_view(caps, format, false),
+                            MipAutogen => backing
+                                .is_some_and(|format| resource::image_filter_needed(caps, format)),
+                            StorageView | TypedStore | TypedLoad => {
+                                resource::storage_uses_buffer(caps, format, false)
+                            }
+                            AtomicAdd | AtomicBitwise | AtomicSigned | AtomicUnsigned
+                            | AtomicCompare | AtomicExchange => {
+                                resource::storage_uses_buffer(caps, format, true)
+                            }
+                            Format | Buffer | VertexBuffer | IndexBuffer | StreamBuffer
+                            | Texture1d | Texture2d | Texture3d | TextureCube | ShaderLoad
+                            | ShaderComparison | Mip | RenderTarget | Blend | DepthStencil
+                            | CpuLock | MsaaResolve | Display | Cast | Msaa4 | Msaa8
+                            | MsaaOther | MsaaLoad | Gather | BackBufferCast | GatherComparison
+                            | Decoder | VideoOutput | VideoInput | LogicOp | Tiled | Share
+                            | Raw | Structured => false,
+                        }
+                })
+                .collect();
             Some(ProductionFormat {
                 format,
                 backing,
                 operations,
+                emulated,
             })
         })
         .collect()
@@ -418,6 +449,7 @@ pub(super) fn derive(
                 };
             } else if required
                 && !matches!(bit, Share | Msaa8)
+                && (bit != MsaaOther || level == FeatureLevel::L11_0)
                 && class == FormatClass::Resource
                 && !(matches!(bit, Display | BackBufferCast)
                     && present_format(row.format).is_none())
@@ -496,6 +528,19 @@ mod production_tests {
                 format,
             )
         };
+        for format in [41, 42, 43] {
+            assert!(available(format, AtomicExchange), "{format} exchange");
+            for bit in [
+                AtomicAdd,
+                AtomicBitwise,
+                AtomicCompare,
+                AtomicSigned,
+                AtomicUnsigned,
+            ] {
+                assert_eq!(available(format, bit), format != 41, "{format} {bit:?}");
+            }
+        }
+        assert!(available(65, TypedStore));
         for format in [5, 6, 7, 8, 68, 69, 70, 71, 72] {
             assert!(available(format, Texture2d), "{format} texture");
             assert!(available(format, CpuLock), "{format} map");

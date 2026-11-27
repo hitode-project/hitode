@@ -35,7 +35,7 @@ impl Writer<'_> {
             }
         }
         let bits = layout.bits;
-        let size = if bits < 32 {
+        let size = if bits < 32 && dimension == ResourceDimension::Buffer {
             let count = self
                 .options
                 .buffer_elements
@@ -52,7 +52,7 @@ impl Writer<'_> {
             return Ok(Some(format!("vec4<u32>({size})")));
         }
         let coordinate = &args[0];
-        let (index, bounds) = if let Some([width, height, depth]) = self.storage_extent(slot)
+        let (index, bounds) = if let Some([width, height, depth, pitch]) = self.storage_extent(slot)
             && register == Register::UnorderedAccessView
             && dimension != ResourceDimension::Buffer
         {
@@ -62,12 +62,12 @@ impl Writer<'_> {
                     format!("{coordinate}.x < {width}u"),
                 ),
                 ResourceDimension::Texture1DArray | ResourceDimension::Texture2D => (
-                    format!("({coordinate}.x + {width}u * {coordinate}.y)"),
+                    format!("({coordinate}.x + {pitch}u * {coordinate}.y)"),
                     format!("all({coordinate}.xy < vec2<u32>({width}u, {height}u))"),
                 ),
                 ResourceDimension::Texture2DArray | ResourceDimension::Texture3D => (
                     format!(
-                        "({coordinate}.x + {width}u * ({coordinate}.y + {height}u * {coordinate}.z))"
+                        "({coordinate}.x + {pitch}u * ({coordinate}.y + {height}u * {coordinate}.z))"
                     ),
                     format!("all({coordinate}.xyz < vec3<u32>({width}u, {height}u, {depth}u))"),
                 ),
@@ -129,10 +129,21 @@ impl Writer<'_> {
                 };
                 values[lane] = channel.decode(&field);
             }
+            if register == Register::UnorderedAccessView
+                && self.options.alpha_uavs & (1 << slot) != 0
+            {
+                values.swap(0, 3);
+                values[0] = "0u".into();
+            }
             self.line(&format!("{result} = vec4<u32>({});", values.join(", ")));
         } else {
             let mut words = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-            for (channel, lane) in layout.channels.iter().zip(LANES.chars()) {
+            let lanes = if self.options.alpha_uavs & (1 << slot) != 0 {
+                "wxyz"
+            } else {
+                LANES
+            };
+            for (channel, lane) in layout.channels.iter().zip(lanes.chars()) {
                 let value = channel.encode(&format!("{}.{lane}", args[1]));
                 words[(channel.offset / 32) as usize]
                     .push(format!("({value} << {}u)", channel.offset % 32));

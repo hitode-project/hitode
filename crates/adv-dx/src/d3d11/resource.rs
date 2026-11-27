@@ -3,7 +3,7 @@ use super::{
     desc::{Bind, Misc, Resource, Texture, TextureKind, View, ViewKind},
     ops::Error,
 };
-use adv_device::gpu::{Gpu, ImageRegion, ModernTransfer, TransferBuffer};
+use adv_device::gpu::{Gpu, ImageAlias, ImageRegion, ModernTransfer, TransferBuffer};
 use adv_gpu::{
     Buffer, Caps, Extent, Format, FormatCaps, Image, ImageView,
     resource::{
@@ -73,22 +73,48 @@ impl Backing {
         let format = match (dxgi, bind.contains(Bind::DEPTH_STENCIL)) {
             (39, true) => Format::Depth32Float,
             (53, true) => Format::Depth16Unorm,
+            (39, false)
+                if cfg!(target_vendor = "apple")
+                    && bind.contains(Bind::UNORDERED)
+                    && caps
+                        .format(Format::R32Uint)
+                        .contains(FormatCaps::STORAGE_ATOMIC) =>
+            {
+                Format::R32Uint
+            }
             (format, _) => {
                 backing_format(gpu.device().caps(), format).ok_or(Error::InvalidArgument)?
             }
         };
         let dimension = texture_dimension(texture);
         let [width, height, depth] = texture.extent(0);
+        let view_formats = alternate_formats(texture.format().format, format);
         let mut usage = Usage::COPY_SRC | Usage::COPY_DST;
         for (bit, flag) in [
             (Bind::SHADER, Usage::SAMPLED),
             (Bind::RENDER_TARGET, Usage::COLOR),
             (Bind::DEPTH_STENCIL, Usage::DEPTH_STENCIL),
-            (Bind::UNORDERED, Usage::STORAGE),
         ] {
             if bind.contains(bit) {
                 usage |= flag;
             }
+        }
+        if bind.contains(Bind::UNORDERED)
+            && std::iter::once(format)
+                .chain(view_formats.iter().copied())
+                .any(|format| caps.format(format).contains(FormatCaps::STORAGE))
+        {
+            usage |= Usage::STORAGE;
+        }
+        if texture.samples() == 1
+            && std::iter::once(format)
+                .chain(view_formats.iter().copied())
+                .any(|format| image_filter_needed(caps, format))
+        {
+            usage |= Usage::STORAGE;
+        }
+        if packed_resolve(caps, dxgi, format).is_some() {
+            usage |= Usage::COLOR | Usage::SAMPLED;
         }
         if bind.contains(Bind::RENDER_TARGET) || format.has_stencil() {
             usage |= Usage::SAMPLED;
@@ -108,7 +134,7 @@ impl Backing {
             mips: texture.levels(),
             samples: texture.samples(),
             usage,
-            view_formats: alternate_formats(texture.format().format, format),
+            view_formats,
             label: "D3D11 texture",
         })?;
         Ok(Self::Image(image))
@@ -120,7 +146,9 @@ impl Backing {
             Self::Blocks(blocks) => return blocks.view(gpu, view),
             Self::Buffer(_) => return Err(Error::InvalidArgument),
         };
-        let format = if image.desc().format.has_stencil()
+        let format = if view.format() == 65 && view.kind() != ViewKind::ShaderResource {
+            Format::R8Unorm
+        } else if image.desc().format.has_stencil()
             || (matches!(view.format(), 85 | 86 | 115) && image.desc().format == Format::Bgra8Unorm)
             || (image.desc().format.has_depth()
                 && view.kind() == ViewKind::ShaderResource
@@ -173,7 +201,7 @@ fn texture_dimension(texture: Texture) -> Dimension {
     }
 }
 
-fn image_view(image: &Image, view: &View, format: Format) -> Result<ImageView, Error> {
+pub fn image_view(image: &Image, view: &View, format: Format) -> Result<ImageView, Error> {
     let range = view.subresources();
     let plane = match (
         image.desc().format.has_stencil(),
@@ -204,8 +232,6 @@ fn image_view(image: &Image, view: &View, format: Format) -> Result<ImageView, E
     };
     let components = if view.kind() != ViewKind::ShaderResource {
         ViewComponents::Identity
-    } else if view.format() == 65 {
-        ViewComponents::Alpha
     } else if matches!(view.format(), 88 | 93)
         || (matches!(view.format(), 6..=8)
             && matches!(
@@ -305,10 +331,14 @@ pub fn backing_format(caps: &Caps, format: u32) -> Option<Format> {
             .contains(FormatCaps::SAMPLED | FormatCaps::DEPTH_STENCIL)
             .then_some(Format::Depth32FloatStencil8);
     }
-    if format == 115 && !caps.format(Abgr4Unorm).is_empty() {
+    if format == 115 && caps.format_sample_counts(Abgr4Unorm) & !1 != 0 {
         return Some(Abgr4Unorm);
     }
-    if matches!(format, 85 | 86 | 115) && caps.format(native).is_empty() {
+    if (matches!(format, 85 | 86 | 115) && caps.format(native).is_empty())
+        || (matches!(format, 86 | 115)
+            && caps.format_sample_counts(native) & !1 == 0
+            && packed_resolve(caps, format, Bgra8Unorm).is_some())
+    {
         return caps
             .format(Format::Bgra8Unorm)
             .contains(FormatCaps::SAMPLED | FormatCaps::FILTERED)
@@ -367,7 +397,7 @@ pub fn native_format(format: u32) -> Option<Format> {
         62 => R8Uint,
         63 => R8Snorm,
         64 => R8Sint,
-        65 => Rgba8Unorm,
+        65 => A8Unorm,
         67 => Rgb9e5Float,
         68 | 69 => Rgba8Unorm,
         70 | 71 => Bc1Unorm,
@@ -446,9 +476,130 @@ pub fn storage_format(format: u32) -> Result<naga::StorageFormat, Error> {
         62 => R8Uint,
         63 => R8Snorm,
         64 => R8Sint,
+        65 => R8Unorm,
         87 => Bgra8Unorm,
         _ => return Err(Error::InvalidArgument),
     })
+}
+
+pub fn storage_uses_buffer(caps: &Caps, format: u32, atomic: bool) -> bool {
+    let caps = backing_format(caps, format).map_or(FormatCaps::empty(), |f| caps.format(f));
+    !caps.contains(if atomic {
+        FormatCaps::STORAGE_ATOMIC
+    } else {
+        FormatCaps::STORAGE
+    })
+}
+
+pub fn unfilterable_view(caps: &Caps, format: u32, depth: bool) -> bool {
+    let backing = match (format, depth) {
+        (41, true) => Some(Format::Depth32Float),
+        (56, true) => Some(Format::Depth16Unorm),
+        (2 | 11 | 13 | 16 | 21 | 35 | 37 | 41 | 46 | 56, _) => backing_format(caps, format),
+        _ => None,
+    };
+    backing.is_some_and(|format| {
+        let features = caps.format(format);
+        features.contains(FormatCaps::SAMPLED) && !features.contains(FormatCaps::FILTERED)
+    })
+}
+
+pub fn image_filter_needed(caps: &Caps, format: Format) -> bool {
+    matches!(
+        format,
+        Format::R32Float
+            | Format::Rg32Float
+            | Format::Rgba32Float
+            | Format::Rg16Unorm
+            | Format::Rg16Snorm
+            | Format::Rgba16Unorm
+            | Format::Rgba16Snorm
+    ) && caps
+        .format(format)
+        .contains(FormatCaps::SAMPLED | FormatCaps::STORAGE)
+        && !caps.format(format).contains(FormatCaps::FILTERED)
+}
+
+pub fn packed_resolve(caps: &Caps, format: u32, backing: Format) -> Option<[u32; 4]> {
+    if backing != Format::Bgra8Unorm
+        || !matches!(format, 86 | 115)
+        || !caps
+            .format(backing)
+            .contains(FormatCaps::SAMPLED | FormatCaps::COLOR)
+        || caps.format_sample_counts(backing) & !1 == 0
+    {
+        return None;
+    }
+    Some(match format {
+        86 => [31, 31, 31, 1],
+        _ => [15; 4],
+    })
+}
+
+pub struct LinearStorage {
+    pub extent: [u32; 4],
+    unit: u32,
+    rows: u32,
+    slices: u32,
+}
+
+impl LinearStorage {
+    pub fn new(texture: Texture, view: &View) -> Self {
+        let [width, rows, _] = texture.extent(view.subresources().mips.start);
+        let slices = if texture.kind() == TextureKind::D3 {
+            view.elements().len() as u32
+        } else {
+            view.subresources().layers.len() as u32
+        };
+        let unit = u32::from(texture.format().aligned_unit_bytes);
+        let pitch = (width * unit).next_multiple_of(256);
+        let (height, depth) = if texture.kind() == TextureKind::D1 {
+            (slices, 1)
+        } else {
+            (rows, slices)
+        };
+        Self {
+            extent: [width, height, depth, pitch / unit],
+            unit,
+            rows,
+            slices,
+        }
+    }
+
+    pub fn alias(
+        &self,
+        gpu: &Gpu,
+        texture: Texture,
+        view: &View,
+        image: &Image,
+    ) -> Result<ImageAlias, Error> {
+        let range = view.subresources();
+        let mut region = region(
+            image,
+            texture,
+            range.layers.start * texture.levels() + range.mips.start,
+        );
+        if texture.kind() == TextureKind::D3 {
+            region.origin.2 = view.elements().start;
+        }
+        region.extent.depth_or_layers = self.slices;
+        let row_pitch = self.extent[3] * self.unit;
+        let buffer = gpu.device().create_buffer(&BufferDesc {
+            size: u64::from(row_pitch) * u64::from(self.rows) * u64::from(self.slices),
+            usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
+            memory: Memory::Device,
+            label: "D3D11 linear UAV",
+        })?;
+        Ok(ImageAlias {
+            image: region,
+            linear: TransferBuffer {
+                buffer,
+                offset: 0,
+                row_pitch,
+                rows: self.rows,
+            },
+        })
+    }
 }
 
 pub fn region(image: &Image, texture: Texture, subresource: u32) -> ImageRegion {
@@ -560,10 +711,6 @@ pub fn texture_transfer(
                 .collect::<Vec<_>>();
             expanded.as_slice()
         }
-        65 => {
-            expanded = bytes.iter().flat_map(|&alpha| [0, 0, 0, alpha]).collect();
-            expanded.as_slice()
-        }
         68 | 69 => {
             expanded = bytes
                 .as_chunks::<4>()
@@ -632,7 +779,6 @@ pub fn transfer_unit(texture: Texture, backing: Format) -> u32 {
         {
             16
         }
-        65 => 4,
         68 | 69 => 8,
         85 | 86 | 115 if backing == Format::Bgra8Unorm => 4,
         _ => u32::from(texture.format().aligned_unit_bytes),
@@ -650,7 +796,6 @@ pub fn readback_row(texture: Texture, backing: Format, bytes: &[u8], packed: &mu
                 .iter()
                 .flat_map(|texel| &texel[..12]),
         ),
-        65 => packed.extend(bytes.as_chunks::<4>().0.iter().map(|texel| texel[3])),
         68 | 69 => packed.extend(bytes.as_chunks::<8>().0.iter().flat_map(|pair| {
             let [r, g0, b, _, _, g1, _, _] = *pair;
             if texture.format().format == 68 {

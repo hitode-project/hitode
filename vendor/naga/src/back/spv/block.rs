@@ -4130,13 +4130,14 @@ impl BlockContext<'_> {
                     array_index,
                     fun,
                     value,
+                    result,
                 } => {
                     self.write_image_atomic(
                         image,
                         coordinate,
                         array_index,
                         fun,
-                        value,
+                        (value, result),
                         &mut block,
                     )?;
                 }

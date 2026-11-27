@@ -27,6 +27,10 @@ pub(super) fn clear(
     } else {
         u32::from(layout.unwrap().aligned_unit_bytes)
     };
+    let mut raw = raw;
+    if view.format() == 65 {
+        raw[0] = raw[3];
+    }
     let pattern = Pattern {
         unit,
         format: view.format(),

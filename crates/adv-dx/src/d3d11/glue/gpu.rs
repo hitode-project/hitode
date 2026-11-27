@@ -25,7 +25,7 @@ pub(super) use draw::{
     draw_indexed_instanced, draw_indirect, draw_instanced,
 };
 pub(super) use queries::{begin_query, end_query, get_data};
-use std::sync::mpsc::TryRecvError;
+use std::sync::{Arc, mpsc::TryRecvError};
 
 pub(super) struct Execution {
     gpu: Gpu,
@@ -972,8 +972,8 @@ pub(super) fn clear_color(env: &mut Env<'_>) -> Result<(), Error> {
     let extent = view_rect(&view);
     for view in clear_slices(env, pointer, view)? {
         let command = Command::Transfer(ModernTransfer::ClearColor {
+            value: color_clear_value(&view, value.map(f64::from)),
             view,
-            value: value.map(f64::from),
             area: None,
         });
         execution(env.ext)?.append(command, extent, None, key)?;
@@ -1022,6 +1022,11 @@ fn resolve_view(
         return Err(Error::InvalidArgument);
     };
     let region = resource::region(&image, texture, location.subresource);
+    let format = if format == adv_gpu::Format::A8Unorm {
+        adv_gpu::Format::R8Unorm
+    } else {
+        format
+    };
     Ok(image.create_view(&adv_gpu::resource::ViewDesc {
         format: (image.desc().format != format).then_some(format),
         dimension: None,
@@ -1045,6 +1050,30 @@ pub(super) fn resolve(env: &mut Env<'_>) -> Result<(), Error> {
     let read = key(env, source.pointer, source.subresource);
     let write = key(env, dest.pointer, dest.subresource);
     let extent = view_rect(&destination);
+    let caps = execution(env.ext)?.gpu.device().caps();
+    if let Some(maxima) = resource::packed_resolve(caps, dxgi, format) {
+        use adv_device::gpu::{ModernDraw, SlotBindings};
+        let draw = ModernDraw::packed_resolve(destination, maxima)?;
+        return execution(env.ext)?.append(
+            Command::Draw {
+                draw: Box::new(draw),
+                vertex: SlotBindings::default(),
+                fragment: SlotBindings {
+                    images: vec![Some(source_view)],
+                    ..Default::default()
+                },
+                statistics: None,
+            },
+            extent,
+            Some(read),
+            write,
+        );
+    }
+    if cfg!(target_vendor = "apple") && resource::image_filter_needed(caps, format) {
+        let execution = execution(env.ext)?;
+        let pipeline = Arc::new(execution.gpu.prepare_image_filter(format, false, true)?);
+        return filter_image(execution, pipeline, source_view, destination, read, write);
+    }
     execution(env.ext)?.append(
         Command::Resolve {
             source: source_view,
@@ -1060,9 +1089,92 @@ pub(super) fn generate_mips(env: &mut Env<'_>) -> Result<(), Error> {
     if null_device(env)? {
         return Ok(());
     }
-    let (view, key) = image_view(env, env.arg(1), ViewKind::ShaderResource)?;
+    let pointer = env.arg(1);
+    let (mut view, key) = image_view(env, pointer, ViewKind::ShaderResource)?;
+    let format = view.format();
+    if resource::image_filter_needed(execution(env.ext)?.gpu.device().caps(), format) {
+        let (resource, desc) = context::owned(env, pointer).and_then(Object::view).unwrap();
+        let range = desc.subresources().clone();
+        let Resource::Texture(texture) = description(env, resource)? else {
+            unreachable!()
+        };
+        let image = view.image();
+        let dimension = image.desc().dimension;
+        let volume = dimension == adv_gpu::resource::Dimension::D3;
+        let pipeline = Arc::new(
+            execution(env.ext)?
+                .gpu
+                .prepare_image_filter(format, volume, false)?,
+        );
+        for layer in range.layers {
+            for mip in range.mips.start + 1..range.mips.end {
+                let slice = |mip| {
+                    image.create_view(&adv_gpu::resource::ViewDesc {
+                        format: (format != image.desc().format).then_some(format),
+                        dimension: (dimension == adv_gpu::resource::Dimension::Cube)
+                            .then_some(adv_gpu::resource::Dimension::D2),
+                        mips: mip..mip + 1,
+                        layers: layer..layer + 1,
+                        plane: 0,
+                    })
+                };
+                let subresource = layer * texture.levels() + mip;
+                let read = self::key(env, resource, subresource - 1);
+                let write = self::key(env, resource, subresource);
+                filter_image(
+                    execution(env.ext)?,
+                    pipeline.clone(),
+                    slice(mip - 1)?,
+                    slice(mip)?,
+                    read,
+                    write,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    if view.format() == adv_gpu::Format::A8Unorm {
+        let (_, desc) = context::owned(env, pointer).and_then(Object::view).unwrap();
+        view = resource::image_view(view.image(), desc, adv_gpu::Format::R8Unorm)?;
+    }
     let extent = view_rect(&view);
     execution(env.ext)?.append(Command::GenerateMips(view), extent, Some(key), key)
+}
+
+fn filter_image(
+    execution: &mut Execution,
+    pipeline: Arc<adv_device::gpu::Dispatch>,
+    source: ImageView,
+    destination: ImageView,
+    read: ResourceKey,
+    write: ResourceKey,
+) -> Result<(), Error> {
+    use adv_device::gpu::{DispatchArguments, SlotBindings, StorageBinding};
+    let size = destination.size();
+    let volume = destination.image().desc().dimension == adv_gpu::resource::Dimension::D3;
+    let group = if volume { 4 } else { 8 };
+    execution.append(
+        Command::Dispatch {
+            pipeline,
+            bindings: SlotBindings {
+                images: vec![Some(source)],
+                storage: vec![Some(StorageBinding::Image(destination))],
+                ..Default::default()
+            },
+            arguments: DispatchArguments::Direct([
+                size.width.div_ceil(group),
+                size.height.div_ceil(group),
+                if volume {
+                    size.depth_or_layers.div_ceil(4)
+                } else {
+                    1
+                },
+            ]),
+        },
+        extent_rect([size.width, size.height, 1]),
+        Some(read),
+        write,
+    )
 }
 
 pub(super) fn flush_shared(env: &mut Env<'_>) -> Result<(), Error> {
@@ -1325,7 +1437,7 @@ pub(super) fn clear_view(env: &mut Env<'_>) -> Result<(), Error> {
             let writes = [(key, false)];
             let command = Command::Transfer(ModernTransfer::ClearColor {
                 view: view.clone(),
-                value,
+                value: color_clear_value(view, value),
                 area: Some(rect.into()),
             });
             execution.recording.append(
@@ -1343,6 +1455,13 @@ pub(super) fn clear_view(env: &mut Env<'_>) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+fn color_clear_value(view: &ImageView, mut value: [f64; 4]) -> [f64; 4] {
+    if view.image().desc().format == adv_gpu::Format::A8Unorm {
+        value[0] = value[3];
+    }
+    value
 }
 
 pub(super) fn check(ext: &Ext) -> Result<(), Error> {

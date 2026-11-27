@@ -252,7 +252,7 @@ fn typed_buffers_and_buffer_backed_atomics_match_scalar_ir() {
             8,
             wgsl::Options {
                 storage_formats: &[(1, naga::StorageFormat::R32Uint)],
-                storage_extents: &[(1, [8, 1, 1])],
+                storage_extents: &[(1, [8, 1, 1, 8])],
                 ..Default::default()
             },
         );
@@ -410,6 +410,7 @@ fn typed_uav_uses_the_bound_storage_format() {
 #[test]
 fn native_texture_atomics_match_scalar_ir() {
     compare_image("texture_atomic", true);
+    compare_image("texture_atomic_return", true);
 }
 
 #[test]

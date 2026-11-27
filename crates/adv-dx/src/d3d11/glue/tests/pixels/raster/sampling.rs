@@ -1011,17 +1011,123 @@ fn depth_and_color_views_can_copy_the_same_family_bits() {
 fn alpha_only_attachment_samples_alpha_and_maps_one_byte() {
     let mut r = Raster::new();
     let out = SampleOutput::new(&mut r);
-    let image = r.texture(2, 1, 65, Bind::SHADER | Bind::RENDER_TARGET, 0);
+    let image = r.texture(
+        2,
+        1,
+        65,
+        Bind::SHADER | Bind::RENDER_TARGET | Bind::UNORDERED,
+        0,
+    );
     let rtv = create_object(&mut r.machine, r.device, 9, &[image, 0]);
-    r.clear(rtv, [1., 1., 1., 1.]);
+    r.clear(rtv, [0., 0., 0., 1.]);
+    let uav = create_object(&mut r.machine, r.device, 8, &[image, 0]);
+    write_value(&mut r.machine, ARRAY, uav);
+    r.call(68, &[0, 1, ARRAY, 0]);
+    r.shader(
+        18,
+        69,
+        include_bytes!("../../../../../../tests/fixtures/d3d11/format_alpha_uav.dxbc"),
+    );
+    r.call(41, &[1, 1, 1]);
+    write_value(&mut r.machine, ARRAY, 0u32);
+    r.call(68, &[0, 1, ARRAY, 0]);
     explicit_srv(&mut r, image, 65, 4, [0, 1, 0, 0]);
     r.shader(15, 9, TEXEL_LOAD);
     assert_eq!(
         out.draw(&mut r, [1., 0., 0., 0.], 2),
-        [[0, 0, 0, 1.0f32.to_bits()]; 2]
+        [
+            [0, 0, 0, 1.0f32.to_bits()],
+            [0, 0, 0, (64.0f32 / 255.).to_bits()]
+        ]
     );
     let staging = r.texture(2, 1, 65, 0, 0);
-    assert_eq!(copy_rows(&mut r, image, staging, 2, 1), [255, 255]);
+    assert_eq!(copy_rows(&mut r, image, staging, 2, 1), [255, 64]);
+}
+
+// spec: GFX-CAP-5
+#[test]
+fn typed_array_uav_atomics_return_previous_texels() {
+    let mut r = Raster::new();
+    for (format, shader, minimum) in [
+        (
+            42,
+            include_bytes!("../../../../../../tests/fixtures/d3d11/format_atomic_uint.dxbc")
+                .as_slice(),
+            5,
+        ),
+        (
+            43,
+            include_bytes!("../../../../../../tests/fixtures/d3d11/format_atomic_sint.dxbc")
+                .as_slice(),
+            -2i32 as u32,
+        ),
+    ] {
+        let image = r.image(
+            D3D11_TEXTURE2D_DESC {
+                Width: 10,
+                Height: 2,
+                MipLevels: 1,
+                ArraySize: 3,
+                Format: if format == 42 { 39 } else { format },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BindFlags: Bind::UNORDERED,
+                ..Default::default()
+            },
+            0,
+        );
+        use adv_abi::types::D3D11_UNORDERED_ACCESS_VIEW_DESC;
+        write_value(
+            &mut r.machine,
+            DESCRIPTOR,
+            D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                Format: format,
+                ViewDimension: 5,
+                Anonymous: bytemuck::cast([0u32, 1, 2]),
+            },
+        );
+        let uav = create_object(&mut r.machine, r.device, 8, &[image, DESCRIPTOR]);
+        write_value(&mut r.machine, DESCRIPTOR, [5u32, 0, 0, 0]);
+        r.call(51, &[uav, DESCRIPTOR]);
+        write_value(&mut r.machine, ARRAY, uav);
+        r.call(68, &[0, 1, ARRAY, 0]);
+        r.shader(18, 69, shader);
+        r.call(41, &[1, 1, 1]);
+        let staging = r.texture(10, 2, format, 0, 0);
+        r.call(46, &[staging, 0, 0, 0, 0, image, 2, 0]);
+        let mapped = map(&mut r.machine, r.context, staging, 1);
+        let row: [u32; 10] = GuestPtr::new(mapped.pData + mapped.RowPitch)
+            .read(&r.machine.cpu)
+            .unwrap();
+        assert_eq!(row, [9, 5, 8, 0, 8, 12, minimum, 6, 2, 3]);
+        r.call(15, &[staging, 0]);
+    }
+}
+
+// spec: GFX-CAP-5 GFX-RES-1
+#[test]
+fn float_uav_exchange_keeps_the_image_and_linear_alias_coherent() {
+    let mut r = Raster::new();
+    let image = r.texture(2, 2, 41, Bind::UNORDERED, 0);
+    let view = create_object(&mut r.machine, r.device, 8, &[image, 0]);
+    let staging = r.texture(2, 2, 41, 0, 0);
+    write_value(&mut r.machine, DESCRIPTOR, [1.5f32, 0., 0., 0.]);
+    r.call(52, &[view, DESCRIPTOR]);
+    write_value(&mut r.machine, ARRAY, view);
+    r.call(68, &[0, 1, ARRAY, 0]);
+    r.shader(
+        18,
+        69,
+        include_bytes!("../../../../../../tests/fixtures/d3d11/format_atomic_float.dxbc"),
+    );
+    for previous in [1.5f32, 2.5] {
+        r.call(41, &[1, 1, 1]);
+        let bytes = copy_rows(&mut r, image, staging, 8, 2);
+        let expected = [1.5f32, 1.5, 2.5, previous].map(f32::to_bits);
+        assert_eq!(bytes, bytemuck::bytes_of(&expected));
+    }
 }
 
 // spec: GFX-CAP-5 GFX-RES-1

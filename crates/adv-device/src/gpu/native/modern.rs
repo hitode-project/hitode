@@ -1,5 +1,7 @@
 //! Draw and dispatch payloads for programmable front ends.
 
+mod filter;
+
 use super::resources::gpu_error;
 use super::{Error, Gpu};
 use adv_gpu::encode::{Bind, IndexFormat, Load, Store};
@@ -20,6 +22,24 @@ pub struct BufferRange {
 pub enum StorageBinding {
     Image(ImageView),
     Buffer(BufferRange),
+    ImageAlias(ImageAlias),
+}
+
+/// A linear, writable copy of the image region for the duration of one command.
+#[derive(Clone)]
+pub struct ImageAlias {
+    pub image: ImageRegion,
+    pub linear: TransferBuffer,
+}
+
+impl ImageAlias {
+    pub(super) fn copy(&self, encoder: &mut adv_gpu::encode::Encoder, to_image: bool) {
+        if to_image {
+            encoder.copy_buffer_to_image(self.linear.copy(), self.image.copy(), self.image.extent);
+        } else {
+            encoder.copy_image_to_buffer(self.image.copy(), self.linear.copy(), self.image.extent);
+        }
+    }
 }
 
 /// The stage's original register arrays, indexed by the shader's register
@@ -184,6 +204,9 @@ impl ModernShader {
                             Some(StorageBinding::Buffer(buffer)) => {
                                 Some(Bound::StorageBuffer(buffer))
                             }
+                            Some(StorageBinding::ImageAlias(alias)) => {
+                                Some(Bound::ImageAlias(alias))
+                            }
                             _ => None,
                         }
                     }
@@ -305,6 +328,7 @@ enum Bound {
     Sampler(Sampler),
     StorageBuffer(BufferRange),
     StorageImage(ImageView),
+    ImageAlias(ImageAlias),
 }
 
 pub(crate) struct BoundSlot {
@@ -320,6 +344,19 @@ impl BoundSlot {
             Bound::Sampler(sampler) => Bind::Sampler(sampler),
             Bound::StorageBuffer(b) => Bind::StorageBuffer(b.buffer.slice(b.range.clone())),
             Bound::StorageImage(view) => Bind::StorageImage(view),
+            Bound::ImageAlias(alias) => Bind::StorageBuffer(
+                alias
+                    .linear
+                    .buffer
+                    .slice(0..alias.linear.buffer.desc().size),
+            ),
+        }
+    }
+
+    pub(super) fn image_alias(&self) -> Option<&ImageAlias> {
+        match &self.resource {
+            Bound::ImageAlias(alias) => Some(alias),
+            _ => None,
         }
     }
 }
