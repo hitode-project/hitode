@@ -32,19 +32,19 @@ impl crate::dxgi::Devices for OutputDevices {
         match invocation.operation {
             TakeOwnership => call(|| {
                 if first == 0 {
-                    return Err(Error::InvalidCall);
+                    return Ok(());
                 }
                 let backend = swap_chain::services(env)?;
                 let device = backend.identity(env, first)?;
-                if backend.adapter(env, device)? != output_adapter(env, this)? {
+                let adapter = backend.adapter(env, device)?;
+                if adapter == Adapter::Software {
+                    return Ok(());
+                }
+                if adapter != output_adapter(env, this)? {
                     return Err(Error::InvalidArgument);
                 }
                 if second == 0 {
-                    return Err(if env.ext.get::<State>().output.owner.is_some() {
-                        Error::InvalidArgument
-                    } else {
-                        Error::Unavailable
-                    });
+                    return Ok(());
                 }
                 ops::claim_output(env, this, device, true)
             }),
@@ -63,21 +63,25 @@ impl crate::dxgi::Devices for OutputDevices {
                 ops::release_interfaces(env, interfaces, 0)
             }
             GetGammaControlCapabilities => call(|| {
-                owned(env)?;
+                fullscreen_owner(env)?;
+                let mut positions = [0.0; 1025];
+                for (i, point) in positions[..256].iter_mut().enumerate() {
+                    *point = i as f32 / 255.0;
+                }
                 write(
                     env,
                     first,
                     DXGI_GAMMA_CONTROL_CAPABILITIES {
-                        ScaleAndOffsetSupported: 1,
+                        ScaleAndOffsetSupported: 0,
                         MaxConvertedValue: 1.0,
                         MinConvertedValue: 0.0,
-                        NumGammaControlPoints: 1025,
-                        ControlPointPositions: std::array::from_fn(|i| i as f32 / 1024.0),
+                        NumGammaControlPoints: 256,
+                        ControlPointPositions: positions,
                     },
                 )
             }),
             SetGammaControl => call(|| {
-                owned(env)?;
+                fullscreen_owner(env)?;
                 let gamma = read(env, first)?;
                 let output = &mut env.ext.get_mut::<State>().output;
                 output.gamma = Some(Box::new(gamma));
@@ -85,7 +89,7 @@ impl crate::dxgi::Devices for OutputDevices {
                 Ok(())
             }),
             GetGammaControl => call(|| {
-                owned(env)?;
+                fullscreen_owner(env)?;
                 let output = &env.ext.get::<State>().output;
                 write(
                     env,
@@ -206,6 +210,17 @@ fn owned(env: &Env<'_>) -> Result<u32, Error> {
         .owner
         .as_ref()
         .map(|owner| owner.device)
+        .ok_or(Error::InvalidCall)
+}
+
+fn fullscreen_owner(env: &Env<'_>) -> Result<(), Error> {
+    env.ext
+        .get::<State>()
+        .output
+        .owner
+        .as_ref()
+        .filter(|owner| !owner.retained)
+        .map(|_| ())
         .ok_or(Error::InvalidCall)
 }
 
@@ -461,6 +476,9 @@ fn held(env: &Env<'_>, this: u32) -> Result<DXGI_MODE_DESC, Error> {
 fn dirty_rects(env: &mut Env<'_>) -> Outcome {
     call(|| {
         let mode = held(env, env.arg(0))?;
+        if env.arg(2) == 0 {
+            return Err(Error::InvalidArgument);
+        }
         write(env, env.arg(3), size_of::<RECT>() as u32)?;
         if env.arg(1) < size_of::<RECT>() as u32 {
             return Err(Error::MoreData);
@@ -481,6 +499,9 @@ fn dirty_rects(env: &mut Env<'_>) -> Outcome {
 fn move_rects(env: &mut Env<'_>) -> Outcome {
     call(|| {
         held(env, env.arg(0))?;
+        if env.arg(2) == 0 {
+            return Err(Error::InvalidArgument);
+        }
         write(env, env.arg(3), 0u32)
     })
 }
@@ -488,6 +509,9 @@ fn move_rects(env: &mut Env<'_>) -> Outcome {
 fn pointer_shape(env: &mut Env<'_>) -> Outcome {
     call(|| {
         held(env, env.arg(0))?;
+        if env.arg(2) == 0 || env.arg(4) == 0 {
+            return Err(Error::InvalidArgument);
+        }
         write(env, env.arg(3), 0u32)
     })
 }

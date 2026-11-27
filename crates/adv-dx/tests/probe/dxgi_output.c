@@ -1,4 +1,4 @@
-/* Supplemental Windows rows. Hardware and WARP results are pending.
+/* Supplemental Windows hardware and WARP output rows.
  * Build: i686-w64-mingw32-gcc -O2 -Wall -Wextra -Werror -o dxgi_output.exe dxgi_output.c -ld3d11 -ldxgi -lgdi32 -luser32 -luuid
  */
 #define COBJMACROS

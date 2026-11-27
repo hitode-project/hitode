@@ -519,7 +519,7 @@ fn set_shader(env: &mut Env<'_>, stage: Stage) -> Outcome {
         }
         let specialized = if let Some(object) = owned(env, new) {
             let shader = object.shader().unwrap();
-            if shader.linkage.is_some() {
+            if let Some(class_tables) = &shader.linkage {
                 let linkage = object.shader_linkage().unwrap();
                 let bindings = classes
                     .iter()
@@ -529,13 +529,46 @@ fn set_shader(env: &mut Env<'_>, stage: Stage) -> Outcome {
                             .filter(|instance| instance.linkage == linkage)
                             .ok_or(Error::InvalidArgument)?;
                         let desc = instance.desc;
+                        if desc.Created != 0 {
+                            return Ok((
+                                instance.class.as_slice(),
+                                [
+                                    desc.ConstantBuffer,
+                                    desc.BaseConstantBufferOffset,
+                                    desc.BaseTexture,
+                                    desc.BaseSampler,
+                                ],
+                            ));
+                        }
+                        let index = desc.InstanceIndex;
+                        let named = class_tables
+                            .instances
+                            .iter()
+                            .find(|named| {
+                                named.name == instance.name && index < u32::from(named.count)
+                            })
+                            .ok_or(Error::InvalidArgument)?;
+                        let class = class_tables
+                            .class(named.class)
+                            .ok_or(Error::InvalidArgument)?;
+                        let [cb, vector, texture, sampler] = named.offsets;
+                        let texture = if class.textures == 0 {
+                            127
+                        } else {
+                            texture + index * u32::from(class.textures)
+                        };
+                        let sampler = if class.samplers == 0 {
+                            15
+                        } else {
+                            sampler + index * u32::from(class.samplers)
+                        };
                         Ok((
-                            instance.class.as_slice(),
+                            class.name.as_slice(),
                             [
-                                desc.ConstantBuffer,
-                                desc.BaseConstantBufferOffset,
-                                desc.BaseTexture,
-                                desc.BaseSampler,
+                                cb,
+                                vector + index * u32::from(class.constants),
+                                texture,
+                                sampler,
                             ],
                         ))
                     })

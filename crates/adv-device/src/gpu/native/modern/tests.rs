@@ -2287,7 +2287,6 @@ fn maximum_textures_samplers_constants_and_uavs_execute_together() {
     let mut slots = SlotBindings::default();
     let mut source = String::new();
     let mut sum = String::from("var value = 0u;\n");
-    let mut expected = 0;
     for i in 0..14 {
         let first = i * 65536;
         let last = first + 65536;
@@ -2311,7 +2310,6 @@ fn maximum_textures_samplers_constants_and_uavs_execute_together() {
         .unwrap();
         let weight = i as u32 + 1;
         writeln!(sum, "value += {weight}u * c{i}[4095].x;").unwrap();
-        expected += weight * value;
     }
     constants.flush(std::iter::once(0..14 * 65536));
 
@@ -2349,7 +2347,6 @@ fn maximum_textures_samplers_constants_and_uavs_execute_together() {
             )
             .unwrap();
         }
-        expected += weight * weight;
     }
 
     let outputs: Vec<_> = (0..8)
@@ -2385,7 +2382,7 @@ fn maximum_textures_samplers_constants_and_uavs_execute_together() {
     for (i, output) in outputs.iter().enumerate() {
         assert_eq!(
             read_image(&mut gpu, output, 0, 4),
-            (expected + i as u32).to_le_bytes()
+            (718_674 + i as u32).to_le_bytes()
         );
     }
 }

@@ -199,17 +199,21 @@ fn eviction_priority(env: &mut Env<'_>) -> Outcome {
 fn shared_handle(env: &mut Env<'_>) -> Outcome {
     let (pointer, out) = (env.arg(0), env.arg(1));
     call((|| {
-        write(env, out, 0u32)?;
+        use super::super::desc::Misc;
+        let resource = ops::object(env, table(env), pointer)?.resource().unwrap();
+        if resource.misc().contains(Misc::SHARED_NTHANDLE) {
+            return Err(Error::InvalidArgument);
+        }
+        if !resource.misc().shared() {
+            return write(env, out, 0u32);
+        }
         #[cfg(feature = "gpu")]
         {
             let handle = shared::legacy_handle(env, pointer)?;
             write(env, out, handle)
         }
         #[cfg(not(feature = "gpu"))]
-        {
-            let _ = pointer;
-            Err(dxgi::Error::InvalidCall.into())
-        }
+        Err(dxgi::Error::InvalidCall.into())
     })())
 }
 
@@ -633,7 +637,7 @@ impl dxgi::swap::Buffers for SwapBuffers {
     }
 
     fn shared_adapter(&self, env: &Env<'_>, handle: u32) -> Result<Adapter, dxgi::Error> {
-        shared::adapter(env, handle).ok_or(dxgi::Error::InvalidCall)
+        shared::adapter(env, handle).ok_or(dxgi::Error::InvalidSharedHandle)
     }
 
     fn output(&self, env: &mut Env<'_>, device: u32) -> Result<u32, dxgi::Error> {

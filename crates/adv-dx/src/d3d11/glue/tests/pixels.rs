@@ -993,13 +993,22 @@ fn gpu_copies_preserve_dynamic_buffer_bytes_across_no_overwrite() {
         );
         assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
         assert_eq!(method(&mut machine, context, 47, &[dynamic, source]), 0);
+        assert_eq!(method(&mut machine, context, 47, &[staging, dynamic]), 0);
+        let staged = map(&mut machine, context, staging, 1);
+        assert_eq!(read(&machine, staged.pData), [11, 22, 33, 44]);
+        assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
         let mapped = map(&mut machine, context, dynamic, 5);
         assert_eq!(
             read(&machine, mapped.pData),
             [11, 22, 33, 44],
             "bind {bind:#x}"
         );
+        write_value(&mut machine, mapped.pData + 12, 55u32);
         assert_eq!(method(&mut machine, context, 15, &[dynamic, 0]), 0);
+        assert_eq!(method(&mut machine, context, 47, &[staging, dynamic]), 0);
+        let staged = map(&mut machine, context, staging, 1);
+        assert_eq!(read(&machine, staged.pData), [11, 22, 33, 55]);
+        assert_eq!(method(&mut machine, context, 15, &[staging, 0]), 0);
     }
 }
 
@@ -1179,7 +1188,11 @@ fn gdi_surface_dc_reads_gpu_output_and_uploads_gdi_writes() {
 #[test]
 fn alt_enter_respects_window_association_and_toggles_exclusive_mode() {
     use adv_abi::types::{DXGI_MODE_DESC, DXGI_SWAP_CHAIN_DESC};
+    use adv_device::surface::{Snapshot, SurfaceStore};
     let mut machine = machine();
+    machine
+        .ext
+        .insert(SurfaceStore::new(8, 6, 0x500000, 65536, Snapshot::default()).unwrap());
     crate::ddraw::install(
         &mut machine,
         crate::ddraw::Provider {
@@ -1234,16 +1247,10 @@ fn alt_enter_respects_window_association_and_toggles_exclusive_mode() {
         .resolve_import(DLL, "D3D11CreateDeviceAndSwapChain")
         .unwrap();
     let chain_out = OUT + 4;
-    assert_eq!(
-        guest_call(
-            &mut machine,
-            create,
-            &[
-                0, 1, 0, 0, 0, 0, 7, DESCRIPTOR, chain_out, OUT, LEVEL, CONTEXT
-            ]
-        ),
-        0
-    );
+    let mut creation = [
+        0, 1, 0, 0, 0, 0, 7, DESCRIPTOR, chain_out, OUT, LEVEL, CONTEXT,
+    ];
+    assert_eq!(guest_call(&mut machine, create, &creation), 0);
     let chain = machine.cpu.read_u32(chain_out).unwrap();
     let alt = machine.resolve_import("fixture", "alt_enter").unwrap();
     assert_eq!(guest_call(&mut machine, alt, &[1]), 1);
@@ -1256,15 +1263,30 @@ fn alt_enter_respects_window_association_and_toggles_exclusive_mode() {
     machine.cpu.write(IID, &IID_IDXGIFACTORY1).unwrap();
     assert_eq!(method(&mut machine, chain, 6, &[IID, OUT]), 0);
     let factory = machine.cpu.read_u32(OUT).unwrap();
-    assert_eq!(method(&mut machine, factory, 8, &[0, 2]), 0x887a0001);
+    assert_eq!(method(&mut machine, factory, 8, &[0, 2]), 0);
     for flags in [1, 2] {
         assert_eq!(method(&mut machine, factory, 8, &[1, flags]), 0);
         assert_eq!(guest_call(&mut machine, alt, &[1]), 0);
     }
-    assert_eq!(method(&mut machine, factory, 8, &[1, 0]), 0);
+    assert_eq!(method(&mut machine, factory, 8, &[0, 0]), 0);
     assert_eq!(guest_call(&mut machine, alt, &[1]), 1);
+    assert_eq!(method(&mut machine, chain, 15, &[OUT]), 0);
+    let output = machine.cpu.read_u32(OUT).unwrap();
     assert_eq!(method(&mut machine, chain, 2, &[]), 0);
     assert!(!crate::dxgi::has_swap_chain(&machine.ext, 1));
+
+    creation[1] = 5;
+    assert_eq!(guest_call(&mut machine, create, &creation), 0);
+    let software_chain = machine.cpu.read_u32(chain_out).unwrap();
+    assert_eq!(
+        method(&mut machine, software_chain, 10, &[1, 0]),
+        0x887a0004
+    );
+    assert_eq!(
+        method(&mut machine, software_chain, 10, &[1, output]),
+        0x887a0001
+    );
+    assert_eq!(guest_call(&mut machine, alt, &[1]), 0);
 }
 
 fn presented_device(
@@ -1450,40 +1472,43 @@ fn guest_output_ownership_gamma_surface_copy_and_duplication_share_the_display()
     assert_eq!(method(&mut machine, chain, 15, &[OUT]), 0);
     let output = machine.cpu.read_u32(OUT).unwrap();
     assert_eq!(method(&mut machine, output, 13, &[gamma]), 0x887a0001);
-    assert_eq!(method(&mut machine, output, 11, &[device, 0]), 0x887a0022);
+    assert_eq!(method(&mut machine, output, 11, &[0, 1]), 0);
+    assert_eq!(method(&mut machine, output, 11, &[device, 0]), 0);
     assert_eq!(method(&mut machine, output, 11, &[device, 1]), 0);
+    assert_eq!(method(&mut machine, output, 13, &[gamma]), 0x887a0001);
+    assert_eq!(method(&mut machine, output, 11, &[device, 0]), 0);
     assert_eq!(method(&mut machine, chain, 10, &[1, output]), 0x887a0022);
     assert_eq!(method(&mut machine, output, 12, &[]), 0);
     assert_eq!(method(&mut machine, chain, 10, &[1, output]), 0);
 
     assert_eq!(method(&mut machine, output, 13, &[gamma]), 0);
     let caps: DXGI_GAMMA_CONTROL_CAPABILITIES = GuestPtr::new(gamma).read(&machine.cpu).unwrap();
-    assert_eq!(caps.NumGammaControlPoints, 1025);
+    assert_eq!(caps.ScaleAndOffsetSupported, 0);
+    assert_eq!((caps.MinConvertedValue, caps.MaxConvertedValue), (0., 1.));
+    assert_eq!(caps.NumGammaControlPoints, 256);
+    for (i, &position) in caps.ControlPointPositions[..256].iter().enumerate() {
+        assert_eq!(position, i as f32 / 255.0);
+    }
     assert_eq!(method(&mut machine, output, 15, &[gamma]), 0x887a0001);
     let ramp = DXGI_GAMMA_CONTROL {
-        Scale: DXGI_RGB {
-            Red: 1.0,
-            Green: 1.0,
-            Blue: 1.0,
-        },
-        GammaCurve: [DXGI_RGB {
+        GammaCurve: std::array::from_fn(|i| DXGI_RGB {
             Red: 0.0,
-            Green: 1.0,
+            Green: if i == 255 { 1.0 } else { 0.0 },
             Blue: 0.0,
-        }; 1025],
+        }),
         ..Default::default()
     };
     write_value(&mut machine, gamma, ramp);
     assert_eq!(method(&mut machine, output, 14, &[gamma]), 0);
     assert_eq!(method(&mut machine, output, 15, &[gamma]), 0);
     let stored: DXGI_GAMMA_CONTROL = GuestPtr::new(gamma).read(&machine.cpu).unwrap();
-    assert_eq!(stored.GammaCurve[1024].Green, 1.0);
+    assert_eq!(stored.GammaCurve[255].Green, 1.0);
 
     machine.cpu.write(IID, &IID_ID3D11TEXTURE2D).unwrap();
     assert_eq!(method(&mut machine, chain, 9, &[0, IID, OUT]), 0);
     let buffer = machine.cpu.read_u32(OUT).unwrap();
     let rtv = create_object(&mut machine, device, 9, &[buffer, 0]);
-    write_value(&mut machine, DESCRIPTOR, [1.0f32, 0.0, 0.0, 1.0]);
+    write_value(&mut machine, DESCRIPTOR, [1.0f32, 1.0, 0.0, 1.0]);
     assert_eq!(method(&mut machine, context, 50, &[rtv, DESCRIPTOR]), 0);
     machine.cpu.write(IID, &IID_IDXGISURFACE).unwrap();
     assert_eq!(method(&mut machine, buffer, 0, &[IID, OUT]), 0);
@@ -1543,7 +1568,19 @@ fn guest_output_ownership_gamma_surface_copy_and_duplication_share_the_display()
         method(&mut machine, duplicate, 8, &[0, DESCRIPTOR, OUT]),
         0x887a0001
     );
-    assert_eq!(method(&mut machine, duplicate, 9, &[0, 0, OUT]), 0x887a0003);
+    machine.cpu.write_u32(OUT, 0x1234).unwrap();
+    for slot in [9, 10, 11] {
+        let mut args = vec![0, 0, OUT];
+        if slot == 11 {
+            args.push(DESCRIPTOR);
+        }
+        assert_eq!(method(&mut machine, duplicate, slot, &args), 0x80070057);
+        assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 0x1234);
+    }
+    assert_eq!(
+        method(&mut machine, duplicate, 9, &[0, ARRAY, OUT]),
+        0x887a0003
+    );
     assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 16);
     assert_eq!(method(&mut machine, duplicate, 14, &[]), 0);
     assert_eq!(
@@ -1593,6 +1630,7 @@ fn guest_win32_factory_creates_a_windowless_composition_chain() {
     use adv_abi::types::DXGI_SWAP_CHAIN_DESC1;
     let mut machine = machine();
     let (chain, device, _, frames) = presented_device(&mut machine);
+    let (software, _) = create(&mut machine, 5, 0, &[0xb000]);
     machine.cpu.write(IID, &IID_IDXGIFACTORY2).unwrap();
     assert_eq!(method(&mut machine, chain, 6, &[IID, OUT]), 0);
     let factory = machine.cpu.read_u32(OUT).unwrap();
@@ -1620,13 +1658,15 @@ fn guest_win32_factory_creates_a_windowless_composition_chain() {
         0x887a0001
     );
     assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 0);
-    assert_eq!(
-        method(&mut machine, factory, 24, &[device, DESCRIPTOR, 0, OUT]),
-        0
-    );
-    let composition = machine.cpu.read_u32(OUT).unwrap();
-    assert_eq!(method(&mut machine, composition, 20, &[OUT]), 0x887a0001);
-    assert_eq!(method(&mut machine, composition, 15, &[OUT]), 0x887a0001);
-    assert_eq!(method(&mut machine, composition, 8, &[0, 0]), 0);
+    for adapter in [device, software] {
+        assert_eq!(
+            method(&mut machine, factory, 24, &[adapter, DESCRIPTOR, 0, OUT]),
+            0
+        );
+        let composition = machine.cpu.read_u32(OUT).unwrap();
+        assert_eq!(method(&mut machine, composition, 20, &[OUT]), 0x887a0001);
+        assert_eq!(method(&mut machine, composition, 15, &[OUT]), 0x887a0001);
+        assert_eq!(method(&mut machine, composition, 8, &[0, 0]), 0);
+    }
     assert!(frames.try_recv().is_err());
 }

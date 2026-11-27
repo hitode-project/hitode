@@ -73,7 +73,7 @@ enum Kind {
         desc: Box<Shader>,
         linkage: u32,
     },
-    ClassLinkage(Vec<Arc<crate::shader::dxbc::linkage::Linkage>>),
+    ClassLinkage(ClassLinkage),
     ClassInstance(Box<ClassInstance>),
     InputLayout(Box<super::desc::InputLayout>),
     Query(Box<query::Query>),
@@ -108,6 +108,12 @@ pub(super) struct ClassInstance {
     pub class: Vec<u8>,
     pub name: Vec<u8>,
     pub desc: adv_abi::types::D3D11_CLASS_INSTANCE_DESC,
+}
+
+#[derive(Default)]
+struct ClassLinkage {
+    shaders: Vec<Arc<crate::shader::dxbc::linkage::Linkage>>,
+    names: BTreeMap<Vec<u8>, u32>,
 }
 
 #[derive(Default)]
@@ -467,9 +473,17 @@ impl Object {
 
     pub(super) fn class_linkage(&self) -> Option<&[Arc<crate::shader::dxbc::linkage::Linkage>]> {
         match &self.kind {
-            Kind::ClassLinkage(shaders) => Some(shaders),
+            Kind::ClassLinkage(linkage) => Some(&linkage.shaders),
             _ => None,
         }
+    }
+
+    pub(super) fn class_name_id(&mut self, name: &[u8]) -> Option<u32> {
+        let Kind::ClassLinkage(linkage) = &mut self.kind else {
+            return None;
+        };
+        let next = linkage.names.len() as u32;
+        Some(*linkage.names.entry(name.to_vec()).or_insert(next))
     }
 
     pub(super) fn class_instance(&self) -> Option<&ClassInstance> {
@@ -672,7 +686,12 @@ impl Table {
         pointer: u32,
         device: u32,
     ) -> Result<(), Error> {
-        self.attach(objects, pointer, device, Kind::ClassLinkage(Vec::new()))
+        self.attach(
+            objects,
+            pointer,
+            device,
+            Kind::ClassLinkage(ClassLinkage::default()),
+        )
     }
 
     pub(super) fn attach_class_instance(
@@ -736,10 +755,10 @@ impl Table {
             if result.is_err() {
                 self.release_internal(objects, linkage, &mut Release::default());
             } else if let Some(metadata) = metadata
-                && let Kind::ClassLinkage(shaders) =
+                && let Kind::ClassLinkage(linkage) =
                     &mut self.get_mut(objects, linkage).unwrap().kind
             {
-                shaders.push(metadata);
+                linkage.shaders.push(metadata);
             }
         }
         result

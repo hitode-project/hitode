@@ -26,6 +26,7 @@ pub use state::{DeviceCall, DeviceOperation, Devices, Provider, shared_display};
 pub enum Error {
     InvalidArgument,
     InvalidCall,
+    InvalidSharedHandle,
     StillDrawing,
     NotImplemented,
     AccessLost,
@@ -50,6 +51,7 @@ impl Error {
             Self::AccessLost => 0x887a0026,
             Self::WaitTimeout => 0x887a0027,
             Self::InvalidCall => 0x887a0001,
+            Self::InvalidSharedHandle => 0x88760873,
             Self::NoInterface => 0x80004002,
             Self::NotFound => 0x887a0002,
             Self::MoreData => 0x887a0003,
