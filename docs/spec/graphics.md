@@ -214,6 +214,8 @@ Fixed draws MUST retain their raw vertex streams and index order. Vertex buffer 
 
 Diagnostics count successful submissions and input vertices, including instances, repeated scissors and early flushes; Busy attempts add nothing. Per-present backbuffer areas distinguish changed cells, executed cells and executed cells outside the change. A captured frame reports these areas and submission counts per allocation, generation and attachment aspect. Whole-chain counts distinguish external reads of intermediate retained versions from late demand.
 
+D3D11 verification reads back the full presentation image on the GPU owner and compares completed frames in submission order. Verification readbacks complete independently of the guest call.
+
 On-demand counters MUST report logical commands, physical draws with and without coalescing, and admissions by recording path per completed frame.
 
 ### GFX-REC-4 Conservative damage and bounds
@@ -236,6 +238,8 @@ Each allocation carries the cells where it differs from its content's current ve
 Immutable snapshot presentation MUST preserve known color damage, just as rotating presentation does. Draws whose conservative bounds do not intersect the required execution region MUST be omitted before backend submission.
 Changes to presentation rectangles MUST preserve rendering history while preventing unchanged-frame elision.
 COPY MUST preserve front-buffer pixels outside its destination. It MUST reuse overlap with the same source mapping where the retained front and the backbuffer delta are known. New coverage and a changed mapping require copying the affected destination pixels. A new front or a changed publication source requires full published damage.
+
+D3D11 MUST enqueue presentation without waiting for GPU completion. Outside verification, it MUST copy only recorded output damage when the previous publication remains current. A Present without output writes MUST preserve pacing and completion counts without a copy or publication when that publication remains current.
 
 ### GFX-REC-6 D3D9 unchanged calls
 
@@ -370,6 +374,10 @@ retain their answer until reissued; later recorded work does not delay them.
 **Verification**: Test
 
 Alt+Enter on an associated swap-chain window uses the shared exclusive-mode owner. Either DXGI window-association flag that disables Alt+Enter handling leaves the event to the application.
+
+DXGI output ownership uses the same exclusive-mode owner as DirectDraw and DXGI fullscreen transitions. Output gamma and display-surface access follow that owner. A duplication object reads guest publications from the shared presenter and loses access when the display mode or fullscreen ownership changes.
+
+A valid hardware composition chain can be created on a Win32 desktop process. Its buffers have no window until a compositor attaches the chain.
 
 ## Capabilities
 
