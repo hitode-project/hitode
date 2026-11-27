@@ -27,14 +27,9 @@ impl Raster {
     fn new() -> Self {
         let mut machine = machine();
         let gpu = Gpu::request(!cfg!(target_vendor = "apple")).unwrap();
-        let samples = gpu
-            .device()
-            .caps()
-            .format_sample_counts(adv_gpu::Format::Rgba8Unorm);
         let level = FeatureLevel::L11_0;
-        machine.ext.get_mut::<State>().devices.reports[level.column()] = Some(Arc::new(
-            crate::d3d11::caps::tests::fixture_report_samples(level, samples | 7),
-        ));
+        machine.ext.get_mut::<State>().devices.reports[level.column()] =
+            Some(Arc::new(crate::d3d11::caps::tests::fixture_report(level)));
         machine.ext.get_mut::<State>().execution = Some(gpu::Execution::new(gpu));
         machine.cpu.map(CODE_BYTES, 4096, Prot::RW).unwrap();
         let (device, context) = create(&mut machine, 1, 0, &[0xb000]);
@@ -536,7 +531,12 @@ fn windows_multisample_coverage_uses_guest_resolve() {
     let staging = r.texture(17, 19, 28, 0, 0);
     for samples in [4, 8] {
         let caps = gpu::caps(&r.machine.ext).unwrap();
-        if caps.format_sample_counts(adv_gpu::Format::Rgba8Unorm) & samples == 0 {
+        if caps.format_sample_counts(adv_gpu::Format::Rgba8Unorm) & samples == 0
+            || samples == 8
+                && !caps
+                    .features
+                    .contains(adv_gpu::Features::STANDARD_SAMPLE_LOCATIONS)
+        {
             continue;
         }
         let image = r.image(
