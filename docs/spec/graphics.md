@@ -120,13 +120,18 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 ### GFX-D3D7-2 Device classes
 
 **Rule**: Device7 MUST enumerate RGB, HAL and T&L HAL in that order, and legacy Direct3D MUST enumerate RGB then HAL. The RGB device MUST retain its texture limit, point rounding, terminal line pixel and combiner decisions while sharing HAL rasterization. An unsupported RGB texture cascade MUST return D3DERR_UNSUPPORTEDCOLORARG from ValidateDevice and report one pass.
+Legacy EnumDevices MUST return the descriptor layout for its interface version. GetCaps MUST report the runtime descriptor size while writing only to the caller's declared extent.
 **Verification**: Test
 **Basis**: Windows Direct3D7 semantics and pixel probes
 
 ### GFX-D3D7-3 Fixed-function state
 
-**Rule**: Device7 MUST translate API state into shared fixed-function registers, return API values from getters, and reject retired selectors with DDERR_INVALIDPARAMS. State blocks MUST capture and apply only their member slots, and legacy faces MUST translate vertex types, handles and viewport-owned lights into the shared registers. Execute buffers MUST provide a stable guest address, reject execution while locked, and process state, vertices, branches and primitives in instruction order.
+**Rule**: Device7 MUST preserve raw render-state values and use the measured selector acceptance rules for its device class. State blocks MUST capture and apply only their member slots. Legacy faces MUST translate vertex types, handles and viewport-owned lights into the shared registers.
+RGB MUST apply line stipple in least-significant-bit order and respect LASTPIXEL. HAL and T&L HAL MUST retain the line pattern value without stippling.
+Legacy viewport transforms MUST preserve the caller's screen XYZ fields for clipped vertices. Unclipped calls MUST preserve the caller's clip flags and homogeneous output.
+Execute buffers MUST provide a stable guest address, reject execution while locked, and process state, vertices, branches and primitives in instruction order. SPAN MUST leave pixels unchanged. Execute MUST report the device's clip status and extent after successful playback.
 **Verification**: Test
+**Basis**: Windows Direct3D legacy and Direct3D7 semantics probes
 
 ### GFX-D3D7-4 Texture color keys
 
@@ -137,7 +142,7 @@ Failed SetColorKey calls retain the previous key. A destination-keyed Blt return
 ### GFX-D3D7-5 Shared surface access
 
 **Rule**: Device7 MUST admit immutable draw inputs and access shared surface residency for every texture read and render-target write. DirectDraw locks MUST see recorded GPU writes.
-Packed 16-bit targets MUST blend in resident BGRA and round to the nearest packed color at surface access, independent of `DITHERENABLE`.
+Packed targets MUST use native blendable attachments where available. The BGRA fallback MUST convert to the packed precision at surface access. HAL MUST preserve the `DITHERENABLE` value without changing the packed blend result.
 **Verification**: Test
 
 ### GFX-D3D7-6 Surface loss and restoration

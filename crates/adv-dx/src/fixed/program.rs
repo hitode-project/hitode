@@ -96,6 +96,7 @@ pub(crate) struct Legacy {
     pub blend_weights: u8,
     pub perspective: bool,
     pub clipping: bool,
+    pub line_pattern: bool,
 }
 
 fn build_program(
@@ -108,6 +109,7 @@ fn build_program(
     legacy: Option<Legacy>,
 ) -> Result<String, u32> {
     let (second, clip, fog, fixed) = features;
+    let line_pattern = legacy.is_some_and(|legacy| legacy.line_pattern);
     let specular = ps.is_none() && fixed & 2 != 0;
     let flat = fixed & 4 != 0;
     let stage_arguments = ps.is_none() && fixed & STAGE_ARGUMENTS != 0;
@@ -140,6 +142,9 @@ fn build_program(
     }
     if fog {
         s.push_str("@location(12) fog:f32,\n");
+    }
+    if line_pattern {
+        s.push_str("@location(13) @interpolate(flat, first) line:vec4<f32>,\n");
     }
     s.push_str("}\n");
     if stage_arguments || (second && fixed != 0) || legacy.is_some() {
@@ -354,6 +359,9 @@ fn build_program(
     if fog {
         s.push_str(",out.fog");
     }
+    if line_pattern {
+        s.push_str(",a13");
+    }
     s.push_str(");}\n");
     let depth = pt.is_some_and(|p| p.writes_depth) || fixed & 128 != 0;
     if depth {
@@ -371,6 +379,9 @@ fn build_program(
         }
     )
     .unwrap();
+    if line_pattern {
+        s.push_str("let pattern=draw_parameters.values[14].y;let step=u32(max(0.0,dot(floor(input.position.xy)-input.line.xy,input.line.zw)));if ((pattern>>(16u+((step/max(1u,pattern&65535u))&15u)))&1u)==0u {discard;}\n");
+    }
     s.push_str("let enabled=draw_parameters.values[3].x;\n");
     for n in (0..6).filter(|n| clip & (1 << n) != 0) {
         let field = if n < 4 {

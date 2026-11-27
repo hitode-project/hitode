@@ -269,7 +269,12 @@ mod legacy {
                     .attached(sid)
                     .into_iter()
                     .any(|id| draw.caps(id)[0] & creation::ZBUFFER != 0);
-                device.state = Some(super::state::State::new(desc.width, desc.height, depth));
+                device.state = Some(super::state::State::new(
+                    desc.width,
+                    desc.height,
+                    depth,
+                    None,
+                ));
                 draw.d3d_surface_devices.insert(pointer, device);
             }
             Ok(pointer)

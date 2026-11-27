@@ -27,11 +27,11 @@ impl Calls<'_> {
                 &report::derive(self.store, device.kind).device,
             )?;
         } else {
-            let report = report::legacy_caps(self.store, device.kind);
+            let report = report::legacy_caps(self.store, device.kind, face);
             if args[1] == 0 && args[2] == 0 {
                 return Ok(INVALID);
             }
-            for (ptr, mut desc) in [(args[1], report.hardware), (args[2], report.software)] {
+            for (ptr, desc) in [(args[1], report.hardware), (args[2], report.software)] {
                 if ptr == 0 {
                     continue;
                 }
@@ -39,7 +39,6 @@ impl Calls<'_> {
                 if !matches!(size, 172 | 204 | 252) {
                     return Ok(INVALID);
                 }
-                desc.dwSize = size;
                 self.memory
                     .arg_write(ptr, &bytes_of(&desc)[..size as usize])?;
             }
@@ -74,7 +73,7 @@ impl Calls<'_> {
                 }
                 0
             }
-            "FindDevice" => return self.find_device(args),
+            "FindDevice" => return self.find_device(face, args),
             "NextViewport" | "NextLight" => return self.next_attachment(method, args),
             "SetCurrentViewport" => return self.select_viewport(this, args[1]),
             "GetCurrentViewport" => {
@@ -130,7 +129,22 @@ impl Calls<'_> {
                 }
                 return self.load_texture(this, args[1], 0, 0, 0);
             }
-            "GetInfo" => 1, // The device has no optional driver instrumentation.
+            "GetInfo" if face == Face::Device7 => {
+                let Some(dev) = device(self.draw, self.objects, this) else {
+                    return Ok(INVALID);
+                };
+                let zero = [0; 256];
+                for offset in (0..args[3]).step_by(zero.len()) {
+                    let count = (args[3] - offset).min(zero.len() as u32) as usize;
+                    self.memory.arg_write(args[2] + offset, &zero[..count])?;
+                }
+                if dev.kind == caps::Device::Rgb && !matches!(args[1], 1..=3) {
+                    0x80004005
+                } else {
+                    1
+                }
+            }
+            "GetInfo" => 1,
             "GetStats" => {
                 let Some(device) = device(self.draw, self.objects, this) else {
                     return Ok(INVALID);
@@ -147,7 +161,7 @@ impl Calls<'_> {
         })
     }
 
-    fn find_device(&mut self, args: &[u32]) -> Result<u32, CallError> {
+    fn find_device(&mut self, face: Face, args: &[u32]) -> Result<u32, CallError> {
         let search: D3DFINDDEVICESEARCH = read(self.memory, args[1])?;
         if search.dwSize != size_of::<D3DFINDDEVICESEARCH>() as u32
             || self.memory.arg_u32(args[2])? != size_of::<D3DFINDDEVICERESULT>() as u32
@@ -155,7 +169,7 @@ impl Calls<'_> {
             return Ok(INVALID);
         }
         for class in [caps::Device::Rgb, caps::Device::Hal] {
-            let report = report::legacy_caps(self.store, class);
+            let report = report::legacy_caps(self.store, class, face);
             let hardware = class != caps::Device::Rgb;
             let desc = if hardware {
                 &report.hardware
@@ -419,7 +433,7 @@ impl Calls<'_> {
         let setting = match selector {
             1 => {
                 let material = if value == 0 {
-                    super::super::state::State::new(1, 1, false).fixed.material
+                    decode::defaults(1, 1, false).material
                 } else {
                     let Some(pointer) = dev.material_for_handle(value) else {
                         return Ok(INVALID);

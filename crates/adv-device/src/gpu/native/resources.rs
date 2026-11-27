@@ -120,6 +120,22 @@ impl Image {
         }
     }
 
+    pub(crate) fn packed_attachment_format(&self) -> Option<adv_gpu::Format> {
+        let Storage::Fixed { image, .. } = &self.storage else {
+            return None;
+        };
+        let format = image.desc().format;
+        (image.desc().usage.contains(Usage::COLOR)
+            && matches!(
+                format,
+                adv_gpu::Format::B5g6r5Unorm
+                    | adv_gpu::Format::Bgr5a1Unorm
+                    | adv_gpu::Format::Bgra4Unorm
+                    | adv_gpu::Format::Abgr4Unorm
+            ))
+        .then_some(format)
+    }
+
     pub fn width(&self) -> u32 {
         self.size().0
     }
@@ -413,6 +429,37 @@ impl Gpu {
             depth: None,
         })
     }
+    pub(crate) fn packed_target(
+        &self,
+        width: u32,
+        height: u32,
+        masks: [u32; 4],
+    ) -> Result<Option<Image>, Error> {
+        use adv_gpu::{Format, FormatCaps};
+        let formats: &[Format] = match masks {
+            [0xf800, 0x7e0, 0x1f, 0] => &[Format::B5g6r5Unorm],
+            [0x7c00, 0x3e0, 0x1f, 0 | 0x8000] => &[Format::Bgr5a1Unorm],
+            [0xf00, 0xf0, 0xf, 0xf000] => &[Format::Bgra4Unorm, Format::Abgr4Unorm],
+            _ => return Ok(None),
+        };
+        let Some(format) = formats.iter().copied().find(|&format| {
+            self.device
+                .caps()
+                .format(format)
+                .contains(FormatCaps::SAMPLED | FormatCaps::COLOR | FormatCaps::BLEND)
+        }) else {
+            return Ok(None);
+        };
+        let desc = super::backing::image_desc(
+            (width, height),
+            format,
+            Usage::SAMPLED | Usage::COPY_DST | Usage::COLOR | Usage::COPY_SRC,
+        );
+        Ok(Some(Image::from_native(
+            self.device.create_image(&desc).map_err(gpu_error)?,
+        )))
+    }
+
     /// A sampled texture's levels in `texel`, which no draw renders into.
     pub fn texture_levels(
         &self,
@@ -632,7 +679,10 @@ fn upload_bounds(image: &Image, r: Rect, pitch: u32, length: usize) -> Result<u3
     let bpp = match &image.storage {
         Storage::Fixed { image, .. } => match image.desc().format {
             adv_gpu::Format::R8Unorm => 1,
-            adv_gpu::Format::B5g6r5Unorm | adv_gpu::Format::Bgra4Unorm => 2,
+            adv_gpu::Format::B5g6r5Unorm
+            | adv_gpu::Format::Bgr5a1Unorm
+            | adv_gpu::Format::Bgra4Unorm
+            | adv_gpu::Format::Abgr4Unorm => 2,
             adv_gpu::Format::Bgra8Unorm => 4,
             _ => unreachable!("executor image format"),
         },

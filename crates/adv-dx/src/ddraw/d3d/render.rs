@@ -35,6 +35,10 @@ fn gpu_error(error: gpu::Error) -> CallError {
     error.to_string().into()
 }
 
+pub(super) struct ExecuteDraw<'a> {
+    pub edges: Option<&'a [u16]>,
+}
+
 impl Calls<'_> {
     pub(super) fn create_vertex_buffer(
         &mut self,
@@ -85,7 +89,12 @@ impl Calls<'_> {
         Ok(0)
     }
 
-    pub(super) fn vertex_buffer(&mut self, method: &str, args: &[u32]) -> Result<u32, CallError> {
+    pub(super) fn vertex_buffer(
+        &mut self,
+        face: Face,
+        method: &str,
+        args: &[u32],
+    ) -> Result<u32, CallError> {
         let Some(Object::VertexBuffer {
             desc,
             data,
@@ -100,7 +109,7 @@ impl Calls<'_> {
         };
         match method {
             "Lock" => {
-                if *locked {
+                if *locked && face != Face::VertexBuffer7 {
                     return Ok(VB_LOCKED);
                 }
                 self.memory.arg_put_u32(args[2], *data)?;
@@ -110,7 +119,7 @@ impl Calls<'_> {
                 *locked = true;
             }
             "Unlock" => {
-                if !*locked {
+                if !*locked && face != Face::VertexBuffer7 {
                     return Ok(0x8876080f);
                 }
                 *locked = false;
@@ -586,7 +595,7 @@ impl Calls<'_> {
         &mut self,
         this: u32,
         batch: super::object::PrimitiveBatch,
-        triangle_edges: Option<&[u16]>,
+        execute: Option<ExecuteDraw<'_>>,
     ) -> Result<u32, CallError> {
         let super::object::PrimitiveBatch {
             mut vertices,
@@ -704,7 +713,9 @@ impl Calls<'_> {
                     }
                     if fill == 2 {
                         for (edge, pair) in [[0, 1], [1, 2], [2, 0]].into_iter().enumerate() {
-                            if triangle_edges
+                            if execute
+                                .as_ref()
+                                .and_then(|draw| draw.edges)
                                 .is_some_and(|flags| flags[i as usize] & (0x100 << edge) == 0)
                             {
                                 continue;
@@ -741,8 +752,53 @@ impl Calls<'_> {
                 return Ok(0);
             }
         }
+        let pattern = if kind == caps::Device::Rgb
+            && matches!(topology, Topology::LineStrip | Topology::Lines)
+        {
+            fixed.render[&Render::LinePattern]
+        } else {
+            0
+        };
+        let mut stipple = Vec::new();
+        let stippled_strip = topology == Topology::LineStrip && pattern != 0;
+        if pattern != 0 {
+            let entries = indices
+                .as_ref()
+                .map_or(count, |entries| entries.len() as u32);
+            let vertex = |entry| {
+                indices
+                    .as_ref()
+                    .map_or(entry, |indices| indices[entry as usize])
+            };
+            let mut expanded = Vec::new();
+            for start in (0..entries - 1).step_by(if stippled_strip { 1 } else { 2 }) {
+                let [a, b] = [vertex(start), vertex(start + 1)];
+                let line = match [a, b].map(|index| projection.screen(&bytes, index)) {
+                    [Some([x, y, _]), Some([end_x, end_y, _])] => {
+                        let dx = end_x - x;
+                        let dy = end_y - y;
+                        let step = if dx.abs() >= dy.abs() {
+                            [dx.signum(), 0.]
+                        } else {
+                            [0., dy.signum()]
+                        };
+                        [x.round(), y.round(), step[0], step[1]]
+                    }
+                    _ => [0.; 4],
+                };
+                for index in [a, b] {
+                    append_vertex(&mut expanded, &bytes, index, layout.size);
+                    stipple.push(line);
+                }
+            }
+            bytes = expanded;
+            indices = None;
+            count = stipple.len() as u32;
+            topology = Topology::Lines;
+        }
         let extent = self.store[sid].rect();
-        let rules = rules(kind);
+        let mut rules = rules(kind);
+        rules.round_points |= execute.is_some();
         let view = fixed.viewport_rect().clipped(extent);
         let bounds = draw_bounds(&fixed, layout, topology, &bytes).clipped(view);
         if bounds.empty() {
@@ -782,6 +838,7 @@ impl Calls<'_> {
         let mut reads = Vec::new();
         let mut bindings = Vec::new();
         let mut parameters = [[0; 4]; 40];
+        parameters[14][1] = pattern;
         let mut texture_words = [[0; 4]; 16];
         for (n, &texture) in textures[..active].iter().enumerate() {
             let mut sampler = fixed
@@ -908,11 +965,16 @@ impl Calls<'_> {
                     .screen(&bytes, vertex_index(entry))
                     .map(|[x, y, _]| [x.round(), y.round()])
             };
-            gpu::Inclusive::ranges(topology, entries, |a, b| pixel(a) == pixel(b))
+            if stippled_strip {
+                vec![0..entries, entries - 1..entries]
+            } else {
+                gpu::Inclusive::ranges(topology, entries, |a, b| pixel(a) == pixel(b))
+            }
         } else {
             Vec::new()
         };
-        let clip_extents = (fixed.render[&Render::Extents] != 0 && flags & 8 == 0)
+        let update_extents = fixed.render[&Render::Extents] != 0 && flags & 8 == 0;
+        let clip_extents = (kind != caps::Device::TnlHal && (!legacy_device || update_extents))
             .then(|| projection.extents(&bytes, (0..entries).map(vertex_index)));
         let legacy = Legacy {
             stages: active as u8,
@@ -920,7 +982,16 @@ impl Calls<'_> {
             blend_weights,
             perspective: fixed.render[&Render::TexturePerspective] != 0,
             clipping,
+            line_pattern: !stipple.is_empty(),
         };
+        if legacy.line_pattern {
+            inputs.push(fixed::Input {
+                stream: 1,
+                offset: 0,
+                register: 13,
+                format: AttributeFormat::Float4,
+            });
+        }
         let features = (
             parameters[3][0],
             fixed.render[&Render::FogEnable] != 0,
@@ -949,14 +1020,23 @@ impl Calls<'_> {
                 .insert(key, program.clone());
             program
         };
-        let contents = hash((&bytes, &indices, fixed.key(), parameters, texture_words));
-        let draw_bytes = bytes.len();
+        let stipple = bytemuck::cast_slice::<_, u8>(&stipple);
+        let contents = hash((
+            &bytes,
+            &indices,
+            fixed.key(),
+            parameters,
+            texture_words,
+            stipple,
+        ));
+        let draw_bytes = bytes.len() + stipple.len();
         let stream = VertexStream {
             instance: false,
             bytes: VertexBytes::from(bytes),
             stride: layout.size,
             attributes: inputs
                 .iter()
+                .filter(|input| input.stream == 0)
                 .map(|input| Attribute {
                     location: input.register,
                     offset: input.offset,
@@ -964,10 +1044,23 @@ impl Calls<'_> {
                 })
                 .collect(),
         };
+        let mut streams = vec![stream];
+        if legacy.line_pattern {
+            streams.push(VertexStream {
+                instance: false,
+                bytes: VertexBytes::from(stipple.to_vec()),
+                stride: 16,
+                attributes: vec![Attribute {
+                    location: 13,
+                    offset: 0,
+                    format: AttributeFormat::Float4,
+                }],
+            });
+        }
         let draw = Arc::new(ProgrammableDraw {
             instance_count: 1,
             program,
-            streams: vec![stream],
+            streams,
             indices: indices.map(IndexBytes::from),
             vertex_count: count,
             vertex_constants,
@@ -1000,21 +1093,39 @@ impl Calls<'_> {
             },
         )
         .map_err(gpu_error)?;
-        if legacy_device {
+        if legacy_device && execute.is_none() {
             let dev = ddraw::d3d::device_mut(self.draw, self.objects, this).unwrap();
             dev.legacy.stats[stats.0] += stats.1 as u32;
             if !layout.transformed {
                 dev.legacy.stats[4] += count;
             }
         }
-        if let Some(extents) = clip_extents {
+        if let Some((extents, union, intersection)) = clip_extents {
             let state = ddraw::d3d::device_mut(self.draw, self.objects, this)
                 .unwrap()
                 .state
                 .as_mut()
                 .unwrap();
-            state.clip_status[0] |= 2;
-            state.clip_status[2..].copy_from_slice(&extents);
+            if legacy_device {
+                state.clip_status[0] |= 2;
+                state.clip_status[2..].copy_from_slice(&extents.map(f32::to_bits));
+            } else {
+                state.clip_status[1] |= union;
+                state.clip_status[1] &= !0x00ff_f000 | (intersection << 12);
+                if update_extents {
+                    for (i, (stored, value)) in
+                        state.clip_status[2..6].iter_mut().zip(extents).enumerate()
+                    {
+                        let old = f32::from_bits(*stored);
+                        *stored = if i % 2 == 0 {
+                            old.min(value)
+                        } else {
+                            old.max(value)
+                        }
+                        .to_bits();
+                    }
+                }
+            }
         }
         Ok(0)
     }
@@ -1197,7 +1308,7 @@ impl Projection<'_> {
             }
     }
 
-    fn extents(&self, bytes: &[u8], indices: impl Iterator<Item = u32>) -> [u32; 6] {
+    fn extents(&self, bytes: &[u8], indices: impl Iterator<Item = u32>) -> ([f32; 6], u32, u32) {
         let mut bounds = [
             f32::INFINITY,
             f32::NEG_INFINITY,
@@ -1206,13 +1317,24 @@ impl Projection<'_> {
             f32::INFINITY,
             f32::NEG_INFINITY,
         ];
-        for position in indices.filter_map(|index| self.screen(bytes, index)) {
+        let viewport = self.fixed.viewport_rect();
+        let mut union = 0;
+        let mut intersection = 0xfff;
+        for position @ [x, y, z] in indices.filter_map(|index| self.screen(bytes, index)) {
             for (axis, value) in position.into_iter().enumerate() {
                 bounds[axis * 2] = bounds[axis * 2].min(value);
                 bounds[axis * 2 + 1] = bounds[axis * 2 + 1].max(value);
             }
+            let code = u32::from(x < viewport.x as f32)
+                | (u32::from(x > (viewport.x + viewport.w) as f32) << 1)
+                | (u32::from(y < viewport.y as f32) << 2)
+                | (u32::from(y > (viewport.y + viewport.h) as f32) << 3)
+                | (u32::from(z < 0.) << 4)
+                | (u32::from(z > 1.) << 5);
+            union |= code;
+            intersection &= code;
         }
-        std::array::from_fn(|i| bounds[i].to_bits())
+        (bounds, union, intersection)
     }
 }
 

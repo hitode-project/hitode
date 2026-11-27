@@ -56,7 +56,7 @@ pub(in crate::ddraw::d3d) fn decode(
         let fail = Err(instruction.offset as u32);
         let n = data.dwVertexCount as usize;
         match instruction.opcode {
-            1 | 13 => {
+            1 => {
                 if instruction.records.as_chunks::<4>().0.iter().any(|record| {
                     let point: D3DPOINT = bytemuck::pod_read_unaligned(record);
                     usize::from(point.wFirst) + usize::from(point.wCount) > n
@@ -98,10 +98,8 @@ pub(in crate::ddraw::d3d) fn decode(
             }
             12 if instruction
                 .records
-                .as_chunks::<16>()
-                .0
-                .iter()
-                .any(|record| {
+                .first_chunk::<16>()
+                .is_some_and(|record| {
                     let branch: D3DBRANCH = bytemuck::pod_read_unaligned(record);
                     let target = instruction.offset + branch.dwOffset as usize;
                     branch.dwOffset != 0

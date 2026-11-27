@@ -22,13 +22,19 @@ pub(super) struct Processor<'a> {
     lights: [Option<[f32; 26]>; 8],
     normals: [[f32; 3]; 3],
     lighting: bool,
+    viewport: Option<LegacyViewport>,
 }
 
 impl<'a> Processor<'a> {
-    pub(super) fn new(state: &'a fixed::State, lighting: bool) -> Result<Self, u32> {
+    pub(super) fn new(
+        state: &'a fixed::State,
+        lighting: bool,
+        viewport: Option<LegacyViewport>,
+    ) -> Result<Self, u32> {
         Ok(Self {
             state,
             lighting,
+            viewport,
             lights: if lighting {
                 tnl::active(state).map_err(|_| INVALID)?
             } else {
@@ -60,7 +66,7 @@ impl<'a> Processor<'a> {
         if input.transformed {
             point[3] = float(12);
         } else {
-            let projected = project(self.state, point);
+            let projected = project(self.state, point, self.viewport);
             point = projected.screen;
             clip_flags = projected.flags;
             let eye = projected.eye;
@@ -197,7 +203,7 @@ impl Calls<'_> {
             return Ok(INVALID);
         };
         let state = &dev.state.as_ref().unwrap().fixed;
-        let processor = match Processor::new(state, op & 0x400 != 0) {
+        let processor = match Processor::new(state, op & 0x400 != 0, None) {
             Ok(processor) => processor,
             Err(hr) => return Ok(hr),
         };
@@ -255,17 +261,57 @@ struct Projected {
     flags: u32,
 }
 
-fn project(state: &fixed::State, point: [f32; 4]) -> Projected {
+#[derive(Clone, Copy)]
+pub(super) struct LegacyViewport {
+    view: fixed::Viewport,
+    scale: [f32; 3],
+    offset: [f32; 3],
+}
+
+impl LegacyViewport {
+    pub(super) fn new(words: [u32; 11], viewport2: bool) -> Self {
+        let [_, x, y, w, h, a, b, c, d, min, max] = words;
+        let [a, b, c, d, min, max] = [a, b, c, d, min, max].map(f32::from_bits);
+        let (scale, offset) = if viewport2 {
+            let depth = max - min;
+            (
+                [2. / c, 2. / d, 1. / depth],
+                [-1. - 2. * a / c, 1. - 2. * b / d, -min / depth],
+            )
+        } else {
+            ([2. * a / w as f32, 2. * b / h as f32, 1.], [0.; 3])
+        };
+        Self {
+            view: fixed::Viewport {
+                rect: adv_device::surface::Rect { x, y, w, h },
+                min_depth: 0.,
+                max_depth: 1.,
+            },
+            scale,
+            offset,
+        }
+    }
+}
+
+fn project(state: &fixed::State, point: [f32; 4], legacy: Option<LegacyViewport>) -> Projected {
     let [world, view, projection] = state.transforms;
     let eye = tnl::row(tnl::row(point, &world), &view);
-    let homogeneous @ [x, y, z, w] = tnl::row(eye, &projection);
+    let mut homogeneous = tnl::row(eye, &projection);
+    let [mut x, mut y, mut z, w] = homogeneous;
+    let mut view = state.viewport;
+    if let Some(legacy) = legacy {
+        view = legacy.view;
+        x = x * legacy.scale[0] + w * legacy.offset[0];
+        y = y * legacy.scale[1] + w * legacy.offset[1];
+        z = z * legacy.scale[2] + w * legacy.offset[2];
+        homogeneous[2] += w * legacy.offset[2];
+    }
     let flags = u32::from(x < -w)
         | u32::from(x > w) << 1
         | u32::from(y > w) << 2
         | u32::from(y < -w) << 3
         | u32::from(z < 0.) << 4
         | u32::from(z > w) << 5;
-    let view = state.viewport;
     let rhw = 1. / w;
     let screen = [
         view.rect.x as f32 + (1. + x * rhw) * view.rect.w as f32 * 0.5,
@@ -289,23 +335,15 @@ impl Calls<'_> {
         let Some(Object::Viewport {
             device: Some(owner),
             value,
+            value2,
             ..
         }) = com.get::<Object>(self.objects, viewport)
         else {
             return Ok(0x88760306);
         };
         let dev = device(self.draw, self.objects, *owner).unwrap();
-        let mut state = dev.state.as_ref().unwrap().fixed.clone();
-        state.viewport = fixed::Viewport {
-            rect: adv_device::surface::Rect {
-                x: value[1],
-                y: value[2],
-                w: value[3],
-                h: value[4],
-            },
-            min_depth: f32::from_bits(value[9]),
-            max_depth: f32::from_bits(value[10]),
-        };
+        let state = &dev.state.as_ref().unwrap().fixed;
+        let viewport = LegacyViewport::new(*value, *value2);
         let data: D3DTRANSFORMDATA = read(self.memory, address)?;
         if data.dwSize != size_of::<D3DTRANSFORMDATA>() as u32
             || !matches!(flags, 1 | 2)
@@ -322,7 +360,7 @@ impl Calls<'_> {
             let input = data.lpIn.wrapping_add(n.wrapping_mul(data.dwInSize));
             let output = data.lpOut.wrapping_add(n.wrapping_mul(data.dwOutSize));
             let [x, y, z]: [f32; 3] = read(self.memory, input)?;
-            let point = project(&state, [x, y, z, 1.]);
+            let point = project(state, [x, y, z, 1.], Some(viewport));
             if clipped {
                 intersection &= point.flags;
                 union |= point.flags;
@@ -339,7 +377,7 @@ impl Calls<'_> {
                 )?;
             }
             if clipped && point.flags != 0 {
-                write(self.memory, output, &point.homogeneous)?;
+                write(self.memory, output + 12, &point.screen[3])?;
             } else {
                 let bytes = self
                     .memory

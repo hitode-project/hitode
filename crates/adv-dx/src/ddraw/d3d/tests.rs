@@ -474,13 +474,13 @@ fn device7_state_blocks_capture_neutral_registers_and_matrices() {
     assert_eq!(w(&mut f, "GetRenderState", &[41, OUT]), 0);
     assert_eq!(f.word(OUT), 0);
     assert_eq!(w(&mut f, "DeleteStateBlock", &[block]), 0);
-    assert_eq!(w(&mut f, "ApplyStateBlock", &[block]), 0x88760834);
+    assert_eq!(w(&mut f, "ApplyStateBlock", &[block]), 0);
 }
 
 const EXPECTATIONS: &str = include_str!("expectations.tsv");
 
-fn pixel_row(label: &str, device: &str, case: &str, row: &str) -> Vec<u32> {
-    let raw = EXPECTATIONS
+fn measured_row(label: &str, device: &str, case: &str, row: &str) -> &'static str {
+    EXPECTATIONS
         .lines()
         .find_map(|line| {
             let mut fields = line.split('\t');
@@ -490,7 +490,100 @@ fn pixel_row(label: &str, device: &str, case: &str, row: &str) -> Vec<u32> {
                 && fields.next()? == row)
                 .then(|| fields.next().unwrap())
         })
-        .unwrap();
+        .unwrap_or_else(|| panic!("missing {label}/{device}/{case}/{row}"))
+}
+
+// spec: GFX-D3D7-3
+#[test]
+fn device7_render_registers_and_info_follow_the_device_class() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let target = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        8,
+        8,
+    );
+    let hex = |s| u32::from_str_radix(s, 16).unwrap();
+    for (kind, name) in [
+        (caps::Device::Rgb, "rgb"),
+        (caps::Device::Hal, "hal"),
+        (caps::Device::TnlHal, "tnlhal"),
+    ] {
+        let dev = f.device_kind(d3d, Face::Direct3D7, target, kind);
+        let mut retired_zero = Vec::new();
+        for line in EXPECTATIONS.lines() {
+            let mut row = line.split('\t');
+            let label = row.next().unwrap();
+            if row.next() != Some(name) {
+                continue;
+            }
+            if label == "state-retired-zero" {
+                retired_zero.push(row.next().unwrap().parse::<u32>().unwrap());
+            }
+            if label != "state-default" {
+                continue;
+            }
+            let hr = hex(row.next().unwrap());
+            let value = hex(row.next().unwrap());
+            for slot in row.next().unwrap().split_whitespace() {
+                let slot = slot.parse().unwrap();
+                f.write(OUT, &0xdead_beefu32.to_le_bytes());
+                assert_eq!(
+                    f.device_call(dev, "GetRenderState", &[slot, OUT]),
+                    hr,
+                    "{name} {slot}"
+                );
+                assert_eq!(f.word(OUT), value, "{name} {slot}");
+                for update in [1, 0x5555_0001] {
+                    assert_eq!(
+                        f.device_call(dev, "SetRenderState", &[slot, update]),
+                        hr,
+                        "{name} {slot}"
+                    );
+                    assert_eq!(f.device_call(dev, "GetRenderState", &[slot, OUT]), hr);
+                    assert_eq!(f.word(OUT), if hr == 0 { update } else { value });
+                }
+            }
+        }
+        for slot in [5, 6, 11, 13, 31, 32, 39].into_iter().chain(64..=95) {
+            assert_eq!(
+                f.device_call(dev, "SetRenderState", &[slot, 0]),
+                if retired_zero.contains(&slot) {
+                    0
+                } else {
+                    INVALID
+                },
+                "{name} {slot}"
+            );
+        }
+        assert_eq!(f.device_call(dev, "BeginStateBlock", &[]), 0);
+        assert_eq!(f.device_call(dev, "SetRenderState", &[96, 0x1234]), 0);
+        assert_eq!(f.device_call(dev, "EndStateBlock", &[OUT]), 0);
+        let block = f.word(OUT);
+        assert_eq!(f.device_call(dev, "ApplyStateBlock", &[block]), 0);
+        assert_eq!(f.device_call(dev, "GetRenderState", &[96, OUT]), 0);
+        assert_eq!(f.word(OUT), 0x1234);
+        for id in [1, 2, 3, 4, 5, 6, u32::MAX] {
+            f.write(DATA + 0x100, &[0xcc; 256]);
+            assert_eq!(
+                f.device_call(dev, "GetInfo", &[id, DATA + 0x100, 256]),
+                if kind == caps::Device::Rgb && id > 3 {
+                    0x80004005
+                } else {
+                    1
+                }
+            );
+            assert_eq!(f.word(DATA + 0x100), 0);
+            assert_eq!(f.word(DATA + 0x1fc), 0);
+        }
+    }
+}
+
+fn pixel_row(label: &str, device: &str, case: &str, row: &str) -> Vec<u32> {
+    let raw = measured_row(label, device, case, row);
     let digits = if label == "packed" { 4 } else { 6 };
     (0..raw.len())
         .step_by(digits)
@@ -1379,8 +1472,8 @@ fn indexed_strided_and_vertex_buffer_draws_capture_their_input() {
     let vertex = f.output("IDirect3DVertexBuffer7::Lock", &[vb, 0, OUT, OUT + 4]);
     assert_eq!(f.word(OUT + 4), 128);
     assert_eq!(
-        f.call("IDirect3DVertexBuffer7::Lock", &[vb, 0, OUT, 0]),
-        0x8876080e
+        f.output("IDirect3DVertexBuffer7::Lock", &[vb, 0, OUT, 0]),
+        vertex
     );
     let v = quad(2., 2., 6., 6., 0xffabcdef);
     f.write(vertex, bytemuck::cast_slice(&v));
@@ -1866,12 +1959,15 @@ fn packed_targets_blend_color_and_return_nearest_packed_channels() {
     let dd = f.dd(7);
     let d3d = f.face(dd, IID_IDIRECT3D7);
     let caps = creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE | creation::VIDEO_MEMORY;
-    for (masks, packed) in [
+    for (format, (masks, portable)) in [
         ([0xf800, 0x7e0, 0x1f, 0], 0xa514u16),
         ([0x7c00, 0x3e0, 0x1f, 0], 0x5294),
         ([0x7c00, 0x3e0, 0x1f, 0x8000], 0xd294),
         ([0xf00, 0xf0, 0xf, 0xf000], 0xbaaa),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let rt = f.described_surface(
             dd,
             creation::Described {
@@ -1889,17 +1985,96 @@ fn packed_targets_blend_color_and_return_nearest_packed_channels() {
         }
         assert_eq!(f.device_call(dev, "ValidateDevice", &[OUT]), 0);
         assert_eq!(f.word(OUT), 1);
-        for dither in [0, 1] {
-            assert_eq!(f.device_call(dev, "SetRenderState", &[26, dither]), 0);
-            assert_eq!(
-                f.device_call(dev, "Clear", &[0, 0, 1, 0xff404040, 1f32.to_bits(), 0]),
-                0
-            );
-            draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., 0x80ffffff));
-            let (address, _) = f.lock(rt, 0x10);
-            assert_eq!(f.word(address) as u16, packed, "{masks:x?}");
-            f.unlock(rt);
+        for (case, (dst, src)) in [
+            (0xff404040, 0x80ffffff),
+            (0xff7f7f7f, 0x7fffffff),
+            (0xff000000, 0x01070707),
+        ]
+        .into_iter()
+        .enumerate()
+        .take(if format < 2 { 3 } else { 1 })
+        {
+            let mut undithered = [0; 2];
+            for dither in [0, 1] {
+                assert_eq!(f.device_call(dev, "SetRenderState", &[26, dither]), 0);
+                for draws in 1..=if format < 2 { 2 } else { 1 } {
+                    assert_eq!(
+                        f.device_call(dev, "Clear", &[0, 0, 1, dst, 1f32.to_bits(), 0]),
+                        0
+                    );
+                    for _ in 0..draws {
+                        draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., src));
+                    }
+                    let (address, _) = f.lock(rt, 0x10);
+                    let actual = f.word(address) as u16;
+                    f.unlock(rt);
+                    let expected = if format < 2 {
+                        u16::from_str_radix(
+                            measured_row(
+                                "packed-blend",
+                                "hal",
+                                &format!("{format}-{case}"),
+                                &format!("{dither}-{draws}"),
+                            ),
+                            16,
+                        )
+                        .unwrap()
+                    } else {
+                        portable
+                    };
+                    let reference = &mut undithered[draws - 1];
+                    if dither == 0 {
+                        *reference = actual;
+                    } else {
+                        assert_eq!(actual, *reference);
+                    }
+                    let formats = [0xce79, 0x6739];
+                    let measured = (format < 2 && case == 0 && draws == 2).then(|| formats[format]);
+                    assert!(
+                        actual == expected || measured == Some(actual),
+                        "{masks:x?} {case} {dither} {draws}: {actual:04x} vs {expected:04x}"
+                    );
+                }
+            }
         }
+
+        let rgb = f.device_kind(d3d, Face::Direct3D7, rt, caps::Device::Rgb);
+        let peer = f.described_surface(
+            dd,
+            creation::Described {
+                flags: 0x1007,
+                width: 8,
+                height: 8,
+                caps: [creation::TEXTURE | creation::SYSTEM_MEMORY, 0, 0, 0],
+                format: pixel_format(0x40 | u32::from(masks[3] != 0), 16, masks),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            f.device_call(rgb, "Clear", &[0, 0, 1, 0, 1f32.to_bits(), 0]),
+            0
+        );
+        assert_eq!(
+            f.call("IDirectDrawSurface7::Blt", &[peer, 0, rt, 0, 0, 0]),
+            0
+        );
+        let (address, _) = f.lock(peer, 0);
+        f.write(address, &0x8410u16.to_le_bytes());
+        f.unlock(peer);
+        assert_eq!(
+            f.call("IDirectDrawSurface7::Blt", &[rt, 0, peer, 0, 0, 0]),
+            0
+        );
+        let (address, _) = f.lock(rt, 0x10);
+        assert_eq!(
+            f.word(address) as u16,
+            u16::from_str_radix(
+                measured_row("packed-blt", "rgb", &format.to_string(), "0"),
+                16
+            )
+            .unwrap()
+        );
+        f.unlock(rt);
     }
 }
 
@@ -2043,7 +2218,7 @@ fn device7_applies_the_captured_hal_combiner_blend_and_alpha_test_rules() {
 
 // spec: GFX-D3D7-3
 #[test]
-fn device7_admits_documented_raster_states_and_rejects_retired_selectors() {
+fn device7_draws_point_wireframe_and_wrapped_primitives() {
     let mut f = Fixture::new(true);
     let dd = f.dd(7);
     let d3d = f.face(dd, IID_IDIRECT3D7);
@@ -2055,39 +2230,6 @@ fn device7_admits_documented_raster_states_and_rejects_retired_selectors() {
         8,
     );
     let dev = f.device(d3d, Face::Direct3D7, rt);
-    for slot in [
-        1, 3, 5, 6, 11, 12, 13, 17, 18, 21, 30, 31, 32, 39, 43, 44, 45, 46, 49, 50, 51,
-    ]
-    .into_iter()
-    .chain(64..=95)
-    {
-        f.write(OUT, &0xdead_beefu32.to_le_bytes());
-        assert_eq!(
-            f.device_call(dev, "GetRenderState", &[slot, OUT]),
-            INVALID,
-            "{slot}"
-        );
-        assert_eq!(f.word(OUT), 0xdead_beef);
-        assert_eq!(
-            f.device_call(dev, "SetRenderState", &[slot, 1]),
-            INVALID,
-            "{slot}"
-        );
-    }
-    for (slot, value) in [
-        (2, 2),
-        (7, 2),
-        (9, 3),
-        (10, 0x55550001),
-        (40, 1),
-        (47, 17),
-        (128, 16),
-    ] {
-        assert_eq!(
-            f.device_call(dev, "SetRenderState", &[slot, value]),
-            INVALID
-        );
-    }
     for (slot, value) in [(22, 1), (8, 1), (138, 1), (135, 15)] {
         assert_eq!(f.device_call(dev, "SetRenderState", &[slot, value]), 0);
         assert_eq!(f.device_call(dev, "GetRenderState", &[slot, OUT]), 0);
@@ -2105,7 +2247,7 @@ fn device7_admits_documented_raster_states_and_rejects_retired_selectors() {
     assert_eq!(f.device_call(dev, "GetClipStatus", &[DATA + 0x700]), 0);
     assert_eq!(
         std::array::from_fn(|i| f.word(DATA + 0x708 + i as u32 * 4)),
-        [1f32, 5., 1., 5., 0.5, 0.5].map(f32::to_bits)
+        [1f32, 5., 1., 5.].map(f32::to_bits)
     );
     assert_eq!(f.device_call(dev, "SetRenderState", &[8, 2]), 0);
     assert_eq!(
@@ -2640,6 +2782,40 @@ fn legacy_execute_buffer_copies_vertices_and_draws_the_captured_triangle() {
         f.call("IDirect3DExecuteBuffer::Lock", &[buffer, desc]),
         0x887602ca
     );
+    f.write(data + 96, &11u32.to_le_bytes());
+    let exit = D3DEXECUTEDATA {
+        dwSize: 48,
+        dwInstructionOffset: 96,
+        dwInstructionLength: 4,
+        ..Default::default()
+    };
+    f.write(desc, bytemuck::bytes_of(&exit));
+    assert_eq!(
+        f.call("IDirect3DExecuteBuffer::SetExecuteData", &[buffer, desc]),
+        0
+    );
+    assert_eq!(f.call("IDirect3DExecuteBuffer::Unlock", &[buffer]), 0);
+    assert_eq!(f.call("IDirect3DDevice::BeginScene", &[device]), 0);
+    assert_eq!(
+        f.call("IDirect3DDevice::Execute", &[device, buffer, viewport, 1]),
+        0
+    );
+    assert_eq!(f.call("IDirect3DDevice::EndScene", &[device]), 0);
+    assert_eq!(
+        f.call("IDirect3DExecuteBuffer::GetExecuteData", &[buffer, desc]),
+        0
+    );
+    for (i, word) in measured_row("execute", "win", "first-exit", "0")
+        .split_whitespace()
+        .enumerate()
+    {
+        assert_eq!(
+            f.word(desc + 24 + i as u32 * 4),
+            u32::from_str_radix(word, 16).unwrap()
+        );
+    }
+    f.write(desc, &20u32.to_le_bytes());
+    assert_eq!(f.call("IDirect3DExecuteBuffer::Lock", &[buffer, desc]), 0);
     let vertices = [
         tl(2., 2., 0., 0xff00ff00),
         tl(30., 2., 0., 0xff00ff00),
@@ -2723,6 +2899,351 @@ fn legacy_execute_buffer_copies_vertices_and_draws_the_captured_triangle() {
     let pixels = f.pixels(target, 32, 32);
     assert_eq!(pixels[6 + 2 * 32], 0x00ff00);
     assert_eq!(pixels[2 + 6 * 32], 0);
+    let run = |f: &mut Fixture, case, stream: &[u32], vertices: &[[u32; 8]], flags| {
+        f.write(desc, bytemuck::cast_slice(&[20u32, 1, 0, 1024, 0]));
+        let buffer = f.output(
+            "IDirect3DDevice::CreateExecuteBuffer",
+            &[device, desc, OUT, 0],
+        );
+        assert_eq!(f.call("IDirect3DExecuteBuffer::Lock", &[buffer, desc]), 0);
+        let address = f.word(desc + 16);
+        f.write(address, bytemuck::cast_slice(vertices));
+        f.write(address + 256, bytemuck::cast_slice(stream));
+        let data = D3DEXECUTEDATA {
+            dwSize: 48,
+            dwVertexCount: vertices.len() as u32,
+            dwInstructionOffset: 256,
+            dwInstructionLength: size_of_val(stream) as u32,
+            dsStatus: adv_abi::types::D3DSTATUS {
+                dwStatus: 0x01003004,
+                drExtent: adv_abi::types::D3DRECT {
+                    x1: 10,
+                    y1: 10,
+                    x2: 15,
+                    y2: 15,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        f.write(desc, bytemuck::bytes_of(&data));
+        assert_eq!(
+            f.call("IDirect3DExecuteBuffer::SetExecuteData", &[buffer, desc]),
+            0
+        );
+        assert_eq!(f.call("IDirect3DExecuteBuffer::Unlock", &[buffer]), 0);
+        f.write(OUT, &0xcccc_ccccu32.to_le_bytes());
+        assert_eq!(
+            f.call("IDirect3DExecuteBuffer::Validate", &[buffer, OUT, 0, 0, 0]),
+            0x80004001
+        );
+        assert_eq!(f.word(OUT), 0xcccc_cccc);
+        assert_eq!(
+            f.call("IDirect3DExecuteBuffer::Optimize", &[buffer, 0]),
+            0x80004001
+        );
+        assert_eq!(f.call("IDirect3DViewport3::Clear", &[viewport, 0, 0, 1]), 0);
+        assert_eq!(f.call("IDirect3DDevice::BeginScene", &[device]), 0);
+        let hr = f.call(
+            "IDirect3DDevice::Execute",
+            &[device, buffer, viewport, flags],
+        );
+        assert_eq!(f.call("IDirect3DDevice::EndScene", &[device]), 0);
+        assert_eq!(
+            f.call("IDirect3DExecuteBuffer::GetExecuteData", &[buffer, desc]),
+            0
+        );
+        let mut expected = measured_row("execute", "win", case, "0").split_whitespace();
+        for actual in [hr, f.word(desc + 24), f.word(desc + 28)] {
+            assert_eq!(
+                actual,
+                u32::from_str_radix(expected.next().unwrap(), 16).unwrap(),
+                "{case}"
+            );
+        }
+        for i in 0..4 {
+            assert_eq!(
+                f.word(desc + 32 + i * 4) as i32,
+                expected.next().unwrap().parse::<i32>().unwrap(),
+                "{case} {i}"
+            );
+        }
+        assert_eq!(f.call("IDirect3DExecuteBuffer::Release", &[buffer]), 0);
+    };
+    let vertices = [
+        tl(2.75, 4.25, 0.25, 0xffff0000),
+        tl(13.75, 4.25, 0.25, 0xff0000ff),
+        tl(2.75, 8.25, 0.25, 0xffff0000),
+        tl(13.75, 8.25, 0.25, 0xff0000ff),
+    ];
+    let op = |opcode: u32, size: u32, count: u32| opcode | size << 8 | count << 16;
+    let set_status = op(14, 24, 1);
+    let process = op(9, 16, 1);
+    let points = op(1, 4, 1);
+    let lines = op(2, 4, 2);
+    let branch = |n| op(12, 16, n);
+    let seed = [set_status, 3, 0x01fff000, 10, 10, 15, 15, 11];
+    run(
+        &mut f,
+        "set-status",
+        &[set_status, 1, 0x12345678, 1, 2, 3, 4, 11],
+        &vertices,
+        1,
+    );
+    run(
+        &mut f,
+        "set-extent",
+        &[set_status, 2, 0, 7, 8, 9, 10, 11],
+        &vertices,
+        1,
+    );
+    run(&mut f, "seed-for-span", &seed, &vertices, 1);
+    run(
+        &mut f,
+        "span-seeded",
+        &[process, 2, 0, 4, 0, op(13, 4, 3), 1, 2, (1 << 16) | 3, 11],
+        &vertices,
+        1,
+    );
+    assert!(f.pixels(target, 32, 32).iter().all(|&pixel| pixel == 0));
+    run(&mut f, "seed-for-span", &seed, &vertices, 1);
+    run(
+        &mut f,
+        "copy-seeded",
+        &[process, 2 | 8, 0, 2, 0, 11],
+        &vertices,
+        1,
+    );
+    run(&mut f, "seed-for-span", &seed, &vertices, 1);
+    run(
+        &mut f,
+        "point-seeded",
+        &[process, 2, 0, 4, 0, points, 4, 11],
+        &vertices,
+        1,
+    );
+    assert_eq!(f.pixels(target, 32, 32)[3 + 4 * 32], 0xff0000);
+    run(
+        &mut f,
+        "branch-record1",
+        &[
+            set_status,
+            3,
+            4,
+            1,
+            2,
+            3,
+            4,
+            branch(1),
+            4,
+            4,
+            0,
+            48,
+            set_status,
+            3,
+            7,
+            5,
+            6,
+            7,
+            8,
+            11,
+        ],
+        &vertices,
+        1,
+    );
+    run(
+        &mut f,
+        "branch-record2",
+        &[
+            set_status,
+            3,
+            4,
+            1,
+            2,
+            3,
+            4,
+            branch(2),
+            4,
+            0,
+            0,
+            36,
+            4,
+            0,
+            1,
+            64,
+            set_status,
+            3,
+            7,
+            5,
+            6,
+            7,
+            8,
+            11,
+        ],
+        &vertices,
+        1,
+    );
+    run(
+        &mut f,
+        "exit-trailing",
+        &[11, set_status, 3, 7, 5, 6, 7, 8, 11],
+        &vertices,
+        1,
+    );
+
+    let [identity, translation, destination] =
+        std::array::from_fn(|_| f.output("IDirect3DDevice::CreateMatrix", &[device, OUT]));
+    let mut matrix = [0f32; 16];
+    for i in [0, 5, 10, 15] {
+        matrix[i] = 1.;
+    }
+    let mat = DATA + 0x400;
+    f.write(mat, bytemuck::bytes_of(&matrix));
+    assert_eq!(
+        f.call("IDirect3DDevice::SetMatrix", &[device, identity, mat]),
+        0
+    );
+    matrix[12] = 0.25;
+    f.write(mat, bytemuck::bytes_of(&matrix));
+    assert_eq!(
+        f.call("IDirect3DDevice::SetMatrix", &[device, translation, mat]),
+        0
+    );
+    run(
+        &mut f,
+        "matrix-load",
+        &[op(4, 8, 1), destination, translation, 11],
+        &vertices,
+        1,
+    );
+    run(
+        &mut f,
+        "matrix-multiply",
+        &[op(5, 12, 1), destination, translation, translation, 11],
+        &vertices,
+        1,
+    );
+    assert_eq!(
+        f.call("IDirect3DDevice::GetMatrix", &[device, destination, mat]),
+        0
+    );
+    assert_eq!(f.word(mat + 48), 0.5f32.to_bits());
+    run(
+        &mut f,
+        "matrix-state",
+        &[op(6, 8, 3), 1, destination, 2, identity, 3, identity, 11],
+        &vertices,
+        1,
+    );
+    let lit = vertices.map(|mut v| {
+        let x: f32 = if v[0] == 2.75f32.to_bits() {
+            -0.75
+        } else {
+            1.5
+        };
+        let y: f32 = if v[1] == 4.25f32.to_bits() { 0.75 } else { 0. };
+        v[0] = x.to_bits();
+        v[1] = y.to_bits();
+        v[3] = 0;
+        v
+    });
+    let unlit = lit.map(|mut v| {
+        v[4] = 0;
+        v[5] = (-1f32).to_bits();
+        v
+    });
+    run(
+        &mut f,
+        "light-process",
+        &[
+            op(7, 8, 1),
+            2,
+            0x00ffffff,
+            process,
+            8,
+            0,
+            4,
+            0,
+            points,
+            4,
+            11,
+        ],
+        &unlit,
+        1,
+    );
+    assert_eq!(
+        f.call("IDirect3DDevice::SetMatrix", &[device, destination, mat]),
+        0
+    );
+    run(
+        &mut f,
+        "seed-for-span",
+        &[
+            op(6, 8, 1),
+            1,
+            identity,
+            set_status,
+            3,
+            0x01fff000,
+            10,
+            10,
+            15,
+            15,
+            11,
+        ],
+        &lit,
+        1,
+    );
+    let line_draw = [process, 1 | 8, 0, 4, 0, lines, 1 << 16, (3 << 16) | 2, 11];
+    for (case, flags) in [("transform-clipped", 1), ("transform-unclipped", 2)] {
+        run(&mut f, "seed-for-span", &seed, &lit, 1);
+        run(&mut f, case, &line_draw, &lit, flags);
+        let pixels = f.pixels(target, 32, 32);
+        let expected = pixel_row("execute-pixels", "win", case, "0");
+        for (x, expected) in [6, 8, 13].into_iter().zip(expected) {
+            let actual = pixels[x + 4 * 32];
+            assert!(
+                actual
+                    .to_le_bytes()
+                    .into_iter()
+                    .zip(expected.to_le_bytes())
+                    .all(|(got, want)| got.abs_diff(want) <= 1),
+                "{case} x={x}: {actual:06x} vs {expected:06x}"
+            );
+        }
+    }
+    run(
+        &mut f,
+        "transform-split",
+        &[
+            process, 9, 0x10001, 1, 0, process, 9, 0, 1, 0, process, 9, 0x20002, 2, 0, 11,
+        ],
+        &lit,
+        1,
+    );
+    run(&mut f, "seed-for-span", &seed, &lit, 1);
+    let right = lit.map(|mut v| {
+        v[0] = 1.25f32.to_bits();
+        v
+    });
+    run(&mut f, "transform-all-right", &line_draw, &right, 1);
+    let src = f.surface(dd, false, creation::TEXTURE, 8, 8);
+    let dst = f.surface(dd, false, creation::TEXTURE, 8, 8);
+    let (address, _) = f.lock(src, 0);
+    f.write(address, &0x00cc8844u32.to_le_bytes());
+    f.unlock(src);
+    let [dst_handle, src_handle] = [dst, src].map(|surface| {
+        let texture = f.face(surface, IID_IDIRECT3DTEXTURE);
+        f.output("IDirect3DTexture::GetHandle", &[texture, device, OUT])
+    });
+    run(
+        &mut f,
+        "texture-load",
+        &[op(10, 8, 1), dst_handle, src_handle, 11],
+        &vertices,
+        1,
+    );
+    assert_eq!(f.pixels(dst, 1, 1), [0xcc8844]);
     assert_eq!(f.call("IDirect3DExecuteBuffer::Release", &[buffer]), 0);
 }
 
@@ -2921,12 +3442,41 @@ fn legacy_caps_and_texture_callbacks_use_the_interface_layout() {
         32,
         32,
     );
+    let d3d1 = f.face(dd, IID_IDIRECT3D);
     let device1 = f.face(target, IID_IDIRECT3DHALDEVICE);
     let d3d2 = f.face(dd, IID_IDIRECT3D2);
     let d3d3 = f.face(dd, IID_IDIRECT3D3);
     let device2 = f.device(d3d2, Face::Direct3D2, target);
     let target4 = f.face(target, IID_SURFACE4);
     let device3 = f.device(d3d3, Face::Direct3D3, target4);
+    for (iface, case, pointer) in [
+        ("IDirect3D", "d3d1", d3d1),
+        ("IDirect3D2", "d3d2", d3d2),
+        ("IDirect3D3", "d3d3", d3d3),
+    ] {
+        let mut devices = Vec::new();
+        assert_eq!(
+            f.invoke(
+                &format!("{iface}::EnumDevices"),
+                &[pointer, callback, DATA],
+                |cpu, row| {
+                    let id = cpu.read_u32(row[0]).unwrap();
+                    let expected: Vec<u32> =
+                        measured_row("legacy-enum", "win", case, &format!("{id:08x}"))
+                            .split_whitespace()
+                            .map(|value| value.parse().unwrap())
+                            .collect();
+                    assert_eq!(cpu.read_u32(row[3]).unwrap(), expected[0]);
+                    assert_eq!(cpu.read_u32(row[4]).unwrap(), expected[1]);
+                    assert_eq!(row[4] - row[3], expected[0]);
+                    devices.push(id);
+                    1
+                }
+            ),
+            0
+        );
+        assert_eq!(devices, [0xa4665c60, 0x84e63de0]);
+    }
     let mut formats = Vec::new();
     for (interface, pointer, desc) in [
         ("IDirect3DDevice", device1, true),
@@ -2955,17 +3505,262 @@ fn legacy_caps_and_texture_callbacks_use_the_interface_layout() {
             0
         );
         let address = DATA + 0x300;
-        let size = size_of::<D3DDEVICEDESC>() as u32;
-        f.write(address, &size.to_le_bytes());
-        assert_eq!(
-            f.call(&format!("{interface}::GetCaps"), &[pointer, address, 0]),
-            0
-        );
-        let report: D3DDEVICEDESC = adv_abi::GuestPtr::new(address)
-            .read(&f.machine.cpu)
-            .unwrap();
-        assert_eq!(report.dwMaxTextureWidth, 16384);
-        assert_eq!(report.dwDevCaps & 0x30, 0x10);
+        for size in [172u32, 204, 252] {
+            f.write(address, &[0xcc; 256]);
+            f.write(address, &size.to_le_bytes());
+            assert_eq!(
+                f.call(&format!("{interface}::GetCaps"), &[pointer, address, 0]),
+                0
+            );
+            let report: D3DDEVICEDESC = adv_abi::GuestPtr::new(address)
+                .read(&f.machine.cpu)
+                .unwrap();
+            assert_eq!(report.dwSize, 252);
+            assert_eq!(
+                report.dwMaxVertexCount,
+                if interface == "IDirect3DDevice" {
+                    65534
+                } else {
+                    32768
+                }
+            );
+            assert_eq!(report.dtcTransformCaps.dwSize, 8);
+            assert_eq!(f.word(address + size), 0xcccc_cccc);
+            assert_eq!(report.dwDevCaps & 0x30, 0x10);
+        }
     }
     assert_eq!(formats, vec![formats[0]; 3]);
+    f.write(DATA, &IID_IDIRECT3DTNLHALDEVICE);
+    assert_eq!(
+        f.call("IDirect3D3::EnumZBufferFormats", &[d3d3, DATA, callback, 0]),
+        INVALID
+    );
+}
+
+// spec: GFX-D3D7-3
+#[test]
+fn viewport_transform_leaves_clipped_screen_coordinates_and_unrequested_flags() {
+    use adv_abi::types::D3DTRANSFORMDATA;
+    let mut f = Fixture::new(true);
+    let dd = f.dd(1);
+    let d3d = f.face(dd, IID_IDIRECT3D3);
+    let target = f.surface(
+        dd,
+        false,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        32,
+        32,
+    );
+    let target4 = f.face(target, IID_SURFACE4);
+    let device = f.device(d3d, Face::Direct3D3, target4);
+    let viewport = f.output("IDirect3D3::CreateViewport", &[d3d, OUT, 0]);
+    assert_eq!(
+        f.call("IDirect3DDevice3::AddViewport", &[device, viewport]),
+        0
+    );
+    let desc = DATA + 0x100;
+    let input = DATA + 0x200;
+    let screen = DATA + 0x300;
+    let homogeneous = DATA + 0x400;
+    let transform = DATA + 0x500;
+    let viewport2 = [
+        44u32,
+        4,
+        6,
+        24,
+        20,
+        (-0.5f32).to_bits(),
+        0.75f32.to_bits(),
+        1f32.to_bits(),
+        1.5f32.to_bits(),
+        0.25f32.to_bits(),
+        0.75f32.to_bits(),
+    ];
+    f.write(desc, bytemuck::bytes_of(&viewport2));
+    assert_eq!(
+        f.call("IDirect3DViewport3::SetViewport2", &[viewport, desc]),
+        0
+    );
+    for row in 0..4 {
+        let x = if row < 2 { 0.25f32 } else { 2.5 };
+        let input_vertices = [
+            [x, 0., 0.25, 0., 0., 0., 0., 0.],
+            [2., 0., 0.25, 0., 0., 0., 0., 0.],
+        ];
+        f.write(input, bytemuck::bytes_of(&input_vertices));
+        f.write(screen, &[0xcc; 64]);
+        f.write(homogeneous, &[0xcc; 32]);
+        let data = D3DTRANSFORMDATA {
+            dwSize: size_of::<D3DTRANSFORMDATA>() as u32,
+            lpIn: input,
+            dwInSize: 32,
+            lpOut: screen,
+            dwOutSize: 32,
+            lpHOut: homogeneous,
+            dwClipIntersection: 0xcccc_cccc,
+            dwClipUnion: 0xcccc_cccc,
+            ..Default::default()
+        };
+        f.write(transform, bytemuck::bytes_of(&data));
+        assert_eq!(
+            f.call(
+                "IDirect3DViewport3::TransformVertices",
+                &[viewport, 2, transform, 1 + row % 2, OUT]
+            ),
+            0
+        );
+        let mut expected =
+            measured_row("viewport-clip", "win", &row.to_string(), "0").split_whitespace();
+        for actual in [f.word(OUT), f.word(transform + 28), f.word(transform + 32)] {
+            assert_eq!(
+                actual,
+                u32::from_str_radix(expected.next().unwrap(), 16).unwrap()
+            );
+        }
+        for vertex in 0..2 {
+            for i in 0..8 {
+                let value = expected.next().unwrap();
+                let bits = match (i, value) {
+                    (4, value) => u32::from_str_radix(value, 16).unwrap(),
+                    (_, "-1.07374e+08") => 0xcccc_cccc,
+                    _ => value.parse::<f32>().unwrap().to_bits(),
+                };
+                let address = if i < 4 {
+                    screen + vertex * 32 + i * 4
+                } else {
+                    homogeneous + vertex * 16 + (i - 4) * 4
+                };
+                assert_eq!(f.word(address), bits, "row {row} vertex {vertex} word {i}");
+            }
+        }
+    }
+    let mut viewport1 = viewport2;
+    viewport1[5..9].copy_from_slice(&[8f32, 12., 1., 1.].map(f32::to_bits));
+    f.write(desc, bytemuck::bytes_of(&viewport1));
+    assert_eq!(
+        f.call("IDirect3DViewport3::SetViewport", &[viewport, desc]),
+        0
+    );
+    f.write(input, bytemuck::bytes_of(&[0.25f32, 0.5, 0.25]));
+    assert_eq!(
+        f.call(
+            "IDirect3DViewport3::TransformVertices",
+            &[viewport, 1, transform, 2, OUT]
+        ),
+        0
+    );
+    for (i, word) in measured_row("viewport-clip", "win", "v1", "0")
+        .split_whitespace()
+        .enumerate()
+    {
+        assert_eq!(
+            f.word(screen + i as u32 * 4),
+            word.parse::<f32>().unwrap().to_bits()
+        );
+    }
+}
+
+// spec: GFX-D3D7-3
+#[test]
+fn device7_draws_rgb_line_patterns_and_retains_measured_clip_status() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let target = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        8,
+        8,
+    );
+    let data = DATA + 0x700;
+    let vertices = [
+        tl(1., 1., 0.25, u32::MAX),
+        tl(7., 1., 0.25, u32::MAX),
+        tl(1., 7., 0.25, u32::MAX),
+    ];
+    for (kind, line_class, clip_class) in [
+        (caps::Device::Rgb, "rgb", "hal"),
+        (caps::Device::Hal, "hal", "hal"),
+        (caps::Device::TnlHal, "hal", "tnlhal"),
+    ] {
+        let dev = f.device_kind(d3d, Face::Direct3D7, target, kind);
+        assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+        for pattern in [
+            0, 1, 0x00010001, 0x55550001, 0xffff0001, 0x55550002, 0x00005555,
+        ] {
+            assert_eq!(f.device_call(dev, "SetRenderState", &[10, pattern]), 0);
+            for last in [0, 1] {
+                assert_eq!(f.device_call(dev, "SetRenderState", &[16, last]), 0);
+                assert_eq!(
+                    f.device_call(dev, "Clear", &[0, 0, 1, 0, 1f32.to_bits(), 0]),
+                    0
+                );
+                draw_tl(&mut f, dev, 2, &vertices[..2]);
+                let row = f.pixels(target, 8, 8)[8..16]
+                    .iter()
+                    .map(|&pixel| if pixel == 0 { '0' } else { '1' })
+                    .collect::<String>();
+                assert_eq!(
+                    row,
+                    measured_row(
+                        "line-control",
+                        line_class,
+                        &format!("{pattern:08x}"),
+                        &last.to_string()
+                    ),
+                    "{line_class} {pattern:#x} {last}"
+                );
+            }
+        }
+        assert_eq!(f.device_call(dev, "SetRenderState", &[138, 1]), 0);
+        for flags in 0..=8 {
+            for draw in 0..=1 {
+                let mut expected = measured_row(
+                    "clip-control",
+                    clip_class,
+                    &flags.to_string(),
+                    &draw.to_string(),
+                )
+                .split_whitespace();
+                let clip = [
+                    flags,
+                    0x01002002,
+                    3f32.to_bits(),
+                    4f32.to_bits(),
+                    3f32.to_bits(),
+                    4f32.to_bits(),
+                    0.5f32.to_bits(),
+                    0.75f32.to_bits(),
+                ];
+                f.write(data, bytemuck::bytes_of(&clip));
+                assert_eq!(
+                    f.device_call(dev, "SetClipStatus", &[data]),
+                    u32::from_str_radix(expected.next().unwrap(), 16).unwrap()
+                );
+                if draw == 1 {
+                    draw_tl(&mut f, dev, 4, &vertices);
+                }
+                f.write(data, &[0xcc; 32]);
+                f.write(data, &flags.to_le_bytes());
+                assert_eq!(f.device_call(dev, "GetClipStatus", &[data]), 0);
+                for i in 0..2 {
+                    assert_eq!(
+                        f.word(data + i * 4),
+                        u32::from_str_radix(expected.next().unwrap(), 16).unwrap(),
+                        "{clip_class} {flags} {draw} {i}"
+                    );
+                }
+                for i in 2..6 {
+                    assert_eq!(
+                        f.word(data + i * 4),
+                        expected.next().unwrap().parse::<f32>().unwrap().to_bits(),
+                        "{clip_class} {flags} {draw} {i}"
+                    );
+                }
+                assert_eq!(f.word(data + 24), 0xcccc_cccc);
+                assert_eq!(f.word(data + 28), 0xcccc_cccc);
+            }
+        }
+    }
 }

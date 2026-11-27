@@ -106,6 +106,10 @@ const FORMATS: &[Format] = &[
     Format::Depth32Float,
     Format::Depth24UnormStencil8,
     Format::Depth32FloatStencil8,
+    Format::B5g6r5Unorm,
+    Format::Bgr5a1Unorm,
+    Format::Bgra4Unorm,
+    Format::Abgr4Unorm,
 ];
 fn format_code(format: Format) -> u32 {
     FORMATS

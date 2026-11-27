@@ -1848,7 +1848,10 @@ fn upload_row_bytes(image: &Image, r: Rect) -> u32 {
     let bpp = match &image.storage {
         Storage::Fixed { image, .. } => match image.desc().format {
             adv_gpu::Format::R8Unorm => 1,
-            adv_gpu::Format::B5g6r5Unorm | adv_gpu::Format::Bgra4Unorm => 2,
+            adv_gpu::Format::B5g6r5Unorm
+            | adv_gpu::Format::Bgr5a1Unorm
+            | adv_gpu::Format::Bgra4Unorm
+            | adv_gpu::Format::Abgr4Unorm => 2,
             adv_gpu::Format::Bgra8Unorm => 4,
             _ => unreachable!("executor image format"),
         },
@@ -2381,11 +2384,14 @@ impl Gpu {
             return Err(invalid("image cannot copy onto itself"));
         }
         if color_format(source) != color_format(destination) {
-            if !matches!(
-                (color_format(source), color_format(destination)),
-                (adv_gpu::Format::Rgba8Unorm, adv_gpu::Format::Bgra8Unorm)
-                    | (adv_gpu::Format::Bgra8Unorm, adv_gpu::Format::Rgba8Unorm)
-            ) {
+            let color_blit = |image: &Image| {
+                image.packed_attachment_format().is_some()
+                    || matches!(
+                        color_format(image),
+                        adv_gpu::Format::Rgba8Unorm | adv_gpu::Format::Bgra8Unorm
+                    )
+            };
+            if !(color_blit(source) && color_blit(destination)) {
                 return Err(invalid("copy formats differ"));
             }
             return self.enqueue_blit(source, rectangle, destination, region, Filter::Nearest);
