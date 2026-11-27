@@ -7,6 +7,21 @@
 
   const id = $props.id();
   const status = $derived(updates.status);
+  const canInstall = $derived(typeof status === "object" && Boolean(status.latest && status.canInstall));
+  const progressText = $derived.by(() => {
+    switch (updates.installState) {
+      case "downloading":
+        return updates.percent !== null ? t("正在下载更新… {0}%", updates.percent) : t("正在下载更新…");
+      case "verifying":
+        return t("正在校验签名…");
+      case "installing":
+        return t("正在安装更新…");
+      case "restarting":
+        return t("正在重启…");
+      default:
+        return "";
+    }
+  });
 
   function setAutomatic(value: boolean): void {
     prefs.autoCheckUpdates = value;
@@ -20,14 +35,22 @@
     <div class="label">
       <span>{t("版本")} {device.version}</span>
       <span class="meta" aria-live="polite">
-        {#if status === "checking"}{t("正在检查…")}
+        {#if updates.installing}{progressText}
+        {:else if updates.installError && typeof status === "object"}{t("自动更新失败，请重试或手动下载")} · <a href={status.url} target="_blank" rel="noreferrer">{t("前往下载")}</a>
+        {:else if status === "checking"}{t("正在检查…")}
         {:else if status === "failed"}{t("检查失败，请稍后再试")}
-        {:else if status !== "idle" && status.latest}{t("有新版本 {0}", status.latest)} · <a href={status.url} target="_blank" rel="noreferrer">{t("前往下载")}</a>
+        {:else if status !== "idle" && status.latest}{t("有新版本 {0}", status.latest)} · <a href={status.url} target="_blank" rel="noreferrer">{canInstall ? t("更新说明") : t("前往下载")}</a>
         {:else if status !== "idle"}{t("已是最新版本")}
         {/if}
       </span>
     </div>
-    <button onclick={() => updates.check()} disabled={status === "checking"}>{t("检查更新")}</button>
+    {#if canInstall}
+      <button onclick={() => updates.install()} disabled={updates.installing}>
+        {updates.installError ? t("重新更新") : t("立即更新")}
+      </button>
+    {:else}
+      <button onclick={() => updates.check()} disabled={status === "checking" || updates.installing}>{t("检查更新")}</button>
+    {/if}
   </div>
   <div class="row">
     <div class="label">

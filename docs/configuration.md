@@ -39,7 +39,7 @@ It accepts installed families and imported font files; Auto restores the runtime
 Volume, mute, scaling and FPS controls in the game overlay apply immediately.
 Snapshots include the independent game data directory and registry. Automatic backups default to on with five retained copies; retention choices are three, five or ten and exclude manual backups.
 
-Automatic update checks default to on (`autoCheckUpdates`). The launcher checks the latest GitHub release in the foreground library at most once every 24 hours. Settings shows the installed version and offers manual checks even when automatic checks are off. A newer release is offered as a download link.
+Automatic update checks default to on (`autoCheckUpdates`). The launcher checks the latest GitHub release in the foreground library at most once every 24 hours. Settings shows the installed version and offers manual checks even when automatic checks are off. A newer release is offered as a download link, and on macOS from a writable `.app` bundle it can also download, verify its Ed25519 signature, replace the bundle and relaunch in place.
 
 On iOS, JIT warnings are shown by default; "Don't remind me again" on the library banner persistently hides both the banner and game-launch warnings (`hideJitWarnings`).
 LiveContainer folder-import guidance is shown once and records `liveContainerImportHintSeen` when displayed.

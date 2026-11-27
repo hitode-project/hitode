@@ -124,6 +124,8 @@ jobs:
           codesign --verify --strict "$mount/Hitode.app"
           python3 tools/privacy/scan.py --artifacts "$mount"
           hdiutil detach -quiet "$mount"
+          COPYFILE_DISABLE=1 tar -czf "$RUNNER_TEMP/dist/Hitode-$VERSION-macos-arm64.app.tar.gz" \
+            -C "$stage" Hitode.app
       - name: Collect license texts
         if: matrix.platform == 'macos'
         run: |
@@ -222,8 +224,40 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  sign-macos:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos
+          path: ${{ runner.temp }}/macos
+      - name: Sign the macOS update archive
+        env:
+          MACOS_UPDATE_SIGNING_KEY: ${{ secrets.MACOS_UPDATE_SIGNING_KEY }}
+        run: |
+          version="${TAG#v}"
+          mkdir -p "$RUNNER_TEMP/dist"
+          python3 tools/release/sign_macos_update.py \
+            --tag "$TAG" \
+            --archive "$RUNNER_TEMP/macos/Hitode-$version-macos-arm64.app.tar.gz" \
+            --sig "$RUNNER_TEMP/dist/Hitode-$version-macos-arm64.app.tar.gz.sig" \
+            --key-env MACOS_UPDATE_SIGNING_KEY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-signed
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 14
+
   draft:
-    needs: [build, sign-android]
+    needs: [build, sign-android, sign-macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -241,7 +275,8 @@ jobs:
           version="${TAG#v}"
           out="$RUNNER_TEMP/release"
           mkdir -p "$out"
-          cp "$RUNNER_TEMP"/artifacts/macos/* "$RUNNER_TEMP"/artifacts/ios/* "$RUNNER_TEMP"/artifacts/android-signed/* "$out/"
+          cp "$RUNNER_TEMP"/artifacts/macos/* "$RUNNER_TEMP"/artifacts/macos-signed/* \
+            "$RUNNER_TEMP"/artifacts/ios/* "$RUNNER_TEMP"/artifacts/android-signed/* "$out/"
           python3 tools/privacy/scan.py --artifacts "$out/Hitode-$version-android-arm64.apk" \
             "$out/Hitode-$version-licenses.zip"
           (cd "$out" && sha256sum Hitode-* wine-11.0.tar.xz > SHA256SUMS.txt && cat SHA256SUMS.txt)
