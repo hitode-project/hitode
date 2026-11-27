@@ -13,6 +13,8 @@ mod flags;
 mod inline;
 mod resident;
 
+#[cfg(test)]
+pub(crate) use cost::{CoreClass, with_core_class};
 #[cfg(any(native, test))]
 #[allow(unused_imports)]
 pub(crate) use resident::{access_stub, access_stub_for};
@@ -642,7 +644,9 @@ fn emit<'a>(
     for (b_idx, block) in func.blocks.iter().enumerate() {
         let mut seg_first: Option<usize> = None;
         let mut seg_vals: Vec<Value> = Vec::new();
-        for (i_idx, &(res, op)) in block.insts.iter().enumerate() {
+        let mut i_idx = 0;
+        while i_idx < block.insts.len() {
+            let (res, op) = block.insts[i_idx];
             if let Some(v) = res
                 && func.deferred_fp.contains(&v)
             {
@@ -650,24 +654,61 @@ fn emit<'a>(
                     seg_first = Some(i_idx);
                 }
                 seg_vals.push(v);
-            } else if let Op::FpValidate { values, strict } = op {
-                let count = values.iter().flatten().count();
-                let strict_muls = strict.count_ones() as usize;
+                i_idx += 1;
+                continue;
+            }
+            if matches!(op, Op::FpValidate { .. }) {
+                let run_start = i_idx;
+                let mut total_count = 0usize;
+                let mut total_strict = 0usize;
+                while i_idx < block.insts.len() {
+                    let Op::FpValidate { values, strict } = block.insts[i_idx].1 else {
+                        break;
+                    };
+                    total_count += values.iter().flatten().count();
+                    total_strict += strict.count_ones() as usize;
+                    i_idx += 1;
+                }
                 // Shared x87 segments check FPSR themselves (`x87_rn_fpcr`).
-                let fpsr_eligible =
-                    !has_directed_rounding && !func.deferred_fp.is_empty() && !func_uses_afp_sse;
-                let strategy =
-                    cost::select_validation(core_class, count, strict_muls, fpsr_eligible, false);
-                fp_validate_strategies.insert((b_idx, i_idx), strategy);
-                if strategy == cost::ValidationStrategy::FpsrMask {
+                let fpsr_eligible = seg_first.is_some()
+                    && !has_directed_rounding
+                    && !func.deferred_fp.is_empty()
+                    && !func_uses_afp_sse;
+                let whole = cost::select_validation(
+                    core_class,
+                    total_count,
+                    total_strict,
+                    fpsr_eligible,
+                    false,
+                );
+                if whole == cost::ValidationStrategy::FpsrMask {
                     if let Some(first_i) = seg_first {
                         fpsr_clear_before.insert((b_idx, first_i));
                     }
                     fpsr_deferred_ops.extend(seg_vals.iter().copied());
+                    fp_validate_strategies.insert((b_idx, run_start), whole);
+                    for k in (run_start + 1)..i_idx {
+                        fp_validate_strategies
+                            .insert((b_idx, k), cost::ValidationStrategy::StaticProof);
+                    }
+                } else {
+                    for (offset, &(_, chunk_op)) in block.insts[run_start..i_idx].iter().enumerate()
+                    {
+                        let Op::FpValidate { values, strict } = chunk_op else {
+                            unreachable!();
+                        };
+                        let count = values.iter().flatten().count();
+                        let strict_muls = strict.count_ones() as usize;
+                        let strategy =
+                            cost::select_validation(core_class, count, strict_muls, false, false);
+                        fp_validate_strategies.insert((b_idx, run_start + offset), strategy);
+                    }
                 }
                 seg_first = None;
                 seg_vals.clear();
+                continue;
             }
+            i_idx += 1;
         }
     }
     let env_miss = resident.then(|| asm.label());
@@ -1051,6 +1092,7 @@ fn emit<'a>(
                 e.uses_fp_state = true;
                 if e.has_afp && e.live_mxcsr {
                     fp_state::emit_fold_fpsr(&mut e.asm, T, U, S2);
+                    e.set_fpcr_imm(0);
                 }
                 e.asm.emit(msr_fpsr(Reg::ZR));
             }
@@ -2789,8 +2831,11 @@ impl<'a> Emitter<'a> {
                         let fail = self.fail();
                         self.asm.emit(mrs_fpsr(T));
                         runtime::emit_inc_fp_counter(&mut self.asm, runtime::FP_FPSR_READS, 1, U);
-                        self.asm
-                            .emit(and_imm(W, T, T, u64::from(fp_state::FPSR_CHECK_MASK)));
+                        // 0x8f is not a logical immediate.
+                        self.asm.emit_all(&[
+                            movz(W, U, fp_state::FPSR_CHECK_MASK as u16, 0),
+                            and(W, T, T, U, Lsl, 0),
+                        ]);
                         self.asm.cbz(W, true, T, fail);
                     }
                     cost::ValidationStrategy::VectorWitness

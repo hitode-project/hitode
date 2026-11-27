@@ -4878,3 +4878,141 @@ fn resident_shared_x87_segments_match_the_interpreter_on_nans_and_invalid_conver
         }
     }
 }
+
+// spec: A64-OPT-4, A64-OPT-5, A64-OPT-6, A64F-FP-5
+#[test]
+fn cortex_fpsr_mask_validation_lowers_and_matches_interpreter() {
+    use crate::translate::opt::back::{CoreClass, with_core_class};
+
+    // 3-product sum: 3 strict Muls + 1 Add sink -> 1 Op::FpValidate chunk (4, 3).
+    // Selects FpsrMask on CortexBig (witness_cost = 12 > 8) and CortexLittle (16 > 14).
+    let dot3 = Image::loop_body(|a, head, _| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fmul(qword_ptr(esi + 8)).unwrap();
+        a.fld(qword_ptr(esi + 16)).unwrap();
+        a.fmul(qword_ptr(esi + 24)).unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fld(qword_ptr(esi + 32)).unwrap();
+        a.fmul(qword_ptr(esi + 40)).unwrap();
+        a.faddp(st1, st0).unwrap();
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.add(esi, 48).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+        // Zero popped empty x87 slots so Trial::same_state compares identical raw bytes.
+        a.fldz().unwrap();
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+        a.fstp(st0).unwrap();
+    });
+
+    // 5-product sum: 5 strict Muls + 1 Add sink -> 2 consecutive Op::FpValidate chunks.
+    let dot5 = Image::loop_body(|a, head, _| {
+        a.fld(qword_ptr(esi)).unwrap();
+        a.fmul(qword_ptr(esi + 8)).unwrap();
+        for pair in 1..5u32 {
+            a.fld(qword_ptr(esi + pair * 16)).unwrap();
+            a.fmul(qword_ptr(esi + pair * 16 + 8)).unwrap();
+            a.faddp(st1, st0).unwrap();
+        }
+        a.fstp(qword_ptr(edi)).unwrap();
+        a.add(esi, 80).unwrap();
+        a.add(edi, 8).unwrap();
+        latch(a, head);
+        a.fldz().unwrap();
+        a.fldz().unwrap();
+        a.fstp(st0).unwrap();
+        a.fstp(st0).unwrap();
+    });
+
+    for class in [CoreClass::CortexBig, CoreClass::CortexLittle] {
+        with_core_class(class, || {
+            let mut state = initial(4);
+            state.x87.control = 0x027f;
+            state.x87.status = 0x20;
+
+            let mut trial = Trial::new(&dot3, &state, format!("{class:?} dot3 normal"), &[], |m| {
+                let rows = [
+                    [1.5f64, 2.0, -3.0, 0.5, 4.0, 0.25],
+                    [0.0, 10.0, 2.0, -2.0, 1.0, 4.0],
+                    [7.25, 1.25, -0.5, 6.0, 3.0, -2.0],
+                    [-1.0, 1.0, 2.0, 0.5, 0.0, 9.0],
+                ];
+                for (r, row) in rows.iter().enumerate() {
+                    for (c, v) in row.iter().enumerate() {
+                        m.write(DATA + (r * 6 + c) as u32 * 8, &v.to_le_bytes())
+                            .unwrap();
+                    }
+                }
+            });
+            assert!(trial.try_install_at(state.clone()));
+            assert_eq!(trial.compare(8192).0, RunOutcome::ReachedStop);
+            let native = trial.live.native.as_ref().unwrap();
+            assert!(native.resident_arrivals(dot3.head).unwrap() > 0);
+            assert_eq!(native.diagnostics.resident_cold_exits, 0);
+            assert!(
+                native.diagnostics.fp.fpsr_reads > 0,
+                "{class:?} dot3 should execute FpsrMask validation"
+            );
+
+            // Overflow, underflow, and NaN must trigger cold recovery and match Tier-0.
+            for (label, bad) in [
+                ("overflow", [1e308f64, 1e308, 1.0, 1.0, 1.0, 1.0]),
+                ("underflow", [1e-300f64, 1e-300, 1.0, 1.0, 1.0, 1.0]),
+                ("nan", [f64::NAN, 1.0, 1.0, 1.0, 1.0, 1.0]),
+            ] {
+                let mut trial_bad =
+                    Trial::new(&dot3, &state, format!("{class:?} dot3 {label}"), &[], |m| {
+                        let rows = [
+                            [1.5f64, 2.0, -3.0, 0.5, 4.0, 0.25],
+                            bad,
+                            [2.0, 3.0, 1.0, 4.0, 5.0, 0.5],
+                            [3.0, 1.0, 2.0, 2.0, 1.0, 1.0],
+                        ];
+                        for (r, row) in rows.iter().enumerate() {
+                            for (c, v) in row.iter().enumerate() {
+                                m.write(DATA + (r * 6 + c) as u32 * 8, &v.to_le_bytes())
+                                    .unwrap();
+                            }
+                        }
+                    });
+                assert!(trial_bad.try_install_at(state.clone()));
+                assert_eq!(trial_bad.compare(8192).0, RunOutcome::ReachedStop);
+                assert!(
+                    trial_bad
+                        .live
+                        .native
+                        .as_ref()
+                        .unwrap()
+                        .diagnostics
+                        .resident_cold_exits
+                        > 0,
+                    "{class:?} dot3 {label} must bail on FPSR sticky bit"
+                );
+            }
+
+            // Multi-chunk Op::FpValidate segment must clear FPSR at segment start and match Tier-0.
+            let mut trial5 = Trial::new(
+                &dot5,
+                &state,
+                format!("{class:?} dot5 multi-chunk"),
+                &[],
+                |m| {
+                    for r in 0..4u32 {
+                        for c in 0..10u32 {
+                            let val = 1.0 + f64::from(r) * 0.5 + f64::from(c) * 0.25;
+                            m.write(DATA + (r * 10 + c) * 8, &val.to_le_bytes())
+                                .unwrap();
+                        }
+                    }
+                },
+            );
+            assert!(trial5.try_install_at(state.clone()));
+            assert_eq!(trial5.compare(8192).0, RunOutcome::ReachedStop);
+            let native5 = trial5.live.native.as_ref().unwrap();
+            assert!(native5.resident_arrivals(dot5.head).unwrap() > 0);
+            assert_eq!(native5.diagnostics.resident_cold_exits, 0);
+            assert!(native5.diagnostics.fp.fpsr_reads > 0);
+        });
+    }
+}

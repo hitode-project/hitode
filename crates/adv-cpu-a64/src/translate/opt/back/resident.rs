@@ -174,6 +174,9 @@ impl Emitter<'_> {
                 });
             }
             self.asm.adr(X2, site);
+            if self.modifies_fpcr && !self.has_afp {
+                fp_state::emit_restore_host_fpcr(&mut self.asm, T, U);
+            }
             self.asm.emit_all(&[
                 movz(W, X4, kind as u16, 0),
                 ldr(X, T, RT, RESIDENT_ACCESS),
