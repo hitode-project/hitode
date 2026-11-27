@@ -3,7 +3,7 @@ use crate::argument::CallError;
 use adv_abi::{GuestPtr, Registry, guest::check_range, win32};
 use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_device::{AudioControl, AudioEvent, RingState, ring::RingConfig};
-use adv_machine::{Conv, Env, Machine, Objects, Outcome};
+use adv_machine::{Conv, Env, Machine, Objects, Outcome, Wait};
 use adv_os::Heaps;
 use adv_os::com::{Com, ComIdentity, QueryError};
 use std::collections::BTreeMap;
@@ -568,6 +568,42 @@ pub struct AudioSourceStatus {
     pub locked: u64,
 }
 
+enum CreateFailure {
+    Argument,
+    InvalidObject,
+    Uninitialized,
+    Aggregation,
+    Description,
+    Flags,
+    Format,
+    Size,
+    Effects,
+    SourceId,
+    ComAllocation,
+    GuestReservation,
+    SharedMapping,
+    PcmInitialization,
+    MixerAdmission,
+}
+
+const CREATE_FAILURES: [&str; CreateFailure::MixerAdmission as usize + 1] = [
+    "argument",
+    "invalid_object",
+    "uninitialized",
+    "aggregation",
+    "description",
+    "flags",
+    "format",
+    "size",
+    "effects",
+    "source_id",
+    "com_allocation",
+    "guest_reservation",
+    "shared_mapping",
+    "pcm_initialization",
+    "mixer_admission",
+];
+
 pub struct Sound {
     pub enabled: bool,
     tables: [u32; INTERFACES.len()],
@@ -575,6 +611,7 @@ pub struct Sound {
     com: Com,
     /// Non-owning iteration index; payload and all references live in Objects.
     buffer_ids: BTreeMap<u64, ComIdentity<Object>>,
+    create_failures: [u64; CREATE_FAILURES.len()],
     pub audio: AudioControl,
     owner: u32,
     next_audio_id: u64,
@@ -612,6 +649,10 @@ pub struct Events {
     pub signal: fn(&mut Env<'_>, u32) -> Result<(), String>,
 }
 impl Sound {
+    pub fn create_buffer_failures(&self) -> impl Iterator<Item = (&'static str, u64)> {
+        CREATE_FAILURES.into_iter().zip(self.create_failures)
+    }
+
     /// A mixer stream id for another front's owned PCM (movie audio).
     pub(crate) fn allocate_audio_id(&mut self) -> Option<u64> {
         let id = self.next_audio_id;
@@ -794,6 +835,7 @@ fn install_audio<B: Backend>(
         listener: Deferred::new(Listener::default()),
         com,
         buffer_ids: BTreeMap::new(),
+        create_failures: [0; CREATE_FAILURES.len()],
         audio,
         owner: m.sys.pid,
         next_audio_id: (u64::from(m.sys.pid) << 32) | 1,
@@ -1192,7 +1234,6 @@ fn empty_fx(e: &mut Env<'_>, pointer: u32, name: &str) -> Result<u32, CallError>
 }
 
 fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
-    e.ext.get::<Sound>().audio.sync_clock(e.sys.clock.now_us());
     let full = e.sys.thunks.get(e.thunk).name.clone();
     let name = full.split("::").last().unwrap();
     let a = e.arg(0);
@@ -1276,6 +1317,9 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
     }
     let com = e.ext.get::<Sound>().com;
     let Some(obj) = com.get::<Object>(&e.sys.objects, a) else {
+        if name == "CreateSoundBuffer" {
+            count_create_failure(e, CreateFailure::InvalidObject);
+        }
         return Ok(INVALID);
     };
     let kind = if a == obj.notify {
@@ -1330,17 +1374,22 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
             return Ok(0);
         }
         if !initialized {
+            if name == "CreateSoundBuffer" {
+                count_create_failure(e, CreateFailure::Uninitialized);
+            }
             return Ok(0x887800aa);
         }
         return match name {
             "CreateSoundBuffer" => {
                 if e.arg(3) != 0 {
+                    count_create_failure(e, CreateFailure::Aggregation);
                     return Ok(0x80040110);
                 }
                 check_range(e.cpu, b, 4, Prot::READ)?;
                 let size = e.cpu.read_u32(b)?;
                 if !matches!(size, 20 | 36) {
                     e.cpu.write_u32(c, 0)?;
+                    count_create_failure(e, CreateFailure::Description);
                     return Ok(INVALID);
                 }
                 check_range(e.cpu, b, size, Prot::READ)?;
@@ -1372,12 +1421,15 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                         | LOC_DEFER
                         | 0x80000);
                 if flags & LOC_DEFER != 0 && flags & 0xc != 0 {
+                    count_create_failure(e, CreateFailure::Flags);
                     return Ok(INVALID); // Deferred and fixed allocation are mutually exclusive.
                 }
                 if flags & (CTRL_3D | MUTE_3D_AT_MAX_DISTANCE) == MUTE_3D_AT_MAX_DISTANCE {
+                    count_create_failure(e, CreateFailure::Flags);
                     return Ok(INVALID);
                 }
                 if unsupported != 0 {
+                    count_create_failure(e, CreateFailure::Flags);
                     adv_abi::warn_unavailable(
                         e,
                         &format!("dsound.dll!{full}"),
@@ -1391,6 +1443,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                 let fp = e.cpu.read_u32(b + 16)?;
                 let primary = flags & 1 != 0;
                 if fx && (!version8 || primary) {
+                    count_create_failure(e, CreateFailure::Effects);
                     return Ok(if !version8 { 0x887800be } else { INVALID });
                 }
                 if fx {
@@ -1398,6 +1451,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                 }
                 let format = if primary {
                     if fp != 0 {
+                        count_create_failure(e, CreateFailure::Format);
                         return Ok(INVALID);
                     }
                     // Each device has one primary buffer, and later requests
@@ -1410,6 +1464,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                             .add_ref::<Object>(&mut e.sys.objects, existing)
                             .is_none()
                         {
+                            count_create_failure(e, CreateFailure::ComAllocation);
                             return Ok(OUT_OF_MEMORY);
                         }
                         e.cpu.write_u32(c, existing)?;
@@ -1419,7 +1474,10 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                 } else {
                     match secondary_format(e.cpu, fp)? {
                         Ok(f) => f,
-                        Err(hr) => return Ok(hr),
+                        Err(hr) => {
+                            count_create_failure(e, CreateFailure::Format);
+                            return Ok(hr);
+                        }
                     }
                 };
                 let format_bytes = if primary {
@@ -1437,19 +1495,23 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     && flags & CTRL_3D != 0
                     && (format.channels != 1 || flags & CTRL_PAN != 0)
                 {
+                    count_create_failure(e, CreateFailure::Format);
                     return Ok(INVALID);
                 }
                 if (!primary && (len == 0 || len > DSBSIZE_MAX)) || (primary && len != 0) {
+                    count_create_failure(e, CreateFailure::Size);
                     return Ok(INVALID);
                 }
                 // Like Windows, a length between whole frames rounds up to one.
                 let len = len.next_multiple_of(format.align().max(1));
                 if fx {
                     if e.cpu.read_u32(fp + 8)? != format.rate * format.align() {
+                        count_create_failure(e, CreateFailure::Format);
                         return Ok(0x88780064); // DSERR_BADFORMAT, no publication.
                     }
                     // Effects take 8- or 16-bit PCM, as on Windows.
                     if !matches!(format.bits, 8 | 16) || format.float {
+                        count_create_failure(e, CreateFailure::Effects);
                         adv_abi::warn_unavailable(
                             e,
                             &format!("dsound.dll!{full}"),
@@ -1463,12 +1525,14 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     if u64::from(len) * 1000
                         < u64::from(format.rate) * u64::from(format.align()) * 150
                     {
+                        count_create_failure(e, CreateFailure::Effects);
                         return Ok(0x887800b4); // DSERR_BUFFERTOOSMALL; preserve output.
                     }
                     e.cpu.write_u32(c, 0)?;
                 }
                 let audio_id = e.ext.get::<Sound>().next_audio_id;
                 let Some(next_audio_id) = e.ext.get::<Sound>().next_source_id() else {
+                    count_create_failure(e, CreateFailure::SourceId);
                     return Ok(OUT_OF_MEMORY);
                 };
                 let Some(ptr) = object(
@@ -1477,8 +1541,10 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     flags & 0x100 != 0,
                     spatial_interface(flags),
                     primary,
-                )?
+                )
+                .inspect_err(|_| count_create_failure(e, CreateFailure::ComAllocation))?
                 else {
+                    count_create_failure(e, CreateFailure::ComAllocation);
                     return Ok(OUT_OF_MEMORY);
                 };
                 let (base, region) = if primary {
@@ -1486,12 +1552,14 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                 } else {
                     let mapped_len = adv_machine::vm::align_up(len, 4096);
                     let Some(base) = e.sys.vm.reserve(mapped_len) else {
+                        count_create_failure(e, CreateFailure::GuestReservation);
                         release(e, ptr);
                         return Ok(OUT_OF_MEMORY);
                     };
                     let region = match e.cpu.map_shared_audio(base, mapped_len) {
                         Ok(region) => region,
                         Err(error) => {
+                            count_create_failure(e, CreateFailure::SharedMapping);
                             let _ = e.sys.vm.free(e.cpu, base);
                             release(e, ptr);
                             return Err(CallError::Fail(format!("shared audio mapping: {error}")));
@@ -1502,6 +1570,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                 if !primary && format.bits == 8 {
                     let silence = vec![128; len as usize];
                     if let Err(error) = e.cpu.write(base, &silence) {
+                        count_create_failure(e, CreateFailure::PcmInitialization);
                         e.sys
                             .vm
                             .free(e.cpu, base)
@@ -1511,10 +1580,23 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     }
                 }
                 let s = e.ext.get_mut::<Sound>();
+                let spatial = (!primary && flags & CTRL_3D != 0)
+                    .then(|| Deferred::new(Source::new(format.rate)));
+                let gain = spatial
+                    .as_ref()
+                    .and_then(|source| {
+                        spatial::output(
+                            &s.listener.applied,
+                            &source.applied,
+                            0,
+                            flags & MUTE_3D_AT_MAX_DISTANCE != 0,
+                        )
+                    })
+                    .map_or([1.0; 2], |output| output.gains);
                 let voice = region
                     .as_ref()
                     .map(|region| {
-                        s.audio.add_ring(
+                        s.audio.add_ring_with_gain(
                             audio_id,
                             RingConfig {
                                 view: region.read_alias.clone(),
@@ -1526,6 +1608,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                                 output_rate: 44100,
                                 notifications: Vec::new(),
                             },
+                            gain,
                         )
                     })
                     .transpose();
@@ -1535,6 +1618,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                         if let Some(trace) = s.trace.as_mut() {
                             let _ = writeln!(trace, "create-buffer rejected: {error}");
                         }
+                        count_create_failure(e, CreateFailure::MixerAdmission);
                         // add_ring publishes nothing on failure, so there is no
                         // callback-owned alias requiring deferred retirement.
                         if base != 0 {
@@ -1581,8 +1665,7 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     frequency: format.rate,
                     volume: 0,
                     pan: 0,
-                    spatial: (!primary && flags & CTRL_3D != 0)
-                        .then(|| Deferred::new(Source::new(format.rate))),
+                    spatial,
                     playing: false,
                     looping: false,
                     retuned: false,
@@ -1598,18 +1681,11 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     trace_generation: 0,
                     trace_chunks: None,
                 });
-                let buffer = com
-                    .get_identity(&e.sys.objects, id)
-                    .and_then(|object| object.buffer.as_ref())
-                    .unwrap();
-                if buffer.spatial.is_some() {
-                    s.audio
-                        .set_stereo_gain(audio_id, mix(&s.listener.applied, buffer).0);
-                }
                 s.buffer_ids.insert(audio_id, id);
                 if primary {
                     // The device keeps its primary buffer at zero references.
                     if !com.retain_internal(&mut e.sys.objects, id) {
+                        count_create_failure(e, CreateFailure::ComAllocation);
                         release(e, ptr);
                         return Ok(OUT_OF_MEMORY);
                     }
@@ -1678,40 +1754,15 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     return Ok(OUT_OF_MEMORY);
                 };
                 let s = e.ext.get_mut::<Sound>();
-                let voice = match s.audio.add_ring(
-                    audio_id,
-                    RingConfig {
-                        view: sample_storage.read_alias.clone(),
-                        bytes: orig_len,
-                        channels: orig_format.channels,
-                        bits: orig_format.bits,
-                        float: orig_format.float,
-                        frequency: orig_format.rate,
-                        output_rate: 44100,
-                        notifications: Vec::new(),
-                    },
-                ) {
-                    Ok(voice) => voice,
-                    Err(error) => {
-                        if let Some(trace) = s.trace.as_mut() {
-                            let _ = writeln!(trace, "duplicate-buffer rejected: {error}");
-                        }
-                        release(e, ptr);
-                        return Ok(OUT_OF_MEMORY);
-                    }
-                };
-                s.next_audio_id = next_audio_id;
-                if let Some(record) = s.storage_records.get_mut(&sample_storage.id) {
-                    record.live_buffers += 1;
-                }
-                let id = com.identity::<Object>(&e.sys.objects, ptr).unwrap();
                 let orig_described = com
                     .get_identity(&e.sys.objects, orig_id)
                     .and_then(|o| o.buffer.as_ref())
                     .map_or_else(|| orig_format.bytes(), |b| b.described.clone());
-                let dup_buffer = Buffer {
+                let storage_id = sample_storage.id;
+                let view = sample_storage.read_alias.clone();
+                let mut dup_buffer = Buffer {
                     audio_id,
-                    voice: Some(voice),
+                    voice: None,
                     playback_clock: s.playback_clock.clone(),
                     generation: 0,
                     storage: Some(sample_storage),
@@ -1739,11 +1790,35 @@ fn result(e: &mut Env<'_>) -> Result<u32, CallError> {
                     trace_generation: 0,
                     trace_chunks: None,
                 };
-                s.audio
-                    .set_stereo_gain(audio_id, mix(&s.listener.applied, &dup_buffer).0);
-                if orig_freq != orig_format.rate {
-                    s.audio.set_frequency(audio_id, orig_freq)?;
+                let voice = match s.audio.add_ring_with_gain(
+                    audio_id,
+                    RingConfig {
+                        view,
+                        bytes: orig_len,
+                        channels: orig_format.channels,
+                        bits: orig_format.bits,
+                        float: orig_format.float,
+                        frequency: orig_freq,
+                        output_rate: 44100,
+                        notifications: Vec::new(),
+                    },
+                    mix(&s.listener.applied, &dup_buffer).0,
+                ) {
+                    Ok(voice) => voice,
+                    Err(error) => {
+                        if let Some(trace) = s.trace.as_mut() {
+                            let _ = writeln!(trace, "duplicate-buffer rejected: {error}");
+                        }
+                        release(e, ptr);
+                        return Ok(OUT_OF_MEMORY);
+                    }
+                };
+                s.next_audio_id = next_audio_id;
+                if let Some(record) = s.storage_records.get_mut(&storage_id) {
+                    record.live_buffers += 1;
                 }
+                dup_buffer.voice = Some(voice);
+                let id = com.identity::<Object>(&e.sys.objects, ptr).unwrap();
                 com.get_identity_mut(&mut e.sys.objects, id).unwrap().buffer = Some(dup_buffer);
                 s.buffer_ids.insert(audio_id, id);
                 e.cpu.write_u32(c, ptr)?;
@@ -2637,10 +2712,31 @@ fn retune(audio: &AudioControl, buf: &mut Buffer, rate: u32, now: u64) -> bool {
     buf.generation = generation;
     true
 }
+fn count_create_failure(e: &mut Env<'_>, reason: CreateFailure) {
+    e.ext.get_mut::<Sound>().create_failures[reason as usize] += 1;
+}
+
 fn call(e: &mut Env<'_>) -> Outcome {
+    let now = e.sys.clock.now_us();
+    let audio = &e.ext.get::<Sound>().audio;
+    audio.sync_clock(now);
+    let method = &e.sys.thunks.get(e.thunk).name;
+    let create = method.ends_with("::CreateSoundBuffer");
+    if (create || method.ends_with("::DuplicateSoundBuffer")) && !audio.can_insert_source() {
+        return Outcome::Block {
+            wait: Wait::Until(now + 1000),
+            then: Box::new(|e, _| call(e)),
+            allow_time_skip: false,
+        };
+    }
     match result(e) {
         Ok(v) => Outcome::Return(v),
-        Err(err) => err.outcome(e),
+        Err(err) => {
+            if create && matches!(&err, CallError::Argument(_)) {
+                count_create_failure(e, CreateFailure::Argument);
+            }
+            err.outcome(e)
+        }
     }
 }
 
@@ -2821,6 +2917,7 @@ mod tests {
     use adv_machine::{Clock, Object as WaitObject};
     mod deferred;
     mod empty_fx;
+    mod lifetime;
     const DATA: u32 = 0x500000;
     const STACK: u32 = 0x600000;
 
@@ -2938,6 +3035,16 @@ mod tests {
     }
 
     fn invoke(m: &mut Machine<JitCpu>, name: &str, args: &[u32]) -> u32 {
+        m.ext.get::<Sound>().audio.sync_clock(m.sys.clock.now_us());
+        with_call(m, name, args, result).unwrap()
+    }
+
+    fn with_call<T>(
+        m: &mut Machine<JitCpu>,
+        name: &str,
+        args: &[u32],
+        handler: impl FnOnce(&mut Env<'_>) -> T,
+    ) -> T {
         m.resolve_import("dsound.dll", name).unwrap();
         let thunk = m
             .sys
@@ -2951,14 +3058,13 @@ mod tests {
         for (i, &arg) in args.iter().enumerate() {
             m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
         }
-        result(&mut Env {
+        handler(&mut Env {
             context: m.sys.current,
             cpu: &mut m.cpu,
             sys: &mut m.sys,
             ext: &mut m.ext,
             thunk,
         })
-        .unwrap()
     }
     fn device(m: &mut Machine<JitCpu>) -> u32 {
         assert_eq!(invoke(m, "DirectSoundCreate", &[0, DATA + 128, 0]), 0);
@@ -3101,6 +3207,10 @@ mod tests {
                 assert_ne!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
             }
         }
+        assert_eq!(
+            m.ext.get::<Sound>().create_failures[CreateFailure::Size as usize],
+            2
+        );
     }
     // spec: PERS-SCOPE-12
     #[test]
@@ -3740,21 +3850,15 @@ mod tests {
         for (i, value) in [20, 0x100, 400, 0, DATA + 64].into_iter().enumerate() {
             m.cpu.write_u32(DATA + i as u32 * 4, value).unwrap();
         }
-        let mut created = Vec::new();
-        for _ in 0..256 {
-            assert_eq!(
-                invoke(
-                    &mut m,
-                    "IDirectSound8::CreateSoundBuffer",
-                    &[d, DATA, DATA + 128, 0]
-                ),
-                0
-            );
-            created.push(m.cpu.read_u32(DATA + 128).unwrap());
-        }
         let next_header = heap_next(&mut m);
         let next_mapping = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RW).unwrap();
         m.sys.vm.free(&mut m.cpu, next_mapping).unwrap();
+        let audio = m.ext.get::<Sound>().audio.clone();
+        let _reader = audio.stream().device_reader(44100, 2).unwrap();
+        for _ in 0..7000 {
+            audio.set_gain(0, 1.0);
+        }
+        // Reject mixer insertion directly to exercise cleanup after allocation.
         for _ in 0..32 {
             assert_eq!(
                 invoke(
@@ -3765,7 +3869,7 @@ mod tests {
                 OUT_OF_MEMORY
             );
             assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
-            assert_eq!(m.sys.objects.object_count(), 257);
+            assert_eq!(m.sys.objects.object_count(), 1);
             assert_eq!(heap_next(&mut m), next_header);
             assert!(m.sys.vm.region(next_mapping).is_none());
             assert!(m.cpu.read_u8(next_mapping).is_err());
@@ -3773,15 +3877,13 @@ mod tests {
             assert_eq!(probe, next_mapping);
             m.sys.vm.free(&mut m.cpu, probe).unwrap();
         }
-        for pointer in created {
-            assert_eq!(
-                invoke(&mut m, "IDirectSoundBuffer8::Release", &[pointer]),
-                0
-            );
-        }
-        pump(&mut m).unwrap();
-        assert!(m.ext.get::<Sound>().buffer_ids.is_empty());
-        assert!(m.ext.get::<Sound>().pending_release.is_empty());
+        let sound = m.ext.get::<Sound>();
+        assert!(sound.buffer_ids.is_empty());
+        assert!(sound.pending_release.is_empty());
+        assert_eq!(
+            sound.create_failures[CreateFailure::MixerAdmission as usize],
+            32
+        );
     }
 
     // spec: DEV-AUDIO-11

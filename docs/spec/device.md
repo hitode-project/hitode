@@ -128,6 +128,7 @@ With live output, the mixer MUST stage up to 30 ms or half the buffer, and write
 ### DEV-AUDIO-2 Control delivery
 
 **Rule**: Audio command queues MUST be bounded without losing stop or release requests. Notifications MUST return through machine-owned events.
+DirectSound buffer creation and duplication MUST wait for capacity in the command queue. A duplicate MUST publish its initial frequency and gain with its voice.
 Device reconnection MUST retain refill notifications crossed while reanchoring a playing PCM ring.
 An explicit stop MUST discard that source's pending samples. A running source MUST NOT delay the start of another source at the same sample rate.
 **Verification**: Test
@@ -176,6 +177,7 @@ Unmatched libraries MUST execute their guest implementations.
 ### DEV-AUDIO-7 DirectSound buffer sizes
 
 **Rule**: `CreateSoundBuffer` MUST accept nonempty secondary buffers up to `DSBSIZE_MAX` (0x0FFFFFFF) bytes that are whole blocks of their format, and MUST reject other sizes with `DSERR_INVALIDPARAM`.
+Software buffer creation MUST NOT fail solely because the mixer has registered a fixed number of sources.
 **Verification**: Test
 **Basis**: Windows DirectSound limits; games create static buffers holding whole tracks.
 

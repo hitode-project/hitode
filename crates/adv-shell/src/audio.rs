@@ -47,24 +47,24 @@ impl AudioOutput {
         }
     }
 
-    pub fn json(&self) -> String {
+    pub fn json_fields(&self) -> String {
         #[cfg(host_view)]
         {
             use std::sync::atomic::Ordering::Relaxed;
             let Some(output) = &self.output else {
-                return "{\"device_requested\": false, \"device_running\": false}".into();
+                return "\"device_requested\": false, \"device_running\": false".into();
             };
             let metrics = output.metrics();
             format!(
                 concat!(
-                    "{{\"device_requested\": true, \"device_running\": {}, ",
+                    "\"device_requested\": true, \"device_running\": {}, ",
                     "\"starts\": {}, \"stops\": {}, \"callbacks\": {}, ",
                     "\"non_silent_samples\": {}, \"lock_misses\": {}, ",
                     "\"device_errors\": {}, \"device_changes\": {}, ",
                     "\"device_sample_rate\": {}, \"device_channels\": {}, ",
                     "\"output_frames\": {}, \"max_callback_frames\": {}, ",
                     "\"native_clock_callbacks\": {}, \"device_consumed_frames\": {}, \"device_queued_frames\": {}, ",
-                    "\"hardware_muted\": {}, \"capture_dropped\": {}}}"
+                    "\"hardware_muted\": {}, \"capture_dropped\": {}"
                 ),
                 output.is_running(),
                 metrics.starts.load(Relaxed),
@@ -85,5 +85,7 @@ impl AudioOutput {
                 metrics.capture_dropped.load(Relaxed)
             )
         }
+        #[cfg(not(host_view))]
+        "\"device_requested\": false, \"device_running\": false".into()
     }
 }

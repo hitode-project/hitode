@@ -1,7 +1,7 @@
 //! DirectSound on the Wine userland: the built-in stack's front as a PE image
 //! in place of Wine's dsound.dll, mixing on the host over the session's
 //! audio stream, so no guest thread's scheduling paces playback.
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use adv_abi::dll::{Export, ModuleImage};
 use adv_abi::{Conv, Registry};
@@ -9,6 +9,20 @@ use adv_cpu::backend::Backend;
 use adv_machine::{Machine, Outcome};
 
 pub(super) const MODULE: &str = "dsound.dll";
+
+impl super::session::Session {
+    pub fn directsound_create_failures(&self) -> BTreeMap<&'static str, u64> {
+        let mut failures = BTreeMap::new();
+        self.debug_processes(|machine| {
+            if let Some(sound) = machine.ext.try_get::<adv_dx::dsound::Sound>() {
+                for (reason, count) in sound.create_buffer_failures() {
+                    *failures.entry(reason).or_insert(0) += count;
+                }
+            }
+        });
+        failures
+    }
+}
 
 /// Wine's dsound.spec exports at their ordinals; games import some by ordinal.
 const EXPORTS: [(&str, u16); 12] = [
