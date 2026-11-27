@@ -1014,6 +1014,23 @@ impl Device {
                     if f.is_bc() && base.texture_compression_bc == 0 {
                         caps = FormatCaps::empty();
                     }
+                    if f.is_bc()
+                        && caps.contains(FormatCaps::SAMPLED)
+                        && instance
+                            .get_physical_device_image_format_properties(
+                                physical,
+                                formats::vk(f),
+                                vk::ImageType::TYPE_3D,
+                                vk::ImageTiling::OPTIMAL,
+                                vk::ImageUsageFlags::SAMPLED
+                                    | vk::ImageUsageFlags::TRANSFER_SRC
+                                    | vk::ImageUsageFlags::TRANSFER_DST,
+                                vk::ImageCreateFlags::empty(),
+                            )
+                            .is_ok()
+                    {
+                        caps |= FormatCaps::BC_VOLUME;
+                    }
                     if f == Format::Bgra4Unorm && !plan.use_4444 {
                         caps = FormatCaps::empty();
                     }

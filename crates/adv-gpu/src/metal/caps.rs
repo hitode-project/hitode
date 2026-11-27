@@ -180,6 +180,7 @@ const FORMATS: &[Format] = &[
     Format::B5g6r5Unorm,
     Format::Bgr5a1Unorm,
     Format::Bgra4Unorm,
+    Format::Abgr4Unorm,
     Format::Rgb10a2Unorm,
     Format::R16Float,
     Format::Rg16Float,
@@ -210,7 +211,7 @@ fn format_caps(
     match f {
         Format::Nv12 => C::SAMPLED | C::FILTERED | C::PRESENTABLE,
         Format::P010 | Format::Bgra4Unorm => C::empty(),
-        Format::B5g6r5Unorm | Format::Bgr5a1Unorm => {
+        Format::B5g6r5Unorm | Format::Bgr5a1Unorm | Format::Abgr4Unorm => {
             if apple {
                 color
             } else {
@@ -219,7 +220,11 @@ fn format_caps(
         }
         f if f.is_bc() => {
             if bc {
-                C::SAMPLED | C::FILTERED
+                let mut caps = C::SAMPLED | C::FILTERED;
+                if raw.supportsFamily(MTLGPUFamily::Apple3) {
+                    caps |= C::BC_VOLUME;
+                }
+                caps
             } else {
                 C::empty()
             }
@@ -227,7 +232,7 @@ fn format_caps(
         Format::Depth16Unorm => C::SAMPLED | C::FILTERED | C::DEPTH_STENCIL,
         Format::Depth24UnormStencil8 | Format::Depth32FloatStencil8 => {
             let mut caps = C::SAMPLED | C::DEPTH_STENCIL;
-            if !apple || raw.supportsFamily(MTLGPUFamily::Apple8) {
+            if !apple || raw.supportsFamily(MTLGPUFamily::Apple9) {
                 caps |= C::FILTERED;
             }
             caps
@@ -318,8 +323,15 @@ pub(super) fn pixel_format(f: Format) -> Option<MTLPixelFormat> {
         // Metal's packed names list components from the least significant bit.
         Format::B5g6r5Unorm => M::B5G6R5Unorm,
         Format::Bgr5a1Unorm => M::BGR5A1Unorm,
+        Format::Abgr4Unorm => M::ABGR4Unorm,
         // ABGR4 has alpha in the low nibble, so it cannot represent BGRA4.
-        Format::Bgra4Unorm | Format::Nv12 | Format::Nv21 | Format::P010 => return None,
+        Format::Bgra4Unorm
+        | Format::Nv12
+        | Format::Nv21
+        | Format::P010
+        | Format::Rgb32Float
+        | Format::Rgb32Uint
+        | Format::Rgb32Sint => return None,
         Format::Rgb10a2Unorm => M::RGB10A2Unorm,
         Format::R16Float => M::R16Float,
         Format::Rg16Float => M::RG16Float,
@@ -382,12 +394,14 @@ pub(super) fn block(f: Format) -> (u32, u32) {
         | Format::B5g6r5Unorm
         | Format::Bgr5a1Unorm
         | Format::Bgra4Unorm
+        | Format::Abgr4Unorm
         | Format::R16Float
         | Format::Depth16Unorm => (1, 2),
         Format::Rgba16Float
         | Format::Rg32Float
         | Format::Depth24UnormStencil8
         | Format::Depth32FloatStencil8 => (1, 8),
+        Format::Rgb32Float | Format::Rgb32Uint | Format::Rgb32Sint => (1, 12),
         Format::Rgba32Float => (1, 16),
         _ => (1, 4),
     }

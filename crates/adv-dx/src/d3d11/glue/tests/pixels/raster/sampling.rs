@@ -686,3 +686,375 @@ fn windows_anisotropic_sampling_through_guest_vtables() {
         1. / 255.,
     );
 }
+
+fn explicit_srv(r: &mut Raster, image: u32, format: i32, dimension: i32, words: [u32; 4]) {
+    let desc = adv_abi::types::D3D11_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: dimension,
+        Anonymous: words.map(u32::to_le_bytes).concat().try_into().unwrap(),
+    };
+    write_value(&mut r.machine, DESCRIPTOR, desc);
+    let view = create_object(&mut r.machine, r.device, 7, &[image, DESCRIPTOR]);
+    write_value(&mut r.machine, ARRAY, view);
+    r.call(8, &[0, 1, ARRAY]);
+}
+
+fn copy_rows(r: &mut Raster, source: u32, staging: u32, row: usize, height: usize) -> Vec<u8> {
+    r.call(47, &[staging, source]);
+    let mapped = map(&mut r.machine, r.context, staging, 1);
+    let mut bytes = vec![0; row * height];
+    for (i, output) in bytes.chunks_exact_mut(row).enumerate() {
+        r.machine
+            .cpu
+            .read(mapped.pData + i as u32 * mapped.RowPitch, output)
+            .unwrap();
+    }
+    r.call(15, &[staging, 0]);
+    bytes
+}
+
+// spec: GFX-CAP-5 GFX-RES-1
+#[test]
+fn rgb32_typed_views_and_staging_keep_guest_texel_stride() {
+    const UINT: &[u8] =
+        include_bytes!("../../../../../../tests/fixtures/d3d11/format_rgb_uint.dxbc");
+    const BUFFER: &[u8] =
+        include_bytes!("../../../../../../tests/fixtures/d3d11/format_rgb_buffer.dxbc");
+
+    let mut r = Raster::new();
+    let out = SampleOutput::new(&mut r);
+    let src = [
+        [
+            0x3f00_0000u32,
+            0x3f80_0000,
+            0x4000_0000,
+            4,
+            5,
+            6,
+            0xdead_beef,
+            0,
+        ],
+        [7, 8, 9, 10, 11, 12, 0xdead_beef, 0],
+    ];
+    r.machine
+        .cpu
+        .write(TEXELS, bytemuck::bytes_of(&src))
+        .unwrap();
+    write_value(
+        &mut r.machine,
+        INIT,
+        D3D11_SUBRESOURCE_DATA {
+            pSysMem: TEXELS,
+            SysMemPitch: 32,
+            SysMemSlicePitch: 64,
+        },
+    );
+    let rgb = r.texture(2, 2, 5, Bind::SHADER, INIT);
+    explicit_srv(&mut r, rgb, 6, 4, [0, 1, 0, 0]);
+    r.shader(15, 9, TEXEL_LOAD);
+    assert_eq!(
+        out.draw(&mut r, [1., 0., 0., 0.], 1),
+        [[0.5f32, 1., 2., 1.].map(f32::to_bits)]
+    );
+    explicit_srv(&mut r, rgb, 7, 4, [0, 1, 0, 0]);
+    r.shader(15, 9, UINT);
+    assert_eq!(
+        out.draw(&mut r, [0.; 4], 2)[1],
+        [4.0f32, 5., 6., 1.].map(f32::to_bits)
+    );
+
+    let staging = r.texture(2, 2, 7, 0, 0);
+    let expected: Vec<_> = src
+        .iter()
+        .flat_map(|row| bytemuck::cast_slice::<_, u8>(&row[..6]))
+        .copied()
+        .collect();
+    assert_eq!(copy_rows(&mut r, rgb, staging, 24, 2), expected);
+
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_BUFFER_DESC {
+            ByteWidth: 24,
+            BindFlags: Bind::SHADER,
+            ..Default::default()
+        },
+    );
+    let buffer = create_object(&mut r.machine, r.device, 3, &[DESCRIPTOR, INIT]);
+    explicit_srv(&mut r, buffer, 6, 1, [0, 2, 0, 0]);
+    r.shader(15, 9, BUFFER);
+    assert_eq!(
+        out.draw(&mut r, [0.; 4], 1),
+        [[0.5f32, 1., 2., 1.].map(f32::to_bits)]
+    );
+}
+
+// spec: GFX-CAP-5 GFX-RES-1
+#[test]
+fn narrow_array_view_keeps_its_type_with_one_layer_and_loads_the_selected_mip() {
+    use adv_abi::types::D3D11_TEXTURE1D_DESC;
+    let mut r = Raster::new();
+    let out = SampleOutput::new(&mut r);
+    let colors = [0xffffffffu32, 0xff00ff00, 0xffffffff, 0xff0000ff];
+    let init: Vec<_> = colors
+        .iter()
+        .enumerate()
+        .map(|(i, &color)| {
+            let address = TEXELS + i as u32 * 16;
+            r.machine
+                .cpu
+                .write(address, bytemuck::cast_slice(&[color; 4]))
+                .unwrap();
+            D3D11_SUBRESOURCE_DATA {
+                pSysMem: address,
+                SysMemPitch: 16,
+                SysMemSlicePitch: 16,
+            }
+        })
+        .collect();
+    r.machine
+        .cpu
+        .write(INIT, bytemuck::cast_slice(&init))
+        .unwrap();
+    write_value(
+        &mut r.machine,
+        DESCRIPTOR,
+        D3D11_TEXTURE1D_DESC {
+            Width: 4,
+            MipLevels: 2,
+            ArraySize: 2,
+            Format: 28,
+            BindFlags: Bind::SHADER,
+            ..Default::default()
+        },
+    );
+    let narrow = create_object(&mut r.machine, r.device, 4, &[DESCRIPTOR, INIT]);
+    explicit_srv(&mut r, narrow, 28, 3, [0, 2, 1, 1]);
+    r.shader(
+        15,
+        9,
+        include_bytes!("../../../../../../tests/fixtures/d3d11/format_narrow_array.dxbc"),
+    );
+    assert_eq!(
+        out.draw(&mut r, [0.; 4], 2),
+        [[1.0f32, 0., 2., 18.].map(f32::to_bits); 2]
+    );
+}
+
+// spec: GFX-CAP-5 GFX-RES-1
+#[test]
+fn multisampled_array_view_loads_nonzero_layer_and_sample() {
+    let mut r = Raster::new();
+    let out = SampleOutput::new(&mut r);
+    let ms = r.image(
+        D3D11_TEXTURE2D_DESC {
+            Width: 4,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 2,
+            Format: 28,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 0,
+            },
+            BindFlags: Bind::SHADER | Bind::RENDER_TARGET,
+            ..Default::default()
+        },
+        0,
+    );
+    let rtv = create_object(&mut r.machine, r.device, 9, &[ms, 0]);
+    r.clear(rtv, [1., 0., 0., 1.]);
+    let first = adv_abi::types::D3D11_RENDER_TARGET_VIEW_DESC {
+        Format: 28,
+        ViewDimension: 7,
+        Anonymous: [0u32, 1, 0]
+            .map(u32::to_le_bytes)
+            .concat()
+            .try_into()
+            .unwrap(),
+    };
+    write_value(&mut r.machine, DESCRIPTOR, first);
+    let rtv = create_object(&mut r.machine, r.device, 9, &[ms, DESCRIPTOR]);
+    r.clear(rtv, [0., 0., 1., 1.]);
+    explicit_srv(&mut r, ms, 28, 7, [0, 2, 0, 0]);
+    r.shader(
+        15,
+        9,
+        include_bytes!("../../../../../../tests/fixtures/d3d11/format_ms_array.dxbc"),
+    );
+    assert_eq!(
+        out.draw(&mut r, [0.; 4], 1),
+        [[1.0f32, 0., 2., 4.].map(f32::to_bits)]
+    );
+}
+
+// spec: GFX-CAP-5 GFX-RES-1
+#[test]
+fn compressed_typeless_copies_keep_blocks_and_decode_the_view() {
+    let mut r = Raster::new();
+    let out = SampleOutput::new(&mut r);
+    let block = [0x0080_0080u32, 0];
+    r.machine
+        .cpu
+        .write(TEXELS, bytemuck::bytes_of(&block))
+        .unwrap();
+    write_value(
+        &mut r.machine,
+        INIT,
+        D3D11_SUBRESOURCE_DATA {
+            pSysMem: TEXELS,
+            SysMemPitch: 8,
+            SysMemSlicePitch: 8,
+        },
+    );
+    let source = r.texture(4, 4, 70, Bind::SHADER, INIT);
+    let staging = r.texture(4, 4, 71, 0, 0);
+    r.shader(15, 9, TEXEL_LOAD);
+    explicit_srv(&mut r, source, 71, 4, [0, 1, 0, 0]);
+    let linear = out.draw(&mut r, [0.; 4], 1)[0];
+    explicit_srv(&mut r, source, 72, 4, [0, 1, 0, 0]);
+    let srgb = out.draw(&mut r, [0.; 4], 1)[0];
+    assert!(f32::from_bits(linear[1]) > f32::from_bits(srgb[1]));
+    assert_eq!(
+        copy_rows(&mut r, source, staging, 8, 1),
+        bytemuck::bytes_of(&block)
+    );
+}
+
+// spec: GFX-CAP-5 GFX-RES-1
+#[test]
+fn d32s8_staging_copies_both_aspects() {
+    let mut r = Raster::new();
+    let _out = SampleOutput::new(&mut r);
+    let texels = [[0.25f32.to_bits(), 17u32], [0.75f32.to_bits(), 218u32]];
+    r.machine
+        .cpu
+        .write(TEXELS, bytemuck::bytes_of(&texels))
+        .unwrap();
+    write_value(
+        &mut r.machine,
+        INIT,
+        D3D11_SUBRESOURCE_DATA {
+            pSysMem: TEXELS,
+            SysMemPitch: 16,
+            SysMemSlicePitch: 16,
+        },
+    );
+    let source = r.texture(2, 1, 20, Bind::DEPTH_STENCIL, INIT);
+    let staging = r.texture(2, 1, 20, 0, 0);
+    assert_eq!(
+        copy_rows(&mut r, source, staging, 16, 1),
+        bytemuck::bytes_of(&texels)
+    );
+}
+
+// spec: GFX-CAP-5 GFX-RES-1
+#[test]
+fn packed_color_pairs_sample_and_map_without_losing_green_lanes() {
+    let mut r = Raster::new();
+    let out = SampleOutput::new(&mut r);
+    r.shader(15, 9, TEXEL_LOAD);
+    for (format, pair) in [(68, [255, 0, 0, 255]), (69, [0, 255, 255, 0])] {
+        r.machine.cpu.write(TEXELS, &pair).unwrap();
+        write_value(
+            &mut r.machine,
+            INIT,
+            D3D11_SUBRESOURCE_DATA {
+                pSysMem: TEXELS,
+                SysMemPitch: 4,
+                SysMemSlicePitch: 4,
+            },
+        );
+        let source = r.texture(2, 1, format, Bind::SHADER, INIT);
+        explicit_srv(&mut r, source, format, 4, [0, 1, 0, 0]);
+        assert_eq!(
+            out.draw(&mut r, [1., 0., 0., 0.], 2),
+            [
+                [1.0f32, 0., 0., 1.].map(f32::to_bits),
+                [1.0f32, 1., 0., 1.].map(f32::to_bits),
+            ]
+        );
+        let staging = r.texture(2, 1, format, 0, 0);
+        assert_eq!(copy_rows(&mut r, source, staging, 4, 1), pair);
+    }
+}
+
+// spec: GFX-CAP-5 GFX-RES-1
+#[test]
+fn depth_and_color_views_can_copy_the_same_family_bits() {
+    let mut r = Raster::new();
+    let _out = SampleOutput::new(&mut r);
+    for (format, bytes) in [
+        (39, vec![0, 0, 128, 62, 0, 0, 64, 63]),
+        (53, vec![0, 64, 0, 192]),
+    ] {
+        r.machine.cpu.write(TEXELS, &bytes).unwrap();
+        write_value(
+            &mut r.machine,
+            INIT,
+            D3D11_SUBRESOURCE_DATA {
+                pSysMem: TEXELS,
+                SysMemPitch: bytes.len() as u32,
+                SysMemSlicePitch: bytes.len() as u32,
+            },
+        );
+        let color = r.texture(2, 1, format, Bind::SHADER, INIT);
+        let depth = r.texture(2, 1, format, Bind::DEPTH_STENCIL, 0);
+        r.call(47, &[depth, color]);
+        let staging = r.texture(2, 1, format, 0, 0);
+        assert_eq!(copy_rows(&mut r, depth, staging, bytes.len(), 1), bytes);
+    }
+}
+
+// spec: GFX-CAP-5 GFX-RES-1
+#[test]
+fn alpha_only_attachment_samples_alpha_and_maps_one_byte() {
+    let mut r = Raster::new();
+    let out = SampleOutput::new(&mut r);
+    let image = r.texture(2, 1, 65, Bind::SHADER | Bind::RENDER_TARGET, 0);
+    let rtv = create_object(&mut r.machine, r.device, 9, &[image, 0]);
+    r.clear(rtv, [1., 1., 1., 1.]);
+    explicit_srv(&mut r, image, 65, 4, [0, 1, 0, 0]);
+    r.shader(15, 9, TEXEL_LOAD);
+    assert_eq!(
+        out.draw(&mut r, [1., 0., 0., 0.], 2),
+        [[0, 0, 0, 1.0f32.to_bits()]; 2]
+    );
+    let staging = r.texture(2, 1, 65, 0, 0);
+    assert_eq!(copy_rows(&mut r, image, staging, 2, 1), [255, 255]);
+}
+
+// spec: GFX-CAP-5 GFX-RES-1
+#[test]
+fn bgra4_attachment_keeps_guest_nibble_order() {
+    let mut r = Raster::new();
+    let out = SampleOutput::new(&mut r);
+    let caps = gpu::caps(&r.machine.ext).unwrap();
+    let color =
+        crate::d3d11::resource::backing_format(caps, 115) != Some(adv_gpu::Format::Bgra8Unorm);
+    let packed = [0, 255, 0, 255];
+    r.machine.cpu.write(TEXELS, &packed).unwrap();
+    write_value(
+        &mut r.machine,
+        INIT,
+        D3D11_SUBRESOURCE_DATA {
+            pSysMem: TEXELS,
+            SysMemPitch: 4,
+            SysMemSlicePitch: 4,
+        },
+    );
+    let bind = Bind::SHADER | if color { Bind::RENDER_TARGET } else { 0 };
+    let image = r.texture(2, 1, 115, bind, INIT);
+    if color {
+        let rtv = create_object(&mut r.machine, r.device, 9, &[image, 0]);
+        r.clear(rtv, [1., 0., 0., 1.]);
+    }
+    explicit_srv(&mut r, image, 115, 4, [0, 1, 0, 0]);
+    r.shader(15, 9, TEXEL_LOAD);
+    assert_eq!(
+        out.draw(&mut r, [1., 0., 0., 0.], 2),
+        [[1.0f32, 0., 0., 1.].map(f32::to_bits); 2]
+    );
+    let staging = r.texture(2, 1, 115, 0, 0);
+    assert_eq!(copy_rows(&mut r, image, staging, 4, 1), [0, 255, 0, 255]);
+}

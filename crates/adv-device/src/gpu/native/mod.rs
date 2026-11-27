@@ -56,7 +56,7 @@ pub(crate) mod stream;
 #[path = "../test_support/native.rs"]
 pub mod test_support;
 
-pub use compressed::BlockTexture;
+pub use compressed::{BlockTexture, decode_bc, decoded_bc_format};
 pub use expand::{
     Expand, ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude, ExpansionRegion,
     ExpansionWindow,

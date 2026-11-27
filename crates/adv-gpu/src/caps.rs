@@ -155,6 +155,8 @@ bitflags::bitflags! {
         const STORAGE = 1 << 5;
         /// Typed loads from a storage image.
         const STORAGE_READ = 1 << 9;
+        /// This block-compressed format can back a volume texture.
+        const BC_VOLUME = 1 << 10;
         const PRESENTABLE = 1 << 6;
         /// Presentable buffers of this format are losslessly compressed, so
         /// rendering into them costs what a private image costs.

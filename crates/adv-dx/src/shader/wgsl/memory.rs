@@ -98,16 +98,16 @@ impl Writer<'_> {
                     dimension, returns, ..
                 } if binding.register == Register::Resource => {
                     let dimension = match dimension {
-                        ResourceDimension::Texture1D => "1d",
+                        ResourceDimension::Texture1D => "2d",
                         ResourceDimension::Texture2D => "2d",
                         ResourceDimension::Texture2DMs => "multisampled_2d",
                         ResourceDimension::Texture3D => "3d",
                         ResourceDimension::TextureCube => "cube",
                         ResourceDimension::Texture2DArray => "2d_array",
                         ResourceDimension::TextureCubeArray => "cube_array",
-                        ResourceDimension::Texture1DArray
-                        | ResourceDimension::Texture2DMsArray
-                        | ResourceDimension::RawBuffer
+                        ResourceDimension::Texture1DArray => "2d_array",
+                        ResourceDimension::Texture2DMsArray => "multisampled_2d_array",
+                        ResourceDimension::RawBuffer
                         | ResourceDimension::StructuredBuffer
                         | ResourceDimension::Buffer => {
                             return Err(Error::UnsupportedRegister(binding.register));
@@ -565,9 +565,17 @@ impl Writer<'_> {
     ) -> Result<Option<String>, Error> {
         let (coordinate, layer, condition) = match dimension {
             ResourceDimension::Texture1D => (
-                format!("bitcast<i32>({}.x)", args[0]),
+                format!("vec2<i32>(bitcast<i32>({}.x), 0)", args[0]),
                 String::new(),
-                format!("{}.x < textureDimensions({name})", args[0]),
+                format!("{}.x < textureDimensions({name}).x", args[0]),
+            ),
+            ResourceDimension::Texture1DArray => (
+                format!("vec2<i32>(bitcast<i32>({}.x), 0)", args[0]),
+                format!(", bitcast<i32>({}.y)", args[0]),
+                format!(
+                    "{}.x < textureDimensions({name}).x && {}.y < textureNumLayers({name})",
+                    args[0], args[0]
+                ),
             ),
             ResourceDimension::Texture2D => (
                 format!("bitcast<vec2<i32>>({}.xy)", args[0]),
@@ -590,7 +598,6 @@ impl Writer<'_> {
             ResourceDimension::Buffer
             | ResourceDimension::Texture2DMs
             | ResourceDimension::TextureCube
-            | ResourceDimension::Texture1DArray
             | ResourceDimension::Texture2DMsArray
             | ResourceDimension::TextureCubeArray
             | ResourceDimension::RawBuffer
@@ -659,35 +666,50 @@ impl Writer<'_> {
             .iter()
             .find(|lod| lod.slot == slot)
             .copied();
+        let narrow = matches!(
+            dimension,
+            ResourceDimension::Texture1D | ResourceDimension::Texture1DArray
+        );
+        let multisampled = matches!(
+            dimension,
+            ResourceDimension::Texture2DMs | ResourceDimension::Texture2DMsArray
+        );
         let (width, lanes, array) = match dimension {
-            ResourceDimension::Texture1D => (1, "x", ""),
+            ResourceDimension::Texture1D => (2, "x", ""),
+            ResourceDimension::Texture1DArray => (2, "x", "y"),
             ResourceDimension::Texture2D | ResourceDimension::Texture2DMs => (2, "xy", ""),
-            ResourceDimension::Texture2DArray => (2, "xy", "z"),
+            ResourceDimension::Texture2DArray | ResourceDimension::Texture2DMsArray => {
+                (2, "xy", "z")
+            }
             ResourceDimension::Texture3D | ResourceDimension::TextureCube => (3, "xyz", ""),
             ResourceDimension::TextureCubeArray => (3, "xyz", "w"),
             ResourceDimension::Buffer
-            | ResourceDimension::Texture1DArray
-            | ResourceDimension::Texture2DMsArray
             | ResourceDimension::RawBuffer
             | ResourceDimension::StructuredBuffer => {
                 return Err(Error::UnsupportedOpcode(op.opcode));
             }
         };
         let cast = |value: &str, ty: &str| {
-            if width == 1 {
-                format!("bitcast<{ty}>({value}.{lanes})")
+            if narrow {
+                format!("vec2<{ty}>(bitcast<{ty}>({value}.x), 0)")
             } else {
                 format!("bitcast<vec{width}<{ty}>>({value}.{lanes})")
             }
         };
+        if op.opcode == Resinfo {
+            return Ok(self.resource_info(op, args, texture, dimension));
+        }
+        if matches!(op.opcode, SampleInfo | SamplePos) && multisampled {
+            return self.sample_query(op, &format!("textureNumSamples({texture})"), args);
+        }
         let load_layer = if array.is_empty() {
             String::new()
         } else {
             format!(", bitcast<i32>({}.{})", args[0], array)
         };
         let offset = if let Some(offset) = op.resource.offset {
-            if width == 1 {
-                format!(", {}i", offset[0])
+            if narrow {
+                format!(", vec2<i32>({}i, 0)", offset[0])
             } else {
                 let values: Vec<_> = offset[..width].iter().map(|v| format!("{v}i")).collect();
                 format!(", vec{width}<i32>({})", values.join(", "))
@@ -695,14 +717,6 @@ impl Writer<'_> {
         } else {
             String::new()
         };
-        if op.opcode == Resinfo {
-            return Ok(self.resource_info(op, args, texture, dimension));
-        }
-        if matches!(op.opcode, SampleInfo | SamplePos)
-            && dimension == ResourceDimension::Texture2DMs
-        {
-            return self.sample_query(op, &format!("textureNumSamples({texture})"), args);
-        }
         let empty = lod.is_some_and(|lod| lod.minimum > lod.last as f32);
         let default = lod.map_or(0, |lod| lod.default_alpha);
         if empty && op.opcode != Lod {
@@ -741,16 +755,8 @@ impl Writer<'_> {
                 format!(" && {level} >= {minimum}u")
             };
             self.open(&format!("if {level} < {count}{first}"));
-            let index_u32 = if width == 1 {
-                format!("bitcast<u32>({xy})")
-            } else {
-                format!("bitcast<vec{width}<u32>>({xy})")
-            };
-            let in_bounds = if width == 1 {
-                format!("{index_u32} < {dimensions}")
-            } else {
-                format!("all({index_u32} < {dimensions})")
-            };
+            let index_u32 = format!("bitcast<vec{width}<u32>>({xy})");
+            let in_bounds = format!("all({index_u32} < {dimensions})");
             let in_bounds = if array.is_empty() {
                 in_bounds
             } else {
@@ -775,7 +781,11 @@ impl Writer<'_> {
             return Ok(result);
         }
         let (sampler, component) = sampler.ok_or(Error::UnsupportedOpcode(op.opcode))?;
-        let mut coord = cast(&args[0], "f32");
+        let mut coord = if narrow {
+            format!("vec2<f32>(bitcast<f32>({}.x), 0.5)", args[0])
+        } else {
+            cast(&args[0], "f32")
+        };
         let suffix = if array.is_empty() {
             String::new()
         } else {
@@ -965,7 +975,7 @@ impl Writer<'_> {
                 "mix(mix({name}.w, {name}.z, {weight}.x), mix({name}.x, {name}.y, {weight}.x), {weight}.y)"
             );
         }
-        if let Some(border) = border
+        if let Some(mut border) = border
             && !matches!(
                 dimension,
                 ResourceDimension::TextureCube | ResourceDimension::TextureCubeArray
@@ -976,6 +986,9 @@ impl Writer<'_> {
                 .iter()
                 .find(|format| format.slot == slot)
         {
+            if narrow {
+                border.axes[1] = false;
+            }
             sample = self.border_sample(border::BorderSample {
                 sampler: border,
                 format: *format,
@@ -1186,7 +1199,10 @@ impl Writer<'_> {
         texture: &str,
         dimension: ResourceDimension,
     ) -> String {
-        let multisampled = dimension == ResourceDimension::Texture2DMs;
+        let multisampled = matches!(
+            dimension,
+            ResourceDimension::Texture2DMs | ResourceDimension::Texture2DMsArray
+        );
         let count = if multisampled {
             "1u".into()
         } else {
@@ -1202,17 +1218,20 @@ impl Writer<'_> {
         self.line(&format!("var {name} = vec4<u32>(0u, 0u, 0u, {count});"));
         self.open(&format!("if {level} < {count}"));
         let dimensions = match dimension {
-            ResourceDimension::Texture1D => format!("vec3<u32>({size}, 0u, 0u)"),
+            ResourceDimension::Texture1D => format!("vec3<u32>({size}.x, 0u, 0u)"),
+            ResourceDimension::Texture1DArray => {
+                format!("vec3<u32>({size}.x, textureNumLayers({texture}), 0u)")
+            }
             ResourceDimension::Texture3D => size,
-            ResourceDimension::Texture2DArray | ResourceDimension::TextureCubeArray => {
+            ResourceDimension::Texture2DArray
+            | ResourceDimension::Texture2DMsArray
+            | ResourceDimension::TextureCubeArray => {
                 format!("vec3<u32>({size}, textureNumLayers({texture}))")
             }
             ResourceDimension::Texture2D
             | ResourceDimension::Texture2DMs
             | ResourceDimension::TextureCube
             | ResourceDimension::Buffer
-            | ResourceDimension::Texture1DArray
-            | ResourceDimension::Texture2DMsArray
             | ResourceDimension::RawBuffer
             | ResourceDimension::StructuredBuffer => format!("vec3<u32>({size}, 0u)"),
         };
@@ -1230,7 +1249,13 @@ impl Writer<'_> {
                 }
             };
             let x = axis('x', true);
-            let y = axis('y', dimension != ResourceDimension::Texture1D);
+            let y = axis(
+                'y',
+                !matches!(
+                    dimension,
+                    ResourceDimension::Texture1D | ResourceDimension::Texture1DArray
+                ),
+            );
             let z = axis('z', dimension == ResourceDimension::Texture3D);
             format!("bitcast<vec4<u32>>(vec4<f32>({x}, {y}, {z}, f32({name}.w)))")
         } else {
@@ -1241,14 +1266,14 @@ impl Writer<'_> {
 
 fn storage_dimension(dimension: ResourceDimension) -> Option<&'static str> {
     match dimension {
-        ResourceDimension::Texture1D => Some("1d"),
+        ResourceDimension::Texture1D => Some("2d"),
+        ResourceDimension::Texture1DArray => Some("2d_array"),
         ResourceDimension::Texture2D => Some("2d"),
         ResourceDimension::Texture2DArray => Some("2d_array"),
         ResourceDimension::Texture3D => Some("3d"),
         ResourceDimension::Buffer
         | ResourceDimension::Texture2DMs
         | ResourceDimension::TextureCube
-        | ResourceDimension::Texture1DArray
         | ResourceDimension::Texture2DMsArray
         | ResourceDimension::TextureCubeArray
         | ResourceDimension::RawBuffer

@@ -42,6 +42,8 @@ pub struct Options<'a> {
     pub storage_formats: &'a [(u32, naga::StorageFormat)],
     /// Typed buffer SRV formats, keyed by their DXBC register slot.
     pub buffer_formats: &'a [(u32, naga::StorageFormat)],
+    /// Typed RGB buffer SRVs use three stored channels and an implicit alpha.
+    pub rgb_buffers: &'a [u32],
     /// Logical element counts of subword views, whose bindings include padding.
     pub buffer_elements: &'a [(Register, u32, u32)],
     /// Buffer-backed R32 textures, keyed by UAV slot, with the view's XYZ extent.
@@ -62,6 +64,7 @@ impl Default for Options<'_> {
         Self {
             storage_formats: &[],
             buffer_formats: &[],
+            rgb_buffers: &[],
             buffer_elements: &[],
             storage_extents: &[],
             image_atomics: false,

@@ -115,9 +115,11 @@ impl Pattern {
         range: Range<u32>,
         pitch: u32,
     ) -> Result<(), Error> {
-        let mut source =
-            crate::shader::wgsl::clear_pattern(draw::storage_format(self.format)?, self.integer)
-                .map_err(|_| Error::InvalidArgument)?;
+        let mut source = crate::shader::wgsl::clear_pattern(
+            resource::storage_format(self.format)?,
+            self.integer,
+        )
+        .map_err(|_| Error::InvalidArgument)?;
         source.push_str(
             r#"
 struct Clear {

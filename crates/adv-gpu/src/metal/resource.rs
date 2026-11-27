@@ -318,17 +318,20 @@ impl Image {
             let desc = self.desc();
             if desc.format == Format::A8Unorm && desc.usage.contains(Usage::SAMPLED) {
                 return Box::new(
-                    self.create_view(&ViewDesc {
-                        format: None,
-                        dimension: None,
-                        mips: 0..desc.mips,
-                        layers: 0..if desc.dimension == Dimension::D3 {
-                            1
-                        } else {
-                            desc.size.depth_or_layers
+                    self.create_view(
+                        &ViewDesc {
+                            format: None,
+                            dimension: None,
+                            mips: 0..desc.mips,
+                            layers: 0..if desc.dimension == Dimension::D3 {
+                                1
+                            } else {
+                                desc.size.depth_or_layers
+                            },
+                            plane: 0,
                         },
-                        plane: 0,
-                    })
+                        ViewLayout::default(),
+                    )
                     .expect("alpha sample view"),
                 );
             }
@@ -345,7 +348,11 @@ impl Image {
             })
         })
     }
-    pub(crate) fn create_view(&self, desc: &ViewDesc) -> Result<crate::ImageView> {
+    pub(crate) fn create_view(
+        &self,
+        desc: &ViewDesc,
+        layout: ViewLayout,
+    ) -> Result<crate::ImageView> {
         if let Some(reason) = self.data.lost.get() {
             return Err(Error::DeviceLost(reason.clone()));
         }
@@ -415,7 +422,15 @@ impl Image {
         } else {
             dimension
         };
-        let ty = texture_type(raw_dimension, desc.layers.len() as u32, image.samples);
+        let slices = desc.layers.len() as u32;
+        let type_slices = if layout.array && raw_dimension == Dimension::Cube {
+            slices.max(12)
+        } else if layout.array {
+            slices.max(2)
+        } else {
+            slices
+        };
+        let ty = texture_type(raw_dimension, type_slices, image.samples);
         let mips = NSRange::new(desc.mips.start as usize, desc.mips.len());
         let layers = NSRange::new(
             if volume_slice {
@@ -432,6 +447,20 @@ impl Image {
         let raw = unsafe {
             let swizzle = if view_format == Format::A8Unorm {
                 Some(alpha_swizzle())
+            } else if layout.components == ViewComponents::Rgb {
+                Some(MTLTextureSwizzleChannels {
+                    red: MTLTextureSwizzle::Red,
+                    green: MTLTextureSwizzle::Green,
+                    blue: MTLTextureSwizzle::Blue,
+                    alpha: MTLTextureSwizzle::One,
+                })
+            } else if layout.components == ViewComponents::Alpha {
+                Some(MTLTextureSwizzleChannels {
+                    red: MTLTextureSwizzle::Zero,
+                    green: MTLTextureSwizzle::Zero,
+                    blue: MTLTextureSwizzle::Zero,
+                    alpha: MTLTextureSwizzle::Alpha,
+                })
             } else if desc.plane == 1 {
                 Some(MTLTextureSwizzleChannels {
                     red: MTLTextureSwizzle::Zero,

@@ -241,13 +241,16 @@ impl Image {
             core: Arc::new(core),
             default: std::sync::OnceLock::new(),
         };
-        let default = image.default_view(&ViewDesc {
-            format: None,
-            dimension: None,
-            mips: 0..image.desc().mips,
-            layers: 0..layers(image.desc()),
-            plane: 0,
-        })?;
+        let default = image.default_view(
+            &ViewDesc {
+                format: None,
+                dimension: None,
+                mips: 0..image.desc().mips,
+                layers: 0..layers(image.desc()),
+                plane: 0,
+            },
+            ViewLayout::default(),
+        )?;
         let _ = image.default.set(default);
         Ok(crate::Image { inner: image })
     }
@@ -265,28 +268,35 @@ impl Image {
     }
     pub(crate) fn view(&self) -> &crate::ImageView {
         self.default.get_or_init(|| {
-            self.default_view(&ViewDesc {
-                format: None,
-                dimension: None,
-                mips: 0..self.desc().mips,
-                layers: 0..layers(self.desc()),
-                plane: 0,
-            })
+            self.default_view(
+                &ViewDesc {
+                    format: None,
+                    dimension: None,
+                    mips: 0..self.desc().mips,
+                    layers: 0..layers(self.desc()),
+                    plane: 0,
+                },
+                ViewLayout::default(),
+            )
             .expect("default image view")
         })
     }
     pub(crate) fn id(&self) -> u64 {
         self.core.handle.as_raw()
     }
-    pub(crate) fn create_view(&self, desc: &ViewDesc) -> Result<crate::ImageView> {
+    pub(crate) fn create_view(
+        &self,
+        desc: &ViewDesc,
+        layout: ViewLayout,
+    ) -> Result<crate::ImageView> {
         if self.desc().format.planes() > 1 && self.core.conversion.is_some() {
             return Err(Error::Unavailable(
                 "plane views require mutable multi-planar images".into(),
             ));
         }
-        self.default_view(desc)
+        self.default_view(desc, layout)
     }
-    fn default_view(&self, desc: &ViewDesc) -> Result<crate::ImageView> {
+    fn default_view(&self, desc: &ViewDesc, layout: ViewLayout) -> Result<crate::ImageView> {
         let planar = self.core.desc.format == Format::Nv12 && self.core.conversion.is_none();
         if planar
             && (desc.plane > 1
@@ -328,14 +338,14 @@ impl Image {
         }
         let view_type = match dimension {
             Dimension::D1 => {
-                if desc.layers.len() > 1 {
+                if layout.array || desc.layers.len() > 1 {
                     vk::ImageViewType::TYPE_1D_ARRAY
                 } else {
                     vk::ImageViewType::TYPE_1D
                 }
             }
             Dimension::D2 => {
-                if desc.layers.len() > 1 {
+                if layout.array || desc.layers.len() > 1 {
                     vk::ImageViewType::TYPE_2D_ARRAY
                 } else {
                     vk::ImageViewType::TYPE_2D
@@ -343,7 +353,7 @@ impl Image {
             }
             Dimension::D3 => vk::ImageViewType::TYPE_3D,
             Dimension::Cube => {
-                if desc.layers.len() > 6 {
+                if layout.array || desc.layers.len() > 6 {
                     vk::ImageViewType::CUBE_ARRAY
                 } else {
                     vk::ImageViewType::CUBE
@@ -386,7 +396,10 @@ impl Image {
         }
         let swizzle_alpha =
             format == Format::A8Unorm && view_usage.contains(vk::ImageUsageFlags::SAMPLED);
-        if (!planar && desc.plane != 0) || swizzle_alpha {
+        if (!planar && desc.plane != 0)
+            || swizzle_alpha
+            || layout.components != ViewComponents::Identity
+        {
             view_usage &= vk::ImageUsageFlags::SAMPLED;
         }
         if !view_usage.intersects(
@@ -432,6 +445,18 @@ impl Image {
                 g: Swizzle::ZERO,
                 b: Swizzle::ZERO,
                 a: Swizzle::R,
+            });
+        } else if layout.components == ViewComponents::Rgb {
+            info = info.components(vk::ComponentMapping {
+                a: Swizzle::ONE,
+                ..Default::default()
+            });
+        } else if layout.components == ViewComponents::Alpha {
+            info = info.components(vk::ComponentMapping {
+                r: Swizzle::ZERO,
+                g: Swizzle::ZERO,
+                b: Swizzle::ZERO,
+                a: Swizzle::A,
             });
         }
         if self.core.conversion.is_some() {

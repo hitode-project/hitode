@@ -387,6 +387,18 @@ impl State {
                 source,
                 destination,
             } => encoder.copy_image(source.copy(), destination.copy(), source.extent),
+            CopyImageBits {
+                source,
+                scratch,
+                destination,
+            } => {
+                encoder.copy_image_to_buffer(source.copy(), scratch.copy(), source.extent);
+                encoder.copy_buffer_to_image(
+                    scratch.copy(),
+                    destination.copy(),
+                    destination.extent,
+                );
+            }
             Upload {
                 source,
                 destination,

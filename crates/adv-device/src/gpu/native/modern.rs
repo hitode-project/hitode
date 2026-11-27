@@ -610,6 +610,11 @@ pub enum ModernTransfer {
         source: ImageRegion,
         destination: ImageRegion,
     },
+    CopyImageBits {
+        source: ImageRegion,
+        scratch: TransferBuffer,
+        destination: ImageRegion,
+    },
     Upload {
         source: TransferBuffer,
         destination: ImageRegion,

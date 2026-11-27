@@ -27,7 +27,13 @@ impl Writer<'_> {
         dimension: ResourceDimension,
     ) -> Result<Option<String>, Error> {
         let format = self.buffer_format(register, slot)?;
-        let layout = Layout::new(format)?;
+        let mut layout = Layout::new(format)?;
+        if register == Register::Resource && self.options.rgb_buffers.contains(&slot) {
+            let alpha = layout.channels.pop().unwrap();
+            if format != naga::StorageFormat::Bgra8Unorm {
+                layout.bits -= alpha.width;
+            }
+        }
         let bits = layout.bits;
         let size = if bits < 32 {
             let count = self

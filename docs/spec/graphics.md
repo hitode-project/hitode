@@ -398,6 +398,8 @@ Alt+Enter on an associated swap-chain window uses the shared exclusive-mode owne
 **Rule**: Reported format and multisample capabilities MUST require an executing path on the resource backing. Queries MUST apply the selected level's restrictions and return the Windows status and output for unsupported formats.
 **Verification**: Test
 
+Device creation derives format support from the same backing selection used for resource allocation. Typed views reinterpret the stored bits or decode the stored blocks in the view's format. Texture transfers preserve the guest's texel or block layout when the physical backing differs.
+
 ### GFX-CAP-6 Direct3D 7 capability derivation
 
 **Rule**: Direct3D 7 and legacy descriptors MUST report only the fixed-function paths admitted for that device. Texture and depth enumeration MUST use the same admitted paths.
