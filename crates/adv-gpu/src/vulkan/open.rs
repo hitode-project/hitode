@@ -297,12 +297,20 @@ impl Device {
     }
 
     #[cfg(test)]
-    pub(super) fn open_with_push_limit(
+    pub(super) fn open_with_binding_limits(
         options: &DeviceOptions,
-        limit: u32,
+        push_limit: Option<u32>,
+        storage_limit: Option<u32>,
     ) -> Result<(crate::Device, crate::Queue)> {
         unsafe {
-            let (inst, adapter) = Self::prepare_adapter(options)?;
+            let (inst, mut adapter) = Self::prepare_adapter(options)?;
+            if let Some(limit) = storage_limit {
+                let buffers = &mut adapter
+                    .props
+                    .limits
+                    .max_per_stage_descriptor_storage_buffers;
+                *buffers = (*buffers).min(limit);
+            }
             let plan = select_device_plan(&adapter.support, options.disable, Mask::empty())?;
             Self::create_configured_device(
                 inst,
@@ -311,7 +319,7 @@ impl Device {
                 &plan,
                 Mask::empty(),
                 false,
-                Some(limit),
+                push_limit,
             )
         }
     }
@@ -1140,6 +1148,13 @@ impl Device {
                 .modern
                 .contains(Modern::EXTENDED_DYNAMIC_STATE)
                 .then(|| Eds::load(instance, device, adapter.api));
+            let mut push_descriptors = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
+            if caps.modern.contains(Modern::PUSH_DESCRIPTORS) {
+                instance.get_physical_device_properties2(
+                    physical,
+                    &mut vk::PhysicalDeviceProperties2::default().push_next(&mut push_descriptors),
+                );
+            }
             let push = ash::khr::push_descriptor::Device::new(instance, device);
             let dynamic = ash::khr::dynamic_rendering::Device::new(instance, device);
             let sync2 = ash::khr::synchronization2::Device::new(instance, device);
@@ -1153,6 +1168,8 @@ impl Device {
                 eds,
                 pipelines: Mutex::new(pipeline::Pipelines::default()),
                 heap,
+                native_limits: l,
+                max_push_descriptors: push_descriptors.max_push_descriptors,
                 cache_prefix: adapter.cache_prefix,
                 health_dir: options.cache_dir.clone(),
                 caller_disable: options.disable,

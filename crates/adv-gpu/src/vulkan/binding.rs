@@ -415,11 +415,13 @@ pub(super) struct Bindings {
     uniform_sets: Vec<vk::DescriptorSet>,
     uniform_dirty: u64,
     // Push-descriptor and cached-set tiers.
-    dirty: [[u128; 2]; 4],
+    dirty: [[u128; 4]; 4],
     changed: bool,
     pushed_layout: vk::PipelineLayout,
     values: Vec<Bound>,
 }
+/// The portable group-3 slot after both compact storage register ranges.
+pub(super) const STORAGE_WINDOW: u32 = 2 * crate::pipeline::VERTEX_BINDING_BASES[3];
 const CLEAN: (usize, usize) = (usize::MAX, 0);
 impl Bindings {
     pub(super) fn clear(&mut self) {
@@ -432,7 +434,7 @@ impl Bindings {
         self.push_dirty = (0, 0);
         self.uniform_sets.clear();
         self.uniform_dirty = 0;
-        self.dirty = [[0; 2]; 4];
+        self.dirty = [[0; 4]; 4];
         self.changed = false;
         self.pushed_layout = vk::PipelineLayout::null();
         self.values.clear();
@@ -562,7 +564,7 @@ impl Bindings {
                 },
             ),
         };
-        debug_assert!(slot < 256, "slot {slot}");
+        debug_assert!(slot <= STORAGE_WINDOW, "slot {slot}");
         let slots = &mut self.slots[group as usize];
         if slots.len() <= slot as usize {
             slots.resize(slot as usize + 1, Bound::default());
@@ -651,6 +653,72 @@ impl Bindings {
             self.encode(field, &bound);
         }
     }
+    pub(super) fn prepare_storage_window(
+        &mut self,
+        encoder: &mut Encoder,
+        compiled: &Compiled,
+    ) -> Result<()> {
+        let slots = &compiled.storage_window;
+        let context = encoder.shared.context.clone();
+        let limit = u64::from(context.native_limits.max_storage_buffer_range);
+        let mut words = Vec::with_capacity(slots.len() * 2);
+        let mut end = (slots.len() * 8) as u64;
+        for &slot in slots {
+            let size = self.slots[3][slot as usize].size / 4;
+            let start = end;
+            end += size * 4;
+            if end > limit {
+                return Err(Error::Invalid(
+                    "packed storage window exceeds the device range".into(),
+                ));
+            }
+            words.extend([(start / 4) as u32, size as u32]);
+        }
+        let buffer = Device(context.clone()).create_buffer(&BufferDesc {
+            size: end,
+            usage: BufferUsage::STORAGE | BufferUsage::COPY_DST,
+            memory: Memory::Device,
+            label: "packed storage window",
+        })?;
+        let window = buffer.inner.0.handle;
+        encoder.synced = false;
+        encoder.memory_barrier();
+        unsafe {
+            let metadata = std::slice::from_raw_parts(
+                words.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(words.as_slice()),
+            );
+            context
+                .device
+                .cmd_update_buffer(encoder.command, window, 0, metadata);
+            for (&slot, &[dst_offset, count]) in slots.iter().zip(words.as_chunks::<2>().0) {
+                let source = self.slots[3][slot as usize];
+                if count != 0 {
+                    context.device.cmd_copy_buffer(
+                        encoder.command,
+                        vk::Buffer::from_raw(source.handle),
+                        window,
+                        &[vk::BufferCopy {
+                            src_offset: source.offset,
+                            dst_offset: u64::from(dst_offset) * 4,
+                            size: u64::from(count) * 4,
+                        }],
+                    );
+                }
+            }
+        }
+        encoder.synced = false;
+        encoder.memory_barrier();
+        self.bind(
+            encoder,
+            Some(compiled),
+            STORAGE_WINDOW,
+            Bind::StorageBuffer(buffer.slice(0..end)),
+            |_| None,
+        );
+        Ok(())
+    }
+
     /// Makes the bindings visible to the next draw or dispatch. False if the
     /// encoder failed.
     pub(super) fn flush(
@@ -761,7 +829,8 @@ impl Bindings {
                 self.values
                     .push(self.slots[group(b.kind) as usize][b.slot as usize]);
             }
-            let (set, new) = encoder.descriptor_set(compiled.set_layout, &self.values)?;
+            let (set, new) =
+                encoder.descriptor_set(compiled.set_layout, &self.values, compiled.indexed_set)?;
             if !new {
                 unsafe {
                     encoder.shared.context.device.cmd_bind_descriptor_sets(
@@ -850,7 +919,7 @@ impl Bindings {
             }
         }
         self.changed = false;
-        self.dirty = [[0; 2]; 4];
+        self.dirty = [[0; 4]; 4];
         self.pushed_layout = compiled.layout;
         Ok(())
     }
@@ -858,13 +927,13 @@ impl Bindings {
 
 #[derive(Default)]
 pub(super) struct DescriptorArena {
-    pools: Vec<vk::DescriptorPool>,
+    pools: [Vec<vk::DescriptorPool>; 2],
     /// Keyed by the set layout followed by the bound values.
     sets: HashMap<Vec<Bound>, vk::DescriptorSet>,
 }
 impl DescriptorArena {
     pub(super) fn reset(&mut self, context: &Context) -> Result<()> {
-        for &pool in &self.pools {
+        for &pool in self.pools.iter().flatten() {
             context.result(unsafe {
                 context
                     .device
@@ -875,7 +944,7 @@ impl DescriptorArena {
         Ok(())
     }
     pub(super) fn destroy(&mut self, context: &Context) {
-        for pool in self.pools.drain(..) {
+        for pool in self.pools.iter_mut().flat_map(|pools| pools.drain(..)) {
             unsafe {
                 context.device.destroy_descriptor_pool(pool, None);
             }
@@ -886,6 +955,7 @@ impl DescriptorArena {
         context: &Context,
         layout: vk::DescriptorSetLayout,
         key: &[Bound],
+        indexed: bool,
     ) -> Result<(vk::DescriptorSet, bool)> {
         if let Some(&set) = self.sets.get(key) {
             return Ok((set, false));
@@ -897,7 +967,8 @@ impl DescriptorArena {
                     .set_layouts(&[layout]),
             )
         };
-        for &pool in &self.pools {
+        let pools = &mut self.pools[usize::from(indexed)];
+        for &pool in pools.iter() {
             match allocate(pool) {
                 Ok(sets) => {
                     self.sets.insert(key.to_vec(), sets[0]);
@@ -920,15 +991,21 @@ impl DescriptorArena {
             ty,
             descriptor_count: 1024,
         });
+        let flags = if indexed {
+            vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND
+        } else {
+            vk::DescriptorPoolCreateFlags::empty()
+        };
         let pool = context.result(unsafe {
             context.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
+                    .flags(flags)
                     .max_sets(256)
                     .pool_sizes(&sizes),
                 None,
             )
         })?;
-        self.pools.push(pool);
+        pools.push(pool);
         let set = context.result(allocate(pool))?[0];
         self.sets.insert(key.to_vec(), set);
         Ok((set, true))

@@ -136,7 +136,7 @@ impl ModernShader {
     ) -> adv_gpu::Result<adv_gpu::shader::Entry> {
         device
             .create_shader(ShaderDesc {
-                source: Source::Ir(Box::new(self.module.clone())),
+                source: Source::CompactIr(Box::new(self.module.clone())),
                 identity: self.identity,
                 label: "modern shader",
             })?

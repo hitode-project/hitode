@@ -8,6 +8,7 @@ pub(crate) struct Encoder {
     pub(super) device: Device,
     pub(super) command: Object<dyn MTLCommandBuffer>,
     pub(super) spans: Vec<crate::Span>,
+    pub(super) error: Option<Error>,
     pub(super) bindings: Option<Box<Bindings>>,
     blit: Option<Object<dyn MTLBlitCommandEncoder>>,
     pub(super) visibility: Option<Object<dyn MTLBuffer>>,
@@ -70,6 +71,7 @@ impl Encoder {
             device,
             command,
             spans: Vec::new(),
+            error: None,
             bindings: Some(bindings),
             blit: None,
             visibility,
@@ -709,7 +711,12 @@ impl RenderPass<'_> {
         self.pipeline = Some(p.clone());
     }
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        self.encoder.bindings.as_mut().unwrap().bind(slot, resource);
+        let bindings = self.encoder.bindings.as_mut().unwrap();
+        if let Some(remap) = self.pipeline.as_ref().and_then(|p| p.remap[1].as_deref()) {
+            bindings.bind_remapped(&remap.layout, slot, resource);
+        } else {
+            bindings.bind(slot, resource);
+        }
     }
     pub(crate) fn bind_vertex(&mut self, slot: u32, resource: Bind<'_>) {
         let group = match resource {
@@ -719,12 +726,15 @@ impl RenderPass<'_> {
             Bind::StorageImage(_) | Bind::StorageBuffer(_) => 3,
         };
         let slot = crate::shader::compile::stage_slot(crate::pipeline::Stages::VERTEX, group, slot);
-        self.vertex_bindings
-            .get_or_insert_with(Bindings::new)
-            .bind(slot, resource);
+        let vertex = self.vertex_bindings.get_or_insert_with(Bindings::new);
+        if let Some(remap) = self.pipeline.as_ref().and_then(|p| p.remap[0].as_deref()) {
+            vertex.bind_remapped(&remap.layout, slot, resource);
+        } else {
+            vertex.bind(slot, resource);
+        }
     }
     /// Gives each stage the bindings it reads that changed since its last draw.
-    fn flush(&mut self) -> MTLPrimitiveType {
+    fn flush(&mut self) -> Result<MTLPrimitiveType> {
         let p = self
             .pipeline
             .as_deref()
@@ -735,11 +745,17 @@ impl RenderPass<'_> {
         let table = |stage: usize| p.sizes[stage].as_deref().filter(|_| sizes);
         if let Some(vertex) = &mut self.vertex_bindings {
             vertex.flush(0, p.used[0], p.sizes[0].as_deref(), &Vertex(raw));
+            if let Some(remap) = p.remap[0].as_deref() {
+                vertex.flush_remapped(0, remap, &self.encoder.device, &Vertex(raw))?;
+            }
         } else {
             bindings.flush(0, p.used[0], table(0), &Vertex(raw));
         }
         bindings.flush(1, p.used[1], table(1), &Fragment(raw));
-        p.topology
+        if let Some(remap) = p.remap[1].as_deref() {
+            bindings.flush_remapped(1, remap, &self.encoder.device, &Fragment(raw))?;
+        }
+        Ok(p.topology)
     }
     pub(crate) fn set_index_buffer(&mut self, buffer: BufferSlice<'_>, format: IndexFormat) {
         let raw = &buffer.buffer.inner.0.raw;
@@ -750,8 +766,14 @@ impl RenderPass<'_> {
         }
     }
     pub(crate) fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
+        let topology = match self.flush() {
+            Ok(topology) => topology,
+            Err(error) => {
+                self.encoder.error = Some(error);
+                return;
+            }
+        };
         self.work = true;
-        let topology = self.flush();
         unsafe {
             self.raw
                 .drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
@@ -769,8 +791,14 @@ impl RenderPass<'_> {
         base_vertex: i32,
         instances: Range<u32>,
     ) {
+        let topology = match self.flush() {
+            Ok(topology) => topology,
+            Err(error) => {
+                self.encoder.error = Some(error);
+                return;
+            }
+        };
         self.work = true;
-        let topology = self.flush();
         let (buffer, offset, format) = self
             .index
             .as_ref()
@@ -781,8 +809,14 @@ impl RenderPass<'_> {
         }
     }
     pub(crate) fn draw_indirect(&mut self, args: BufferSlice<'_>, indexed: bool) {
+        let topology = match self.flush() {
+            Ok(topology) => topology,
+            Err(error) => {
+                self.encoder.error = Some(error);
+                return;
+            }
+        };
         self.work = true;
-        let topology = self.flush();
         unsafe {
             if indexed {
                 let (buffer, offset, format) = self
@@ -893,9 +927,14 @@ impl ComputePass<'_> {
         self.pipeline = Some(p.clone());
     }
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        self.encoder.bindings.as_mut().unwrap().bind(slot, resource);
+        let bindings = self.encoder.bindings.as_mut().unwrap();
+        if let Some(remap) = self.pipeline.as_ref().and_then(|p| p.remap.as_deref()) {
+            bindings.bind_remapped(&remap.layout, slot, resource);
+        } else {
+            bindings.bind(slot, resource);
+        }
     }
-    fn flush(&mut self) -> MTLSize {
+    fn flush(&mut self) -> Result<MTLSize> {
         let p = self
             .pipeline
             .as_deref()
@@ -903,18 +942,34 @@ impl ComputePass<'_> {
         let bindings = self.encoder.bindings.as_mut().unwrap();
         let sizes = std::mem::take(&mut bindings.sizes_dirty);
         let table = p.sizes.as_deref().filter(|_| sizes);
-        bindings.flush(0, p.used, table, &Compute(&self.raw));
-        p.workgroup
+        let target = Compute(&self.raw);
+        bindings.flush(0, p.used, table, &target);
+        if let Some(remap) = p.remap.as_deref() {
+            bindings.flush_remapped(0, remap, &self.encoder.device, &target)?;
+        }
+        Ok(p.workgroup)
     }
     pub(crate) fn dispatch(&mut self, x: u32, y: u32, z: u32) {
+        let workgroup = match self.flush() {
+            Ok(workgroup) => workgroup,
+            Err(error) => {
+                self.encoder.error = Some(error);
+                return;
+            }
+        };
         self.work = true;
-        let workgroup = self.flush();
         self.raw
             .dispatchThreadgroups_threadsPerThreadgroup(metal_size(x, y, z), workgroup);
     }
     pub(crate) fn dispatch_indirect(&mut self, args: BufferSlice<'_>) {
+        let workgroup = match self.flush() {
+            Ok(workgroup) => workgroup,
+            Err(error) => {
+                self.encoder.error = Some(error);
+                return;
+            }
+        };
         self.work = true;
-        let workgroup = self.flush();
         unsafe {
             self.raw
                 .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
@@ -952,6 +1007,7 @@ pub(super) struct Bindings {
     buffers: [Option<BufferBinding>; 31],
     textures: [Option<Object<dyn MTLTexture>>; 128],
     samplers: [Option<Object<dyn MTLSamplerState>>; 32],
+    arguments: Vec<Option<Argument>>,
     bound_buffers: u32,
     bound_textures: u128,
     bound_samplers: u32,
@@ -964,6 +1020,11 @@ pub(super) struct Bindings {
     sizes_dirty: bool,
     /// Per stage: the size table last written to `buffer(SIZES)`.
     sent: [Option<ArrayVec<u32, { shader::SIZES }>>; 2],
+}
+
+enum Argument {
+    Buffer(BufferBinding),
+    Texture(Object<dyn MTLTexture>),
 }
 
 struct BufferBinding {
@@ -982,6 +1043,7 @@ trait Target {
     fn texture(&self, texture: &ProtocolObject<dyn MTLTexture>, index: usize);
     fn sampler(&self, sampler: &ProtocolObject<dyn MTLSamplerState>, index: usize);
     fn bytes(&self, bytes: &[u32], index: usize);
+    fn resident(&self, resource: &ProtocolObject<dyn MTLResource>, usage: MTLResourceUsage);
 }
 struct Vertex<'a>(&'a ProtocolObject<dyn MTLRenderCommandEncoder>);
 struct Fragment<'a>(&'a ProtocolObject<dyn MTLRenderCommandEncoder>);
@@ -990,7 +1052,7 @@ fn bytes(bytes: &[u32]) -> (NonNull<std::ffi::c_void>, usize) {
     (NonNull::from(bytes).cast(), std::mem::size_of_val(bytes))
 }
 macro_rules! target {
-    ($ty:ident, $buffer:ident, $offset:ident, $texture:ident, $sampler:ident, $bytes:ident) => {
+    ($ty:ident, $buffer:ident, $offset:ident, $texture:ident, $sampler:ident, $bytes:ident, $($stages:expr)?) => {
         impl Target for $ty<'_> {
             fn buffer(&self, buffer: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize) {
                 unsafe { self.0.$buffer(Some(buffer), offset, index) }
@@ -1008,7 +1070,16 @@ macro_rules! target {
                 let (pointer, length) = bytes(data);
                 unsafe { self.0.$bytes(pointer, length, index) }
             }
+            fn resident(&self, resource: &ProtocolObject<dyn MTLResource>, usage: MTLResourceUsage) {
+                target!(@resident self.0, resource, usage, $($stages)?);
+            }
         }
+    };
+    (@resident $encoder:expr, $resource:expr, $usage:expr, $stages:expr) => {
+        $encoder.useResource_usage_stages($resource, $usage, $stages)
+    };
+    (@resident $encoder:expr, $resource:expr, $usage:expr,) => {
+        $encoder.useResource_usage($resource, $usage)
     };
 }
 target!(
@@ -1017,7 +1088,8 @@ target!(
     setVertexBufferOffset_atIndex,
     setVertexTexture_atIndex,
     setVertexSamplerState_atIndex,
-    setVertexBytes_length_atIndex
+    setVertexBytes_length_atIndex,
+    MTLRenderStages::Vertex
 );
 target!(
     Fragment,
@@ -1025,7 +1097,8 @@ target!(
     setFragmentBufferOffset_atIndex,
     setFragmentTexture_atIndex,
     setFragmentSamplerState_atIndex,
-    setFragmentBytes_length_atIndex
+    setFragmentBytes_length_atIndex,
+    MTLRenderStages::Fragment
 );
 target!(
     Compute,
@@ -1033,7 +1106,7 @@ target!(
     setBufferOffset_atIndex,
     setTexture_atIndex,
     setSamplerState_atIndex,
-    setBytes_length_atIndex
+    setBytes_length_atIndex,
 );
 
 impl Bindings {
@@ -1042,6 +1115,7 @@ impl Bindings {
             buffers: std::array::from_fn(|_| None),
             textures: std::array::from_fn(|_| None),
             samplers: std::array::from_fn(|_| None),
+            arguments: Vec::new(),
             bound_buffers: 0,
             bound_textures: 0,
             bound_samplers: 0,
@@ -1071,6 +1145,7 @@ impl Bindings {
             s &= s - 1;
             self.samplers[i] = None;
         }
+        self.arguments.clear();
         self.bound_buffers = 0;
         self.bound_textures = 0;
         self.bound_samplers = 0;
@@ -1080,16 +1155,62 @@ impl Bindings {
         self.sizes_dirty = false;
         self.sent = [None, None];
     }
+    fn register(slot: u32, resource: Bind<'_>) -> shader::Register {
+        let (group, buffer) = match resource {
+            Bind::Uniform(_) => (0, true),
+            Bind::Sampled(_) => (1, false),
+            Bind::Sampler(_) => (2, false),
+            Bind::StorageImage(_) => (3, false),
+            Bind::StorageBuffer(_) => (3, true),
+        };
+        shader::Register {
+            group,
+            slot,
+            buffer,
+        }
+    }
+
     fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        let index;
+        let shader::Register { group, buffer, .. } = Self::register(slot, resource);
+        self.bind_at(shader::index(group, slot, buffer).1, resource);
+    }
+
+    fn bind_remapped(&mut self, layout: &shader::Remap, slot: u32, resource: Bind<'_>) {
+        let register = Self::register(slot, resource);
+        match layout.registers[&register] {
+            shader::Location::Direct(index) => {
+                self.bind_at(
+                    if register.group == 2 {
+                        slot
+                    } else {
+                        u32::from(index)
+                    },
+                    resource,
+                );
+            }
+            shader::Location::Argument(id) => {
+                let id = id as usize;
+                if self.arguments.len() <= id {
+                    self.arguments.resize_with(id + 1, || None);
+                }
+                self.arguments[id] = Some(match resource {
+                    Bind::Uniform(b) | Bind::StorageBuffer(b) => Argument::Buffer(BufferBinding {
+                        raw: b.buffer.inner.0.raw.clone(),
+                        offset: b.offset,
+                        size: b.size,
+                    }),
+                    Bind::Sampled(view) | Bind::StorageImage(view) => {
+                        Argument::Texture(view.inner.raw.clone())
+                    }
+                    Bind::Sampler(_) => unreachable!(),
+                });
+            }
+        }
+    }
+
+    fn bind_at(&mut self, index: u32, resource: Bind<'_>) {
         match resource {
             Bind::Uniform(b) | Bind::StorageBuffer(b) => {
-                let group = if matches!(resource, Bind::Uniform(_)) {
-                    0
-                } else {
-                    3
-                };
-                index = shader::index(group, slot, true).1;
                 let raw = &b.buffer.inner.0.raw;
                 match &mut self.buffers[index as usize] {
                     Some(old) if same(&old.raw, raw) => {
@@ -1115,12 +1236,6 @@ impl Bindings {
                 self.dirty[1].buffers |= 1 << index;
             }
             Bind::Sampled(image) | Bind::StorageImage(image) => {
-                let group = if matches!(resource, Bind::Sampled(_)) {
-                    1
-                } else {
-                    3
-                };
-                index = shader::index(group, slot, false).1;
                 let entry = &mut self.textures[index as usize];
                 if entry
                     .as_ref()
@@ -1134,7 +1249,6 @@ impl Bindings {
                 self.dirty[1].textures |= 1 << index;
             }
             Bind::Sampler(sampler) => {
-                index = shader::index(2, slot, false).1;
                 let entry = &mut self.samplers[index as usize];
                 if entry
                     .as_ref()
@@ -1149,6 +1263,79 @@ impl Bindings {
             }
         }
     }
+    fn flush_remapped(
+        &mut self,
+        stage: usize,
+        remap: &shader::Remapped,
+        device: &Device,
+        target: &impl Target,
+    ) -> Result<()> {
+        let layout = &remap.layout;
+        if !layout.argument_writes.is_empty() {
+            let encoder = unsafe {
+                remap
+                    .function
+                    .newArgumentEncoderWithBufferIndex(shader::ARGUMENTS)
+            };
+            // Each draw owns its bytes until the command buffer completes.
+            let arguments = device
+                .0
+                .raw
+                .newBufferWithLength_options(
+                    encoder.encodedLength(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or(Error::OutOfMemory)?;
+            unsafe { encoder.setArgumentBuffer_offset(Some(&arguments), 0) };
+            for (id, &write) in layout.argument_writes.iter().enumerate() {
+                let mut usage = MTLResourceUsage::Read;
+                if write {
+                    usage |= MTLResourceUsage::Write;
+                }
+                unsafe {
+                    match self.arguments[id].as_ref().unwrap() {
+                        Argument::Buffer(buffer) => {
+                            encoder.setBuffer_offset_atIndex(
+                                Some(&buffer.raw),
+                                buffer.offset as usize,
+                                id,
+                            );
+                            target.resident(buffer.raw.as_ref(), usage);
+                        }
+                        Argument::Texture(texture) => {
+                            encoder.setTexture_atIndex(Some(texture), id);
+                            target.resident(texture.as_ref(), usage);
+                        }
+                    }
+                }
+            }
+            target.buffer(&arguments, 0, shader::ARGUMENTS);
+            self.dirty[stage].buffers |= 1 << shader::ARGUMENTS;
+            self.moved[stage] |= 1 << shader::ARGUMENTS;
+        }
+        if !layout.sizes.is_empty() {
+            let values: Vec<_> = layout
+                .sizes
+                .iter()
+                .map(|location| match location {
+                    Some(shader::Location::Direct(index)) => {
+                        self.buffers[*index as usize].as_ref().unwrap().size as u32
+                    }
+                    Some(shader::Location::Argument(id)) => {
+                        match self.arguments[*id as usize].as_ref().unwrap() {
+                            Argument::Buffer(buffer) => buffer.size as u32,
+                            _ => unreachable!(),
+                        }
+                    }
+                    None => 0,
+                })
+                .collect();
+            target.bytes(&values, shader::SIZES);
+            self.sent[stage] = None;
+        }
+        Ok(())
+    }
+
     /// Sends `stage` the changed indices it reads, and its size table when
     /// `sizes` is given and differs from the last one sent.
     fn flush(&mut self, stage: usize, used: Used, sizes: Option<&[Option<u8>]>, to: &impl Target) {

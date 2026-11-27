@@ -393,6 +393,13 @@ Alt+Enter on an associated swap-chain window uses the shared exclusive-mode owne
 **Rule**: The Direct3D 11 capability core MUST select the highest level whose mandatory paths execute on the device. Optional compute support and feature queries MUST reflect the selected level and executing paths.
 **Verification**: Test
 
+Modern GPU bindings compact each stage's used registers. Metal binds constant
+buffers at their buffer offsets, keeps storage images at index 95 and below,
+and places overflowing textures and buffers in a Tier 2 argument buffer.
+Vulkan uses cached sets when the heap indices exceed the push budget. Descriptor
+indexing provides the larger descriptor limits, and read-only storage buffers
+can share a packed window on devices without descriptor indexing.
+
 ### GFX-CAP-5 Direct3D 11 format capabilities
 
 **Rule**: Reported format and multisample capabilities MUST require an executing path on the resource backing. Queries MUST apply the selected level's restrictions and return the Windows status and output for unsupported formats.

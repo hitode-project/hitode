@@ -1123,14 +1123,15 @@ fn bindless_ring_offsets_keep_one_descriptor_for_ten_thousand_draws() {
 
 #[test]
 fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
-    let (device, mut queue) = Device::open_with_push_limit(
+    let (device, mut queue) = Device::open_with_binding_limits(
         &DeviceOptions {
             software: !cfg!(target_os = "android"),
             // Shell processes on user builds cannot load layers.
             validation: !cfg!(target_os = "android"),
             ..Default::default()
         },
-        128,
+        Some(128),
+        None,
     )
     .unwrap();
     if !device.caps().modern.contains(Modern::BINDLESS) {
@@ -1327,13 +1328,14 @@ fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
 
 #[test]
 fn bindless_128_sampled_images_use_cached_sets_with_128_push_constant_bytes() {
-    let (device, mut queue) = Device::open_with_push_limit(
+    let (device, mut queue) = Device::open_with_binding_limits(
         &DeviceOptions {
             software: !cfg!(target_os = "android"),
             validation: !cfg!(target_os = "android"),
             ..Default::default()
         },
-        128,
+        Some(128),
+        None,
     )
     .unwrap();
     let context = &device.inner.0;
@@ -1946,4 +1948,158 @@ fn guest_pipeline_failure_demotes_tier_for_next_open() {
             .contains("masked: bindless")
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// spec: GFX-CAP-4
+#[test]
+fn packed_storage_window_preserves_128_srv_ranges_and_eight_uavs() {
+    storage_binding_limits(false);
+}
+
+// spec: GFX-CAP-4
+#[test]
+fn indexed_sets_preserve_128_srv_ranges_and_eight_uavs() {
+    storage_binding_limits(true);
+}
+
+fn storage_binding_limits(indexed: bool) {
+    use std::fmt::Write;
+
+    let (device, mut queue) = Device::open_with_binding_limits(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            disable: if indexed {
+                Modern::empty()
+            } else {
+                Modern::from_test_env() | Modern::BINDLESS
+            },
+            ..Default::default()
+        },
+        None,
+        Some(16),
+    )
+    .unwrap();
+    if indexed && !device.caps().modern.contains(Modern::BINDLESS) {
+        return;
+    }
+    let stride = u64::from(device.caps().limits.storage_offset_alignment).max(16);
+    let input = device
+        .create_buffer(&BufferDesc {
+            size: stride * 128,
+            usage: BufferUsage::STORAGE | BufferUsage::COPY_DST,
+            memory: Memory::Upload,
+            label: "storage SRVs",
+        })
+        .unwrap();
+    let output = device
+        .create_buffer(&BufferDesc {
+            size: stride * 8,
+            usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC,
+            memory: Memory::Device,
+            label: "buffer UAVs",
+        })
+        .unwrap();
+    let mut source = String::new();
+    let mut body = String::from("var value = 0u;\n");
+    let mut bindings = Vec::new();
+    let mut expected = 0;
+    for slot in 0..128 {
+        let len = slot % 4 + 1;
+        let start = (u64::from(slot) * stride) as usize;
+        // SAFETY: the input buffer has no GPU users yet.
+        unsafe {
+            input.mapped().unwrap().as_mut()[start..start + 4]
+                .copy_from_slice(&(slot + 1).to_ne_bytes());
+        }
+        expected += slot + 1 + len;
+        writeln!(
+            source,
+            "@group(3) @binding({slot}) var<storage, read> s{slot}: array<u32>;"
+        )
+        .unwrap();
+        writeln!(body, "value += s{slot}[id.x] + arrayLength(&s{slot});").unwrap();
+        bindings.push(Binding {
+            slot,
+            kind: BindingKind::StorageBuffer { writable: false },
+            stages: Stages::COMPUTE,
+        });
+    }
+    input.flush(std::iter::once(0..stride * 128));
+    for i in 0..8 {
+        let slot = 128 + i;
+        writeln!(
+            source,
+            "@group(3) @binding({slot}) var<storage, read_write> u{i}: array<u32>;"
+        )
+        .unwrap();
+        writeln!(body, "u{i}[0] = value + {i}u;").unwrap();
+        bindings.push(Binding {
+            slot,
+            kind: BindingKind::StorageBuffer { writable: true },
+            stages: Stages::COMPUTE,
+        });
+    }
+    writeln!(source, "@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{ {body} }}").unwrap();
+    let module = naga::front::wgsl::parse_str(&source).unwrap();
+    let shader = device
+        .create_shader(ShaderDesc {
+            source: Source::CompactIr(Box::new(module)),
+            identity: 113,
+            label: "storage window",
+        })
+        .unwrap();
+    let pipeline = device
+        .create_compute_pipeline(
+            &ComputePipelineDesc {
+                entry: shader.entry("main", Stage::Compute).unwrap(),
+                bindings,
+                label: "storage window",
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(pipeline.inner.compiled.indexed_set, indexed);
+    assert_eq!(
+        pipeline.inner.compiled.storage_window.len(),
+        if indexed { 0 } else { 128 }
+    );
+
+    let result = readback(&device, stride * 8);
+    let mut encoder = queue.encoder("packed storage window");
+    let last = 127 * stride;
+    encoder.fill_buffer(input.slice(last..last + 4), 200);
+    expected += 200 - 128;
+    {
+        let mut pass = encoder.compute_pass(&ComputePassDesc {
+            timestamps: None,
+            label: "storage window",
+        });
+        pass.set_pipeline(&pipeline);
+        for slot in 0..128 {
+            let offset = u64::from(slot) * stride;
+            let size = u64::from(slot % 4 + 1) * 4;
+            pass.bind(
+                slot,
+                Bind::StorageBuffer(input.slice(offset..offset + size)),
+            );
+        }
+        for i in 0..8 {
+            let offset = u64::from(i) * stride;
+            pass.bind(
+                128 + i,
+                Bind::StorageBuffer(output.slice(offset..offset + 4)),
+            );
+        }
+        pass.dispatch(1, 1, 1);
+    }
+    encoder.copy_buffer(output.slice(0..stride * 8), &result, 0);
+    finish(&mut queue, encoder);
+    for i in 0..8 {
+        let offset = i * stride as usize;
+        assert_eq!(
+            &bytes(&result)[offset..offset + 4],
+            &(expected + i as u32).to_ne_bytes()
+        );
+    }
 }

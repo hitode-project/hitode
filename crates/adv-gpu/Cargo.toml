@@ -33,7 +33,7 @@ objc2-metal = { version = "0.3.2", optional = true, default-features = false, fe
     "MTLSampler", "MTLPixelFormat", "MTLTypes", "MTLRenderPass",
     "MTLRenderCommandEncoder", "MTLRenderPipeline", "MTLDepthStencil",
     "MTLBlitCommandEncoder", "MTLComputePass", "MTLComputeCommandEncoder",
-    "MTLCounters", "MTLLibrary", "MTLArgument", "MTLBinaryArchive", "MTLFence", "MTLComputePipeline",
+    "MTLCounters", "MTLLibrary", "MTLArgument", "MTLArgumentEncoder", "MTLBinaryArchive", "MTLFence", "MTLComputePipeline",
     "objc2-io-surface",
 ] }
 objc2-io-surface = { version = "0.3.2", optional = true, default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "libc", "objc2-core-foundation"] }

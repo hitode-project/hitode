@@ -386,7 +386,7 @@ fn capture_buffer(
         let buffer = resource::upload(
             &execution(env.ext)?.gpu,
             &bytes,
-            usage,
+            usage | BufferUsage::COPY_SRC,
             (size as u64).max(1).next_multiple_of(4),
         )?;
         return Ok(buffer);
