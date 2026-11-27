@@ -1481,6 +1481,10 @@ fn guest_output_ownership_gamma_surface_copy_and_duplication_share_the_display()
     assert_eq!(method(&mut machine, output, 12, &[]), 0);
     assert_eq!(method(&mut machine, chain, 10, &[1, output]), 0);
 
+    machine
+        .cpu
+        .write(gamma, &[0xcc; size_of::<DXGI_GAMMA_CONTROL>()])
+        .unwrap();
     assert_eq!(method(&mut machine, output, 13, &[gamma]), 0);
     let caps: DXGI_GAMMA_CONTROL_CAPABILITIES = GuestPtr::new(gamma).read(&machine.cpu).unwrap();
     assert_eq!(caps.ScaleAndOffsetSupported, 0);
@@ -1489,7 +1493,50 @@ fn guest_output_ownership_gamma_surface_copy_and_duplication_share_the_display()
     for (i, &position) in caps.ControlPointPositions[..256].iter().enumerate() {
         assert_eq!(position, i as f32 / 255.0);
     }
+    assert!(
+        caps.ControlPointPositions[256..]
+            .iter()
+            .all(|point| point.to_bits() == 0xcccc_cccc)
+    );
     assert_eq!(method(&mut machine, output, 15, &[gamma]), 0x887a0001);
+    let mut programmed = DXGI_GAMMA_CONTROL {
+        Scale: DXGI_RGB {
+            Red: 2.,
+            Green: 3.,
+            Blue: 4.,
+        },
+        Offset: DXGI_RGB {
+            Red: 0.25,
+            Green: 0.5,
+            Blue: 0.75,
+        },
+        ..Default::default()
+    };
+    for (i, point) in programmed.GammaCurve[..256].iter_mut().enumerate() {
+        let t = i as f32 / 255.0;
+        let term = t * (1.0 - t) / 8.0;
+        *point = DXGI_RGB {
+            Red: t + term,
+            Green: t,
+            Blue: t - term,
+        };
+    }
+    let tail = DXGI_RGB {
+        Red: 0.125,
+        Green: 0.25,
+        Blue: 0.5,
+    };
+    programmed.GammaCurve[256] = tail;
+    programmed.GammaCurve[1024] = tail;
+    write_value(&mut machine, gamma, programmed);
+    assert_eq!(method(&mut machine, output, 14, &[gamma]), 0);
+    machine
+        .cpu
+        .write(gamma, &[0xcc; size_of::<DXGI_GAMMA_CONTROL>()])
+        .unwrap();
+    assert_eq!(method(&mut machine, output, 15, &[gamma]), 0);
+    let stored: DXGI_GAMMA_CONTROL = GuestPtr::new(gamma).read(&machine.cpu).unwrap();
+    assert_eq!(bytemuck::bytes_of(&stored), bytemuck::bytes_of(&programmed));
     let ramp = DXGI_GAMMA_CONTROL {
         GammaCurve: std::array::from_fn(|i| DXGI_RGB {
             Red: 0.0,
@@ -1577,17 +1624,28 @@ fn guest_output_ownership_gamma_surface_copy_and_duplication_share_the_display()
         assert_eq!(method(&mut machine, duplicate, slot, &args), 0x80070057);
         assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 0x1234);
     }
+    machine.cpu.write_u32(ARRAY, 0xcccc_cccc).unwrap();
     assert_eq!(
         method(&mut machine, duplicate, 9, &[0, ARRAY, OUT]),
         0x887a0003
     );
     assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 16);
+    assert_eq!(machine.cpu.read_u32(ARRAY).unwrap(), 0xcccc_cccc);
+    assert_eq!(method(&mut machine, duplicate, 10, &[0, ARRAY, OUT]), 0);
+    assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 0);
+    assert_eq!(
+        method(&mut machine, duplicate, 11, &[0, ARRAY, OUT, DESCRIPTOR]),
+        0
+    );
+    assert_eq!(machine.cpu.read_u32(OUT).unwrap(), 0);
+    assert_eq!(machine.cpu.read_u32(ARRAY).unwrap(), 0xcccc_cccc);
     assert_eq!(method(&mut machine, duplicate, 14, &[]), 0);
     assert_eq!(
         method(&mut machine, duplicate, 8, &[0, DESCRIPTOR, OUT]),
         0x887a0027
     );
     assert_eq!(method(&mut machine, chain, 10, &[0, 0]), 0);
+    assert_eq!(method(&mut machine, output, 15, &[gamma]), 0x887a0001);
     assert_eq!(
         method(&mut machine, duplicate, 8, &[0, DESCRIPTOR, OUT]),
         0x887a0026

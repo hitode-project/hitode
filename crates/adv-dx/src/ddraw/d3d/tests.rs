@@ -2730,6 +2730,12 @@ fn device7_validates_and_draws_the_captured_texture_cascades() {
 // spec: GFX-D3D7-1, GFX-D3D7-3, GFX-D3D7-5
 #[test]
 fn legacy_execute_buffer_copies_vertices_and_draws_the_captured_triangle() {
+    for kind in [caps::Device::Hal, caps::Device::Rgb] {
+        legacy_execute_buffer(kind);
+    }
+}
+
+fn legacy_execute_buffer(kind: caps::Device) {
     use adv_abi::types::D3DEXECUTEDATA;
     let mut f = Fixture::new(true);
     let dd = f.dd(1);
@@ -2741,7 +2747,7 @@ fn legacy_execute_buffer_copies_vertices_and_draws_the_captured_triangle() {
         32,
         32,
     );
-    let device = f.face(target, IID_IDIRECT3DHALDEVICE);
+    let device = f.face(target, kind.guid());
     let viewport = f.output("IDirect3D::CreateViewport", &[d3d, OUT, 0]);
     assert_eq!(
         f.call("IDirect3DDevice::AddViewport", &[device, viewport]),
@@ -3540,6 +3546,12 @@ fn legacy_caps_and_texture_callbacks_use_the_interface_layout() {
 // spec: GFX-D3D7-3
 #[test]
 fn viewport_transform_leaves_clipped_screen_coordinates_and_unrequested_flags() {
+    for kind in [caps::Device::Hal, caps::Device::Rgb] {
+        legacy_viewport_transform(kind);
+    }
+}
+
+fn legacy_viewport_transform(kind: caps::Device) {
     use adv_abi::types::D3DTRANSFORMDATA;
     let mut f = Fixture::new(true);
     let dd = f.dd(1);
@@ -3552,7 +3564,7 @@ fn viewport_transform_leaves_clipped_screen_coordinates_and_unrequested_flags() 
         32,
     );
     let target4 = f.face(target, IID_SURFACE4);
-    let device = f.device(d3d, Face::Direct3D3, target4);
+    let device = f.device_kind(d3d, Face::Direct3D3, target4, kind);
     let viewport = f.output("IDirect3D3::CreateViewport", &[d3d, OUT, 0]);
     assert_eq!(
         f.call("IDirect3DDevice3::AddViewport", &[device, viewport]),
@@ -3633,6 +3645,38 @@ fn viewport_transform_leaves_clipped_screen_coordinates_and_unrequested_flags() 
                 assert_eq!(f.word(address), bits, "row {row} vertex {vertex} word {i}");
             }
         }
+    }
+    for (row, xyz) in [
+        [0.0f32, 0., 0.],
+        [0., 0., 0.125],
+        [0., 0., 0.25],
+        [0., 0., 0.5],
+        [0., 0., 0.75],
+        [0., 0., 1.],
+        [0.75, 0., 0.5],
+        [0., 0.8, 0.5],
+        [-0.75, 0., 0.5],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        f.write(input, bytemuck::bytes_of(&xyz));
+        f.write(screen, &[0xcc; 32]);
+        f.write(homogeneous, &[0xcc; 16]);
+        let hr = f.call(
+            "IDirect3DViewport3::TransformVertices",
+            &[viewport, 1, transform, 1, OUT],
+        );
+        let expected = measured_row("viewport2-depth", "win", &row.to_string(), "0")
+            .split_whitespace()
+            .map(|value| u32::from_str_radix(value, 16).unwrap())
+            .collect::<Vec<_>>();
+        let actual = [hr, f.word(OUT)]
+            .into_iter()
+            .chain((0..4).map(|i| f.word(screen + i * 4)))
+            .chain((1..4).map(|i| f.word(homogeneous + i * 4)))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "depth row {row}");
     }
     let mut viewport1 = viewport2;
     viewport1[5..9].copy_from_slice(&[8f32, 12., 1., 1.].map(f32::to_bits));
