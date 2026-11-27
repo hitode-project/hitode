@@ -2,6 +2,7 @@
 use super::*;
 
 mod draw;
+mod gamma;
 mod queries;
 use crate::d3d11::{
     desc::{Texture, Usage},
@@ -12,7 +13,7 @@ use adv_abi::types::D3D11_BOX;
 use adv_cpu::backend::Guest;
 use adv_device::{
     gpu::{BufferRange, Gpu, ModernTransfer, TransferBuffer},
-    surface::{Access, Rect},
+    surface::{Access, Rect, Region},
 };
 use adv_gpu::{
     Buffer, Extent, ImageView,
@@ -31,6 +32,10 @@ pub(super) struct Execution {
     pub(super) recording: Recording,
     active_queries: BTreeMap<(u64, u64), u32>,
     present_target: Option<adv_device::gpu::Image>,
+    present_gamma: Option<u64>,
+    gamma: Option<(u64, gamma::Pass)>,
+    verify_frames: bool,
+    other_presentations: Option<u64>,
 }
 
 impl Execution {
@@ -40,6 +45,10 @@ impl Execution {
             recording: Recording::default(),
             active_queries: BTreeMap::new(),
             present_target: None,
+            present_gamma: None,
+            gamma: None,
+            verify_frames: std::env::var("ADV_VERIFY_FRAMES").as_deref() == Ok("1"),
+            other_presentations: None,
         }
     }
 
@@ -50,6 +59,17 @@ impl Execution {
         read: Option<ResourceKey>,
         write: ResourceKey,
     ) -> Result<(), Error> {
+        self.append_region(command, extent, extent, read, write)
+    }
+
+    fn append_region(
+        &mut self,
+        command: Command,
+        extent: Rect,
+        bounds: Rect,
+        read: Option<ResourceKey>,
+        write: ResourceKey,
+    ) -> Result<(), Error> {
         let writes = [(write, false)];
         let key = 0;
         self.recording.append(
@@ -57,7 +77,7 @@ impl Execution {
             command,
             Effects {
                 extent,
-                bounds: extent,
+                bounds,
                 key,
                 reads: read.as_slice(),
                 writes: &writes,
@@ -374,6 +394,7 @@ pub(super) fn staging_access(
     if !map::coherent(resource) {
         return Ok(());
     }
+    let key = key(env, pointer, subresource);
     let table = table(env);
     let store = table
         .get_mut(&mut env.sys.objects, pointer)
@@ -383,19 +404,28 @@ pub(super) fn staging_access(
     let base = store.pointer();
     let mut transfer_error = None;
     let result = store.staging_gpu_access(subresource, access, |layout, slice, parts| {
-        let result = upload_shadow(
-            env.ext,
-            env.cpu,
-            backing,
-            resource,
-            subresource,
-            Shadow {
-                base,
-                layout,
-                slice,
-            },
-            parts,
-        );
+        let result = (|| {
+            let execution = execution(env.ext)?;
+            if let Resource::Texture(texture) = resource {
+                let [width, height, _] = texture.extent(subresource % texture.levels());
+                execution
+                    .recording
+                    .written(key, extent_rect([width, height, 1]));
+            }
+            upload_shadow(
+                env.ext,
+                env.cpu,
+                backing,
+                resource,
+                subresource,
+                Shadow {
+                    base,
+                    layout,
+                    slice,
+                },
+                parts,
+            )
+        })();
         result.map_err(|error| {
             transfer_error = Some(error);
             map::Error::InvalidArgument
@@ -675,9 +705,15 @@ fn submit_copy(
     };
     let read = key(env, source.pointer, source.subresource);
     let write = key(env, destination.pointer, destination.subresource);
-    execution(env.ext)?.append(
+    execution(env.ext)?.append_region(
         Command::Transfer(transfer),
         extent_rect(destination.extent()),
+        Rect {
+            x: at[0],
+            y: at[1],
+            w: size[0],
+            h: size[1],
+        },
         Some(read),
         write,
     )?;
@@ -873,9 +909,15 @@ pub(super) fn update_resource(env: &mut Env<'_>) -> Result<(), Error> {
     };
     if let Some(transfer) = transfer {
         let write = key(env, destination.pointer, destination.subresource);
-        execution(env.ext)?.append(
+        execution(env.ext)?.append_region(
             Command::Transfer(transfer),
             extent_rect(extent),
+            Rect {
+                x: origin[0],
+                y: origin[1],
+                w: size[0],
+                h: size[1],
+            },
             None,
             write,
         )
@@ -1075,72 +1117,172 @@ pub(super) fn present(
     source: [u32; 2],
     serial: u64,
     first: bool,
-) -> Result<(), Error> {
-    let description = ops::object(env, table(env), pointer)?
+) -> Result<bool, adv_device::gpu::Error> {
+    use adv_device::gpu::{Error as GpuError, Filter, Image};
+    use adv_device::surface::SurfaceStore;
+    let error = |error: Error| GpuError::Device(format!("D3D11 present: {:#x}", error.hresult()));
+    let object = ops::object(env, table(env), pointer).map_err(error)?;
+    let description = object
         .resource()
-        .ok_or(Error::InvalidArgument)?;
-    let Backing::Image(mut image) = backing(env, pointer, description)? else {
-        return Err(Error::InvalidArgument);
+        .ok_or_else(|| error(Error::InvalidArgument))?;
+    let device = object.device().unwrap();
+    let Backing::Image(mut image) = backing(env, pointer, description).map_err(error)? else {
+        return Err(error(Error::InvalidArgument));
     };
     let key = key(env, pointer, 0);
     let size = (source[0], source[1]);
-    let execution = execution(env.ext)?;
-    let damage = execution
-        .recording
-        .present(&mut execution.gpu, key, size, serial, first)?;
-    if image.desc().samples > 1 {
-        let resolved = execution
-            .gpu
-            .device()
-            .create_image(&adv_gpu::resource::ImageDesc {
-                samples: 1,
-                usage: adv_gpu::resource::Usage::COLOR
-                    | adv_gpu::resource::Usage::SAMPLED
-                    | adv_gpu::resource::Usage::COPY_SRC,
-                ..*image.desc()
-            })?;
-        execution
-            .gpu
-            .resolve(image.view().clone(), resolved.view().clone())?;
-        image = resolved;
+    let other_presentations = env
+        .ext
+        .try_get::<SurfaceStore>()
+        .map(|store| store.stats.presentations);
+    let gamma = crate::dxgi::output_gamma(env.ext, device);
+    let revision = gamma.map(|(revision, _)| revision);
+    let gamma_update = gamma
+        .filter(|(revision, _)| {
+            env.ext
+                .get::<State>()
+                .execution
+                .as_ref()
+                .unwrap()
+                .gamma
+                .as_ref()
+                .is_none_or(|(old, pass)| old != revision || pass.size() != size)
+        })
+        .map(|(_, curve)| *curve);
+    let execution = execution(env.ext).map_err(error)?;
+    let damage = if first
+        || execution.other_presentations != other_presentations
+        || execution.present_gamma != revision
+    {
+        Some(Region::whole(size))
+    } else {
+        execution.recording.damage(key, size)
+    };
+    let pixels = damage.as_ref().map_or(0, Region::area);
+    let publish = damage.is_some();
+    if publish {
+        execution.gpu.try_admit_present()?;
     }
-    if execution
+    if let Some(curve) = gamma_update {
+        let pass = gamma::Pass::new(&execution.gpu, size, curve).map_err(error)?;
+        execution.gamma = Some((revision.unwrap(), pass));
+    } else if revision.is_none() {
+        execution.gamma = None;
+    }
+    let target = execution
         .present_target
         .as_ref()
-        .is_none_or(|image| (image.width(), image.height()) != size)
-    {
-        execution.present_target = Some(
-            execution
-                .gpu
-                .presentation_target(size.0, size.1, false)?
-                .image,
-        );
+        .filter(|image| (image.width(), image.height()) == size)
+        .cloned();
+    let (target, submitted) = execution.gpu.with_nonblocking_admission(|gpu| {
+        let commands = execution.recording.submit(gpu)?;
+        if !publish && !execution.verify_frames {
+            if commands {
+                gpu.flush()?;
+            }
+            return Ok((None, commands));
+        }
+        if image.desc().samples > 1 {
+            let resolved = gpu
+                .device()
+                .create_image(&adv_gpu::resource::ImageDesc {
+                    samples: 1,
+                    usage: adv_gpu::resource::Usage::COLOR
+                        | adv_gpu::resource::Usage::SAMPLED
+                        | adv_gpu::resource::Usage::COPY_SRC,
+                    ..*image.desc()
+                })
+                .map_err(|error| GpuError::Device(error.to_string()))?;
+            gpu.resolve(image.view().clone(), resolved.view().clone())?;
+            image = resolved;
+        }
+        let target = match target {
+            Some(target) => target,
+            None => gpu.presentation_target(size.0, size.1, false)?.image,
+        };
+        let copies = if execution.verify_frames {
+            vec![extent_rect([size.0, size.1, 1]).into()]
+        } else {
+            damage.as_ref().unwrap().rects()
+        };
+        let source = if let Some((_, pass)) = &execution.gamma {
+            pass.apply(gpu, &image, &copies)?;
+            pass.image.clone()
+        } else {
+            Image::from_native(image)
+        };
+        for rect in copies {
+            gpu.blit(&source, rect.into(), &target, rect.into(), Filter::Nearest)?;
+        }
+        if execution.verify_frames {
+            let changed = damage.clone().unwrap_or_else(|| Region::empty(size));
+            execution.recording.verify(gpu, &target, changed)?;
+        }
+        if let Some(damage) = damage {
+            gpu.present_admitted(
+                &target,
+                damage,
+                serial,
+                std::sync::Arc::new([]),
+                std::sync::Arc::new([]),
+            );
+        }
+        Ok((Some(target), true))
+    })?;
+    if let Some(target) = target {
+        execution.present_target = Some(target);
+        execution.other_presentations = other_presentations;
+        execution.present_gamma = revision;
     }
-    let source = adv_device::gpu::Image::from_native(image);
-    let target = execution.present_target.as_ref().unwrap();
-    let rect = extent_rect([size.0, size.1, 1]);
-    execution.gpu.blit(
-        &source,
-        rect,
-        target,
-        rect,
-        adv_device::gpu::Filter::Nearest,
-    )?;
-    #[cfg(feature = "d3d9-counters")]
-    let damage_pixels = damage.area();
-    execution.gpu.present(
-        target,
-        damage,
-        serial,
-        std::sync::Arc::new([]),
-        std::sync::Arc::new([]),
-    )?;
-    #[cfg(feature = "d3d9-counters")]
-    {
-        execution.recording.counters.presents += 1;
-        execution.recording.counters.damage_pixels += damage_pixels;
+    execution
+        .recording
+        .presented(key, size, serial, pixels, submitted);
+    Ok(publish)
+}
+
+pub(super) fn capture(ext: &mut Ext) -> Result<adv_device::frame::Waker, Error> {
+    Ok(execution(ext)?.gpu.waker())
+}
+
+pub(super) fn copy_capture(
+    env: &mut Env<'_>,
+    pointer: u32,
+    description: Resource,
+    frame: &adv_device::frame::Captured,
+) -> Result<(), Error> {
+    use adv_device::gpu::Image;
+    use adv_gpu::resource::Usage as GpuUsage;
+    let Resource::Texture(texture) = description else {
+        return Err(Error::InvalidArgument);
+    };
+    if texture.layers() != 1 || texture.levels() != 1 || texture.samples() != 1 {
+        return Err(Error::InvalidArgument);
     }
-    Ok(())
+    let location = Location {
+        pointer,
+        subresource: 0,
+        resource: description,
+    };
+    let dest = location.acquire(env, false)?;
+    let Backing::Image(image) = &dest else {
+        return Err(Error::InvalidArgument);
+    };
+    let execution = execution(env.ext)?;
+    execution.recording.submit(&mut execution.gpu)?;
+    let gpu = &mut execution.gpu;
+    let source = gpu.image(frame.width, frame.height)?;
+    let source_rect = extent_rect([frame.width, frame.height, 1]);
+    gpu.upload(&source, source_rect, frame.width * 4, &frame.bgra)?;
+    let converted = gpu.device().create_image(&adv_gpu::resource::ImageDesc {
+        usage: GpuUsage::COLOR | GpuUsage::COPY_SRC,
+        ..*image.desc()
+    })?;
+    gpu.point_copy(&source, &Image::from_native(converted.clone()))?;
+    gpu.transfer(ModernTransfer::CopyImage {
+        source: resource::region(&converted, texture, 0),
+        destination: resource::region(image, texture, 0),
+    })?;
+    location.written(env, &dest, true)
 }
 
 pub(super) fn clear_view(env: &mut Env<'_>) -> Result<(), Error> {

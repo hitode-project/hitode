@@ -1,4 +1,5 @@
 //! Assembly dependencies and factory state.
+use super::abi::DXGI_GAMMA_CONTROL;
 use super::caps::{AdapterInfo, Display, PhysicalMode};
 use adv_abi::{Env, Outcome, com::Com};
 use adv_device::surface::SurfaceStore;
@@ -79,7 +80,10 @@ pub(super) struct State {
     pub adapter_vtable: u32,
     pub output_vtable: u32,
     pub swap_chain_vtable: u32,
+    pub duplication_vtable: u32,
+    pub output: Output,
     pub provider: Provider,
+    pub presentation: u64,
     pub chains: BTreeMap<u32, Vec<u32>>,
 }
 
@@ -87,4 +91,19 @@ pub(super) struct State {
 pub(super) struct Factory {
     pub window: Option<u32>,
     pub window_flags: u32,
+}
+
+#[derive(Default)]
+pub(super) struct Output {
+    pub owner: Option<Owner>,
+    pub gamma: Option<Box<DXGI_GAMMA_CONTROL>>,
+    pub gamma_version: u64,
+    pub epoch: u64,
+    pub duplicating: bool,
+}
+
+pub(super) struct Owner {
+    pub claimant: u32,
+    pub device: u32,
+    pub retained: bool,
 }

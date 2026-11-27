@@ -2,7 +2,7 @@
 use super::caps::{ADAPTERS, Adapter, Display};
 use super::desc::{self, ModeRequest};
 use super::object::{Kind, Notification, Object, PrivateData};
-use super::state::{DeviceCall, DeviceOperation, Factory, State};
+use super::state::{DeviceCall, DeviceOperation, Factory, Owner, State};
 use super::{Error, abi::*};
 use adv_abi::com::{IUNKNOWN, Iid, QueryError};
 use adv_abi::{Env, Outcome};
@@ -186,8 +186,19 @@ fn destroy(env: &mut Env<'_>, this: u32, interfaces: &mut Vec<u32>) -> u32 {
                     PrivateData::Bytes(_) => None,
                 }),
         );
-        if let Kind::SwapChain(chain) = destroyed.value.kind {
-            chain.destroy(env, this, interfaces);
+        match destroyed.value.kind {
+            Kind::SwapChain(chain) => {
+                if chain.fullscreen.Windowed == 0 {
+                    release_output(env, this, interfaces);
+                }
+                chain.destroy(env, this, interfaces);
+            }
+            Kind::Duplication(duplication) => {
+                env.ext.get_mut::<State>().output.duplicating = false;
+                interfaces.push(duplication.device);
+            }
+            Kind::Output => release_output(env, this, interfaces),
+            Kind::Factory(_) | Kind::Adapter(_) => (),
         }
         if let Some(parent) = destroyed.value.parent {
             destroy(env, parent, interfaces);
@@ -312,7 +323,9 @@ pub(super) fn enum_output(env: &mut Env<'_>, this: u32, index: u32) -> Result<u3
 pub(super) fn adapter(env: &Env<'_>, this: u32) -> Result<Adapter, Error> {
     match object(env, this)?.kind {
         Kind::Adapter(adapter) => Ok(adapter),
-        Kind::Factory(_) | Kind::Output | Kind::SwapChain(_) => Err(Error::InvalidCall),
+        Kind::Factory(_) | Kind::Output | Kind::SwapChain(_) | Kind::Duplication(_) => {
+            Err(Error::InvalidCall)
+        }
     }
 }
 
@@ -510,11 +523,69 @@ pub(super) fn unregister_notification(
     Ok(())
 }
 
+pub(super) fn claim_output(
+    env: &mut Env<'_>,
+    claimant: u32,
+    device: u32,
+    direct: bool,
+) -> Result<(), Error> {
+    if let Some(owner) = &env.ext.get::<State>().output.owner {
+        return if owner.claimant == claimant || direct && owner.device == device {
+            Ok(())
+        } else {
+            Err(Error::Unavailable)
+        };
+    }
+    let buffers = env.ext.get::<super::swap::Services>().buffers;
+    if direct {
+        buffers.retain_device(env, device)?;
+    }
+    if !crate::ddraw::front::modes::set_modern_exclusive(env.ext, claimant, true) {
+        if direct {
+            buffers.drop_device_ref(env, device);
+        }
+        return Err(Error::Unavailable);
+    }
+    let output = &mut env.ext.get_mut::<State>().output;
+    output.owner = Some(Owner {
+        claimant,
+        device,
+        retained: direct,
+    });
+    output.epoch += 1;
+    Ok(())
+}
+
+pub(super) fn release_output(env: &mut Env<'_>, claimant: u32, interfaces: &mut Vec<u32>) {
+    let output = &mut env.ext.get_mut::<State>().output;
+    if output
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner.claimant == claimant)
+    {
+        let owner = output.owner.take().unwrap();
+        output.gamma = None;
+        output.epoch += 1;
+        crate::ddraw::front::modes::set_modern_exclusive(env.ext, claimant, false);
+        if owner.retained {
+            interfaces.push(owner.device);
+        }
+    }
+}
+
+pub(super) fn output_mode_changed(ext: &mut adv_machine::Ext) {
+    ext.get_mut::<State>().output.epoch += 1;
+}
+
 pub(super) fn device(env: &mut Env<'_>, call: DeviceCall) -> Outcome {
     if let Some(devices) = env.ext.get::<State>().provider.devices {
         return devices.invoke(env, call);
     }
-    let error = match call.operation {
+    device_unavailable(call.operation)
+}
+
+pub(super) fn device_unavailable(operation: DeviceOperation) -> Outcome {
+    let error = match operation {
         DeviceOperation::CreateSwapChain
         | DeviceOperation::CreateSwapChainForHwnd
         | DeviceOperation::CreateSwapChainForCoreWindow

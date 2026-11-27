@@ -23,6 +23,7 @@ macro_rules! vtable {
 }
 
 mod exports;
+pub(super) mod output;
 mod swap_chain;
 
 const FACTORY: &[Slot] = vtable!("IDXGIFactory7",
@@ -118,7 +119,7 @@ pub fn register(registry: &mut Registry) {
     exports::register(registry);
     registry.register(create_factory_ABI);
     registry.register(create_factory1_ABI);
-    for slots in [FACTORY, ADAPTER, OUTPUT, swap_chain::SLOTS] {
+    for slots in [FACTORY, ADAPTER, OUTPUT, swap_chain::SLOTS, output::SLOTS] {
         for (index, &(name, handler, level)) in slots.iter().enumerate() {
             let (interface, method) = name.split_once("::").unwrap();
             let signature =
@@ -154,6 +155,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>, provider: Provider) -> Resu
         table(machine, ADAPTER)?,
         table(machine, OUTPUT)?,
         table(machine, swap_chain::SLOTS)?,
+        table(machine, output::SLOTS)?,
     ];
     let com = adv_abi::com::Com::new(&mut machine.sys.objects).ok_or("DXGI COM namespace")?;
     let storage = machine
@@ -171,6 +173,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>, provider: Provider) -> Resu
         adapter_vtable,
         output_vtable,
         swap_chain_vtable,
+        duplication_vtable,
     ] = entries.each_ref().map(|entries| {
         let start = address;
         address += entries.len() as u32 * 4;
@@ -181,6 +184,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>, provider: Provider) -> Resu
         adapter_vtable,
         output_vtable,
         swap_chain_vtable,
+        duplication_vtable,
     ]
     .into_iter()
     .zip(&entries)
@@ -196,7 +200,10 @@ pub fn install<B: Backend>(machine: &mut Machine<B>, provider: Provider) -> Resu
         adapter_vtable,
         output_vtable,
         swap_chain_vtable,
+        duplication_vtable,
         provider,
+        presentation: 0,
+        output: Default::default(),
         chains: Default::default(),
     });
     Ok(())
@@ -771,7 +778,6 @@ device_glue!(
     |env: &mut Env<'_>| {
         interface_pointer(env, 5)?;
         device_required(env, 1)?;
-        device_required(env, 2)?;
         structure::<DXGI_SWAP_CHAIN_DESC1>(env, 3)
     }
 );
@@ -806,9 +812,7 @@ fn shared_resource_luid(env: &mut Env<'_>) -> Outcome {
         write(env, out, adapter.description(info).AdapterLuid)
     })
 }
-device_glue!(take_ownership, TakeOwnership, 2, |env: &mut Env<'_>| {
-    device_required(env, 1)
-});
+device_glue!(take_ownership, TakeOwnership, 2);
 device_glue!(release_ownership, ReleaseOwnership, 0);
 device_glue!(
     gamma_caps,
@@ -856,6 +860,12 @@ mod tests;
 /// Install the window and device services for private swap-chain callers.
 pub fn install_swap_chains<B: Backend>(machine: &mut Machine<B>, services: super::swap::Services) {
     machine.ext.insert(services);
+    machine
+        .ext
+        .get_mut::<State>()
+        .provider
+        .devices
+        .get_or_insert(&output::OutputDevices);
 }
 
 pub fn has_swap_chain(ext: &adv_machine::Ext, window: u32) -> bool {
