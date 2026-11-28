@@ -430,6 +430,7 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
     let Some(gpu) = state.gpu.as_mut() else {
         return Outcome::Return(UNAVAILABLE);
     };
+    let guest = format::plane(format, address, pitch, (lock.rectangle.w, lock.rectangle.h));
     let Some((pixels, pitch)) = format::snapshot(
         env.cpu,
         gpu,
@@ -459,6 +460,7 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
             pixels,
             pitch,
             rectangle: lock.rectangle,
+            guest,
         },
     )
 }

@@ -14,8 +14,8 @@
 //!
 //! The records are shared with the DIB bodies through `Services::text_state`,
 //! which is null while records are off.
+use crate::{Env, Ext, Sys};
 use adv_cpu::backend::GuestExt;
-use adv_machine::{Ext, Sys};
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
@@ -164,7 +164,8 @@ pub struct MovedPixels {
     pub thread: u32,
     pub kind: MoveKind,
     pub destination: Store,
-    /// The destination rectangle written, as left, top, right, bottom.
+    /// The destination rectangle written, as left, top, right, bottom. A
+    /// draw's is a bound that may exceed the pixels it covers.
     pub rect: [i32; 4],
     pub source: Store,
     /// `None` when the move reads the source in a way no affine map
@@ -345,14 +346,14 @@ pub fn records(ext: &Ext) -> Option<std::cell::RefMut<'_, TextRecords>> {
 }
 
 /// The calling guest thread's ID, from its TEB client ID.
-pub fn thread(env: &adv_machine::Env<'_>) -> u32 {
+pub fn thread(env: &Env<'_>) -> u32 {
     let teb = env.sys.contexts[env.context as usize].teb;
     env.cpu.read_u32(teb + 0x24).unwrap_or(0)
 }
 
 /// Note pixels a host handler moved, while records are on.
 pub fn moved(
-    env: &adv_machine::Env<'_>,
+    env: &Env<'_>,
     kind: MoveKind,
     destination: Store,
     rect: [i32; 4],
@@ -364,8 +365,8 @@ pub fn moved(
     }
 }
 
-/// Note a copy a DIB body completed.
-pub(super) fn copied(
+/// Note a copy a DIB body completed; `services` are the body's.
+pub fn copied(
     services: adv_cpu::body::Services,
     kind: MoveKind,
     destination: Plane,

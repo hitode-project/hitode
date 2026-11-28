@@ -22,6 +22,23 @@ pub(super) fn pitch(format: u32, width: u32) -> Option<u32> {
     width.checked_mul(bytes(format)?)
 }
 
+/// The guest pixels a `width` × `height` upload of `format` reads from
+/// `address`, as text records name them (WINE-UNIX-8).
+pub(super) fn plane(
+    format: u32,
+    address: u32,
+    pitch: u32,
+    (width, height): (u32, u32),
+) -> Option<adv_machine::text_records::Plane> {
+    Some(adv_machine::text_records::Plane {
+        bits: address,
+        stride: pitch as i32,
+        bpp: bytes(format)? * 8,
+        origin: [0, 0],
+        size: [width as i32, height as i32],
+    })
+}
+
 pub(super) fn length(format: u32, width: u32, height: u32) -> Option<u32> {
     pitch(format, width)?
         .checked_mul(height)

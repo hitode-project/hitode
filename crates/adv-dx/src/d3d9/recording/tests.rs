@@ -304,6 +304,7 @@ fn render_target_readback_and_gpu_lock_flush_prior_draws() {
             w: 16,
             h: 12,
         },
+        guest: None,
     };
     assert!(matches!(
         record(&mut env(&mut f), owner, op),

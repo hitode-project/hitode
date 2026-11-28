@@ -293,6 +293,7 @@ fn update_surface(
             w: from.w,
             h: from.h,
         };
+        let guest = format::plane(source_format, address, pitch, (from.w, from.h));
         let (pixels, pitch) = format::snapshot(
             env.cpu,
             gpu,
@@ -315,6 +316,7 @@ fn update_surface(
                 pixels,
                 pitch,
                 rectangle,
+                guest,
             },
         ))
     })();
@@ -468,6 +470,7 @@ fn color_fill(
             level,
             target,
             pixels: Pixels::Host(Arc::new(pixels), UploadKey::Admission(admission)),
+            guest: None,
             pitch,
             rectangle: to,
         },

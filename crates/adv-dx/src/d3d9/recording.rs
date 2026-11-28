@@ -455,8 +455,9 @@ fn append(
         }
         return Outcome::Return(0);
     }
-    let f = frame(env, owner);
     let effects = p.damage(target.as_ref());
+    crate::text::recorded(env, &effects, text_origin(&p.operation));
+    let f = frame(env, owner);
     let mut operation = p.operation.clone();
     if let (Some(target), Operation::Draw(draw)) = (target, &mut operation) {
         draw.target = target;
@@ -934,6 +935,23 @@ pub(super) fn cancel(env: &mut Env<'_>, operation: &Operation) {
         }
     }
 }
+/// What an operation reads that its damage effects do not name.
+fn text_origin(operation: &Operation) -> crate::text::Origin {
+    match operation {
+        Operation::Upload { guest, .. } => crate::text::Origin {
+            upload: *guest,
+            copy: None,
+        },
+        Operation::Copy {
+            rectangle, region, ..
+        } => crate::text::Origin {
+            upload: None,
+            copy: crate::text::rect_map(*region, *rectangle),
+        },
+        _ => Default::default(),
+    }
+}
+
 pub(super) fn present_operation(
     env: &mut Env<'_>,
     owner: Id,
@@ -941,6 +959,9 @@ pub(super) fn present_operation(
     deadline: Option<u64>,
     copy: Option<(Id, presentation::Copy)>,
 ) -> Outcome {
+    if crate::text::on(env) {
+        note_present(env, owner, copy.map(|(_, copy)| copy));
+    }
     let token = token(env, owner);
     dispatch_now(
         env,
@@ -953,6 +974,37 @@ pub(super) fn present_operation(
             copy,
         },
     )
+}
+
+/// Note for text records that the device shows its back buffer in its window.
+fn note_present(env: &Env<'_>, owner: Id, copy: Option<presentation::Copy>) {
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
+        return;
+    };
+    let Some(back_buffer) = d.all_back_buffers().next() else {
+        return;
+    };
+    let p = d.parameters;
+    let whole = |w, h| adv_device::surface::Rect { x: 0, y: 0, w, h };
+    let (destination, source) = match copy {
+        Some(copy) => match copy.rects() {
+            Some(rects) => rects,
+            None => return,
+        },
+        // A flip shows the whole back buffer over the whole client area.
+        None => {
+            let provider = env.ext.get::<State>().provider;
+            let Some((w, h)) = (provider.window)(env.ext, &env.sys.objects, p.hDeviceWindow) else {
+                return;
+            };
+            (whole(w, h), whole(p.BackBufferWidth, p.BackBufferHeight))
+        }
+    };
+    let Some(map) = crate::text::rect_map(destination, source) else {
+        return;
+    };
+    let source = key::content(env, back_buffer, None, 0);
+    crate::text::presented(env, source, p.hDeviceWindow, destination, map);
 }
 
 fn window_presented(env: &Env<'_>, owner: Id) {

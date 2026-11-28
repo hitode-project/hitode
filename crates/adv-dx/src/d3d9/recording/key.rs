@@ -333,6 +333,7 @@ fn prepare_checked(
             pixels,
             pitch,
             rectangle,
+            guest: _,
         } => {
             write(
                 content(env, *resource, *level, 0),

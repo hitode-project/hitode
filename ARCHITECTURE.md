@@ -205,6 +205,7 @@ The four crates a guest call crosses, one row per role. The rules stay in the sp
 | [`vm`](crates/adv-machine/src/vm.rs), [`layout`](crates/adv-machine/src/layout.rs), [`guest_words`](crates/adv-machine/src/guest_words.rs) | Guest address-space bookkeeping and the layout of host-owned regions; words shared with authored guest code | Mapping pages, which `adv-cpu-core::memory` does |
 | [`process`](crates/adv-machine/src/process.rs), [`objects`](crates/adv-machine/src/objects.rs), [`ext`](crates/adv-machine/src/ext.rs) | The process facts the machine needs, owned payloads and alias namespaces, and per-subsystem state by type | Image loading; API handle semantics |
 | [`trace`](crates/adv-machine/src/trace.rs), [`stats`](crates/adv-machine/src/stats.rs), [`frame_budget`](crates/adv-machine/src/frame_budget.rs), [`schedule_trace`](crates/adv-machine/src/schedule_trace.rs), [`wait_diagnostics`](crates/adv-machine/src/wait_diagnostics.rs) | Diagnostics: the host-call trace, cost accounting, frame budgets, and scheduler and wait observations |  |
+| [`text_records`](crates/adv-machine/src/text_records.rs) | Text records (WINE-UNIX-8): where host fonts draw text and where host devices move its pixels, shared with direct bodies | Finding text that guest code draws; turning records into extracted text |
 
 ### adv-nt
 

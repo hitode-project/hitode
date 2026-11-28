@@ -1,8 +1,8 @@
 //! Wine 11 DIB primitives over checked, directly accessible guest spans.
 
-use super::text_records::{MoveKind, Plane};
 use adv_cpu::body::{EAX, EDX, Input, Mem, Ret, Stop};
 use adv_machine::Conv;
+use adv_machine::text_records::{self, MoveKind, Plane};
 #[path = "dib_layout.rs"]
 mod layout;
 use layout::{dib as d, *};
@@ -907,7 +907,7 @@ fn note_copy(env: &mut Args<'_, impl Mem>, kind: MoveKind) {
     let noted = copy_extent(env, kind);
     env.cpu.stop = None;
     if let Some((destination, rect, source, offset)) = noted {
-        super::text_records::copied(services, kind, destination, rect, source, offset);
+        text_records::copied(services, kind, destination, rect, source, offset);
     }
 }
 

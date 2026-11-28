@@ -30,9 +30,28 @@ fn text(line: &DrawnLine) -> String {
         .collect()
 }
 
+/// Run the test `child` alone in a new test process, as Wine keeps one
+/// server per process.
+fn in_child(child: &str) {
+    if wine::wine().is_none() {
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", child, "--nocapture"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "{child}");
+}
+
 // spec: WINE-UNIX-8
 #[test]
 fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
+    in_child("drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied_child");
+}
+
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied_child() {
     let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
@@ -265,4 +284,206 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
     assert_ne!(blended.bits, dib.bits);
     assert_eq!((converted_copy.bits, converted_copy.bpp), (converted, 24));
     assert!(moves.iter().all(|moved| moved.thread == thread));
+}
+
+// spec: WINE-UNIX-8
+#[cfg(feature = "gpu")]
+#[test]
+fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window() {
+    in_child("text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child");
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child() {
+    use adv_runtime::wine::session::Session;
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/text-records-d3d9")
+        .join(std::process::id().to_string());
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    let game = root.join("game");
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::copy(probes.join("d3d9.exe"), game.join("d3d9.exe")).unwrap();
+    let output = root.join("stdout");
+    let stdout = std::fs::File::create(&output).unwrap();
+    let config = Config {
+        dist: &dist,
+        prefix: &root.join("prefix"),
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: Some(&game.join("d3d9.exe")),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: Some(std::os::fd::AsRawFd::as_raw_fd(&stdout)),
+    };
+    let wake = adv_sync::WakeEvent::new().unwrap();
+    let gpu_wake = wake.clone();
+    let gpu = adv_device::gpu::test_support::request(false).unwrap();
+    let mut session = Session::start(&config, wake, move |machine| {
+        machine.ext.insert(gpu.waker());
+        Session::attach_gpu(machine, gpu, gpu_wake)
+    })
+    .unwrap();
+    session.set_text_records(true);
+    let stop = session.run(Instant::now() + Duration::from_secs(60));
+    let batch = session.take_text_records();
+    drop(session);
+    drop(stdout);
+    assert!(
+        matches!(stop, Stop::Exited(0)),
+        "{stop:?}: {}",
+        std::fs::read_to_string(output).unwrap()
+    );
+
+    assert_eq!(batch.dropped, 0);
+    let lines: Vec<_> = batch
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TextRecord::Line(line) => Some(line),
+            _ => None,
+        })
+        .collect();
+    // "Hi" on the system-memory surface, then on the back buffer, then the
+    // static window's own caption as the window repaints.
+    assert_eq!(
+        lines.iter().map(|line| text(line)).collect::<Vec<_>>(),
+        ["Hi", "Hi", "probe"]
+    );
+    let moves: Vec<_> = batch
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TextRecord::Move(moved) => Some(moved),
+            _ => None,
+        })
+        .collect();
+    let back = lines[1].plane.unwrap();
+    let Some(upload) = moves.iter().find(|moved| moved.kind == MoveKind::Upload) else {
+        panic!("{moves:#?}");
+    };
+    // The back buffer's DC pixels go up to the back buffer resource whole.
+    let Store::Memory(read) = upload.source else {
+        panic!("{upload:?}");
+    };
+    assert_eq!((read.bits, read.size), (back.bits, [64, 32]), "{upload:?}");
+    assert_eq!(
+        (upload.rect, upload.map),
+        ([0, 0, 64, 32], Some(Map::offset(0, 0)))
+    );
+    assert!(matches!(upload.destination, Store::Resource(_)));
+    // Each present shows that resource across the 64 × 32 window.
+    let presents: Vec<_> = moves
+        .iter()
+        .filter(|moved| moved.kind == MoveKind::Present)
+        .collect();
+    assert!(!presents.is_empty(), "{moves:#?}");
+    for present in &presents {
+        assert_eq!(present.source, upload.destination);
+        assert!(matches!(present.destination, Store::Window(_)));
+        assert_eq!(
+            (present.rect, present.map),
+            ([0, 0, 64, 32], Some(Map::offset(0, 0)))
+        );
+    }
+    // Nothing moved out of the system-memory surface, which no copy reads.
+    let [start, end] = lines[0].plane.unwrap().span();
+    assert!(moves.iter().all(|moved| match moved.source {
+        Store::Memory(plane) => plane.span()[1] <= start || plane.span()[0] >= end,
+        _ => true,
+    }));
+}
+
+// spec: WINE-UNIX-8
+#[cfg(feature = "gpu")]
+#[test]
+fn a_d3d9_draw_that_samples_a_text_texture_is_recorded_with_its_map() {
+    in_child("a_d3d9_draw_that_samples_a_text_texture_is_recorded_with_its_map_child");
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn a_d3d9_draw_that_samples_a_text_texture_is_recorded_with_its_map_child() {
+    use adv_runtime::wine::session::Session;
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/text-records-d3d9-draw")
+        .join(std::process::id().to_string());
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    let game = root.join("game");
+    std::fs::create_dir_all(&game).unwrap();
+    let exe = game.join("text-records-d3d9.exe");
+    std::fs::copy(probes.join("text-records-d3d9.exe"), &exe).unwrap();
+    let config = Config {
+        dist: &dist,
+        prefix: &root.join("prefix"),
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: Some(&exe),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: None,
+    };
+    let wake = adv_sync::WakeEvent::new().unwrap();
+    let gpu_wake = wake.clone();
+    let gpu = adv_device::gpu::test_support::request(false).unwrap();
+    let mut session = Session::start(&config, wake, move |machine| {
+        machine.ext.insert(gpu.waker());
+        Session::attach_gpu(machine, gpu, gpu_wake)
+    })
+    .unwrap();
+    session.set_text_records(true);
+    let stop = session.run(Instant::now() + Duration::from_secs(60));
+    let batch = session.take_text_records();
+    drop(session);
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}");
+
+    let moves: Vec<_> = batch
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TextRecord::Move(moved) => Some(moved),
+            _ => None,
+        })
+        .collect();
+    let kinds: Vec<_> = moves.iter().map(|moved| moved.kind).collect();
+    assert_eq!(
+        kinds,
+        [MoveKind::Upload, MoveKind::Draw, MoveKind::Present],
+        "{moves:#?}"
+    );
+    let [upload, draw, present] = [moves[0], moves[1], moves[2]];
+    // The texture's DC pixels reach the texture, the quad samples it 1:1 at
+    // (8, 4) on the back buffer, and the back buffer reaches the window.
+    assert_eq!(draw.source, upload.destination);
+    // Draw bounds are the damage planner's, which may pad a pixel.
+    let [l, t, r, b] = draw.rect;
+    assert!(
+        (7..=8).contains(&l)
+            && (3..=4).contains(&t)
+            && (72..=73).contains(&r)
+            && (36..=37).contains(&b),
+        "{draw:?}"
+    );
+    assert_eq!(draw.map, Some(Map::offset(-8, -4)), "{draw:?}");
+    assert_eq!(present.source, draw.destination);
+    assert!(matches!(present.destination, Store::Window(_)));
+    assert_eq!(present.rect, [0, 0, 128, 64]);
 }
