@@ -32,4 +32,8 @@ test("isAndroidPermissionBlocked distinguishes denied external access from unplu
     isAndroidPermissionBlocked({ ...base, path: "/data/user/0/org.hitode.launcher/files/imports/abc" }),
     false,
   );
+  assert.equal(
+    isAndroidPermissionBlocked({ ...base, path: "/storage/emulated/0/Download/game.mdf", offline: null }),
+    true,
+  );
 });

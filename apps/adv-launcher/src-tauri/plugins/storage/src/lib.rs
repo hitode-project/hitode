@@ -98,6 +98,26 @@ impl<R: Runtime> Storage<R> {
         self.call("pickFile", json!({ "dest": dest })).await
     }
 
+    /// One file whose extension is validated before copying when falling back
+    /// from direct shared-storage access. `extensions` applies to direct paths
+    /// (where sibling files are reachable) and `copy_extensions` to single-file copies.
+    pub async fn pick_file_filtered(
+        &self,
+        dest: &std::path::Path,
+        extensions: &[&str],
+        copy_extensions: &[&str],
+    ) -> Reply<PickedFile> {
+        self.call(
+            "pickFile",
+            json!({
+                "dest": dest,
+                "extensions": extensions,
+                "copyExtensions": copy_extensions,
+            }),
+        )
+        .await
+    }
+
     pub async fn copy_folder(
         &self,
         uri: String,

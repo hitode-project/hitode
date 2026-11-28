@@ -27,6 +27,7 @@ export type ScriptRun = {
   shown: boolean;
   result?: { exitCode: number; entries: number } | { error: string };
 };
+import { loadGameSetup } from "./fake-settings";
 import { explainJit, jit } from "./jit.svelte";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
@@ -372,7 +373,9 @@ export class LaunchFlow {
       this.view = "prepare";
     }
     const game = library.get(id);
-    if (game && androidStorage.blocked(game.path, game.offline)) {
+    const discs = loadGameSetup(id, game?.codepage ?? 932).discs;
+    const discBlocked = discs.some((disc) => androidStorage.blocked(disc, null));
+    if ((game && androidStorage.blocked(game.path, game.offline)) || discBlocked) {
       this.recovery = "permission";
       this.#fail("unsupported", t("需要文件访问权限"));
       return;

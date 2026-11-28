@@ -92,6 +92,7 @@ pub struct Vfs {
     whiteouts: whiteouts::Whiteouts,
     install: Option<PathBuf>,
     other: PathBuf,
+    codepage: u32,
     optical: BTreeMap<char, std::sync::Arc<optical::OpticalMedia>>,
     memo: Mutex<Memo>,
 }
@@ -186,6 +187,7 @@ impl Vfs {
             whiteouts: whiteouts::Whiteouts::load(cfg.data_dir.join("whiteouts")),
             install: cfg.install_dir.clone(),
             other: cfg.system_dir.clone(),
+            codepage: cfg.codepage,
             optical: BTreeMap::new(),
             memo: Mutex::default(),
         }

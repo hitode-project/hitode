@@ -50,6 +50,48 @@ internal fun readableFilePath(
     ?.takeIf { it.isFile && it.canRead() }
     ?.path
 
+/** Resolves a readable file inside Hitode's own DriveProvider roots (`C:` or `Games:`). */
+internal fun driveFilePath(documentId: String, dataDir: File): String? {
+    val (root, relative) = when {
+        documentId.startsWith("C:/") -> File(dataDir, "wine/drive_c") to documentId.removePrefix("C:/")
+        documentId.startsWith("Games:/") -> File(dataDir, "imports") to documentId.removePrefix("Games:/")
+        else -> return null
+    }
+    if (relative.isEmpty() || relative.contains('\u0000')) return null
+    val parts = relative.split('/')
+    if (parts.any { it.isEmpty() || it == "." || it == ".." }) return null
+    val base = root.canonicalFile.toPath()
+    val target = File(root, relative).canonicalFile
+    val targetPath = target.toPath()
+    return if (targetPath.startsWith(base) && targetPath != base && target.isFile && target.canRead()) {
+        target.path
+    } else null
+}
+
+/** Extracts a MediaStore `_id` from Downloads (`msf:<id>` / `<id>`) or MediaDocuments IDs. */
+internal fun mediaDocumentId(authority: String?, documentId: String): Long? = when (authority) {
+    "com.android.providers.downloads.documents" -> when {
+        documentId.startsWith("msf:") -> documentId.removePrefix("msf:").toLongOrNull()
+        else -> documentId.toLongOrNull()
+    }
+    "com.android.providers.media.documents" -> {
+        val colon = documentId.indexOf(':')
+        if (colon > 0) documentId.substring(colon + 1).toLongOrNull() else null
+    }
+    else -> null
+}
+
+internal fun extensionMatches(name: String, allowed: List<String>?): Boolean {
+    if (allowed.isNullOrEmpty()) return true
+    val dot = name.lastIndexOf('.')
+    if (dot <= 0 || dot == name.length - 1) return false
+    val ext = name.substring(dot + 1).lowercase()
+    return allowed.any { it.equals(ext, ignoreCase = true) }
+}
+
+internal fun fallbackDisplayName(uriPath: String?): String? =
+    uriPath?.substringAfterLast('/')?.takeIf { it.isNotEmpty() && it != "." && it != ".." }
+
 internal fun canGrantDirectAccess(
     authority: String?,
     documentId: String,

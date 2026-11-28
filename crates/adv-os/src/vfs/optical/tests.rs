@@ -408,3 +408,263 @@ fn optical_containers_present_the_first_data_track_as_logical_sectors() {
     drop(vfs);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+/// Builds a binary Alcohol 120% v1.3 `.mds` descriptor with one session.
+fn build_mds(
+    medium_type: u16,
+    tracks: &[(u8, u8, u16, u32, u64)], // (point, mode, sector_size, pregap, start_offset)
+    filenames: &[(&str, bool)],         // (name, wide_utf16le)
+) -> Vec<u8> {
+    let mut out = vec![0u8; 88];
+    out[..16].copy_from_slice(b"MEDIA DESCRIPTOR");
+    out[16] = 1;
+    out[17] = 3;
+    out[0x12..0x14].copy_from_slice(&medium_type.to_le_bytes());
+    out[0x14..0x16].copy_from_slice(&1u16.to_le_bytes());
+
+    let sessions_offset = out.len() as u32;
+    out[0x50..0x54].copy_from_slice(&sessions_offset.to_le_bytes());
+    let mut session = vec![0u8; 24];
+    session[0x0A] = tracks.len() as u8;
+    let tracks_offset = sessions_offset + 24;
+    session[0x14..0x18].copy_from_slice(&tracks_offset.to_le_bytes());
+    out.extend_from_slice(&session);
+
+    let extra_base = out.len() + tracks.len() * 80;
+    let footer_base = extra_base + tracks.len() * 8;
+    let names_base = footer_base + filenames.len() * 16;
+
+    let mut name_offsets = Vec::new();
+    let mut name_blob = Vec::new();
+    for &(name, wide) in filenames {
+        name_offsets.push((names_base + name_blob.len()) as u32);
+        if wide {
+            for unit in name.encode_utf16().chain([0]) {
+                name_blob.extend_from_slice(&unit.to_le_bytes());
+            }
+        } else {
+            name_blob.extend_from_slice(name.as_bytes());
+            name_blob.push(0);
+        }
+    }
+
+    for (idx, &(point, mode, sector_size, _pregap, start_offset)) in tracks.iter().enumerate() {
+        let mut block = vec![0u8; 80];
+        block[0x00] = mode;
+        block[0x04] = point;
+        if medium_type < 0x10 {
+            let extra_off = (extra_base + idx * 8) as u32;
+            block[0x0C..0x10].copy_from_slice(&extra_off.to_le_bytes());
+        }
+        block[0x10..0x12].copy_from_slice(&sector_size.to_le_bytes());
+        block[0x28..0x30].copy_from_slice(&start_offset.to_le_bytes());
+        block[0x30..0x34].copy_from_slice(&(filenames.len() as u32).to_le_bytes());
+        block[0x34..0x38].copy_from_slice(&(footer_base as u32).to_le_bytes());
+        out.extend_from_slice(&block);
+    }
+    for &(_, _, _, pregap, _) in tracks {
+        out.extend_from_slice(&pregap.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+    for (idx, &(_, wide)) in filenames.iter().enumerate() {
+        let mut footer = vec![0u8; 16];
+        footer[0..4].copy_from_slice(&name_offsets[idx].to_le_bytes());
+        footer[4..8].copy_from_slice(&(u32::from(wide)).to_le_bytes());
+        out.extend_from_slice(&footer);
+    }
+    out.extend_from_slice(&name_blob);
+    out
+}
+
+#[test]
+// spec: DEV-DISC-4, DEV-DISC-5
+fn mdf_and_mds_variants_mount_across_sector_layouts_pregaps_and_splits() {
+    let (_, directory) = fixture("mdf-variants");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = directory.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+
+    // 2368-byte PQ subchannel raw MDF without a descriptor.
+    assert_eq!(logical(&write("pq.mdf", &raw(1, 2368))), FIXTURE);
+
+    // 2336-byte Mode 2 Form 1 without sync/header (8-byte subheader + 2048 user data).
+    let mut mode2_2336 = Vec::new();
+    for data in FIXTURE.chunks(2048) {
+        let mut sector = vec![0u8; 2336];
+        sector[0..8].copy_from_slice(&[0, 0, 8, 0, 0, 0, 8, 0]);
+        sector[8..8 + 2048].copy_from_slice(data);
+        mode2_2336.extend_from_slice(&sector);
+    }
+    assert_eq!(logical(&write("m2_2336.mdf", &mode2_2336)), FIXTURE);
+
+    // Raw MDF with zeroed bad sectors at LBA 0 and LBA 1 (common on copy-protected discs).
+    let mut bad_sys = raw(1, 2352);
+    bad_sys[..2 * 2352].fill(0);
+    let expected_bad = {
+        let mut e = FIXTURE.to_vec();
+        e[..2 * 2048].fill(0);
+        e
+    };
+    assert_eq!(logical(&write("bad_sys.mdf", &bad_sys)), expected_bad);
+
+    // Raw MDF where LBA 0 is Mode 0 (0x00) and LBA 1 is zeroed, while LBA 16 is Mode 1.
+    let mut mode0_lba0 = raw(1, 2352);
+    mode0_lba0[15] = 0;
+    mode0_lba0[2352..2 * 2352].fill(0);
+    let expected_mode0 = {
+        let mut e = FIXTURE.to_vec();
+        e[2048..2 * 2048].fill(0);
+        e
+    };
+    assert_eq!(logical(&write("mode0.mdf", &mode0_lba0)), expected_mode0);
+
+    // Lone raw MDF with a 150-sector zeroed pregap.
+    let mut pregapped = vec![0u8; 150 * 2352];
+    pregapped.extend_from_slice(&raw(1, 2352));
+    assert_eq!(logical(&write("pregap150.mdf", &pregapped)), FIXTURE);
+
+    // Binary MDS with lead-in point 0xA0, non-zero start_offset, 2368-byte track 1,
+    // audio track 2 boundary, and a UTF-16LE non-matching filename.
+    let lead = vec![0xAAu8; 4096];
+    let track1 = raw(1, 2368);
+    let track1_start = lead.len() as u64;
+    let track2_start = track1_start + track1.len() as u64;
+    let audio_tail = vec![0x55u8; 10 * 2368];
+    write("custom_data.mdf", &[lead, track1, audio_tail].concat());
+    let mds_bytes = build_mds(
+        0x00,
+        &[
+            (0xA0, 0x00, 0, 0, 0),
+            (0x01, 0xAA, 2368, 0, track1_start),
+            (0x02, 0xA9, 2352, 0, track2_start),
+        ],
+        &[("custom_data.mdf", true)],
+    );
+    assert_eq!(logical(&write("game.mds", &mds_bytes)), FIXTURE);
+
+    // Opening a `.mdf` directly picks up its sibling `.mds` layout (non-zero offset).
+    let sibling_lead = vec![0xBBu8; 2048];
+    let sibling_start = sibling_lead.len() as u64;
+    write("paired.mdf", &[sibling_lead, raw(2, 2352)].concat());
+    write(
+        "paired.mds",
+        &build_mds(
+            0x00,
+            &[(0x01, 0xAC, 2352, 0, sibling_start)],
+            &[("*.mdf", false)],
+        ),
+    );
+    assert_eq!(logical(&directory.join("paired.mdf")), FIXTURE);
+
+    // Multi-part split DVD MDF (`.mdf` + `.md0` + `.md1`) works via both `.mds` and `.mdf`.
+    let part1 = FIXTURE.len() / 3;
+    let part2 = (FIXTURE.len() * 2) / 3;
+    let split_mdf = write("split.mdf", &FIXTURE[..part1]);
+    write("split.md0", &FIXTURE[part1..part2]);
+    write("split.md1", &FIXTURE[part2..]);
+    let split_mds = write(
+        "split.mds",
+        &build_mds(0x10, &[(0x01, 0x02, 2048, 0, 0)], &[("*.mdf", false)]),
+    );
+    assert_eq!(logical(&split_mds), FIXTURE);
+    assert_eq!(logical(&split_mdf), FIXTURE);
+
+    // MDS whose first track is audio is rejected with Unsupported.
+    write("audio_first.mdf", &raw(1, 2352));
+    let audio_mds = write(
+        "audio_first.mds",
+        &build_mds(0x00, &[(0x01, 0xA9, 2352, 0, 0)], &[("*.mdf", false)]),
+    );
+    let cfg = crate::OsConfig::new(directory.join("game"), "game.exe", directory.join("data"));
+    let mut vfs = Vfs::new(&cfg);
+    assert_eq!(
+        vfs.mount_disc('E', &audio_mds).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        vfs.mount_disc('E', directory.join("audio_first.mdf"))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Unsupported
+    );
+
+    drop(vfs);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+// spec: DEV-DISC-4, DEV-DISC-6
+fn optical_reader_handles_evd_nonzero_terminator_truncated_tail_and_shift_jis_primary() {
+    let (_, directory) = fixture("iso-compat");
+    let cfg = crate::OsConfig::new(directory.join("game"), "game.exe", directory.join("data"));
+    let mut vfs = Vfs::new(&cfg);
+
+    // 1. Non-zero Volume Descriptor Set Terminator body (spaces in bytes 7..2048).
+    let mut nonzero_term = FIXTURE.to_vec();
+    // Sector 18 is the Volume Set Terminator in optical.iso.
+    assert_eq!(nonzero_term[18 * 2048], 255);
+    nonzero_term[18 * 2048 + 7..19 * 2048].fill(b' ');
+    let path = directory.join("nonzero_term.iso");
+    std::fs::write(&path, &nonzero_term).unwrap();
+    vfs.mount_disc('D', &path).unwrap();
+    assert!(vfs.open_optical_file("D:/ReadMe.txt").is_ok()); // privacy: allow authored guest optical path
+
+    // 2. ISO 9660:1999 Enhanced Volume Descriptor (type 2, version 2) before terminator.
+    let mut with_evd = FIXTURE.to_vec();
+    let pvd = with_evd[16 * 2048..17 * 2048].to_vec();
+    let mut evd = pvd;
+    evd[0] = 2; // Supplementary / Enhanced
+    evd[6] = 2; // Version 2 (ISO 9660:1999)
+    evd[881] = 2; // file_structure_version = 2
+    // Replace Joliet (sector 17) with EVD while keeping terminator at sector 18.
+    with_evd[17 * 2048..18 * 2048].copy_from_slice(&evd);
+    let evd_path = directory.join("evd.iso");
+    std::fs::write(&evd_path, &with_evd).unwrap();
+    vfs.mount_disc('E', &evd_path).unwrap();
+    assert!(vfs.open_optical_file("E:/readme.txt").is_ok()); // privacy: allow authored guest optical path
+
+    // 3. TAO-style truncated tail: PVD claims 2 more sectors than the file contains.
+    let mut truncated = FIXTURE.to_vec();
+    let declared_sectors = (FIXTURE.len() as u32 / 2048) + 2;
+    truncated[16 * 2048 + 80..16 * 2048 + 84].copy_from_slice(&declared_sectors.to_le_bytes());
+    truncated[16 * 2048 + 84..16 * 2048 + 88].copy_from_slice(&declared_sectors.to_be_bytes());
+    let trunc_path = directory.join("tao_short.iso");
+    std::fs::write(&trunc_path, &truncated).unwrap();
+    vfs.mount_disc('F', &trunc_path).unwrap();
+    assert_eq!(
+        vfs.optical_drive('F').unwrap().total_bytes,
+        FIXTURE.len() as u64
+    );
+    assert!(vfs.open_optical_file("F:/ReadMe.txt").is_ok()); // privacy: allow authored guest optical path
+
+    // 4. Primary-only ISO with Shift_JIS volume label and filename (code page 932).
+    let mut sjis = FIXTURE.to_vec();
+    // Terminate after PVD (remove Joliet at sector 17).
+    sjis[17 * 2048..18 * 2048].fill(0);
+    sjis[17 * 2048..17 * 2048 + 7].copy_from_slice(&[255, b'C', b'D', b'0', b'0', b'1', 1]);
+    let (label_bytes, _, _) = encoding_rs::SHIFT_JIS.encode("日本語盤");
+    sjis[16 * 2048 + 40..16 * 2048 + 72].fill(b' ');
+    sjis[16 * 2048 + 40..16 * 2048 + 40 + label_bytes.len()].copy_from_slice(&label_bytes);
+    // Primary root directory is at PVD root extent; replace "README.TXT;1" (12 bytes)
+    // with a 12-byte Shift_JIS name ("読込.TXT;1" = 4 + 6 = 10 -> "読込案.TXT;1" = 6 + 6 = 12).
+    let (sjis_name, _, _) = encoding_rs::SHIFT_JIS.encode("読込案.TXT;1");
+    assert_eq!(sjis_name.len(), 12);
+    let root_lba =
+        u32::from_le_bytes(sjis[16 * 2048 + 158..16 * 2048 + 162].try_into().unwrap()) as usize;
+    let root_slice = &mut sjis[root_lba * 2048..(root_lba + 1) * 2048];
+    let pos = root_slice
+        .windows(12)
+        .position(|w| w == b"README.TXT;1")
+        .expect("README.TXT;1 in primary root");
+    root_slice[pos..pos + 12].copy_from_slice(&sjis_name);
+    let sjis_path = directory.join("sjis.iso");
+    std::fs::write(&sjis_path, &sjis).unwrap();
+    vfs.mount_disc('G', &sjis_path).unwrap();
+    assert_eq!(vfs.optical_drive('G').unwrap().label, "日本語盤");
+    assert!(vfs.open_optical_file("G:/読込案.TXT").is_ok()); // privacy: allow authored guest optical path
+
+    drop(vfs);
+    std::fs::remove_dir_all(directory).unwrap();
+}

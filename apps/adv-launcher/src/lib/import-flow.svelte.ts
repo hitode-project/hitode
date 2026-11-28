@@ -455,11 +455,18 @@ export class ImportPick {
 
 /* ---------- Installer / disc image ---------- */
 
-/** The disc image the next install screen installs from. */
+/** The disc image the next install screen installs from, or a picker error to show there. */
 let pendingDisc: string | null = null;
+let pendingError: string | null = null;
 
 export function chooseInstallDisc(path: string): void {
   pendingDisc = path;
+  pendingError = null;
+}
+
+export function chooseInstallError(message: string): void {
+  pendingDisc = null;
+  pendingError = message;
 }
 
 /** Where an install is: reading the disc, ready to run its setup, or choosing the installed program. */
@@ -487,6 +494,7 @@ export class InstallFlow {
   keep = $state(true);
   /** Further discs of a setup on several, mounted after the first and put in drive D: from the pause menu. */
   more = $state<string[]>([]);
+  addDiscError = $state("");
   /**
    * What the setup installed: in the install folder, or in a folder its
    * uninstall entry names when it was told to install elsewhere.
@@ -504,8 +512,11 @@ export class InstallFlow {
   }
 
   async #read(): Promise<void> {
+    const pickError = pendingError;
     const disc = pendingDisc;
+    pendingError = null;
     pendingDisc = null;
+    if (pickError) return this.#fail(pickError);
     if (!disc) return this.#fail(t("没有选择光盘镜像"));
     this.disc = disc;
     try {
@@ -569,8 +580,13 @@ export class InstallFlow {
   }
 
   async addDisc(): Promise<void> {
-    const path = await call<string | null>("pick_game_file", { kind: "disc" }, null);
-    if (path && path !== this.disc && !this.more.includes(path)) this.more = [...this.more, path];
+    this.addDiscError = "";
+    try {
+      const path = await call<string | null>("pick_game_file", { kind: "disc" }, null);
+      if (path && path !== this.disc && !this.more.includes(path)) this.more = [...this.more, path];
+    } catch (error) {
+      this.addDiscError = String(error);
+    }
   }
 
   async changeTarget(): Promise<void> {

@@ -95,7 +95,7 @@
             <span class="t">{t("光盘")}</span>
             <span class="val" style="font-size: 12px">{t("更换光盘需重新启动游戏")}</span>
           </div>
-          {#each setup.discs as disc, i (disc)}
+          {#each setup.discs as disc, i (`${i}:${disc}`)}
             <div class="row sm">
               <span class="drv">{GameForm.LETTERS[i] ?? ""}</span>
               <span class="disc ellipsis">{disc}</span>

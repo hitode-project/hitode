@@ -40,6 +40,7 @@ pub(super) struct OpticalMedia {
     image: IsoImage<Disc>,
     root: DirectoryRef,
     joliet: bool,
+    codepage: u32,
     pub(super) info: OpticalDriveInfo,
 }
 
@@ -99,9 +100,22 @@ fn range(offset: u64, length: u64, image_len: u64) -> io::Result<()> {
     Ok(())
 }
 
+fn decode_ansi(bytes: &[u8], codepage: u32) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let encoding = match codepage {
+        932 => encoding_rs::SHIFT_JIS,
+        936 => encoding_rs::GBK,
+        950 => encoding_rs::BIG5,
+        _ => encoding_rs::WINDOWS_1252,
+    };
+    encoding.decode(bytes).0.into_owned()
+}
+
 /// Bound metadata before the library caches the path table. This prevents an
 /// untrusted size from allocating image-sized metadata, and caps descriptor scans.
-fn inspect(file: &mut Disc) -> io::Result<OpticalDriveInfo> {
+fn inspect(file: &mut Disc, codepage: u32) -> io::Result<OpticalDriveInfo> {
     let image_len = file.len();
     let mut primary: Option<[u8; SECTOR as usize]> = None;
     let mut label = None;
@@ -111,15 +125,22 @@ fn inspect(file: &mut Disc) -> io::Result<OpticalDriveInfo> {
         let mut descriptor = [0; SECTOR as usize];
         file.seek(SeekFrom::Start(sector * SECTOR))?;
         file.read_exact(&mut descriptor)?;
-        if &descriptor[1..6] != b"CD001" || descriptor[6] != 1 {
+        let valid_version = descriptor[6] == 1 || (descriptor[0] == 2 && descriptor[6] == 2);
+        if &descriptor[1..6] != b"CD001" || !valid_version {
             return Err(invalid("invalid ISO9660 volume descriptor"));
         }
         if descriptor[0] == 255 {
+            if descriptor[7..].iter().any(|&b| b != 0) {
+                file.normalize_terminator(sector);
+            }
             let descriptor = primary.ok_or_else(|| invalid("ISO has no primary descriptor"))?;
-            let total_bytes = u64::from(both_u32(&descriptor[80..88])?) * SECTOR;
-            if total_bytes > image_len || total_bytes < 19 * SECTOR {
+            let declared = u64::from(both_u32(&descriptor[80..88])?) * SECTOR;
+            if declared < 19 * SECTOR || image_len < 19 * SECTOR {
                 return Err(invalid("ISO volume capacity exceeds image bounds"));
             }
+            // Clamp to the actual image length so TAO dumps missing trailing
+            // run-out/padding sectors still mount while extent checks stay bounded.
+            let total_bytes = declared.min(image_len);
             // NT CDFS descriptor checksum, also used by Wine's
             // dlls/mountmgr.sys/device.c VOLUME_GetSuperblockSerial. Prefer the
             // selected Joliet descriptor, as Windows does for Unicode volumes.
@@ -131,7 +152,7 @@ fn inspect(file: &mut Disc) -> io::Result<OpticalDriveInfo> {
             let serial = u32::from_be_bytes(columns);
             return Ok(OpticalDriveInfo {
                 label: label.unwrap_or_else(|| {
-                    String::from_utf8_lossy(&descriptor[40..72])
+                    decode_ansi(&descriptor[40..72], codepage)
                         .trim_end_matches([' ', '\0'])
                         .to_owned()
                 }),
@@ -147,7 +168,7 @@ fn inspect(file: &mut Disc) -> io::Result<OpticalDriveInfo> {
                 max_component_length: if label_level != 0 { 110 } else { 221 },
             });
         }
-        if descriptor[0] == 1 || descriptor[0] == 2 {
+        if descriptor[0] == 1 || (descriptor[0] == 2 && descriptor[6] == 1) {
             if descriptor[128..132] != [0, 8, 8, 0] {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -176,14 +197,14 @@ fn inspect(file: &mut Disc) -> io::Result<OpticalDriveInfo> {
                     _ => 0,
                 };
                 if level != 0 && level >= label_level {
-                    let units = descriptor[40..72]
+                    let units: Vec<u16> = descriptor[40..72]
                         .as_chunks::<2>()
                         .0
                         .iter()
-                        .map(|b| u16::from_be_bytes([b[0], b[1]]));
-                    let text: Result<String, _> = char::decode_utf16(units).collect();
+                        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+                        .collect();
                     label = Some(
-                        text.map_err(|_| invalid("invalid Joliet volume label"))?
+                        String::from_utf16_lossy(&units)
                             .trim_end_matches([' ', '\0'])
                             .to_owned(),
                     );
@@ -197,9 +218,9 @@ fn inspect(file: &mut Disc) -> io::Result<OpticalDriveInfo> {
 }
 
 impl OpticalMedia {
-    fn open(path: &Path) -> io::Result<Arc<Self>> {
+    fn open(path: &Path, codepage: u32) -> io::Result<Arc<Self>> {
         let mut file = Disc::open(path)?;
-        let info = inspect(&mut file)?;
+        let info = inspect(&mut file, codepage)?;
         let image = IsoImage::open(file).map_err(iso_error)?;
         // Windows sees Joliet Unicode names ahead of the primary short names.
         let selected = image
@@ -227,6 +248,7 @@ impl OpticalMedia {
             image,
             root,
             joliet,
+            codepage,
             info,
         }))
     }
@@ -257,8 +279,7 @@ impl OpticalMedia {
                 .collect::<Result<String, _>>()
                 .map_err(|_| invalid("invalid Joliet file identifier"))?
         } else {
-            String::from_utf8(record.name().to_vec())
-                .map_err(|_| invalid("invalid ISO file identifier"))?
+            decode_ansi(record.name(), self.codepage)
         };
         if let Some((base, version)) = name.rsplit_once(';')
             && !version.is_empty()
@@ -541,7 +562,7 @@ impl Vfs {
         {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        let media = OpticalMedia::open(path.as_ref())?;
+        let media = OpticalMedia::open(path.as_ref(), self.codepage)?;
         self.optical.insert(letter, media);
         Ok(())
     }

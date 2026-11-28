@@ -56,6 +56,7 @@
             <span class="v mono" style="flex: 1 1 auto; min-width: 0; text-align: right">{[flow.disc, ...flow.more].map((p) => p.split(/[\\/]/).pop()).join(" · ")}</span>
             {#if flow.canAddDisc}<button class="quiet sm" style="margin-right: -12px" onclick={() => void flow.addDisc()}>{t("添加光盘…")}</button>{/if}
           </div>
+          {#if flow.addDiscError}<p role="alert" style="margin: 8px 0 0; font-size: 13px; color: var(--danger)">{flow.addDiscError}</p>{/if}
           <div class="rw">
             <span class="k">{t("游玩时保留光盘")}</span>
             <ImportSwitch checked={flow.keep} label={t("游玩时保留光盘")} onchange={(v) => (flow.keep = v)} />
