@@ -205,9 +205,10 @@ export class GameForm {
 
   async addDisc(): Promise<void> {
     if (this.discsFull) return;
+    this.error = "";
     try {
       const path = await call<string | null>("pick_game_file", { kind: "disc" }, null);
-      if (path) this.setup.discs.push(path);
+      if (path && !this.setup.discs.includes(path)) this.setup.discs.push(path);
     } catch (e) { this.error = String(e); }
   }
 

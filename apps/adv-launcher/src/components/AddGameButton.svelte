@@ -3,7 +3,7 @@
   import { t } from "../lib/i18n.svelte";
   import { nav } from "../lib/nav.svelte";
   import { call } from "../lib/bridge";
-  import { chooseInstallDisc } from "../lib/import-flow.svelte";
+  import { chooseInstallDisc, chooseInstallError } from "../lib/import-flow.svelte";
 
   let { compact = false }: { compact?: boolean } = $props();
   let open = $state(false);
@@ -29,10 +29,15 @@
   /** A disc image's setup installs the game (WINE-SES-12). */
   async function install() {
     open = false;
-    const path = await call<string | null>("pick_game_file", { kind: "disc" }, null);
-    if (!path) return;
-    chooseInstallDisc(path);
-    nav.go({ name: "install" });
+    try {
+      const path = await call<string | null>("pick_game_file", { kind: "disc" }, null);
+      if (!path) return;
+      chooseInstallDisc(path);
+      nav.go({ name: "install" });
+    } catch (error) {
+      chooseInstallError(String(error));
+      nav.go({ name: "install" });
+    }
   }
 </script>
 

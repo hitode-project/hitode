@@ -216,4 +216,61 @@ class ImportFilesTest {
             parent.deleteRecursively()
         }
     }
+
+    // spec: AND-APP-9
+    @Test fun directFileHelpersResolveDriveMediaAndExtensionsSafely() {
+        val dataDir = Files.createTempDirectory("drive-file-test").toFile()
+        try {
+            val disc = File(dataDir, "imports/abc123/disc.mdf").apply {
+                parentFile!!.mkdirs()
+                writeText("mdf")
+            }
+            val driveFile = File(dataDir, "wine/drive_c/game/disc.mds").apply {
+                parentFile!!.mkdirs()
+                writeText("mds")
+            }
+            File(dataDir, "outside.mdf").writeText("outside")
+
+            assertEquals(disc.canonicalPath, driveFilePath("Games:/abc123/disc.mdf", dataDir))
+            assertEquals(driveFile.canonicalPath, driveFilePath("C:/game/disc.mds", dataDir))
+            assertNull(driveFilePath("Games:/abc123", dataDir))
+            assertNull(driveFilePath("Games:/../outside.mdf", dataDir))
+            assertNull(driveFilePath("Other:/disc.mdf", dataDir))
+
+            assertEquals(
+                1000012345L,
+                mediaDocumentId("com.android.providers.downloads.documents", "msf:1000012345"),
+            )
+            assertEquals(
+                42L,
+                mediaDocumentId("com.android.providers.downloads.documents", "42"),
+            )
+            assertNull(
+                mediaDocumentId(
+                    "com.android.providers.downloads.documents",
+                    "raw:/storage/emulated/0/Download/disc.mdf",
+                )
+            )
+            assertEquals(
+                9876L,
+                mediaDocumentId("com.android.providers.media.documents", "document:9876"),
+            )
+            assertNull(mediaDocumentId("com.android.externalstorage.documents", "primary:disc.mdf"))
+
+            val directDiscs = listOf("iso", "mds", "mdf")
+            val copyDiscs = listOf("iso", "mdf")
+            assertTrue(extensionMatches("GAME.MDF", copyDiscs))
+            assertTrue(extensionMatches("game.mds", directDiscs))
+            assertFalse(extensionMatches("game.mds", copyDiscs))
+            assertFalse(extensionMatches("noext", copyDiscs))
+            assertTrue(extensionMatches("anything", null))
+
+            assertEquals("disc.mdf", fallbackDisplayName("/storage/emulated/0/Download/disc.mdf"))
+            assertNull(fallbackDisplayName("/"))
+            assertNull(fallbackDisplayName(".."))
+            assertNull(fallbackDisplayName(null))
+        } finally {
+            dataDir.deleteRecursively()
+        }
+    }
 }

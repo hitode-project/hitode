@@ -36,20 +36,24 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
 }
 
 /// The system picker shows every file, so the extension is checked here.
-/// Copies live beside the library, out of the iOS picker's temporary inbox.
+/// Direct shared-storage paths on Android can also open descriptors (`.mds`,
+/// `.cue`, `.ccd`) beside their data files; single-file copies only accept
+/// self-contained images. Copies live beside the library, out of the iOS
+/// picker's temporary inbox.
 #[tauri::command]
 #[cfg(mobile)]
 pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Option<String>, String> {
     use tauri::Manager;
     use tauri_plugin_storage::StorageExt;
-    // The picker copies one file, so descriptors that name siblings are left
-    // out; their raw data files mount on their own.
-    let extensions: &[&str] = match kind.as_str() {
-        "disc" => &["iso", "bin", "img", "mdf", "nrg"],
-        "font" => &["ttf", "ttc", "otf", "otc"],
-        "registry" => &["reg", "bat", "cmd"],
-        "run" => &["exe", "bat", "cmd", "reg"],
-        "component" => &["exe", "dll", "cab"],
+    let (direct_extensions, copy_extensions): (&[&str], &[&str]) = match kind.as_str() {
+        "disc" => (
+            &["iso", "cue", "bin", "img", "ccd", "mds", "mdf", "nrg"],
+            &["iso", "bin", "img", "mdf", "nrg"],
+        ),
+        "font" => (&["ttf", "ttc", "otf", "otc"], &["ttf", "ttc", "otf", "otc"]),
+        "registry" => (&["reg", "bat", "cmd"], &["reg", "bat", "cmd"]),
+        "run" => (&["exe", "bat", "cmd", "reg"], &["exe", "bat", "cmd", "reg"]),
+        "component" => (&["exe", "dll", "cab"], &["exe", "dll", "cab"]),
         _ => return Err("unknown file type".into()),
     };
     let files = app
@@ -60,16 +64,26 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
     std::fs::create_dir_all(&files).map_err(|e| e.to_string())?;
     #[cfg(target_os = "ios")]
     crate::game_storage::exclude_from_backup(&files);
-    let Some(mut path) = app.storage().pick_file(&files).await?.path else {
+    let Some(mut path) = app
+        .storage()
+        .pick_file_filtered(&files, direct_extensions, copy_extensions)
+        .await?
+        .path
+    else {
         return Ok(None);
+    };
+    let allowed = if cfg!(target_os = "ios") || is_private_copy(&files, &path) {
+        copy_extensions
+    } else {
+        direct_extensions
     };
     let matches = path
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| extensions.contains(&e.to_ascii_lowercase().as_str()));
+        .is_some_and(|e| allowed.contains(&e.to_ascii_lowercase().as_str()));
     if !matches {
         cleanup_rejected_pick(&files, &path, cfg!(target_os = "ios"));
-        return Err(format!("choose a .{} file", extensions.join(" / .")));
+        return Err(format!("choose a .{} file", allowed.join(" / .")));
     }
     if cfg!(target_os = "ios") {
         let folder = fresh_folder(&files)?;
@@ -78,6 +92,15 @@ pub async fn pick_game_file(app: tauri::AppHandle, kind: String) -> Result<Optio
         path = target;
     }
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[cfg(any(mobile, test))]
+fn is_private_copy(files_dir: &std::path::Path, path: &std::path::Path) -> bool {
+    files_dir
+        .canonicalize()
+        .ok()
+        .zip(path.canonicalize().ok())
+        .is_some_and(|(dir, target)| target.starts_with(dir))
 }
 
 /// Removes a private copy created by the mobile picker when validation rejects it,
@@ -164,6 +187,9 @@ mod tests {
 
         cleanup_rejected_pick(&files, &copy, false);
         assert!(!copy_dir.exists());
+
+        assert!(is_private_copy(&files, &files));
+        assert!(!is_private_copy(&files, &external));
 
         cleanup_rejected_pick(&files, &external, false);
         assert!(external.is_file());

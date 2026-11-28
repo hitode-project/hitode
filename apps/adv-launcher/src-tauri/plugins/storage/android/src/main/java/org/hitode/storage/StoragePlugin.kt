@@ -14,6 +14,7 @@ import android.os.SystemClock
 import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
+import android.provider.MediaStore
 import android.provider.Settings
 import androidx.activity.result.ActivityResult
 import androidx.appcompat.app.AppCompatActivity
@@ -63,6 +64,8 @@ class ExportArgs {
 @InvokeArg
 class PickFileArgs {
     lateinit var dest: String
+    var extensions: List<String>? = null
+    var copyExtensions: List<String>? = null
 }
 
 @InvokeArg
@@ -340,19 +343,31 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
         }
         thread(name = "file-copy") {
             try {
+                val args = invoke.parseArgs(PickFileArgs::class.java)
                 val uri = result.data?.data ?: throw IOException("No file selected")
                 val direct = directPath(uri)
                 if (direct != null) {
+                    val allowed = args.extensions
+                    if (!extensionMatches(File(direct).name, allowed)) {
+                        throw IOException("choose a .${allowed.orEmpty().joinToString(" / .")} file")
+                    }
                     invoke.resolve(JSObject().put("path", direct))
                     return@thread
                 }
-                val dest = File(invoke.parseArgs(PickFileArgs::class.java).dest)
-                val name = resolver.query(uri, arrayOf(Document.COLUMN_DISPLAY_NAME), null, null, null)
-                    ?.use { if (it.moveToFirst()) it.getString(0) else null }
-                    ?: throw IOException("Cannot read the file name")
+                val dest = File(args.dest)
+                val name = checkedName(
+                    resolver.query(uri, arrayOf(Document.COLUMN_DISPLAY_NAME), null, null, null)
+                        ?.use { if (it.moveToFirst()) it.getString(0) else null }
+                        ?: fallbackDisplayName(uri.path)
+                        ?: throw IOException("Cannot read the file name")
+                )
+                val allowedForCopy = args.copyExtensions ?: args.extensions
+                if (!extensionMatches(name, allowedForCopy)) {
+                    throw IOException("choose a .${allowedForCopy.orEmpty().joinToString(" / .")} file")
+                }
                 // A folder per copy keeps the original name without collisions.
                 val folder = Files.createTempDirectory(dest.toPath(), "file-").toFile()
-                val file = File(folder, checkedName(name))
+                val file = File(folder, name)
                 try {
                     val input = resolver.openInputStream(uri) ?: throw IOException("Cannot open file")
                     input.use { file.outputStream().use { output -> it.copyTo(output, 65536) } }
@@ -367,17 +382,47 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    /** External-storage volumes and Downloads documents name a real file under all-files access. */
+    /** External-storage, Downloads/MediaStore, DriveProvider and file:// URIs name a real file. */
     private fun directPath(uri: Uri): String? {
-        if (!granted() || !DocumentsContract.isDocumentUri(activity, uri)) return null
+        if (uri.scheme == "file") {
+            return uri.path?.takeIf { File(it).let { file -> file.isFile && file.canRead() } }
+        }
+        if (!DocumentsContract.isDocumentUri(activity, uri)) return null
         val id = DocumentsContract.getDocumentId(uri)
+        if (uri.authority == activity.packageName + ".drive") {
+            return driveFilePath(id, activity.dataDir)
+        }
+        if (!granted()) return null
         return when (uri.authority) {
             "com.android.externalstorage.documents" -> readableFilePath(id, true, storageRoots())
-            "com.android.providers.downloads.documents" -> id.removePrefix("raw:")
-                .takeIf { id.startsWith("raw:") }
-                ?.takeIf { File(it).let { file -> file.isFile && file.canRead() } }
+            "com.android.providers.downloads.documents" -> {
+                if (id.startsWith("raw:")) {
+                    id.removePrefix("raw:")
+                        .takeIf { File(it).let { file -> file.isFile && file.canRead() } }
+                } else {
+                    mediaDocumentId(uri.authority, id)?.let { queryMediaStorePath(it) }
+                }
+            }
+            "com.android.providers.media.documents" ->
+                mediaDocumentId(uri.authority, id)?.let { queryMediaStorePath(it) }
             else -> null
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun queryMediaStorePath(mediaId: Long): String? {
+        val projection = arrayOf(MediaStore.MediaColumns.DATA)
+        return runCatching {
+            resolver.query(
+                MediaStore.Files.getContentUri("external"),
+                projection,
+                "${MediaStore.MediaColumns._ID} = ?",
+                arrayOf(mediaId.toString()),
+                null,
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }
+        }.getOrNull()?.takeIf { File(it).let { file -> file.isFile && file.canRead() } }
     }
 
     private fun entries(tree: Uri, parent: String, signal: CancellationSignal): List<Entry> {

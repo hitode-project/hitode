@@ -298,9 +298,10 @@ Software buffer creation MUST NOT fail solely because the mixer has registered a
 | Container | First track |
 |---|---|
 | `.iso`, or any image without a sync pattern | 2048-byte user data |
-| `.bin`, `.img`, `.mdf` | Mode 1 or Mode 2 Form 1 raw sectors of 2352 or 2448 bytes, found by sync pattern |
+| `.bin`, `.img`, `.mdf` | Mode 1, Mode 2 Form 1, or Mode 2 sectors of 2352, 2368, 2448 or 2336 bytes (including zeroed/Mode-0 system sectors, 150-sector pregaps, sibling `.mds`, and split `.md0`+ parts) |
 | `.cue` | The named file at `INDEX 01` with the declared sector size |
-| `.ccd`, `.mds` | The same-stem `.img` or `.mdf` |
+| `.ccd` | The same-stem `.img` |
+| `.mds` | Parsed first track offset, sector size and data files (including split `.md0`+ parts), falling back to same-stem `.mdf` |
 | `.nrg` | The first `DAOX`, `DAOI`, `ETN2` or `ETNF` track |
 
 ### DEV-DISC-5 Bounded image access
