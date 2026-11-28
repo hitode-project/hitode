@@ -1,4 +1,5 @@
 //! Position once in logical coordinates, compose our cached glyphs on DIBs.
+use super::super::text_records::{Code, DrawnGlyph, DrawnLine, TextRecord};
 use super::*;
 use std::sync::Arc;
 
@@ -271,7 +272,13 @@ pub(super) fn render(
             i += c.len_utf16();
         }
     }
+    let mut drawn = Vec::with_capacity(codes.len());
     for (i, unit) in codes {
+        drawn.push(if indices {
+            Code::Index(unit)
+        } else {
+            Code::Unicode(unit)
+        });
         let glyph = match env.ext.get_mut::<Fonts>().text.glyph(
             &request,
             GlyphRequest {
@@ -298,7 +305,11 @@ pub(super) fn render(
     let Some((dev, function)) = physdev(env, dc) else {
         return Outcome::Return(0);
     };
-    if env.cpu.read_u32(dev).unwrap() == data(env, |l| l.dib_driver).unwrap() {
+    let dib = env.cpu.read_u32(dev).unwrap() == data(env, |l| l.dib_driver).unwrap();
+    if env.ext.get::<Fonts>().records.is_some() {
+        record_line(env, hdc, &request, dib.then_some(dev), &run, &drawn);
+    }
+    if dib {
         return compose(env, dev, &run);
     }
     // Metafile/path/printer drivers receive the positioned glyph run, and obtain
@@ -351,6 +362,36 @@ pub(super) fn render(
             Outcome::Return(result.value())
         },
     )
+}
+/// One drawn line for text extraction (WINE-UNIX-8), before composition.
+fn record_line(
+    env: &mut Env<'_>,
+    hdc: u32,
+    request: &FontRequest,
+    surface: Option<u32>,
+    run: &Run,
+    codes: &[Code],
+) {
+    let thread = super::thread_id(env);
+    let records = env.ext.get_mut::<Fonts>().records.as_mut().unwrap();
+    let sequence = records.sequence();
+    records.push(TextRecord::Line(DrawnLine {
+        sequence,
+        thread,
+        dc: hdc,
+        surface,
+        face: request.face.clone(),
+        height: request.height,
+        clip: run.clip,
+        glyphs: codes
+            .iter()
+            .zip(&run.glyphs)
+            .map(|(&code, (_, origin))| DrawnGlyph {
+                code,
+                origin: *origin,
+            })
+            .collect(),
+    }));
 }
 pub(super) fn output(env: &mut Env<'_>, a: &[u32]) -> Outcome {
     let units = match placement::read(env, a[5], a[6] * 2, false) {

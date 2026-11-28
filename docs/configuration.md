@@ -173,6 +173,7 @@ device loss; builds without it omit the executor hooks.
 | `--frame-budget` | Diagnostic | Off; headless with one guest worker only |
 | `--control-stdin` | Diagnostic | Off |
 | `--record-input` | Diagnostic | No recording; also `ADV_RECORD_INPUT=PATH` |
+| `--text-log` | Diagnostic | No output; writes the session's text records (WINE-UNIX-8) as JSON lines, which hold game text and stay local |
 | `--help`, `-h` | Diagnostic | Help not shown |
 
 The default-off features above conflict with the default-on rule; each must become default or be removed.

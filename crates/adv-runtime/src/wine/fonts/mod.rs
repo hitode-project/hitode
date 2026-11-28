@@ -40,6 +40,8 @@ pub(super) struct Fonts {
     apis: Registry,
     dwrite: std::collections::BTreeMap<u32, (text::FontResourceId, u32)>,
     realizations: std::collections::BTreeMap<u32, FontRequest>,
+    /// Text records while a host consumer has enabled them (WINE-UNIX-8).
+    pub records: Option<super::text_records::TextRecords>,
 }
 
 pub(super) fn install<B: adv_cpu::backend::Backend>(
@@ -73,6 +75,7 @@ pub(super) fn install<B: adv_cpu::backend::Backend>(
         eudc: None,
         dwrite: Default::default(),
         realizations: Default::default(),
+        records: None,
     });
     machine
         .ext
@@ -736,6 +739,7 @@ fn glyph(
             yy: fixed(12),
         },
     };
+    let character = request.character;
     match env.ext.get_mut::<Fonts>().text.glyph(&font, request) {
         Ok(glyph) => {
             let fetch = !buffer.is_null() && capacity != 0 && format & 0x7f != 0;
@@ -781,11 +785,46 @@ fn glyph(
             {
                 return fail(env);
             }
+            if fetch && !bytes.is_empty() {
+                record_glyph(env, dc, &font, character, buffer.addr(), bytes.len());
+            }
             Outcome::Return(glyph.required_bytes)
         }
         Err(TextError::Unavailable) => unavailable_font(env, GDI_ERROR),
         Err(_) => fail(env),
     }
+}
+
+/// The drawing guest thread's ID, from its TEB client ID.
+fn thread_id(env: &Env<'_>) -> u32 {
+    let teb = env.sys.contexts[env.context as usize].teb;
+    env.cpu.read_u32(teb + 0x24).unwrap_or(0)
+}
+fn record_glyph(
+    env: &mut Env<'_>,
+    dc: u32,
+    font: &FontRequest,
+    character: Character,
+    buffer: u32,
+    len: usize,
+) {
+    let thread = thread_id(env);
+    let Some(records) = env.ext.get_mut::<Fonts>().records.as_mut() else {
+        return;
+    };
+    let sequence = records.sequence();
+    records.push(super::text_records::TextRecord::Glyph(
+        super::text_records::ProducedGlyph {
+            sequence,
+            thread,
+            dc,
+            face: font.face.clone(),
+            height: font.height,
+            code: character.into(),
+            buffer,
+            len: len as u32,
+        },
+    ));
 }
 
 fn decode_encoding(value: u8) -> Encoding {

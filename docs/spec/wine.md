@@ -389,6 +389,16 @@ Native font initialization fills win32u's ANSI, OEM and UTF-8 code page tables f
 
 The pinned Wine source carries both through `tools/wine/patches`.
 
+### WINE-UNIX-8 Text records
+
+**Rule**: While text records are on, the host font frontend MUST keep exactly the records listed below. While records are off, it MUST NOT keep any. Records beyond capacity MUST be counted as dropped.
+**Verification**: Test
+
+- Each drawn line, before composition: its thread, DC, target DIB device, font, clip, and each glyph's code and device origin. Glyph-index text keeps its indices.
+- Each successful GetGlyphOutline that writes glyph bytes: its character and the written guest range.
+
+Measurement keeps no record. Text extraction reads these where characters lose their identity; the session takes them through `take_text_records`.
+
 ## Threads
 
 ### WINE-THR-1 One scheduling authority
