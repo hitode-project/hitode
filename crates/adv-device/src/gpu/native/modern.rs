@@ -43,14 +43,64 @@ impl ImageAlias {
     }
 }
 
-/// The stage's original register arrays, indexed by the shader's register
-/// number. Holes and bindings unused by the entry point are never visited.
+/// The stage's original register arrays, keyed by the shader's register
+/// number. Bindings unused by the entry point are never visited.
 #[derive(Clone, Default)]
 pub struct SlotBindings {
-    pub uniforms: Vec<Option<BufferWindow>>,
-    pub images: Vec<Option<ImageView>>,
-    pub samplers: Vec<Option<Sampler>>,
-    pub storage: Vec<Option<StorageBinding>>,
+    pub uniforms: Slots<BufferWindow>,
+    pub images: Slots<ImageView>,
+    pub samplers: Slots<Sampler>,
+    pub storage: Slots<StorageBinding>,
+}
+
+/// Bound registers in register order. Stages bind a few registers spread over
+/// a wide range (pulled vertex streams sit above 192), so the table holds only
+/// the bound ones.
+#[derive(Clone)]
+pub struct Slots<T>(Vec<(u32, T)>);
+
+impl<T> Default for Slots<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T> Slots<T> {
+    fn find(&self, register: usize) -> Result<usize, usize> {
+        self.0.binary_search_by_key(&register, |&(n, _)| n as usize)
+    }
+
+    pub fn get(&self, register: usize) -> Option<&T> {
+        self.find(register).ok().map(|n| &self.0[n].1)
+    }
+
+    /// Bind `value` at `register`, replacing any earlier binding there.
+    pub fn set(&mut self, register: usize, value: T) {
+        match self.find(register) {
+            Ok(n) => self.0[n].1 = value,
+            Err(n) => self.0.insert(n, (register as u32, value)),
+        }
+    }
+
+    /// Bound values in register order.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.0.iter().map(|(_, value)| value)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Registers `0..N` in order.
+impl<T, const N: usize> From<[T; N]> for Slots<T> {
+    fn from(values: [T; N]) -> Self {
+        Self(values.into_iter().zip(0..).map(|(v, n)| (n, v)).collect())
+    }
 }
 
 pub struct ModernShader {
@@ -190,41 +240,27 @@ impl ModernShader {
             .map(|&(register, binding)| {
                 let i = register as usize;
                 let resource = match binding.kind {
-                    BindingKind::UniformBuffer => slots
-                        .uniforms
-                        .get(i)
-                        .and_then(Clone::clone)
-                        .map(Bound::Uniform),
-                    BindingKind::SampledImage { .. } => slots
-                        .images
-                        .get(i)
-                        .and_then(Clone::clone)
-                        .map(Bound::Sampled),
-                    BindingKind::Sampler { .. } => slots
-                        .samplers
-                        .get(i)
-                        .and_then(Clone::clone)
-                        .map(Bound::Sampler),
-                    BindingKind::StorageImage { .. } => {
-                        match slots.storage.get(i).and_then(Clone::clone) {
-                            Some(StorageBinding::Image(view)) => Some(Bound::StorageImage(view)),
-                            _ => None,
-                        }
+                    BindingKind::UniformBuffer => {
+                        slots.uniforms.get(i).cloned().map(Bound::Uniform)
                     }
-                    BindingKind::StorageBuffer { .. } => {
-                        match slots.storage.get(i).and_then(Clone::clone) {
-                            Some(StorageBinding::Buffer(buffer)) => {
-                                Some(Bound::StorageBuffer(buffer.into()))
-                            }
-                            Some(StorageBinding::Window(window)) => {
-                                Some(Bound::StorageBuffer(window))
-                            }
-                            Some(StorageBinding::ImageAlias(alias)) => {
-                                Some(Bound::ImageAlias(alias))
-                            }
-                            _ => None,
-                        }
+                    BindingKind::SampledImage { .. } => {
+                        slots.images.get(i).cloned().map(Bound::Sampled)
                     }
+                    BindingKind::Sampler { .. } => {
+                        slots.samplers.get(i).cloned().map(Bound::Sampler)
+                    }
+                    BindingKind::StorageImage { .. } => match slots.storage.get(i).cloned() {
+                        Some(StorageBinding::Image(view)) => Some(Bound::StorageImage(view)),
+                        _ => None,
+                    },
+                    BindingKind::StorageBuffer { .. } => match slots.storage.get(i).cloned() {
+                        Some(StorageBinding::Buffer(buffer)) => {
+                            Some(Bound::StorageBuffer(buffer.into()))
+                        }
+                        Some(StorageBinding::Window(window)) => Some(Bound::StorageBuffer(window)),
+                        Some(StorageBinding::ImageAlias(alias)) => Some(Bound::ImageAlias(alias)),
+                        _ => None,
+                    },
                     _ => None,
                 };
                 let resource = resource.ok_or_else(|| {

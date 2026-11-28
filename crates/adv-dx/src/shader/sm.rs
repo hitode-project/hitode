@@ -2366,6 +2366,13 @@ pub struct Program {
     fields: Vec<Field>,
 }
 
+/// Storage for repeated runs; reuse one across invocations to avoid allocating.
+#[derive(Clone, Debug, Default)]
+pub struct Scratch {
+    inputs: ir::interpreter::Inputs,
+    machine: ir::interpreter::Scratch,
+}
+
 struct Buffers<'a, C: ?Sized>(&'a C);
 
 impl<C: ConstantSource + ?Sized> ir::interpreter::ConstantBuffers for Buffers<'_, C> {
@@ -2487,7 +2494,22 @@ impl Program {
         constants: &C,
         sampler: &mut dyn Sampler,
     ) -> Result<Outputs, Error> {
-        let mut registers = ir::interpreter::Inputs::default();
+        self.run_in(input, constants, sampler, &mut Scratch::default())
+    }
+
+    /// [`Program::run`] with storage kept in `scratch` between invocations.
+    pub fn run_in<C: ConstantSource + ?Sized>(
+        &self,
+        input: &Inputs,
+        constants: &C,
+        sampler: &mut dyn Sampler,
+        scratch: &mut Scratch,
+    ) -> Result<Outputs, Error> {
+        let Scratch {
+            inputs: registers,
+            machine,
+        } = scratch;
+        registers.registers.clear();
         for &n in &self.inputs {
             let value = match n {
                 0..16 => input.v[n as usize],
@@ -2505,7 +2527,7 @@ impl Program {
         };
         let result = self
             .prepared
-            .run(&registers, &Buffers(constants), &mut textures)
+            .run_in(registers, &Buffers(constants), &mut textures, machine)
             .map_err(|e| Error::new(0, textures.error.take().unwrap_or_else(|| e.to_string())))?;
         let read = |register: u32| {
             result

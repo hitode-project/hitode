@@ -3,12 +3,79 @@
 mod alu;
 
 use super::*;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
+/// Register values by `(register, index)`. A shader touches few input and
+/// output registers, so a scan beats hashing and clearing keeps the storage.
+#[derive(Clone, Debug, Default)]
+pub struct Registers(Vec<((Register, u32), Vector)>);
+
+impl Registers {
+    pub fn get(&self, key: &(Register, u32)) -> Option<&Vector> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    pub fn insert(&mut self, key: (Register, u32), value: Vector) -> Option<Vector> {
+        match self.0.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, slot)) => Some(std::mem::replace(slot, value)),
+            None => {
+                self.0.push((key, value));
+                None
+            }
+        }
+    }
+
+    fn entry(&mut self, key: (Register, u32)) -> &mut Vector {
+        let n = match self.0.iter().position(|(k, _)| *k == key) {
+            Some(n) => n,
+            None => {
+                self.0.push((key, [0; 4]));
+                self.0.len() - 1
+            }
+        };
+        &mut self.0[n].1
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&(Register, u32), &Vector)> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl std::ops::Index<&(Register, u32)> for Registers {
+    type Output = Vector;
+
+    fn index(&self, key: &(Register, u32)) -> &Vector {
+        self.get(key).expect("register not present")
+    }
+}
+
+impl<const N: usize> From<[((Register, u32), Vector); N]> for Registers {
+    fn from(entries: [((Register, u32), Vector); N]) -> Self {
+        let mut registers = Self::default();
+        for (key, value) in entries {
+            registers.insert(key, value);
+        }
+        registers
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Inputs {
-    pub registers: HashMap<(Register, u32), Vector>,
+    pub registers: Registers,
 }
 
 pub type Constants = HashMap<u32, Vec<Vector>>;
@@ -29,8 +96,18 @@ impl ConstantBuffers for Constants {
 
 #[derive(Clone, Debug, Default)]
 pub struct Outputs {
-    pub registers: HashMap<(Register, u32), Vector>,
+    pub registers: Registers,
     pub discarded: bool,
+}
+
+/// Storage one run fills, kept across runs of the same or another program.
+#[derive(Clone, Debug, Default)]
+pub struct Scratch {
+    temps: Vec<Vector>,
+    /// Indexable temporaries; only the first `arrays_live` are declared in this run.
+    arrays: Vec<(u32, Vec<Vector>)>,
+    arrays_live: usize,
+    pub outputs: Outputs,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -136,21 +213,71 @@ impl Prepared {
         constants: &impl ConstantBuffers,
         resources: &mut impl Resources,
     ) -> Result<Outputs, Error> {
+        let mut scratch = Scratch::default();
+        self.run_in(inputs, constants, resources, &mut scratch)?;
+        Ok(scratch.outputs)
+    }
+
+    /// Run with storage from `scratch`, leaving the result in `scratch.outputs`.
+    pub fn run_in<'s>(
+        &self,
+        inputs: &Inputs,
+        constants: &impl ConstantBuffers,
+        resources: &mut impl Resources,
+        scratch: &'s mut Scratch,
+    ) -> Result<&'s Outputs, Error> {
+        scratch.temps.clear();
+        scratch.temps.resize(self.temporary_count as usize, [0; 4]);
+        scratch.arrays_live = 0;
+        scratch.outputs.registers.clear();
+        scratch.outputs.discarded = false;
         let mut machine = Machine {
             inputs,
             constants,
             resources,
-            temps: vec![[0; 4]; self.temporary_count as usize],
-            arrays: HashMap::new(),
+            scratch,
             immediate: &[],
-            outputs: Outputs::default(),
             fuel: self.fuel,
             flush: self.module.model.flushes_denormals(),
             body: &self.module.body,
             routines: &self.routines,
         };
         let _ = machine.block(&self.module.body[..self.entry])?;
-        Ok(machine.outputs)
+        Ok(&scratch.outputs)
+    }
+}
+
+impl Scratch {
+    fn array(&self, array: u32) -> Option<&[Vector]> {
+        self.arrays[..self.arrays_live]
+            .iter()
+            .find(|(n, _)| *n == array)
+            .map(|(_, rows)| rows.as_slice())
+    }
+
+    fn array_mut(&mut self, array: u32) -> Option<&mut [Vector]> {
+        self.arrays[..self.arrays_live]
+            .iter_mut()
+            .find(|(n, _)| *n == array)
+            .map(|(_, rows)| rows.as_mut_slice())
+    }
+
+    fn declare_array(&mut self, array: u32, rows: usize) {
+        let live = &mut self.arrays[..self.arrays_live];
+        let slot = match live.iter().position(|(n, _)| *n == array) {
+            Some(n) => n,
+            None => {
+                if self.arrays_live == self.arrays.len() {
+                    self.arrays.push((array, Vec::new()));
+                }
+                self.arrays_live += 1;
+                self.arrays_live - 1
+            }
+        };
+        let (n, values) = &mut self.arrays[slot];
+        *n = array;
+        values.clear();
+        values.resize(rows, [0; 4]);
     }
 }
 
@@ -165,10 +292,8 @@ struct Machine<'a, C: ?Sized, R> {
     inputs: &'a Inputs,
     constants: &'a C,
     resources: &'a mut R,
-    temps: Vec<Vector>,
-    arrays: HashMap<u32, Vec<Vector>>,
+    scratch: &'a mut Scratch,
     immediate: &'a [Vector],
-    outputs: Outputs,
     fuel: usize,
     flush: bool,
     body: &'a [Statement],
@@ -187,8 +312,8 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
             let branch = match statement {
                 Statement::Declare(decl) => {
                     if decl.opcode == Opcode::DclIndexableTemp {
-                        self.arrays
-                            .insert(decl.data[0], vec![[0; 4]; decl.data[1] as usize]);
+                        self.scratch
+                            .declare_array(decl.data[0], decl.data[1] as usize);
                     }
                     ControlFlow::Continue(())
                 }
@@ -270,7 +395,7 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
             .clone();
         let body = self.body;
         Ok(match self.block(&body[range])? {
-            ControlFlow::Break(Branch::Return) if self.outputs.discarded => {
+            ControlFlow::Break(Branch::Return) if self.scratch.outputs.discarded => {
                 ControlFlow::Break(Branch::Return)
             }
             _ => ControlFlow::Continue(()),
@@ -293,7 +418,7 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
             if conditional && !self.test(op)? {
                 return Ok(ControlFlow::Continue(()));
             }
-            self.outputs.discarded = op.opcode == Discard;
+            self.scratch.outputs.discarded = op.opcode == Discard;
             let branch = if matches!(op.opcode, Break | Breakc) {
                 Branch::Break
             } else if matches!(op.opcode, Continue | Continuec) {
@@ -310,7 +435,7 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
             .zip(src_types)
             .filter(|&(_, ty)| *ty != ValueType::Binding)
             .map(|(source, ty)| self.read(source, *ty, op.flush_inputs))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<SmallVec<[Vector; 6]>, _>>()?;
         let mut values = if matches!(
             op.opcode,
             DerivRtx | DerivRty | DerivRtxCoarse | DerivRtyCoarse | DerivRtxFine | DerivRtyFine
@@ -450,8 +575,8 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
             } => {
                 let array = self.index(&indices[0], 1)?;
                 let row = self.index(&indices[1], 1)?;
-                self.arrays
-                    .get(&array)
+                self.scratch
+                    .array(array)
                     .and_then(|rows| rows.get(row as usize))
                     .copied()
                     .unwrap_or_default()
@@ -460,6 +585,7 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
                 let (register, index) = self.location(operand)?;
                 match register {
                     Register::Temp => *self
+                        .scratch
                         .temps
                         .get(index as usize)
                         .ok_or(Error::MissingInput(register, index))?,
@@ -474,6 +600,7 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
                     | Register::OutputDepthLessEqual
                     | Register::OutputCoverageMask
                     | Register::OutputStencilRef => *self
+                        .scratch
                         .outputs
                         .registers
                         .get(&(register, index))
@@ -503,8 +630,8 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
             let array = self.index(array, 1)?;
             let row = self.index(row, 1)?;
             let Some(register) = self
-                .arrays
-                .get_mut(&array)
+                .scratch
+                .array_mut(array)
                 .and_then(|rows| rows.get_mut(row as usize))
             else {
                 return Err(Error::MissingInput(Register::IndexableTemp, row));
@@ -515,6 +642,7 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
             match register {
                 Register::Null => return Ok(()),
                 Register::Temp => self
+                    .scratch
                     .temps
                     .get_mut(index as usize)
                     .ok_or(Error::MissingInput(register, index))?,
@@ -524,7 +652,7 @@ impl<'a, C: ConstantBuffers + ?Sized, R: Resources> Machine<'a, C, R> {
                 | Register::OutputDepthLessEqual
                 | Register::OutputCoverageMask
                 | Register::OutputStencilRef => {
-                    self.outputs.registers.entry((register, index)).or_default()
+                    self.scratch.outputs.registers.entry((register, index))
                 }
                 _ => return Err(Error::UnsupportedRegister(register)),
             }

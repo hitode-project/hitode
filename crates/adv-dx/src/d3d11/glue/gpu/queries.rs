@@ -471,8 +471,7 @@ pub(super) fn helper<const N: usize>(
     for (slot, buffer) in buffers {
         bindings
             .storage
-            .resize_with(bindings.storage.len().max(slot as usize + 1), || None);
-        bindings.storage[slot as usize] = Some(StorageBinding::Buffer(buffer));
+            .set(slot as usize, StorageBinding::Buffer(buffer));
     }
     Ok((Arc::new(gpu.prepare_dispatch(shader)?), bindings))
 }

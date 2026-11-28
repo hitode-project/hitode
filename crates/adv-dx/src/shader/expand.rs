@@ -754,13 +754,12 @@ pub fn draw_auto(
         range: 0..16,
     };
     let mut bindings = SlotBindings {
-        uniforms: vec![Some(
-            BufferRange {
-                buffer: params,
-                range: 0..16,
-            }
-            .into(),
-        )],
+        uniforms: [BufferRange {
+            buffer: params,
+            range: 0..16,
+        }
+        .into()]
+        .into(),
         ..Default::default()
     };
     bind_storage(&mut bindings, 0, cursor);
@@ -769,16 +768,15 @@ pub fn draw_auto(
 }
 
 fn bind_storage(slots: &mut SlotBindings, register: u32, buffer: impl Into<BufferWindow>) {
-    if slots.storage.len() <= register as usize {
-        slots.storage.resize_with(register as usize + 1, || None);
-    }
-    slots.storage[register as usize] = Some(StorageBinding::Window(buffer.into()));
+    slots
+        .storage
+        .set(register as usize, StorageBinding::Window(buffer.into()));
 }
 
 pub(crate) fn bind_draw_state(slots: &mut SlotBindings, uniform: BufferWindow) {
-    let slot = pulled::DRAW_STATE_SLOT as usize;
-    slots.uniforms.resize_with(slot + 1, || None);
-    slots.uniforms[slot] = Some(uniform);
+    slots
+        .uniforms
+        .set(pulled::DRAW_STATE_SLOT as usize, uniform);
 }
 
 fn scratch(slot: u32, region: usize) -> ExpansionBinding {

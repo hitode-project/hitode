@@ -493,15 +493,17 @@ fn vertices(
     }
     let mut result = Vec::new();
     let mut common_w = None;
+    let mut scratch = crate::shader::sm::Scratch::default();
     for n in 0..count {
         let mut output = if let Some(vertex) = vertex {
             let program = draw.programmable.as_ref()?;
             vertex
                 .program()?
-                .run(
+                .run_in(
                     &vertex_input(program, n as u32)?,
                     &program.vertex_constants,
                     &mut NoTextures,
+                    &mut scratch,
                 )
                 .ok()?
         } else if transformed {
