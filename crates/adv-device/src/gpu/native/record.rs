@@ -26,7 +26,7 @@ const MAX_RECYCLED_BYTES: usize = 8 << 20;
 
 pub(super) struct Recording {
     white: Image,
-    samplers: HashMap<gpu::Sampler, adv_gpu::Sampler>,
+    samplers: rustc_hash::FxHashMap<gpu::Sampler, adv_gpu::Sampler>,
 }
 impl Recording {
     pub fn new(device: &adv_gpu::Device, stream: &mut Producer) -> Result<Self, Error> {
@@ -66,7 +66,7 @@ impl Recording {
     fn with_white(white: Image) -> Self {
         Self {
             white,
-            samplers: HashMap::new(),
+            samplers: Default::default(),
         }
     }
 }
@@ -756,7 +756,8 @@ struct WorkerState {
     device: adv_gpu::Device,
     stream: Producer,
     target: Option<(ImageId, Option<Depth>)>,
-    facades: HashMap<u64, FacadeState>,
+    /// Looked up several times per command, so it uses a fast hasher.
+    facades: rustc_hash::FxHashMap<u64, FacadeState>,
     shared: Arc<WorkerShared>,
     owner_waker: Option<super::stream::Waker>,
     pending_cmds: usize,
@@ -774,7 +775,7 @@ fn worker_loop(
         device,
         stream,
         target: None,
-        facades: HashMap::new(),
+        facades: Default::default(),
         shared: shared.clone(),
         owner_waker,
         pending_cmds: 0,
@@ -1564,7 +1565,8 @@ impl WorkerState {
         let data = self
             .stream
             .bytes(cursor as u32, alignment as u32, |bytes| {
-                bytes.fill(0);
+                // Programs read only their used registers (GFX-REC-7), so the
+                // rest of each window keeps whatever the ring held.
                 for (stage, constants) in [&draw.vertex_constants, &draw.pixel_constants]
                     .into_iter()
                     .enumerate()
@@ -1580,11 +1582,12 @@ impl WorkerState {
                 }
                 bytes[parameters_offset..parameters_offset + 640]
                     .copy_from_slice(bytemuck::bytes_of(&draw.parameters));
-                for (stream, &(offset, _)) in draw.streams.iter().zip(&stream_ranges) {
-                    let offset = offset as usize;
-                    stream
-                        .bytes
-                        .copy_to(&mut bytes[offset..offset + stream.bytes.len()]);
+                for (stream, &(offset, len)) in draw.streams.iter().zip(&stream_ranges) {
+                    let (offset, end) = (offset as usize, (offset + len) as usize);
+                    let written = offset + stream.bytes.len();
+                    stream.bytes.copy_to(&mut bytes[offset..written]);
+                    // The last word of a stream is read whole.
+                    bytes[written..end].fill(0);
                 }
                 if let Some(indices) = &draw.indices {
                     bytes[index_offset..].copy_from_slice(bytemuck::cast_slice(indices.as_slice()));

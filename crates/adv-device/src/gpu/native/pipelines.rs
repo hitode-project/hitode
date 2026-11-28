@@ -167,7 +167,8 @@ impl Hasher for JobDigest {
 
 #[derive(Default)]
 pub(super) struct Pipelines {
-    entries: HashMap<Key, (RenderPipeline, [u8; 32], bool)>,
+    /// Looked up on every draw, so it uses a fast hasher.
+    entries: rustc_hash::FxHashMap<Key, (RenderPipeline, [u8; 32], bool)>,
     order: VecDeque<Key>,
     modern_order: VecDeque<[u8; 32]>,
     jobs: Arc<Mutex<HashMap<[u8; 32], PipelineJob>>>,
