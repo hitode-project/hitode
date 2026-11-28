@@ -25,9 +25,45 @@ impl Drop for Mapping {
 pub(super) use os::{debugged, finish_preparation};
 pub(super) use os::{synchronize, writable};
 
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CacheType {
+    dminline: usize,
+    iminline: usize,
+    idc: bool,
+    dic: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+impl CacheType {
+    const fn decode(ctr: u64) -> Self {
+        Self {
+            dminline: 4usize << ((ctr >> 16) & 0xf),
+            iminline: 4usize << (ctr & 0xf),
+            idc: (ctr >> 28) & 1 != 0,
+            dic: (ctr >> 29) & 1 != 0,
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
+fn cache_type() -> CacheType {
+    static CACHE: std::sync::OnceLock<CacheType> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let ctr: u64;
+        // SAFETY: CTR_EL0 is readable at EL0 on Linux and Android; caching it
+        // avoids repeated EL1 traps on heterogeneous big.LITTLE SoCs.
+        unsafe { std::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+        CacheType::decode(ctr)
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 fn each_line(base: *const u8, line: usize, ranges: &[(usize, usize)], mut each: impl FnMut(usize)) {
     for &(offset, len) in ranges {
+        if len == 0 {
+            continue;
+        }
         let start = base as usize + offset;
         let mut at = start & !(line - 1);
         while at < start + len {
@@ -37,35 +73,77 @@ fn each_line(base: *const u8, line: usize, ranges: &[(usize, usize)], mut each: 
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+trait CacheOps {
+    fn dc_cvau(&mut self, addr: usize);
+    fn dsb_ish(&mut self);
+    fn ic_ivau(&mut self, addr: usize);
+    fn isb(&mut self);
+}
+
+/// Runs ARMv8 data-to-instruction cache maintenance for `ranges` using the
+/// decoded `CTR_EL0` capabilities:
+/// - `IDC == 0`: clean data lines with `dc cvau`, then `dsb ish`;
+/// - `IDC == 1`: `dsb ish` alone orders writes to the point of unification;
+/// - `DIC == 0`: invalidate instruction lines with `ic ivau`, then `dsb ish`;
+/// - `DIC == 1`: skip `ic ivau` and the second `dsb ish`;
+/// - always finish with `isb`.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn synchronize_with(
+    cache: CacheType,
+    write: *const u8,
+    exec: *const u8,
+    ranges: &[(usize, usize)],
+    ops: &mut impl CacheOps,
+) {
+    if !cache.idc {
+        each_line(write, cache.dminline, ranges, |at| ops.dc_cvau(at));
+    }
+    ops.dsb_ish();
+    if !cache.dic {
+        each_line(exec, cache.iminline, ranges, |at| ops.ic_ivau(at));
+        ops.dsb_ish();
+    }
+    ops.isb();
+}
+
 /// Cleans data lines through the write view to the point of unification,
 /// then invalidates instruction lines through the execute view, with one
 /// set of barriers for all `ranges` (offsets and lengths). Cores with
-/// CTR_EL0.IDC need no data clean.
+/// CTR_EL0.IDC need no data clean; cores with CTR_EL0.DIC need no
+/// instruction invalidate.
 ///
 /// # Safety
 /// Every range must be mapped in both views.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 unsafe fn clean_and_invalidate(write: *const u8, exec: *const u8, ranges: &[(usize, usize)]) {
     use std::arch::asm;
-    let ctr: u64;
-    // SAFETY: CTR_EL0 is readable at EL0 on Linux.
-    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
-    if ctr >> 28 & 1 == 0 {
-        let data_line = 4usize << (ctr >> 16 & 0xf);
-        // SAFETY: cache maintenance on mapped addresses has no other effect.
-        each_line(write, data_line, ranges, |at| unsafe {
-            asm!("dc cvau, {}", in(reg) at, options(nostack))
-        });
+
+    struct Arm64Ops;
+    impl CacheOps for Arm64Ops {
+        #[inline(always)]
+        fn dc_cvau(&mut self, addr: usize) {
+            // SAFETY: caller guarantees every range is mapped in the write view.
+            unsafe { asm!("dc cvau, {}", in(reg) addr, options(nostack)) };
+        }
+        #[inline(always)]
+        fn dsb_ish(&mut self) {
+            // SAFETY: barrier only.
+            unsafe { asm!("dsb ish", options(nostack)) };
+        }
+        #[inline(always)]
+        fn ic_ivau(&mut self, addr: usize) {
+            // SAFETY: caller guarantees every range is mapped in the execute view.
+            unsafe { asm!("ic ivau, {}", in(reg) addr, options(nostack)) };
+        }
+        #[inline(always)]
+        fn isb(&mut self) {
+            // SAFETY: barrier only.
+            unsafe { asm!("isb", options(nostack)) };
+        }
     }
-    // SAFETY: barriers only.
-    unsafe { asm!("dsb ish", options(nostack)) };
-    let code_line = 4usize << (ctr & 0xf);
-    // SAFETY: as above.
-    each_line(exec, code_line, ranges, |at| unsafe {
-        asm!("ic ivau, {}", in(reg) at, options(nostack))
-    });
-    // SAFETY: barriers only.
-    unsafe { asm!("dsb ish", "isb", options(nostack)) };
+
+    synchronize_with(cache_type(), write, exec, ranges, &mut Arm64Ops);
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -458,5 +536,182 @@ mod os {
             libc::munmap(write.as_ptr().cast(), len);
             libc::munmap(exec.as_ptr().cast(), len);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Op {
+        DcCvau(usize),
+        DsbIsh,
+        IcIvau(usize),
+        Isb,
+    }
+
+    #[derive(Default)]
+    struct Recorder(Vec<Op>);
+
+    impl CacheOps for Recorder {
+        fn dc_cvau(&mut self, addr: usize) {
+            self.0.push(Op::DcCvau(addr));
+        }
+        fn dsb_ish(&mut self) {
+            self.0.push(Op::DsbIsh);
+        }
+        fn ic_ivau(&mut self, addr: usize) {
+            self.0.push(Op::IcIvau(addr));
+        }
+        fn isb(&mut self) {
+            self.0.push(Op::Isb);
+        }
+    }
+
+    // spec: A64-CTL-2, A64-MEM-12
+    #[test]
+    fn ctr_el0_decodes_line_sizes_and_idc_dic_bits() {
+        // Typical Cortex-A55/A76: IminLine=4 (64B), DminLine=4 (64B), IDC=0, DIC=0.
+        assert_eq!(
+            CacheType::decode(0x8444_c004),
+            CacheType {
+                dminline: 64,
+                iminline: 64,
+                idc: false,
+                dic: false,
+            }
+        );
+        // Asymmetric lines (32B icache, 64B dcache) with IDC=1 (bit 28), DIC=0.
+        let idc_only = (1u64 << 28) | (4u64 << 16) | 3u64;
+        assert_eq!(
+            CacheType::decode(idc_only),
+            CacheType {
+                dminline: 64,
+                iminline: 32,
+                idc: true,
+                dic: false,
+            }
+        );
+        // DIC=1 (bit 29) with IDC=0, 16B icache, 128B dcache.
+        let dic_only = (1u64 << 29) | (5u64 << 16) | 2u64;
+        assert_eq!(
+            CacheType::decode(dic_only),
+            CacheType {
+                dminline: 128,
+                iminline: 16,
+                idc: false,
+                dic: true,
+            }
+        );
+        // Both IDC=1 and DIC=1 (ARMv8.5+ coherent caches).
+        let coherent = (1u64 << 29) | (1u64 << 28) | (4u64 << 16) | 4u64;
+        assert_eq!(
+            CacheType::decode(coherent),
+            CacheType {
+                dminline: 64,
+                iminline: 64,
+                idc: true,
+                dic: true,
+            }
+        );
+    }
+
+    // spec: A64-CTL-2, A64-MEM-12
+    #[test]
+    fn cache_sync_respects_idc_and_dic_barriers() {
+        let write = 0x1000usize as *const u8;
+        let exec = 0x2000usize as *const u8;
+        // Unaligned span across two 64B dcache / three 32B icache lines, plus an empty range.
+        let ranges = [(0x10usize, 0x48usize), (0x14usize, 0usize)];
+
+        // IDC=0, DIC=0: dc cvau -> dsb ish -> ic ivau -> dsb ish -> isb.
+        let mut ops = Recorder::default();
+        synchronize_with(
+            CacheType {
+                dminline: 64,
+                iminline: 32,
+                idc: false,
+                dic: false,
+            },
+            write,
+            exec,
+            &ranges,
+            &mut ops,
+        );
+        assert_eq!(
+            ops.0,
+            vec![
+                Op::DcCvau(0x1000),
+                Op::DcCvau(0x1040),
+                Op::DsbIsh,
+                Op::IcIvau(0x2000),
+                Op::IcIvau(0x2020),
+                Op::IcIvau(0x2040),
+                Op::DsbIsh,
+                Op::Isb,
+            ]
+        );
+
+        // IDC=1, DIC=0: dsb ish -> ic ivau -> dsb ish -> isb (no dc cvau).
+        let mut ops = Recorder::default();
+        synchronize_with(
+            CacheType {
+                dminline: 64,
+                iminline: 32,
+                idc: true,
+                dic: false,
+            },
+            write,
+            exec,
+            &ranges,
+            &mut ops,
+        );
+        assert_eq!(
+            ops.0,
+            vec![
+                Op::DsbIsh,
+                Op::IcIvau(0x2000),
+                Op::IcIvau(0x2020),
+                Op::IcIvau(0x2040),
+                Op::DsbIsh,
+                Op::Isb,
+            ]
+        );
+
+        // IDC=0, DIC=1: dc cvau -> dsb ish -> isb (no ic ivau, no second dsb ish).
+        let mut ops = Recorder::default();
+        synchronize_with(
+            CacheType {
+                dminline: 64,
+                iminline: 32,
+                idc: false,
+                dic: true,
+            },
+            write,
+            exec,
+            &ranges,
+            &mut ops,
+        );
+        assert_eq!(
+            ops.0,
+            vec![Op::DcCvau(0x1000), Op::DcCvau(0x1040), Op::DsbIsh, Op::Isb]
+        );
+
+        // IDC=1, DIC=1: dsb ish -> isb only.
+        let mut ops = Recorder::default();
+        synchronize_with(
+            CacheType {
+                dminline: 64,
+                iminline: 32,
+                idc: true,
+                dic: true,
+            },
+            write,
+            exec,
+            &ranges,
+            &mut ops,
+        );
+        assert_eq!(ops.0, vec![Op::DsbIsh, Op::Isb]);
     }
 }

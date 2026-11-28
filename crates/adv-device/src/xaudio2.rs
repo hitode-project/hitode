@@ -186,6 +186,7 @@ pub struct Event {
     buffers: Vec<Buffer>,
     voices: Vec<Voice>,
     reverbs: Vec<reverb::Reverb>,
+    retired_buses: Vec<Vec<f32>>,
 }
 
 pub struct Control {
@@ -226,6 +227,13 @@ pub struct Graph {
     voices: BTreeMap<u32, Voice>,
     callbacks: Vec<u32>,
     running: bool,
+    tail_hold: u8,
+    render_pass: u64,
+    order_scratch: Vec<(u64, u32)>,
+    buses: BTreeMap<u32, (u64, Vec<f32>)>,
+    source_bus: Vec<f32>,
+    mix_scratch: Vec<f32>,
+    copy_scratch: Vec<f32>,
 }
 impl Graph {
     pub fn new() -> (Control, Box<Self>) {
@@ -247,6 +255,13 @@ impl Graph {
                 voices: BTreeMap::new(),
                 callbacks: Vec::new(),
                 running: true,
+                tail_hold: 0,
+                render_pass: 0,
+                order_scratch: Vec::new(),
+                buses: BTreeMap::new(),
+                source_bus: Vec::new(),
+                mix_scratch: Vec::new(),
+                copy_scratch: Vec::new(),
             }),
         )
     }
@@ -256,6 +271,7 @@ impl Graph {
             buffers: Vec::new(),
             voices: Vec::new(),
             reverbs: Vec::new(),
+            retired_buses: Vec::new(),
         };
         while let Some(scheduled) = self.commands.pop() {
             if let Command::Commit(set) = scheduled.command {
@@ -281,6 +297,7 @@ impl Graph {
             || !retired.voices.is_empty()
             || !retired.callbacks.is_empty()
             || !retired.reverbs.is_empty()
+            || !retired.retired_buses.is_empty()
         {
             self.pending_events.push_back(retired);
         }
@@ -297,6 +314,9 @@ impl Graph {
                         _ => channels,
                     });
                 voice.channel_volumes.resize(channels, 1.0);
+                if voice.stage > 0 {
+                    self.buses.insert(voice.id, (0, Vec::new()));
+                }
                 self.voices.insert(voice.id, *voice);
             }
             Command::Destroy(id) => {
@@ -314,6 +334,11 @@ impl Graph {
                     | Command::SendFilter(voice, ..) => *voice != id,
                     _ => true,
                 });
+                if let Some((_, bus)) = self.buses.remove(&id)
+                    && bus.capacity() > 0
+                {
+                    retired.retired_buses.push(bus);
+                }
                 if let Some(voice) = self.voices.remove(&id) {
                     retired.voices.push(voice);
                 }
@@ -444,7 +469,18 @@ impl Graph {
         }
     }
     pub fn active(&self) -> bool {
-        true
+        if !self.running {
+            return false;
+        }
+        if self.tail_hold > 0
+            || self.callbacks.iter().any(|&cb| cb != 0)
+            || !self.pending_events.is_empty()
+        {
+            return true;
+        }
+        self.voices
+            .values()
+            .any(|v| v.stage == 0 && (v.playing || v.tails))
     }
     fn publish(&mut self) {
         while let Some(event) = self.pending_events.pop_front() {
@@ -465,6 +501,7 @@ impl Graph {
             buffers: Vec::new(),
             voices: Vec::new(),
             reverbs: Vec::new(),
+            retired_buses: Vec::new(),
         };
         for &cb in &self.callbacks {
             record(
@@ -477,18 +514,61 @@ impl Graph {
                 pts as u64,
             );
         }
-        let mut order: Vec<_> = self.voices.values().map(|v| (v.stage, v.id)).collect();
-        order.sort_unstable();
-        let mut buses: BTreeMap<u32, Vec<f32>> = self
-            .voices
-            .values()
-            .map(|v| (v.id, vec![0.0; frames * v.channels]))
-            .collect();
-        for (_, id) in order {
-            let voice = self.voices.get_mut(&id).unwrap();
-            let mut bus = buses.remove(&id).unwrap();
+        self.render_pass = self.render_pass.wrapping_add(1);
+        if self.render_pass == 0 {
+            for (pass, _) in self.buses.values_mut() {
+                *pass = 0;
+            }
+            self.render_pass = 1;
+        }
+        let pass = self.render_pass;
+        self.order_scratch.clear();
+        for voice in self.voices.values() {
             if voice.stage == 0 && !voice.playing && !voice.tails {
                 continue;
+            }
+            self.order_scratch.push((voice.stage, voice.id));
+        }
+        self.order_scratch.sort_unstable();
+        let mut tail_excited = false;
+        for index in 0..self.order_scratch.len() {
+            let (_, id) = self.order_scratch[index];
+            let voice = self.voices.get_mut(&id).unwrap();
+            let has_reverb_or_filter = voice.filter_enabled
+                || voice
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::Reverb { enabled: true, .. }));
+            let has_meter = voice
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Meter(true)));
+            let from_bus = self
+                .buses
+                .get(&id)
+                .is_some_and(|(bus_pass, _)| *bus_pass == pass);
+            if voice.stage > 0 && !from_bus && !has_reverb_or_filter && !has_meter {
+                continue;
+            }
+            let needed = frames * voice.channels;
+            let mut bus = if from_bus {
+                let mut bus = std::mem::take(&mut self.buses.get_mut(&id).unwrap().1);
+                if bus.len() != needed {
+                    bus.resize(needed, 0.0);
+                }
+                bus
+            } else {
+                let mut bus = std::mem::take(&mut self.source_bus);
+                bus.clear();
+                bus.resize(needed, 0.0);
+                bus
+            };
+            if voice.stage > 0
+                && has_reverb_or_filter
+                && from_bus
+                && bus.iter().any(|sample| sample.abs() > 1e-6)
+            {
+                tail_excited = true;
             }
             if voice.stage == 0 && voice.playing {
                 record(
@@ -638,16 +718,22 @@ impl Graph {
                                 reverb::Reverb::new(rate, output_channels, *next)
                             });
                             dsp.parameters(parameters);
-                            bus = dsp.process(&mut bus, output_channels, *next);
+                            let processed = dsp.process(&mut bus, output_channels, *next);
+                            let old = std::mem::replace(&mut bus, processed);
+                            if old.capacity() > 0 {
+                                event.retired_buses.push(old);
+                            }
                         } else if output_channels != *next {
-                            let mut copy = vec![0.0; frames * next];
-                            for (input, output) in
-                                bus.chunks(output_channels).zip(copy.chunks_mut(*next))
+                            self.copy_scratch.clear();
+                            self.copy_scratch.resize(frames * next, 0.0);
+                            for (input, output) in bus
+                                .chunks(output_channels)
+                                .zip(self.copy_scratch.chunks_mut(*next))
                             {
                                 output[0] = input[0];
                                 output[1] = input[output_channels - 1];
                             }
-                            bus = copy;
+                            std::mem::swap(&mut bus, &mut self.copy_scratch);
                         }
                         output_channels = *next;
                     }
@@ -658,6 +744,12 @@ impl Graph {
                 for (channel, sample) in frame.iter_mut().enumerate() {
                     *sample *= voice.volume * voice.channel_volumes[channel];
                 }
+            }
+            if voice.stage > 0
+                && has_reverb_or_filter
+                && bus.iter().any(|sample| sample.abs() > 1e-6)
+            {
+                tail_excited = true;
             }
             if voice.stage == u64::MAX {
                 for (frame, source) in output
@@ -670,14 +762,19 @@ impl Graph {
                 }
             } else {
                 for send in &mut voice.sends {
-                    if let Some(destination) = buses.get_mut(&send.voice) {
-                        let mut mixed = vec![0.0; send.channels];
+                    if let Some((dest_pass, destination)) = self.buses.get_mut(&send.voice) {
+                        if *dest_pass != pass {
+                            *dest_pass = pass;
+                            destination.clear();
+                            destination.resize(frames * send.channels, 0.0);
+                        }
+                        self.mix_scratch.resize(send.channels, 0.0);
                         for (source, dest) in bus
                             .chunks(output_channels)
                             .zip(destination.chunks_mut(send.channels))
                         {
-                            mixed.fill(0.0);
-                            for (d, value) in mixed.iter_mut().enumerate() {
+                            self.mix_scratch.fill(0.0);
+                            for (d, value) in self.mix_scratch.iter_mut().enumerate() {
                                 for (s, sample) in source.iter().enumerate() {
                                     *value += sample * send.matrix[d * output_channels + s];
                                 }
@@ -691,6 +788,17 @@ impl Graph {
                     }
                 }
             }
+            if from_bus {
+                self.buses.get_mut(&id).unwrap().1 = bus;
+            } else {
+                self.source_bus = bus;
+            }
+        }
+        if tail_excited {
+            // Covers up to ~100 ms reverb pre-delay at 256 frames / 44.1 kHz.
+            self.tail_hold = 20;
+        } else if self.tail_hold > 0 {
+            self.tail_hold -= 1;
         }
         for &cb in &self.callbacks {
             record(
@@ -703,7 +811,11 @@ impl Graph {
                 (pts + frames as f64 * 1_000_000.0 / f64::from(rate)) as u64,
             );
         }
-        if !event.callbacks.is_empty() || !event.buffers.is_empty() || !event.reverbs.is_empty() {
+        if !event.callbacks.is_empty()
+            || !event.buffers.is_empty()
+            || !event.reverbs.is_empty()
+            || !event.retired_buses.is_empty()
+        {
             self.pending_events.push_back(event);
         }
         self.publish();
@@ -829,4 +941,206 @@ pub fn decode(format: &[u8], data: &[u8]) -> Result<Vec<f32>, String> {
         }
     }
     Ok(samples)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_graph_with_voices(stopped_sources: u32) -> (Control, Box<Graph>) {
+        let (mut control, mut graph) = Graph::new();
+        let master = Voice::new(1000, 2, 44100, u64::MAX, 0, Arc::new(State::default()));
+        let mut submix = Voice::new(500, 2, 44100, 1, 0, Arc::new(State::default()));
+        submix.sends = vec![Send {
+            voice: 1000,
+            channels: 2,
+            matrix: vec![1.0, 0.0, 0.0, 1.0],
+            filter: None,
+            filter_state: vec![[0.0; 2]; 2],
+        }];
+        control.send(0, Command::Create(Box::new(master)));
+        control.send(0, Command::Create(Box::new(submix)));
+        for id in 1..=stopped_sources {
+            let mut source = Voice::new(id, 2, 44100, 0, 0, Arc::new(State::default()));
+            source.sends = vec![Send {
+                voice: 500,
+                channels: 2,
+                matrix: vec![1.0, 0.0, 0.0, 1.0],
+                filter: None,
+                filter_state: vec![[0.0; 2]; 2],
+            }];
+            control.send(0, Command::Create(Box::new(source)));
+        }
+        graph.service();
+        (control, graph)
+    }
+
+    // spec: WINE-XAUDIO-1, WINE-XAUDIO-4
+    #[test]
+    fn active_reflects_playing_tails_callbacks_and_engine_state() {
+        let (mut control, mut graph) = make_graph_with_voices(64);
+        // 64 stopped source voices + submix + master: idle, allows audio stream teardown.
+        assert!(!graph.active());
+
+        // Starting one source voice activates the graph.
+        control.send(0, Command::Playing(1, true));
+        graph.service();
+        assert!(graph.active());
+
+        // Stopping the engine deactivates the graph even while a voice is playing.
+        control.send(0, Command::Engine(false));
+        graph.service();
+        assert!(!graph.active());
+
+        // Restarting the engine restores active state.
+        control.send(0, Command::Engine(true));
+        graph.service();
+        assert!(graph.active());
+
+        // Stopping the source voice returns active() to false.
+        control.send(0, Command::Playing(1, false));
+        graph.service();
+        assert!(!graph.active());
+
+        // Stopping with XAUDIO2_PLAY_TAILS keeps the graph active for effect tails.
+        control.send(0, Command::Tails(1));
+        graph.service();
+        assert!(graph.active());
+
+        // Stopping cleanly clears tails and returns active() to false.
+        control.send(0, Command::Playing(1, false));
+        graph.service();
+        assert!(!graph.active());
+
+        // Registered engine callbacks keep the graph active while running.
+        control.send(0, Command::Callbacks(vec![0x1234]));
+        graph.service();
+        assert!(graph.active());
+
+        control.send(0, Command::Engine(false));
+        graph.service();
+        assert!(!graph.active());
+
+        control.send(0, Command::Engine(true));
+        control.send(0, Command::Callbacks(vec![]));
+        graph.service();
+        assert!(!graph.active());
+    }
+
+    // spec: WINE-XAUDIO-1, WINE-XAUDIO-6
+    #[test]
+    fn silent_stopped_voices_reuse_scratch_and_preserve_playback_output() {
+        let (mut control, mut graph) = make_graph_with_voices(64);
+        let mut output = vec![0.0f32; 256 * 2];
+
+        // Render while all 64 source voices are stopped: zero output and no source bus allocated.
+        graph.render(&mut output, 2, 44100, 0.0);
+        assert!(output.iter().all(|&s| s == 0.0));
+        assert_eq!(graph.source_bus.capacity(), 0);
+        assert!(graph.buses.values().all(|(_, buf)| buf.capacity() == 0));
+
+        // Submit and play on voice 1, verify rendered output matches exact input samples.
+        let samples: Vec<f32> = (0..512).map(|i| (i as f32 + 1.0) / 1024.0).collect();
+        control.send(
+            0,
+            Command::Submit(
+                1,
+                Buffer::new(samples.clone(), 0, [0, 256], [0, 256, 0], true),
+            ),
+        );
+        control.send(0, Command::Playing(1, true));
+        output.fill(0.0);
+        graph.render(&mut output, 2, 44100, 10_000.0);
+        assert!(graph.active());
+        for (actual, expected) in output.iter().zip(samples.iter()) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} vs {expected}");
+        }
+
+        // Capture scratch pointers after warmup; subsequent renders must reuse the exact buffers.
+        let source_ptr = graph.source_bus.as_ptr();
+        let submix_ptr = graph.buses[&500].1.as_ptr();
+        let master_ptr = graph.buses[&1000].1.as_ptr();
+        let order_ptr = graph.order_scratch.as_ptr();
+
+        let second: Vec<f32> = vec![0.25; 512];
+        control.send(
+            0,
+            Command::Submit(1, Buffer::new(second, 0, [0, 256], [0, 256, 0], true)),
+        );
+        output.fill(0.0);
+        graph.render(&mut output, 2, 44100, 20_000.0);
+        assert!(output.iter().all(|&s| (s - 0.25).abs() < 1e-6));
+        assert_eq!(graph.source_bus.as_ptr(), source_ptr);
+        assert_eq!(graph.buses[&500].1.as_ptr(), submix_ptr);
+        assert_eq!(graph.buses[&1000].1.as_ptr(), master_ptr);
+        assert_eq!(graph.order_scratch.as_ptr(), order_ptr);
+
+        // Stop voice 1: output is silent and active() becomes false.
+        control.send(0, Command::Playing(1, false));
+        output.fill(0.0);
+        graph.render(&mut output, 2, 44100, 30_000.0);
+        assert!(output.iter().all(|&s| s == 0.0));
+        assert!(!graph.active());
+    }
+
+    // spec: WINE-XAUDIO-4, WINE-XAUDIO-7
+    #[test]
+    fn submix_reverb_tail_keeps_graph_active_until_decay() {
+        let (mut control, mut graph) = Graph::new();
+        let master = Voice::new(3, 1, 44100, u64::MAX, 0, Arc::new(State::default()));
+        let mut submix = Voice::new(2, 1, 44100, 1, 0, Arc::new(State::default()));
+        submix.effects = vec![Effect::Reverb {
+            enabled: true,
+            channels: 1,
+            parameters: Vec::new(),
+        }];
+        submix.sends = vec![Send {
+            voice: 3,
+            channels: 1,
+            matrix: vec![1.0],
+            filter: None,
+            filter_state: vec![[0.0; 2]],
+        }];
+        let mut source = Voice::new(1, 1, 44100, 0, 0, Arc::new(State::default()));
+        source.sends = vec![Send {
+            voice: 2,
+            channels: 1,
+            matrix: vec![1.0],
+            filter: None,
+            filter_state: vec![[0.0; 2]],
+        }];
+        for v in [master, submix, source] {
+            control.send(0, Command::Create(Box::new(v)));
+        }
+        graph.service();
+        assert!(!graph.active());
+
+        let mut impulse = vec![0.0f32; 1024];
+        impulse[0] = 0.5;
+        control.send(
+            0,
+            Command::Submit(1, Buffer::new(impulse, 0, [0, 1024], [0, 1024, 0], true)),
+        );
+        control.send(0, Command::Playing(1, true));
+        let mut output = vec![0.0f32; 1024];
+        graph.render(&mut output, 1, 44100, 0.0);
+        assert!(graph.active());
+
+        // Stop the source voice: submix reverb tail still rings out and keeps graph active.
+        control.send(0, Command::Playing(1, false));
+        output.fill(0.0);
+        graph.render(&mut output, 1, 44100, 25_000.0);
+        assert!(output.iter().any(|s| s.abs() > 1e-6));
+        assert!(graph.active());
+
+        // After enough silent blocks for the reverb tail to decay, active() becomes false.
+        for block in 0..400 {
+            output.fill(0.0);
+            graph.render(&mut output, 1, 44100, (block as f64 + 2.0) * 25_000.0);
+            if !graph.active() {
+                break;
+            }
+        }
+        assert!(!graph.active());
+    }
 }

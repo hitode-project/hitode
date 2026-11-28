@@ -566,7 +566,7 @@ fn compiled_states_share_across_dynamic_and_depth_state_changes() {
     desc.depth_stencil.as_mut().unwrap().depth_bias = true;
     assert_eq!(device.pipeline_identity(&desc), identity);
     let second = device.create_render_pipeline(&desc, None).unwrap();
-    assert_eq!(first.inner.0.raw, second.inner.0.raw);
+    assert_eq!(first.inner.0.state.raw, second.inner.0.state.raw);
     assert_ne!(first.inner.0.depth, second.inner.0.depth);
     desc.depth_stencil.as_mut().unwrap().depth_bias = false;
     let third = device.create_render_pipeline(&desc, None).unwrap();
@@ -574,7 +574,7 @@ fn compiled_states_share_across_dynamic_and_depth_state_changes() {
     desc.colors[0].write_mask = 1;
     assert_ne!(device.pipeline_identity(&desc), identity);
     let fourth = device.create_render_pipeline(&desc, None).unwrap();
-    assert_ne!(first.inner.0.raw, fourth.inner.0.raw);
+    assert_ne!(first.inner.0.state.raw, fourth.inner.0.state.raw);
 }
 
 #[test]
@@ -626,7 +626,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
     let cache = crate::pipeline::PipelineCache::load(&[]);
     let pipeline = device.create_compute_pipeline(&desc, Some(&cache)).unwrap();
     let same = device.create_compute_pipeline(&desc, None).unwrap();
-    assert_eq!(pipeline.inner.0.raw, same.inner.0.raw);
+    assert_eq!(pipeline.inner.0.state.raw, same.inner.0.state.raw);
     let uniforms = upload_words(&device, &[0, 0, 0, 0, 7, 0, 0, 0]);
     let values = device
         .create_buffer(&BufferDesc {
@@ -871,4 +871,109 @@ fn precompiled_msl_and_shader_validation() {
         }),
         Err(Error::Compile(_))
     ));
+}
+
+#[test]
+fn dropped_pipelines_evict_from_cache_while_in_flight_work_completes() {
+    let (device, mut queue) = gpu!();
+    let render_desc = draw_desc(&device);
+    let render = device.create_render_pipeline(&render_desc, None).unwrap();
+    let render_dup = device.create_render_pipeline(&render_desc, None).unwrap();
+    assert!(Arc::ptr_eq(
+        &render.inner.0.state,
+        &render_dup.inner.0.state
+    ));
+    drop(render_dup);
+
+    let compute_shader = device
+        .create_shader(ShaderDesc {
+            source: Source::Wgsl(
+                "@group(3) @binding(0) var<storage, read_write> out: array<u32>;
+                 @compute @workgroup_size(1) fn main() { out[0] = 77u; }",
+            ),
+            identity: 191,
+            label: "evict compute",
+        })
+        .unwrap();
+    let compute_desc = ComputePipelineDesc {
+        entry: compute_shader.entry("main", Stage::Compute).unwrap(),
+        bindings: vec![Binding {
+            slot: 0,
+            kind: BindingKind::StorageBuffer { writable: true },
+            stages: Stages::COMPUTE,
+        }],
+        label: "evict compute",
+    };
+    let compute = device.create_compute_pipeline(&compute_desc, None).unwrap();
+    {
+        let pipelines = device.inner.0.pipelines.lock().unwrap();
+        assert_eq!(pipelines.render.len(), 1);
+        assert_eq!(pipelines.compute.len(), 1);
+    }
+
+    let target = image(&device, Format::Rgba8Unorm);
+    let pixels = readback(&device, 256);
+    let values = device
+        .create_buffer(&BufferDesc {
+            size: 16,
+            memory: Memory::Readback,
+            usage: BufferUsage::STORAGE,
+            label: "evict values",
+        })
+        .unwrap();
+    let mut encoder = queue.encoder("drop pipelines before submit");
+    {
+        let mut pass = encoder.render_pass(&color_pass(
+            target.view(),
+            Load::Clear([0.0; 4]),
+            Store::Store,
+            WHOLE,
+        ));
+        pass.set_pipeline(&render);
+        pass.set_scissor(WHOLE);
+        pass.draw(0..3, 0..1);
+    }
+    encoder.copy_image_to_buffer(
+        ImageCopy {
+            image: &target,
+            mip: 0,
+            layer: 0,
+            origin: (0, 0, 0),
+        },
+        BufferCopy {
+            buffer: &pixels,
+            offset: 0,
+            row_pitch: 0,
+            rows: 0,
+        },
+        target.desc().size,
+    );
+    {
+        let mut pass = encoder.compute_pass(&ComputePassDesc {
+            timestamps: None,
+            label: "evict compute",
+        });
+        pass.set_pipeline(&compute);
+        pass.bind(0, Bind::StorageBuffer(values.slice(0..16)));
+        pass.dispatch(1, 1, 1);
+    }
+
+    // Dropping the last handles evicts both weak entries immediately while the
+    // encoded Metal command buffer still retains its ObjC pipeline states.
+    drop(render);
+    drop(compute);
+    {
+        let pipelines = device.inner.0.pipelines.lock().unwrap();
+        assert!(pipelines.render.is_empty());
+        assert!(pipelines.compute.is_empty());
+    }
+
+    finish(&mut queue, encoder);
+    for pixel in bytes(&pixels).as_chunks::<4>().0 {
+        assert_eq!(*pixel, [255; 4]);
+    }
+    assert_eq!(
+        u32::from_le_bytes(bytes(&values)[..4].try_into().unwrap()),
+        77
+    );
 }

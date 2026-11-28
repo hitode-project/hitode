@@ -164,6 +164,8 @@ pub struct Session {
     finished: Option<u32>,
     idle: BTreeMap<i32, Option<u64>>,
     foreground: i32,
+    schedule_cursor: i32,
+    next_process: Option<i32>,
     delivered: u64,
     retired_debug: [u64; 8],
     retired_boundaries: adv_nt::counters::Boundaries,
@@ -886,6 +888,8 @@ impl Session {
             metrics: ControlMetrics::default(),
             fonts,
             foreground: shared.id.get(),
+            schedule_cursor: shared.id.get(),
+            next_process: None,
             delivered: 0,
             retired_debug: [0; 8],
             retired_boundaries: Default::default(),
@@ -934,20 +938,30 @@ impl Session {
     }
 
     fn run_family(&mut self, until: Instant, stop_frame: bool) -> Stop {
+        if let Some(pid) = self.next_process.take()
+            && self.shared.id.get() != pid
+            && self.shared.driver.borrow().parked.contains_key(&pid)
+            && let Err(error) = self.select(pid)
+        {
+            return Stop::Failed(error);
+        }
         let result = self.run_family_inner(until, stop_frame);
         if matches!(result, Stop::Failed(_)) {
             self.failed_process = Some(self.machine.sys.pid);
         }
-        if self.shared.id.get() != self.foreground
+        let current = self.shared.id.get();
+        if current != self.foreground
             && self
                 .shared
                 .driver
                 .borrow()
                 .parked
                 .contains_key(&self.foreground)
-            && let Err(error) = self.select(self.foreground)
         {
-            return Stop::Failed(error);
+            self.next_process = Some(current);
+            if let Err(error) = self.select(self.foreground) {
+                return Stop::Failed(error);
+            }
         }
         result
     }
@@ -994,6 +1008,7 @@ impl Session {
                 Err(error) => return Stop::Failed(error),
             };
             let id = self.shared.id.get();
+            self.schedule_cursor = id;
             // A single-process game is already foreground: skip the window view.
             if self.presented_frames() != before
                 && self.foreground != id
@@ -1112,11 +1127,7 @@ impl Session {
                 self.shared.driver.borrow_mut().parked.insert(*pid, machine);
             }
             let now = self.machine.sys.clock.now_us();
-            let ready = ids.into_iter().find(|pid| {
-                self.idle
-                    .get(pid)
-                    .is_none_or(|deadline| deadline.is_some_and(|deadline| deadline <= now))
-            });
+            let ready = next_ready_pid(&ids, self.schedule_cursor, &self.idle, now);
             if let Some(pid) = ready {
                 if let Err(error) = self.select(pid) {
                     return Stop::Failed(error);
@@ -1875,5 +1886,69 @@ mod import_tests {
         std::fs::write(system.join("mfc42.dll"), b"").unwrap();
         assert_eq!(super::missing_import(&exe, &system), None);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Select the next ready parked process in round-robin order after `cursor`,
+/// wrapping around to the lowest ready PID when none strictly exceed `cursor`.
+fn next_ready_pid(
+    ids: &[i32],
+    cursor: i32,
+    idle: &BTreeMap<i32, Option<u64>>,
+    now: u64,
+) -> Option<i32> {
+    let is_ready = |pid: &&i32| {
+        idle.get(*pid)
+            .is_none_or(|deadline| deadline.is_some_and(|deadline| deadline <= now))
+    };
+    let split = ids.partition_point(|&pid| pid <= cursor);
+    ids[split..]
+        .iter()
+        .chain(&ids[..split])
+        .find(is_ready)
+        .copied()
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::next_ready_pid;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn three_ready_processes_schedule_round_robin_without_starvation() {
+        let mut active = 10;
+        let mut parked: BTreeSet<i32> = [20, 30].into_iter().collect();
+        let idle = BTreeMap::new();
+        let mut scheduled = Vec::new();
+
+        for _ in 0..9 {
+            scheduled.push(active);
+            let cursor = active;
+            let ids: Vec<i32> = parked.iter().copied().collect();
+            let next = next_ready_pid(&ids, cursor, &idle, 0).expect("another process is ready");
+            parked.remove(&next);
+            parked.insert(active);
+            active = next;
+        }
+
+        assert_eq!(scheduled, vec![10, 20, 30, 10, 20, 30, 10, 20, 30]);
+    }
+
+    #[test]
+    fn round_robin_skips_idle_processes_until_deadline_expires() {
+        let ids = [10, 20, 30];
+        let mut idle = BTreeMap::new();
+        idle.insert(20, Some(500));
+        idle.insert(30, None);
+
+        // With cursor=10 and now=100, 20 is waiting until 500 and 30 has no deadline -> wraps to 10.
+        assert_eq!(next_ready_pid(&ids, 10, &idle, 100), Some(10));
+        // Once now reaches 500, 20 becomes ready and is chosen immediately after cursor=10.
+        assert_eq!(next_ready_pid(&ids, 10, &idle, 500), Some(20));
+        // From cursor=20 at now=500, 30 is still idle -> wraps to 10.
+        assert_eq!(next_ready_pid(&ids, 20, &idle, 500), Some(10));
+        // When all parked processes are idle, none is selected.
+        idle.insert(10, Some(600));
+        assert_eq!(next_ready_pid(&ids, 20, &idle, 400), None);
     }
 }

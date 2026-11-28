@@ -1,6 +1,14 @@
 use super::*;
 use objc2_foundation::{NSArray, NSProcessInfo, NSURL};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::sync::RwLock;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct EntryKey(u64, u32, Stage);
+fn entry_key(entry: &Entry) -> EntryKey {
+    EntryKey(entry.shader.identity, entry.index, entry.stage)
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ColorKey {
@@ -9,9 +17,9 @@ struct ColorKey {
     write_mask: u8,
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct RenderKey {
-    vertex: Entry,
-    fragment: Option<Entry>,
+pub(super) struct RenderKey {
+    vertex: EntryKey,
+    fragment: Option<EntryKey>,
     colors: Vec<ColorKey>,
     color_slots: u8,
     depth: MTLPixelFormat,
@@ -26,8 +34,8 @@ impl RenderKey {
             .and_then(|d| caps::pixel_format(d.format))
             .unwrap_or(MTLPixelFormat::Invalid);
         Self {
-            vertex: desc.vertex.clone(),
-            fragment: desc.fragment.clone(),
+            vertex: entry_key(&desc.vertex),
+            fragment: desc.fragment.as_ref().map(entry_key),
             colors: desc
                 .colors
                 .iter()
@@ -85,16 +93,52 @@ impl DepthKey {
         )
     }
 }
+pub(super) struct RenderState {
+    pub raw: Object<dyn MTLRenderPipelineState>,
+    device: Weak<DeviceState>,
+    key: RenderKey,
+}
+impl Drop for RenderState {
+    fn drop(&mut self) {
+        if let Some(device) = self.device.upgrade() {
+            let mut pipelines = device.pipelines.lock().unwrap();
+            if let std::collections::hash_map::Entry::Occupied(entry) =
+                pipelines.render.entry(self.key.clone())
+                && entry.get().strong_count() == 0
+            {
+                entry.remove();
+            }
+        }
+    }
+}
+pub(super) struct ComputeState {
+    pub raw: Object<dyn MTLComputePipelineState>,
+    device: Weak<DeviceState>,
+    key: EntryKey,
+}
+impl Drop for ComputeState {
+    fn drop(&mut self) {
+        if let Some(device) = self.device.upgrade() {
+            let mut pipelines = device.pipelines.lock().unwrap();
+            if let std::collections::hash_map::Entry::Occupied(entry) =
+                pipelines.compute.entry(self.key)
+                && entry.get().strong_count() == 0
+            {
+                entry.remove();
+            }
+        }
+    }
+}
 #[derive(Default)]
 pub(super) struct Pipelines {
-    render: HashMap<RenderKey, Object<dyn MTLRenderPipelineState>>,
+    pub(super) render: HashMap<RenderKey, Weak<RenderState>>,
     depth: HashMap<DepthKey, Object<dyn MTLDepthStencilState>>,
-    compute: HashMap<Entry, Object<dyn MTLComputePipelineState>>,
+    pub(super) compute: HashMap<EntryKey, Weak<ComputeState>>,
 }
 #[derive(Clone)]
 pub(crate) struct RenderPipeline(pub(super) Arc<RenderData>);
 pub(super) struct RenderData {
-    pub raw: Object<dyn MTLRenderPipelineState>,
+    pub state: Arc<RenderState>,
     pub depth: Object<dyn MTLDepthStencilState>,
     pub raster: Raster,
     pub topology: MTLPrimitiveType,
@@ -150,7 +194,7 @@ impl Raster {
 #[derive(Clone)]
 pub(crate) struct ComputePipeline(pub(super) Arc<ComputeData>);
 pub(super) struct ComputeData {
-    pub raw: Object<dyn MTLComputePipelineState>,
+    pub state: Arc<ComputeState>,
     pub workgroup: MTLSize,
     pub threadgroup: Box<[u32]>,
     pub used: shader::Used,
@@ -189,87 +233,131 @@ impl Device {
                 })?,
             ];
             let key = RenderKey::new(desc, slots);
-            let d = MTLRenderPipelineDescriptor::new();
-            d.setLabel(Some(&NSString::from_str(desc.label)));
-            d.setVertexFunction(Some(&vertex.raw));
-            d.setFragmentFunction(fragment.map(|f| &*f.raw));
-            d.setRasterSampleCount(key.samples as usize);
-            d.setAlphaToCoverageEnabled(key.alpha_to_coverage);
-            d.setDepthAttachmentPixelFormat(key.depth);
-            d.setStencilAttachmentPixelFormat(key.stencil);
-            for (i, c) in color_slots(slots).zip(&key.colors) {
-                let color = unsafe { d.colorAttachments().objectAtIndexedSubscript(i) };
-                color.setPixelFormat(c.format);
-                let mask = c.write_mask;
-                color.setWriteMask(MTLColorWriteMask(
-                    ((mask & 1) << 3 | (mask & 2) << 1 | (mask & 4) >> 1 | (mask & 8) >> 3)
-                        as usize,
-                ));
-                if let Some((rgb, alpha)) = c.blend {
-                    color.setBlendingEnabled(true);
-                    color.setSourceRGBBlendFactor(factor(rgb.src));
-                    color.setDestinationRGBBlendFactor(factor(rgb.dst));
-                    color.setRgbBlendOperation(operation(rgb.op));
-                    color.setSourceAlphaBlendFactor(factor(alpha.src));
-                    color.setDestinationAlphaBlendFactor(factor(alpha.dst));
-                    color.setAlphaBlendOperation(operation(alpha.op));
-                }
-            }
-            // Archive access and deduplication are synchronized across compile callers.
-            let mut archive = cache.map(|c| c.inner.0.lock().unwrap());
-            let archive = archive.as_mut().and_then(|a| a.as_mut());
-            if let Some(a) = &archive {
-                d.setBinaryArchives(Some(&NSArray::from_slice(&[&*a.raw])));
-                a.raw
-                    .addRenderPipelineFunctionsWithDescriptor_error(&d)
-                    .map_err(|e| shader::compile_error("render archive", e))?;
-            }
-            let mut pipelines = self.0.pipelines.lock().unwrap();
-            let raw = if let Some(raw) = pipelines.render.get(&key) {
-                raw.clone()
-            } else {
-                let raw = self
-                    .0
-                    .raw
-                    .newRenderPipelineStateWithDescriptor_error(&d)
-                    .map_err(|e| shader::compile_error("render pipeline", e))?;
-                pipelines.render.insert(key, raw.clone());
-                raw
-            };
             let depth_key = DepthKey::new(desc.depth_stencil);
-            let depth = if let Some(raw) = pipelines.depth.get(&depth_key) {
-                raw.clone()
-            } else {
-                let d = MTLDepthStencilDescriptor::new();
-                d.setDepthCompareFunction(resource::compare(depth_key.compare));
-                d.setDepthWriteEnabled(depth_key.write);
-                if let Some((front, back)) = depth_key.stencil {
-                    for (front_face, face) in [(true, front), (false, back)] {
-                        let s = MTLStencilDescriptor::new();
-                        s.setStencilCompareFunction(resource::compare(face.compare));
-                        s.setStencilFailureOperation(stencil_op(face.fail));
-                        s.setDepthFailureOperation(stencil_op(face.depth_fail));
-                        s.setDepthStencilPassOperation(stencil_op(face.pass));
-                        s.setReadMask(u32::from(depth_key.read_mask));
-                        s.setWriteMask(u32::from(depth_key.write_mask));
-                        if front_face {
-                            d.setFrontFaceStencil(Some(&s));
-                        } else {
-                            d.setBackFaceStencil(Some(&s));
-                        }
+            let (cached_state, cached_depth) = {
+                let pipelines = self.0.pipelines.lock().unwrap();
+                (
+                    pipelines.render.get(&key).and_then(Weak::upgrade),
+                    pipelines.depth.get(&depth_key).cloned(),
+                )
+            };
+            let need_archive = cache.is_some_and(|c| {
+                c.inner
+                    .0
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|a| !a.added_render.contains(&key))
+            });
+            let descriptor = (cached_state.is_none() || need_archive).then(|| {
+                let d = MTLRenderPipelineDescriptor::new();
+                d.setLabel(Some(&NSString::from_str(desc.label)));
+                d.setVertexFunction(Some(&vertex.raw));
+                d.setFragmentFunction(fragment.map(|f| &*f.raw));
+                d.setRasterSampleCount(key.samples as usize);
+                d.setAlphaToCoverageEnabled(key.alpha_to_coverage);
+                d.setDepthAttachmentPixelFormat(key.depth);
+                d.setStencilAttachmentPixelFormat(key.stencil);
+                for (i, c) in color_slots(slots).zip(&key.colors) {
+                    let color = unsafe { d.colorAttachments().objectAtIndexedSubscript(i) };
+                    color.setPixelFormat(c.format);
+                    let mask = c.write_mask;
+                    color.setWriteMask(MTLColorWriteMask(
+                        ((mask & 1) << 3 | (mask & 2) << 1 | (mask & 4) >> 1 | (mask & 8) >> 3)
+                            as usize,
+                    ));
+                    if let Some((rgb, alpha)) = c.blend {
+                        color.setBlendingEnabled(true);
+                        color.setSourceRGBBlendFactor(factor(rgb.src));
+                        color.setDestinationRGBBlendFactor(factor(rgb.dst));
+                        color.setRgbBlendOperation(operation(rgb.op));
+                        color.setSourceAlphaBlendFactor(factor(alpha.src));
+                        color.setDestinationAlphaBlendFactor(factor(alpha.dst));
+                        color.setAlphaBlendOperation(operation(alpha.op));
                     }
                 }
-                let raw = self
-                    .0
-                    .raw
-                    .newDepthStencilStateWithDescriptor(&d)
-                    .ok_or(Error::OutOfMemory)?;
-                pipelines.depth.insert(depth_key, raw.clone());
-                raw
+                d
+            });
+            // Keep the device pipeline map unlocked throughout archive updates
+            // and driver compilation. Write-lock the archive only to add new
+            // functions, then hold a read lock across pipeline creation so
+            // concurrent compiles share the archive without racing mutation or
+            // serialization.
+            if need_archive && let (Some(cache), Some(d)) = (cache, descriptor.as_ref()) {
+                let mut archive = cache.inner.0.write().unwrap();
+                if let Some(a) = archive.as_mut()
+                    && !a.added_render.contains(&key)
+                {
+                    a.raw
+                        .addRenderPipelineFunctionsWithDescriptor_error(d)
+                        .map_err(|e| shader::compile_error("render archive", e))?;
+                    a.added_render.insert(key.clone());
+                }
+            }
+            let state = match cached_state {
+                Some(state) => state,
+                None => {
+                    let d = descriptor.as_ref().unwrap();
+                    let raw = {
+                        let archive_guard = cache.map(|c| c.inner.0.read().unwrap());
+                        if let Some(a) = archive_guard.as_ref().and_then(|g| g.as_ref()) {
+                            d.setBinaryArchives(Some(&NSArray::from_slice(&[&*a.raw])));
+                        }
+                        self.0
+                            .raw
+                            .newRenderPipelineStateWithDescriptor_error(d)
+                            .map_err(|e| shader::compile_error("render pipeline", e))?
+                    };
+                    let mut pipelines = self.0.pipelines.lock().unwrap();
+                    if let Some(existing) = pipelines.render.get(&key).and_then(Weak::upgrade) {
+                        drop(pipelines);
+                        drop(raw);
+                        existing
+                    } else {
+                        let state = Arc::new(RenderState {
+                            raw,
+                            device: Arc::downgrade(&self.0),
+                            key: key.clone(),
+                        });
+                        pipelines.render.insert(key, Arc::downgrade(&state));
+                        state
+                    }
+                }
+            };
+            let depth = match cached_depth {
+                Some(raw) => raw,
+                None => {
+                    let d = MTLDepthStencilDescriptor::new();
+                    d.setDepthCompareFunction(resource::compare(depth_key.compare));
+                    d.setDepthWriteEnabled(depth_key.write);
+                    if let Some((front, back)) = depth_key.stencil {
+                        for (front_face, face) in [(true, front), (false, back)] {
+                            let s = MTLStencilDescriptor::new();
+                            s.setStencilCompareFunction(resource::compare(face.compare));
+                            s.setStencilFailureOperation(stencil_op(face.fail));
+                            s.setDepthFailureOperation(stencil_op(face.depth_fail));
+                            s.setDepthStencilPassOperation(stencil_op(face.pass));
+                            s.setReadMask(u32::from(depth_key.read_mask));
+                            s.setWriteMask(u32::from(depth_key.write_mask));
+                            if front_face {
+                                d.setFrontFaceStencil(Some(&s));
+                            } else {
+                                d.setBackFaceStencil(Some(&s));
+                            }
+                        }
+                    }
+                    let raw = self
+                        .0
+                        .raw
+                        .newDepthStencilStateWithDescriptor(&d)
+                        .ok_or(Error::OutOfMemory)?;
+                    let mut pipelines = self.0.pipelines.lock().unwrap();
+                    pipelines.depth.entry(depth_key).or_insert(raw).clone()
+                }
             };
             Ok(crate::RenderPipeline {
                 inner: RenderPipeline(Arc::new(RenderData {
-                    raw,
+                    state,
                     depth,
                     raster: Raster::new(
                         desc.primitive,
@@ -303,37 +391,78 @@ impl Device {
                 ));
             }
             let used = self.used(&desc.bindings, Stages::COMPUTE, entry)?;
-            let d = MTLComputePipelineDescriptor::new();
-            d.setLabel(Some(&NSString::from_str(desc.label)));
-            d.setComputeFunction(Some(&entry.raw));
-            let mut archive = cache.map(|c| c.inner.0.lock().unwrap());
-            let archive = archive.as_mut().and_then(|a| a.as_mut());
-            if let Some(a) = &archive {
-                d.setBinaryArchives(Some(&NSArray::from_slice(&[&*a.raw])));
-                a.raw
-                    .addComputePipelineFunctionsWithDescriptor_error(&d)
-                    .map_err(|e| shader::compile_error("compute archive", e))?;
-            }
-            let mut pipelines = self.0.pipelines.lock().unwrap();
-            let raw = if let Some(raw) = pipelines.compute.get(&desc.entry) {
-                raw.clone()
-            } else {
-                let raw = self
+            let key = entry_key(&desc.entry);
+            let cached = self
+                .0
+                .pipelines
+                .lock()
+                .unwrap()
+                .compute
+                .get(&key)
+                .and_then(Weak::upgrade);
+            let need_archive = cache.is_some_and(|c| {
+                c.inner
                     .0
-                    .raw
-                    .newComputePipelineStateWithDescriptor_options_reflection_error(
-                        &d,
-                        MTLPipelineOption::empty(),
-                        None,
-                    )
-                    .map_err(|e| shader::compile_error("compute pipeline", e))?;
-                pipelines.compute.insert(desc.entry.clone(), raw.clone());
-                raw
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|a| !a.added_compute.contains(&key))
+            });
+            let descriptor = (cached.is_none() || need_archive).then(|| {
+                let d = MTLComputePipelineDescriptor::new();
+                d.setLabel(Some(&NSString::from_str(desc.label)));
+                d.setComputeFunction(Some(&entry.raw));
+                d
+            });
+            if need_archive && let (Some(cache), Some(d)) = (cache, descriptor.as_ref()) {
+                let mut archive = cache.inner.0.write().unwrap();
+                if let Some(a) = archive.as_mut()
+                    && !a.added_compute.contains(&key)
+                {
+                    a.raw
+                        .addComputePipelineFunctionsWithDescriptor_error(d)
+                        .map_err(|e| shader::compile_error("compute archive", e))?;
+                    a.added_compute.insert(key);
+                }
+            }
+            let state = match cached {
+                Some(state) => state,
+                None => {
+                    let d = descriptor.as_ref().unwrap();
+                    let raw = {
+                        let archive_guard = cache.map(|c| c.inner.0.read().unwrap());
+                        if let Some(a) = archive_guard.as_ref().and_then(|g| g.as_ref()) {
+                            d.setBinaryArchives(Some(&NSArray::from_slice(&[&*a.raw])));
+                        }
+                        self.0
+                            .raw
+                            .newComputePipelineStateWithDescriptor_options_reflection_error(
+                                d,
+                                MTLPipelineOption::empty(),
+                                None,
+                            )
+                            .map_err(|e| shader::compile_error("compute pipeline", e))?
+                    };
+                    let mut pipelines = self.0.pipelines.lock().unwrap();
+                    if let Some(existing) = pipelines.compute.get(&key).and_then(Weak::upgrade) {
+                        drop(pipelines);
+                        drop(raw);
+                        existing
+                    } else {
+                        let state = Arc::new(ComputeState {
+                            raw,
+                            device: Arc::downgrade(&self.0),
+                            key,
+                        });
+                        pipelines.compute.insert(key, Arc::downgrade(&state));
+                        state
+                    }
+                }
             };
             let [width, height, depth] = entry.workgroup.map(|n| n as usize);
             Ok(crate::ComputePipeline {
                 inner: ComputePipeline(Arc::new(ComputeData {
-                    raw,
+                    state,
                     workgroup: MTLSize {
                         width,
                         height,
@@ -434,14 +563,16 @@ fn operation(value: BlendOp) -> MTLBlendOperation {
 }
 
 #[derive(Clone)]
-pub(crate) struct PipelineCache(Arc<Mutex<Option<Archive>>>);
+pub(crate) struct PipelineCache(Arc<RwLock<Option<Archive>>>);
 struct Archive {
     raw: Object<dyn MTLBinaryArchive>,
     header: Vec<u8>,
     /// The archive's latest serialized payload. Metal declines to serialize
     /// again until a new pipeline is added, and this file then still holds the
     /// current contents. A loaded archive starts from its source file.
-    last: Option<TemporaryFile>,
+    last: Option<Arc<TemporaryFile>>,
+    added_render: HashSet<RenderKey>,
+    added_compute: HashSet<EntryKey>,
 }
 const MAGIC: &[u8; 8] = b"ADVMTL\0\x01";
 fn header(device: &ProtocolObject<dyn MTLDevice>) -> Vec<u8> {
@@ -490,29 +621,36 @@ impl PipelineCache {
             Some(Archive {
                 raw,
                 header,
-                last: backing,
+                last: backing.map(Arc::new),
+                added_render: HashSet::new(),
+                added_compute: HashSet::new(),
             })
         });
         crate::pipeline::PipelineCache {
-            inner: Self(Arc::new(Mutex::new(archive))),
+            inner: Self(Arc::new(RwLock::new(archive))),
         }
     }
     pub(crate) fn serialize(&self) -> Result<Vec<u8>> {
-        let mut archive = self.0.lock().unwrap();
-        let Some(archive) = &mut *archive else {
-            return Ok(Vec::new());
-        };
-        let file = TemporaryFile::new()?;
-        match archive.raw.serializeToURL_error(&file.url()) {
-            Ok(()) => archive.last = Some(file),
-            Err(e) if archive.last.is_none() => {
-                return Err(shader::compile_error("Metal archive", e));
+        let (last, header) = {
+            let mut archive = self.0.write().unwrap();
+            let Some(archive) = &mut *archive else {
+                return Ok(Vec::new());
+            };
+            let file = TemporaryFile::new()?;
+            match archive.raw.serializeToURL_error(&file.url()) {
+                Ok(()) => archive.last = Some(Arc::new(file)),
+                Err(e) if archive.last.is_none() => {
+                    return Err(shader::compile_error("Metal archive", e));
+                }
+                Err(_) => {}
             }
-            Err(_) => {}
-        }
-        let last = archive.last.as_ref().unwrap();
+            (
+                archive.last.as_ref().unwrap().clone(),
+                archive.header.clone(),
+            )
+        };
         let bytes = std::fs::read(&last.0).map_err(io_error)?;
-        let mut data = archive.header.clone();
+        let mut data = header;
         data.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         data.extend_from_slice(&bytes);
         Ok(data)
@@ -548,8 +686,10 @@ impl Drop for TemporaryFile {
         let _ = std::fs::remove_file(&self.0);
     }
 }
-// Archive mutation is protected by its mutex.
+// Archive mutation and serialization take the RwLock write guard; concurrent
+// pipeline creation shares the read guard only for read-only archive lookups.
 unsafe impl Send for Archive {}
+unsafe impl Sync for Archive {}
 
 #[cfg(test)]
 mod tests {

@@ -213,9 +213,11 @@ Preparation MUST validate the compressed stream completely before publishing the
 
 ### HOST-SES-8 Presentation rate
 
-**Rule**: `Present` and software frames MUST be presented at most once per 1/60 s on displays faster than 60 Hz, with at most 10% slack. Software frames rely on DEV-FRAME-8 boundaries for this cap. Slower displays MUST cap presentation at their own rate.
+**Rule**: Displays faster than 60 Hz MUST cap average presentation at 60 Hz, using fixed whole-multiple vsync steps within 1% and nearest-vsync rational snapping otherwise. Software frames rely on DEV-FRAME-8 boundaries for this cap. Slower displays MUST cap presentation at their own rate.
 **Applies to**: macOS, Android
 **Verification**: Test
+
+On integer multiples of 60 Hz, presentation counts strictly every whole-multiple vsync to stay at 60 Hz. On non-integer rates above 60 Hz, snapping the rational 60 Hz cadence to the nearest host vsync aligns with GFX-PACE-1 without repaying missed frames. When the host display period is unknown, presentation enforces at least 90% of 1/60 s between counted refreshes to avoid 120 Hz boundary jitter.
 
 ### HOST-SES-10 Submit before refresh
 
@@ -231,7 +233,7 @@ The executor MUST keep at most one unlatched transaction and one newest held fra
 
 The request is the presentation cap of HOST-SES-8, not an estimate of the guest's rate. A cadence estimate under load moves every few frames: SurfaceControl honors each value, and the display switches refresh rate on every change. A layer that posts nothing lets its request lapse, so the display still idles.
 
-Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFrameRate` on the SurfaceControl base layer, updating the request only when the estimated rate changes.
+Android MUST issue that one-time 60 Hz request through runtime-resolved `ASurfaceTransaction_setFrameRate` on the SurfaceControl base layer using `ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE`.
 
 ### HOST-LIB-1 Storage and removal
 

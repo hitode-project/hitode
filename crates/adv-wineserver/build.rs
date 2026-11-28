@@ -43,6 +43,8 @@ fn main() {
             .is_some_and(|name| name == "inproc_sync.c")
         {
             *source = "c/inproc_sync.c".into();
+        } else if source.file_name().is_some_and(|name| name == "registry.c") {
+            *source = "c/registry.c".into();
         }
     }
     let mut server = cc::Build::new();

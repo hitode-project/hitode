@@ -516,12 +516,24 @@ impl Compiler {
     }
 }
 
+/// Lower nice value for background JIT compilation on Linux and Android:
+/// below the interactive owner (`-2`) and normal threads (`0`), above GPU
+/// background compilation (`10`), without core pinning or RT priority (AND-APP-8).
+#[cfg(any(target_os = "android", target_os = "linux"))]
+const COMPILE_NICE: libc::c_int = 5;
+
 /// Below the interactive owner and computation workers, above background work.
 fn set_priority() {
     #[cfg(target_vendor = "apple")]
     // SAFETY: sets this thread's own QoS class.
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    // SAFETY: lowers this thread's own scheduling priority (higher nice value);
+    // never pins cores or uses real-time scheduling (AND-APP-8).
+    unsafe {
+        let _ = libc::setpriority(libc::PRIO_PROCESS, 0, COMPILE_NICE);
     }
 }
 
@@ -536,5 +548,22 @@ mod tests {
         let queue = pool.queue.clone();
         drop(pool);
         assert_eq!(Arc::strong_count(&queue), 1);
+    }
+
+    // spec: A64A-PLACE-4
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn compile_worker_lowers_nice_without_pinning() {
+        let nice = std::thread::spawn(|| {
+            set_priority();
+            // SAFETY: queries the calling thread's own nice value.
+            unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
+        })
+        .join()
+        .unwrap();
+        assert!(
+            nice >= COMPILE_NICE,
+            "expected nice >= {COMPILE_NICE}, got {nice}"
+        );
     }
 }
