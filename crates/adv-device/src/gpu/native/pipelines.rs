@@ -41,9 +41,11 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const MAX_PIPELINES: usize = 512;
 const ARCHIVE_LIMIT: usize = 8 << 20;
+const ARCHIVE_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 const MAGIC: &[u8; 8] = b"ADVNAT01";
 
 /// Vertex constants at slot 0 are followed immediately by the 640-byte
@@ -242,10 +244,42 @@ struct SaveRequest {
     persisted: Arc<AtomicU64>,
 }
 
+struct PendingSave {
+    ready_at: Instant,
+    request: SaveRequest,
+}
+
 #[derive(Default)]
 struct ArchiveSaverState {
-    pending: HashMap<PathBuf, SaveRequest>,
+    pending: HashMap<PathBuf, PendingSave>,
     writing: Option<PathBuf>,
+}
+
+impl ArchiveSaverState {
+    fn schedule(&mut self, request: SaveRequest, ready_at: Instant) {
+        self.pending
+            .insert(request.path.clone(), PendingSave { ready_at, request });
+    }
+
+    fn take_ready(&mut self, now: Instant) -> Result<SaveRequest, Option<Duration>> {
+        let mut earliest: Option<Instant> = None;
+        let mut due_key: Option<PathBuf> = None;
+        for (path, entry) in &self.pending {
+            if entry.ready_at <= now {
+                due_key = Some(path.clone());
+                break;
+            }
+            if earliest.is_none_or(|time| entry.ready_at < time) {
+                earliest = Some(entry.ready_at);
+            }
+        }
+        if let Some(key) = due_key {
+            let entry = self.pending.remove(&key).unwrap();
+            self.writing = Some(key);
+            return Ok(entry.request);
+        }
+        Err(earliest.map(|time| time.saturating_duration_since(now)))
+    }
 }
 
 fn archive_saver() -> &'static Arc<(Mutex<ArchiveSaverState>, Condvar)> {
@@ -261,13 +295,16 @@ fn archive_saver() -> &'static Arc<(Mutex<ArchiveSaverState>, Condvar)> {
                     let req = {
                         let mut state = lock.lock().unwrap();
                         loop {
-                            let next_key = state.pending.keys().next().cloned();
-                            if let Some(key) = next_key {
-                                let req = state.pending.remove(&key).unwrap();
-                                state.writing = Some(key);
-                                break req;
+                            match state.take_ready(Instant::now()) {
+                                Ok(req) => break req,
+                                Err(Some(wait)) => {
+                                    let (guard, _) = cv.wait_timeout(state, wait).unwrap();
+                                    state = guard;
+                                }
+                                Err(None) => {
+                                    state = cv.wait(state).unwrap();
+                                }
                             }
-                            state = cv.wait(state).unwrap();
                         }
                     };
                     if save_archive(&req.path, &req.identity, &req.recipes, &req.cache, false)
@@ -286,10 +323,14 @@ fn archive_saver() -> &'static Arc<(Mutex<ArchiveSaverState>, Condvar)> {
 }
 
 fn schedule_archive_save(req: SaveRequest) {
+    schedule_archive_save_after(req, ARCHIVE_SAVE_DEBOUNCE);
+}
+
+fn schedule_archive_save_after(req: SaveRequest, delay: Duration) {
     let (lock, cv) = &**archive_saver();
     let mut state = lock.lock().unwrap();
-    state.pending.insert(req.path.clone(), req);
-    cv.notify_one();
+    state.schedule(req, Instant::now() + delay);
+    cv.notify_all();
 }
 
 fn wait_archive_save(path: &Path) {
@@ -2482,5 +2523,106 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         assert_eq!(pipelines.misses, 4);
         assert_eq!(pipelines.entries.len(), 2);
         assert_eq!(pipelines.jobs.lock().unwrap().len(), 2);
+    }
+
+    // spec: GFX-CACHE-8, GFX-CACHE-9
+    #[test]
+    fn periodic_archive_saves_debounce_and_coalesce_while_flush_bypasses() {
+        let mut state = ArchiveSaverState::default();
+        let path = PathBuf::from("debounced.native");
+        let cache = Arc::new(p::PipelineCache::load(&[]));
+        let recipe = |color_write: u8| {
+            let mut draw_state = DrawState::new(1, 1);
+            draw_state.color_write = color_write;
+            Recipe {
+                kind: Kind::Fixed(0),
+                raster: Raster::from(&draw_state),
+                colors: vec![format_code(Format::Bgra8Unorm)],
+                depth: None,
+            }
+        };
+        let t0 = Instant::now();
+        state.schedule(
+            SaveRequest {
+                path: path.clone(),
+                identity: "id".into(),
+                recipes: VecDeque::from([recipe(1)]),
+                cache: cache.clone(),
+                persisted: Arc::new(AtomicU64::new(0)),
+            },
+            t0 + ARCHIVE_SAVE_DEBOUNCE,
+        );
+        let half = ARCHIVE_SAVE_DEBOUNCE / 2;
+        assert_eq!(state.take_ready(t0 + half).err(), Some(Some(half)));
+        // A burst update coalesces into one pending save and resets the quiet window.
+        state.schedule(
+            SaveRequest {
+                path: path.clone(),
+                identity: "id".into(),
+                recipes: VecDeque::from([recipe(1), recipe(2)]),
+                cache,
+                persisted: Arc::new(AtomicU64::new(0)),
+            },
+            t0 + half + ARCHIVE_SAVE_DEBOUNCE,
+        );
+        assert_eq!(
+            state.take_ready(t0 + ARCHIVE_SAVE_DEBOUNCE).err(),
+            Some(Some(half))
+        );
+        let ready = state
+            .take_ready(t0 + half + ARCHIVE_SAVE_DEBOUNCE)
+            .ok()
+            .expect("coalesced save should become ready after quiet period");
+        assert_eq!(ready.recipes.len(), 2);
+        assert_eq!(state.writing.as_deref(), Some(path.as_path()));
+        assert!(state.pending.is_empty());
+
+        let Some((gpu, _queue, _consumer)) = open() else {
+            return;
+        };
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let directory = std::env::temp_dir().join(format!(
+            "adv-debounce-cache-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut pipelines = Pipelines::default();
+        pipelines.open(&gpu.device, Some(&directory));
+        let (archive_path, identity, _) = pipelines.archive_info().unwrap();
+        for mask in [1u8, 2u8] {
+            let mut draw_state = DrawState::new(1, 1);
+            draw_state.color_write = mask;
+            pipelines
+                .fixed(&gpu.device, &draw_state, &[Format::Bgra8Unorm], None, 0)
+                .unwrap();
+        }
+        // Periodic saves remain queued behind the debounce window during the burst.
+        assert!(
+            archive_saver()
+                .0
+                .lock()
+                .unwrap()
+                .pending
+                .contains_key(&archive_path)
+        );
+        assert!(!archive_path.exists());
+
+        // `flush()` cancels the debounced entry and persists synchronously right away.
+        let started = Instant::now();
+        pipelines.flush().unwrap();
+        assert!(started.elapsed() < ARCHIVE_SAVE_DEBOUNCE);
+        assert!(
+            !archive_saver()
+                .0
+                .lock()
+                .unwrap()
+                .pending
+                .contains_key(&archive_path)
+        );
+        assert_eq!(pipelines.stats().persisted_pipelines, 2);
+        let (loaded, _) = load_archive(&archive_path, &identity).unwrap();
+        assert_eq!(loaded.len(), 2);
+        drop(pipelines);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
