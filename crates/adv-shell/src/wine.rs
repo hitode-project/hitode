@@ -249,7 +249,7 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
                 let session = start(environment, options, dist, wake.clone(), &keys, host)?;
                 let (code, session, _) =
                     drive(options, session, None, &keys, &wake, debugger, started)?;
-                Ok((code, session.presented_frames()))
+                Ok((code, session.frame().frames))
             })?;
         eprintln!(
             "wine: exit {code} after {:.2}s, {frames} frames presented",
@@ -297,7 +297,10 @@ pub(super) fn run_execution(
         })
         .transpose()?;
     let pacer = super::frame_pacer::HostPacer {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         vsync: worker.vsync.take(),
+        #[cfg(target_os = "android")]
+        vsync: None,
         keys: keys.clone(),
         origin: Instant::now(),
     };
@@ -1150,7 +1153,7 @@ fn drive(
     if let Err(error) = session.machine.cpu.persist() {
         eprintln!("warning: {error}");
     }
-    if needs_exit_capture(options, session.presented_frames()) {
+    if session.presented_frames() > 0 {
         outcome.screenshot_error = session.capture().err();
     }
     if outcome.screenshot_error.is_none() {
@@ -1237,12 +1240,6 @@ fn drive(
         return Err(format!("{MISSING_DLL}{module}"));
     }
     Ok((code, session, summary))
-}
-
-/// Only read back the latest GPU frame on exit when a consumer actually uses
-/// its pixels (screenshot file or JSON report checksum/dimensions).
-fn needs_exit_capture(options: &Options, presented_frames: u64) -> bool {
-    presented_frames > 0 && (options.screenshot.is_some() || options.report.is_some())
 }
 
 fn position(x: i16, y: i16) -> u32 {
@@ -1485,31 +1482,6 @@ fn usable(set: &DialogSet) -> impl Iterator<Item = &adv_runtime::DialogWindow> {
     set.dialogs
         .iter()
         .filter(|dialog| dialog.visible && dialog.enabled)
-}
-
-#[cfg(test)]
-mod exit_capture_tests {
-    use super::{Options, needs_exit_capture};
-    use std::path::PathBuf;
-
-    #[test]
-    fn exit_capture_runs_only_when_screenshot_or_report_needs_frame() {
-        let mut options = Options::new(PathBuf::from("game.exe"), PathBuf::from("data"));
-        // Normal launcher runs have neither --screenshot nor --report: zero GPU readback on exit.
-        assert!(!needs_exit_capture(&options, 0));
-        assert!(!needs_exit_capture(&options, 120));
-
-        // --screenshot requires a capture once at least one frame has been presented.
-        options.screenshot = Some(PathBuf::from("out.png"));
-        assert!(!needs_exit_capture(&options, 0));
-        assert!(needs_exit_capture(&options, 1));
-
-        // --report reads frame dimensions and checksum, so it captures when frames were presented.
-        options.screenshot = None;
-        options.report = Some(PathBuf::from("report.json"));
-        assert!(!needs_exit_capture(&options, 0));
-        assert!(needs_exit_capture(&options, 5));
-    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

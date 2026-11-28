@@ -13,6 +13,7 @@ pub(crate) struct Queue {
 pub(super) struct Shared {
     pub(super) context: Arc<Context>,
     handle: vk::Queue,
+    timeline: vk::Semaphore,
     pub(super) state: Mutex<State>,
     pub(super) descriptors: Mutex<Vec<binding::DescriptorArena>>,
     pub(super) storage_window: Mutex<Option<crate::Buffer>>,
@@ -45,9 +46,21 @@ type Callback = Box<dyn FnOnce() + Send>;
 impl Queue {
     pub(super) fn new(device: crate::Device) -> Result<Self> {
         let context = device.inner.0.clone();
+        let timeline = if context.caps.modern.contains(Modern::TIMELINE_SEMAPHORES) {
+            let mut ty =
+                vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+            context.result(unsafe {
+                context
+                    .device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ty), None)
+            })?
+        } else {
+            vk::Semaphore::null()
+        };
         let shared = Arc::new(Shared {
             handle: unsafe { context.device.get_device_queue(context.family, 0) },
             context,
+            timeline,
             descriptors: Mutex::new(Vec::new()),
             storage_window: Mutex::new(None),
             state: Mutex::new(State {
@@ -63,7 +76,6 @@ impl Queue {
                 sync: present::Semaphores::default(),
             }),
         });
-        let _ = shared.context.queue.set(Arc::downgrade(&shared));
         let (sender, receiver) = mpsc::channel();
         let backend = shared.clone();
         let waiter = std::thread::Builder::new()
@@ -145,8 +157,7 @@ impl Queue {
         context.result(unsafe { context.device.end_command_buffer(encoder.inner.command) })?;
         let mut state = self.shared.state.lock().unwrap();
         let token = state.next;
-        let timeline = context.timeline_semaphore;
-        let fence = if timeline == vk::Semaphore::null() {
+        let fence = if self.shared.timeline == vk::Semaphore::null() {
             match state.fences.pop() {
                 Some(f) => f,
                 None => context.result(unsafe {
@@ -176,8 +187,8 @@ impl Queue {
         commands.push(encoder.inner.command);
         let mut semaphores = arrayvec::ArrayVec::<_, 2>::new();
         let mut values = arrayvec::ArrayVec::<_, 2>::new();
-        if timeline != vk::Semaphore::null() {
-            semaphores.push(timeline);
+        if self.shared.timeline != vk::Semaphore::null() {
+            semaphores.push(self.shared.timeline);
             values.push(token);
         }
         #[cfg(target_os = "android")]
@@ -190,7 +201,7 @@ impl Queue {
         let mut submit = vk::SubmitInfo::default()
             .command_buffers(&commands)
             .signal_semaphores(&semaphores);
-        if timeline != vk::Semaphore::null() {
+        if self.shared.timeline != vk::Semaphore::null() {
             submit = submit.push_next(&mut timeline_info);
         }
         #[cfg(target_os = "android")]
@@ -266,32 +277,29 @@ impl Queue {
         }
         let timeout = timeout.as_nanos().min(u64::MAX as u128) as u64;
         let context = &self.shared.context;
-        let timeline = context.timeline_semaphore;
-        let result = if timeline != vk::Semaphore::null() {
-            drop(state);
-            let semaphores = [timeline];
-            let values = [token.0];
-            let info = vk::SemaphoreWaitInfo::default()
-                .semaphores(&semaphores)
-                .values(&values);
-            unsafe {
+        let result = unsafe {
+            if self.shared.timeline != vk::Semaphore::null() {
+                let semaphores = [self.shared.timeline];
+                let values = [token.0];
+                let info = vk::SemaphoreWaitInfo::default()
+                    .semaphores(&semaphores)
+                    .values(&values);
                 if context.api >= vk::API_VERSION_1_2 {
                     context.device.wait_semaphores(&info, timeout)
                 } else {
                     context.timeline.wait_semaphores(&info, timeout)
                 }
+            } else {
+                let fence = state
+                    .pending
+                    .iter()
+                    .find(|s| s.token == token.0)
+                    .unwrap()
+                    .fence;
+                context.device.wait_for_fences(&[fence], true, timeout)
             }
-        } else {
-            let fence = state
-                .pending
-                .iter()
-                .find(|s| s.token == token.0)
-                .unwrap()
-                .fence;
-            let result = unsafe { context.device.wait_for_fences(&[fence], true, timeout) };
-            drop(state);
-            result
         };
+        drop(state);
         if result == Err(vk::Result::TIMEOUT) {
             return Ok(false);
         }
@@ -375,10 +383,9 @@ impl Shared {
             state.waiting = oldest.1;
             oldest
         };
-        let timeline = self.context.timeline_semaphore;
         let result = unsafe {
-            if timeline != vk::Semaphore::null() {
-                let semaphores = [timeline];
+            if self.timeline != vk::Semaphore::null() {
+                let semaphores = [self.timeline];
                 let values = [token];
                 let info = vk::SemaphoreWaitInfo::default()
                     .semaphores(&semaphores)
@@ -403,74 +410,55 @@ impl Shared {
         }
         true
     }
-    pub(super) fn query_completed_fences(&self) -> Result<u64> {
-        self.context.check()?;
-        let state = self.state.lock().unwrap();
-        let mut completed = state.completed;
-        for submission in &state.pending {
-            if self
-                .context
-                .result(unsafe { self.context.device.get_fence_status(submission.fence) })?
-            {
-                completed = submission.token;
-            } else {
-                break;
-            }
-        }
-        self.context
-            .completed
-            .fetch_max(completed, Ordering::Release);
-        Ok(completed)
-    }
     fn poll(&self) -> Result<Token> {
         self.context.check()?;
-        let mut retired_resources = Vec::new();
-        let completed = {
-            let mut state = self.state.lock().unwrap();
-            let completed = if let Some(completed) = self.context.poll_timeline()? {
-                completed
-            } else {
-                let mut completed = state.completed;
-                for submission in &state.pending {
-                    if self
-                        .context
-                        .result(unsafe { self.context.device.get_fence_status(submission.fence) })?
-                    {
-                        completed = submission.token;
-                    } else {
-                        break;
-                    }
-                }
-                completed
-            };
-            let completed = state.completed.max(completed);
-            state.completed = completed;
-            self.context
-                .completed
-                .fetch_max(completed, Ordering::Release);
-            while state.pending.front().is_some_and(|s| s.token <= completed) {
-                let mut submission = state.pending.pop_front().unwrap();
-                if let Some(arena) = submission._resources.descriptors.take() {
-                    self.descriptors.lock().unwrap().push(arena);
-                }
-                let fence = submission.fence;
-                if fence != vk::Fence::null() && fence == state.waiting {
-                    state.retired = true;
-                } else if fence != vk::Fence::null() {
+        let mut state = self.state.lock().unwrap();
+        let completed = if self.timeline != vk::Semaphore::null() {
+            self.context.result(unsafe {
+                if self.context.api >= vk::API_VERSION_1_2 {
                     self.context
-                        .result(unsafe { self.context.device.reset_fences(&[fence]) })?;
-                    state.fences.push(fence);
+                        .device
+                        .get_semaphore_counter_value(self.timeline)
+                } else {
+                    self.context
+                        .timeline
+                        .get_semaphore_counter_value(self.timeline)
                 }
-                let mut commands = submission.commands;
-                commands.reset(&self.context)?;
-                state.pools.push(commands);
-                retired_resources.push(submission._resources);
+            })?
+        } else {
+            let mut completed = state.completed;
+            for submission in &state.pending {
+                if self
+                    .context
+                    .result(unsafe { self.context.device.get_fence_status(submission.fence) })?
+                {
+                    completed = submission.token;
+                } else {
+                    break;
+                }
             }
-            #[cfg(target_os = "android")]
-            state.sync.retire(completed);
             completed
         };
-        drop(retired_resources);
+        state.completed = completed;
+        while state.pending.front().is_some_and(|s| s.token <= completed) {
+            let mut submission = state.pending.pop_front().unwrap();
+            if let Some(arena) = submission._resources.descriptors.take() {
+                self.descriptors.lock().unwrap().push(arena);
+            }
+            let fence = submission.fence;
+            if fence != vk::Fence::null() && fence == state.waiting {
+                state.retired = true;
+            } else if fence != vk::Fence::null() {
+                self.context
+                    .result(unsafe { self.context.device.reset_fences(&[fence]) })?;
+                state.fences.push(fence);
+            }
+            let mut commands = submission.commands;
+            commands.reset(&self.context)?;
+            state.pools.push(commands);
+        }
+        #[cfg(target_os = "android")]
+        state.sync.retire(completed);
         self.context.rings.lock().unwrap().retain(|weak| {
             if let Some(ring) = weak.upgrade() {
                 ring.retire(completed);
@@ -513,6 +501,9 @@ impl Drop for Shared {
             }
             #[cfg(target_os = "android")]
             state.sync.destroy(&self.context);
+            if self.timeline != vk::Semaphore::null() {
+                self.context.device.destroy_semaphore(self.timeline, None);
+            }
             for arena in self.descriptors.get_mut().unwrap() {
                 arena.destroy(&self.context);
             }

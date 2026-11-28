@@ -11,7 +11,7 @@ use gpu_allocator::vulkan::{
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::caps::*;
 use crate::encode::*;
@@ -95,8 +95,6 @@ pub(crate) struct Context {
     /// each may submit a use of an object dropped now.
     next: AtomicU64,
     open: AtomicU64,
-    completed: AtomicU64,
-    queue: OnceLock<Weak<queue::Shared>>,
     retired: Mutex<VecDeque<(u64, Retired)>>,
     passes: Mutex<HashMap<encode::PassKey, encode::LegacyPass>>,
     samplers: Mutex<HashMap<SamplerDesc, Weak<SamplerCore>>>,
@@ -104,7 +102,6 @@ pub(crate) struct Context {
     dynamic: ash::khr::dynamic_rendering::Device,
     sync2: ash::khr::synchronization2::Device,
     timeline: ash::khr::timeline_semaphore::Device,
-    timeline_semaphore: vk::Semaphore,
     api: u32,
     anisotropy: bool,
     max_anisotropy: f32,
@@ -156,11 +153,6 @@ pub(super) enum Retired {
     Sampler {
         handle: vk::Sampler,
         index: Option<u32>,
-    },
-    Pipeline {
-        handle: vk::Pipeline,
-        layout: vk::PipelineLayout,
-        set_layout: vk::DescriptorSetLayout,
     },
     Video(video::Resources),
     #[cfg(target_os = "android")]
@@ -248,22 +240,6 @@ impl Context {
         }
         Ok(())
     }
-    pub(super) fn poll_timeline(&self) -> Result<Option<u64>> {
-        if self.timeline_semaphore == vk::Semaphore::null() {
-            return Ok(None);
-        }
-        let completed = self.result(unsafe {
-            if self.api >= vk::API_VERSION_1_2 {
-                self.device
-                    .get_semaphore_counter_value(self.timeline_semaphore)
-            } else {
-                self.timeline
-                    .get_semaphore_counter_value(self.timeline_semaphore)
-            }
-        })?;
-        self.completed.fetch_max(completed, Ordering::Release);
-        Ok(Some(completed))
-    }
     fn result<T>(&self, result: std::result::Result<T, vk::Result>) -> Result<T> {
         self.result_in(result, "")
     }
@@ -284,22 +260,16 @@ impl Context {
         let token = retired.back().map_or(token, |(last, _)| token.max(*last));
         retired.push_back((token, item));
     }
-    /// Destroys objects whose last possible use has completed. Drains the ready
-    /// prefix under the lock and frees handles outside it so foreground drops
-    /// calling `retire` never block on batch destruction.
+    /// Destroys objects whose last possible use has completed. Holding the
+    /// lock throughout means a poll that returns has destroyed them, whichever
+    /// thread reaped; destruction drops no handles, so it never retires.
     pub(super) fn reap(&self, completed: u64) {
-        let ready: Vec<Retired> = {
-            let mut retired = self.retired.lock().unwrap();
-            let count = retired
-                .iter()
-                .take_while(|(token, _)| *token <= completed)
-                .count();
-            if count == 0 {
-                return;
-            }
-            retired.drain(..count).map(|(_, item)| item).collect()
-        };
-        for item in ready {
+        let mut retired = self.retired.lock().unwrap();
+        while retired
+            .front()
+            .is_some_and(|(token, _)| *token <= completed)
+        {
+            let (_, item) = retired.pop_front().unwrap();
             self.destroy(item);
         }
     }
@@ -354,17 +324,14 @@ impl Context {
                             }
                         }
                     }
-                    let removed: Vec<encode::LegacyPass> = {
-                        let mut passes = self.passes.lock().unwrap();
-                        passes
-                            .extract_if(|key, _| key.uses(handle))
-                            .map(|(_, pass)| pass)
-                            .collect()
-                    };
-                    for pass in removed {
-                        self.device.destroy_framebuffer(pass.framebuffer, None);
-                        self.device.destroy_render_pass(pass.pass, None);
-                    }
+                    self.passes.lock().unwrap().retain(|key, pass| {
+                        let used = key.uses(handle);
+                        if used {
+                            self.device.destroy_framebuffer(pass.framebuffer, None);
+                            self.device.destroy_render_pass(pass.pass, None);
+                        }
+                        !used
+                    });
                     self.device.destroy_image_view(handle, None);
                 }
                 Retired::Sampler { handle, index } => {
@@ -372,17 +339,6 @@ impl Context {
                         heap.free(1, index);
                     }
                     self.device.destroy_sampler(handle, None);
-                }
-                Retired::Pipeline {
-                    handle,
-                    layout,
-                    set_layout,
-                } => {
-                    self.device.destroy_pipeline(handle, None);
-                    self.device.destroy_pipeline_layout(layout, None);
-                    if set_layout != vk::DescriptorSetLayout::null() {
-                        self.device.destroy_descriptor_set_layout(set_layout, None);
-                    }
                 }
                 Retired::Video(resources) => resources.destroy(&self.device),
                 #[cfg(target_os = "android")]
@@ -516,9 +472,6 @@ impl Drop for Context {
         self.heap.take();
         self.allocator.get_mut().unwrap().take();
         unsafe {
-            if self.timeline_semaphore != vk::Semaphore::null() {
-                self.device.destroy_semaphore(self.timeline_semaphore, None);
-            }
             self.device.destroy_device(None);
             if let Some((debug, messenger)) = &self.debug {
                 debug.destroy_debug_utils_messenger(*messenger, None);

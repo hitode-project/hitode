@@ -32,118 +32,6 @@ pub struct Session {
 }
 type OnFinished = Box<dyn FnOnce(Result<Finished, String>)>;
 
-#[cfg(target_os = "android")]
-struct OwnedNativeWindow(std::ptr::NonNull<ndk_sys::ANativeWindow>);
-#[cfg(target_os = "android")]
-// SAFETY: ANativeWindow refcounting and SurfaceControl creation have no thread affinity.
-unsafe impl Send for OwnedNativeWindow {}
-#[cfg(target_os = "android")]
-impl OwnedNativeWindow {
-    /// # Safety
-    /// `window` must be valid on entry; this wrapper acquires its own reference.
-    unsafe fn acquire(window: std::ptr::NonNull<ndk_sys::ANativeWindow>) -> Self {
-        unsafe {
-            ndk_sys::ANativeWindow_acquire(window.as_ptr());
-        }
-        Self(window)
-    }
-    fn as_non_null(&self) -> std::ptr::NonNull<ndk_sys::ANativeWindow> {
-        self.0
-    }
-    fn addr(&self) -> usize {
-        self.0.as_ptr() as usize
-    }
-}
-#[cfg(target_os = "android")]
-impl Drop for OwnedNativeWindow {
-    fn drop(&mut self) {
-        unsafe {
-            ndk_sys::ANativeWindow_release(self.0.as_ptr());
-        }
-    }
-}
-
-/// Stand-in compositor used only if the Android surface is transiently absent
-/// while Vulkan initializes off the UI thread; suspended before any present.
-#[cfg(target_os = "android")]
-struct PendingCompositor(adv_display::plan::CompositorCaps);
-#[cfg(target_os = "android")]
-impl adv_display::compositor::Compositor for PendingCompositor {
-    fn detach(&mut self) -> Option<adv_gpu::queue::Fence> {
-        None
-    }
-    fn caps(&self) -> adv_display::plan::CompositorCaps {
-        self.0.clone()
-    }
-    fn present(
-        &mut self,
-        _: &adv_display::plan::Layers,
-        _: &adv_display::plan::Tiles,
-        _: &mut [adv_display::compositor::AcquiredImage],
-        _: u64,
-        _: Instant,
-    ) -> Result<(), adv_display::compositor::Error> {
-        Err(adv_display::compositor::Error::SurfaceLost)
-    }
-    fn drain(
-        &mut self,
-        _: &mut Vec<adv_display::compositor::Presented>,
-        _: &mut Vec<adv_display::compositor::Released>,
-    ) {
-    }
-}
-
-#[cfg(target_os = "android")]
-struct AndroidDisplayInit {
-    latest_window: Arc<std::sync::Mutex<Option<OwnedNativeWindow>>>,
-    ready: std::sync::mpsc::Receiver<(crate::display::Ui, Option<usize>)>,
-    upscaler: Option<crate::Upscaler>,
-    scaling: Option<crate::Scaling>,
-    trim: bool,
-}
-
-#[cfg(target_os = "android")]
-fn prepare_android_display(
-    options: &Options,
-    latest_window: &std::sync::Mutex<Option<OwnedNativeWindow>>,
-    view_size: (u32, u32),
-    wake: WakeEvent,
-) -> Result<(crate::display::Startup, crate::display::Ui, Option<usize>), String> {
-    crate::display::open_with(
-        options.gpu_software,
-        Some(options.gpu_health_dir()),
-        |device, queue| {
-            let caps = crate::display::platform_caps(Some(&device));
-            let current = latest_window
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|w| unsafe { OwnedNativeWindow::acquire(w.as_non_null()) });
-            let (compositor, built_window): (
-                Box<dyn adv_display::compositor::Compositor>,
-                Option<usize>,
-            ) = match current {
-                Some(window) => match unsafe {
-                    adv_display::compositor::android::SurfaceCompositor::new(
-                        window.as_non_null(),
-                        caps.clone(),
-                    )
-                } {
-                    Ok(compositor) => (Box::new(compositor), Some(window.addr())),
-                    Err(adv_display::compositor::Error::SurfaceLost) => {
-                        (Box::new(PendingCompositor(caps)), None)
-                    }
-                    Err(error) => return Ok(Err(format!("SurfaceControl: {error:?}"))),
-                },
-                None => (Box::new(PendingCompositor(caps)), None),
-            };
-            let (startup, ui) =
-                crate::display::channel(device, queue, compositor, view_size, wake.clone())?;
-            Ok(Ok((startup, ui, built_window)))
-        },
-    )
-}
-
 struct Driver {
     options: Arc<Options>,
     #[cfg(mobile)]
@@ -152,8 +40,6 @@ struct Driver {
     activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
     view: View,
     ui: RefCell<Option<frontend::Ui>>,
-    #[cfg(target_os = "android")]
-    display_init: RefCell<Option<AndroidDisplayInit>>,
     #[cfg(target_os = "macos")]
     damage_hud: adv_display::display::DamageHud,
     done: RefCell<spsc::Consumer<Result<Finished, String>>>,
@@ -205,32 +91,6 @@ impl Session {
         Self::new_inner(view, options, on_finished, Some(execution))
     }
 
-    /// Starts one Wine game on Android without blocking the activity's UI
-    /// thread on Vulkan device open, health probing, or initial display
-    /// pipeline compilation (AND-APP-10, AND-APP-13).
-    ///
-    /// # Safety
-    /// `window` must be valid on entry; the session acquires its own reference.
-    #[cfg(target_os = "android")]
-    pub unsafe fn new_with_execution_surface(
-        view: View,
-        window: std::ptr::NonNull<ndk_sys::ANativeWindow>,
-        view_size: (u32, u32),
-        mut options: Options,
-        on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
-        execution: &crate::Execution,
-    ) -> Result<Self, String> {
-        options.wine = Some(execution.distribution.clone());
-        let initial = unsafe { OwnedNativeWindow::acquire(window) };
-        Self::start(
-            view,
-            options,
-            on_finished,
-            Some(execution),
-            Some((initial, view_size)),
-        )
-    }
-
     fn new_inner(
         view: View,
         options: Options,
@@ -246,8 +106,6 @@ impl Session {
             execution,
             #[cfg(target_os = "macos")]
             projection,
-            #[cfg(target_os = "android")]
-            None,
         )
     }
     fn start(
@@ -256,7 +114,6 @@ impl Session {
         on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
         execution: Option<&crate::Execution>,
         #[cfg(target_os = "macos")] projection: Rc<RefCell<Projection>>,
-        #[cfg(target_os = "android")] android_surface: Option<(OwnedNativeWindow, (u32, u32))>,
     ) -> Result<Self, String> {
         let wake = WakeEvent::new().map_err(|e| e.to_string())?;
         let keys = Arc::new(KeyState::default());
@@ -268,37 +125,8 @@ impl Session {
             .map_err(|e| e.to_string())?;
         let (mut worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
 
-        #[cfg(target_os = "android")]
-        let (display_init, android_display) = match android_surface {
-            Some((initial_window, view_size)) => {
-                let latest_window = Arc::new(std::sync::Mutex::new(Some(initial_window)));
-                let (display_tx, display_rx) = std::sync::mpsc::sync_channel(1);
-                let display_wake = ui.wake();
-                (
-                    Some(AndroidDisplayInit {
-                        latest_window: latest_window.clone(),
-                        ready: display_rx,
-                        upscaler: None,
-                        scaling: None,
-                        trim: false,
-                    }),
-                    Some((latest_window, view_size, display_tx, display_wake)),
-                )
-            }
-            None => {
-                let (startup, display) = view.create_display(
-                    options.gpu_software,
-                    ui.wake(),
-                    Some(options.gpu_health_dir()),
-                )?;
-                worker.display = Some(startup);
-                ui.display(display);
-                (None, None)
-            }
-        };
         #[cfg(target_os = "macos")]
         let damage_hud;
-        #[cfg(not(target_os = "android"))]
         {
             let (startup, display) = view.create_display(
                 options.gpu_software,
@@ -318,7 +146,7 @@ impl Session {
         {
             worker.vsync = Some(view.vsync());
         }
-        #[cfg(mobile)]
+        #[cfg(target_os = "ios")]
         {
             worker.vsync = Some(view.vsync.clone());
         }
@@ -334,41 +162,8 @@ impl Session {
             &mut adv_runtime::wine::session::Host,
             &std::path::Path,
         )>| {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                #[cfg(target_os = "android")]
-                if let Some((latest_window, view_size, display_tx, display_wake)) = android_display
-                {
-                    if worker.stopped() {
-                        return Ok(Finished {
-                            exit_code: 0,
-                            summary: Default::default(),
-                            registry: None,
-                        });
-                    }
-                    let (startup, mut display_ui, built_window) = prepare_android_display(
-                        &execution_options,
-                        &latest_window,
-                        view_size,
-                        display_wake.clone(),
-                    )?;
-                    if built_window.is_none() {
-                        // Start suspended until the UI thread delivers a live surface.
-                        unsafe {
-                            display_ui.replace_window(None)?;
-                        }
-                    }
-                    worker.display = Some(startup);
-                    let _ = display_tx.send((display_ui, built_window));
-                    display_wake.signal();
-                    if worker.stopped() {
-                        return Ok(Finished {
-                            exit_code: 0,
-                            summary: Default::default(),
-                            registry: None,
-                        });
-                    }
-                }
-                match environment {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match environment {
                     Some((environment, dist)) => crate::wine::run_execution(
                         environment,
                         &execution_options,
@@ -385,9 +180,8 @@ impl Session {
                         keys,
                         execution_sender,
                     ),
-                }
-            }))
-            .unwrap_or_else(|_| Err("execution worker panicked".into()));
+                }))
+                .unwrap_or_else(|_| Err("execution worker panicked".into()));
             let _ = tx.push(result);
             completion_wake.signal();
         };
@@ -414,8 +208,6 @@ impl Session {
             view,
             wake: ui.wake(),
             ui: RefCell::new(Some(ui)),
-            #[cfg(target_os = "android")]
-            display_init: RefCell::new(display_init),
             #[cfg(target_os = "macos")]
             damage_hud,
             done: RefCell::new(rx),
@@ -443,15 +235,11 @@ impl Session {
             driver.view.bind(
                 view_keys,
                 Box::new(move |window| {
-                    if let Some(driver) = weak.upgrade() {
-                        if let Some(init) = driver.display_init.borrow().as_ref() {
-                            *init.latest_window.lock().unwrap() =
-                                window.map(|w| unsafe { OwnedNativeWindow::acquire(w) });
-                        }
-                        if let Some(ui) = driver.ui.borrow_mut().as_mut() {
-                            unsafe {
-                                ui.replace_window(window)?;
-                            }
+                    if let Some(driver) = weak.upgrade()
+                        && let Some(ui) = driver.ui.borrow_mut().as_mut()
+                    {
+                        unsafe {
+                            ui.replace_window(window)?;
                         }
                     }
                     Ok(())
@@ -556,10 +344,6 @@ impl Session {
         self.driver.view.hub().sleep(sleeping);
     }
     pub fn set_upscaler(&self, value: crate::Upscaler) {
-        #[cfg(target_os = "android")]
-        if let Some(init) = self.driver.display_init.borrow_mut().as_mut() {
-            init.upscaler = Some(value);
-        }
         if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
             ui.set_upscaler(value);
         }
@@ -567,10 +351,6 @@ impl Session {
     /// Set the presentation and input coordinate scaling together.
     pub fn set_scaling(&self, value: crate::Scaling) {
         self.driver.view.hub().scaling.set(value);
-        #[cfg(target_os = "android")]
-        if let Some(init) = self.driver.display_init.borrow_mut().as_mut() {
-            init.scaling = Some(value);
-        }
         if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
             ui.set_scaling(value);
         }
@@ -654,10 +434,6 @@ impl Session {
     /// The system asked for memory back, or the app went to the background.
     #[cfg(mobile)]
     pub fn trim_memory(&self) {
-        #[cfg(target_os = "android")]
-        if let Some(init) = self.driver.display_init.borrow_mut().as_mut() {
-            init.trim = true;
-        }
         if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
             ui.trim_memory();
         }
@@ -713,58 +489,7 @@ impl Session {
     }
 }
 impl Driver {
-    #[cfg(target_os = "android")]
-    fn install_pending_display(&self) -> Result<(), String> {
-        let ready = {
-            let mut init = self.display_init.borrow_mut();
-            let Some(state) = init.as_mut() else {
-                return Ok(());
-            };
-            match state.ready.try_recv() {
-                Ok(pair) => {
-                    let state = init.take().unwrap();
-                    Some((pair, state))
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    init.take();
-                    None
-                }
-            }
-        };
-        let Some(((mut display_ui, built_window), state)) = ready else {
-            return Ok(());
-        };
-        let current = state
-            .latest_window
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|w| unsafe { OwnedNativeWindow::acquire(w.as_non_null()) });
-        let current_addr = current.as_ref().map(OwnedNativeWindow::addr);
-        if current_addr != built_window {
-            unsafe {
-                display_ui.replace_window(current.as_ref().map(OwnedNativeWindow::as_non_null))?;
-            }
-        }
-        drop(current);
-        if let Some(upscaler) = state.upscaler {
-            display_ui.set_upscaler(upscaler);
-        }
-        if let Some(scaling) = state.scaling {
-            display_ui.set_scaling(scaling);
-        }
-        if state.trim {
-            display_ui.trim();
-        }
-        if let Some(ui) = self.ui.borrow_mut().as_mut() {
-            ui.display(display_ui);
-        }
-        Ok(())
-    }
     fn tick(&self) -> Result<Option<Instant>, String> {
-        #[cfg(target_os = "android")]
-        self.install_pending_display()?;
         #[cfg(target_os = "macos")]
         let projection = self.projection.borrow().clone();
         if self.finish_pending() {
@@ -851,8 +576,6 @@ impl Driver {
         false
     }
     fn finish(&self, mut result: Result<Finished, String>) {
-        #[cfg(target_os = "android")]
-        let _ = self.install_pending_display();
         if let Ok(finished) = &mut result {
             let display = self
                 .ui

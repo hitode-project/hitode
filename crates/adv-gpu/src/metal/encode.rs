@@ -704,8 +704,8 @@ impl RenderPass<'_> {
         if old.is_some_and(|old| std::ptr::eq(old, &**p)) {
             return;
         }
-        if old.is_none_or(|old| !same(&old.state.raw, &p.state.raw)) {
-            self.raw.setRenderPipelineState(&p.state.raw);
+        if old.is_none_or(|old| !same(&old.raw, &p.raw)) {
+            self.raw.setRenderPipelineState(&p.raw);
         }
         if old.is_none_or(|old| !same(&old.depth, &p.depth)) {
             self.raw.setDepthStencilState(Some(&p.depth));
@@ -939,9 +939,9 @@ impl ComputePass<'_> {
         if self
             .pipeline
             .as_ref()
-            .is_none_or(|old| !same(&old.state.raw, &p.state.raw))
+            .is_none_or(|old| !same(&old.raw, &p.raw))
         {
-            self.raw.setComputePipelineState(&p.state.raw);
+            self.raw.setComputePipelineState(&p.raw);
         }
         for (index, &length) in p.threadgroup.iter().enumerate() {
             unsafe {

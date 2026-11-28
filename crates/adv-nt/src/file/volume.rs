@@ -4,7 +4,7 @@
 //! section metadata. They contain no medium data. Reads and mapped pages come
 //! from the retained source, including when a handle reaches another process.
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -82,7 +82,6 @@ pub trait Volume {
 struct Mounted {
     root: PathBuf,
     source: Rc<dyn Volume>,
-    prepared: RefCell<HashSet<String>>,
 }
 struct Identity {
     entry: Entry,
@@ -257,11 +256,7 @@ impl Namespace {
                 reader: RefCell::new(None),
             }),
         );
-        Ok(Rc::new(Mounted {
-            root,
-            source,
-            prepared: RefCell::new(HashSet::new()),
-        }))
+        Ok(Rc::new(Mounted { root, source }))
     }
 }
 impl Drop for Namespace {
@@ -479,26 +474,27 @@ impl Mounts {
         Ok(())
     }
     pub fn prepare_directory(&self, host: &Path) -> io::Result<()> {
-        let found = self.0.volumes.borrow().values().find_map(|mount| {
-            host.strip_prefix(&mount.root)
-                .ok()
-                .map(|relative| (mount.clone(), relative.to_string_lossy().replace('/', "\\")))
-        });
-        let Some((mount, relative)) = found else {
-            return Ok(());
-        };
-        if mount.prepared.borrow().contains(&relative) {
-            return Ok(());
+        let volumes = self
+            .0
+            .volumes
+            .borrow()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for mount in &volumes {
+            if let Ok(relative) = host.strip_prefix(&mount.root) {
+                let relative = relative.to_string_lossy().replace('/', "\\");
+                for entry in mount.source.list(&relative)? {
+                    let path = if relative.is_empty() {
+                        entry.name.clone()
+                    } else {
+                        format!("{relative}\\{}", entry.name)
+                    };
+                    self.identity(mount, &host.join(&entry.name), &path, entry)?;
+                }
+                break;
+            }
         }
-        for entry in mount.source.list(&relative)? {
-            let path = if relative.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{relative}\\{}", entry.name)
-            };
-            self.identity(&mount, &host.join(&entry.name), &path, entry)?;
-        }
-        mount.prepared.borrow_mut().insert(relative);
         Ok(())
     }
     pub fn read_only(&self, host: &Path) -> bool {
@@ -726,104 +722,5 @@ mod tests {
         assert_eq!(mounts.original(&file), original);
         assert_eq!(mounts.original(&drive), drive);
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    // spec: WINE-SES-13
-    #[test]
-    fn prepare_directory_caches_immutable_mount_and_resets_on_disc_change() {
-        struct CountingVolume {
-            entries: Vec<Entry>,
-            list_calls: Rc<Cell<usize>>,
-        }
-        impl Volume for CountingVolume {
-            fn info(&self) -> Info {
-                Info {
-                    label: "DISC".into(),
-                    serial: 1,
-                    sector_size: 2048,
-                    total_bytes: 2048 * 512,
-                    filesystem: "CDFS".into(),
-                    flags: 0,
-                    max_name: 255,
-                }
-            }
-            fn entry(&self, path: &str) -> io::Result<Entry> {
-                if path.is_empty() {
-                    return Ok(Entry {
-                        name: String::new(),
-                        directory: true,
-                        size: 0,
-                        allocated: 0,
-                        created: None,
-                        accessed: None,
-                        modified: None,
-                        attributes: 0x10,
-                    });
-                }
-                self.entries
-                    .iter()
-                    .find(|e| e.name.eq_ignore_ascii_case(path))
-                    .cloned()
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
-            }
-            fn list(&self, path: &str) -> io::Result<Vec<Entry>> {
-                assert_eq!(path, "");
-                self.list_calls.set(self.list_calls.get() + 1);
-                Ok(self.entries.clone())
-            }
-            fn open(&self, _path: &str) -> io::Result<Rc<dyn ReadFile>> {
-                Err(io::Error::from(io::ErrorKind::Unsupported))
-            }
-        }
-
-        let root = std::env::temp_dir().join(format!("adv-nt-volume-cache-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-
-        let make_entries = |prefix: &str, count: usize| -> Vec<Entry> {
-            (0..count)
-                .map(|i| Entry {
-                    name: format!("{prefix}_{i:04}.dat"),
-                    directory: false,
-                    size: 4,
-                    allocated: 2048,
-                    created: None,
-                    accessed: None,
-                    modified: None,
-                    attributes: 0x20,
-                })
-                .collect()
-        };
-
-        let disc1_calls = Rc::new(Cell::new(0));
-        let disc1: Rc<dyn Volume> = Rc::new(CountingVolume {
-            entries: make_entries("disc1", 512),
-            list_calls: disc1_calls.clone(),
-        });
-        let mount_root = root.join("D");
-        let mut mounts = Mounts::new(None, Some(root.clone()));
-        mounts.attach('D', mount_root.clone(), disc1).unwrap();
-
-        for _ in 0..513 {
-            mounts.prepare_directory(&mount_root).unwrap();
-        }
-        assert_eq!(disc1_calls.get(), 1);
-        assert!(mount_root.join("disc1_0511.dat").exists());
-
-        // Swapping the disc creates a fresh Mounted instance whose directories prepare once.
-        let disc2_calls = Rc::new(Cell::new(0));
-        let disc2: Rc<dyn Volume> = Rc::new(CountingVolume {
-            entries: make_entries("disc2", 8),
-            list_calls: disc2_calls.clone(),
-        });
-        let disc2_root = mounts.change('D', disc2).unwrap();
-        for _ in 0..10 {
-            mounts.prepare_directory(&disc2_root).unwrap();
-        }
-        assert_eq!(disc2_calls.get(), 1);
-        assert!(disc2_root.join("disc2_0007.dat").exists());
-
-        drop(mounts);
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

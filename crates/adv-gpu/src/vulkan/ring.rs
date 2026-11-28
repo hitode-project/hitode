@@ -5,7 +5,6 @@ pub(crate) struct Ring(
     std::marker::PhantomData<std::cell::Cell<()>>,
 );
 pub(super) struct RingCore {
-    pub(super) context: Arc<Context>,
     pub(super) buffer: crate::Buffer,
     pub(super) state: Mutex<RingState>,
 }
@@ -48,7 +47,6 @@ impl Device {
             label: "upload ring",
         })?;
         let ring = Arc::new(RingCore {
-            context: self.0.clone(),
             buffer: buffer.clone(),
             state: Mutex::new(RingState {
                 capacity: size,
@@ -68,95 +66,43 @@ impl Device {
         ))
     }
 }
-impl RingState {
-    fn retire_locked(&mut self, completed: u64) {
-        while let Some(span) = self.spans.front() {
-            if !span.dropped || span.last.is_none_or(|t| t > completed) {
-                break;
-            }
-            self.tail = span.end;
-            self.spans.pop_front();
-            self.base_id += 1;
-        }
-    }
-    fn try_reserve(&mut self, size: u64, align: u64) -> Result<(u64, u64)> {
-        if align == 0 || !align.is_power_of_two() {
-            return Err(Error::Invalid(
-                "ring alignment must be a power of two".into(),
-            ));
-        }
-        let capacity = self.capacity;
+impl Ring {
+    pub(crate) fn reserve(&mut self, size: u64, align: u64) -> Result<crate::Span> {
+        debug_assert!(align.is_power_of_two(), "ring alignment {align}");
+        let mut state = self.0.state.lock().unwrap();
+        let capacity = state.capacity;
         if size > capacity {
             return Err(Error::Busy);
         }
-        let offset = (self.head % capacity).next_multiple_of(align);
+        let offset = (state.head % capacity).next_multiple_of(align);
         let start = if offset + size <= capacity {
-            self.head - self.head % capacity + offset
+            state.head - state.head % capacity + offset
         } else {
-            self.head - self.head % capacity + capacity
+            state.head - state.head % capacity + capacity
         };
         // Empty rings may discard padding left at the end of the previous lap.
-        let tail = if self.spans.is_empty() {
+        let tail = if state.spans.is_empty() {
             start
         } else {
-            self.tail
+            state.tail
         };
         if start + size - tail > capacity {
             return Err(Error::Busy);
         }
         let end = start + size;
-        let id = self.base_id + self.spans.len() as u64;
-        self.head = end;
-        self.tail = tail;
-        self.spans.push_back(Reservation {
+        let id = state.base_id + state.spans.len() as u64;
+        state.head = end;
+        state.tail = tail;
+        state.spans.push_back(Reservation {
             end,
             dropped: false,
             last: None,
         });
-        Ok((start % capacity, id))
-    }
-}
-impl Ring {
-    pub(crate) fn reserve(&mut self, size: u64, align: u64) -> Result<crate::Span> {
-        self.0.context.check()?;
-        let (offset, id) = {
-            let mut state = self.0.state.lock().unwrap();
-            match state.try_reserve(size, align) {
-                Ok(reserved) => reserved,
-                Err(Error::Busy) => {
-                    let cached = self.0.context.completed.load(Ordering::Acquire);
-                    state.retire_locked(cached);
-                    match state.try_reserve(size, align) {
-                        Ok(reserved) => reserved,
-                        Err(Error::Busy) => {
-                            // Release the ring lock before querying the GPU so
-                            // Shared::poll cannot deadlock on RingCore::state.
-                            drop(state);
-                            let completed =
-                                if let Some(completed) = self.0.context.poll_timeline()? {
-                                    completed
-                                } else if let Some(shared) =
-                                    self.0.context.queue.get().and_then(Weak::upgrade)
-                                {
-                                    shared.query_completed_fences()?
-                                } else {
-                                    return Err(Error::Busy);
-                                };
-                            let mut state = self.0.state.lock().unwrap();
-                            state.retire_locked(completed);
-                            state.try_reserve(size, align)?
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
-                Err(err) => return Err(err),
-            }
-        };
         Ok(crate::Span {
             inner: Span {
                 ring: self.0.clone(),
                 id,
-                offset,
+                offset: start % capacity,
                 len: size,
                 retained: false,
             },
@@ -231,36 +177,14 @@ impl RingCore {
         state.unsubmitted_dropped = 0;
     }
     pub(super) fn retire(&self, completed: u64) {
-        self.state.lock().unwrap().retire_locked(completed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn state() -> RingState {
-        RingState {
-            capacity: 64,
-            head: 0,
-            tail: 0,
-            base_id: 0,
-            unsubmitted_dropped: 0,
-            spans: VecDeque::new(),
+        let mut state = self.state.lock().unwrap();
+        while let Some(span) = state.spans.front() {
+            if !span.dropped || span.last.is_none_or(|t| t > completed) {
+                break;
+            }
+            state.tail = span.end;
+            state.spans.pop_front();
+            state.base_id += 1;
         }
-    }
-
-    #[test]
-    fn tight_space_recovers_after_retiring_completed_spans() {
-        let mut state = state();
-        let (_, first) = state.try_reserve(48, 16).unwrap();
-        assert!(matches!(state.try_reserve(32, 16), Err(Error::Busy)));
-        let idx = (first - state.base_id) as usize;
-        state.spans[idx].last = Some(2);
-        state.spans[idx].dropped = true;
-        state.retire_locked(1);
-        assert!(matches!(state.try_reserve(32, 16), Err(Error::Busy)));
-        state.retire_locked(2);
-        assert_eq!(state.try_reserve(32, 16).unwrap().0, 0);
     }
 }

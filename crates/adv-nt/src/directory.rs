@@ -209,38 +209,6 @@ pub fn forget(env: &mut Env<'_>, handle: u32) {
     }
 }
 
-fn listing_for<'a>(
-    listings: &'a mut HashMap<u32, Listing>,
-    mounts: &crate::file::volume::Mounts,
-    handle: u32,
-    directory: Option<PathBuf>,
-    mask: Option<&[u16]>,
-    restart: bool,
-) -> Result<&'a mut Listing, Status> {
-    let fresh = !listings.contains_key(&handle) || (restart && mask.is_some());
-    if fresh {
-        let directory = directory.ok_or(status::INVALID_PARAMETER)?;
-        mounts
-            .prepare_directory(&directory)
-            .map_err(|_| status::OBJECT_PATH_NOT_FOUND)?;
-        let names = list(&directory, mask)?;
-        if names.is_empty() {
-            return Err(status::NO_SUCH_FILE);
-        }
-        let listing = Listing {
-            directory,
-            names,
-            position: 0,
-        };
-        listings.insert(handle, listing);
-    }
-    let listing = listings.get_mut(&handle).expect("listed above");
-    if restart {
-        listing.position = 0;
-    }
-    Ok(listing)
-}
-
 /// NtQueryDirectoryFile(handle, event, apc, apc_context, *io, *buffer,
 /// length, class, single_entry, *mask, restart_scan)
 pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
@@ -291,20 +259,35 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         let directory = crate::section::file_path(fd.fd);
         drop(fd);
         let mounts = crate::file::volume::mounts(env);
+        if let Some(directory) = &directory {
+            mounts
+                .prepare_directory(directory)
+                .map_err(|_| status::OBJECT_PATH_NOT_FOUND)?;
+        }
         let mask = match mask {
             0 => None,
             mask => Some(read_unicode_string(env, mask)?).filter(|mask| !mask.is_empty()),
         };
 
         let listings = &mut env.ext.get_or_default::<Listings>().0;
-        let listing = listing_for(
-            listings,
-            &mounts,
-            handle,
-            directory,
-            mask.as_deref(),
-            restart,
-        )?;
+        let fresh = !listings.contains_key(&handle) || (restart && mask.is_some());
+        if fresh {
+            let directory = directory.ok_or(status::INVALID_PARAMETER)?;
+            let names = list(&directory, mask.as_deref())?;
+            if names.is_empty() {
+                return Err(status::NO_SUCH_FILE.into());
+            }
+            let listing = Listing {
+                directory,
+                names,
+                position: 0,
+            };
+            listings.insert(handle, listing);
+        }
+        let listing = listings.get_mut(&handle).expect("listed above");
+        if restart {
+            listing.position = 0;
+        }
 
         let mut bytes = Vec::new();
         let mut last: Option<u32> = None;
@@ -627,133 +610,5 @@ mod tests {
         std::fs::write(root.join("Later.g00"), b"").unwrap();
         assert_eq!(names("later.G00"), ["Later.g00"]);
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    // spec: WINE-SYS-5
-    #[test]
-    fn sequential_enumeration_of_read_only_mount_lists_volume_once() {
-        use std::cell::Cell;
-        use std::io;
-        use std::rc::Rc;
-
-        use crate::file::volume::{Entry, Info, Mounts, ReadFile, Volume};
-
-        struct SyntheticVolume {
-            entries: Vec<Entry>,
-            list_calls: Rc<Cell<usize>>,
-        }
-        impl Volume for SyntheticVolume {
-            fn info(&self) -> Info {
-                Info {
-                    label: "DISC".into(),
-                    serial: 1,
-                    sector_size: 2048,
-                    total_bytes: 2048 * 512,
-                    filesystem: "CDFS".into(),
-                    flags: 0,
-                    max_name: 255,
-                }
-            }
-            fn entry(&self, path: &str) -> io::Result<Entry> {
-                if path.is_empty() {
-                    return Ok(Entry {
-                        name: String::new(),
-                        directory: true,
-                        size: 0,
-                        allocated: 0,
-                        created: None,
-                        accessed: None,
-                        modified: None,
-                        attributes: 0x10,
-                    });
-                }
-                self.entries
-                    .iter()
-                    .find(|e| e.name.eq_ignore_ascii_case(path))
-                    .cloned()
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
-            }
-            fn list(&self, path: &str) -> io::Result<Vec<Entry>> {
-                assert_eq!(path, "");
-                self.list_calls.set(self.list_calls.get() + 1);
-                Ok(self.entries.clone())
-            }
-            fn open(&self, _path: &str) -> io::Result<Rc<dyn ReadFile>> {
-                Err(io::Error::from(io::ErrorKind::Unsupported))
-            }
-        }
-
-        let root =
-            std::env::temp_dir().join(format!("adv-nt-directory-cd-enum-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let mount_root = root.join("D");
-
-        let entries: Vec<Entry> = (0..512)
-            .map(|i| Entry {
-                name: format!("file_{i:04}.bin"),
-                directory: false,
-                size: 16,
-                allocated: 2048,
-                created: None,
-                accessed: None,
-                modified: None,
-                attributes: 0x20,
-            })
-            .collect();
-        let list_calls = Rc::new(Cell::new(0));
-        let volume: Rc<dyn Volume> = Rc::new(SyntheticVolume {
-            entries,
-            list_calls: list_calls.clone(),
-        });
-        let mut mounts = Mounts::new(None, Some(root.clone()));
-        mounts.attach('D', mount_root.clone(), volume).unwrap();
-
-        let mut listings = std::collections::HashMap::new();
-        let handle = 0x10;
-        let mut seen = Vec::new();
-        // Enumerate one entry per call (512 files + "." + "..") plus final exhaustion check.
-        for call in 0..515 {
-            let directory = if call == 0 {
-                Some(mount_root.clone())
-            } else {
-                // Continuations must not re-prepare or even require the directory path.
-                None
-            };
-            let listing =
-                super::listing_for(&mut listings, &mounts, handle, directory, None, false).unwrap();
-            if listing.position < listing.names.len() {
-                seen.push(
-                    listing.names[listing.position]
-                        .clone()
-                        .into_string()
-                        .unwrap(),
-                );
-                listing.position += 1;
-            }
-        }
-
-        assert_eq!(seen.len(), 514);
-        assert_eq!(seen[0], ".");
-        assert_eq!(seen[1], "..");
-        assert_eq!(seen[2], "file_0000.bin");
-        assert_eq!(seen[513], "file_0511.bin");
-        assert_eq!(list_calls.get(), 1);
-
-        // Opening a second handle on the same immutable directory reuses the prepared cache.
-        let listing = super::listing_for(
-            &mut listings,
-            &mounts,
-            0x20,
-            Some(mount_root.clone()),
-            None,
-            false,
-        )
-        .unwrap();
-        assert_eq!(listing.names.len(), 514);
-        assert_eq!(list_calls.get(), 1);
-
-        drop(mounts);
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

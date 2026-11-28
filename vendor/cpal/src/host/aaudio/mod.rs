@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::cmp;
 use std::convert::TryInto;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::vec::IntoIter as VecIntoIter;
 
@@ -264,14 +263,6 @@ where
     Ok(Stream::Input(stream))
 }
 
-static DEFAULT_OUTPUT_CONFIG: Mutex<Option<SupportedStreamConfig>> = Mutex::new(None);
-
-fn invalidate_default_output_config() {
-    *DEFAULT_OUTPUT_CONFIG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
-}
-
 fn build_output_stream<D, E>(
     device: &Device,
     config: &StreamConfig,
@@ -287,7 +278,6 @@ where
     let builder = configure_for_device(builder, device, config);
     let created = Instant::now();
     let channel_count = config.channels as i32;
-    let is_default_device = device.0.is_none();
     let stream = builder
         .data_callback(Box::new(move |stream, data, num_frames| {
             // AAudio timestamps use CLOCK_MONOTONIC's boot epoch, whereas
@@ -326,9 +316,6 @@ where
             ndk::audio::AudioCallbackResult::Continue
         }))
         .error_callback(Box::new(move |stream, error| {
-            if is_default_device {
-                invalidate_default_output_config();
-            }
             (error_callback)(StreamError::from(error))
         }))
         .open_stream()?;
@@ -399,55 +386,12 @@ impl DeviceTrait for Device {
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        if self.0.is_none() {
-            if let Some(cached) = DEFAULT_OUTPUT_CONFIG
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-            {
-                return Ok(cached.clone());
-            }
-        }
+        let mut configs: Vec<_> = self.supported_output_configs().unwrap().collect();
         // Prefer Android's native mixer rate (typically 48 kHz) over cpal's
         // 44.1 kHz default heuristic so AAudio can select FastTrack/MMAP
         // instead of falling back to Legacy deep-buffer resampling.
         let preferred_rate =
             SampleRate(java_interface::native_output_sample_rate().unwrap_or(48_000));
-        if self.0.is_none() {
-            // Probe preferred configurations in priority order before falling
-            // back to the 52-call brute-force enumeration over all formats and rates.
-            let rates = [preferred_rate.0 as i32, 48_000, 44_100];
-            for (channels, channel_mask) in [
-                (2u16, android_media::CHANNEL_OUT_STEREO),
-                (1u16, android_media::CHANNEL_OUT_MONO),
-            ] {
-                for (sample_format, android_format) in [
-                    (SampleFormat::F32, android_media::ENCODING_PCM_FLOAT),
-                    (SampleFormat::I16, android_media::ENCODING_PCM_16BIT),
-                ] {
-                    for (idx, &rate) in rates.iter().enumerate() {
-                        if rate <= 0 || rates[..idx].contains(&rate) {
-                            continue;
-                        }
-                        if let SupportedBufferSize::Range { min, max } =
-                            buffer_size_range_for_params(true, rate, channel_mask, android_format)
-                        {
-                            let config = SupportedStreamConfig::new(
-                                channels,
-                                SampleRate(rate as u32),
-                                SupportedBufferSize::Range { min, max },
-                                sample_format,
-                            );
-                            *DEFAULT_OUTPUT_CONFIG
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = Some(config.clone());
-                            return Ok(config);
-                        }
-                    }
-                }
-            }
-        }
-        let mut configs: Vec<_> = self.supported_output_configs().unwrap().collect();
         configs.sort_by(|a, b| {
             let cmp_channels = (b.channels == 2)
                 .cmp(&(a.channels == 2))
@@ -482,11 +426,6 @@ impl DeviceTrait for Device {
             .next()
             .ok_or(DefaultStreamConfigError::StreamTypeNotSupported)?
             .with_max_sample_rate();
-        if self.0.is_none() {
-            *DEFAULT_OUTPUT_CONFIG
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(config.clone());
-        }
         Ok(config)
     }
 
@@ -551,51 +490,42 @@ impl DeviceTrait for Device {
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        let result = (|| {
-            let format = match sample_format {
-                SampleFormat::I16 => ndk::audio::AudioFormat::PCM_I16,
-                SampleFormat::F32 => ndk::audio::AudioFormat::PCM_Float,
-                sample_format => {
-                    return Err(BackendSpecificError {
-                        description: format!(
-                            "{} format is not supported on Android.",
-                            sample_format
-                        ),
-                    }
-                    .into());
+        let format = match sample_format {
+            SampleFormat::I16 => ndk::audio::AudioFormat::PCM_I16,
+            SampleFormat::F32 => ndk::audio::AudioFormat::PCM_Float,
+            sample_format => {
+                return Err(BackendSpecificError {
+                    description: format!("{} format is not supported on Android.", sample_format),
                 }
-            };
-            let channel_count = match config.channels {
-                1 => 1,
-                2 => 2,
-                _ => {
-                    // TODO: more channels available in native AAudio
-                    return Err(BackendSpecificError {
-                        description: "More than 2 channels are not supported yet.".to_owned(),
-                    }
-                    .into());
+                .into())
+            }
+        };
+        let channel_count = match config.channels {
+            1 => 1,
+            2 => 2,
+            channels => {
+                // TODO: more channels available in native AAudio
+                return Err(BackendSpecificError {
+                    description: "More than 2 channels are not supported yet.".to_owned(),
                 }
-            };
+                .into());
+            }
+        };
 
-            let builder = ndk::audio::AudioStreamBuilder::new()?
-                .direction(ndk::audio::AudioDirection::Output)
-                .performance_mode(ndk::audio::AudioPerformanceMode::LowLatency)
-                .channel_count(channel_count)
-                .format(format);
+        let builder = ndk::audio::AudioStreamBuilder::new()?
+            .direction(ndk::audio::AudioDirection::Output)
+            .performance_mode(ndk::audio::AudioPerformanceMode::LowLatency)
+            .channel_count(channel_count)
+            .format(format);
 
-            build_output_stream(
-                self,
-                config,
-                data_callback,
-                error_callback,
-                builder,
-                sample_format,
-            )
-        })();
-        if result.is_err() && self.0.is_none() {
-            invalidate_default_output_config();
-        }
-        result
+        build_output_stream(
+            self,
+            config,
+            data_callback,
+            error_callback,
+            builder,
+            sample_format,
+        )
     }
 }
 
@@ -603,10 +533,7 @@ impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
         match self {
             Self::Input(stream) => stream.request_start().map_err(PlayStreamError::from),
-            Self::Output(stream) => stream.request_start().map_err(|err| {
-                invalidate_default_output_config();
-                PlayStreamError::from(err)
-            }),
+            Self::Output(stream) => stream.request_start().map_err(PlayStreamError::from),
         }
     }
 

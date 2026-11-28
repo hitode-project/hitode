@@ -39,13 +39,10 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 const MAX_PIPELINES: usize = 512;
 const ARCHIVE_LIMIT: usize = 8 << 20;
-const ARCHIVE_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 const MAGIC: &[u8; 8] = b"ADVNAT01";
 
 /// Vertex constants at slot 0 are followed immediately by the 640-byte
@@ -168,185 +165,12 @@ impl Hasher for JobDigest {
     }
 }
 
-struct LruCache<K, V> {
-    /// Looked up on every draw, so it uses a fast hasher.
-    entries: rustc_hash::FxHashMap<K, (V, u64)>,
-    clock: u64,
-    capacity: usize,
-}
-impl<K: Clone + Eq + Hash, V> Default for LruCache<K, V> {
-    fn default() -> Self {
-        Self::new(MAX_PIPELINES)
-    }
-}
-impl<K: Clone + Eq + Hash, V> LruCache<K, V> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            entries: rustc_hash::FxHashMap::default(),
-            clock: 0,
-            capacity,
-        }
-    }
-    fn next_stamp(&mut self) -> u64 {
-        self.clock += 1;
-        self.clock
-    }
-    fn get(&mut self, key: &K) -> Option<&V> {
-        let stamp = self.next_stamp();
-        let (value, last_used) = self.entries.get_mut(key)?;
-        *last_used = stamp;
-        Some(value)
-    }
-    fn insert(&mut self, key: K, value: V) -> Option<(K, V)> {
-        let stamp = self.next_stamp();
-        if let Some((slot, last_used)) = self.entries.get_mut(&key) {
-            *slot = value;
-            *last_used = stamp;
-            return None;
-        }
-        let evicted = if self.entries.len() == self.capacity {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, ts))| *ts)
-                .map(|(k, _)| k.clone())?;
-            self.entries
-                .remove(&oldest)
-                .map(|(old_value, _)| (oldest, old_value))
-        } else {
-            None
-        };
-        self.entries.insert(key, (value, stamp));
-        evicted
-    }
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.clock = 0;
-    }
-    fn values(&self) -> impl Iterator<Item = &V> {
-        self.entries.values().map(|(value, _)| value)
-    }
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-    #[cfg(test)]
-    fn contains_key(&self, key: &K) -> bool {
-        self.entries.contains_key(key)
-    }
-}
-
-struct SaveRequest {
-    path: PathBuf,
-    identity: String,
-    recipes: VecDeque<Recipe>,
-    cache: Arc<p::PipelineCache>,
-    persisted: Arc<AtomicU64>,
-}
-
-struct PendingSave {
-    ready_at: Instant,
-    request: SaveRequest,
-}
-
-#[derive(Default)]
-struct ArchiveSaverState {
-    pending: HashMap<PathBuf, PendingSave>,
-    writing: Option<PathBuf>,
-}
-
-impl ArchiveSaverState {
-    fn schedule(&mut self, request: SaveRequest, ready_at: Instant) {
-        self.pending
-            .insert(request.path.clone(), PendingSave { ready_at, request });
-    }
-
-    fn take_ready(&mut self, now: Instant) -> Result<SaveRequest, Option<Duration>> {
-        let mut earliest: Option<Instant> = None;
-        let mut due_key: Option<PathBuf> = None;
-        for (path, entry) in &self.pending {
-            if entry.ready_at <= now {
-                due_key = Some(path.clone());
-                break;
-            }
-            if earliest.is_none_or(|time| entry.ready_at < time) {
-                earliest = Some(entry.ready_at);
-            }
-        }
-        if let Some(key) = due_key {
-            let entry = self.pending.remove(&key).unwrap();
-            self.writing = Some(key);
-            return Ok(entry.request);
-        }
-        Err(earliest.map(|time| time.saturating_duration_since(now)))
-    }
-}
-
-fn archive_saver() -> &'static Arc<(Mutex<ArchiveSaverState>, Condvar)> {
-    static SAVER: OnceLock<Arc<(Mutex<ArchiveSaverState>, Condvar)>> = OnceLock::new();
-    SAVER.get_or_init(|| {
-        let shared = Arc::new((Mutex::new(ArchiveSaverState::default()), Condvar::new()));
-        let worker = shared.clone();
-        let _ = std::thread::Builder::new()
-            .name("adv-gpu-archive".into())
-            .spawn(move || {
-                let (lock, cv) = &*worker;
-                loop {
-                    let req = {
-                        let mut state = lock.lock().unwrap();
-                        loop {
-                            match state.take_ready(Instant::now()) {
-                                Ok(req) => break req,
-                                Err(Some(wait)) => {
-                                    let (guard, _) = cv.wait_timeout(state, wait).unwrap();
-                                    state = guard;
-                                }
-                                Err(None) => {
-                                    state = cv.wait(state).unwrap();
-                                }
-                            }
-                        }
-                    };
-                    if save_archive(&req.path, &req.identity, &req.recipes, &req.cache, false)
-                        .is_ok()
-                    {
-                        req.persisted
-                            .store(req.recipes.len() as u64, Ordering::Relaxed);
-                    }
-                    let mut state = lock.lock().unwrap();
-                    state.writing = None;
-                    cv.notify_all();
-                }
-            });
-        shared
-    })
-}
-
-fn schedule_archive_save(req: SaveRequest) {
-    schedule_archive_save_after(req, ARCHIVE_SAVE_DEBOUNCE);
-}
-
-fn schedule_archive_save_after(req: SaveRequest, delay: Duration) {
-    let (lock, cv) = &**archive_saver();
-    let mut state = lock.lock().unwrap();
-    state.schedule(req, Instant::now() + delay);
-    cv.notify_all();
-}
-
-fn wait_archive_save(path: &Path) {
-    let (lock, cv) = &**archive_saver();
-    let mut state = lock.lock().unwrap();
-    state.pending.remove(path);
-    while state.writing.as_deref() == Some(path) {
-        state = cv.wait(state).unwrap();
-    }
-}
-
 #[derive(Default)]
 pub(super) struct Pipelines {
-    /// Looked up on every draw, so it uses a fast hasher inside `LruCache`.
-    entries: LruCache<Key, (RenderPipeline, [u8; 32], bool)>,
-    modern_lru: LruCache<[u8; 32], ()>,
+    /// Looked up on every draw, so it uses a fast hasher.
+    entries: rustc_hash::FxHashMap<Key, (RenderPipeline, [u8; 32], bool)>,
+    order: VecDeque<Key>,
+    modern_order: VecDeque<[u8; 32]>,
     jobs: Arc<Mutex<HashMap<[u8; 32], PipelineJob>>>,
     anticipated: u64,
     cache_hits: u64,
@@ -355,11 +179,12 @@ pub(super) struct Pipelines {
     batch: Option<Compile<()>>,
     cache: Option<Arc<p::PipelineCache>>,
     store: Option<Archive>,
+    save: Option<Compile<u64>>,
     counters: CompileCounters,
     hits: u64,
     misses: u64,
     discarded: u64,
-    persisted: Arc<AtomicU64>,
+    persisted: u64,
 }
 
 // Task, unclaimed speculative recipe bytes, and creation-time origin.
@@ -438,13 +263,6 @@ impl Compiler {
 }
 
 impl Pipelines {
-    #[cfg(test)]
-    fn with_capacity(capacity: usize) -> Self {
-        let mut pipelines = Self::default();
-        pipelines.entries = LruCache::new(capacity);
-        pipelines.modern_lru = LruCache::new(capacity);
-        pipelines
-    }
     pub fn modern(
         &mut self,
         device: &Device,
@@ -473,7 +291,6 @@ impl Pipelines {
         let (task, per_sample_uav_shader) = {
             let mut jobs = self.jobs.lock().unwrap();
             if let Some((task, _, _)) = jobs.get(&hash) {
-                self.modern_lru.get(&hash);
                 self.cache_hits += 1;
                 (task.clone(), None)
             } else {
@@ -547,9 +364,10 @@ impl Pipelines {
                     });
                     Ok(built.map_err(gpu_error))
                 });
-                if let Some((evicted, ())) = self.modern_lru.insert(hash, ()) {
-                    jobs.remove(&evicted);
+                if self.modern_order.len() == MAX_PIPELINES {
+                    jobs.remove(&self.modern_order.pop_front().unwrap());
                 }
+                self.modern_order.push_back(hash);
                 jobs.insert(hash, (task.clone(), None, false));
                 self.misses += 1;
                 (task, per_sample_uav_shader)
@@ -718,15 +536,18 @@ impl Pipelines {
         };
         let built = task.wait().clone().map_err(Error::Device)??;
         let pipeline = built.pipeline;
-        self.anticipated += u64::from(anticipated);
-        if let Some((_, (_, old_recipe, _))) = self
-            .entries
-            .insert(key, (pipeline.clone(), recipe_key, anticipated))
-            && !self.entries.values().any(|(_, r, _)| *r == old_recipe)
-        {
+        if self.entries.len() == MAX_PIPELINES {
+            let (_, old_recipe, _) = self
+                .entries
+                .remove(&self.order.pop_front().unwrap())
+                .unwrap();
             // Speculative jobs keep their own budget in `prepare_program`.
             self.jobs.lock().unwrap().remove(&old_recipe);
         }
+        self.anticipated += u64::from(anticipated);
+        self.entries
+            .insert(key.clone(), (pipeline.clone(), recipe_key, anticipated));
+        self.order.push_back(key);
         if let Some(store) = &mut self.store
             && store.remember(recipe, recipe_key, encoded.len(), built.identity)
         {
@@ -735,29 +556,39 @@ impl Pipelines {
         Ok(pipeline)
     }
     fn save(&mut self) {
+        if let Some(job) = &self.save {
+            match job.ready() {
+                None => return,
+                Some(Ok(count)) => self.persisted = *count,
+                Some(Err(_)) => {}
+            }
+        }
         let Some(store) = &self.store else {
             return;
         };
-        let Some(cache) = &self.cache else {
-            return;
-        };
-        schedule_archive_save(SaveRequest {
-            path: store.path.clone(),
-            identity: store.identity.clone(),
-            recipes: store.recipes.clone(),
-            cache: cache.clone(),
-            persisted: self.persisted.clone(),
-        });
+        let (path, identity, recipes, cache) = (
+            store.path.clone(),
+            store.identity.clone(),
+            store.recipes.clone(),
+            self.cache.clone().unwrap(),
+        );
+        self.save = Some(Compile::spawn(
+            ARCHIVE_LIMIT,
+            CompileCounters::default(),
+            move || {
+                save_archive(&path, &identity, &recipes, &cache).map_err(|e| e.to_string())?;
+                Ok(recipes.len() as u64)
+            },
+        ));
     }
     fn open(&mut self, device: &Device, directory: Option<&Path>) {
         // The archive is a best-effort cache; a failed write only costs compiles.
         let _ = self.flush();
         self.jobs = Default::default();
-        self.modern_lru.clear();
+        self.modern_order.clear();
         self.batch = None;
         self.cache = None;
         self.store = None;
-        self.persisted = Arc::new(AtomicU64::new(0));
         let Some(directory) = directory else {
             return;
         };
@@ -778,7 +609,7 @@ impl Pipelines {
         let archive = load_archive(&path, &identity);
         self.discarded += u64::from(path.exists() && archive.is_none());
         let (recipes, driver) = archive.unwrap_or_default();
-        self.persisted = Arc::new(AtomicU64::new(recipes.len() as u64));
+        self.persisted = recipes.len() as u64;
         let cache = Arc::new(p::PipelineCache::load(&driver));
         let bytes = serde_json::to_vec(&recipes).unwrap().len();
         for recipe in &recipes {
@@ -836,7 +667,13 @@ impl Pipelines {
             compile_wait_ns: ns,
             prebuild_hits: self.hits,
             prebuild_misses: self.misses,
-            persisted_pipelines: self.persisted.load(Ordering::Relaxed),
+            persisted_pipelines: self
+                .save
+                .as_ref()
+                .and_then(Compile::ready)
+                .and_then(|result| result.as_ref().ok())
+                .copied()
+                .unwrap_or(self.persisted),
             discarded_pipelines: self.discarded,
             ..Default::default()
         }
@@ -867,11 +704,14 @@ impl Pipelines {
     /// The final write supersedes the background one, so only its failure
     /// leaves the archive without the latest recipes.
     fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(job) = self.save.take()
+            && let Ok(count) = job.resolve()
+        {
+            self.persisted = *count;
+        }
         if let (Some(store), Some(cache)) = (&self.store, &self.cache) {
-            wait_archive_save(&store.path);
-            save_archive(&store.path, &store.identity, &store.recipes, cache, true)?;
-            self.persisted
-                .store(store.recipes.len() as u64, Ordering::Relaxed);
+            save_archive(&store.path, &store.identity, &store.recipes, cache)?;
+            self.persisted = store.recipes.len() as u64;
         }
         Ok(())
     }
@@ -1099,7 +939,6 @@ fn save_archive(
     identity: &str,
     recipes: &VecDeque<Recipe>,
     cache: &p::PipelineCache,
-    sync: bool,
 ) -> std::io::Result<()> {
     use std::io::Write;
     let meta = serde_json::to_vec(&Disk {
@@ -1139,9 +978,7 @@ fn save_archive(
         file.write_all(&meta_len.to_le_bytes())?;
         file.write_all(&meta)?;
         file.write_all(&driver)?;
-        if sync {
-            file.sync_all()?;
-        }
+        file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, path)
     })();
@@ -2445,183 +2282,6 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         rejected.flush().unwrap();
         drop(rejected);
         gpu.set_pipeline_cache_directory(None);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    // spec: GFX-CACHE-1
-    #[test]
-    fn pipeline_cache_evicts_least_recently_used_entry_at_capacity() {
-        let mut cache: LruCache<usize, usize> = LruCache::default();
-        for id in 0..MAX_PIPELINES {
-            assert!(cache.insert(id, id).is_none());
-        }
-        assert_eq!(cache.len(), MAX_PIPELINES);
-        // Touch the oldest entry so it stays resident while entry 1 becomes LRU.
-        assert_eq!(cache.get(&0), Some(&0));
-        let evicted = cache.insert(MAX_PIPELINES, MAX_PIPELINES);
-        assert_eq!(evicted, Some((1, 1)));
-        assert_eq!(cache.len(), MAX_PIPELINES);
-        assert!(cache.contains_key(&0));
-        assert!(!cache.contains_key(&1));
-        assert!(cache.contains_key(&MAX_PIPELINES));
-    }
-
-    // spec: GFX-CACHE-1
-    #[test]
-    fn lru_eviction_releases_evicted_pipeline_jobs_and_handles() {
-        let Some((gpu, _queue, _consumer)) = open() else {
-            return;
-        };
-        let mut pipelines = Pipelines::with_capacity(2);
-        let state_for = |mask: u8| {
-            let mut state = DrawState::new(1, 1);
-            state.color_write = mask;
-            state
-        };
-        drop(
-            pipelines
-                .fixed(&gpu.device, &state_for(1), &[Format::Bgra8Unorm], None, 0)
-                .unwrap(),
-        );
-        drop(
-            pipelines
-                .fixed(&gpu.device, &state_for(2), &[Format::Bgra8Unorm], None, 0)
-                .unwrap(),
-        );
-        // Touch mask 1 so mask 2 becomes the least recently used entry.
-        drop(
-            pipelines
-                .fixed(&gpu.device, &state_for(1), &[Format::Bgra8Unorm], None, 0)
-                .unwrap(),
-        );
-        assert_eq!(pipelines.cache_hits, 1);
-        assert_eq!(pipelines.misses, 2);
-
-        // Inserting a third variant evicts mask 2 from both `entries` and `jobs`.
-        drop(
-            pipelines
-                .fixed(&gpu.device, &state_for(4), &[Format::Bgra8Unorm], None, 0)
-                .unwrap(),
-        );
-        assert_eq!(pipelines.entries.len(), 2);
-        assert_eq!(pipelines.jobs.lock().unwrap().len(), 2);
-        assert_eq!(pipelines.misses, 3);
-
-        // Mask 1 still hits; requesting evicted mask 2 must recompile instead of
-        // finding a lingering job or entry.
-        drop(
-            pipelines
-                .fixed(&gpu.device, &state_for(1), &[Format::Bgra8Unorm], None, 0)
-                .unwrap(),
-        );
-        assert_eq!(pipelines.cache_hits, 2);
-        drop(
-            pipelines
-                .fixed(&gpu.device, &state_for(2), &[Format::Bgra8Unorm], None, 0)
-                .unwrap(),
-        );
-        assert_eq!(pipelines.misses, 4);
-        assert_eq!(pipelines.entries.len(), 2);
-        assert_eq!(pipelines.jobs.lock().unwrap().len(), 2);
-    }
-
-    // spec: GFX-CACHE-8, GFX-CACHE-9
-    #[test]
-    fn periodic_archive_saves_debounce_and_coalesce_while_flush_bypasses() {
-        let mut state = ArchiveSaverState::default();
-        let path = PathBuf::from("debounced.native");
-        let cache = Arc::new(p::PipelineCache::load(&[]));
-        let recipe = |color_write: u8| {
-            let mut draw_state = DrawState::new(1, 1);
-            draw_state.color_write = color_write;
-            Recipe {
-                kind: Kind::Fixed(0),
-                raster: Raster::from(&draw_state),
-                colors: vec![format_code(Format::Bgra8Unorm)],
-                depth: None,
-            }
-        };
-        let t0 = Instant::now();
-        state.schedule(
-            SaveRequest {
-                path: path.clone(),
-                identity: "id".into(),
-                recipes: VecDeque::from([recipe(1)]),
-                cache: cache.clone(),
-                persisted: Arc::new(AtomicU64::new(0)),
-            },
-            t0 + ARCHIVE_SAVE_DEBOUNCE,
-        );
-        let half = ARCHIVE_SAVE_DEBOUNCE / 2;
-        assert_eq!(state.take_ready(t0 + half).err(), Some(Some(half)));
-        // A burst update coalesces into one pending save and resets the quiet window.
-        state.schedule(
-            SaveRequest {
-                path: path.clone(),
-                identity: "id".into(),
-                recipes: VecDeque::from([recipe(1), recipe(2)]),
-                cache,
-                persisted: Arc::new(AtomicU64::new(0)),
-            },
-            t0 + half + ARCHIVE_SAVE_DEBOUNCE,
-        );
-        assert_eq!(
-            state.take_ready(t0 + ARCHIVE_SAVE_DEBOUNCE).err(),
-            Some(Some(half))
-        );
-        let ready = state
-            .take_ready(t0 + half + ARCHIVE_SAVE_DEBOUNCE)
-            .expect("coalesced save should become ready after quiet period");
-        assert_eq!(ready.recipes.len(), 2);
-        assert_eq!(state.writing.as_deref(), Some(path.as_path()));
-        assert!(state.pending.is_empty());
-
-        let Some((gpu, _queue, _consumer)) = open() else {
-            return;
-        };
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let directory = std::env::temp_dir().join(format!(
-            "adv-debounce-cache-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut pipelines = Pipelines::default();
-        pipelines.open(&gpu.device, Some(&directory));
-        let (archive_path, identity, _) = pipelines.archive_info().unwrap();
-        for mask in [1u8, 2u8] {
-            let mut draw_state = DrawState::new(1, 1);
-            draw_state.color_write = mask;
-            pipelines
-                .fixed(&gpu.device, &draw_state, &[Format::Bgra8Unorm], None, 0)
-                .unwrap();
-        }
-        // Periodic saves remain queued behind the debounce window during the burst.
-        assert!(
-            archive_saver()
-                .0
-                .lock()
-                .unwrap()
-                .pending
-                .contains_key(&archive_path)
-        );
-        assert!(!archive_path.exists());
-
-        // `flush()` cancels the debounced entry and persists synchronously right away.
-        let started = Instant::now();
-        pipelines.flush().unwrap();
-        assert!(started.elapsed() < ARCHIVE_SAVE_DEBOUNCE);
-        assert!(
-            !archive_saver()
-                .0
-                .lock()
-                .unwrap()
-                .pending
-                .contains_key(&archive_path)
-        );
-        assert_eq!(pipelines.stats().persisted_pipelines, 2);
-        let (loaded, _) = load_archive(&archive_path, &identity).unwrap();
-        assert_eq!(loaded.len(), 2);
-        drop(pipelines);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

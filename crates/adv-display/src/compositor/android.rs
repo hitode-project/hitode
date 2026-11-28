@@ -194,8 +194,6 @@ mod native {
     }
 
     fn set_rate(surface: Handle, rate: u32) {
-        // ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE.
-        const FIXED_SOURCE: i8 = 1;
         type SetRate = unsafe extern "C" fn(Handle, Handle, f32, i8);
         static SET: OnceLock<Option<SetRate>> = OnceLock::new();
         let setter = SET.get_or_init(|| {
@@ -214,7 +212,7 @@ mod native {
         if let Some(set) = setter {
             unsafe {
                 let tx = ASurfaceTransaction_create();
-                set(tx, surface, rate as f32, FIXED_SOURCE);
+                set(tx, surface, rate as f32, 0);
                 ASurfaceTransaction_apply(tx);
                 ASurfaceTransaction_delete(tx);
             }

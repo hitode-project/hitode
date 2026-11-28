@@ -1,7 +1,6 @@
 package org.hitode.launcher
 
 import android.content.ActivityNotFoundException
-import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Color
@@ -96,21 +95,8 @@ class MainActivity : TauriActivity() {
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build()
             )
-            .setWillPauseWhenDucked(false)
             .setOnAudioFocusChangeListener(
-                { change ->
-                    when (change) {
-                        AudioManager.AUDIOFOCUS_GAIN,
-                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
-                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK,
-                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE -> nativeAudioFocus(true)
-                        AudioManager.AUDIOFOCUS_LOSS,
-                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> nativeAudioFocus(false)
-                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                            // Keep running while the platform ducks audio output.
-                        }
-                    }
-                },
+                { change -> nativeAudioFocus(change == AudioManager.AUDIOFOCUS_GAIN) },
                 Handler(Looper.getMainLooper())
             )
             .build()
@@ -219,15 +205,10 @@ class MainActivity : TauriActivity() {
         super.onPause()
     }
 
-    /** Backgrounded UI or critical memory pressure: release free display buffers. */
+    /** Hidden UI or memory pressure: the display keeps one buffer per pool. */
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        @Suppress("DEPRECATION")
-        val trim = level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN ||
-            level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL
-        if (trim) {
-            nativeTrimMemory()
-        }
+        nativeTrimMemory()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

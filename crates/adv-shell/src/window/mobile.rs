@@ -49,7 +49,8 @@ pub struct GameView {
     window: Cell<Option<NonNull<ndk_sys::ANativeWindow>>>,
     #[cfg(target_os = "ios")]
     pub(super) host: RefCell<Option<objc2::rc::Retained<input::HostView>>>,
-    /// The display-link or Choreographer vsync grid for guest pacing (PROC-CLOCK-4).
+    /// The display-link vsync grid for guest pacing (PROC-CLOCK-4).
+    #[cfg(target_os = "ios")]
     pub(crate) vsync: Arc<adv_sync::vsync::Vsync>,
     client: Cell<(u32, u32)>,
     canvas: Cell<(u32, u32)>,
@@ -105,6 +106,7 @@ impl GameView {
             window: Cell::new(None),
             #[cfg(target_os = "ios")]
             host: RefCell::new(None),
+            #[cfg(target_os = "ios")]
             vsync: Arc::default(),
             client: Cell::new((width, height)),
             canvas: Cell::new((width.max(1), height.max(1))),
@@ -137,7 +139,7 @@ impl GameView {
             physical_keys: RefCell::new(Default::default()),
             keys: RefCell::new(Arc::default()),
             frame_clock: Cell::new(false),
-            period: Cell::new(0),
+            period: Cell::new(16_666_667),
         });
         #[cfg(target_os = "ios")]
         {

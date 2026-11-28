@@ -50,8 +50,6 @@ API 30+ grants direct access through `MANAGE_EXTERNAL_STORAGE`. API 29 uses lega
 
 SurfaceControl MUST retain its own window reference. Window replacement and loss MUST poke the owner without waiting for a guest frame. Replacement MUST rebuild only the compositor, retaining detached leases and display pools while presentation is suspended. Rebuilding MUST reattach the same images without encoding, and the owner MUST run at `PRIORITY_DISPLAY` without core affinity.
 
-Choreographer callbacks MUST publish display refresh timestamps and periods to the shared vsync grid for guest pacing. When `AChoreographer_registerRefreshRateCallback` is unavailable on API 29, the loop MUST infer the display period from consecutive un-gapped callbacks instead of assuming 60 Hz.
-
 ### AND-APP-11 Touch input
 
 **Rule**: Touch coordinates MUST match the scaled viewport and clamp to canvas edges. Touches MUST reach the guest only as the gestures of AND-APP-14.
@@ -69,8 +67,6 @@ Choreographer callbacks MUST publish display refresh timestamps and periods to t
 **Rule**: The launcher MUST create and drive game sessions on the activity's UI thread, at most one at a time, using the SurfaceView's current window. A session MUST be paused while the activity is paused, audio focus is lost or the overlay holds a pause. Game mode MUST begin when a session starts and end when it finishes, hiding the trackpad cursor.
 **Applies to**: Android
 **Verification**: Review — sessions need the activity's looper and SurfaceView, which only a device provides.
-
-Audio focus requests MUST allow platform ducking, revoking focus only on `AUDIOFOCUS_LOSS` or `AUDIOFOCUS_LOSS_TRANSIENT` and never pausing on `AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK`. Memory trim callbacks MUST release free display buffers only at `TRIM_MEMORY_UI_HIDDEN` or higher, or at `TRIM_MEMORY_RUNNING_CRITICAL`, ignoring moderate and low foreground trim levels.
 
 ### AND-APP-14 Shared mobile gestures
 
@@ -94,7 +90,7 @@ iOS publishes no housing geometry. An iPhone's is read from its safe-area depth.
 **Rule**: Background and suspended states MUST pause guest execution and audio. Foreground execution MUST require audio focus and no overlay pause. Ending an interruption MUST NOT override background, suspension or overlay pauses.
 **Verification**: Test
 
-Suspension retains the lifecycle state to restore, including foreground/background changes received while suspended. Android pauses on full or non-duckable transient audio focus loss, keeping guest execution running during `AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK`. Its lifecycle and pause path invalidates input generations under AND-APP-3.
+Suspension retains the lifecycle state to restore, including foreground/background changes received while suspended. Android continues using its existing lifecycle and audio-focus callbacks and pause event path, which invalidates input generations under AND-APP-3.
 
 ### AND-APP-17 Managed game files
 

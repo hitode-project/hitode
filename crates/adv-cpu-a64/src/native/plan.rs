@@ -341,16 +341,10 @@ impl JobPlan {
 const BLOCKS_PER_THREAD: f64 = 4.0;
 /// The owner's fixed work in a split besides its blocks: admission and merge.
 const ROUND_NS: f64 = 10_000.0;
-/// Cap on skipped-split backoff between wake-estimate decay steps.
-const MAX_DECAY_INTERVAL: u32 = 64;
-
 /// Rolling median of three claimed wakes, seeded with the startup estimate.
 pub(super) struct WakeEstimate {
     recent: [u64; 2],
     pub ns: u64,
-    decay_wait: u32,
-    decay_interval: u32,
-    probing: bool,
 }
 
 impl Default for WakeEstimate {
@@ -358,9 +352,6 @@ impl Default for WakeEstimate {
         Self {
             recent: [WAKE_NS; 2],
             ns: WAKE_NS,
-            decay_wait: 0,
-            decay_interval: 1,
-            probing: false,
         }
     }
 }
@@ -371,44 +362,16 @@ impl WakeEstimate {
         let ns = ns.max(1);
         self.ns = ns.clamp(older.min(newer), older.max(newer));
         self.recent = [newer, ns];
-        if ns <= WAKE_NS {
-            self.probing = false;
-            self.decay_interval = 1;
-            self.decay_wait = 0;
-        } else if self.probing {
-            self.probing = false;
-            self.decay_interval = (self.decay_interval * 2).min(MAX_DECAY_INTERVAL);
-            self.decay_wait = self.decay_interval;
-        }
     }
 
     /// Relaxes an elevated estimate after a skipped split so a transient
     /// stall cannot wedge splitting for the rest of the run.
     pub fn decay(&mut self) {
         if self.ns > WAKE_NS {
-            let old = self.ns;
-            let next = (old / 2).max(WAKE_NS);
+            let next = (self.ns / 2).max(WAKE_NS);
             self.ns = next;
-            self.recent = [old, next];
+            self.recent = [next, next];
         }
-    }
-
-    /// Applies backed-off decay when a split is skipped only because the wake
-    /// estimate exceeds `WAKE_NS`. Probes that confirm wake latency remains
-    /// elevated double the interval between decay steps up to
-    /// `MAX_DECAY_INTERVAL`, avoiding periodic retry oscillation while still
-    /// recovering from transient stalls.
-    pub fn on_skipped_split(&mut self) {
-        if self.ns <= WAKE_NS {
-            return;
-        }
-        if self.decay_wait > 0 {
-            self.decay_wait -= 1;
-            return;
-        }
-        self.decay();
-        self.probing = true;
-        self.decay_wait = self.decay_interval;
     }
 }
 
@@ -1102,55 +1065,6 @@ mod tests {
             wake.decay();
         }
         assert_eq!(wake.ns, WAKE_NS);
-    }
-
-    // spec: A64-TR-9
-    #[test]
-    fn wake_estimate_backs_off_when_high_wake_persists_and_resets_when_fast() {
-        let mut wake = WakeEstimate::default();
-        wake.record(200_000);
-        wake.record(200_000);
-        assert_eq!(wake.ns, 200_000);
-
-        let skips_to_floor = |wake: &mut WakeEstimate| {
-            let mut skips = 0u32;
-            while wake.ns > WAKE_NS {
-                wake.on_skipped_split();
-                skips += 1;
-                assert!(skips <= 512, "wake estimate failed to decay");
-            }
-            skips
-        };
-
-        // First probe decays quickly after a transient stall.
-        let first = skips_to_floor(&mut wake);
-        assert!(first <= 4);
-
-        // Confirming high wake rebounds immediately on the first probe and
-        // backs off subsequent decay intervals to prevent oscillation.
-        wake.record(200_000);
-        assert!(wake.ns > WAKE_NS);
-        assert_eq!(wake.decay_interval, 2);
-        let second = skips_to_floor(&mut wake);
-        wake.record(200_000);
-        assert_eq!(wake.decay_interval, 4);
-        let third = skips_to_floor(&mut wake);
-        assert!(third > second);
-
-        // Repeatedly confirmed high wake reaches the capped backoff interval.
-        for _ in 0..8 {
-            wake.record(200_000);
-            let _ = skips_to_floor(&mut wake);
-        }
-        wake.record(200_000);
-        let steady = skips_to_floor(&mut wake);
-        assert!(steady >= MAX_DECAY_INTERVAL);
-
-        // Once a probe observes a fast wake, backoff resets and the estimate converges.
-        wake.record(12_000);
-        assert_eq!(wake.decay_interval, 1);
-        wake.record(12_000);
-        assert_eq!(wake.ns, 12_000);
     }
 
     // spec: A64-OPT-4 A64-OPT-6

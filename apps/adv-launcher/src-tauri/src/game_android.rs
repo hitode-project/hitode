@@ -219,13 +219,11 @@ pub async fn start_game(
             if host.session.is_some() {
                 return Err("a game is already running".into());
             }
-            let (surface_window, size) = {
-                let surface = host
-                    .surface
-                    .as_ref()
-                    .ok_or("the game surface is not ready")?;
-                (surface.window, surface.size)
-            };
+            let size = host
+                .surface
+                .as_ref()
+                .ok_or("the game surface is not ready")?
+                .size;
             let view = GameView::new(size.0, size.1)?;
             view.set_listener(crate::mobile_view::listener(
                 host_window.clone(),
@@ -240,35 +238,28 @@ pub async fn start_game(
             let finished_window = host_window.clone();
             let started_at = Instant::now();
             let game_id_for_host = id.clone();
-            // SAFETY: `host.surface` keeps `surface_window` alive across this call
-            // and `Session::new_with_execution_surface` acquires its own reference.
-            let session = unsafe {
-                Session::new_with_execution_surface(
-                    view,
-                    surface_window,
-                    size,
-                    options,
-                    Box::new(move |result| {
-                        let _files = files;
-                        // Dropped after the borrow: teardown must not run inside it.
-                        let ended = HOST.with_borrow_mut(|host| {
-                            host.playback.take();
-                            host.game_id = None;
-                            host.script_hidden = false;
-                            (host.session.take(), host.view.take())
-                        });
-                        drop(ended);
-                        crate::gamepad::on_pause_or_stop();
-                        if let Err(error) =
-                            android::set_game_mode(finished_window.app_handle(), false)
-                        {
-                            log::error!("leaving game mode: {error}");
-                        }
-                        crate::play::finished(&finished_window, id, result, started_at);
-                    }),
-                    &host_window.state::<adv_shell::Execution>(),
-                )
-            };
+            let session = Session::new_with_execution(
+                view,
+                options,
+                Box::new(move |result| {
+                    let _files = files;
+                    // Dropped after the borrow: teardown must not run inside it.
+                    let ended = HOST.with_borrow_mut(|host| {
+                        host.playback.take();
+                        host.game_id = None;
+                        host.script_hidden = false;
+                        (host.session.take(), host.view.take())
+                    });
+                    drop(ended);
+                    crate::gamepad::on_pause_or_stop();
+                    if let Err(error) = android::set_game_mode(finished_window.app_handle(), false)
+                    {
+                        log::error!("leaving game mode: {error}");
+                    }
+                    crate::play::finished(&finished_window, id, result, started_at);
+                }),
+                &host_window.state::<adv_shell::Execution>(),
+            );
             let session = match session {
                 Ok(session) => session,
                 Err(error) => {
@@ -278,10 +269,7 @@ pub async fn start_game(
             };
             session.set_active(host.lifecycle.foreground());
             session.set_upscaler(filter);
-            if let Err(error) = playback.apply(&session) {
-                host.view.take();
-                return Err(error);
-            }
+            playback.apply(&session)?;
             // A script runs behind the run page until it shows something.
             if script {
                 let shown_window = host_window.clone();
