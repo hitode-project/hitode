@@ -1564,7 +1564,8 @@ impl WorkerState {
         let data = self
             .stream
             .bytes(cursor as u32, alignment as u32, |bytes| {
-                bytes.fill(0);
+                // Programs read only their used registers (GFX-REC-7), so the
+                // rest of each window keeps whatever the ring held.
                 for (stage, constants) in [&draw.vertex_constants, &draw.pixel_constants]
                     .into_iter()
                     .enumerate()
@@ -1580,11 +1581,12 @@ impl WorkerState {
                 }
                 bytes[parameters_offset..parameters_offset + 640]
                     .copy_from_slice(bytemuck::bytes_of(&draw.parameters));
-                for (stream, &(offset, _)) in draw.streams.iter().zip(&stream_ranges) {
-                    let offset = offset as usize;
-                    stream
-                        .bytes
-                        .copy_to(&mut bytes[offset..offset + stream.bytes.len()]);
+                for (stream, &(offset, len)) in draw.streams.iter().zip(&stream_ranges) {
+                    let (offset, end) = (offset as usize, (offset + len) as usize);
+                    let written = offset + stream.bytes.len();
+                    stream.bytes.copy_to(&mut bytes[offset..written]);
+                    // The last word of a stream is read whole.
+                    bytes[written..end].fill(0);
                 }
                 if let Some(indices) = &draw.indices {
                     bytes[index_offset..].copy_from_slice(bytemuck::cast_slice(indices.as_slice()));
