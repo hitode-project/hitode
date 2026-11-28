@@ -4141,3 +4141,95 @@ fn donotlight_draws_follow_state_changes_across_presented_frames() {
         assert_eq!(f.pixels(primary, 640, 480), model, "frame {frame}");
     }
 }
+
+// spec: GFX-D3D7-5
+#[test]
+fn mip_textures_reassemble_only_after_a_level_changes() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let caps = creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE | creation::VIDEO_MEMORY;
+    let output = f.surface(dd, true, caps, 8, 8);
+    let dev = f.device(d3d, Face::Direct3D7, output);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+    assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 1, 2]), 0);
+    assert_eq!(f.device_call(dev, "SetTextureStageState", &[0, 18, 2]), 0);
+    let tex = f.described_surface(
+        dd,
+        creation::Described {
+            flags: 0x1007 | creation::DDSD_MIPMAPCOUNT,
+            width: 8,
+            height: 8,
+            mipmaps: 3,
+            caps: [
+                creation::TEXTURE | creation::MIPMAP | creation::COMPLEX | creation::THREE_D_DEVICE,
+                0,
+                0,
+                0,
+            ],
+            format: pixel_format(0x40, 32, [0xff0000, 0xff00, 0xff, 0]),
+            ..Default::default()
+        },
+    );
+    let mut levels = vec![tex];
+    for _ in 1..3 {
+        f.write(
+            DATA + 0x180,
+            bytemuck::bytes_of(&[creation::TEXTURE | creation::MIPMAP, 0, 0, 0]),
+        );
+        let next = f.output(
+            "IDirectDrawSurface7::GetAttachedSurface",
+            &[*levels.last().unwrap(), DATA + 0x180, OUT],
+        );
+        levels.push(next);
+    }
+    let fill = |f: &mut Fixture, level: u32, side: u32, color: u32| {
+        let (address, pitch) = f.lock(level, 0);
+        for y in 0..side {
+            f.write(
+                address + pitch * y,
+                bytemuck::cast_slice(&vec![color; side as usize]),
+            );
+        }
+        f.unlock(level);
+    };
+    for (n, color) in [0xff0000, 0x0000ff, 0xffffff].into_iter().enumerate() {
+        fill(&mut f, levels[n], 8 >> n, color);
+    }
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, tex]), 0);
+    // A quad of `size` minifies the texture to the level that size selects.
+    let sample = |f: &mut Fixture, size: f32| {
+        assert_eq!(f.device_call(dev, "Clear", &[0, 0, 1, 0xff00ff00, 0, 0]), 0);
+        draw_tl(f, dev, 5, &quad(0., 0., size, size, u32::MAX));
+        let pixel = f.pixels(output, 8, 8)[0];
+        let d3d = f
+            .machine
+            .ext
+            .get::<front::State>()
+            .draw
+            .d3d
+            .as_ref()
+            .unwrap();
+        assert_eq!(d3d.mips.len(), 1);
+        (pixel, d3d.mips.values().next().unwrap().1.id())
+    };
+    let (pixel, assembled) = sample(&mut f, 8.);
+    assert_eq!(pixel, 0xff0000);
+    assert_eq!(sample(&mut f, 4.), (0x0000ff, assembled));
+    assert_eq!(sample(&mut f, 8.), (0xff0000, assembled));
+    // A CPU write to a level reassembles the chain.
+    fill(&mut f, levels[1], 4, 0xffff00);
+    let (pixel, written) = sample(&mut f, 4.);
+    assert_eq!(pixel, 0xffff00);
+    assert_ne!(written, assembled);
+    // So does drawing into a level, which only its GPU copy sees.
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, 0]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderTarget", &[levels[1], 0]), 0);
+    draw_tl(&mut f, dev, 5, &quad(0., 0., 4., 4., 0xff00ffff));
+    assert_eq!(f.device_call(dev, "SetRenderTarget", &[output, 0]), 0);
+    assert_eq!(f.device_call(dev, "SetTexture", &[0, tex]), 0);
+    let (pixel, copied) = sample(&mut f, 4.);
+    assert_eq!(pixel, 0x00ffff);
+    assert_ne!(copied, written);
+    assert_eq!(sample(&mut f, 4.), (0x00ffff, copied));
+}

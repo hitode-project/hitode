@@ -20,6 +20,7 @@ pub struct Residency<I> {
     cpu_stale: Region,
     gpu_stale: Region,
     stamp: (u64, u64),
+    gpu_writes: u64,
 }
 
 /// A storage identity, unique per process, and its CPU write count.
@@ -36,12 +37,18 @@ impl<I> Residency<I> {
             cpu_stale: Region::default(),
             gpu_stale: Region::default(),
             stamp: stamp(),
+            gpu_writes: 0,
         }
     }
 
     /// Changes with every CPU write and with replaced storage.
     pub fn cpu_stamp(&self) -> (u64, u64) {
         self.stamp
+    }
+
+    /// Changes with every write on either side and with replaced storage.
+    pub fn write_stamp(&self) -> (u64, u64, u64) {
+        (self.stamp.0, self.stamp.1, self.gpu_writes)
     }
 
     pub fn has_cpu(&self) -> bool {
@@ -55,6 +62,7 @@ impl<I> Residency<I> {
             cpu_stale: Region::default(),
             gpu_stale: Region::default(),
             stamp: stamp(),
+            gpu_writes: 0,
         }
     }
 
@@ -104,8 +112,10 @@ impl<I> Residency<I> {
         mode: Access,
         transfer: impl FnOnce(&I, &[Rect]) -> Result<(), E>,
     ) -> Result<(), E> {
-        if matches!((side, mode), (Side::Cpu, Access::Write)) {
-            self.stamp.1 += 1;
+        match (side, mode) {
+            (Side::Cpu, Access::Write) => self.stamp.1 += 1,
+            (Side::Gpu, Access::Write) => self.gpu_writes += 1,
+            _ => {}
         }
         let Some(gpu) = self.gpu.as_ref().filter(|_| self.cpu) else {
             return Ok(());
@@ -226,6 +236,11 @@ impl<P: Presenter> Surfaces<P> {
     /// See [`Residency::cpu_stamp`]. It travels with the storage.
     pub fn cpu_stamp(&self, id: u32) -> Option<(u64, u64)> {
         Some(self.surfaces.get(&id)?.residency.cpu_stamp())
+    }
+
+    /// See [`Residency::write_stamp`]. It travels with the storage.
+    pub fn write_stamp(&self, id: u32) -> Option<(u64, u64, u64)> {
+        Some(self.surfaces.get(&id)?.residency.write_stamp())
     }
 
     #[cfg(feature = "gpu")]

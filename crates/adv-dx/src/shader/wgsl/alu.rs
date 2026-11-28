@@ -11,8 +11,8 @@ fn dx_nan(bits: u32) -> bool {
     return (bits & 0x7fffffffu) > 0x7f800000u;
 }
 fn dx_sat(bits: u32) -> u32 {
-    if bits >= 0x80000000u || bits < 0x00800000u || dx_nan(bits) { return 0u; }
-    return min(bits, 0x3f800000u);
+    // Only positive normals and infinity, 0x00800000..=0x7f800000, survive.
+    return select(0u, min(bits, 0x3f800000u), bits - 0x00800000u <= 0x7f000000u);
 }
 fn dx_min(a: u32, b: u32) -> u32 {
     if dx_nan(a) { return b; }
@@ -248,4 +248,105 @@ pub(super) fn expression(
         DerivRtyFine => float(format!("dpdyFine({x})")),
         other => return Err(Error::UnsupportedOpcode(other)),
     })
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use adv_device::gpu::{
+        BufferRange, DispatchArguments, Gpu, ModernShader, ModernTransfer, SlotBindings,
+        StorageBinding,
+    };
+    use adv_gpu::resource::{BufferDesc, BufferUsage, Memory};
+    use std::sync::Arc;
+
+    /// Every sign, exponent and leading mantissa bits, with low bits that
+    /// reach each end of the mantissa.
+    fn inputs() -> Vec<u32> {
+        (0..=0xffffu32)
+            .flat_map(|high| {
+                [0, 1, 0x4000, 0x7fff, 0x8000, 0xffff].map(move |low| high << 16 | low)
+            })
+            .collect()
+    }
+
+    /// Denormals flush to zero, NaN and nonpositive values saturate to zero.
+    fn saturated(bits: u32) -> u32 {
+        let value = f32::from_bits(if bits & 0x7f80_0000 == 0 { 0 } else { bits });
+        if value > 0.0 {
+            value.min(1.0).to_bits()
+        } else {
+            0
+        }
+    }
+
+    // spec: GFX-NUM-1
+    #[test]
+    fn saturation_helper_matches_the_reference_on_the_gpu() {
+        let mut gpu = Gpu::request(!cfg!(target_vendor = "apple")).unwrap();
+        let words = inputs();
+        let size = words.len() as u64 * 4;
+        let buffer = |usage, memory| {
+            let buffer = gpu
+                .device()
+                .create_buffer(&BufferDesc {
+                    size,
+                    usage,
+                    memory,
+                    label: "saturation oracle",
+                })
+                .unwrap();
+            BufferRange {
+                buffer,
+                range: 0..size,
+            }
+        };
+        let data = buffer(BufferUsage::STORAGE | BufferUsage::COPY_SRC, Memory::Upload);
+        // The buffer has not been submitted.
+        unsafe { &mut *data.buffer.mapped().unwrap().as_ptr() }
+            .copy_from_slice(bytemuck::cast_slice(&words));
+        let readback = buffer(BufferUsage::COPY_DST, Memory::Readback);
+        let source = format!(
+            "{}
+@group(3) @binding(0) var<storage, read_write> data: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    if id.x < arrayLength(&data) {{ data[id.x] = dx_sat(data[id.x]); }}
+}}",
+            super::HELPERS
+        );
+        let shader =
+            ModernShader::wgsl(1, &source, "main", adv_gpu::shader::Stage::Compute).unwrap();
+        let pipeline = gpu.prepare_dispatch(Arc::new(shader)).unwrap();
+        let slots = SlotBindings {
+            storage: [StorageBinding::Buffer(data.clone())].into(),
+            ..Default::default()
+        };
+        let groups = (words.len() as u32).div_ceil(64);
+        gpu.dispatch(&pipeline, &slots, DispatchArguments::Direct([groups, 1, 1]))
+            .unwrap();
+        gpu.transfer(ModernTransfer::CopyBuffer {
+            source: data,
+            destination: readback.buffer.clone(),
+            offset: 0,
+        })
+        .unwrap();
+        let fence = gpu.target(1, 1, false).unwrap();
+        gpu.clear(&fence, Some([0.; 4]), None).unwrap();
+        let mut pending = gpu.readback(&fence.image, None).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(result) = pending.poll() {
+                result.unwrap();
+                break;
+            }
+            gpu.check().unwrap();
+            assert!(std::time::Instant::now() < deadline, "readback timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The readback above waited for the copy.
+        let results: &[u32] =
+            bytemuck::cast_slice(unsafe { readback.buffer.mapped().unwrap().as_ref() });
+        for (&input, &output) in words.iter().zip(results) {
+            assert_eq!(output, saturated(input), "dx_sat({input:08x})");
+        }
+    }
 }
