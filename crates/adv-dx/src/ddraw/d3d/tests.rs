@@ -4118,7 +4118,9 @@ fn donotlight_draws_follow_state_changes_across_presented_frames() {
     f.write(VERTICES, bytemuck::cast_slice(&vertices));
     for (frame, x) in [0u32, 64, 64, 128, 128, 0].into_iter().enumerate() {
         let mut world = [0f32; 16];
-        [0, 5, 10, 15].map(|i| world[i] = 1.);
+        for i in [0, 5, 10, 15] {
+            world[i] = 1.;
+        }
         world[12] = x as f32;
         f.write(DATA + 0x200, bytemuck::bytes_of(&world));
         assert_eq!(f.device_call(dev, "SetTransform", &[1, DATA + 0x200]), 0);
