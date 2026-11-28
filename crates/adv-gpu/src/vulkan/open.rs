@@ -1316,6 +1316,7 @@ impl Device {
                 completed: AtomicU64::new(0),
                 queue: OnceLock::new(),
                 retired: Mutex::new(VecDeque::new()),
+                reaping: Mutex::new(()),
                 passes: Mutex::new(HashMap::new()),
                 samplers: Mutex::new(HashMap::new()),
                 rings: Mutex::new(Vec::new()),

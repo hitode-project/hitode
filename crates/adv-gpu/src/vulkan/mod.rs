@@ -98,6 +98,10 @@ pub(crate) struct Context {
     completed: AtomicU64,
     queue: OnceLock<Weak<queue::Shared>>,
     retired: Mutex<VecDeque<(u64, Retired)>>,
+    /// Serializes `Shared::poll` and `Context::reap` so any caller returning
+    /// `Token(T)` observes completed `drop(retired_resources)` and `destroy()`
+    /// without blocking `submit()` or foreground `retire()`.
+    reaping: Mutex<()>,
     passes: Mutex<HashMap<encode::PassKey, encode::LegacyPass>>,
     samplers: Mutex<HashMap<SamplerDesc, Weak<SamplerCore>>>,
     rings: Mutex<Vec<Weak<ring::RingCore>>>,
@@ -285,9 +289,15 @@ impl Context {
         retired.push_back((token, item));
     }
     /// Destroys objects whose last possible use has completed. Drains the ready
-    /// prefix under the lock and frees handles outside it so foreground drops
-    /// calling `retire` never block on batch destruction.
+    /// prefix under `retired` and frees handles outside it so foreground drops
+    /// calling `retire` never block on batch destruction, while `reaping`
+    /// ensures concurrent `poll`/`reap` callers do not return before ongoing
+    /// destruction finishes.
     pub(super) fn reap(&self, completed: u64) {
+        let _reaping = self.reaping.lock().unwrap();
+        self.reap_locked(completed);
+    }
+    pub(super) fn reap_locked(&self, completed: u64) {
         let ready: Vec<Retired> = {
             let mut retired = self.retired.lock().unwrap();
             let count = retired
