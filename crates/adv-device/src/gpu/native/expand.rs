@@ -110,10 +110,10 @@ impl Expand {
                     .flat_map(|bin| [&bin.vertex, &bin.fragment]),
             )
         {
-            for uniform in slots.uniforms.iter().flatten() {
+            for uniform in slots.uniforms.iter() {
                 uniform.retain(windows);
             }
-            for storage in slots.storage.iter().flatten() {
+            for storage in slots.storage.iter() {
                 if let StorageBinding::Window(window) = storage {
                     window.retain(windows);
                 }
@@ -442,12 +442,11 @@ fn bind(
     for binding in expansion {
         match *binding {
             ExpansionBinding::Parameters { slot } => {
-                set(&mut slots.uniforms, slot, parameters.clone().into());
+                slots.uniforms.set(slot as usize, parameters.clone().into());
             }
             ExpansionBinding::Scratch { slot, region } => {
-                set(
-                    &mut slots.storage,
-                    slot,
+                slots.storage.set(
+                    slot as usize,
                     StorageBinding::Buffer(BufferRange {
                         buffer: scratch.clone(),
                         range: regions[region].clone(),
@@ -456,14 +455,6 @@ fn bind(
             }
         }
     }
-}
-
-fn set<T>(slots: &mut Vec<Option<T>>, slot: u32, value: T) {
-    let slot = slot as usize;
-    if slots.len() <= slot {
-        slots.resize_with(slot + 1, || None);
-    }
-    slots[slot] = Some(value);
 }
 
 fn invalid(error: Error) -> adv_gpu::Error {

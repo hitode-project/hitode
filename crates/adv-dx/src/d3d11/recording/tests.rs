@@ -56,7 +56,7 @@ fn recorded_dispatch_finishes_before_the_draw_reads_its_image() {
     let dispatch = Command::Dispatch {
         pipeline: Arc::new(gpu.prepare_dispatch(compute).unwrap()),
         bindings: SlotBindings {
-            storage: vec![Some(StorageBinding::Image(storage.view().clone()))],
+            storage: [StorageBinding::Image(storage.view().clone())].into(),
             ..Default::default()
         },
         arguments: DispatchArguments::Direct([2, 2, 1]),
@@ -121,7 +121,7 @@ fn recorded_dispatch_finishes_before_the_draw_reads_its_image() {
         statistics: None,
         vertex: SlotBindings::default(),
         fragment: SlotBindings {
-            images: vec![Some(storage.view().clone())],
+            images: [storage.view().clone()].into(),
             ..Default::default()
         },
     };

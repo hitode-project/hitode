@@ -348,11 +348,7 @@ fn compute_matches_reference_points_and_indices_in_all_captured_cases() {
         .unwrap();
         let pipeline = gpu.prepare_dispatch(Arc::new(shader)).unwrap();
         let slots = SlotBindings {
-            storage: buffers
-                .iter()
-                .cloned()
-                .map(|buffer| Some(StorageBinding::Buffer(buffer)))
-                .collect(),
+            storage: buffers.clone().map(StorageBinding::Buffer).into(),
             ..Default::default()
         };
         gpu.dispatch(&pipeline, &slots, DispatchArguments::Direct([groups, 1, 1]))

@@ -204,8 +204,8 @@ fn image_filter_downsamples_and_resolves_with_point_loads() {
     gpu.dispatch(
         &mip,
         &SlotBindings {
-            images: vec![Some(view(0))],
-            storage: vec![Some(StorageBinding::Image(view(1)))],
+            images: [view(0)].into(),
+            storage: [StorageBinding::Image(view(1))].into(),
             ..Default::default()
         },
         DispatchArguments::Direct([1, 1, 1]),
@@ -234,8 +234,8 @@ fn image_filter_downsamples_and_resolves_with_point_loads() {
         gpu.dispatch(
             &resolve,
             &SlotBindings {
-                images: vec![Some(source.view().clone())],
-                storage: vec![Some(StorageBinding::Image(view(1)))],
+                images: [source.view().clone()].into(),
+                storage: [StorageBinding::Image(view(1))].into(),
                 ..Default::default()
             },
             DispatchArguments::Direct([1, 1, 1]),
@@ -250,7 +250,7 @@ fn image_filter_downsamples_and_resolves_with_point_loads() {
             ModernDraw::packed_resolve(packed.view().clone(), [31, 31, 31, 1]).unwrap(),
             &SlotBindings::default(),
             &SlotBindings {
-                images: vec![Some(source.view().clone())],
+                images: [source.view().clone()].into(),
                 ..Default::default()
             },
         )
@@ -413,8 +413,7 @@ fn pixel_probe_standard_multisample_resolve_and_load() {
             .unwrap();
 
         let mut slots = SlotBindings::default();
-        slots.images.resize(112, None);
-        slots.images[111] = Some(msaa.view().clone());
+        slots.images.set(111, msaa.view().clone());
         let load = shader(
             "
 @group(1) @binding(111) var tex: texture_multisampled_2d<f32>;
@@ -552,7 +551,7 @@ struct Pixel {
             ),
             &SlotBindings::default(),
             &SlotBindings {
-                images: vec![Some(copy.view().clone())],
+                images: [copy.view().clone()].into(),
                 ..Default::default()
             },
         )
@@ -616,7 +615,7 @@ fn metal_sample_mask_output_reduces_input_coverage() {
     );
     let vertex = shader(TRIANGLE, Stage::Vertex);
     let slots = SlotBindings {
-        images: vec![Some(msaa.view().clone())],
+        images: [msaa.view().clone()].into(),
         ..Default::default()
     };
     // The edge covers samples 1 and 3. D3D11 exposes both bits to each
@@ -696,8 +695,9 @@ fn mrt_compute_boundaries_predication_and_queries() {
     );
     let dispatch = gpu.prepare_dispatch(cs).unwrap();
     let mut slots = SlotBindings::default();
-    slots.storage.resize(8, None);
-    slots.storage[7] = Some(StorageBinding::Image(storage.view().clone()));
+    slots
+        .storage
+        .set(7, StorageBinding::Image(storage.view().clone()));
     let vertex = shader(TRIANGLE, Stage::Vertex);
     let fragment = shader(
         "
@@ -756,8 +756,7 @@ struct Output {
         index,
     };
     let mut sampled = SlotBindings::default();
-    sampled.images.resize(100, None);
-    sampled.images[99] = Some(storage.view().clone());
+    sampled.images.set(99, storage.view().clone());
     let make_draw = |compare, clear| {
         let mut draw = draw(
             2,
@@ -897,8 +896,8 @@ fn sample(
 ) -> Vec<f32> {
     let out = target(gpu, width, 1, Format::Rgba32Float);
     let slots = SlotBindings {
-        images: vec![Some(view)],
-        samplers: vec![sampler],
+        images: [view].into(),
+        samplers: sampler.map(|s| [s].into()).unwrap_or_default(),
         ..Default::default()
     };
     gpu.draw_modern(
@@ -1221,11 +1220,9 @@ struct Output { @builtin(position) p: vec4<f32>, @location(0) alpha: vec4<f32> }
         Stage::Fragment,
     );
     let mut vs = SlotBindings::default();
-    vs.images.resize(128, None);
-    vs.images[127] = Some(alpha.view().clone());
+    vs.images.set(127, alpha.view().clone());
     let mut fs = SlotBindings::default();
-    fs.images.resize(128, None);
-    fs.images[127] = Some(mips.view().clone());
+    fs.images.set(127, mips.view().clone());
     let out = target(&gpu, 1, 1, Format::Rgba8Unorm);
     gpu.draw_modern(
         draw(1, 1, vertex, fragment, [color(&out, Load::DontCare)]),
@@ -1889,8 +1886,8 @@ fn pixel_probe_texel_mapping_and_filter_weights() {
         };
         let s = sampler(&gpu, address, filter, None);
         let slots = SlotBindings {
-            images: vec![Some(pattern.view().clone())],
-            samplers: vec![Some(s)],
+            images: [pattern.view().clone()].into(),
+            samplers: [s].into(),
             ..Default::default()
         };
         gpu.draw_modern(draw, &SlotBindings::default(), &slots)
@@ -1936,8 +1933,8 @@ fn pixel_probe_texel_mapping_and_filter_weights() {
     );
     let s = sampler(&gpu, Address::Clamp, Filter::Linear, None);
     let slots = SlotBindings {
-        images: vec![Some(ramp.view().clone())],
-        samplers: vec![Some(s)],
+        images: [ramp.view().clone()].into(),
+        samplers: [s].into(),
         ..Default::default()
     };
     gpu.draw_modern(
@@ -2296,13 +2293,14 @@ fn maximum_textures_samplers_constants_and_uavs_execute_together() {
             constants.mapped().unwrap().as_mut()[(last - 16) as usize..(last - 12) as usize]
                 .copy_from_slice(&value.to_ne_bytes());
         }
-        slots.uniforms.push(Some(
+        slots.uniforms.set(
+            slots.uniforms.len(),
             BufferRange {
                 buffer: constants.clone(),
                 range: first..last,
             }
             .into(),
-        ));
+        );
         writeln!(
             source,
             "@group(0) @binding({i}) var<uniform> c{i}: array<vec4<u32>, 4096>;"
@@ -2324,12 +2322,13 @@ fn maximum_textures_samplers_constants_and_uavs_execute_together() {
             Usage::SAMPLED | Usage::COPY_DST,
         );
         upload(&mut gpu, &input, 0, 4, 1, &[i as u8 + 1, 0, 0, 255]);
-        slots.images.push(Some(input.view().clone()));
+        slots.images.set(slots.images.len(), input.view().clone());
         writeln!(source, "@group(1) @binding({i}) var t{i}: texture_2d<f32>;").unwrap();
         if i < 16 {
-            slots
-                .samplers
-                .push(Some(sampler(&gpu, Address::Clamp, Filter::Nearest, None)));
+            slots.samplers.set(
+                slots.samplers.len(),
+                sampler(&gpu, Address::Clamp, Filter::Nearest, None),
+            );
             writeln!(source, "@group(2) @binding({i}) var s{i}: sampler;").unwrap();
         }
         let weight = i + 1;
@@ -2360,9 +2359,10 @@ fn maximum_textures_samplers_constants_and_uavs_execute_together() {
                 1,
                 Usage::STORAGE | Usage::COPY_SRC,
             );
-            slots
-                .storage
-                .push(Some(StorageBinding::Image(output.view().clone())));
+            slots.storage.set(
+                slots.storage.len(),
+                StorageBinding::Image(output.view().clone()),
+            );
             writeln!(
                 source,
                 "@group(3) @binding({i}) var u{i}: texture_storage_2d<r32uint, write>;"
@@ -2415,13 +2415,14 @@ fn vertex_streams_buffer_srvs_and_constant_buffers_keep_their_offsets_and_length
                 .copy_from_slice(&(i as u32 + 1).to_ne_bytes());
         }
         if i < CONSTANTS {
-            slots.uniforms.push(Some(
+            slots.uniforms.set(
+                slots.uniforms.len(),
                 BufferRange {
                     buffer: data.clone(),
                     range: offset..offset + 16,
                 }
                 .into(),
-            ));
+            );
             writeln!(
                 source,
                 "@group(0) @binding({i}) var<uniform> c{i}: vec4<u32>;"
@@ -2430,10 +2431,13 @@ fn vertex_streams_buffer_srvs_and_constant_buffers_keep_their_offsets_and_length
             writeln!(sum, "value += c{i}.x;").unwrap();
         } else {
             let register = i - CONSTANTS;
-            slots.storage.push(Some(StorageBinding::Buffer(BufferRange {
-                buffer: data.clone(),
-                range: offset..offset + (register % STREAMS + 1) * 4,
-            })));
+            slots.storage.set(
+                slots.storage.len(),
+                StorageBinding::Buffer(BufferRange {
+                    buffer: data.clone(),
+                    range: offset..offset + (register % STREAMS + 1) * 4,
+                }),
+            );
             writeln!(
                 source,
                 "@group(3) @binding({register}) var<storage, read> data{register}: array<u32>;"

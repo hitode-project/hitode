@@ -31,8 +31,8 @@ pub use native::{
     DrawArguments, Expand, ExpansionBinding, ExpansionDispatch, ExpansionDraw, ExpansionPrelude,
     ExpansionRegion, ExpansionWindow, Gpu, Image, ImageAlias, ImageId, ImageRegion, ModernColor,
     ModernDepth, ModernDraw, ModernShader, ModernTransfer, Predicate, QuerySlot, Readback,
-    SlotBindings, Staged, StorageBinding, Target, TimestampDisjoint, TransferBuffer, UniformWindow,
-    decode_bc, decoded_bc_format,
+    SlotBindings, Slots, Staged, StorageBinding, Target, TimestampDisjoint, TransferBuffer,
+    UniformWindow, decode_bc, decoded_bc_format,
 };
 pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,

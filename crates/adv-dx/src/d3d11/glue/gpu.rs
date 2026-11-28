@@ -1458,7 +1458,7 @@ pub(super) fn resolve(env: &mut Env<'_>) -> Result<(), Error> {
                 draw: Box::new(draw),
                 vertex: SlotBindings::default(),
                 fragment: SlotBindings {
-                    images: vec![Some(source_view)],
+                    images: [source_view].into(),
                     ..Default::default()
                 },
                 statistics: None,
@@ -1556,8 +1556,8 @@ fn filter_image(
         Command::Dispatch {
             pipeline,
             bindings: SlotBindings {
-                images: vec![Some(source)],
-                storage: vec![Some(StorageBinding::Image(destination))],
+                images: [source].into(),
+                storage: [StorageBinding::Image(destination)].into(),
                 ..Default::default()
             },
             arguments: DispatchArguments::Direct([

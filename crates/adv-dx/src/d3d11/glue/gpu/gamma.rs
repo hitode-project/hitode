@@ -93,8 +93,8 @@ impl Pass {
     ) -> Result<(), GpuError> {
         let (width, height) = self.size();
         let fragment = SlotBindings {
-            images: vec![Some(source.view().clone())],
-            storage: vec![Some(StorageBinding::Buffer(self.curve.clone()))],
+            images: [source.view().clone()].into(),
+            storage: [StorageBinding::Buffer(self.curve.clone())].into(),
             ..Default::default()
         };
         for &scissor in copies {

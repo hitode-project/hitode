@@ -639,7 +639,7 @@ fn slots_for(
                         execution.zero_constants.as_ref().unwrap().slice(0..length)
                     }
                 };
-                set_slot(&mut slots.uniforms, binding, BufferWindow::Uniform(window));
+                slots.uniforms.set(binding, BufferWindow::Uniform(window));
             }
             Sampler => {
                 let mut desc = sampler_description(env, state.samplers[index]);
@@ -670,7 +670,7 @@ fn slots_for(
                     mode,
                     shader_bias,
                 ))?;
-                set_slot(&mut slots.samplers, binding, sampler);
+                slots.samplers.set(binding, sampler);
             }
             Resource | UnorderedAccessView => {
                 let view_slot = match (location.register, stage) {
@@ -722,18 +722,16 @@ fn slots_for(
                             &view.desc,
                             &image,
                         )?;
-                        set_slot(
-                            &mut slots.storage,
-                            binding,
-                            StorageBinding::ImageAlias(alias),
-                        );
+                        slots
+                            .storage
+                            .set(binding, StorageBinding::ImageAlias(alias));
                     }
                     (backing @ (Backing::Image(_) | Backing::Blocks(_)), _) => {
                         let view = backing.view(&execution(env.ext)?.gpu, &view.desc)?;
                         if location.group == 1 {
-                            set_slot(&mut slots.images, binding, view);
+                            slots.images.set(binding, view);
                         } else {
-                            set_slot(&mut slots.storage, binding, StorageBinding::Image(view));
+                            slots.storage.set(binding, StorageBinding::Image(view));
                         }
                     }
                     (Backing::Buffer(buffer), super::Resource::Buffer(desc)) => {
@@ -746,8 +744,7 @@ fn slots_for(
                         let elements = view.desc.elements();
                         let range = u64::from(elements.start) * u64::from(unit)
                             ..u64::from(elements.end) * u64::from(unit);
-                        set_slot(
-                            &mut slots.storage,
+                        slots.storage.set(
                             binding,
                             StorageBinding::Buffer(BufferRange { buffer, range }),
                         );
@@ -766,8 +763,7 @@ fn slots_for(
         .and_then(|slot| snapshot.view(slot))
         .ok_or(Error::InvalidArgument)?;
         let counter = counter_buffer(env, view.pointer)?;
-        set_slot(
-            &mut slots.storage,
+        slots.storage.set(
             binding as usize,
             StorageBinding::Buffer(BufferRange {
                 buffer: counter,
@@ -784,13 +780,6 @@ fn bindings(translation: &Translation) -> (&Reflection, &[BindingLocation], &[(u
         &translation.locations,
         &translation.counters,
     )
-}
-
-fn set_slot<T>(slots: &mut Vec<Option<T>>, slot: usize, value: T) {
-    if slots.len() <= slot {
-        slots.resize_with(slot + 1, || None);
-    }
-    slots[slot] = Some(value);
 }
 
 fn sampler_description(env: &Env<'_>, pointer: u32) -> D3D11_SAMPLER_DESC {
@@ -2196,8 +2185,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     };
     if let DrawRange::Indirect(args, resource, _) = &args {
         reads.push(*resource);
-        set_slot(
-            &mut vertex_bindings.storage,
+        vertex_bindings.storage.set(
             DRAW_ARGUMENTS_SLOT as usize,
             StorageBinding::Buffer(BufferRange {
                 buffer: args.buffer.clone(),
@@ -2208,11 +2196,7 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
     for fetch in &fetches {
         let stream = fetch.layout.stream as usize;
         let slot = VERTEX_STREAM_BASE as usize + stream;
-        if vertex_bindings
-            .storage
-            .get(slot)
-            .is_some_and(Option::is_some)
-        {
+        if vertex_bindings.storage.get(slot).is_some() {
             continue;
         }
         let pointer = snapshot.ia.vertices[stream].buffer;
@@ -2230,11 +2214,9 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             }
             captured => captured,
         };
-        set_slot(
-            &mut vertex_bindings.storage,
-            slot,
-            StorageBinding::Window(window),
-        );
+        vertex_bindings
+            .storage
+            .set(slot, StorageBinding::Window(window));
     }
     let (occlusion, statistics) =
         queries::draw_slots(env, raster_stream.is_some(), expansion.is_none())?;

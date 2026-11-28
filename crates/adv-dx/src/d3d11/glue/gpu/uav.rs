@@ -178,17 +178,17 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>,
         )?;
         let size = buffer.desc().size;
         let bindings = SlotBindings {
-            uniforms: vec![Some(
-                BufferRange {
-                    buffer: uniform,
-                    range: 0..32,
-                }
-                .into(),
-            )],
-            storage: vec![Some(StorageBinding::Buffer(BufferRange {
+            uniforms: [BufferRange {
+                buffer: uniform,
+                range: 0..32,
+            }
+            .into()]
+            .into(),
+            storage: [StorageBinding::Buffer(BufferRange {
                 buffer,
                 range: 0..size,
-            }))],
+            })]
+            .into(),
             ..Default::default()
         };
         let groups = (range.end.div_ceil(4) - range.start / 4).div_ceil(64);
