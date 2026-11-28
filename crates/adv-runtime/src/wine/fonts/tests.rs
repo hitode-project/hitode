@@ -153,6 +153,82 @@ fn empty_glyph_reports_a_black_box_without_a_bitmap() {
     }
 }
 
+// spec: WINE-UNIX-8
+#[test]
+fn produced_glyph_bytes_are_recorded_only_while_records_are_on() {
+    use super::super::text_records::{Code, ProducedGlyph, TextRecord};
+    let (mut machine, data, dc) = fixture();
+    let matrix = data + 64;
+    let buffer = data + 256;
+    machine.cpu.write_u32(matrix, 1 << 16).unwrap();
+    machine.cpu.write_u32(matrix + 12, 1 << 16).unwrap();
+    let gray = |machine: &mut Machine<JitCpu>, name| {
+        invoke(
+            machine,
+            data,
+            name,
+            &[dc, 65, 6, data, 1024, buffer, matrix],
+        )
+    };
+    assert!(gray(&mut machine, "GetGlyphOutlineW") > 0);
+    assert!(machine.ext.get::<Fonts>().records.is_none());
+
+    machine.ext.get_mut::<Fonts>().records = Some(Default::default());
+    let written = gray(&mut machine, "GetGlyphOutlineW");
+    // Metrics alone and a size query hand the guest no glyph bytes.
+    invoke(
+        &mut machine,
+        data,
+        "GetGlyphOutlineW",
+        &[dc, 66, 0, data, 0, 0, matrix],
+    );
+    invoke(
+        &mut machine,
+        data,
+        "GetGlyphOutlineW",
+        &[dc, 66, 6, data, 0, 0, matrix],
+    );
+    invoke(
+        &mut machine,
+        data,
+        "GetGlyphOutlineA",
+        &[dc, 67, 6, data, 1024, buffer, matrix],
+    );
+    let batch = machine
+        .ext
+        .get_mut::<Fonts>()
+        .records
+        .as_mut()
+        .unwrap()
+        .take();
+    assert_eq!(batch.dropped, 0);
+    let glyphs: Vec<_> = batch
+        .records
+        .iter()
+        .map(|record| match record {
+            TextRecord::Glyph(glyph) => glyph.clone(),
+            TextRecord::Line(line) => panic!("no line was drawn: {line:?}"),
+        })
+        .collect();
+    assert_eq!(glyphs.len(), 2);
+    let ProducedGlyph {
+        sequence,
+        dc: recorded,
+        code,
+        buffer: at,
+        len,
+        ref face,
+        height,
+        ..
+    } = glyphs[0];
+    assert_eq!(
+        (sequence, recorded, code, at, len),
+        (0, dc, Code::Unicode(65), buffer, written)
+    );
+    assert_eq!((face.as_str(), height), ("Arial", -24));
+    assert_eq!((glyphs[1].sequence, glyphs[1].code), (1, Code::Unicode(67)));
+}
+
 // spec: WIN32-GDI-10
 #[test]
 fn text_extent_rejects_short_readonly_and_overflowing_ranges_without_partial_size() {

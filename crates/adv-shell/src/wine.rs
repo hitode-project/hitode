@@ -840,6 +840,11 @@ fn drive(
         .map_err(|e| RunError::from_message(e, started.elapsed()))?;
     let mut recorder = Recorder::open(options.record_input.as_deref(), started)
         .map_err(|e| RunError::from_message(e, started.elapsed()))?;
+    let mut text_log = super::text_log::TextLog::open(options.text_log.as_deref())
+        .map_err(|e| RunError::from_message(e, started.elapsed()))?;
+    if text_log.is_some() {
+        session.set_text_records(true);
+    }
     let auto_delay = options
         .auto_dialog_ms
         .map(|ms| Duration::from_millis(u64::from(ms)));
@@ -1141,6 +1146,9 @@ fn drive(
                 }
                 Stop::Failed(error) => return Err(error),
             }
+            if text_log.is_some() {
+                super::text_log::TextLog::write(&mut text_log, session.take_text_records());
+            }
             for url in session.take_links() {
                 match worker.as_mut() {
                     Some(worker) => worker.open_link(url),
@@ -1179,6 +1187,9 @@ fn drive(
         Instant::now(),
     ) {
         complete_gate(completion, &mut session, keys);
+    }
+    if text_log.is_some() {
+        super::text_log::TextLog::write(&mut text_log, session.take_text_records());
     }
     session.machine.sys.trace.flush();
     session

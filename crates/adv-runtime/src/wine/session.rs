@@ -1598,6 +1598,28 @@ impl Session {
         std::mem::take(&mut self.links.borrow_mut().0)
     }
 
+    /// Starts or stops keeping text records (WINE-UNIX-8). Stopping discards
+    /// the records not yet taken.
+    pub fn set_text_records(&mut self, enabled: bool) {
+        let records = &mut self.machine.ext.get_mut::<super::fonts::Fonts>().records;
+        if !enabled {
+            *records = None;
+        } else if records.is_none() {
+            *records = Some(Default::default());
+        }
+    }
+
+    /// Text records kept since the last call; empty while records are off.
+    pub fn take_text_records(&mut self) -> super::text_records::TextBatch {
+        self.machine
+            .ext
+            .get_mut::<super::fonts::Fonts>()
+            .records
+            .as_mut()
+            .map(|records| records.take())
+            .unwrap_or_default()
+    }
+
     /// Frames presented so far.
     pub fn presented_frames(&self) -> u64 {
         self.machine.ext.get::<SurfaceStore>().stats.presentations

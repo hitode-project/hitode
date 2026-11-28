@@ -48,6 +48,8 @@ mod performance;
 mod record;
 #[cfg(host_view)]
 mod session;
+#[cfg(host_view)]
+mod text_log;
 
 pub mod window;
 #[cfg(host_view)]
@@ -268,6 +270,8 @@ pub struct Options {
     control_stdin: bool,
     /// Record the player's input as a replay schedule; also `ADV_RECORD_INPUT=PATH`.
     record_input: Option<PathBuf>,
+    /// Write the session's text records as JSON lines.
+    text_log: Option<PathBuf>,
     /// Serve `tools/debug/hitode_debug.py`; also `ADV_DEBUG=1`.
     pub debug: bool,
     frame_budget: bool,
@@ -474,6 +478,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --frame-budget          opt-in bounded per-frame accounting (headless, one worker)\n\
   --control-stdin         explicitly enable line-based diagnostic commands\n\
   --record-input PATH     record the player's input as a play_session.py schedule\n\
+  --text-log PATH         write drawn text and produced glyphs as JSON lines\n\
   --debug                 serve the interactive debugger (tools/debug/hitode_debug.py)\n\
   --help                  show this help\n\
 All guest code, including DLLs and callbacks, executes inside the guest CPU.";
@@ -541,6 +546,7 @@ impl Options {
             profile: false,
             control_stdin: false,
             record_input: None,
+            text_log: None,
             debug: false,
             frame_budget: false,
             audio: false,
@@ -673,6 +679,7 @@ impl Options {
                 "--profile" => options.profile = true,
                 "--control-stdin" => options.control_stdin = true,
                 "--record-input" => options.record_input = Some(value()?.into()),
+                "--text-log" => options.text_log = Some(value()?.into()),
                 "--debug" => options.debug = true,
                 "--frame-budget" => options.frame_budget = true,
                 "--audio" => options.audio = true,
