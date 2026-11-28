@@ -660,12 +660,20 @@ pub(crate) struct PeriodEstimator {
     inferred: Option<i64>,
     last_frame_ns: Option<i64>,
     posted_at_ns: Option<i64>,
-    slower_run: Option<(i64, u8)>,
+    candidate: Option<(i64, u8)>,
 }
 #[cfg(any(target_os = "android", test))]
 impl PeriodEstimator {
-    const MIN_PERIOD_NS: i64 = 2_000_000;
-    const MAX_PERIOD_NS: i64 = 50_000_000;
+    /// Bounds covering ~285 Hz..~28.6 Hz (240 Hz..30 Hz with jitter margin).
+    const MIN_PERIOD_NS: i64 = 3_500_000;
+    const MAX_PERIOD_NS: i64 = 35_000_000;
+    /// Consecutive matching callbacks required to establish an initial or faster period.
+    const CONSISTENT_SAMPLES: u8 = 2;
+    /// Consecutive matching callbacks required to switch to a non-multiple slower period.
+    const SLOWER_SAMPLES: u8 = 4;
+    /// Consecutive matching callbacks required to switch to an integer multiple of the
+    /// current period (e.g. genuine 120 Hz -> 60 Hz switch vs missed Choreographer callbacks).
+    const SLOWER_MULTIPLE_SAMPLES: u8 = 8;
 
     pub(crate) fn set_reported(&mut self, period_ns: i64) {
         if period_ns > 0 {
@@ -677,48 +685,86 @@ impl PeriodEstimator {
         self.posted_at_ns = Some(now_ns);
     }
 
+    fn periods_match(a: i64, b: i64) -> bool {
+        (a - b).abs() * 10 <= a.min(b)
+    }
+
+    fn is_integer_multiple(delta: i64, base: i64) -> bool {
+        if delta <= base || base <= 0 {
+            return false;
+        }
+        let mult = (delta + base / 2) / base;
+        mult >= 2 && (delta - mult * base).abs() * 10 <= mult * base
+    }
+
+    fn record_candidate(&mut self, delta: i64, required: u8) -> Option<i64> {
+        match self.candidate {
+            Some((cand, count)) if Self::periods_match(delta, cand) => {
+                let next_count = count + 1;
+                let avg = (cand * i64::from(count) + delta) / i64::from(next_count);
+                if next_count >= required {
+                    self.candidate = None;
+                    Some(avg)
+                } else {
+                    self.candidate = Some((avg, next_count));
+                    None
+                }
+            }
+            _ => {
+                self.candidate = Some((delta, 1));
+                None
+            }
+        }
+    }
+
     pub(crate) fn on_frame(&mut self, frame_ns: i64) -> Option<i64> {
         let prev = self.last_frame_ns.replace(frame_ns);
         let posted = self.posted_at_ns.take();
         if let Some(period) = self.reported {
             return Some(period);
         }
-        if let (Some(prev), Some(posted)) = (prev, posted) {
+        let adjacent = prev.zip(posted).and_then(|(prev, posted)| {
             let delta = frame_ns.saturating_sub(prev);
             let post_delay = posted.saturating_sub(prev);
-            // A callback posted before 40% of `delta` cannot have skipped a
-            // vsync (which requires waiting at least 50% of `delta`).
-            if (Self::MIN_PERIOD_NS..=Self::MAX_PERIOD_NS).contains(&delta)
+            let tight_post = self
+                .inferred
+                .is_none_or(|cur| delta <= cur || post_delay < cur / 2);
+            ((Self::MIN_PERIOD_NS..=Self::MAX_PERIOD_NS).contains(&delta)
                 && posted >= prev.saturating_sub(2_000_000)
-                && post_delay < delta * 2 / 5
-            {
-                match self.inferred {
-                    None => {
-                        self.inferred = Some(delta);
-                        self.slower_run = None;
-                    }
-                    Some(cur) if delta < cur * 3 / 4 => {
-                        self.inferred = Some(delta);
-                        self.slower_run = None;
-                    }
-                    Some(cur) if (delta - cur).abs() <= cur / 6 => {
-                        self.inferred = Some((cur * 7 + delta) / 8);
-                        self.slower_run = None;
-                    }
-                    Some(_) => match self.slower_run {
-                        Some((cand, count)) if (delta - cand).abs() <= cand / 8 => {
-                            let avg = (cand * i64::from(count) + delta) / i64::from(count + 1);
-                            if count + 1 >= 4 {
-                                self.inferred = Some(avg);
-                                self.slower_run = None;
-                            } else {
-                                self.slower_run = Some((avg, count + 1));
-                            }
-                        }
-                        _ => {
-                            self.slower_run = Some((delta, 1));
-                        }
-                    },
+                && post_delay < delta / 4
+                && tight_post)
+                .then_some(delta)
+        });
+        let Some(delta) = adjacent else {
+            // Idle gaps, missing posts, or out-of-range deltas break any
+            // consecutive candidate run so isolated missed callbacks never accumulate.
+            self.candidate = None;
+            return self.inferred;
+        };
+        match self.inferred {
+            None => {
+                if let Some(confirmed) = self.record_candidate(delta, Self::CONSISTENT_SAMPLES) {
+                    self.inferred = Some(confirmed);
+                }
+            }
+            Some(cur) if Self::periods_match(delta, cur) => {
+                self.inferred = Some((cur * 7 + delta) / 8);
+                self.candidate = None;
+            }
+            Some(cur) if delta < cur => {
+                // Shrink promptly once a shorter consistent period is observed.
+                if let Some(faster) = self.record_candidate(delta, Self::CONSISTENT_SAMPLES) {
+                    self.inferred = Some(faster);
+                }
+            }
+            Some(cur) => {
+                let required = if Self::is_integer_multiple(delta, cur) {
+                    Self::SLOWER_MULTIPLE_SAMPLES
+                } else {
+                    Self::SLOWER_SAMPLES
+                };
+                if let Some(slower) = self.record_candidate(delta, required) {
+                    self.inferred = Some(slower);
                 }
             }
         }
@@ -834,20 +880,111 @@ mod tests {
     // spec: AND-APP-10
     #[test]
     fn api29_period_estimator_infers_adjacent_display_period_and_rejects_idle_gaps() {
-        // Adjacent 120 Hz callbacks infer ~8.33 ms even without refresh-rate callbacks.
+        // Adjacent 120 Hz callbacks infer ~8.33 ms once confirmed by consecutive samples.
         let mut est = PeriodEstimator::default();
         est.on_post(0);
         assert_eq!(est.on_frame(1_000_000), None);
         est.on_post(1_500_000);
-        assert_eq!(est.on_frame(9_333_333), Some(8_333_333));
+        assert_eq!(est.on_frame(9_333_333), None);
+        est.on_post(9_800_000);
+        assert_eq!(est.on_frame(17_666_666), Some(8_333_333));
         // An idle gap (posted 9 ms after previous frame) must not overwrite 120 Hz with 60 Hz.
-        est.on_post(18_500_000);
-        assert_eq!(est.on_frame(26_000_000), Some(8_333_333));
+        est.on_post(26_666_666);
+        assert_eq!(est.on_frame(34_333_333), Some(8_333_333));
 
         // Reported API 30+ refresh-rate callbacks take precedence over inferred periods.
         est.set_reported(11_111_111);
-        est.on_post(26_500_000);
-        assert_eq!(est.on_frame(34_333_333), Some(11_111_111));
+        est.on_post(34_800_000);
+        assert_eq!(est.on_frame(42_666_666), Some(11_111_111));
+    }
+    // spec: AND-APP-10
+    #[test]
+    fn api29_period_estimator_rejects_missed_callbacks_and_adapts_to_rate_switches() {
+        let step = |est: &mut PeriodEstimator, t: &mut i64, delta: i64| -> Option<i64> {
+            est.on_post(*t + 500_000);
+            *t += delta;
+            est.on_frame(*t)
+        };
+        for period in [16_666_667i64, 11_111_111, 8_333_333, 6_944_444] {
+            // A dropped first callback (2*period) must not be adopted as the panel period.
+            let mut est = PeriodEstimator::default();
+            let mut t = 1_000_000i64;
+            est.on_post(0);
+            assert_eq!(est.on_frame(t), None);
+            assert_eq!(step(&mut est, &mut t, period * 2), None);
+            assert_eq!(step(&mut est, &mut t, period), None);
+            let confirmed = step(&mut est, &mut t, period).unwrap();
+            assert!(
+                (confirmed - period).abs() <= 2,
+                "period={period} confirmed={confirmed}"
+            );
+
+            // Single 2x and 3x missed-callback gaps, and repeated isolated gaps separated
+            // by idle pauses or normal callbacks, must not alter the estimated period.
+            for mult in [2i64, 3] {
+                for _ in 0..6 {
+                    let got = step(&mut est, &mut t, period * mult).unwrap();
+                    assert!(
+                        (got - period).abs() <= 10,
+                        "period={period} mult={mult} got={got}"
+                    );
+                    // Interleave an idle pause so isolated misses cannot accumulate.
+                    est.on_post(t + period);
+                    t += period * 2;
+                    let after_idle = est.on_frame(t).unwrap();
+                    assert!(
+                        (after_idle - period).abs() <= 10,
+                        "period={period} after_idle={after_idle}"
+                    );
+                }
+                let recovered = step(&mut est, &mut t, period).unwrap();
+                assert!(
+                    (recovered - period).abs() <= 10,
+                    "period={period} recovered={recovered}"
+                );
+            }
+        }
+
+        // Genuine sustained 120 Hz -> 60 Hz switch adapts cleanly, then shrinks back to 120 Hz.
+        let mut est = PeriodEstimator::default();
+        let mut t = 1_000_000i64;
+        est.on_post(0);
+        est.on_frame(t);
+        step(&mut est, &mut t, 8_333_333);
+        assert_eq!(step(&mut est, &mut t, 8_333_333), Some(8_333_333));
+        // Brief 3-frame burst of dropped callbacks stays at 120 Hz.
+        for _ in 0..3 {
+            assert_eq!(step(&mut est, &mut t, 16_666_667), Some(8_333_333));
+        }
+        assert_eq!(step(&mut est, &mut t, 8_333_333), Some(8_333_333));
+        // Sustained 60 Hz across 8 consecutive callbacks switches cleanly.
+        for i in 1..=8 {
+            let got = step(&mut est, &mut t, 16_666_667).unwrap();
+            if i < 8 {
+                assert_eq!(got, 8_333_333, "switched too early at sample {i}");
+            } else {
+                assert_eq!(got, 16_666_667, "failed to adopt sustained 60 Hz");
+            }
+        }
+        // Switching back up to 120 Hz shrinks promptly on 2 consistent callbacks.
+        assert_eq!(step(&mut est, &mut t, 8_333_333), Some(16_666_667));
+        assert_eq!(step(&mut est, &mut t, 8_333_333), Some(8_333_333));
+
+        // Non-multiple sustained switch (90 Hz -> 60 Hz) adapts in 4 consecutive callbacks.
+        let mut est90 = PeriodEstimator::default();
+        let mut t90 = 1_000_000i64;
+        est90.on_post(0);
+        est90.on_frame(t90);
+        step(&mut est90, &mut t90, 11_111_111);
+        assert_eq!(step(&mut est90, &mut t90, 11_111_111), Some(11_111_111));
+        for i in 1..=4 {
+            let got = step(&mut est90, &mut t90, 16_666_667).unwrap();
+            if i < 4 {
+                assert_eq!(got, 11_111_111);
+            } else {
+                assert_eq!(got, 16_666_667);
+            }
+        }
     }
     // spec: AND-APP-10
     #[test]

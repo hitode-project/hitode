@@ -31,6 +31,8 @@ fn instant_from_monotonic(frame_ns: i64) -> Instant {
     }
 }
 
+const API29_MAX_PROBES: u8 = 4;
+
 pub(super) struct MainLoop {
     looper: NonNull<ALooper>,
     timer: OwnedFd,
@@ -38,7 +40,7 @@ pub(super) struct MainLoop {
     choreographer: *mut AChoreographer,
     pending: Cell<bool>,
     frame_waiting: Cell<bool>,
-    probed: Cell<bool>,
+    probes: Cell<u8>,
     pacer: RefCell<crate::frontend::RefreshPacer>,
     estimator: RefCell<crate::frontend::PeriodEstimator>,
     unregister: Option<RateHook>,
@@ -81,7 +83,7 @@ impl MainLoop {
             choreographer,
             pending: Cell::new(false),
             frame_waiting: Cell::new(false),
-            probed: Cell::new(false),
+            probes: Cell::new(0),
             pacer: RefCell::default(),
             estimator: RefCell::default(),
             unregister: (!register.is_null() && !unregister.is_null())
@@ -190,20 +192,20 @@ unsafe extern "C" fn frame_callback(frame_ns: i64, data: *mut c_void) {
                     Duration::from_nanos(period as u64),
                 );
             }
-            if !main_loop.frame_waiting.replace(false) {
-                return false;
-            }
-            let counted = main_loop.pacer.borrow_mut().counts(frame_ns, period);
-            if !counted {
+            let waiting = main_loop.frame_waiting.replace(false);
+            let counted = waiting && main_loop.pacer.borrow_mut().counts(frame_ns, period);
+            if waiting && !counted {
                 // A waiting frame attaches on the next counted refresh.
                 main_loop.frame_waiting.set(true);
                 main_loop.post_frame();
             } else if main_loop.unregister.is_none()
                 && period == 0
-                && !main_loop.probed.replace(true)
+                && main_loop.probes.get() < API29_MAX_PROBES
             {
-                // API 29 lacks refresh-rate callbacks: take one adjacent
-                // sample after the first active frame to measure the panel.
+                // API 29 lacks refresh-rate callbacks: collect a bounded run
+                // of adjacent callbacks after the first active frame until
+                // consecutive samples confirm the panel period.
+                main_loop.probes.set(main_loop.probes.get() + 1);
                 main_loop.post_frame();
             }
             counted
