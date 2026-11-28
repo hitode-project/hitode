@@ -151,6 +151,80 @@ fn discovered_fonts_and_aliases_survive_prefix_reuse() {
     }
 }
 
+// spec: WINE-UNIX-6, WINE-SES-5
+#[test]
+fn dc_font_code_page_and_hooked_glyph_outline_follow_locale_association() {
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("adv-wine-font-codepage-{}", std::process::id()));
+    let game = root.join("game");
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::copy(
+        probes.join("font_codepage.exe"),
+        game.join("font_codepage.exe"),
+    )
+    .unwrap();
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../adv-device/tests/fixtures");
+    std::fs::copy(
+        fixtures.join("font-resource-japanese.ttf"),
+        game.join("japanese.ttf"),
+    )
+    .unwrap();
+    let fonts = format!(r"\??\unix{}", fixtures.to_string_lossy().replace('/', "\\"));
+    let mut host = Host::default();
+    // Reuse one prefix server across DBCS and Western locales so FontAssoc
+    // registry values must be updated on every session start.
+    for (pass, (locale, acp, expected_ansi, hooked)) in [
+        (0x804, 936, 936, true),
+        (0x411, 932, 1252, false),
+        (0x404, 950, 950, true),
+        (0x409, 1252, 1252, false),
+        (0x804, 936, 936, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = root.join(format!("stdout-{pass}"));
+        let stdout = std::fs::File::create(&output).unwrap();
+        let config = Config {
+            dist: &dist,
+            prefix: &root.join("prefix"),
+            drive: None,
+            locale,
+            fonts: &fonts,
+            exe: Some(&game.join("font_codepage.exe")),
+            width: 640,
+            height: 480,
+            jit: true,
+            debug: "",
+            stdout: Some(std::os::fd::AsRawFd::as_raw_fd(&stdout)),
+        };
+        let mut session = host
+            .start(
+                &config,
+                adv_sync::WakeEvent::new().unwrap(),
+                &SessionOptions::default(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let stop = session.run(Instant::now() + Duration::from_secs(30));
+        drop(session);
+        drop(stdout);
+        let text = std::fs::read_to_string(output).unwrap();
+        assert!(
+            matches!(stop, Stop::Exited(0)),
+            "pass {pass} (locale {locale:#x}): {stop:?}: {text}"
+        );
+        let mut expected = vec![format!("acp={acp} ansi_cp={expected_ansi} no_dfa_cp=1252")];
+        if hooked {
+            expected.push("hooked_ggo=1".into());
+        }
+        assert_eq!(text.lines().collect::<Vec<_>>(), expected);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn probe(name: &str, draw: bool) -> Option<(Vec<u8>, String, Duration, String)> {
     let wine::Wine { dist, probes } = wine::wine()?;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

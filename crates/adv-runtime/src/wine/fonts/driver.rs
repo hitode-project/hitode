@@ -12,12 +12,21 @@ fn write(env: &mut Env<'_>, pointer: u32, bytes: &[u8]) -> Outcome {
         Outcome::Return(0)
     }
 }
+/// Registry key Wine's `get_associated_charset_info` reads when updating a DC's
+/// font code page for `ANSI_CHARSET` fonts.
+const ASSOCIATED_CHARSET_KEY: &str = concat!(
+    r"\Registry\Machine\System\CurrentControlSet\Control",
+    r"\FontAssoc\Associated Charset"
+);
+
 /// The tables Wine's `update_codepage` fills: win32u's own ANSI and OEM
-/// conversions read them.
+/// conversions read them, and `update_font_code_page` reads the associated
+/// charset values from the registry.
 fn code_pages(env: &mut Env<'_>) {
     let teb = env.sys.contexts[env.context as usize].teb;
     let peb = env.cpu.read_u32(teb + 0x30).unwrap();
-    for (data, table) in [
+    let mut acp = 0u16;
+    for (index, (data, table)) in [
         (0, super::data(env, |l| l.utf8_cp)),
         (
             env.cpu.read_u32(peb + 0x58).unwrap(),
@@ -27,9 +36,46 @@ fn code_pages(env: &mut Env<'_>) {
             env.cpu.read_u32(peb + 0x5c).unwrap(),
             super::data(env, |l| l.oem_cp),
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let info = code_page_table(env, data);
+        if index == 1 {
+            acp = u16::from_le_bytes([info[0], info[1]]);
+        }
         env.cpu.write(table.unwrap(), &info).unwrap();
+    }
+    font_association(env, acp);
+}
+
+/// Mirrors Wine's `update_font_association_info` so `GdiGetCodePage` and Wine's
+/// own ANSI GDI bodies follow Windows' DBCS font-association rules for `acp`.
+fn font_association(env: &mut Env<'_>, acp: u16) {
+    let values = match acp {
+        932 => Some([("ANSI(00)", "NO"), ("OEM(FF)", "NO"), ("SYMBOL(02)", "NO")]),
+        936 | 949 | 950 => Some([
+            ("ANSI(00)", "YES"),
+            ("OEM(FF)", "YES"),
+            ("SYMBOL(02)", "NO"),
+        ]),
+        _ => None,
+    };
+    if let Some(values) = values {
+        for (name, value) in values {
+            adv_nt::registry::set_volatile_string(env, ASSOCIATED_CHARSET_KEY, name, value)
+                .unwrap();
+        }
+    } else {
+        for name in ["ANSI(00)", "OEM(FF)", "SYMBOL(02)"] {
+            match adv_nt::registry::delete_platform_value(env, ASSOCIATED_CHARSET_KEY, name) {
+                Ok(())
+                | Err(adv_nt::status::Error::Status(
+                    adv_nt::status::OBJECT_NAME_NOT_FOUND | adv_nt::status::OBJECT_PATH_NOT_FOUND,
+                )) => {}
+                Err(error) => panic!("clear font association value {name}: {error:?}"),
+            }
+        }
     }
 }
 
