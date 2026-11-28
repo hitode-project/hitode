@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 
 pub(super) struct State {
     pub fixed: fixed::State,
+    /// `fixed` with lighting off for draws that pass DONOTLIGHT, tagged
+    /// with the key of the `fixed` it derives from.
+    unlit: std::cell::RefCell<Option<(u128, fixed::State)>>,
     recording: Option<Saved>,
     blocks: BTreeMap<u32, Saved>,
     next_block: u32,
@@ -21,6 +24,25 @@ struct Saved {
 pub(super) type BindingChanges = [(u32, u32); 8];
 
 impl State {
+    /// The state a draw runs with. Keying the device state here caches its
+    /// fingerprint across the draws that follow.
+    pub fn draw_state(&self, lit: bool) -> fixed::State {
+        let key = self.fixed.key();
+        if lit {
+            return self.fixed.clone();
+        }
+        let mut unlit = self.unlit.borrow_mut();
+        if let Some((tag, state)) = unlit.as_ref()
+            && *tag == key
+        {
+            return state.clone();
+        }
+        let mut state = self.fixed.clone();
+        state.apply(Setting::Render(fixed::Render::Lighting, 0));
+        state.key();
+        *unlit = Some((key, state.clone()));
+        state
+    }
     pub fn new(width: u32, height: u32, depth: bool, device7: Option<super::caps::Device>) -> Self {
         let mut fixed = desc::state::defaults(width, height, depth);
         if let Some(device) = device7 {
@@ -36,6 +58,7 @@ impl State {
         }
         Self {
             fixed,
+            unlit: Default::default(),
             recording: None,
             blocks: BTreeMap::new(),
             next_block: 1,
