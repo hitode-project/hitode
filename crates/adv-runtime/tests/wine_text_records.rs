@@ -4,7 +4,9 @@
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use adv_runtime::wine::session::{Config, Host, SessionOptions, Stop};
-use adv_runtime::wine::text_records::{Code, CopiedPixels, CopyKind, DrawnLine, TextRecord};
+use adv_runtime::wine::text_records::{
+    Code, DrawnLine, Map, MoveKind, MovedPixels, Store, TextRecord,
+};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -48,6 +50,8 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
     )
     .unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../adv-device/tests/fixtures");
+    let cff = fixtures.join("font-resource-japanese-cff.otf");
+    std::fs::copy(cff, game.join("cff.otf")).unwrap();
     let font_path = format!(r"\??\unix{}", fixtures.to_string_lossy().replace('/', "\\"));
     let output = root.join("stdout");
     let stdout = std::fs::File::create(&output).unwrap();
@@ -87,7 +91,7 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
     let words: Vec<u32> = loop {
         let stop = session.run(Instant::now() + Duration::from_millis(50));
         let bytes = std::fs::read(&report).unwrap_or_default();
-        if bytes.len() == 24 {
+        if bytes.len() == 28 {
             break bytes
                 .chunks(4)
                 .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
@@ -99,12 +103,39 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
             std::fs::read_to_string(&output).unwrap()
         );
     };
-    let [buffer, bytes, first, second, hwnd, converted] = words[..] else {
+    let [buffer, bytes, first, second, hwnd, converted, dwrite] = words[..] else {
         panic!("{words:?}");
     };
     let batch = session.take_text_records();
     let windows = session.window_planes();
+    // Glyph indices turn back into characters through the recorded fonts.
+    let mut characters = |font, code| match code {
+        Code::Index(glyph) => session.glyph_characters(font, glyph),
+        other => panic!("{other:?}"),
+    };
+    let indexed: Vec<_> = batch
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TextRecord::Line(line) if matches!(line.glyphs[0].code, Code::Index(_)) => Some(
+                line.glyphs
+                    .iter()
+                    .map(|glyph| characters(line.font, glyph.code))
+                    .collect::<Vec<_>>(),
+            ),
+            TextRecord::Glyph(glyph) if glyph.dc.is_none() => {
+                Some(vec![characters(glyph.font, glyph.code)])
+            }
+            _ => None,
+        })
+        .collect();
     drop(session);
+    assert_eq!(indexed[0], [[0x3042], [0x20]]);
+    assert!(
+        indexed[1..].iter().all(|glyphs| glyphs == &[[0x3042]]),
+        "{indexed:?}"
+    );
+    assert!(indexed.len() > 1, "{indexed:?}");
 
     assert_eq!(batch.dropped, 0);
     let sequences: Vec<_> = batch.records.iter().map(TextRecord::sequence).collect();
@@ -165,16 +196,17 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
             _ => None,
         })
         .collect();
-    assert_eq!(glyphs.len(), 1, "{glyphs:#?}");
+    // GetGlyphOutline's glyph, then the one DirectWrite rasterized.
+    let (outline, directwrite) = glyphs.split_first().unwrap();
     assert_eq!(
-        (
-            glyphs[0].code,
-            glyphs[0].buffer,
-            glyphs[0].len,
-            glyphs[0].dc
-        ),
-        (Code::Unicode(0x3042), buffer, bytes, lines[0].dc)
+        (outline.code, outline.buffer, outline.len, outline.dc),
+        (Code::Unicode(0x3042), buffer, bytes, Some(lines[0].dc))
     );
+    assert!(!directwrite.is_empty(), "{glyphs:#?}");
+    for glyph in directwrite {
+        assert_eq!((glyph.code, glyph.dc), (Code::Index(dwrite), None));
+        assert_ne!(glyph.len, 0);
+    }
 
     // The window's surface holds the copied text and the line drawn on it.
     let window = windows
@@ -184,36 +216,53 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
     assert_eq!(window.client, Some([0, 0, 200, 120]));
     assert_eq!(lines[5].plane.unwrap().bits, window.bits);
 
-    // Only copies out of planes that hold text are kept: not the plain blit.
-    let copies: Vec<&CopiedPixels> = batch
+    // Only moves out of stores that hold text are kept: not the plain blit.
+    let moves: Vec<&MovedPixels> = batch
         .records
         .iter()
         .filter_map(|record| match record {
-            TextRecord::Copy(copy) => Some(copy),
+            TextRecord::Move(moved) => Some(moved),
             _ => None,
         })
         .collect();
-    let moved: Vec<_> = copies
+    let memory = |store: Store| match store {
+        Store::Memory(plane) => plane,
+        other => panic!("{other:?}"),
+    };
+    let summary: Vec<_> = moves
         .iter()
-        .map(|copy| (copy.kind, copy.source.bits, copy.rect, copy.offset))
+        .map(|moved| (moved.kind, memory(moved.source).bits, moved.rect, moved.map))
         .collect();
     assert_eq!(
-        moved,
+        summary,
         [
-            (CopyKind::Copy, dib.bits, [10, 4, 170, 100], [-10, -4]),
-            (CopyKind::Blend, dib.bits, [0, 0, 64, 32], [2, 2]),
-            (CopyKind::Convert, dib.bits, [0, 0, 160, 96], [0, 0]),
+            (
+                MoveKind::Copy,
+                dib.bits,
+                [10, 4, 170, 100],
+                Some(Map::offset(-10, -4))
+            ),
+            (
+                MoveKind::Blend,
+                dib.bits,
+                [0, 0, 64, 32],
+                Some(Map::offset(2, 2))
+            ),
+            (
+                MoveKind::Convert,
+                dib.bits,
+                [0, 0, 160, 96],
+                Some(Map::offset(0, 0))
+            ),
         ],
-        "{copies:#?}"
+        "{moves:#?}"
     );
+    let [window_copy, blended, converted_copy] = [0, 1, 2].map(|n| memory(moves[n].destination));
     assert_eq!(
-        (copies[0].destination.bits, copies[0].destination.stride),
+        (window_copy.bits, window_copy.stride),
         (window.bits, window.stride as i32)
     );
-    assert_ne!(copies[1].destination.bits, dib.bits);
-    assert_eq!(
-        (copies[2].destination.bits, copies[2].destination.bpp),
-        (converted, 24)
-    );
-    assert!(copies.iter().all(|copy| copy.thread == thread));
+    assert_ne!(blended.bits, dib.bits);
+    assert_eq!((converted_copy.bits, converted_copy.bpp), (converted, 24));
+    assert!(moves.iter().all(|moved| moved.thread == thread));
 }

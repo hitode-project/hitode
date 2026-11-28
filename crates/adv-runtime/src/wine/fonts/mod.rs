@@ -40,6 +40,8 @@ pub(super) struct Fonts {
     apis: Registry,
     dwrite: std::collections::BTreeMap<u32, (text::FontResourceId, u32)>,
     realizations: std::collections::BTreeMap<u32, FontRequest>,
+    /// The fonts text records name, by key (WINE-UNIX-8).
+    pub(super) recorded: Vec<FontRequest>,
 }
 
 pub(super) fn install<B: adv_cpu::backend::Backend>(
@@ -73,6 +75,7 @@ pub(super) fn install<B: adv_cpu::backend::Backend>(
         eudc: None,
         dwrite: Default::default(),
         realizations: Default::default(),
+        recorded: Vec::new(),
     });
     machine
         .ext
@@ -783,7 +786,7 @@ fn glyph(
                 return fail(env);
             }
             if fetch && !bytes.is_empty() {
-                record_glyph(env, dc, &font, character, buffer.addr(), bytes.len());
+                record_glyph(env, Some(dc), &font, character, buffer.addr(), bytes.len());
             }
             Outcome::Return(glyph.required_bytes)
         }
@@ -801,29 +804,53 @@ fn code(character: Character) -> super::text_records::Code {
     }
 }
 
-/// The drawing guest thread's ID, from its TEB client ID.
-fn thread_id(env: &Env<'_>) -> u32 {
-    let teb = env.sys.contexts[env.context as usize].teb;
-    env.cpu.read_u32(teb + 0x24).unwrap_or(0)
+/// The key text records name `font` by; it stays valid while records are on.
+fn recorded_font(env: &mut Env<'_>, font: &FontRequest) -> u32 {
+    let recorded = &mut env.ext.get_mut::<Fonts>().recorded;
+    let key = recorded
+        .iter()
+        .position(|known| known == font)
+        .unwrap_or_else(|| {
+            recorded.push(font.clone());
+            recorded.len() - 1
+        });
+    key as u32
 }
+
+/// The characters `glyph` stands for in the recorded font `font`.
+pub(super) fn glyph_characters(ext: &mut adv_machine::Ext, font: u32, glyph: u32) -> Vec<u32> {
+    let fonts = ext.get_mut::<Fonts>();
+    let Some(request) = fonts.recorded.get(font as usize).cloned() else {
+        return Vec::new();
+    };
+    fonts
+        .text
+        .glyph_characters(&request, glyph)
+        .unwrap_or_default()
+}
+
+/// Glyph bytes written for the guest (WINE-UNIX-8); `dc` is GetGlyphOutline's.
 fn record_glyph(
     env: &mut Env<'_>,
-    dc: u32,
+    dc: Option<u32>,
     font: &FontRequest,
     character: Character,
     buffer: u32,
     len: usize,
 ) {
-    let thread = thread_id(env);
-    let Some(mut records) = super::text_records::records(env.ext) else {
+    if super::text_records::records(env.ext).is_none() {
         return;
-    };
+    }
+    let thread = super::text_records::thread(env);
+    let key = recorded_font(env, font);
+    let mut records = super::text_records::records(env.ext).unwrap();
     let sequence = records.sequence();
     records.push(super::text_records::TextRecord::Glyph(
         super::text_records::ProducedGlyph {
             sequence,
             thread,
             dc,
+            font: key,
             face: font.face.clone(),
             height: font.height,
             code: code(character),

@@ -1,6 +1,6 @@
 //! Wine 11 DIB primitives over checked, directly accessible guest spans.
 
-use super::text_records::{CopyKind, Plane};
+use super::text_records::{MoveKind, Plane};
 use adv_cpu::body::{EAX, EDX, Input, Mem, Ret, Stop};
 use adv_machine::Conv;
 #[path = "dib_layout.rs"]
@@ -883,23 +883,23 @@ fn pattern_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
 
 fn copy_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let done = copy_rect_pixels(env)?;
-    note_copy(env, CopyKind::Copy);
+    note_copy(env, MoveKind::Copy);
     Some(done)
 }
 fn blend_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let done = blend_rects_pixels(env)?;
-    note_copy(env, CopyKind::Blend);
+    note_copy(env, MoveKind::Blend);
     Some(done)
 }
 fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let done = convert_to_pixels(env)?;
-    note_copy(env, CopyKind::Convert);
+    note_copy(env, MoveKind::Convert);
     Some(done)
 }
 
 /// Note a completed copy for text records (WINE-UNIX-8). It rereads inputs
 /// the body already read, and never fails the body.
-fn note_copy(env: &mut Args<'_, impl Mem>, kind: CopyKind) {
+fn note_copy(env: &mut Args<'_, impl Mem>, kind: MoveKind) {
     let services = env.cpu.mem.services();
     if services.text_state.is_null() {
         return;
@@ -915,19 +915,19 @@ fn note_copy(env: &mut Args<'_, impl Mem>, kind: CopyKind) {
 /// the source offset from destination points.
 fn copy_extent(
     env: &mut Args<'_, impl Mem>,
-    kind: CopyKind,
+    kind: MoveKind,
 ) -> Option<(Plane, [i32; 4], Plane, [i32; 2])> {
     let base = env.base;
     let dst = destination(env)?;
     match kind {
-        CopyKind::Copy => {
+        MoveKind::Copy => {
             let src = Dib::read(&mut env.cpu, env.args[2], base)?;
             let rect = rects(&mut env.cpu, env.args[1], 1)?.get(0);
             let (sx, sy) = point(&mut env.cpu, env.args[3])?;
             let offset = [sx.wrapping_sub(rect[0]), sy.wrapping_sub(rect[1])];
             Some((dst.plane(), rect, src.plane_as(dst.pixel_bpp), offset))
         }
-        CopyKind::Blend => {
+        MoveKind::Blend => {
             let src = Dib::read(&mut env.cpu, env.args[3], base)?;
             let rect = rects(&mut env.cpu, env.args[2], env.args[1])?
                 .iter()
@@ -943,7 +943,7 @@ fn copy_extent(
             let (sx, sy) = point(&mut env.cpu, env.args[4])?;
             Some((dst.plane(), rect, src.plane_as(32), [sx, sy]))
         }
-        CopyKind::Convert => {
+        MoveKind::Convert => {
             let src = Dib::read(&mut env.cpu, env.args[1], base)?;
             let mut bytes = [0; rect::SIZE];
             read_into(&mut env.cpu, env.args[2], &mut bytes)?;
@@ -951,6 +951,8 @@ fn copy_extent(
             let rect = [0, 0, r.wrapping_sub(l), b.wrapping_sub(t)];
             Some((dst.plane(), rect, src.plane(), [l, t]))
         }
+        // The other moves are not DIB primitives.
+        _ => None,
     }
 }
 

@@ -637,6 +637,15 @@ impl Text {
     ) -> Result<Vec<u16>, TextError> {
         self.font(request)?.glyph_indices(units, missing)
     }
+    /// The characters the font's cmap maps to glyph index `glyph`, which
+    /// turns glyph-index text back into characters.
+    pub fn glyph_characters(
+        &mut self,
+        request: &FontRequest,
+        glyph: u32,
+    ) -> Result<Vec<u32>, TextError> {
+        self.font(request)?.glyph_characters(glyph)
+    }
     pub fn char_width_info(&mut self, request: &FontRequest) -> Result<[i32; 2], TextError> {
         self.font(request)?.width_info()
     }

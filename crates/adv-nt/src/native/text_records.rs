@@ -1,20 +1,26 @@
 //! Text records (WINE-UNIX-8): the lines the host font frontend draws, the
-//! glyph bytes it hands the guest, and the host pixel copies that move drawn
-//! text, kept only while a host consumer asks.
+//! glyph bytes it hands the guest, and the host pixel moves that carry drawn
+//! text on, kept only while a host consumer asks.
 //!
 //! Text extraction reads these at the points where a character turns into
 //! pixels or glyph bytes and would lose its identity. A drawn line keeps its
 //! characters, or glyph indices when the guest drew indices, with the device
 //! origin of each on the plane it went to. A produced glyph keeps the guest
 //! range its bytes went to, so later uses of those bytes can be traced back to
-//! the character. A copy is kept only when its source plane has held text, and
-//! then marks its destination plane as holding text, so records follow drawn
-//! text from plane to plane and ignore unrelated blits.
+//! the character. A move (a DIB copy, a device upload, draw or copy, or a
+//! present) is kept only when its source holds text, and then marks its
+//! destination as holding text, so records follow drawn text from store to
+//! store and ignore unrelated pixels.
 //!
-//! The store is shared with the DIB bodies through `Services::text_state`,
+//! The records are shared with the DIB bodies through `Services::text_state`,
 //! which is null while records are off.
+use adv_cpu::backend::GuestExt;
 use adv_machine::{Ext, Sys};
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashSet, VecDeque},
+    rc::Rc,
+};
 
 /// What one glyph of a drawn line stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +35,7 @@ pub enum Code {
 
 /// A guest DIB as Wine's dib_info addresses it: device point `(x, y)` is the
 /// pixel at `bits + (origin[1] + y) * stride + (origin[0] + x) * bpp / 8`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Plane {
     pub bits: u32,
     /// Bytes from one row to the next; negative for bottom-up DIBs.
@@ -39,6 +45,35 @@ pub struct Plane {
     pub origin: [i32; 2],
     /// The bits' width and height in pixels.
     pub size: [i32; 2],
+}
+
+impl Plane {
+    /// The guest bytes the plane's rows occupy, as start and end.
+    pub fn span(&self) -> [u32; 2] {
+        let rows = i64::from(self.size[1].max(0));
+        let stride = i64::from(self.stride);
+        let start = i64::from(self.bits) + stride.min(0) * (rows - 1).max(0);
+        let end = start + stride.abs() * rows;
+        [start, end].map(|at| at.clamp(0, i64::from(u32::MAX)) as u32)
+    }
+}
+
+/// A device resource's subresource, as the DirectX frontends key it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Resource {
+    pub allocation: (u64, u64),
+    pub subresource: u64,
+}
+
+/// Where pixels are kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Store {
+    /// Guest memory, as a DIB or a locked surface addresses it.
+    Memory(Plane),
+    /// A device resource the guest cannot address.
+    Resource(Resource),
+    /// A window's client area, which a swap chain presents to.
+    Window(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +93,8 @@ pub struct DrawnLine {
     /// The DIB the line was composed into; `None` for metafile, path and
     /// other drivers, which receive the run instead.
     pub plane: Option<Plane>,
+    /// The session's key for the font, as `Session::glyph_characters` takes it.
+    pub font: u32,
     pub face: String,
     pub height: i32,
     /// Device coordinates the line was clipped to.
@@ -65,12 +102,16 @@ pub struct DrawnLine {
     pub glyphs: Vec<DrawnGlyph>,
 }
 
-/// Glyph bytes GetGlyphOutline wrote into a guest buffer.
+/// Glyph bytes GetGlyphOutline or DirectWrite wrote into a guest buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProducedGlyph {
     pub sequence: u64,
     pub thread: u32,
-    pub dc: u32,
+    /// The DC GetGlyphOutline used; DirectWrite has none.
+    pub dc: Option<u32>,
+    /// The session's key for the font, as `Session::glyph_characters` takes it.
+    pub font: u32,
+    /// The requested face; for DirectWrite, the font resource's name.
     pub face: String,
     pub height: i32,
     pub code: Code,
@@ -78,36 +119,64 @@ pub struct ProducedGlyph {
     pub len: u32,
 }
 
-/// The DIB primitive that copied pixels.
+/// What moved pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CopyKind {
+pub enum MoveKind {
     /// copy_rect: BitBlt and its relatives, with a raster operation.
     Copy,
     /// blend_rects: AlphaBlend.
     Blend,
     /// convert_to: a format conversion, as GetDIBits and SetDIBits make.
     Convert,
+    /// Guest memory to a device resource.
+    Upload,
+    /// A device copy between resources.
+    DeviceCopy,
+    /// A device draw that sampled the source.
+    Draw,
+    /// A swap chain presented the source to a window.
+    Present,
+    /// A device resource to guest memory.
+    Readback,
 }
 
-/// Pixels a host DIB primitive copied from a plane that has held text.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CopiedPixels {
+/// Which source pixel each destination pixel reads: the source point is
+/// the destination point times `scale`, plus `offset`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Map {
+    pub scale: [f64; 2],
+    pub offset: [f64; 2],
+}
+
+impl Map {
+    pub fn offset(x: i32, y: i32) -> Self {
+        Self {
+            scale: [1.0; 2],
+            offset: [f64::from(x), f64::from(y)],
+        }
+    }
+}
+
+/// Pixels moved from a source that holds text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MovedPixels {
     pub sequence: u64,
     pub thread: u32,
-    pub kind: CopyKind,
-    pub destination: Plane,
-    /// Destination device rectangle the copy wrote, as left, top, right, bottom.
+    pub kind: MoveKind,
+    pub destination: Store,
+    /// The destination rectangle written, as left, top, right, bottom.
     pub rect: [i32; 4],
-    pub source: Plane,
-    /// Source device point = destination device point + offset.
-    pub offset: [i32; 2],
+    pub source: Store,
+    /// `None` when the move reads the source in a way no affine map
+    /// describes, such as a transformed draw.
+    pub map: Option<Map>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TextRecord {
     Line(DrawnLine),
     Glyph(ProducedGlyph),
-    Copy(CopiedPixels),
+    Move(MovedPixels),
 }
 
 impl TextRecord {
@@ -115,13 +184,13 @@ impl TextRecord {
         match self {
             TextRecord::Line(line) => line.sequence,
             TextRecord::Glyph(glyph) => glyph.sequence,
-            TextRecord::Copy(copy) => copy.sequence,
+            TextRecord::Move(moved) => moved.sequence,
         }
     }
 }
 
 /// Records taken since the previous take.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TextBatch {
     pub records: Vec<TextRecord>,
     /// Records that did not fit before this take, so the batch is incomplete.
@@ -135,8 +204,47 @@ pub struct TextRecords {
     records: VecDeque<TextRecord>,
     next: u64,
     dropped: u64,
-    /// Bits of the planes that have held text, sorted.
-    planes: Vec<u32>,
+    holdings: Holdings,
+}
+
+/// The stores that have held text since records went on.
+#[derive(Default)]
+struct Holdings {
+    /// Sorted, disjoint guest byte ranges.
+    memory: Vec<[u32; 2]>,
+    stores: HashSet<Store>,
+}
+
+impl Holdings {
+    fn holds(&self, store: &Store) -> bool {
+        match store {
+            Store::Memory(plane) => {
+                let [start, end] = plane.span();
+                let at = self.memory.partition_point(|range| range[1] <= start);
+                self.memory.get(at).is_some_and(|range| range[0] < end)
+            }
+            other => self.stores.contains(other),
+        }
+    }
+
+    fn mark(&mut self, store: Store) {
+        let Store::Memory(plane) = store else {
+            self.stores.insert(store);
+            return;
+        };
+        let [mut start, mut end] = plane.span();
+        if start == end {
+            return;
+        }
+        // Merge every range that touches the new one.
+        let first = self.memory.partition_point(|range| range[1] < start);
+        let last = self.memory.partition_point(|range| range[0] <= end);
+        for range in &self.memory[first..last] {
+            start = start.min(range[0]);
+            end = end.max(range[1]);
+        }
+        self.memory.splice(first..last, [[start, end]]);
+    }
 }
 
 impl TextRecords {
@@ -154,7 +262,7 @@ impl TextRecords {
             plane: Some(plane), ..
         }) = &record
         {
-            self.mark(plane.bits);
+            self.holdings.mark(Store::Memory(*plane));
         }
         if self.records.len() == Self::CAPACITY {
             self.records.pop_front();
@@ -163,39 +271,30 @@ impl TextRecords {
         self.records.push_back(record);
     }
 
-    /// Keep a copy when its source has held text.
-    fn copied(
+    /// Keep a move when its source holds text; its destination then does.
+    pub fn moved(
         &mut self,
         thread: u32,
-        kind: CopyKind,
-        destination: Plane,
+        kind: MoveKind,
+        destination: Store,
         rect: [i32; 4],
-        source: Plane,
-        offset: [i32; 2],
+        source: Store,
+        map: Option<Map>,
     ) {
-        if self.planes.binary_search(&source.bits).is_err()
-            || rect[0] >= rect[2]
-            || rect[1] >= rect[3]
-        {
+        if rect[0] >= rect[2] || rect[1] >= rect[3] || !self.holdings.holds(&source) {
             return;
         }
         let sequence = self.sequence();
-        self.push(TextRecord::Copy(CopiedPixels {
+        self.push(TextRecord::Move(MovedPixels {
             sequence,
             thread,
             kind,
             destination,
             rect,
             source,
-            offset,
+            map,
         }));
-        self.mark(destination.bits);
-    }
-
-    fn mark(&mut self, bits: u32) {
-        if let Err(at) = self.planes.binary_search(&bits) {
-            self.planes.insert(at, bits);
-        }
+        self.holdings.mark(destination);
     }
 
     pub fn take(&mut self) -> TextBatch {
@@ -245,10 +344,30 @@ pub fn records(ext: &Ext) -> Option<std::cell::RefMut<'_, TextRecords>> {
         .map(|store| store.borrow_mut())
 }
 
+/// The calling guest thread's ID, from its TEB client ID.
+pub fn thread(env: &adv_machine::Env<'_>) -> u32 {
+    let teb = env.sys.contexts[env.context as usize].teb;
+    env.cpu.read_u32(teb + 0x24).unwrap_or(0)
+}
+
+/// Note pixels a host handler moved, while records are on.
+pub fn moved(
+    env: &adv_machine::Env<'_>,
+    kind: MoveKind,
+    destination: Store,
+    rect: [i32; 4],
+    source: Store,
+    map: Option<Map>,
+) {
+    if let Some(mut records) = records(env.ext) {
+        records.moved(thread(env), kind, destination, rect, source, map);
+    }
+}
+
 /// Note a copy a DIB body completed.
 pub(super) fn copied(
     services: adv_cpu::body::Services,
-    kind: CopyKind,
+    kind: MoveKind,
     destination: Plane,
     rect: [i32; 4],
     source: Plane,
@@ -262,7 +381,14 @@ pub(super) fn copied(
     // is published, and body services are captured afresh for each entry.
     let store = unsafe { &*pointer };
     if let Ok(mut store) = store.try_borrow_mut() {
-        store.copied(services.thread, kind, destination, rect, source, offset);
+        store.moved(
+            services.thread,
+            kind,
+            Store::Memory(destination),
+            rect,
+            Store::Memory(source),
+            Some(Map::offset(offset[0], offset[1])),
+        );
     }
 }
 
@@ -289,7 +415,8 @@ mod tests {
             records.push(TextRecord::Glyph(ProducedGlyph {
                 sequence,
                 thread: 1,
-                dc: 2,
+                dc: Some(2),
+                font: 0,
                 face: String::new(),
                 height: 0,
                 code: Code::Unicode(65),
@@ -308,69 +435,78 @@ mod tests {
 
     // spec: WINE-UNIX-8
     #[test]
-    fn copies_are_kept_only_from_planes_that_have_held_text() {
+    fn moves_are_kept_only_from_stores_that_hold_text() {
         let mut records = TextRecords::default();
         let rect = [0, 0, 4, 4];
-        records.copied(
-            7,
-            CopyKind::Copy,
-            plane(0x2000),
-            rect,
-            plane(0x1000),
-            [0, 0],
-        );
+        let memory = |bits| Store::Memory(plane(bits));
+        let texture = Store::Resource(Resource {
+            allocation: (1, 2),
+            subresource: 0,
+        });
+        let map = Some(Map::offset(1, 2));
+        records.moved(7, MoveKind::Copy, memory(0x2000), rect, memory(0x1000), map);
         let sequence = records.sequence();
         records.push(TextRecord::Line(DrawnLine {
             sequence,
             thread: 7,
             dc: 1,
             plane: Some(plane(0x1000)),
+            font: 0,
             face: String::new(),
             height: 0,
             clip: None,
             glyphs: Vec::new(),
         }));
-        records.copied(
+        records.moved(
             7,
-            CopyKind::Copy,
-            plane(0x2000),
+            MoveKind::Copy,
+            memory(0x2000),
             [0, 0, 0, 4],
-            plane(0x1000),
-            [0, 0],
+            memory(0x1000),
+            map,
         );
-        records.copied(
-            7,
-            CopyKind::Blend,
-            plane(0x2000),
-            rect,
-            plane(0x1000),
-            [1, 2],
-        );
-        // The destination now holds text, so a copy from it is kept too.
-        records.copied(
-            7,
-            CopyKind::Convert,
-            plane(0x3000),
-            rect,
-            plane(0x2000),
-            [0, 0],
-        );
-        let kinds: Vec<_> = records
+        // A plane inside the text's bytes holds text, one past them does not.
+        let inner = Store::Memory(Plane {
+            size: [4, 4],
+            ..plane(0x1100)
+        });
+        records.moved(7, MoveKind::Upload, texture, rect, inner, None);
+        records.moved(7, MoveKind::Copy, memory(0x5000), rect, memory(0x1400), map);
+        records.moved(7, MoveKind::Present, Store::Window(9), rect, texture, map);
+        let kept: Vec<_> = records
             .take()
             .records
             .into_iter()
-            .map(|record| match record {
-                TextRecord::Copy(copy) => Some((copy.kind, copy.source.bits, copy.offset)),
+            .filter_map(|record| match record {
+                TextRecord::Move(moved) => Some((moved.kind, moved.source, moved.destination)),
                 _ => None,
             })
             .collect();
         assert_eq!(
-            kinds,
+            kept,
             [
-                None,
-                Some((CopyKind::Blend, 0x1000, [1, 2])),
-                Some((CopyKind::Convert, 0x2000, [0, 0]))
+                (MoveKind::Upload, inner, texture),
+                (MoveKind::Present, texture, Store::Window(9)),
             ]
         );
+    }
+
+    #[test]
+    fn plane_spans_cover_bottom_up_rows() {
+        let up = Plane {
+            stride: -64,
+            ..plane(0x1000 + 64 * 15)
+        };
+        assert_eq!(up.span(), [0x1000, 0x1400]);
+        assert_eq!(plane(0x1000).span(), [0x1000, 0x1400]);
+    }
+
+    #[test]
+    fn marked_memory_merges_touching_ranges() {
+        let mut holdings = Holdings::default();
+        for bits in [0x3000, 0x1000, 0x1400] {
+            holdings.mark(Store::Memory(plane(bits)));
+        }
+        assert_eq!(holdings.memory, [[0x1000, 0x1800], [0x3000, 0x3400]]);
     }
 }

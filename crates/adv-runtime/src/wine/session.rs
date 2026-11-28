@@ -1604,6 +1604,19 @@ impl Session {
     pub fn set_text_records(&mut self, enabled: bool) {
         let machine = &mut self.machine;
         super::text_records::set(&mut machine.sys, &mut machine.ext, enabled);
+        if !enabled {
+            machine
+                .ext
+                .get_mut::<super::fonts::Fonts>()
+                .recorded
+                .clear();
+        }
+    }
+
+    /// The characters glyph index `glyph` stands for in a text record's
+    /// font, from the font's cmap; empty for an unknown font or glyph.
+    pub fn glyph_characters(&mut self, font: u32, glyph: u32) -> Vec<u32> {
+        super::fonts::glyph_characters(&mut self.machine.ext, font, glyph)
     }
 
     /// Text records kept since the last call; empty while records are off.
