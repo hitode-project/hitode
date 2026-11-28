@@ -39,10 +39,13 @@ const UPDATE_PUBLIC_KEY: [u8; 32] = [
 struct Release {
     tag_name: String,
     html_url: String,
+    /// Only macOS installs releases in place; other platforms ignore assets.
+    #[cfg(target_os = "macos")]
     #[serde(default)]
     assets: Vec<ReleaseAsset>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Deserialize)]
 struct ReleaseAsset {
     name: String,
@@ -221,10 +224,7 @@ fn check() -> Result<Update, String> {
         installable
     };
     #[cfg(not(target_os = "macos"))]
-    let can_install = {
-        let _ = &release.assets;
-        false
-    };
+    let can_install = false;
 
     Ok(Update {
         current,
