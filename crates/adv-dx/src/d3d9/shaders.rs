@@ -135,7 +135,8 @@ pub(super) struct Constants {
 struct Captured {
     usage: adv_device::constants::ConstantUsage,
     extra: Vec<(usize, [u32; 4])>,
-    snapshot: adv_device::gpu::ConstantSnapshot,
+    /// Built when a draw is prepared; a reused draw needs only the key.
+    snapshot: Option<adv_device::gpu::ConstantSnapshot>,
     key: u128,
 }
 impl Clone for Constants {
@@ -171,37 +172,57 @@ impl Constants {
             *captured = None;
         }
     }
+    fn read(&self, extra: &[(usize, [u32; 4])], n: usize) -> [u32; 4] {
+        match n {
+            0..256 => self.floats[n].map(f32::to_bits),
+            256..272 => self.integers[n - 256].map(|v| v as u32),
+            272..288 => [self.booleans[n - 272] as u32, 0, 0, 0],
+            _ => extra
+                .iter()
+                .find(|(index, _)| *index == n)
+                .map_or([0; 4], |(_, v)| *v),
+        }
+    }
     fn capture(
         &self,
         usage: adv_device::constants::ConstantUsage,
         extra: &[(usize, [u32; 4])],
+        snapshot: bool,
     ) -> std::cell::RefMut<'_, Option<Captured>> {
+        use std::hash::{Hash, Hasher};
         let mut captured = self.captured.borrow_mut();
         if !captured
             .as_ref()
             .is_some_and(|c| c.usage == usage && c.extra == extra)
         {
-            use std::hash::Hash;
-            let snapshot = adv_device::gpu::ConstantSnapshot::capture(usage, |n| match n {
-                0..256 => self.floats[n].map(f32::to_bits),
-                256..272 => self.integers[n - 256].map(|v| v as u32),
-                272..288 => [self.booleans[n - 272] as u32, 0, 0, 0],
-                _ => extra
-                    .iter()
-                    .find(|(index, _)| *index == n)
-                    .map_or([0; 4], |(_, v)| *v),
-            });
+            // The bytes a snapshot's ranges hash, read in place.
             let mut h = xxhash_rust::xxh3::Xxh3::new();
-            for range in snapshot.ranges(usage) {
-                range.hash(&mut h);
+            for range in usage.ranges() {
+                range.start.hash(&mut h);
+                h.write_usize(range.len());
+                for n in range.start / 16..range.end / 16 {
+                    h.write(bytemuck::bytes_of(&self.read(extra, n)));
+                }
             }
-            let key = h.digest128();
             *captured = Some(Captured {
                 usage,
                 extra: extra.to_vec(),
-                snapshot,
-                key,
+                snapshot: None,
+                key: h.digest128(),
             });
+        }
+        let c = captured.as_mut().unwrap();
+        if snapshot && c.snapshot.is_none() {
+            let taken = adv_device::gpu::ConstantSnapshot::capture(usage, |n| self.read(extra, n));
+            #[cfg(any(test, feature = "d3d9-counters"))]
+            {
+                let mut h = xxhash_rust::xxh3::Xxh3::new();
+                for range in taken.ranges(usage) {
+                    range.hash(&mut h);
+                }
+                debug_assert_eq!(h.digest128(), c.key);
+            }
+            c.snapshot = Some(taken);
         }
         captured
     }
@@ -210,11 +231,8 @@ impl Constants {
         usage: adv_device::constants::ConstantUsage,
         extra: &[(usize, [u32; 4])],
     ) -> adv_device::gpu::ConstantSnapshot {
-        self.capture(usage, extra)
-            .as_ref()
-            .unwrap()
-            .snapshot
-            .clone()
+        let captured = self.capture(usage, extra, true);
+        captured.as_ref().unwrap().snapshot.clone().unwrap()
     }
     fn register_bits(&self, n: usize) -> [u32; 4] {
         match n {
@@ -257,7 +275,7 @@ impl Constants {
         true
     }
     pub(super) fn key(&self, usage: adv_device::constants::ConstantUsage) -> u128 {
-        self.capture(usage, &[]).as_ref().unwrap().key
+        self.capture(usage, &[], false).as_ref().unwrap().key
     }
 }
 #[derive(Clone, Default)]

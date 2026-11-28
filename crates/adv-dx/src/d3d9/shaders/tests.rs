@@ -862,3 +862,31 @@ fn unused_constant_uploads_retain_the_used_register_capture() {
     );
     assert_eq!(before.register(0), [0; 4]);
 }
+
+#[test]
+fn constant_keys_read_registers_in_place_and_snapshots_wait_for_preparation() {
+    let mut constants = Constants::default();
+    let mut usage = adv_device::constants::ConstantUsage::default();
+    for register in [0, 1, 4, 257] {
+        usage.set(register);
+    }
+    constants.write_register(4, [1, 2, 3, 4]);
+    let key = constants.key(usage);
+    // A reused draw takes only the key.
+    assert!(
+        constants
+            .captured
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .is_none()
+    );
+    let snapshot = constants.snapshot(usage, &[]);
+    assert_eq!(snapshot.register(4), [1, 2, 3, 4]);
+    assert_eq!(constants.key(usage), key);
+    constants.write_register(4, [1, 2, 3, 5]);
+    assert_ne!(constants.key(usage), key);
+    constants.write_register(4, [1, 2, 3, 4]);
+    assert_eq!(constants.key(usage), key);
+}
