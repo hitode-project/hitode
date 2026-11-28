@@ -26,7 +26,7 @@ const MAX_RECYCLED_BYTES: usize = 8 << 20;
 
 pub(super) struct Recording {
     white: Image,
-    samplers: HashMap<gpu::Sampler, adv_gpu::Sampler>,
+    samplers: rustc_hash::FxHashMap<gpu::Sampler, adv_gpu::Sampler>,
 }
 impl Recording {
     pub fn new(device: &adv_gpu::Device, stream: &mut Producer) -> Result<Self, Error> {
@@ -66,7 +66,7 @@ impl Recording {
     fn with_white(white: Image) -> Self {
         Self {
             white,
-            samplers: HashMap::new(),
+            samplers: Default::default(),
         }
     }
 }
@@ -756,7 +756,8 @@ struct WorkerState {
     device: adv_gpu::Device,
     stream: Producer,
     target: Option<(ImageId, Option<Depth>)>,
-    facades: HashMap<u64, FacadeState>,
+    /// Looked up several times per command, so it uses a fast hasher.
+    facades: rustc_hash::FxHashMap<u64, FacadeState>,
     shared: Arc<WorkerShared>,
     owner_waker: Option<super::stream::Waker>,
     pending_cmds: usize,
@@ -774,7 +775,7 @@ fn worker_loop(
         device,
         stream,
         target: None,
-        facades: HashMap::new(),
+        facades: Default::default(),
         shared: shared.clone(),
         owner_waker,
         pending_cmds: 0,
