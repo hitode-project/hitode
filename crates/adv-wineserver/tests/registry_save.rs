@@ -7,7 +7,7 @@ use std::io::IoSliceMut;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adv_wineserver::{Clock, Config, PROTOCOL_VERSION, Server, State};
 
@@ -163,20 +163,100 @@ fn send_request<R: Request + Copy>(
     fixed
 }
 
-fn set_string_value(
+fn write_request_without_step<R: Request + Copy>(
+    request_pipe: &ChannelFd,
+    mut request: R,
+    data: &[u8],
+) {
+    request.header().req = R::NUMBER;
+    request.header().request_size = data.len() as u32;
+    let mut fixed = [0u8; protocol::FIXED_SIZE];
+    // SAFETY: request is repr(C) and fits in FIXED_SIZE; pipes and buffers are live.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&raw const request).cast::<u8>(),
+            fixed.as_mut_ptr(),
+            size_of::<R>(),
+        );
+        assert_eq!(
+            hitode_write(request_pipe.as_raw_fd(), fixed.as_ptr().cast(), fixed.len()),
+            fixed.len() as isize
+        );
+        if !data.is_empty() {
+            assert_eq!(
+                hitode_write(request_pipe.as_raw_fd(), data.as_ptr().cast(), data.len()),
+                data.len() as isize
+            );
+        }
+    }
+}
+
+fn read_reply(reply_pipe: &ChannelFd) -> [u8; protocol::FIXED_SIZE] {
+    let mut fixed = [0u8; protocol::FIXED_SIZE];
+    // SAFETY: reply_pipe is live and receives one fixed-size reply header.
+    unsafe {
+        assert_eq!(
+            hitode_read(
+                reply_pipe.as_raw_fd(),
+                fixed.as_mut_ptr().cast(),
+                fixed.len()
+            ),
+            fixed.len() as isize
+        );
+    }
+    fixed
+}
+
+fn create_key(
+    server: &mut Server,
+    clock: &TestClock,
+    request_pipe: &ChannelFd,
+    reply_pipe: &ChannelFd,
+    path: &str,
+) -> u32 {
+    let key_name = utf16_bytes(path);
+    let mut objattr = Vec::with_capacity(16 + key_name.len());
+    objattr.extend_from_slice(&0u32.to_le_bytes()); // rootdir
+    objattr.extend_from_slice(&0x40u32.to_le_bytes()); // OBJ_CASE_INSENSITIVE
+    objattr.extend_from_slice(&0u32.to_le_bytes()); // sd_len
+    objattr.extend_from_slice(&(key_name.len() as u32).to_le_bytes()); // name_len
+    objattr.extend_from_slice(&key_name);
+
+    let reply = send_request(
+        server,
+        clock,
+        request_pipe,
+        reply_pipe,
+        protocol::CreateKeyRequest {
+            access: 0x000f_003f, // KEY_ALL_ACCESS
+            options: 0,
+            ..Default::default()
+        },
+        &objattr,
+    );
+    // SAFETY: reply holds CreateKeyReply.
+    let key_reply =
+        unsafe { std::ptr::read_unaligned(reply.as_ptr().cast::<protocol::CreateKeyReply>()) };
+    assert_eq!(key_reply.header.error, 0, "create_key failed for {path}");
+    assert_ne!(key_reply.hkey, 0);
+    key_reply.hkey
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_raw_value(
     server: &mut Server,
     clock: &TestClock,
     request_pipe: &ChannelFd,
     reply_pipe: &ChannelFd,
     hkey: u32,
     name: &str,
-    value: &str,
+    value_type: i32,
+    value_bytes: &[u8],
 ) {
     let name_bytes = utf16_bytes(name);
-    let value_bytes = utf16_nul_bytes(value);
     let mut payload = Vec::with_capacity(name_bytes.len() + value_bytes.len());
     payload.extend_from_slice(&name_bytes);
-    payload.extend_from_slice(&value_bytes);
+    payload.extend_from_slice(value_bytes);
     let reply = send_request(
         server,
         clock,
@@ -184,7 +264,7 @@ fn set_string_value(
         reply_pipe,
         protocol::SetKeyValueRequest {
             hkey,
-            r#type: 1, // REG_SZ
+            r#type: value_type,
             namelen: name_bytes.len() as u32,
             ..Default::default()
         },
@@ -194,6 +274,45 @@ fn set_string_value(
     let answer =
         unsafe { std::ptr::read_unaligned(reply.as_ptr().cast::<protocol::SetKeyValueReply>()) };
     assert_eq!(answer.header.error, 0, "set_key_value failed");
+}
+
+fn set_string_value(
+    server: &mut Server,
+    clock: &TestClock,
+    request_pipe: &ChannelFd,
+    reply_pipe: &ChannelFd,
+    hkey: u32,
+    name: &str,
+    value: &str,
+) {
+    set_raw_value(
+        server,
+        clock,
+        request_pipe,
+        reply_pipe,
+        hkey,
+        name,
+        1, // REG_SZ
+        &utf16_nul_bytes(value),
+    );
+}
+
+fn queue_string_value_without_step(request_pipe: &ChannelFd, hkey: u32, name: &str, value: &str) {
+    let name_bytes = utf16_bytes(name);
+    let value_bytes = utf16_nul_bytes(value);
+    let mut payload = Vec::with_capacity(name_bytes.len() + value_bytes.len());
+    payload.extend_from_slice(&name_bytes);
+    payload.extend_from_slice(&value_bytes);
+    write_request_without_step(
+        request_pipe,
+        protocol::SetKeyValueRequest {
+            hkey,
+            r#type: 1, // REG_SZ
+            namelen: name_bytes.len() as u32,
+            ..Default::default()
+        },
+        &payload,
+    );
 }
 
 fn assert_no_temp_registry_files(prefix: &Path) {
@@ -275,35 +394,75 @@ fn periodic_save_offloads_without_cache_invalidation_and_flush_persists_atomical
     };
     assert_eq!(init_reply.header.error, 0);
 
-    // Create a persistent key under HKLM\Software.
-    let key_name = utf16_bytes("\\Registry\\Machine\\Software\\HitodeAsyncRegTest");
-    let mut objattr = Vec::with_capacity(16 + key_name.len());
-    objattr.extend_from_slice(&0u32.to_le_bytes()); // rootdir
-    objattr.extend_from_slice(&0x40u32.to_le_bytes()); // OBJ_CASE_INSENSITIVE
-    objattr.extend_from_slice(&0u32.to_le_bytes()); // sd_len
-    objattr.extend_from_slice(&(key_name.len() as u32).to_le_bytes()); // name_len
-    objattr.extend_from_slice(&key_name);
-
-    let reply = send_request(
+    // Create persistent keys in both system.reg (HKLM) and userdef.reg (HKU\.Default).
+    let hkey = create_key(
         &mut server,
         &clock,
         &request_pipe,
         &reply_pipe,
-        protocol::CreateKeyRequest {
-            access: 0x000f_003f, // KEY_ALL_ACCESS
-            options: 0,
-            ..Default::default()
-        },
-        &objattr,
+        "\\Registry\\Machine\\Software\\HitodeAsyncRegTest",
     );
-    // SAFETY: reply holds CreateKeyReply.
-    let key_reply =
-        unsafe { std::ptr::read_unaligned(reply.as_ptr().cast::<protocol::CreateKeyReply>()) };
-    assert_eq!(key_reply.header.error, 0, "create_key failed");
-    let hkey = key_reply.hkey;
-    assert_ne!(hkey, 0);
+    let userdef_key = create_key(
+        &mut server,
+        &clock,
+        &request_pipe,
+        &reply_pipe,
+        "\\Registry\\User\\.Default\\HitodeStaggerTest",
+    );
 
-    // 1. Periodic 30 s save offloads disk write without bumping names_revision.
+    // Exercise formatting fidelity (DWORD, binary line wrapping, Unicode & control escapes)
+    // and populate a moderately large synthetic subtree so periodic save latency is measurable.
+    set_raw_value(
+        &mut server,
+        &clock,
+        &request_pipe,
+        &reply_pipe,
+        hkey,
+        "DwordVal",
+        4, // REG_DWORD
+        &0x1234_abcd_u32.to_le_bytes(),
+    );
+    let binary_blob: Vec<u8> = (0u8..96).collect();
+    set_raw_value(
+        &mut server,
+        &clock,
+        &request_pipe,
+        &reply_pipe,
+        hkey,
+        "BinaryWrap",
+        3, // REG_BINARY
+        &binary_blob,
+    );
+    set_string_value(
+        &mut server,
+        &clock,
+        &request_pipe,
+        &reply_pipe,
+        hkey,
+        "Escaped\"Name",
+        "Line1\nTab\tUni\u{3042}0\\End",
+    );
+    for idx in 0..400u32 {
+        let sub = create_key(
+            &mut server,
+            &clock,
+            &request_pipe,
+            &reply_pipe,
+            &format!("\\Registry\\Machine\\Software\\HitodeAsyncRegTest\\Sub{idx:04}"),
+        );
+        set_string_value(
+            &mut server,
+            &clock,
+            &request_pipe,
+            &reply_pipe,
+            sub,
+            "Entry",
+            "SyntheticPayloadValueForFastSerializer",
+        );
+    }
+
+    // 1. Periodic 30 s save offloads disk write without bumping names_revision,
+    //    staggers multiple dirty branches across ticks, and completes rapidly.
     set_string_value(
         &mut server,
         &clock,
@@ -313,42 +472,103 @@ fn periodic_save_offloads_without_cache_invalidation_and_flush_persists_atomical
         "Phase",
         "PeriodicValue",
     );
-    let rev_before = adv_wineserver::names_revision();
-    // SAFETY: reads an internal atomic/mutex-guarded counter.
-    let writes_before = unsafe { hitode_registry_async_writes() };
-    clock.0.set(clock.0.get() + 31 * TICKS_PER_SECOND);
-    assert!(matches!(server.step(&clock), State::Waiting(_)));
-    assert_eq!(
-        adv_wineserver::names_revision(),
-        rev_before,
-        "periodic registry save must not invalidate guest name caches"
-    );
-    // SAFETY: waits for the background writer to finish the periodic write.
-    unsafe { hitode_registry_wait() };
-    // SAFETY: reads the completed async write counter.
-    assert!(
-        unsafe { hitode_registry_async_writes() } > writes_before,
-        "periodic save must offload writes to the background writer"
-    );
-    let system_reg = std::fs::read_to_string(prefix.join("system.reg")).unwrap();
-    assert!(
-        system_reg.contains("HitodeAsyncRegTest") && system_reg.contains("PeriodicValue"),
-        "periodic save did not persist expected registry content"
-    );
-    assert_no_temp_registry_files(&prefix);
-
-    // 2. Explicit Server::flush() waits for atomic persistence before returning (WINE-SES-10).
     set_string_value(
         &mut server,
         &clock,
         &request_pipe,
         &reply_pipe,
-        hkey,
-        "Phase",
-        "FlushedValue",
+        userdef_key,
+        "Stagger",
+        "SecondBranchValue",
     );
+    let rev_before = adv_wineserver::names_revision();
+    // SAFETY: reads an internal atomic/mutex-guarded counter.
+    let writes_before = unsafe { hitode_registry_async_writes() };
+    clock.0.set(clock.0.get() + 31 * TICKS_PER_SECOND);
+    let t0 = Instant::now();
+    let after_first_tick = server.step(&clock);
+    let first_tick_elapsed = t0.elapsed();
+    assert!(
+        matches!(after_first_tick, State::Waiting(Some(delay)) if delay <= Duration::from_secs(2)),
+        "periodic save with multiple dirty branches should stagger remaining branch (~1s), got {after_first_tick:?}"
+    );
+    assert!(
+        first_tick_elapsed < Duration::from_millis(16),
+        "fast serializer periodic tick took too long: {first_tick_elapsed:?}"
+    );
+    assert_eq!(
+        adv_wineserver::names_revision(),
+        rev_before,
+        "periodic registry save must not invalidate guest name caches"
+    );
+    // SAFETY: waits for the background writer to finish the first staggered write.
+    unsafe { hitode_registry_wait() };
+    // SAFETY: reads the completed async write counter.
+    let writes_after_first = unsafe { hitode_registry_async_writes() };
+    assert_eq!(
+        writes_after_first,
+        writes_before + 1,
+        "periodic save must serialize at most one dirty branch per tick"
+    );
+
+    // Second staggered tick saves the second dirty branch (userdef.reg).
+    clock.0.set(clock.0.get() + 2 * TICKS_PER_SECOND);
+    assert!(matches!(server.step(&clock), State::Waiting(_)));
+    // SAFETY: waits for the background writer to finish the second staggered write.
+    unsafe { hitode_registry_wait() };
+    // SAFETY: reads the completed async write counter.
+    let writes_after_second = unsafe { hitode_registry_async_writes() };
+    assert_eq!(
+        writes_after_second,
+        writes_after_first + 1,
+        "second staggered tick must offload strictly one remaining dirty branch"
+    );
+
+    // Third staggered tick drains user.reg (dirty from fresh prefix init), and a
+    // subsequent 2 s step performs no extra writes once all branches are clean.
+    clock.0.set(clock.0.get() + 2 * TICKS_PER_SECOND);
+    assert!(matches!(server.step(&clock), State::Waiting(_)));
+    // SAFETY: waits for any remaining staggered write.
+    unsafe { hitode_registry_wait() };
+    // SAFETY: reads the completed async write counter.
+    let writes_after_third = unsafe { hitode_registry_async_writes() };
+    clock.0.set(clock.0.get() + 2 * TICKS_PER_SECOND);
+    assert!(matches!(server.step(&clock), State::Waiting(_)));
+    // SAFETY: waits for background writer idle.
+    unsafe { hitode_registry_wait() };
+    // SAFETY: reads the completed async write counter.
+    assert_eq!(
+        unsafe { hitode_registry_async_writes() },
+        writes_after_third,
+        "clean branches must return to the 30 s periodic cadence"
+    );
+    let system_reg = std::fs::read_to_string(prefix.join("system.reg")).unwrap();
+    assert!(
+        system_reg.contains("HitodeAsyncRegTest")
+            && system_reg.contains("PeriodicValue")
+            && system_reg.contains("\"DwordVal\"=dword:1234abcd\n")
+            && system_reg.contains("\"BinaryWrap\"=hex:00,01,02,")
+            && system_reg.contains("\\\n  ")
+            && system_reg.contains("\"Escaped\\\"Name\"=\"Line1\\nTab\\tUni\\x30420\\\\End\"\n"),
+        "periodic save did not persist expected formatted registry content"
+    );
+    let userdef_reg = std::fs::read_to_string(prefix.join("userdef.reg")).unwrap();
+    assert!(
+        userdef_reg.contains("HitodeStaggerTest") && userdef_reg.contains("SecondBranchValue"),
+        "staggered second branch did not persist expected registry content"
+    );
+    assert_no_temp_registry_files(&prefix);
+
+    // 2. Regression: a pending (un-stepped) registry write queued right before
+    //    Server::flush() must be drained FIRST and then flushed atomically (WINE-SES-10).
+    queue_string_value_without_step(&request_pipe, hkey, "Phase", "QueuedBeforeFlush");
     let rev_before_flush = adv_wineserver::names_revision();
     server.flush(&clock);
+    let reply = read_reply(&reply_pipe);
+    // SAFETY: reply begins with ReplyHeader.
+    let answer =
+        unsafe { std::ptr::read_unaligned(reply.as_ptr().cast::<protocol::SetKeyValueReply>()) };
+    assert_eq!(answer.header.error, 0);
     assert_eq!(
         adv_wineserver::names_revision(),
         rev_before_flush,
@@ -356,12 +576,14 @@ fn periodic_save_offloads_without_cache_invalidation_and_flush_persists_atomical
     );
     let system_reg = std::fs::read_to_string(prefix.join("system.reg")).unwrap();
     assert!(
-        system_reg.contains("FlushedValue"),
-        "Server::flush must persist modified registry keys before returning"
+        system_reg.contains("QueuedBeforeFlush"),
+        "Server::flush must drain pending requests BEFORE flushing registry to disk"
     );
     assert_no_temp_registry_files(&prefix);
 
-    // 3. Server exit persists final changes before returning State::Exited(0).
+    // 3. Regression: writing a registry key right before Server::drop() (well before
+    //    the 30 s periodic timer and without calling flush()) still persists atomically.
+    clock.0.set(clock.0.get() + TICKS_PER_SECOND);
     set_string_value(
         &mut server,
         &clock,
@@ -369,28 +591,15 @@ fn periodic_save_offloads_without_cache_invalidation_and_flush_persists_atomical
         &reply_pipe,
         hkey,
         "Phase",
-        "ShutdownValue",
+        "DropBeforeTimerValue",
     );
     drop((request_pipe, reply_pipe, reply_write, wait_write, client));
-    let mut state = server.step(&clock);
-    let start_ticks = clock.0.get();
-    while let State::Waiting(Some(timeout)) = state {
-        assert!(
-            clock.0.get() - start_ticks < 10 * TICKS_PER_SECOND,
-            "server still running"
-        );
-        clock
-            .0
-            .set(clock.0.get() + timeout.max(Duration::from_millis(1)).as_nanos() as u64 / 100);
-        state = server.step(&clock);
-    }
-    assert_eq!(state, State::Exited(0));
+    drop(server);
     let system_reg = std::fs::read_to_string(prefix.join("system.reg")).unwrap();
     assert!(
-        system_reg.contains("ShutdownValue"),
-        "server exit must persist final registry changes before returning Exited"
+        system_reg.contains("DropBeforeTimerValue"),
+        "Server::drop must flush remaining dirty registry keys before shutdown"
     );
     assert_no_temp_registry_files(&prefix);
-    drop(server);
     std::fs::remove_dir_all(root).unwrap();
 }

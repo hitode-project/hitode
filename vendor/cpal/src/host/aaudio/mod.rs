@@ -264,6 +264,14 @@ where
     Ok(Stream::Input(stream))
 }
 
+static DEFAULT_OUTPUT_CONFIG: Mutex<Option<SupportedStreamConfig>> = Mutex::new(None);
+
+fn invalidate_default_output_config() {
+    *DEFAULT_OUTPUT_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 fn build_output_stream<D, E>(
     device: &Device,
     config: &StreamConfig,
@@ -279,6 +287,7 @@ where
     let builder = configure_for_device(builder, device, config);
     let created = Instant::now();
     let channel_count = config.channels as i32;
+    let is_default_device = device.0.is_none();
     let stream = builder
         .data_callback(Box::new(move |stream, data, num_frames| {
             // AAudio timestamps use CLOCK_MONOTONIC's boot epoch, whereas
@@ -317,6 +326,9 @@ where
             ndk::audio::AudioCallbackResult::Continue
         }))
         .error_callback(Box::new(move |stream, error| {
+            if is_default_device {
+                invalidate_default_output_config();
+            }
             (error_callback)(StreamError::from(error))
         }))
         .open_stream()?;
@@ -387,7 +399,6 @@ impl DeviceTrait for Device {
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        static DEFAULT_OUTPUT_CONFIG: Mutex<Option<SupportedStreamConfig>> = Mutex::new(None);
         if self.0.is_none() {
             if let Some(cached) = DEFAULT_OUTPUT_CONFIG
                 .lock()
@@ -540,42 +551,51 @@ impl DeviceTrait for Device {
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        let format = match sample_format {
-            SampleFormat::I16 => ndk::audio::AudioFormat::PCM_I16,
-            SampleFormat::F32 => ndk::audio::AudioFormat::PCM_Float,
-            sample_format => {
-                return Err(BackendSpecificError {
-                    description: format!("{} format is not supported on Android.", sample_format),
+        let result = (|| {
+            let format = match sample_format {
+                SampleFormat::I16 => ndk::audio::AudioFormat::PCM_I16,
+                SampleFormat::F32 => ndk::audio::AudioFormat::PCM_Float,
+                sample_format => {
+                    return Err(BackendSpecificError {
+                        description: format!(
+                            "{} format is not supported on Android.",
+                            sample_format
+                        ),
+                    }
+                    .into());
                 }
-                .into())
-            }
-        };
-        let channel_count = match config.channels {
-            1 => 1,
-            2 => 2,
-            channels => {
-                // TODO: more channels available in native AAudio
-                return Err(BackendSpecificError {
-                    description: "More than 2 channels are not supported yet.".to_owned(),
+            };
+            let channel_count = match config.channels {
+                1 => 1,
+                2 => 2,
+                _ => {
+                    // TODO: more channels available in native AAudio
+                    return Err(BackendSpecificError {
+                        description: "More than 2 channels are not supported yet.".to_owned(),
+                    }
+                    .into());
                 }
-                .into());
-            }
-        };
+            };
 
-        let builder = ndk::audio::AudioStreamBuilder::new()?
-            .direction(ndk::audio::AudioDirection::Output)
-            .performance_mode(ndk::audio::AudioPerformanceMode::LowLatency)
-            .channel_count(channel_count)
-            .format(format);
+            let builder = ndk::audio::AudioStreamBuilder::new()?
+                .direction(ndk::audio::AudioDirection::Output)
+                .performance_mode(ndk::audio::AudioPerformanceMode::LowLatency)
+                .channel_count(channel_count)
+                .format(format);
 
-        build_output_stream(
-            self,
-            config,
-            data_callback,
-            error_callback,
-            builder,
-            sample_format,
-        )
+            build_output_stream(
+                self,
+                config,
+                data_callback,
+                error_callback,
+                builder,
+                sample_format,
+            )
+        })();
+        if result.is_err() && self.0.is_none() {
+            invalidate_default_output_config();
+        }
+        result
     }
 }
 
@@ -583,7 +603,10 @@ impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
         match self {
             Self::Input(stream) => stream.request_start().map_err(PlayStreamError::from),
-            Self::Output(stream) => stream.request_start().map_err(PlayStreamError::from),
+            Self::Output(stream) => stream.request_start().map_err(|err| {
+                invalidate_default_output_config();
+                PlayStreamError::from(err)
+            }),
         }
     }
 

@@ -290,16 +290,19 @@ impl Server {
 
     /// Drain disconnected clients and save registry changes on Wine's stack.
     pub fn flush(&mut self, clock: &dyn Clock) {
-        FLUSH.set(true);
         loop {
             let state = self.step(clock);
             if matches!(state, State::Exited(_)) {
-                FLUSH.set(false);
                 break;
             }
             if !matches!(state, State::Waiting(Some(Duration::ZERO))) && !self.kernel_ready() {
                 break;
             }
+        }
+        if !matches!(self.state, State::Exited(_)) {
+            FLUSH.set(true);
+            let _ = self.step(clock);
+            FLUSH.set(false);
         }
         // SAFETY: wait until every offloaded registry write completes atomically
         // on disk before returning (WINE-SES-10, HOST-SES-5).
@@ -431,6 +434,11 @@ impl Drop for Server {
         if !self.watch.is_null() {
             // SAFETY: stop joins the watcher before its callback storage is freed.
             unsafe { hitode_event_unwatch(self.watch) };
+        }
+        if !matches!(self.state, State::Exited(_)) {
+            // SAFETY: the coroutine is suspended and the execution owner serializes
+            // server globals; persist any dirty registry branches before shutdown.
+            unsafe { flush_registry() };
         }
         // SAFETY: drain pending background registry writes and join the writer thread.
         unsafe { hitode_registry_shutdown() };

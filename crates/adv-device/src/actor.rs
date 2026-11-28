@@ -1425,6 +1425,7 @@ impl crate::AudioStream {
                 || self.shared.clock.now_us(0)
                     < self.shared.active_until_us.load(Ordering::Acquire))
     }
+    #[cfg(feature = "device")]
     pub(crate) fn is_suspended(&self) -> bool {
         self.shared.suspended.load(Ordering::Acquire)
     }

@@ -91,13 +91,13 @@ impl Policy {
             return Action::StopSync { clear_cache: false };
         }
         if !active {
-            if !running_or_opening {
-                self.reset();
-                return Action::None;
-            }
             if fault {
                 self.reset();
                 return Action::StopSync { clear_cache: true };
+            }
+            if !running_or_opening {
+                self.reset();
+                return Action::None;
             }
             let since = *self.idle_since.get_or_insert(now);
             let stop_at = since + IDLE_GRACE;
@@ -109,7 +109,7 @@ impl Policy {
             return Action::None;
         }
         let resumed_from_idle = self.idle_since.take().is_some();
-        if fault && running_or_opening {
+        if fault {
             self.retry_at = Some(now + FAULT_RETRY);
             self.next_check = self.retry_at;
             return Action::FaultBackoff;
@@ -150,6 +150,10 @@ impl StreamSession {
         self.stream.is_some()
     }
 
+    fn clear_cache(&mut self) {
+        self.cached_config = None;
+    }
+
     fn stop(&mut self, clear_cache: bool) {
         if self.stream.take().is_some() {
             self.metrics.stops.fetch_add(1, Ordering::Relaxed);
@@ -157,7 +161,7 @@ impl StreamSession {
         self.drain_capture();
         self.device = None;
         if clear_cache {
-            self.cached_config = None;
+            self.clear_cache();
         }
         self.fault.store(false, Ordering::Release);
     }
@@ -176,22 +180,27 @@ impl StreamSession {
     ) -> Result<(), String> {
         let device = default_device();
         if self.stream.is_some() {
-            if self
+            if self.fault.load(Ordering::Acquire) {
+                log::warn!("audio stream faulted before check; closing and renegotiating");
+                self.stop(true);
+            } else if self
                 .device
                 .as_ref()
                 .zip(device.as_ref())
                 .is_some_and(|(old, new)| same_device(old, new))
             {
                 return Ok(());
+            } else {
+                self.metrics.device_changes.fetch_add(1, Ordering::Relaxed);
+                log::info!("default audio output changed; rebuilding stream");
+                self.stop(true);
             }
-            self.metrics.device_changes.fetch_add(1, Ordering::Relaxed);
-            log::info!("default audio output changed; rebuilding stream");
-            self.stop(true);
         }
-        let stream = device
-            .as_ref()
-            .ok_or_else(|| "no output device".to_string())
-            .and_then(|d| self.start(d))?;
+        let Some(target) = device.as_ref() else {
+            self.clear_cache();
+            return Err("no output device".to_string());
+        };
+        let stream = self.start(target)?;
         self.stream = Some(stream);
         self.device = device;
         self.metrics.starts.fetch_add(1, Ordering::Relaxed);
@@ -200,20 +209,16 @@ impl StreamSession {
     }
 
     fn start(&mut self, device: &cpal::Device) -> Result<cpal::Stream, String> {
-        if let Some((cached_device, cached_config)) = self.cached_config.clone()
-            && same_device(&cached_device, device)
-        {
-            match self.open_with_config(device, &cached_config) {
-                Ok(stream) => return Ok(stream),
-                Err(_) => {
-                    self.cached_config = None;
-                }
-            }
-        }
-        let supported = device.default_output_config().map_err(|e| e.to_string())?;
-        let stream = self.open_with_config(device, &supported)?;
-        self.cached_config = Some((device.clone(), supported));
-        Ok(stream)
+        let mut cached = self.cached_config.take();
+        let result = open_with_cache(
+            &mut cached,
+            device,
+            same_device,
+            |d| d.default_output_config().map_err(|e| e.to_string()),
+            |d, c| self.open_with_config(d, c),
+        );
+        self.cached_config = cached;
+        result
     }
 
     fn open_with_config(
@@ -357,9 +362,78 @@ impl StreamSession {
     }
 }
 
+fn open_with_cache<D, C, S>(
+    cached: &mut Option<(D, C)>,
+    device: &D,
+    same_device: impl Fn(&D, &D) -> bool,
+    default_config: impl FnOnce(&D) -> Result<C, String>,
+    mut open: impl FnMut(&D, &C) -> Result<S, String>,
+) -> Result<S, String>
+where
+    D: Clone,
+    C: Clone,
+{
+    if let Some((cached_device, cached_config)) = cached.clone() {
+        if same_device(&cached_device, device) {
+            match open(device, &cached_config) {
+                Ok(stream) => return Ok(stream),
+                Err(_) => {
+                    *cached = None;
+                }
+            }
+        } else {
+            *cached = None;
+        }
+    }
+    let supported = default_config(device)?;
+    let stream = match open(device, &supported) {
+        Ok(stream) => stream,
+        Err(err) => {
+            *cached = None;
+            return Err(err);
+        }
+    };
+    *cached = Some((device.clone(), supported));
+    Ok(stream)
+}
+
+trait AudioBackend {
+    fn is_running(&self) -> bool;
+    fn drain_capture(&mut self);
+    fn clear_cache(&mut self);
+    fn stop(&mut self, clear_cache: bool);
+    fn ensure_or_check(&mut self) -> Result<(), String>;
+}
+
+impl AudioBackend for StreamSession {
+    fn is_running(&self) -> bool {
+        StreamSession::is_running(self)
+    }
+
+    fn drain_capture(&mut self) {
+        StreamSession::drain_capture(self);
+    }
+
+    fn clear_cache(&mut self) {
+        StreamSession::clear_cache(self);
+    }
+
+    fn stop(&mut self, clear_cache: bool) {
+        StreamSession::stop(self, clear_cache);
+    }
+
+    fn ensure_or_check(&mut self) -> Result<(), String> {
+        StreamSession::ensure_or_check(self, || cpal::default_host().default_output_device())
+    }
+}
+
 #[derive(Default)]
 struct WorkerShared {
     want_running: bool,
+    /// Non-cancellable teardown requested by a stream fault/disconnect.
+    /// Even if `want_running` flips back to `true` before the worker wakes,
+    /// the worker must close the old stream and invalidate cached config first.
+    pending_close: bool,
     clear_cache: bool,
     request_serial: u64,
     handled_serial: u64,
@@ -389,6 +463,20 @@ impl AudioWorker {
         mute: bool,
         volume: Arc<AtomicU8>,
     ) -> Self {
+        Self::spawn_with(move || StreamSession {
+            source,
+            stream: None,
+            device: None,
+            cached_config: None,
+            fault,
+            metrics,
+            capture,
+            mute,
+            volume,
+        })
+    }
+
+    fn spawn_with<B: AudioBackend>(make_backend: impl FnOnce() -> B + Send + 'static) -> Self {
         let state = Arc::new((
             Mutex::new(WorkerShared::default()),
             Condvar::new(),
@@ -400,17 +488,7 @@ impl AudioWorker {
         let handle = std::thread::Builder::new()
             .name("adv-audio-device".into())
             .spawn(move || {
-                let mut session = StreamSession {
-                    source,
-                    stream: None,
-                    device: None,
-                    cached_config: None,
-                    fault,
-                    metrics,
-                    capture,
-                    mute,
-                    volume,
-                };
+                let mut session = make_backend();
                 worker_loop(&mut session, &worker_state, &worker_running);
             })
             .expect("spawn audio device worker");
@@ -455,11 +533,20 @@ impl AudioWorker {
         work_cv.notify_one();
     }
 
-    fn request_stop_async(&mut self, clear_cache: bool) {
+    fn request_stop_async(&mut self) {
         let (lock, work_cv, _) = &*self.state;
         let mut shared = lock.lock().unwrap_or_else(|e| e.into_inner());
         shared.want_running = false;
-        shared.clear_cache |= clear_cache;
+        shared.request_serial += 1;
+        work_cv.notify_one();
+    }
+
+    fn request_fault_stop(&mut self) {
+        let (lock, work_cv, _) = &*self.state;
+        let mut shared = lock.lock().unwrap_or_else(|e| e.into_inner());
+        shared.want_running = false;
+        shared.pending_close = true;
+        shared.clear_cache = true;
         shared.request_serial += 1;
         work_cv.notify_one();
     }
@@ -468,6 +555,7 @@ impl AudioWorker {
         let (lock, work_cv, done_cv) = &*self.state;
         let mut shared = lock.lock().unwrap_or_else(|e| e.into_inner());
         shared.want_running = false;
+        shared.pending_close |= clear_cache;
         shared.clear_cache |= clear_cache;
         shared.request_serial += 1;
         let target = shared.request_serial;
@@ -492,8 +580,8 @@ impl AudioWorker {
     }
 }
 
-fn worker_loop(
-    session: &mut StreamSession,
+fn worker_loop<B: AudioBackend>(
+    session: &mut B,
     state: &(Mutex<WorkerShared>, Condvar, Condvar),
     running: &AtomicBool,
 ) {
@@ -509,16 +597,29 @@ fn worker_loop(
         }
         let target = shared.request_serial;
         let want_running = shared.want_running;
+        let pending_close = shared.pending_close;
         let clear_cache = shared.clear_cache;
+        shared.pending_close = false;
         shared.clear_cache = false;
         shared.busy = true;
         drop(shared);
 
         session.drain_capture();
+        if pending_close {
+            // A faulted or disconnected stream must be closed and its cached
+            // config invalidated before any replacement stream is opened.
+            session.stop(true);
+            running.store(session.is_running(), Ordering::Release);
+        }
         let outcome = if want_running {
-            Some(session.ensure_or_check(|| cpal::default_host().default_output_device()))
+            if clear_cache && !pending_close {
+                session.clear_cache();
+            }
+            Some(session.ensure_or_check())
         } else {
-            session.stop(clear_cache);
+            if !pending_close {
+                session.stop(clear_cache);
+            }
             None
         };
         running.store(session.is_running(), Ordering::Release);
@@ -627,13 +728,13 @@ impl Output {
             }
             Action::StopIdle => {
                 if let Some(worker) = self.worker.as_mut() {
-                    worker.request_stop_async(false);
+                    worker.request_stop_async();
                 }
             }
             Action::FaultBackoff => {
                 log::warn!("audio device stream failed; reopening default output");
                 if let Some(worker) = self.worker.as_mut() {
-                    worker.request_stop_async(true);
+                    worker.request_fault_stop();
                 }
             }
             Action::EnsureOrCheck => {
@@ -1011,6 +1112,283 @@ mod tests {
             !worker.is_running_or_opening(),
             "in-flight async stop must not re-arm idle hysteresis"
         );
+    }
+
+    #[test]
+    fn config_cache_invalidates_on_open_failure_and_renegotiates_fresh_params() {
+        let mut cached: Option<(&'static str, u32)> = None;
+        let mut probes = 0u32;
+
+        // First open probes default config (48_000) and caches it.
+        let s1 = open_with_cache(
+            &mut cached,
+            &"default",
+            |a, b| a == b,
+            |_| {
+                probes += 1;
+                Ok(48_000)
+            },
+            |_, &rate| Ok(rate),
+        );
+        assert_eq!(s1, Ok(48_000));
+        assert_eq!(probes, 1);
+        assert_eq!(cached, Some(("default", 48_000)));
+
+        // Second open reuses cached config without re-probing.
+        let s2 = open_with_cache(
+            &mut cached,
+            &"default",
+            |a, b| a == b,
+            |_| {
+                probes += 1;
+                Ok(44_100)
+            },
+            |_, &rate| Ok(rate),
+        );
+        assert_eq!(s2, Ok(48_000));
+        assert_eq!(probes, 1);
+
+        // Route change makes stale cached config (48_000) fail open; cache must
+        // invalidate and re-negotiate fresh params (44_100) immediately.
+        let s3 = open_with_cache(
+            &mut cached,
+            &"default",
+            |a, b| a == b,
+            |_| {
+                probes += 1;
+                Ok(44_100)
+            },
+            |_, &rate| {
+                if rate == 48_000 {
+                    Err("stale route config".into())
+                } else {
+                    Ok(rate)
+                }
+            },
+        );
+        assert_eq!(s3, Ok(44_100));
+        assert_eq!(probes, 2);
+        assert_eq!(cached, Some(("default", 44_100)));
+
+        // If fresh open also fails, cached config must remain cleared rather than
+        // retaining the previous route's parameters.
+        let s4: Result<u32, String> = open_with_cache(
+            &mut cached,
+            &"default",
+            |a, b| a == b,
+            |_| {
+                probes += 1;
+                Ok(44_100)
+            },
+            |_, _| Err("audio route transiently unavailable".into()),
+        );
+        assert!(s4.is_err());
+        assert_eq!(probes, 3);
+        assert_eq!(cached, None);
+
+        // Next attempt re-probes fresh config (96_000) and succeeds.
+        let s5 = open_with_cache(
+            &mut cached,
+            &"default",
+            |a, b| a == b,
+            |_| {
+                probes += 1;
+                Ok(96_000)
+            },
+            |_, &rate| Ok(rate),
+        );
+        assert_eq!(s5, Ok(96_000));
+        assert_eq!(probes, 4);
+        assert_eq!(cached, Some(("default", 96_000)));
+    }
+
+    #[test]
+    fn reopen_during_pending_fault_stop_closes_old_stream_and_renegotiates_first() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum Event {
+            Probe(u32),
+            Open(u32),
+            Stop { clear_cache: bool },
+        }
+
+        struct Gate {
+            entered: Mutex<bool>,
+            entered_cv: Condvar,
+            release: Mutex<bool>,
+            release_cv: Condvar,
+        }
+
+        impl Gate {
+            fn new() -> Self {
+                Self {
+                    entered: Mutex::new(false),
+                    entered_cv: Condvar::new(),
+                    release: Mutex::new(false),
+                    release_cv: Condvar::new(),
+                }
+            }
+
+            fn arrive_and_wait(&self) {
+                {
+                    let mut entered = self.entered.lock().unwrap();
+                    *entered = true;
+                    self.entered_cv.notify_all();
+                }
+                let mut release = self.release.lock().unwrap();
+                while !*release {
+                    release = self.release_cv.wait(release).unwrap();
+                }
+            }
+
+            fn wait_until_entered(&self) {
+                let mut entered = self.entered.lock().unwrap();
+                while !*entered {
+                    entered = self.entered_cv.wait(entered).unwrap();
+                }
+            }
+
+            fn release(&self) {
+                let mut release = self.release.lock().unwrap();
+                *release = true;
+                self.release_cv.notify_all();
+            }
+        }
+
+        struct FakeBackend {
+            running: bool,
+            cached_config: Option<u32>,
+            next_config: u32,
+            checks: u32,
+            events: Arc<Mutex<Vec<Event>>>,
+            check_gate: Arc<Gate>,
+        }
+
+        impl AudioBackend for FakeBackend {
+            fn is_running(&self) -> bool {
+                self.running
+            }
+
+            fn drain_capture(&mut self) {}
+
+            fn clear_cache(&mut self) {
+                self.cached_config = None;
+            }
+
+            fn stop(&mut self, clear_cache: bool) {
+                if self.running || clear_cache {
+                    self.events
+                        .lock()
+                        .unwrap()
+                        .push(Event::Stop { clear_cache });
+                }
+                self.running = false;
+                if clear_cache {
+                    self.cached_config = None;
+                }
+            }
+
+            fn ensure_or_check(&mut self) -> Result<(), String> {
+                if self.running {
+                    self.checks += 1;
+                    if self.checks == 1 {
+                        // Pause the worker mid-check so the caller can queue a
+                        // fault-stop followed immediately by a reopen request.
+                        self.check_gate.arrive_and_wait();
+                    }
+                    return Ok(());
+                }
+                let config = match self.cached_config {
+                    Some(cfg) => cfg,
+                    None => {
+                        let cfg = self.next_config;
+                        self.next_config += 1;
+                        self.events.lock().unwrap().push(Event::Probe(cfg));
+                        self.cached_config = Some(cfg);
+                        cfg
+                    }
+                };
+                self.events.lock().unwrap().push(Event::Open(config));
+                self.running = true;
+                Ok(())
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let check_gate = Arc::new(Gate::new());
+        let worker_events = events.clone();
+        let worker_gate = check_gate.clone();
+        let mut worker = AudioWorker::spawn_with(move || FakeBackend {
+            running: false,
+            cached_config: None,
+            next_config: 1,
+            checks: 0,
+            events: worker_events,
+            check_gate: worker_gate,
+        });
+
+        let wait_idle = |worker: &AudioWorker| {
+            let (lock, _, done_cv) = &*worker.state;
+            let mut shared = lock.lock().unwrap();
+            while shared.handled_serial < shared.request_serial || shared.busy {
+                shared = done_cv.wait(shared).unwrap();
+            }
+        };
+
+        // 1. Initial open negotiates config 1 and starts stream 1.
+        worker.request_open_or_check();
+        wait_idle(&worker);
+        assert!(worker.is_running());
+
+        // 2. Start a periodic check that pauses the worker thread inside ensure_or_check.
+        worker.request_open_or_check();
+        check_gate.wait_until_entered();
+
+        // 3. While the worker is busy, a stream fault/disconnect queues a fault-stop,
+        //    and a subsequent reopen arrives BEFORE the worker processes the fault-stop.
+        worker.request_fault_stop();
+        worker.request_open_or_check();
+        check_gate.release();
+        wait_idle(&worker);
+
+        assert!(
+            worker.is_running(),
+            "replacement stream must be open after fault teardown + reopen"
+        );
+        let log = events.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                Event::Probe(1),
+                Event::Open(1),
+                Event::Stop { clear_cache: true },
+                Event::Probe(2),
+                Event::Open(2),
+            ],
+            "reopen during pending fault-stop must still close old stream and renegotiate first"
+        );
+
+        worker.shutdown();
+    }
+
+    #[test]
+    fn fault_during_pending_idle_stop_still_triggers_backoff_and_teardown() {
+        let mut policy = Policy::default();
+        let now = Instant::now();
+
+        // Even if an idle stop cleared running_or_opening, a late fault while active
+        // must still trigger FaultBackoff (non-cancellable close + cache clear).
+        assert_eq!(
+            policy.step(now, true, false, false, true),
+            Action::FaultBackoff
+        );
+        assert_eq!(policy.next_wake(), Some(now + FAULT_RETRY));
+
+        // And a late fault while silent must still tear down synchronously and clear cache.
+        assert_eq!(
+            policy.step(now + Duration::from_millis(10), false, false, false, true),
+            Action::StopSync { clear_cache: true }
+        );
+        assert!(policy.next_wake().is_none());
     }
 
     #[test]
