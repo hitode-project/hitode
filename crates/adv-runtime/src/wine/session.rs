@@ -14,6 +14,7 @@ mod host;
 mod installed;
 mod registry;
 pub use adv_cpu::backend::GuestExt;
+pub use adv_drv::user::WindowPlane;
 pub use adv_machine::exception::Checkpoint;
 pub use adv_nt::exception::{
     DispatchFailure, ExceptionCounts, LastUnsupported, Record, StubGaps, WINE_STUB,
@@ -1601,23 +1602,18 @@ impl Session {
     /// Starts or stops keeping text records (WINE-UNIX-8). Stopping discards
     /// the records not yet taken.
     pub fn set_text_records(&mut self, enabled: bool) {
-        let records = &mut self.machine.ext.get_mut::<super::fonts::Fonts>().records;
-        if !enabled {
-            *records = None;
-        } else if records.is_none() {
-            *records = Some(Default::default());
-        }
+        let machine = &mut self.machine;
+        super::text_records::set(&mut machine.sys, &mut machine.ext, enabled);
     }
 
     /// Text records kept since the last call; empty while records are off.
     pub fn take_text_records(&mut self) -> super::text_records::TextBatch {
-        self.machine
-            .ext
-            .get_mut::<super::fonts::Fonts>()
-            .records
-            .as_mut()
-            .map(|records| records.take())
-            .unwrap_or_default()
+        super::text_records::take(&mut self.machine.ext)
+    }
+
+    /// The window surfaces text records can land in, by their pixels' address.
+    pub fn window_planes(&self) -> Vec<WindowPlane> {
+        adv_drv::user::window_planes(&self.machine.ext)
     }
 
     /// Frames presented so far.

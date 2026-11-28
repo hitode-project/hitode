@@ -1,5 +1,6 @@
 //! Wine 11 DIB primitives over checked, directly accessible guest spans.
 
+use super::text_records::{CopyKind, Plane};
 use adv_cpu::body::{EAX, EDX, Input, Mem, Ret, Stop};
 use adv_machine::Conv;
 #[path = "dib_layout.rs"]
@@ -311,6 +312,19 @@ impl Dib {
     }
     fn size(&self) -> usize {
         self.pixel_bpp.div_ceil(8) as usize
+    }
+    fn plane(&self) -> Plane {
+        self.plane_as(self.pixel_bpp)
+    }
+    /// The plane as a primitive that addresses its pixels at `bpp` sees it.
+    fn plane_as(&self, bpp: u32) -> Plane {
+        Plane {
+            bits: self.bits,
+            stride: self.stride,
+            bpp,
+            origin: [self.left, self.top],
+            size: [self.width, self.height],
+        }
     }
     fn at(&self, x: i32, y: i32) -> u32 {
         let x = self.left.wrapping_add(x);
@@ -868,6 +882,79 @@ fn pattern_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
 }
 
 fn copy_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+    let done = copy_rect_pixels(env)?;
+    note_copy(env, CopyKind::Copy);
+    Some(done)
+}
+fn blend_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+    let done = blend_rects_pixels(env)?;
+    note_copy(env, CopyKind::Blend);
+    Some(done)
+}
+fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+    let done = convert_to_pixels(env)?;
+    note_copy(env, CopyKind::Convert);
+    Some(done)
+}
+
+/// Note a completed copy for text records (WINE-UNIX-8). It rereads inputs
+/// the body already read, and never fails the body.
+fn note_copy(env: &mut Args<'_, impl Mem>, kind: CopyKind) {
+    let services = env.cpu.mem.services();
+    if services.text_state.is_null() {
+        return;
+    }
+    let noted = copy_extent(env, kind);
+    env.cpu.stop = None;
+    if let Some((destination, rect, source, offset)) = noted {
+        super::text_records::copied(services, kind, destination, rect, source, offset);
+    }
+}
+
+/// The destination plane and rectangle a copy wrote, its source plane and
+/// the source offset from destination points.
+fn copy_extent(
+    env: &mut Args<'_, impl Mem>,
+    kind: CopyKind,
+) -> Option<(Plane, [i32; 4], Plane, [i32; 2])> {
+    let base = env.base;
+    let dst = destination(env)?;
+    match kind {
+        CopyKind::Copy => {
+            let src = Dib::read(&mut env.cpu, env.args[2], base)?;
+            let rect = rects(&mut env.cpu, env.args[1], 1)?.get(0);
+            let (sx, sy) = point(&mut env.cpu, env.args[3])?;
+            let offset = [sx.wrapping_sub(rect[0]), sy.wrapping_sub(rect[1])];
+            Some((dst.plane(), rect, src.plane_as(dst.pixel_bpp), offset))
+        }
+        CopyKind::Blend => {
+            let src = Dib::read(&mut env.cpu, env.args[3], base)?;
+            let rect = rects(&mut env.cpu, env.args[2], env.args[1])?
+                .iter()
+                .filter(|r| r[0] < r[2] && r[1] < r[3])
+                .reduce(|a, b| {
+                    [
+                        a[0].min(b[0]),
+                        a[1].min(b[1]),
+                        a[2].max(b[2]),
+                        a[3].max(b[3]),
+                    ]
+                })?;
+            let (sx, sy) = point(&mut env.cpu, env.args[4])?;
+            Some((dst.plane(), rect, src.plane_as(32), [sx, sy]))
+        }
+        CopyKind::Convert => {
+            let src = Dib::read(&mut env.cpu, env.args[1], base)?;
+            let mut bytes = [0; rect::SIZE];
+            read_into(&mut env.cpu, env.args[2], &mut bytes)?;
+            let [l, t, r, b] = std::array::from_fn(|i| word(&bytes, i * 4) as i32);
+            let rect = [0, 0, r.wrapping_sub(l), b.wrapping_sub(t)];
+            Some((dst.plane(), rect, src.plane(), [l, t]))
+        }
+    }
+}
+
+fn copy_rect_pixels(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let base = env.base;
     let dst = destination(env)?;
     let mut src = Dib::read(&mut env.cpu, env.args[2], base)?;
@@ -1042,7 +1129,7 @@ fn blend_width(left: i32, right: i32) -> i32 {
     }
 }
 
-fn blend_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+fn blend_rects_pixels(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     if env.args[1] as i32 <= 0 {
         return Some(0);
     }
@@ -1598,7 +1685,7 @@ fn row<const S: u8, const D: u8>(input: &[u8], output: &mut [u8], src: &Dib, dst
     }
 }
 
-fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+fn convert_to_pixels(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let base = env.base;
     let dst = destination(env)?;
     let src = Dib::read(&mut env.cpu, env.args[1], base)?;

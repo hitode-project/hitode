@@ -12,7 +12,7 @@ These terms have one meaning across the docs, specs, code comments and reports. 
 | HLE | HLE | A Win32 API service that the host implements, covering the personality and the API front ends. |
 | API front end / shell | API 前端／宿主壳 | Respectively: the entry point of an API such as DSound, and the platform window with its input and output. Do not write "front end" alone for any of them. |
 | overlay input region | 覆盖层输入区域 | A rectangle the launcher overlay claims for input. A press inside a region, or any press while the overlay is modal, goes to the webview. |
-| text record | 文本记录 | A line the host font frontend drew, or glyph bytes it wrote for the guest, kept while a host consumer extracts text. It marks where a character becomes pixels or glyph bytes. |
+| text record | 文本记录 | A line the host font frontend drew, glyph bytes it wrote for the guest, or a host copy that moved drawn text, kept while a host consumer extracts text. It marks where a character becomes pixels or glyph bytes, or its pixels move. |
 
 ## Execution
 

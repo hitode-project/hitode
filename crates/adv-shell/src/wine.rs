@@ -1147,7 +1147,11 @@ fn drive(
                 Stop::Failed(error) => return Err(error),
             }
             if text_log.is_some() {
-                super::text_log::TextLog::write(&mut text_log, session.take_text_records());
+                super::text_log::TextLog::write(
+                    &mut text_log,
+                    session.take_text_records(),
+                    session.window_planes(),
+                );
             }
             for url in session.take_links() {
                 match worker.as_mut() {
@@ -1189,7 +1193,11 @@ fn drive(
         complete_gate(completion, &mut session, keys);
     }
     if text_log.is_some() {
-        super::text_log::TextLog::write(&mut text_log, session.take_text_records());
+        super::text_log::TextLog::write(
+            &mut text_log,
+            session.take_text_records(),
+            session.window_planes(),
+        );
     }
     session.machine.sys.trace.flush();
     session

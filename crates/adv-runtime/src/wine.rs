@@ -28,10 +28,10 @@ mod dmsynth;
 mod fonts;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;
-pub mod text_records;
 /// Codec library acceleration on the image-mapping path.
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub use adv_drv::codec;
+pub use adv_nt::native::text_records;
 mod sound;
 mod video;
 pub mod winmm;

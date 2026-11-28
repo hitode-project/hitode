@@ -156,7 +156,7 @@ fn empty_glyph_reports_a_black_box_without_a_bitmap() {
 // spec: WINE-UNIX-8
 #[test]
 fn produced_glyph_bytes_are_recorded_only_while_records_are_on() {
-    use super::super::text_records::{Code, ProducedGlyph, TextRecord};
+    use super::super::text_records::{self, Code, ProducedGlyph, TextRecord};
     let (mut machine, data, dc) = fixture();
     let matrix = data + 64;
     let buffer = data + 256;
@@ -171,9 +171,9 @@ fn produced_glyph_bytes_are_recorded_only_while_records_are_on() {
         )
     };
     assert!(gray(&mut machine, "GetGlyphOutlineW") > 0);
-    assert!(machine.ext.get::<Fonts>().records.is_none());
+    assert!(text_records::records(&machine.ext).is_none());
 
-    machine.ext.get_mut::<Fonts>().records = Some(Default::default());
+    text_records::set(&mut machine.sys, &mut machine.ext, true);
     let written = gray(&mut machine, "GetGlyphOutlineW");
     // Metrics alone and a size query hand the guest no glyph bytes.
     invoke(
@@ -194,20 +194,14 @@ fn produced_glyph_bytes_are_recorded_only_while_records_are_on() {
         "GetGlyphOutlineA",
         &[dc, 67, 6, data, 1024, buffer, matrix],
     );
-    let batch = machine
-        .ext
-        .get_mut::<Fonts>()
-        .records
-        .as_mut()
-        .unwrap()
-        .take();
+    let batch = text_records::take(&mut machine.ext);
     assert_eq!(batch.dropped, 0);
     let glyphs: Vec<_> = batch
         .records
         .iter()
         .map(|record| match record {
             TextRecord::Glyph(glyph) => glyph.clone(),
-            TextRecord::Line(line) => panic!("no line was drawn: {line:?}"),
+            other => panic!("only glyphs were produced: {other:?}"),
         })
         .collect();
     assert_eq!(glyphs.len(), 2);

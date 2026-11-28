@@ -583,6 +583,40 @@ pub(super) fn compose(env: &mut Env<'_>, drawn: Option<(u32, [i32; 4])>) -> Resu
     Ok(())
 }
 
+/// A window surface's pixels for text extraction (WINE-UNIX-8): a top-down
+/// 32-bit plane holding the window's whole extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowPlane {
+    pub hwnd: u32,
+    pub bits: u32,
+    pub stride: u32,
+    pub size: [u32; 2],
+    /// The client area's part of the plane, as x, y, width and height.
+    pub client: Option<[u32; 4]>,
+}
+
+/// The window surfaces, by their pixels' address.
+pub fn window_planes(ext: &Ext) -> Vec<WindowPlane> {
+    let Some(surfaces) = ext.try_get::<Surfaces>() else {
+        return Vec::new();
+    };
+    let mut planes: Vec<_> = surfaces
+        .0
+        .values()
+        .map(|surface| WindowPlane {
+            hwnd: surface.hwnd,
+            bits: surface.pixels,
+            stride: surface.width * 4,
+            size: [surface.width, surface.height],
+            client: window(ext, surface.hwnd)
+                .and_then(|w| client_part(surface, &w))
+                .map(|(x, y, width, height)| [x, y, width, height]),
+        })
+        .collect();
+    planes.sort_unstable_by_key(|plane| plane.bits);
+    planes
+}
+
 /// The client area's place in its surface: offset and size.
 fn client_part(surface: &Surface, window: &super::Window) -> Option<(u32, u32, u32, u32)> {
     let full = (surface.width, surface.height);
