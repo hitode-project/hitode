@@ -497,6 +497,7 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) -> Result<(), String> {
         programs: Default::default(),
         written: Default::default(),
         versions: Default::default(),
+        mips: Default::default(),
         counters: Default::default(),
     };
     for face in Face::ALL {

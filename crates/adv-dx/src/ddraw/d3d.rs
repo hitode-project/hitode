@@ -132,6 +132,9 @@ mod legacy {
         /// every surface whose damage history the recording keeps or that a
         /// presented chain holds. CPU writes and exchanges change them.
         pub(super) versions: BTreeMap<u32, (u64, (u64, u64))>,
+        /// Assembled mip images of textures, tagged with the storage and
+        /// writes of every level they copied.
+        pub(super) mips: BTreeMap<u32, (u128, adv_device::gpu::Image)>,
         pub counters: crate::record::Counters,
     }
 
@@ -140,6 +143,7 @@ mod legacy {
             self.depths.remove(&id);
             self.written.remove(&id);
             self.versions.remove(&id);
+            self.mips.remove(&id);
             self.queue.forget((u64::from(id), 0));
         }
 

@@ -461,26 +461,49 @@ impl Calls<'_> {
         if !mips || self.draw.caps(id)[0] & creation::MIPMAP == 0 {
             return Ok(image);
         }
-        let mut levels = vec![(extent, image)];
+        let mut levels = smallvec::SmallVec::<[_; 12]>::new();
+        levels.push((id, extent, image));
         let mut next = id;
         while let Some(&level) = self.draw.complex.get(&next).and_then(|chain| chain.first()) {
             let rect = self.store[level].rect();
             let image = self
                 .store
                 .gpu_access(level, rect, Access::Read, self.memory)?;
-            levels.push((rect, image));
+            levels.push((level, rect, image));
             next = level;
         }
-        let gpu = &mut self.draw.d3d.as_mut().unwrap().gpu;
+        // Each level's storage, version and writes on either side, after
+        // the reads above uploaded its CPU changes.
+        let key = hash(
+            levels
+                .iter()
+                .map(|(level, _, image)| {
+                    (
+                        *level,
+                        image.id(),
+                        self.store[*level].version,
+                        self.store.write_stamp(*level),
+                    )
+                })
+                .collect::<smallvec::SmallVec<[_; 12]>>(),
+        );
+        let d3d = self.draw.d3d.as_mut().unwrap();
+        if let Some((tag, image)) = d3d.mips.get(&id)
+            && *tag == key
+        {
+            return Ok(image.clone());
+        }
+        let gpu = &mut d3d.gpu;
         let image = gpu
             .target_levels(extent.w, extent.h, levels.len() as u32)
             .map_err(gpu_error)?
             .image;
-        for (level, (rect, source)) in levels.into_iter().enumerate() {
+        for (level, (_, rect, source)) in levels.into_iter().enumerate() {
             let destination = image.mip_level(level as u32).map_err(gpu_error)?;
             gpu.copy(&source, rect, &destination, 0, 0)
                 .map_err(gpu_error)?;
         }
+        d3d.mips.insert(id, (key, image.clone()));
         Ok(image)
     }
 
