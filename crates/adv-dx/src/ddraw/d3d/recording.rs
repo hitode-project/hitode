@@ -1,10 +1,12 @@
 //! Device7 submissions over the common version and pass planner.
+use crate::argument::CallError;
 use crate::record::{
-    Cursor, Front, Kind, Op, Reason, Recording, ResourceKey, damage::Input, key::hash,
+    Counters, Cursor, Front, Kind, Op, Plan, Reason, Recording, ResourceKey, damage::Input,
+    key::hash,
 };
 use adv_device::{
     gpu::{self, DrawState, Gpu, ProgrammableDraw, Target},
-    surface::Rect,
+    surface::{Access, Presenter, Rect, Region, SurfaceMemory, Surfaces},
 };
 use std::sync::Arc;
 
@@ -12,6 +14,7 @@ pub(super) type Queue = Recording<Payload>;
 
 pub(super) enum Payload {
     Clear {
+        surface: u32,
         target: Target,
         rect: Rect,
         color: Option<[f64; 4]>,
@@ -19,6 +22,8 @@ pub(super) enum Payload {
         stencil: Option<u32>,
     },
     Draw {
+        surface: u32,
+        area: Rect,
         target: Target,
         draw: Arc<ProgrammableDraw>,
         state: DrawState,
@@ -34,7 +39,6 @@ pub(super) struct Submission<'a> {
 }
 
 pub(super) enum Boundary {
-    EndScene,
     SurfaceAccess,
     QueueLimit,
 }
@@ -54,6 +58,7 @@ impl Front for Adapter {
                 color,
                 depth,
                 stencil,
+                ..
             } => {
                 let color = color.filter(|_| sink.clear_mask & 1 != 0);
                 let depth = depth.filter(|_| sink.clear_mask & 2 != 0);
@@ -69,6 +74,7 @@ impl Front for Adapter {
                 draw,
                 state,
                 line_ranges,
+                ..
             } => sink.gpu.draw_programmable_line_ranges(
                 target,
                 draw.clone(),
@@ -81,24 +87,60 @@ impl Front for Adapter {
 
     fn reason(boundary: Boundary) -> Reason {
         match boundary {
-            Boundary::EndScene => Reason::Barrier,
             Boundary::SurfaceAccess => Reason::Map,
             Boundary::QueueLimit => Reason::CommandLimit,
         }
     }
 }
 
-pub(super) fn flush(
+pub(super) fn flush<P: Presenter>(
     queue: &mut Queue,
     gpu: &mut Gpu,
+    store: &mut Surfaces<P>,
+    memory: &dyn SurfaceMemory,
     boundary: Boundary,
-) -> Result<(), gpu::Error> {
+) -> Result<(), CallError> {
     if queue.commands.is_empty() {
         return Ok(());
     }
     let plan = queue.plan(Adapter::reason(boundary));
+    execute(queue, gpu, store, memory, plan)
+}
+
+/// Run the planned commands. A color write makes the CPU copy stale only
+/// where it executes, so a later surface access reads back no more.
+fn execute<P: Presenter>(
+    queue: &mut Queue,
+    gpu: &mut Gpu,
+    store: &mut Surfaces<P>,
+    memory: &dyn SurfaceMemory,
+    plan: Plan<Payload>,
+) -> Result<(), CallError> {
     for index in queue.cursor.ops..queue.commands.len() {
         if let Some(op) = plan.at(queue, index) {
+            let (surface, area, color) = match op.payload {
+                Payload::Clear {
+                    surface,
+                    rect,
+                    color,
+                    ..
+                } => (*surface, *rect, color.is_some() && op.clear_mask & 1 != 0),
+                Payload::Draw {
+                    surface,
+                    area,
+                    state,
+                    ..
+                } => (*surface, *area, state.color_write != 0),
+            };
+            if color {
+                let whole = [area];
+                for &rect in op.scissors.as_deref().unwrap_or(&whole) {
+                    let rect = rect.clipped(area);
+                    if !rect.empty() {
+                        store.gpu_access(surface, rect, Access::Write, memory)?;
+                    }
+                }
+            }
             Adapter::encode(
                 &mut Submission {
                     gpu,
@@ -106,7 +148,8 @@ pub(super) fn flush(
                     clear_mask: op.clear_mask,
                 },
                 op.payload,
-            )?;
+            )
+            .map_err(|error| error.to_string())?;
         }
         queue.retire(
             &plan,
@@ -118,6 +161,35 @@ pub(super) fn flush(
     }
     queue.end(Some(plan));
     Ok(())
+}
+
+/// Plan the recording for presenting `slot`, run what the plan keeps and
+/// return the cells that changed since the previous presentation. Without
+/// a known change they are the whole surface.
+pub(super) fn present<P: Presenter>(
+    queue: &mut Queue,
+    gpu: &mut Gpu,
+    store: &mut Surfaces<P>,
+    memory: &dyn SurfaceMemory,
+    counters: &mut Counters,
+    (slot, size): (u128, (u32, u32)),
+) -> Result<Region, CallError> {
+    let plan = queue.plan(Reason::Present {
+        slot,
+        verify: false,
+    });
+    queue.present_damage(
+        &plan,
+        size,
+        false,
+        |delta, current| match delta {
+            Some(delta) if current => delta.clone(),
+            _ => Region::whole(size),
+        },
+        counters,
+    );
+    execute(queue, gpu, store, memory, plan)?;
+    Ok(queue.verify_region.clone().unwrap())
 }
 
 pub(super) fn key(surface: u32, aspect: u8) -> ResourceKey {
@@ -134,12 +206,14 @@ pub(super) struct Effects<'a> {
     pub state_key: u128,
 }
 
-pub(super) fn admit(
+pub(super) fn admit<P: Presenter>(
     queue: &mut Queue,
     gpu: &mut Gpu,
+    store: &mut Surfaces<P>,
+    memory: &dyn SurfaceMemory,
     payload: Payload,
     effects: Effects<'_>,
-) -> Result<(), gpu::Error> {
+) -> Result<(), CallError> {
     let (kind, clear_keys, depth_write, stencil_write, color_write) = match &payload {
         Payload::Clear {
             color,
@@ -187,6 +261,7 @@ pub(super) fn admit(
     let target = match &payload {
         Payload::Clear { target, .. } | Payload::Draw { target, .. } => target,
     };
+    let slot = hash(target.image.id());
     let attachment = target.depth().map(|depth| {
         (
             Rect {
@@ -205,7 +280,7 @@ pub(super) fn admit(
             view: effects.view,
             attachment,
             color_shape: 0,
-            slot: u128::from(effects.target),
+            slot,
             bounds: effects.area,
             key: effects.state_key,
             reads: &reads,
@@ -220,7 +295,7 @@ pub(super) fn admit(
         trace: None,
     });
     if admitted.at_limit() {
-        flush(queue, gpu, Boundary::QueueLimit)?;
+        flush(queue, gpu, store, memory, Boundary::QueueLimit)?;
     }
     Ok(())
 }

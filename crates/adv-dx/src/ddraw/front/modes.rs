@@ -2,7 +2,7 @@
 use super::{ComState, DirectDraw, Kind, Loss, State};
 use adv_abi::{Env, GuestPtr, Outcome, win32};
 use adv_cpu::backend::{Prot, Reg};
-use adv_device::surface::{self, PixelFormat, SurfaceStore};
+use adv_device::surface::{self, PixelFormat, SurfaceMemory, SurfaceStore};
 
 const INVALID: u32 = 0x80070057;
 const INVALID_OBJECT: u32 = 0x88760082;
@@ -230,6 +230,7 @@ impl DirectDraw {
     pub(in crate::ddraw) fn sync_activation(
         &mut self,
         store: &mut SurfaceStore,
+        #[cfg_attr(not(feature = "gpu"), allow(unused))] memory: &dyn SurfaceMemory,
         active: bool,
     ) -> Result<(), crate::argument::CallError> {
         let Some(display) = self.display.as_mut() else {
@@ -237,7 +238,7 @@ impl DirectDraw {
         };
         if active == display.suspended {
             #[cfg(feature = "gpu")]
-            self.d3d.as_mut().unwrap().flush()?;
+            self.d3d.as_mut().unwrap().flush(store, memory)?;
             display.suspended = !active;
             if active {
                 set_current(store, display.requested);

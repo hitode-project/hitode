@@ -335,6 +335,17 @@ impl DirectDraw {
         m: &mut dyn SurfaceMemory,
         damage: Rect,
     ) -> Result<(), CallError> {
+        #[cfg(feature = "gpu")]
+        if let Some(d3d) = &mut self.d3d
+            && surfaces.native_target(sid).is_some()
+        {
+            let full = surfaces[sid].rect();
+            let mut region = surface::Region::empty((full.w, full.h));
+            region.add(damage.clipped(full).into());
+            present_native(surfaces, &mut d3d.gpu, sid, m, region)?;
+            self.submitted = Some(sid);
+            return Ok(());
+        }
         if !damage.empty() {
             surfaces.cpu_access(sid, damage, Access::Read, m)?;
         }
@@ -365,18 +376,102 @@ impl DirectDraw {
             return Err("DirectDraw flip chain surfaces have mismatched geometry".into());
         }
         surfaces.flush(m, surface::FlushReason::Immediate)?;
-        let front = surfaces[chain[0]].pixels;
-        for pair in chain.windows(2) {
-            surfaces.get_mut(pair[0]).unwrap().pixels = surfaces[pair[1]].pixels;
+        #[cfg(feature = "gpu")]
+        if let Some(d3d) = &mut self.d3d {
+            if let Some(&target) = chain.iter().find(|&&sid| d3d.pending(sid)) {
+                let identity = crate::record::key::hash(chain);
+                let serial = surfaces.stats.presentations;
+                let Some(damage) =
+                    d3d.present(surfaces, m, (target, identity, serial), chain, true)?
+                else {
+                    // Every member already holds the frame, so the front stays.
+                    let serial = surfaces
+                        .repeat_native_frame(chain[0])
+                        .map_err(|error| error.to_string())?;
+                    d3d.presented(surfaces, (identity, serial), chain);
+                    self.submitted = Some(chain[0]);
+                    return Ok(0);
+                };
+                self.exchange(surfaces, chain);
+                let d3d = self.d3d.as_mut().unwrap();
+                present_native(surfaces, &mut d3d.gpu, chain[0], m, damage)?;
+                let serial = surfaces.stats.presentations;
+                d3d.presented(surfaces, (identity, serial), chain);
+                self.submitted = Some(chain[0]);
+                return Ok(0);
+            }
+            d3d.flush(surfaces, m)?;
         }
-        surfaces.get_mut(*chain.last().unwrap()).unwrap().pixels = front;
+        self.exchange(surfaces, chain);
+        self.present(surfaces, chain[0], m, surfaces[chain[0]].rect())?;
+        Ok(0)
+    }
+
+    fn exchange<P: Presenter>(&mut self, surfaces: &mut Surfaces<P>, chain: &[u32]) {
+        surfaces.rotate(chain);
         if let Some(at) = self.gdi.get_mut(&chain[0])
             && let Some(i) = chain.iter().position(|sid| sid == at)
         {
             *at = chain[(i + chain.len() - 1) % chain.len()];
         }
-        self.present(surfaces, chain[0], m, surfaces[chain[0]].rect())?;
-        Ok(0)
+    }
+
+    /// Run recorded Direct3D work a call can observe. Queries leave it
+    /// queued, and Flip and a Blt of a target to a nonflipping primary plan
+    /// it as a presentation (GFX-D3D7-8).
+    #[cfg(feature = "gpu")]
+    fn flush_d3d<P: Presenter>(
+        &mut self,
+        id: u32,
+        a: &[u32],
+        surfaces: &mut Surfaces<P>,
+        objects: &adv_machine::Objects,
+        m: &mut dyn SurfaceMemory,
+    ) -> Result<(), CallError> {
+        if self.d3d.is_none() {
+            return Ok(());
+        }
+        let presenting = match id {
+            api::ADDREF
+            | api::GET_DESC
+            | api::IS_LOST
+            | api::GET_CAPS
+            | api::GET_DISPLAY_MODE
+            | api::GET_ATTACHED
+            | api::GET_PIXEL_FORMAT
+            | api::GET_COLOR_KEY
+            | api::GET_CLIPPER
+            | api::CLIPPER_GET_HWND
+            | api::GET_BLT_STATUS
+            | api::GET_FLIP_STATUS
+            | api::TEST_COOPERATIVE_LEVEL
+            | api::GET_UNIQUENESS
+            | api::SURFACE_CAPS
+            | api::FLIP => return Ok(()),
+            api::BLT => self
+                .surface_id(objects, a[0])
+                .zip(self.surface_id(objects, a[2])),
+            api::BLT_FAST => self
+                .surface_id(objects, a[0])
+                .zip(self.surface_id(objects, a[3])),
+            _ => None,
+        }
+        .filter(|&(dst, src)| {
+            surfaces.primary_id() == Some(dst)
+                && !self.is_flippable(dst)
+                && self.d3d.as_ref().unwrap().pending(src)
+        });
+        let d3d = self.d3d.as_mut().unwrap();
+        if let Some((dst, src)) = presenting {
+            // The software publication compares the pixels it copies, so an
+            // unchanged frame needs no presentation serial.
+            let identity = crate::record::key::hash((dst, src));
+            d3d.present(surfaces, m, (src, identity, 0), &[src], false)?;
+            d3d.presented(surfaces, (identity, 0), &[]);
+            Ok(())
+        } else {
+            d3d.flush(surfaces, m)
+        }
     }
 
     /// Create the chain `root` was described with: back buffers leading back
@@ -1165,6 +1260,22 @@ fn blt_rect_error(error: CallError) -> u32 {
     }
 }
 
+/// Present `sid`'s GPU copy once CPU writes have reached it. Damage is
+/// relative to the preceding publication.
+#[cfg(feature = "gpu")]
+fn present_native<P: Presenter>(
+    surfaces: &mut Surfaces<P>,
+    gpu: &mut adv_device::gpu::Gpu,
+    sid: u32,
+    m: &dyn SurfaceMemory,
+    damage: surface::Region,
+) -> Result<(), CallError> {
+    let full = surfaces[sid].rect();
+    surfaces.gpu_access(sid, full, Access::Read, m)?;
+    surfaces.present_native(sid, Some(damage), gpu)?;
+    Ok(())
+}
+
 fn rect<P: Presenter>(
     surfaces: &Surfaces<P>,
     id: u32,
@@ -1203,9 +1314,7 @@ impl DirectDraw {
         m: &mut dyn SurfaceMemory,
     ) -> Result<u32, CallError> {
         #[cfg(feature = "gpu")]
-        if let Some(d3d) = &mut self.d3d {
-            d3d.flush()?;
-        }
+        self.flush_d3d(id, a, surfaces, objects, m)?;
         if id == api::UNIMPLEMENTED_COM {
             return Err("unimplemented DirectDraw COM method".into());
         }

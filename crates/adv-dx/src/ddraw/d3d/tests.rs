@@ -3808,3 +3808,275 @@ fn device7_draws_rgb_line_patterns_and_retains_measured_clip_status() {
         }
     }
 }
+
+fn flip_device(f: &mut Fixture, backbuffers: u32) -> (u32, u32) {
+    let dd = f.dd(7);
+    assert_eq!(
+        f.call("IDirectDraw7::SetCooperativeLevel", &[dd, 0, 0x11]),
+        0
+    );
+    assert_eq!(
+        f.call("IDirectDraw7::SetDisplayMode", &[dd, 640, 480, 32, 0, 0]),
+        0
+    );
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let primary = f.described_surface(
+        dd,
+        creation::Described {
+            flags: creation::DDSD_CAPS | creation::DDSD_BACKBUFFERCOUNT,
+            caps: [
+                creation::PRIMARY | creation::FLIP | creation::COMPLEX | creation::THREE_D_DEVICE,
+                0,
+                0,
+                0,
+            ],
+            backbuffers,
+            ..Default::default()
+        },
+    );
+    f.write(DATA + 0x300, &[0; 16]);
+    f.write(DATA + 0x300, &creation::BACKBUFFER.to_le_bytes());
+    assert_eq!(
+        f.call(
+            "IDirectDrawSurface7::GetAttachedSurface",
+            &[primary, DATA + 0x300, OUT]
+        ),
+        0
+    );
+    let back = f.word(OUT);
+    let dev = f.device(d3d, Face::Direct3D7, back);
+    f.machine.cpu.map(VERTICES, 0x10000, Prot::RW).unwrap();
+    (primary, dev)
+}
+
+const VERTICES: u32 = 0x200_0000;
+
+fn fill(model: &mut [u32], width: u32, [x, y, w, h]: [u32; 4], color: u32) {
+    for row in y..y + h {
+        let at = (row * width + x) as usize;
+        model[at..at + w as usize].fill(color);
+    }
+}
+
+/// Clear the target, then draw a band over its lower half and a square at `x`.
+fn draw_scene(f: &mut Fixture, dev: u32, x: f32, band: bool) {
+    let mut vertices = quad(0., 240., 640., 480., 0xff0000ff).to_vec();
+    vertices.extend(quad(x, 0., x + 32., 32., 0xff00ff00));
+    f.write(VERTICES, bytemuck::cast_slice(&vertices));
+    assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+    assert_eq!(f.device_call(dev, "Clear", &[0, 0, 1, 0xff400000, 0, 0]), 0);
+    if band {
+        assert_eq!(
+            f.device_call(dev, "DrawPrimitive", &[5, 0x1c4, VERTICES, 4, 0]),
+            0
+        );
+    }
+    assert_eq!(
+        f.device_call(dev, "DrawPrimitive", &[5, 0x1c4, VERTICES + 128, 4, 0]),
+        0
+    );
+    assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+}
+
+fn scene(x: u32) -> Vec<u32> {
+    let mut model = vec![0x400000; 640 * 480];
+    fill(&mut model, 640, [0, 240, 640, 240], 0xff);
+    fill(&mut model, 640, [x, 0, 32, 32], 0xff00);
+    model
+}
+
+fn d3d7_counters(f: &Fixture) -> [u64; 3] {
+    let c = &f
+        .machine
+        .ext
+        .get::<front::State>()
+        .draw
+        .d3d
+        .as_ref()
+        .unwrap()
+        .counters;
+    [c.full_executions, c.clipped_executions, c.eliminated_frames]
+}
+
+/// GPU readback bytes, counted with the graphics counters.
+fn d3d7_readback(f: &Fixture) -> u64 {
+    #[cfg(feature = "d3d9-counters")]
+    {
+        let d3d = f.machine.ext.get::<front::State>().draw.d3d.as_ref();
+        d3d.unwrap().gpu.traffic().readback_bytes
+    }
+    #[cfg(not(feature = "d3d9-counters"))]
+    {
+        let _ = f;
+        0
+    }
+}
+
+// spec: GFX-D3D7-5, GFX-D3D7-8
+#[test]
+fn device7_flip_presents_frame_damage_and_skips_unchanged_frames() {
+    // Each new image of the chain executes whole once. Unchanged frames run
+    // until every image holds the frame, then repeat the front.
+    for (backbuffers, expected) in [(1, [2, 5, 3]), (2, [3, 5, 2])] {
+        let mut f = Fixture::new(true);
+        let (primary, dev) = flip_device(&mut f, backbuffers);
+        let mut changed = Vec::new();
+        for frame in 0..10 {
+            let x = frame.min(5) * 64;
+            draw_scene(&mut f, dev, x as f32, true);
+            let readback = d3d7_readback(&f);
+            let before = f.machine.ext.get::<SurfaceStore>().stats.presentations;
+            assert_eq!(f.call("IDirectDrawSurface7::Flip", &[primary, 0, 1]), 0);
+            assert_eq!(d3d7_readback(&f), readback);
+            let store = f.machine.ext.get::<SurfaceStore>();
+            assert_eq!(store.stats.presentations, before + 1);
+            let counters = &f
+                .machine
+                .ext
+                .get::<front::State>()
+                .draw
+                .d3d
+                .as_ref()
+                .unwrap()
+                .counters;
+            changed.push(counters.changed_pixels);
+            assert_eq!(f.pixels(primary, 640, 480), scene(x), "frame {frame}");
+        }
+        assert_eq!(d3d7_counters(&f), expected);
+        // A moved square changes the cells it leaves and enters.
+        let moved = changed[3] - changed[2];
+        assert!(moved > 0 && moved < 640 * 480 / 32, "{moved}");
+    }
+}
+
+// spec: GFX-D3D7-8
+#[test]
+fn device7_flip_exchanges_buffers_and_redraws_after_cpu_writes() {
+    // Without a full overwrite the back buffer keeps the old front's pixels.
+    let mut f = Fixture::new(true);
+    let (primary, dev) = flip_device(&mut f, 1);
+    let mut buffers = [vec![0; 640 * 480], vec![0; 640 * 480]];
+    for frame in 0..4 {
+        let x = frame * 64;
+        f.write(
+            VERTICES,
+            bytemuck::cast_slice(&quad(x as f32, 0., x as f32 + 32., 32., 0xff00ff00)),
+        );
+        assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+        assert_eq!(
+            f.device_call(dev, "DrawPrimitive", &[5, 0x1c4, VERTICES, 4, 0]),
+            0
+        );
+        assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+        fill(&mut buffers[1], 640, [x, 0, 32, 32], 0xff00);
+        assert_eq!(f.call("IDirectDrawSurface7::Flip", &[primary, 0, 1]), 0);
+        buffers.swap(0, 1);
+        assert_eq!(f.pixels(primary, 640, 480), buffers[0], "frame {frame}");
+    }
+    assert_eq!(d3d7_counters(&f), [4, 0, 0]);
+    // A color fill of the front reaches the back after the next flip, and
+    // the following frame's clear removes it there.
+    for backbuffers in [1, 2] {
+        let mut f = Fixture::new(true);
+        let (primary, dev) = flip_device(&mut f, backbuffers);
+        for frame in 0..8 {
+            let x = frame.min(4) * 64;
+            draw_scene(&mut f, dev, x as f32, true);
+            assert_eq!(f.call("IDirectDrawSurface7::Flip", &[primary, 0, 1]), 0);
+            assert_eq!(f.pixels(primary, 640, 480), scene(x), "frame {frame}");
+            if frame == 3 {
+                f.write(DATA + 0x400, bytemuck::cast_slice(&[0u32, 100, 640, 140]));
+                let mut fx = [0u32; 25];
+                fx[0] = 100;
+                fx[20] = 0x123456;
+                f.write(DATA + 0x500, bytemuck::cast_slice(&fx));
+                assert_eq!(
+                    f.call(
+                        "IDirectDrawSurface7::Blt",
+                        &[primary, DATA + 0x400, 0, 0, 0x0100_0400, DATA + 0x500]
+                    ),
+                    0
+                );
+                let mut filled = scene(x);
+                fill(&mut filled, 640, [0, 100, 640, 40], 0x123456);
+                assert_eq!(f.pixels(primary, 640, 480), filled);
+            }
+        }
+    }
+}
+
+// spec: GFX-D3D7-8
+#[test]
+fn device7_presenting_blt_reads_back_executed_cells() {
+    let mut f = Fixture::new(true);
+    let dd = f.dd(7);
+    assert_eq!(f.call("IDirectDraw7::SetCooperativeLevel", &[dd, 0, 8]), 0);
+    let d3d = f.face(dd, IID_IDIRECT3D7);
+    let primary = f.described_surface(
+        dd,
+        creation::Described {
+            flags: creation::DDSD_CAPS,
+            caps: [creation::PRIMARY, 0, 0, 0],
+            ..Default::default()
+        },
+    );
+    let rt = f.surface(
+        dd,
+        true,
+        creation::OFFSCREEN_PLAIN | creation::THREE_D_DEVICE,
+        64,
+        64,
+    );
+    let tex = f.surface(dd, true, creation::TEXTURE, 4, 4);
+    let dev = f.device(d3d, Face::Direct3D7, rt);
+    f.machine.cpu.map(VERTICES, 0x10000, Prot::RW).unwrap();
+    let mut vertices = quad(0., 32., 64., 64., 0xff0000ff).to_vec();
+    vertices.extend(quad(0., 0., 16., 16., 0xffffffff));
+    f.write(VERTICES, bytemuck::cast_slice(&vertices));
+    let mut readbacks = Vec::new();
+    for frame in 0..6 {
+        // A texture rewrite between frames changes only the square's cells.
+        if frame % 2 == 0 {
+            let (address, pitch) = f.lock(tex, 0);
+            for y in 0..4 {
+                f.write(
+                    address + y * pitch,
+                    bytemuck::cast_slice(&[0xff000000 | ((frame + 1) * 0x20); 4]),
+                );
+            }
+            f.unlock(tex);
+        }
+        assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+        assert_eq!(f.device_call(dev, "Clear", &[0, 0, 1, 0xff400000, 0, 0]), 0);
+        assert_eq!(f.device_call(dev, "SetTexture", &[0, 0]), 0);
+        assert_eq!(
+            f.device_call(dev, "DrawPrimitive", &[5, 0x1c4, VERTICES, 4, 0]),
+            0
+        );
+        assert_eq!(f.device_call(dev, "SetTexture", &[0, tex]), 0);
+        assert_eq!(
+            f.device_call(dev, "DrawPrimitive", &[5, 0x1c4, VERTICES + 128, 4, 0]),
+            0
+        );
+        assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+        let readback = d3d7_readback(&f);
+        assert_eq!(
+            f.call(
+                "IDirectDrawSurface7::Blt",
+                &[primary, 0, rt, 0, 0x0100_0000, 0]
+            ),
+            0
+        );
+        readbacks.push(d3d7_readback(&f) - readback);
+        let mut model = vec![0x400000; 64 * 64];
+        fill(&mut model, 64, [0, 32, 64, 32], 0xff);
+        fill(&mut model, 64, [0, 0, 16, 16], (frame / 2 * 2 + 1) * 0x20);
+        assert_eq!(f.pixels(rt, 64, 64), model, "frame {frame}");
+    }
+    assert_eq!(d3d7_counters(&f), [1, 2, 3]);
+    if cfg!(feature = "d3d9-counters") {
+        assert_eq!(readbacks[0], 64 * 64 * 4);
+        assert!(readbacks[2] > 0 && readbacks[2] < 64 * 64, "{readbacks:?}");
+        assert_eq!([readbacks[1], readbacks[3], readbacks[5]], [0; 3]);
+    }
+}
