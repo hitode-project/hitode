@@ -2395,3 +2395,109 @@ fn extended_enumeration_keeps_named_substitutes_without_os2_codepage_bits() {
             .any(|row| row.substitute && row.font.face == "MS Gothic")
     );
 }
+
+/// Remove a single SFNT table directory entry from a standalone TrueType font.
+fn strip_table(bytes: &[u8], tag: &[u8; 4]) -> Vec<u8> {
+    let count = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    let kept: Vec<&[u8; 16]> = bytes[12..12 + count * 16]
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .filter(|entry| &entry[..4] != tag)
+        .collect();
+    assert_eq!(kept.len() + 1, count, "table {tag:?} must exist in fixture");
+    let new_count = kept.len() as u16;
+    let power: u16 = 1 << new_count.ilog2();
+    let mut out = bytes[..12].to_vec();
+    out[4..6].copy_from_slice(&new_count.to_be_bytes());
+    out[6..8].copy_from_slice(&(power * 16).to_be_bytes());
+    out[8..10].copy_from_slice(&(power.ilog2() as u16).to_be_bytes());
+    out[10..12].copy_from_slice(&(new_count * 16 - power * 16).to_be_bytes());
+    out.resize(12 + kept.len() * 16, 0);
+    for (index, entry) in kept.into_iter().enumerate() {
+        let offset = u32::from_be_bytes(entry[8..12].try_into().unwrap()) as usize;
+        let length = u32::from_be_bytes(entry[12..16].try_into().unwrap()) as usize;
+        let start = out.len() as u32;
+        let slot = &mut out[12 + index * 16..12 + (index + 1) * 16];
+        slot.copy_from_slice(entry);
+        slot[8..12].copy_from_slice(&start.to_be_bytes());
+        out.extend_from_slice(&bytes[offset..offset + length]);
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+    out
+}
+
+// spec: WIN32-GDI-12
+#[test]
+fn outline_metrics_and_signature_fall_back_when_os2_is_missing() {
+    let without_os2 = strip_table(SINGLE, b"OS/2");
+    let mut text = Text::with_font_directories(&[]);
+    text.add_file_resource(&without_os2, true).unwrap();
+
+    let mut request = font("ADV Resource Fixture");
+    let m = text.outline_metrics(&request).unwrap();
+    assert_eq!(m.em_units, 1000);
+    assert_eq!((m.ascent, m.descent, m.line_gap), (32, -8, 0));
+    assert_eq!((m.mac_ascent, m.mac_descent, m.mac_line_gap), (32, -8, 0));
+    assert_eq!(m.panose, [0; 10]);
+    assert_eq!(m.selection, 0x40);
+    assert_eq!(m.embedding, 0);
+    assert_eq!((m.cap_height, m.x_height), (0, 0));
+    assert_eq!((m.strikeout_size, m.strikeout_position), (0, 0));
+    assert_eq!(m.subscript_size, Point { x: 0, y: 0 });
+    assert_eq!(m.superscript_size, Point { x: 0, y: 0 });
+
+    let (_, wide) = text.unicode_metrics(&request).unwrap();
+    assert_eq!(wide, [0x20, 0x42, 0x1f, 0x20]);
+    assert_eq!(text.signature(&request).unwrap(), FontSignature::default());
+    assert_eq!(text.language_info(&request).unwrap(), 0);
+
+    // Simulated styles still apply when OS/2 is absent.
+    request.italic = true;
+    request.underline = true;
+    request.weight = 700;
+    assert_eq!(text.outline_metrics(&request).unwrap().selection, 0x63);
+
+    // Full enumeration lists the face and its request resolves back to working outline metrics.
+    let enumerated = text
+        .enumerate(None, FontEnumeration::FamiliesEx(Encoding::Automatic))
+        .unwrap();
+    assert!(
+        enumerated
+            .iter()
+            .any(|entry| entry.font.face == "ADV Resource Fixture")
+    );
+    for entry in enumerated {
+        let mut req = entry.font;
+        req.height = -24;
+        assert!(text.outline_metrics(&req).is_ok());
+        assert!(text.unicode_metrics(&req).is_ok());
+        assert!(text.signature(&req).is_ok());
+    }
+}
+
+// spec: WIN32-GDI-12
+#[test]
+#[cfg(target_os = "macos")]
+fn enumerated_macos_system_fonts_provide_outline_and_unicode_metrics() {
+    let mut text = Text::default();
+    text.set_language("zh-Hans");
+    let enumerated = text
+        .enumerate(None, FontEnumeration::FamiliesEx(Encoding::Automatic))
+        .unwrap();
+    assert!(!enumerated.is_empty());
+    let mut checked_faces = BTreeSet::new();
+    for entry in enumerated {
+        if !checked_faces.insert(entry.font.face.clone()) {
+            continue;
+        }
+        let mut req = entry.font;
+        req.height = -24;
+        text.outline_metrics(&req)
+            .unwrap_or_else(|err| panic!("outline_metrics failed for {:?}: {err}", req.face));
+        text.unicode_metrics(&req)
+            .unwrap_or_else(|err| panic!("unicode_metrics failed for {:?}: {err}", req.face));
+        text.signature(&req)
+            .unwrap_or_else(|err| panic!("signature failed for {:?}: {err}", req.face));
+    }
+}
