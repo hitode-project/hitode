@@ -297,10 +297,7 @@ pub(super) fn run_execution(
         })
         .transpose()?;
     let pacer = super::frame_pacer::HostPacer {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
         vsync: worker.vsync.take(),
-        #[cfg(target_os = "android")]
-        vsync: None,
         keys: keys.clone(),
         origin: Instant::now(),
     };

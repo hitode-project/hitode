@@ -1,23 +1,46 @@
 use super::Driver;
 use ndk_sys::*;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::c_void,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     ptr::NonNull,
     rc::{Rc, Weak},
-    time::Instant,
+    time::{Duration, Instant},
 };
 type RateHook =
     unsafe extern "C" fn(*mut AChoreographer, AChoreographer_refreshRateCallback, *mut c_void);
+
+fn monotonic_ns() -> i64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    time.tv_sec * 1_000_000_000 + time.tv_nsec
+}
+
+fn instant_from_monotonic(frame_ns: i64) -> Instant {
+    let now = Instant::now();
+    let now_ns = monotonic_ns();
+    if now_ns >= frame_ns {
+        now.checked_sub(Duration::from_nanos((now_ns - frame_ns) as u64))
+            .unwrap_or(now)
+    } else {
+        now + Duration::from_nanos((frame_ns - now_ns) as u64)
+    }
+}
+
 pub(super) struct MainLoop {
     looper: NonNull<ALooper>,
     timer: OwnedFd,
     wake_fd: i32,
     choreographer: *mut AChoreographer,
     pending: Cell<bool>,
-    /// Frame time of the last refresh presentation counted, in nanoseconds.
-    counted: Cell<i64>,
+    frame_waiting: Cell<bool>,
+    probed: Cell<bool>,
+    pacer: RefCell<crate::frontend::RefreshPacer>,
+    estimator: RefCell<crate::frontend::PeriodEstimator>,
     unregister: Option<RateHook>,
     driver: Weak<Driver>,
 }
@@ -57,7 +80,10 @@ impl MainLoop {
             wake_fd: driver.wake.as_raw_fd(),
             choreographer,
             pending: Cell::new(false),
-            counted: Cell::new(i64::MIN / 2),
+            frame_waiting: Cell::new(false),
+            probed: Cell::new(false),
+            pacer: RefCell::default(),
+            estimator: RefCell::default(),
             unregister: (!register.is_null() && !unregister.is_null())
                 .then(|| unsafe { std::mem::transmute::<*mut c_void, RateHook>(unregister) }),
             driver: Rc::downgrade(driver),
@@ -92,22 +118,18 @@ impl MainLoop {
     }
     fn post_frame(&self) {
         self.pending.set(true);
+        self.estimator.borrow_mut().on_post(monotonic_ns());
         // One Weak token survives teardown until the uncancellable callback.
         let data = Box::into_raw(Box::new(self.driver.clone())).cast();
         unsafe {
             AChoreographer_postFrameCallback64(self.choreographer, Some(frame_callback), data);
         }
     }
-    /// Whether the frame at `frame_ns` is a presentation refresh.
-    fn counts(&self, frame_ns: i64, period: i64) -> bool {
-        let counted = crate::frontend::counts_refresh(frame_ns - self.counted.get(), period);
-        if counted {
-            self.counted.set(frame_ns);
-        }
-        counted
-    }
     pub(super) fn arm(&self, next: Option<Instant>, frame: bool) -> Result<(), String> {
         let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
+        if frame {
+            self.frame_waiting.set(true);
+        }
         if crate::frontend::request_vsync(frame.then(Instant::now), self.pending.get()) {
             self.post_frame();
         }
@@ -148,11 +170,40 @@ unsafe extern "C" fn fd_callback(fd: i32, _: i32, data: *mut c_void) -> i32 {
 unsafe extern "C" fn frame_callback(frame_ns: i64, data: *mut c_void) {
     let weak = unsafe { Box::from_raw(data as *mut Weak<Driver>) };
     if let Some(driver) = weak.upgrade() {
-        let counted = driver.main_loop.borrow().as_ref().is_none_or(|main_loop| {
+        let counted = driver.main_loop.borrow().as_ref().is_some_and(|main_loop| {
             main_loop.pending.set(false);
-            let counted = main_loop.counts(frame_ns, driver.view.period.get());
+            let period = {
+                let mut estimator = main_loop.estimator.borrow_mut();
+                let reported = driver.view.period.get();
+                if main_loop.unregister.is_some() && reported > 0 {
+                    estimator.set_reported(reported);
+                }
+                let period = estimator.on_frame(frame_ns).unwrap_or(0);
+                if main_loop.unregister.is_none() && period > 0 {
+                    driver.view.period.set(period);
+                }
+                period
+            };
+            if period > 0 {
+                driver.view.vsync.publish(
+                    instant_from_monotonic(frame_ns),
+                    Duration::from_nanos(period as u64),
+                );
+            }
+            if !main_loop.frame_waiting.replace(false) {
+                return false;
+            }
+            let counted = main_loop.pacer.borrow_mut().counts(frame_ns, period);
             if !counted {
                 // A waiting frame attaches on the next counted refresh.
+                main_loop.frame_waiting.set(true);
+                main_loop.post_frame();
+            } else if main_loop.unregister.is_none()
+                && period == 0
+                && !main_loop.probed.replace(true)
+            {
+                // API 29 lacks refresh-rate callbacks: take one adjacent
+                // sample after the first active frame to measure the panel.
                 main_loop.post_frame();
             }
             counted
@@ -164,11 +215,16 @@ unsafe extern "C" fn frame_callback(frame_ns: i64, data: *mut c_void) {
     }
 }
 unsafe extern "C" fn rate_callback(period: i64, data: *mut c_void) {
-    let driver = unsafe { &*(data as *const Driver) };
-    driver.view.period.set(period);
+    if period > 0 {
+        let driver = unsafe { &*(data as *const Driver) };
+        driver.view.period.set(period);
+    }
 }
 impl Drop for MainLoop {
     fn drop(&mut self) {
+        if let Some(driver) = self.driver.upgrade() {
+            driver.view.vsync.clear();
+        }
         unsafe {
             if let Some(unregister) = self.unregister {
                 unregister(

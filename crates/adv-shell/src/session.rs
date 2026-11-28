@@ -146,7 +146,7 @@ impl Session {
         {
             worker.vsync = Some(view.vsync());
         }
-        #[cfg(target_os = "ios")]
+        #[cfg(mobile)]
         {
             worker.vsync = Some(view.vsync.clone());
         }

@@ -45,7 +45,7 @@ pub struct Worker {
     #[cfg(any(host_view, feature = "gpu"))]
     pub(crate) display: Option<crate::display::Startup>,
     /// The host frame clock's vsync grid, handed to guest refresh pacing.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(host_view)]
     pub(crate) vsync: Option<Arc<adv_sync::vsync::Vsync>>,
     incoming: spsc::Consumer<Delivery>,
     requests: spsc::Producer<Request>,
@@ -118,7 +118,7 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
 
             #[cfg(any(host_view, feature = "gpu"))]
             display: None,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            #[cfg(host_view)]
             vsync: None,
             incoming,
             requests: requests_tx,
@@ -581,16 +581,149 @@ fn refresh_deadline(
 ) -> Option<Instant> {
     (!in_flight && dirty && dimensions.0 != 0 && dimensions.1 != 0).then_some(next)
 }
-/// Whether a vsync `elapsed_ns` after the last counted one is a presentation
-/// refresh: faster panels count every n-th vsync, the fewest that keep
-/// presentation at or below 60 Hz.
+/// Tracks Android display refreshes so presentation follows HOST-SES-8:
+/// - slower or ~60 Hz displays count every vsync,
+/// - displays within 1% of a whole multiple of 60 Hz count every k-th vsync,
+/// - other faster displays snap rational 60 Hz cadence to the nearest host
+///   vsync (consistent with GFX-PACE-1) without repaying missed frames,
+/// - an unknown period (`<= 0`) enforces a 90% of 1/60 s floor to avoid
+///   120 Hz half-period boundary jitter.
 #[cfg(any(target_os = "android", test))]
-pub(crate) fn counts_refresh(elapsed_ns: i64, period_ns: i64) -> bool {
-    const SIXTY: i64 = 16_666_667;
-    let period = if period_ns > 0 { period_ns } else { SIXTY };
-    // The tolerance absorbs periods a little shorter than an exact divisor.
-    let every = ((SIXTY as f64 / period as f64 - 0.05).ceil() as i64).max(1);
-    elapsed_ns >= every * period - period / 2
+#[derive(Default)]
+pub(crate) struct RefreshPacer {
+    last_counted: Option<i64>,
+    cadence_origin: i64,
+    cadence_step: u64,
+}
+#[cfg(any(target_os = "android", test))]
+impl RefreshPacer {
+    const SIXTY_NS: i64 = 16_666_667;
+    const UNKNOWN_FLOOR_NS: i64 = Self::SIXTY_NS - Self::SIXTY_NS / 10;
+
+    fn anchor(&mut self, frame_ns: i64) -> bool {
+        self.last_counted = Some(frame_ns);
+        self.cadence_origin = frame_ns;
+        self.cadence_step = 0;
+        true
+    }
+
+    /// Whether the vsync at `frame_ns` counts as a presentation refresh.
+    pub(crate) fn counts(&mut self, frame_ns: i64, period_ns: i64) -> bool {
+        let Some(last) = self.last_counted else {
+            return self.anchor(frame_ns);
+        };
+        let elapsed = frame_ns.saturating_sub(last);
+        if period_ns <= 0 {
+            return if elapsed >= Self::UNKNOWN_FLOOR_NS {
+                self.anchor(frame_ns)
+            } else {
+                false
+            };
+        }
+        let rate = 1e9 / period_ns as f64;
+        if rate <= 60.0 * 1.01 {
+            return self.anchor(frame_ns);
+        }
+        let whole = (rate / 60.0).round();
+        if whole >= 2.0 && (rate - whole * 60.0).abs() <= 0.01 * rate {
+            let every = whole as i64;
+            return if elapsed >= every * period_ns - period_ns / 2 {
+                self.anchor(frame_ns)
+            } else {
+                false
+            };
+        }
+        let next_step = self.cadence_step + 1;
+        let ideal =
+            i128::from(self.cadence_origin) + (i128::from(next_step) * 1_000_000_000 + 30) / 60;
+        let next_ideal =
+            i128::from(self.cadence_origin) + (i128::from(next_step + 1) * 1_000_000_000 + 30) / 60;
+        let snap_margin = i128::from(period_ns / 2);
+        let frame = i128::from(frame_ns);
+        if frame < ideal - snap_margin {
+            return false;
+        }
+        if frame >= next_ideal - snap_margin {
+            return self.anchor(frame_ns);
+        }
+        self.last_counted = Some(frame_ns);
+        self.cadence_step = next_step;
+        true
+    }
+}
+/// Tracks the display's vsync period from `AChoreographer` refresh-rate
+/// callbacks (API 30+) or consecutive un-gapped frame callbacks (API 29).
+#[cfg(any(target_os = "android", test))]
+#[derive(Default)]
+pub(crate) struct PeriodEstimator {
+    reported: Option<i64>,
+    inferred: Option<i64>,
+    last_frame_ns: Option<i64>,
+    posted_at_ns: Option<i64>,
+    slower_run: Option<(i64, u8)>,
+}
+#[cfg(any(target_os = "android", test))]
+impl PeriodEstimator {
+    const MIN_PERIOD_NS: i64 = 2_000_000;
+    const MAX_PERIOD_NS: i64 = 50_000_000;
+
+    pub(crate) fn set_reported(&mut self, period_ns: i64) {
+        if period_ns > 0 {
+            self.reported = Some(period_ns);
+        }
+    }
+
+    pub(crate) fn on_post(&mut self, now_ns: i64) {
+        self.posted_at_ns = Some(now_ns);
+    }
+
+    pub(crate) fn on_frame(&mut self, frame_ns: i64) -> Option<i64> {
+        let prev = self.last_frame_ns.replace(frame_ns);
+        let posted = self.posted_at_ns.take();
+        if let Some(period) = self.reported {
+            return Some(period);
+        }
+        if let (Some(prev), Some(posted)) = (prev, posted) {
+            let delta = frame_ns.saturating_sub(prev);
+            let post_delay = posted.saturating_sub(prev);
+            // A callback posted before 40% of `delta` cannot have skipped a
+            // vsync (which requires waiting at least 50% of `delta`).
+            if (Self::MIN_PERIOD_NS..=Self::MAX_PERIOD_NS).contains(&delta)
+                && posted >= prev.saturating_sub(2_000_000)
+                && post_delay < delta * 2 / 5
+            {
+                match self.inferred {
+                    None => {
+                        self.inferred = Some(delta);
+                        self.slower_run = None;
+                    }
+                    Some(cur) if delta < cur * 3 / 4 => {
+                        self.inferred = Some(delta);
+                        self.slower_run = None;
+                    }
+                    Some(cur) if (delta - cur).abs() <= cur / 6 => {
+                        self.inferred = Some((cur * 7 + delta) / 8);
+                        self.slower_run = None;
+                    }
+                    Some(_) => match self.slower_run {
+                        Some((cand, count)) if (delta - cand).abs() <= cand / 8 => {
+                            let avg = (cand * i64::from(count) + delta) / i64::from(count + 1);
+                            if count + 1 >= 4 {
+                                self.inferred = Some(avg);
+                                self.slower_run = None;
+                            } else {
+                                self.slower_run = Some((avg, count + 1));
+                            }
+                        }
+                        _ => {
+                            self.slower_run = Some((delta, 1));
+                        }
+                    },
+                }
+            }
+        }
+        self.inferred
+    }
 }
 #[cfg(any(mobile, test))]
 pub(crate) fn request_vsync(next: Option<Instant>, pending: bool) -> bool {
@@ -643,25 +776,78 @@ mod tests {
     // spec: HOST-SES-8
     #[test]
     fn presentation_refreshes_stay_at_sixty_hertz_on_faster_panels() {
-        let count = |period: i64, ticks: i64| {
-            let mut last = i64::MIN / 2;
-            (1..=ticks)
-                .filter(|&n| {
-                    let at = n * period + if n % 2 == 0 { 300_000 } else { -300_000 };
-                    let counted = counts_refresh(at - last, period);
-                    if counted {
-                        last = at;
+        let count_jittered = |period: i64, ticks: i64| {
+            let mut pacer = RefreshPacer::default();
+            let mut intervals = Vec::new();
+            let mut last = None;
+            for n in 1..=ticks {
+                let at = n * period + if n % 2 == 0 { 300_000 } else { -300_000 };
+                if pacer.counts(at, period) {
+                    if let Some(prev) = last {
+                        intervals.push(at - prev);
                     }
-                    counted
-                })
-                .count()
+                    last = Some(at);
+                }
+            }
+            (intervals.len() + usize::from(last.is_some()), intervals)
         };
-        // One second of vsyncs with jitter, at 60, 120, 90 and 144 Hz.
-        assert_eq!(count(16_666_667, 60), 60);
-        assert_eq!(count(8_333_333, 120), 60);
-        assert_eq!(count(11_111_111, 90), 45);
-        assert_eq!(count(6_944_444, 144), 48);
-        assert!(counts_refresh(16_666_667, 0));
+        // Slower, 60 Hz, and whole-multiple panels pace strictly at 60 Hz (or panel rate).
+        assert_eq!(count_jittered(20_000_000, 50).0, 50);
+        assert_eq!(count_jittered(16_666_667, 60).0, 60);
+        let (hz120, iv120) = count_jittered(8_333_333, 120);
+        assert_eq!(hz120, 60);
+        assert!(iv120.iter().all(|&d| (d - 16_666_666).abs() < 1_000_000));
+        let (hz180, iv180) = count_jittered(5_555_556, 180);
+        assert_eq!(hz180, 60);
+        assert!(iv180.iter().all(|&d| (d - 16_666_668).abs() < 1_000_000));
+        let (hz240, iv240) = count_jittered(4_166_667, 240);
+        assert_eq!(hz240, 60);
+        assert!(iv240.iter().all(|&d| (d - 16_666_668).abs() < 1_000_000));
+
+        // Non-integer faster panels snap rational 60 Hz cadence to nearest vsyncs.
+        for (period, ticks) in [(11_111_111, 90), (6_944_444, 144), (6_060_606, 165)] {
+            let (total, intervals) = count_jittered(period, ticks);
+            assert_eq!(total, 60, "period={period} ticks={ticks}");
+            let min_iv = *intervals.iter().min().unwrap();
+            let max_iv = *intervals.iter().max().unwrap();
+            assert!(
+                min_iv >= period - 700_000 && max_iv <= 3 * period + 700_000,
+                "period={period} min={min_iv} max={max_iv}"
+            );
+        }
+
+        // Unknown period (API 29 before measurement): 120 Hz never jitters on a 1 ns boundary.
+        let mut unknown = RefreshPacer::default();
+        assert!(unknown.counts(0, 0));
+        assert!(!unknown.counts(8_333_333, 0));
+        assert!(!unknown.counts(8_333_334, 0));
+        assert!(!unknown.counts(8_334_000, 0));
+        assert!(unknown.counts(16_666_667, 0));
+
+        // Idle gaps re-anchor instead of repaying missed 60 Hz frames.
+        let mut idle = RefreshPacer::default();
+        assert!(idle.counts(0, 6_944_444));
+        assert!(idle.counts(500_000_000, 6_944_444));
+        assert!(!idle.counts(506_944_444, 6_944_444));
+        assert!(idle.counts(513_888_888, 6_944_444));
+    }
+    // spec: AND-APP-10
+    #[test]
+    fn api29_period_estimator_infers_adjacent_display_period_and_rejects_idle_gaps() {
+        // Adjacent 120 Hz callbacks infer ~8.33 ms even without refresh-rate callbacks.
+        let mut est = PeriodEstimator::default();
+        est.on_post(0);
+        assert_eq!(est.on_frame(1_000_000), None);
+        est.on_post(1_500_000);
+        assert_eq!(est.on_frame(9_333_333), Some(8_333_333));
+        // An idle gap (posted 9 ms after previous frame) must not overwrite 120 Hz with 60 Hz.
+        est.on_post(18_500_000);
+        assert_eq!(est.on_frame(26_000_000), Some(8_333_333));
+
+        // Reported API 30+ refresh-rate callbacks take precedence over inferred periods.
+        est.set_reported(11_111_111);
+        est.on_post(26_500_000);
+        assert_eq!(est.on_frame(34_333_333), Some(11_111_111));
     }
     // spec: AND-APP-10
     #[test]
