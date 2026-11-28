@@ -280,6 +280,10 @@ pub(super) fn start(
         return Outcome::Return(1);
     };
     if fonts[index].substitute {
+        env.ext
+            .get_or_default::<adv_abi::ApiDiagnostics>()
+            .font_events
+            .record_substitution(face.as_deref());
         adv_abi::warn_unavailable(
             env,
             api,

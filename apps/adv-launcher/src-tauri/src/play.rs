@@ -65,7 +65,7 @@ pub(crate) fn shown(window: &WebviewWindow, id: &str) {
 pub(crate) fn finished(
     window: &WebviewWindow,
     id: String,
-    result: Result<adv_shell::Finished, String>,
+    result: Result<adv_shell::Finished, adv_shell::RunError>,
     started: Instant,
 ) {
     let elapsed = started.elapsed();
@@ -75,7 +75,7 @@ pub(crate) fn finished(
     };
     let summary = match &result {
         Ok(finished) => finished.summary.clone(),
-        Err(error) => adv_shell::error_summary(error, elapsed),
+        Err(error) => (*error.summary).clone(),
     };
     if let Some(played) = played
         && let Err(error) = window.state::<Mutex<Library>>().lock().unwrap().finished(
@@ -84,7 +84,7 @@ pub(crate) fn finished(
             LastRun {
                 ended: library::now(),
                 summary: Some(summary.clone()),
-                error: result.as_ref().err().cloned(),
+                error: result.as_ref().err().map(|error| error.message.clone()),
             },
         )
     {
@@ -105,7 +105,7 @@ pub(crate) fn finished(
         Err(error) => Finished::Error {
             game_id: id,
             summary,
-            error,
+            error: error.message,
         },
     };
     let _ = window.emit("game_finished", payload);
@@ -286,4 +286,39 @@ pub async fn disc_changed(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// Waits briefly for a live report snapshot from the execution thread; if the
+/// execution thread does not answer within 1.2s, returns a wedged snapshot.
+pub async fn live_summary_wait(
+    result: std::sync::mpsc::Receiver<adv_report::RunSummary>,
+    settings: adv_report::Settings,
+) -> Result<adv_report::RunSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut summary = match result.recv_timeout(std::time::Duration::from_millis(1200)) {
+            Ok(summary) => summary,
+            Err(_) => adv_report::RunSummary {
+                run: Some(adv_report::RunInfo {
+                    jit: true,
+                    stop: adv_report::StopReason::LiveSnapshot,
+                    exit_code: None,
+                    processes: 1,
+                    failed_is_child: false,
+                    dialogs_shown: 0,
+                    present_size: None,
+                }),
+                hang: Some(adv_report::HangSnapshot {
+                    exec_thread_responsive: false,
+                    idle_wait_pct: None,
+                    threads: Vec::new(),
+                    top_boundaries: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        };
+        summary.settings = Some(settings);
+        summary
+    })
+    .await
+    .map_err(|error| error.to_string())
 }

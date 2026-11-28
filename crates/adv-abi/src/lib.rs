@@ -46,8 +46,8 @@ pub use guest::{AnsiStr, Arguments, GuestArg, GuestPtr, GuestReturn, Handle, Wid
 pub use personality::ExportClass;
 pub use signature::{AbiKind, Parameter, Signature};
 pub use stub::{
-    ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, MessageBoxCall, RejectedProbe,
-    RunMode, StubCall, warn_structural, warn_unavailable,
+    ApiDiagnostics, DynamicLookupFailure, DynamicLookupKind, FontDiagnostics, MessageBoxCall,
+    RejectedProbe, RunMode, StubCall, record_probe_rejection, warn_structural, warn_unavailable,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

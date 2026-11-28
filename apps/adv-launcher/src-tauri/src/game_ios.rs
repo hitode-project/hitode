@@ -513,6 +513,25 @@ pub async fn pause_game(window: WebviewWindow, paused: bool) -> Result<(), Strin
     .await
 }
 
+/// Captures a live report snapshot from the currently running session, if any.
+#[tauri::command]
+pub async fn live_report_summary(
+    window: WebviewWindow,
+) -> Result<Option<adv_report::RunSummary>, String> {
+    let pending = on_ui(window.app_handle(), move || {
+        Ok(HOST.with_borrow(|host| {
+            host.as_ref()
+                .and_then(|host| host.session.as_ref())
+                .map(|session| session.report_snapshot())
+        }))
+    })
+    .await?;
+    match pending {
+        Some((rx, settings)) => Ok(Some(crate::play::live_summary_wait(rx, settings).await?)),
+        None => Ok(None),
+    }
+}
+
 /// Puts another of the game's disc images in drive `letter` while it runs.
 #[tauri::command]
 pub async fn change_disc(

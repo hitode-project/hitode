@@ -71,6 +71,35 @@ impl Boundaries {
         }
     }
 
+    /// Top `limit` boundary entries across syscalls, unix calls and server
+    /// requests, ranked by host time then call count.
+    pub fn top_entries(&self, limit: usize) -> Vec<(&'static str, String, u64, u64)> {
+        let mut rows: Vec<(&'static str, String, u64, u64)> = Vec::new();
+        for (&number, &tally) in &self.syscalls {
+            rows.push(("syscall", syscall_name(number), tally.calls, tally.host_ns));
+        }
+        for (&(table, code), &tally) in &self.unix {
+            let name = match self.libraries.get(&table) {
+                _ if table == crate::dispatch::NTDLL_UNIXLIB => format!("ntdll.so:{code}"),
+                Some(name) => format!("{name}:{code}"),
+                None => format!("{table:#x}:{code}"),
+            };
+            rows.push(("unix", name, tally.calls, tally.host_ns));
+        }
+        for (&number, &tally) in &self.server {
+            let name = usize::try_from(number)
+                .ok()
+                .and_then(|n| REQUEST_NAMES.get(n))
+                .map_or_else(|| number.to_string(), |name| (*name).to_owned());
+            rows.push(("server", name, tally.calls, tally.host_ns));
+        }
+        rows.sort_unstable_by(|a, b| b.3.cmp(&a.3).then(b.2.cmp(&a.2)).then(a.1.cmp(&b.1)));
+        rows.truncate(limit);
+        rows.into_iter()
+            .map(|(kind, name, calls, host_ns)| (kind, name, calls, host_ns / 1_000_000))
+            .collect()
+    }
+
     /// The `limit` busiest entries of each kind by host time, as JSON.
     pub fn json(&self, limit: usize) -> String {
         fn rows<K>(map: &HashMap<K, Tally>, limit: usize, name: impl Fn(&K) -> String) -> String {

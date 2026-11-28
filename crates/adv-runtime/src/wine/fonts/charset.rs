@@ -49,7 +49,14 @@ pub(super) fn query(env: &mut Env<'_>, dc: u32, api: &str) -> i32 {
     }
     let request = font_request(env, dc);
     match env.ext.get_mut::<Fonts>().text.metrics(&request) {
-        Ok(metrics) => i32::from(encode_encoding(metrics.encoding)),
+        Ok(metrics) => {
+            let cs = encode_encoding(metrics.encoding);
+            env.ext
+                .get_or_default::<adv_abi::ApiDiagnostics>()
+                .font_events
+                .record_charset(cs);
+            i32::from(cs)
+        }
         Err(error) => {
             adv_abi::warn_unavailable(
                 env,

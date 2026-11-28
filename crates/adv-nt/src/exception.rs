@@ -54,6 +54,28 @@ fn stub_name(cpu: &dyn adv_cpu::backend::Guest, address: u32) -> Option<String> 
     None
 }
 
+/// Bounded counts of guest exceptions dispatched on this machine (`code -> (count, last_pc)`).
+#[derive(Clone, Debug, Default)]
+pub struct ExceptionCounts {
+    pub entries: std::collections::BTreeMap<u32, (u64, u32)>,
+}
+
+/// Last unsupported NT, Unix or driver operation on this machine, recorded only
+/// when returning `Outcome::Fail` so reports can classify it without host text.
+#[derive(Clone, Debug)]
+pub struct LastUnsupported {
+    pub subsystem: &'static str,
+    pub op: String,
+    pub code: Option<String>,
+}
+
+/// Why exception dispatch failed before reaching the guest's handler.
+#[derive(Clone, Copy, Debug)]
+pub struct DispatchFailure {
+    pub tag: &'static str,
+}
+
+#[derive(Clone)]
 pub struct Record {
     pub code: u32,
     pub flags: u32,
@@ -82,7 +104,7 @@ const DISPATCH_CLEARED_FLAGS: u32 = 0x100 | 0x400 | 0x4_0000;
 /// The machine's exception handler for NT processes.
 pub fn deliver(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint) -> Outcome {
     if matches!(event, Exception::Trap { vector: 41, .. }) {
-        return fastfail(env);
+        return fastfail(env, checkpoint);
     }
     if matches!(event, Exception::Trap { vector: 45, .. })
         && matches!(checkpoint.state.regs[0], 1 | 3 | 4 | 5)
@@ -116,7 +138,16 @@ pub fn deliver(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint) 
 const STATUS_STACK_BUFFER_OVERRUN: u32 = 0xc000_0409;
 
 /// `__fastfail` (`int 0x29`) bypasses user handlers and ends the process.
-fn fastfail(env: &mut Env<'_>) -> Outcome {
+fn fastfail(env: &mut Env<'_>, checkpoint: Checkpoint) -> Outcome {
+    env.ext.insert(Record {
+        code: STATUS_STACK_BUFFER_OVERRUN,
+        flags: 1,
+        nested: 0,
+        address: checkpoint.state.eip,
+        count: 0,
+        information: [0; 15],
+    });
+    env.ext.insert(checkpoint);
     if env.ext.try_get::<crate::server::Link>().is_some() {
         let _ = crate::process::terminate(env, &[0, STATUS_STACK_BUFFER_OVERRUN]);
         return crate::process::terminate(
@@ -135,11 +166,25 @@ fn enter_dispatcher(
     record: &Record,
     tail: &[u8],
 ) -> Outcome {
+    {
+        let counts = env.ext.get_or_default::<ExceptionCounts>();
+        if let Some((count, last_pc)) = counts.entries.get_mut(&record.code) {
+            *count = count.saturating_add(1);
+            *last_pc = record.address;
+        } else if counts.entries.len() < 32 {
+            counts.entries.insert(record.code, (1, record.address));
+        }
+    }
     let Some(&Dispatchers {
         exception: dispatcher,
         ..
     }) = env.ext.try_get::<Dispatchers>()
     else {
+        env.ext.insert(record.clone());
+        env.ext.insert(checkpoint);
+        env.ext.insert(DispatchFailure {
+            tag: "no_exception_dispatcher",
+        });
         return Outcome::Fail("no exception dispatcher".into());
     };
 
@@ -148,6 +193,11 @@ fn enter_dispatcher(
         .checked_sub(LAYOUT_SIZE + tail.len() as u32)
         .map(|sp| sp & !63)
     else {
+        env.ext.insert(record.clone());
+        env.ext.insert(checkpoint);
+        env.ext.insert(DispatchFailure {
+            tag: "invalid_stack_pointer",
+        });
         return Outcome::Fail(format!(
             "exception {:#010x}: invalid stack pointer {sp:#010x}",
             record.code
@@ -168,6 +218,9 @@ fn enter_dispatcher(
             information: [0; 15],
         });
         env.ext.insert(checkpoint);
+        env.ext.insert(DispatchFailure {
+            tag: "stack_overflow_during_dispatch",
+        });
         return Outcome::Fail(format!(
             "exception stack overflow while delivering {:#010x} at {:#010x}, parameters {:x?}",
             record.code,
@@ -193,13 +246,19 @@ fn enter_dispatcher(
     put_context(env, &mut frame, CONTEXT as usize, &checkpoint.state);
     frame[LAYOUT_SIZE as usize..].copy_from_slice(tail);
     if let Err(error) = env.cpu.write(stack, &frame) {
-        return Outcome::Fail(format!(
+        let message = format!(
             "exception {:#010x} at {:#010x}, parameters {:x?}, registers {:x?}: could not write frame: {error}",
             record.code,
             record.address,
             &record.information[..record.count],
             checkpoint.state.regs
-        ));
+        );
+        env.ext.insert(record.clone());
+        env.ext.insert(checkpoint);
+        env.ext.insert(DispatchFailure {
+            tag: "unwritable_exception_frame",
+        });
+        return Outcome::Fail(message);
     }
     debug_assert_eq!(env.cpu.read_u32(stack).ok(), Some(stack + RECORD));
 

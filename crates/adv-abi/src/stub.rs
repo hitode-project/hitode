@@ -2,7 +2,7 @@
 use crate::{ExportClass, Registry, personality, signature, trace};
 use adv_machine::{Env, Outcome, layout::teb};
 use std::any::Any;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RunMode {
@@ -73,6 +73,39 @@ pub struct MessageBoxCall {
     pub preceding_lookup_failure: Option<DynamicLookupFailure>,
 }
 
+/// Bounded font substitution and charset observations recorded on the slow path.
+#[derive(Debug, Default, Clone)]
+pub struct FontDiagnostics {
+    pub missing_faces: BTreeSet<String>,
+    pub substitutions: u32,
+    pub charsets: BTreeSet<u8>,
+    pub gdi_codepages: BTreeSet<u32>,
+}
+
+impl FontDiagnostics {
+    pub fn record_substitution(&mut self, face: Option<&str>) {
+        self.substitutions = self.substitutions.saturating_add(1);
+        if let Some(face) = face
+            && !face.is_empty()
+            && self.missing_faces.len() < 32
+        {
+            self.missing_faces.insert(face.chars().take(64).collect());
+        }
+    }
+
+    pub fn record_charset(&mut self, charset: u8) {
+        if self.charsets.len() < 16 {
+            self.charsets.insert(charset);
+        }
+    }
+
+    pub fn record_gdi_codepage(&mut self, codepage: u32) {
+        if self.gdi_codepages.len() < 8 {
+            self.gdi_codepages.insert(codepage);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ApiDiagnostics {
     pub gaps: BTreeMap<String, u64>,
@@ -83,6 +116,10 @@ pub struct ApiDiagnostics {
     /// Explicit capability failures, not ordinary API errors such as missing files.
     pub warnings: BTreeMap<(String, String), u64>,
     pub unrecorded_warnings: u64,
+    /// Bounded capability-probe rejections (e.g. D3D9 CheckDeviceFormat -> NOTAVAILABLE).
+    pub probe_rejections: BTreeMap<(String, String), u64>,
+    /// Bounded font substitution and charset observations.
+    pub font_events: FontDiagnostics,
     pub dynamic_lookup_failures: VecDeque<DynamicLookupFailure>,
     pub dynamic_lookup_failure_count: u64,
     pub dropped_dynamic_lookup_failures: u64,
@@ -130,6 +167,18 @@ pub fn warn_unavailable(env: &mut Env<'_>, api: &str, reason: &str) {
     }
     let caller = env.caller();
     emit_warning(env, api, reason, caller, None);
+}
+
+/// Record a capability probe rejection (such as a rejected D3D9 format/usage
+/// query) without treating it as an unimplemented stub.
+pub fn record_probe_rejection(env: &mut Env<'_>, api: &str, detail: &str) {
+    let diagnostics = env.ext.get_or_default::<ApiDiagnostics>();
+    let key = (api.to_owned(), detail.to_owned());
+    if let Some(count) = diagnostics.probe_rejections.get_mut(&key) {
+        *count = count.saturating_add(1);
+    } else if diagnostics.probe_rejections.len() < 32 {
+        diagnostics.probe_rejections.insert(key, 1);
+    }
 }
 
 /// Structural mismatches disqualify acceptance even if a host frontend returns

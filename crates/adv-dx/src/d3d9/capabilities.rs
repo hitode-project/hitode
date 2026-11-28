@@ -177,6 +177,7 @@ fn check_format(
     // QUERY_FILTER asks for filtering beyond point sampling, which every
     // sampled 2D format here has. QUERY_POSTPIXELSHADER_BLENDING asks whether
     // post-pixel-shader blending works on render-target color formats.
+    let raw_usage = usage;
     let (filter, usage) = (usage & 0x20000 != 0, usage & !0x20000);
     let (post_ps_blend, usage) = (usage & 0x80000 != 0, usage & !0x80000);
     let vertex_texture_query = usage == 0x100000
@@ -205,6 +206,11 @@ fn check_format(
     if available(env) && format == 22 && supported {
         0
     } else {
+        adv_abi::record_probe_rejection(
+            env,
+            "d3d9.dll!IDirect3D9::CheckDeviceFormat",
+            &format!("fmt={format} usage={raw_usage:#x} res={resource} check={check}"),
+        );
         UNAVAILABLE
     }
 }
@@ -229,6 +235,11 @@ fn check_multisample(
         || !(matches!(format, 21..=23) || depth::format(format).is_some())
         || samples != 0
     {
+        adv_abi::record_probe_rejection(
+            env,
+            "d3d9.dll!IDirect3D9::CheckDeviceMultiSampleType",
+            &format!("fmt={format} samples={samples}"),
+        );
         return UNAVAILABLE;
     }
     if quality.is_null() {

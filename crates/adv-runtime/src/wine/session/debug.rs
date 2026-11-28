@@ -2,6 +2,132 @@
 use super::*;
 use adv_cpu::backend::GuestExt;
 
+/// Decodes only the single `iced_x86::Code` enum name at `pc`, never bytes or
+/// operands, so reports identify the faulting instruction form safely.
+pub fn decode_fault_insn(machine: &Machine<Cpu>, pc: u32) -> Option<String> {
+    if pc == 0 {
+        return None;
+    }
+    let mut bytes = [0u8; 15];
+    let mut readable = bytes.len();
+    while readable > 0 && machine.cpu.read(pc, &mut bytes[..readable]).is_err() {
+        readable -= 1;
+    }
+    if readable == 0 {
+        return None;
+    }
+    let mut decoder = iced_x86::Decoder::with_ip(
+        32,
+        &bytes[..readable],
+        u64::from(pc),
+        iced_x86::DecoderOptions::NONE,
+    );
+    let instruction = decoder.decode();
+    (instruction.code() != iced_x86::Code::INVALID).then(|| format!("{:?}", instruction.code()))
+}
+
+fn after_call_in_images(
+    machine: &Machine<Cpu>,
+    address: u32,
+    images: &adv_nt::identity::Images,
+) -> bool {
+    if address < 7 || images.containing(address).is_none() {
+        return false;
+    }
+    let mut bytes = [0u8; 7];
+    if machine.cpu.read(address - 7, &mut bytes).is_err() {
+        return false;
+    }
+    let call = |modrm: u8| modrm & 0x38 == 0x10;
+    bytes[2] == 0xe8
+        || (bytes[5] == 0xff && call(bytes[6]) && bytes[6] >> 6 == 3)
+        || (bytes[5] == 0xff
+            && call(bytes[6])
+            && bytes[6] >> 6 == 0
+            && bytes[6] & 7 != 4
+            && bytes[6] & 7 != 5)
+        || (bytes[4] == 0xff && call(bytes[5]) && bytes[5] >> 6 == 1)
+        || (bytes[4] == 0xff && call(bytes[5]) && bytes[5] >> 6 == 0 && bytes[5] & 7 == 4)
+        || (bytes[3] == 0xff && call(bytes[4]) && bytes[4] >> 6 == 1 && bytes[4] & 7 == 4)
+        || (bytes[1] == 0xff && call(bytes[2]) && (bytes[2] >> 6 == 2 || bytes[2] & 0xc7 == 5))
+        || (bytes[0] == 0xff && call(bytes[1]) && bytes[1] >> 6 == 2 && bytes[1] & 7 == 4)
+}
+
+/// Collects up to `limit` guest code addresses from the current context's
+/// registers and stack.
+pub fn current_stack_addresses(machine: &Machine<Cpu>, limit: usize) -> Vec<u32> {
+    use adv_cpu::backend::Reg;
+    guest_stack_addresses(
+        machine,
+        machine.sys.current,
+        machine.cpu.reg(Reg::Eip),
+        machine.cpu.reg(Reg::Esp),
+        machine.cpu.reg(Reg::Ebp),
+        limit,
+    )
+}
+
+/// Collects up to `limit` guest code addresses for a failure report: starts
+/// with `pc`, walks the EBP frame chain inside the thread stack, then falls
+/// back to scanning stack words that follow a CALL inside a mapped image.
+pub fn guest_stack_addresses(
+    machine: &Machine<Cpu>,
+    context: u32,
+    pc: u32,
+    sp: u32,
+    bp: u32,
+    limit: usize,
+) -> Vec<u32> {
+    let mut frames = Vec::with_capacity(limit);
+    if pc != 0 && limit > 0 {
+        frames.push(pc);
+    }
+    let Some(stack) = machine.sys.contexts.get(context as usize) else {
+        return frames;
+    };
+    let in_stack = |addr: u32, bytes: u32| {
+        addr >= sp
+            && addr >= stack.stack_lo
+            && addr
+                .checked_add(bytes)
+                .is_some_and(|end| end <= stack.stack_hi)
+    };
+    let mut frame = bp;
+    while frames.len() < limit && in_stack(frame, 8) {
+        let Ok(next) = machine.cpu.read_u32(frame) else {
+            break;
+        };
+        let Ok(ret) = machine.cpu.read_u32(frame + 4) else {
+            break;
+        };
+        if ret != 0 && frames.last().copied() != Some(ret) {
+            frames.push(ret);
+        }
+        if next <= frame {
+            break;
+        }
+        frame = next;
+    }
+    if frames.len() < limit
+        && let Some(images) = machine.ext.try_get::<adv_nt::identity::Images>()
+        && sp >= stack.stack_lo
+        && sp < stack.stack_hi
+    {
+        let end = stack.stack_hi.min(sp.saturating_add(4096));
+        let mut cursor = sp & !3;
+        while cursor + 4 <= end && frames.len() < limit {
+            let Ok(word) = machine.cpu.read_u32(cursor) else {
+                break;
+            };
+            if after_call_in_images(machine, word, images) && !frames.contains(&word) {
+                frames.push(word);
+            }
+            cursor += 4;
+        }
+    }
+    frames
+}
+
 pub(super) fn counters(machine: &Machine<Cpu>) -> [u64; 8] {
     use crate::Engine;
     let cpu = machine.cpu.counters();
@@ -94,7 +220,228 @@ pub(super) fn merge_api_diagnostics(
     }
 }
 
+/// Raw read-only thread state captured for hang and live-report snapshots.
+pub struct RawThreadSnapshot {
+    pub tid: u32,
+    pub state: &'static str,
+    pub blocked_api: Option<String>,
+    pub stack: Vec<u32>,
+}
+
+/// Raw read-only session diagnostics collected at snapshot or exit time.
+pub struct RawDiagnostics {
+    pub warnings: Vec<(String, String, u64)>,
+    pub rejected_probes: Vec<(String, String, u64)>,
+    pub wine_errors: Vec<(String, String, String, u64)>,
+    pub hooked_exports: Vec<(String, &'static str)>,
+    pub exceptions_seen: Vec<(u32, u64, u32)>,
+    pub graphics_fronts: Vec<&'static str>,
+    pub audio_fronts: Vec<&'static str>,
+    pub video_fronts: Vec<&'static str>,
+    pub font_events: adv_abi::FontDiagnostics,
+    pub windows: (u32, u32, u32),
+    pub top_cliffs: Vec<(String, u64)>,
+}
+
 impl Session {
+    /// Active guest threads across the session's processes, with bounded
+    /// guest stack addresses for hang diagnosis.
+    pub fn collect_thread_snapshots(&self, limit: usize) -> Vec<RawThreadSnapshot> {
+        use adv_cpu::backend::Reg;
+        let mut threads = Vec::new();
+        self.debug_processes(|machine| {
+            for context in &machine.sys.contexts {
+                if threads.len() >= limit || context.is_done() {
+                    continue;
+                }
+                let blocked_api = context.blocked_thunk().map(|thunk| {
+                    let call = machine.sys.thunks.get(thunk);
+                    format!("{}!{}", call.module.to_ascii_lowercase(), call.name)
+                });
+                let (pc, sp, bp) = if let Some(sp) = context.blocked_stack() {
+                    let pc = machine.cpu.read_u32(sp).unwrap_or(0);
+                    (pc, sp, 0)
+                } else if machine.sys.current == context.id {
+                    (
+                        machine.cpu.reg(Reg::Eip),
+                        machine.cpu.reg(Reg::Esp),
+                        machine.cpu.reg(Reg::Ebp),
+                    )
+                } else {
+                    (0, 0, 0)
+                };
+                let stack = if sp != 0 {
+                    guest_stack_addresses(machine, context.id, pc, sp, bp, 6)
+                } else {
+                    Vec::new()
+                };
+                threads.push(RawThreadSnapshot {
+                    tid: context.tid,
+                    state: context.state_name(),
+                    blocked_api,
+                    stack,
+                });
+            }
+        });
+        threads
+    }
+
+    /// Collects bounded, read-only diagnostics across live processes.
+    pub fn collect_diagnostics_raw(&self) -> RawDiagnostics {
+        use crate::Engine;
+        let mut warnings_map: BTreeMap<(String, String), u64> = BTreeMap::new();
+        let mut probes_map: BTreeMap<(String, String), u64> = BTreeMap::new();
+        let mut hooks_map: BTreeMap<String, &'static str> = BTreeMap::new();
+        let mut exceptions_map: BTreeMap<u32, (u64, u32)> = BTreeMap::new();
+        let mut font_events = adv_abi::FontDiagnostics::default();
+        let mut graphics_fronts = std::collections::BTreeSet::<&'static str>::new();
+        let mut audio_fronts = std::collections::BTreeSet::<&'static str>::new();
+        let mut video_fronts = std::collections::BTreeSet::<&'static str>::new();
+
+        self.debug_processes(|machine| {
+            if let Some(diag) = machine.ext.try_get::<adv_abi::ApiDiagnostics>() {
+                for ((api, reason), &count) in &diag.warnings {
+                    let api_norm = normalize_api_gap(api).unwrap_or_else(|| api.clone());
+                    *warnings_map.entry((api_norm, reason.clone())).or_default() += count;
+                }
+                for ((api, detail), &count) in &diag.probe_rejections {
+                    *probes_map.entry((api.clone(), detail.clone())).or_default() += count;
+                }
+                font_events.substitutions = font_events
+                    .substitutions
+                    .saturating_add(diag.font_events.substitutions);
+                for face in &diag.font_events.missing_faces {
+                    if font_events.missing_faces.len() < 32 {
+                        font_events.missing_faces.insert(face.clone());
+                    }
+                }
+                for &cs in &diag.font_events.charsets {
+                    font_events.record_charset(cs);
+                }
+                for &cp in &diag.font_events.gdi_codepages {
+                    font_events.record_gdi_codepage(cp);
+                }
+            }
+            for (api, form) in adv_nt::identity::detect_hooks(&machine.cpu, &machine.ext) {
+                hooks_map.entry(api).or_insert(form);
+            }
+            if let Some(counts) = machine.ext.try_get::<adv_nt::exception::ExceptionCounts>() {
+                for (&code, &(count, last_pc)) in &counts.entries {
+                    let entry = exceptions_map.entry(code).or_insert((0, last_pc));
+                    entry.0 = entry.0.saturating_add(count);
+                    entry.1 = last_pc;
+                }
+            }
+            if let Some(images) = machine.ext.try_get::<adv_nt::identity::Images>() {
+                for module in images.0.values() {
+                    match module.name.as_str() {
+                        "ddraw.dll" => {
+                            graphics_fronts.insert("ddraw");
+                        }
+                        "d3d8.dll" => {
+                            graphics_fronts.insert("d3d8");
+                        }
+                        "d3d9.dll" => {
+                            graphics_fronts.insert("d3d9");
+                        }
+                        "d3d10.dll" | "d3d10_1.dll" => {
+                            graphics_fronts.insert("d3d10");
+                        }
+                        "d3d11.dll" => {
+                            graphics_fronts.insert("d3d11");
+                        }
+                        "dxgi.dll" => {
+                            graphics_fronts.insert("dxgi");
+                        }
+                        "opengl32.dll" => {
+                            graphics_fronts.insert("opengl");
+                        }
+                        "dsound.dll" => {
+                            audio_fronts.insert("dsound");
+                        }
+                        "winmm.dll" => {
+                            audio_fronts.insert("winmm");
+                        }
+                        "xaudio2_7.dll" | "xaudio2_8.dll" | "xaudio2_9.dll" => {
+                            audio_fronts.insert("xaudio2");
+                        }
+                        "dmusic.dll" | "dmime.dll" | "dmsynth.dll" => {
+                            audio_fronts.insert("dmusic");
+                        }
+                        "quartz.dll" => {
+                            video_fronts.insert("dshow");
+                        }
+                        "amstream.dll" => {
+                            video_fronts.insert("amstream");
+                        }
+                        "wmvcore.dll" => {
+                            video_fronts.insert("wmvcore");
+                        }
+                        "msvfw32.dll" | "avifil32.dll" => {
+                            video_fronts.insert("vfw");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let mut warnings: Vec<_> = warnings_map
+            .into_iter()
+            .map(|((api, reason), count)| (api, reason, count))
+            .collect();
+        warnings.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        warnings.truncate(24);
+
+        let mut rejected_probes: Vec<_> = probes_map
+            .into_iter()
+            .map(|((api, detail), count)| (api, detail, count))
+            .collect();
+        rejected_probes.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        rejected_probes.truncate(16);
+
+        let mut wine_errors: Vec<_> = self
+            .wine_logs
+            .borrow()
+            .entries
+            .iter()
+            .map(|((level, channel, func), &count)| {
+                (level.clone(), channel.clone(), func.clone(), count)
+            })
+            .collect();
+        wine_errors.sort_unstable_by(|a, b| b.3.cmp(&a.3).then(a.1.cmp(&b.1)));
+        wine_errors.truncate(24);
+
+        let hooked_exports: Vec<_> = hooks_map.into_iter().take(24).collect();
+
+        let mut exceptions_seen: Vec<_> = exceptions_map
+            .into_iter()
+            .map(|(code, (count, last_pc))| (code, count, last_pc))
+            .collect();
+        exceptions_seen.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        exceptions_seen.truncate(16);
+
+        let view = project::view(&self.machine.ext);
+        let top_level = view.windows.len() as u32;
+        let visible = view.windows.iter().filter(|w| w.visible).count() as u32;
+        let dialogs = self.dialogs().dialogs.len() as u32;
+        let top_cliffs = self.machine.cpu.top_cliffs(8);
+
+        RawDiagnostics {
+            warnings,
+            rejected_probes,
+            wine_errors,
+            hooked_exports,
+            exceptions_seen,
+            graphics_fronts: graphics_fronts.into_iter().collect(),
+            audio_fronts: audio_fronts.into_iter().collect(),
+            video_fronts: video_fronts.into_iter().collect(),
+            font_events,
+            windows: (top_level, visible, dialogs),
+            top_cliffs,
+        }
+    }
+
     /// Cumulative family counters, including processes that have exited.
     pub fn debug_counters(&self) -> [u64; 8] {
         let mut totals = self.retired_debug;

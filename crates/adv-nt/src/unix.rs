@@ -30,6 +30,40 @@ pub fn call(env: &mut Env<'_>, code: u32, args: u32) -> Outcome {
     }
 }
 
+/// Counted Wine `err:` / `fixme:` debug tags (`(level, channel, func) -> count`),
+/// shared across a session's processes. Message bodies are never retained.
+#[derive(Default)]
+pub struct WineLogCounts {
+    pub entries: std::collections::BTreeMap<(String, String, String), u64>,
+}
+
+fn parse_wine_log_tag(line: &str) -> Option<(&'static str, &str, &str)> {
+    let line = line.trim_start();
+    // Wine prefixes debug lines with `<tid>:` (e.g. `0024:err:module:import_dll ...`).
+    let rest = match line.split_once(':') {
+        Some((tid, after))
+            if !tid.is_empty() && tid.len() <= 8 && tid.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            after
+        }
+        _ => line,
+    };
+    let (level, after) = if let Some(after) = rest.strip_prefix("err:") {
+        ("err", after)
+    } else {
+        ("fixme", rest.strip_prefix("fixme:")?)
+    };
+    let (channel, after) = after.split_once(':')?;
+    let func = after.split_whitespace().next()?.trim_end_matches(':');
+    let ok = |s: &str, max: usize| {
+        !s.is_empty()
+            && s.len() <= max
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    };
+    (ok(channel, 32) && ok(func, 64)).then_some((level, channel, func))
+}
+
 /// Wine's debug output, which ntdll.so writes to standard error; here it
 /// goes to the host log. `struct wine_dbg_write_params { str, len }`.
 fn debug_write(env: &mut Env<'_>, params: u32) -> Outcome {
@@ -42,7 +76,22 @@ fn debug_write(env: &mut Env<'_>, params: u32) -> Outcome {
     })();
     match text {
         Ok(bytes) => {
-            log::warn!(target: "wine", "{}", String::from_utf8_lossy(&bytes).trim_end());
+            let line = String::from_utf8_lossy(&bytes);
+            let trimmed = line.trim_end();
+            log::warn!(target: "wine", "{trimmed}");
+            if let Some(counts) = env
+                .ext
+                .try_get::<std::rc::Rc<std::cell::RefCell<WineLogCounts>>>()
+                && let Some((level, channel, func)) = parse_wine_log_tag(trimmed)
+            {
+                let mut counts = counts.borrow_mut();
+                let key = (level.to_owned(), channel.to_owned(), func.to_owned());
+                if let Some(n) = counts.entries.get_mut(&key) {
+                    *n = n.saturating_add(1);
+                } else if counts.entries.len() < 64 {
+                    counts.entries.insert(key, 1);
+                }
+            }
             Outcome::Return(bytes.len() as u32)
         }
         Err(error) => Outcome::Fail(format!("debug output: {error}")),
@@ -176,5 +225,24 @@ mod tests {
         assert!(!super::link("file:///etc/passwd"));
         assert!(!super::link("/usr/bin/open"));
         assert!(!super::link("xdg-open"));
+    }
+
+    // spec: REPORT-DIAG-1
+    #[test]
+    fn wine_log_tag_parser_keeps_only_channel_and_function() {
+        assert_eq!(
+            super::parse_wine_log_tag(
+                "0024:err:module:import_dll Library C:\\Games\\secret.dll not found"
+            ),
+            Some(("err", "module", "import_dll"))
+        );
+        assert_eq!(
+            super::parse_wine_log_tag("fixme:d3d:wined3d_check_device_format_conversion stub!"),
+            Some(("fixme", "d3d", "wined3d_check_device_format_conversion"))
+        );
+        assert_eq!(
+            super::parse_wine_log_tag("0024:trace:file:CreateFileW C:\\Games\\game.exe"),
+            None
+        );
     }
 }

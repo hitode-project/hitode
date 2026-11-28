@@ -261,22 +261,111 @@ const HOOK_SPAN: u32 = 10;
 #[derive(Default)]
 struct ReadPath(Vec<(u32, [u8; HOOK_SPAN as usize])>);
 
-/// Records the read path's entries in `module`, a distribution image just mapped.
+/// Standard exports commonly hooked by translation patches or virtualizers,
+/// snapshotted once at module load and checked only when building a report.
+const WATCHED_HOOKS: &[(&str, &str)] = &[
+    ("gdi32.dll", "CreateFontA"),
+    ("gdi32.dll", "CreateFontW"),
+    ("gdi32.dll", "CreateFontIndirectA"),
+    ("gdi32.dll", "CreateFontIndirectW"),
+    ("gdi32.dll", "EnumFontFamiliesExA"),
+    ("gdi32.dll", "EnumFontFamiliesExW"),
+    ("gdi32.dll", "GetGlyphOutlineA"),
+    ("gdi32.dll", "GetGlyphOutlineW"),
+    ("gdi32.dll", "TextOutA"),
+    ("gdi32.dll", "TextOutW"),
+    ("gdi32.dll", "ExtTextOutA"),
+    ("gdi32.dll", "ExtTextOutW"),
+    ("kernel32.dll", "CreateFileA"),
+    ("kernel32.dll", "CreateFileW"),
+    ("kernel32.dll", "MultiByteToWideChar"),
+    ("kernel32.dll", "WideCharToMultiByte"),
+    ("kernelbase.dll", "CreateFileW"),
+    ("kernelbase.dll", "ReadFile"),
+    ("ntdll.dll", "NtReadFile"),
+    ("ntdll.dll", "NtQueryDirectoryFile"),
+    ("user32.dll", "CreateWindowExA"),
+    ("user32.dll", "CreateWindowExW"),
+    ("user32.dll", "SetWindowTextA"),
+    ("user32.dll", "SetWindowTextW"),
+    ("user32.dll", "MessageBoxA"),
+    ("user32.dll", "MessageBoxW"),
+];
+
+/// Entry bytes of watched standard exports as the loader mapped them.
+#[derive(Default)]
+struct WatchedHooks(Vec<(String, u32, [u8; HOOK_SPAN as usize])>);
+
+fn hook_form(entry: &[u8]) -> &'static str {
+    match entry {
+        [0xe9, ..] => "jmp_rel32",
+        [0xeb, ..] => "jmp_short_hotpatch",
+        [0xe8, ..] => "call_rel32",
+        [0xff, 0x25, ..] => "jmp_mem",
+        [0x68, _, _, _, _, 0xc3, ..] => "push_ret",
+        [0xcc, ..] => "int3",
+        _ => "modified",
+    }
+}
+
+/// Records the read path's entries and watched hook targets in `module`, a
+/// distribution image just mapped.
 pub(crate) fn note_read_path(cpu: &dyn Guest, ext: &mut Ext, module: &Module) {
     let Some(table) = module.table() else {
         return;
     };
-    let path = ext.get_or_default::<ReadPath>();
-    for &(_, name) in READ_PATH.iter().filter(|(owner, _)| *owner == module.name) {
+    {
+        let path = ext.get_or_default::<ReadPath>();
+        for &(_, name) in READ_PATH.iter().filter(|(owner, _)| *owner == module.name) {
+            let Some(function) = table.named(name) else {
+                continue;
+            };
+            let at = module.base + function.rva - 5;
+            let mut bytes = [0; HOOK_SPAN as usize];
+            if cpu.read(at, &mut bytes).is_ok() {
+                path.0.push((at, bytes));
+            }
+        }
+    }
+    let watched = ext.get_or_default::<WatchedHooks>();
+    for &(owner, name) in WATCHED_HOOKS
+        .iter()
+        .filter(|(owner, _)| *owner == module.name)
+    {
         let Some(function) = table.named(name) else {
             continue;
         };
-        let at = module.base + function.rva - 5;
+        let Some(at) = (module.base + function.rva).checked_sub(5) else {
+            continue;
+        };
         let mut bytes = [0; HOOK_SPAN as usize];
         if cpu.read(at, &mut bytes).is_ok() {
-            path.0.push((at, bytes));
+            watched.0.push((format!("{owner}!{name}"), at, bytes));
         }
     }
+}
+
+/// Returns watched system exports whose entry bytes changed after module load,
+/// along with the classified trampoline form (no code bytes).
+pub fn detect_hooks(cpu: &dyn Guest, ext: &Ext) -> Vec<(String, &'static str)> {
+    let Some(watched) = ext.try_get::<WatchedHooks>() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (api, at, mapped) in &watched.0 {
+        let mut current = [0; HOOK_SPAN as usize];
+        if cpu.read(*at, &mut current).is_ok() && current != *mapped {
+            let form = if current[5..] != mapped[5..] {
+                hook_form(&current[5..])
+            } else {
+                "hotpatch_prefix"
+            };
+            found.push((api.clone(), form));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.dedup_by(|a, b| a.0 == b.0);
+    found
 }
 
 /// Whether guest code hooked the file read path, so that file contents may
@@ -394,6 +483,10 @@ mod tests {
         cpu.write(BASE + 0x1010, &[0xe9, 0x23, 0x06, 0x9b, 0x84])
             .unwrap();
         assert!(reads_hooked(&cpu, &ext));
+        assert_eq!(
+            detect_hooks(&cpu, &ext),
+            vec![("ntdll.dll!NtReadFile".into(), "jmp_rel32")]
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

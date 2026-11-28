@@ -11,7 +11,7 @@
   let { gameId }: { gameId: string } = $props();
 
   const game = $derived(library.get(gameId));
-  const form = new ReportForm(() => game, () => runs.summaryOf(gameId), true);
+  const form = new ReportForm(() => game, () => runs.summaryOf(gameId), true, () => runs.running === gameId);
   const ctx = $derived(form.context);
 
   // A report opened during play (from the pause menu) keeps the game paused.
@@ -199,9 +199,12 @@
         <svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v7.5M4.8 7l3.2 3.2L11.2 7"></path><path d="M3 12.5h10"></path></svg>
       {/snippet}
       <div class="path mono">{form.savedPath}</div>
-        {#if form.attachReport}<p>{t("把文件附到问题中")}</p>{/if}
+        {#if form.attachReport}
+          <p>{form.copied ? t("已复制报告内容，可直接粘贴到问题中或附上此文件") : t("把文件附到问题中")}</p>
+        {/if}
         {#if form.shareError}<p role="alert">{t("未能分享报告，请重试。")}</p>{/if}
       {#snippet actions()}
+        <button class="secondary big" onclick={() => form.copy()}>{form.copied ? t("已复制") : t("复制报告")}</button>
         <button class="secondary big" disabled={form.sharing} onclick={() => form.share()}>{t("分享报告")}</button>
         <button class="primary big" data-autofocus onclick={() => nav.back()}>{t("完成")}</button>
       {/snippet}

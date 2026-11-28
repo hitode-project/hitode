@@ -830,6 +830,29 @@ impl Engine for Cpu {
         }
     }
 
+    fn top_cliffs(&self, limit: usize) -> Vec<(String, u64)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let cliffs = &self.inner.stats.cliffs;
+        let mut rows: Vec<(String, u64)> = Vec::new();
+        for (name, count) in cliffs.x87_exact_rows().into_iter().take(limit) {
+            rows.push((format!("x87:{}", name.replace('/', ":")), count));
+        }
+        for (name, count) in cliffs.fallback_rows().into_iter().take(limit) {
+            rows.push((format!("fallback:{name}"), count));
+        }
+        for (name, count) in cliffs.interpreter_detail_rows().into_iter().take(limit) {
+            rows.push((
+                format!("interp:{}", name.replace('/', ":")),
+                count.instructions,
+            ));
+        }
+        rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        rows.truncate(limit);
+        rows
+    }
+
     fn report_fields(&self) -> String {
         let stats = &self.inner.stats;
         let forms = |which| {
