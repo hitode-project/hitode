@@ -518,7 +518,14 @@ fn ring_reservations_retire_in_order_and_loss_is_sticky() {
     finish(&mut queue, encoder);
     let span = ring.reserve(1024, 16).unwrap();
     assert_eq!(span.offset(), 0);
-    drop(span);
+    // Reserve self-retires completed GPU spans without requiring an explicit poll.
+    let mut encoder = queue.encoder("self-retire span");
+    encoder.retain(span);
+    let _token = queue.submit(encoder).unwrap();
+    let _ = unsafe { device.inner.0.device.device_wait_idle() };
+    let reused = ring.reserve(1024, 16).unwrap();
+    assert_eq!(reused.offset(), 0);
+    drop(reused);
     let error = device
         .inner
         .0

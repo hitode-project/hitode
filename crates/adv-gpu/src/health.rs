@@ -901,15 +901,15 @@ fn parse_sentinel(bytes: &[u8]) -> Option<Sentinel> {
 }
 
 fn arm_sentinel_at(dir: &Path, file: &str, sentinel: &Sentinel) {
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
     let bytes = encode_sentinel(sentinel);
     let path = dir.join(file);
-    let _ = std::fs::File::create(&path).and_then(|mut f| {
-        f.write_all(&bytes)?;
-        f.sync_all()
-    });
+    let write = || std::fs::File::create(&path).and_then(|mut f| f.write_all(&bytes));
+    if let Err(err) = write()
+        && err.kind() == std::io::ErrorKind::NotFound
+        && std::fs::create_dir_all(dir).is_ok()
+    {
+        let _ = write();
+    }
 }
 
 fn arm_sentinel(dir: &Path, sentinel: &Sentinel) {
@@ -1210,8 +1210,6 @@ pub(crate) fn guard_guest_pipeline<T>(
     let armed_dir = cache_dir.filter(|_| caller_disable.is_empty());
     if let Some(dir) = armed_dir {
         let mut state = STORE_LOCK.lock().unwrap();
-        let mut entries = read_archive(dir);
-        reap_sentinel_locked(dir, &state, &mut entries);
         let count = state.active_guest.entry(dir.to_path_buf()).or_insert(0);
         if *count == 0 {
             arm_sentinel_at(

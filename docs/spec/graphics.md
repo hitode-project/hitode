@@ -734,8 +734,8 @@ A clipped primitive can execute whole or in pieces. Each invocation sees the cov
 
 ### GFX-CACHE-1 Pipeline variants
 
-**Rule**: Pipeline keys MUST include immutable program identity, texture visibility, vertex layout, and blend, depth, and raster state. Program construction MUST assign an identity retained by clones. The pipeline cache MUST retain at most 512 entries with FIFO eviction.
-**Verification**: Test — identity and FIFO eviction are covered, but complete key-component coverage also requires review.
+**Rule**: Pipeline keys MUST include immutable program identity, texture visibility, vertex layout, and blend, depth, and raster state. Program construction MUST assign an identity retained by clones. The pipeline cache MUST retain at most 512 entries with LRU eviction.
+**Verification**: Test — identity and LRU eviction are covered, but complete key-component coverage also requires review.
 
 D3D11 caches translated and parsed stage variants per device. Entries compare the shader
 objects, resolved linkage, and all code-generation inputs, and retire when a referenced shader
@@ -765,8 +765,8 @@ the D3D11 frame of the last miss.
 
 ### GFX-CACHE-7 Background compilation
 
-**Rule**: Shader translation and module preparation MUST start at resource creation on a separately bounded, lower-priority worker. Demand MUST take queued work or join its existing compilation, preserving identical source and results. The worker MUST retain at most 64 queued jobs and 32 MiB, leaving work demand-driven if priority reduction fails.
-On Apple hosts, foreground waits MUST temporarily donate priority to the compiler and release that donation after the final waiter resumes.
+**Rule**: Shader translation and module preparation MUST start at resource creation on a separately bounded, lower-priority worker. Demand MUST take queued work or join its existing compilation, preserving identical source and results. The worker MUST retain at most 64 queued jobs and 32 MiB, leaving work demand-driven if reversible priority reduction fails.
+Foreground waits MUST temporarily raise the compiler's priority on Apple, Linux and Android hosts and restore it after the final waiter resumes.
 Binding changes MUST NOT start speculative preparation for transient shader pairs. Shader and declaration creation MUST anticipate driver pipelines from bound draw state, sharing recipe jobs with demand. Anticipated recipes MUST retain at most 16 jobs and 32 MiB, be evicted before demanded pipelines, and persist only after demand.
 **Verification**: Test — queue takeover, running-work joins and priority-donation lifetime; platform priority selection also requires review.
 

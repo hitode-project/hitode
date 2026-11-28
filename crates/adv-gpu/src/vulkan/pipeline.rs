@@ -129,15 +129,23 @@ pub(super) fn input_attachments(
         .collect()
 }
 
+impl Compiled {
+    unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_pipeline(self.handle, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            if self.set_layout != vk::DescriptorSetLayout::null() {
+                device.destroy_descriptor_set_layout(self.set_layout, None);
+            }
+        }
+    }
+}
+
 impl Pipelines {
     pub(super) fn destroy(&mut self, device: &ash::Device) {
         unsafe {
             for compiled in self.render.values().chain(self.compute.values()) {
-                device.destroy_pipeline(compiled.handle, None);
-                device.destroy_pipeline_layout(compiled.layout, None);
-                if compiled.set_layout != vk::DescriptorSetLayout::null() {
-                    device.destroy_descriptor_set_layout(compiled.set_layout, None);
-                }
+                compiled.destroy(device);
             }
             for (_, pass) in self.passes.drain() {
                 device.destroy_render_pass(pass, None);
@@ -615,43 +623,58 @@ impl Device {
         let mut key = RenderKey::new(desc, slots, self.caps().modern);
         key.video = video.map(|v| v.resources.layout.as_raw());
         let key = (key, desc.sample_mask);
-        let mut pipelines = self.0.pipelines.lock().unwrap();
-        let compiled = match pipelines.render.get(&key) {
-            Some(compiled) => compiled.clone(),
+        let reads = if desc.samples == 1
+            && desc
+                .fragment
+                .as_ref()
+                .is_some_and(|ps| ps.shader.inner.compact())
+        {
+            color_slots(slots)
+                .zip(&desc.colors)
+                .filter(|(_, color)| {
+                    color.blend.is_some()
+                        && self
+                            .caps()
+                            .format(color.format)
+                            .contains(FormatCaps::ORDERED_BLEND)
+                })
+                .fold(0, |mask, (slot, _)| mask | 1 << slot)
+        } else {
+            0
+        };
+        let (cached, input_layout, render_pass) = {
+            let mut pipelines = self.0.pipelines.lock().unwrap();
+            if let Some(compiled) = pipelines.render.get(&key) {
+                (Some(compiled.clone()), None, None)
+            } else {
+                let input_layout = if reads != 0 {
+                    Some(pipelines.input_layout(&self.0, reads)?)
+                } else {
+                    None
+                };
+                let render_pass =
+                    if self.caps().modern.contains(Modern::DYNAMIC_RENDERING) && reads == 0 {
+                        None
+                    } else {
+                        Some(pipelines.compatible_pass(&self.0, desc, slots, reads)?)
+                    };
+                (None, input_layout, render_pass)
+            }
+        };
+        let compiled = match cached {
+            Some(compiled) => compiled,
             None => {
-                let mut external = cache.map(|c| c.inner.0.lock().unwrap());
-                let cache = match &mut external {
-                    Some(cache) => cache.handle(&self.0)?,
+                // VkPipelineCache is internally synchronized for pipeline creation
+                // and reads; hold the mutex only for one-time lazy handle init.
+                let cache_handle = match cache {
+                    Some(c) => c.inner.0.lock().unwrap().handle(&self.0)?,
                     None => vk::PipelineCache::null(),
                 };
                 let entries: Vec<&Entry> = std::iter::once(&desc.vertex)
                     .chain(&desc.fragment)
                     .collect();
-                let reads = if desc.samples == 1
-                    && desc
-                        .fragment
-                        .as_ref()
-                        .is_some_and(|ps| ps.shader.inner.compact())
-                {
-                    color_slots(slots)
-                        .zip(&desc.colors)
-                        .filter(|(_, color)| {
-                            color.blend.is_some()
-                                && self
-                                    .caps()
-                                    .format(color.format)
-                                    .contains(FormatCaps::ORDERED_BLEND)
-                        })
-                        .fold(0, |mask, (slot, _)| mask | 1 << slot)
-                } else {
-                    0
-                };
-                let ordered = if reads != 0 {
-                    Some((desc, slots, reads, pipelines.input_layout(&self.0, reads)?))
-                } else {
-                    None
-                };
-                let compiled = Arc::new(self.compile(
+                let ordered = input_layout.map(|layout| (desc, slots, reads, layout));
+                let compiled = self.compile(
                     &key.0.bindings,
                     &entries,
                     video,
@@ -662,13 +685,24 @@ impl Device {
                             (slots, reads),
                             layout,
                             stages,
-                            cache,
-                            &mut pipelines,
+                            cache_handle,
+                            render_pass,
                         )
                     },
-                )?);
-                pipelines.render.insert(key, compiled.clone());
-                compiled
+                )?;
+                let mut pipelines = self.0.pipelines.lock().unwrap();
+                match pipelines.render.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(existing) => {
+                        // SAFETY: this duplicate pipeline was never handed out or bound.
+                        unsafe { compiled.destroy(&self.0.device) };
+                        existing.get().clone()
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        let compiled = Arc::new(compiled);
+                        slot.insert(compiled.clone());
+                        compiled
+                    }
+                }
             }
         };
         Ok(crate::RenderPipeline {
@@ -687,34 +721,42 @@ impl Device {
         let mut bindings = desc.bindings.clone();
         bindings.sort_by_key(|b| (binding::group(b.kind), b.slot));
         let key = ComputeKey(entry_key(&desc.entry), bindings);
-        let mut pipelines = self.0.pipelines.lock().unwrap();
-        let compiled = match pipelines.compute.get(&key) {
-            Some(compiled) => compiled.clone(),
+        let cached = self.0.pipelines.lock().unwrap().compute.get(&key).cloned();
+        let compiled = match cached {
+            Some(compiled) => compiled,
             None => {
-                let mut external = cache.map(|c| c.inner.0.lock().unwrap());
-                let cache = match &mut external {
-                    Some(cache) => cache.handle(&self.0)?,
+                let cache_handle = match cache {
+                    Some(c) => c.inner.0.lock().unwrap().handle(&self.0)?,
                     None => vk::PipelineCache::null(),
                 };
-                let compiled = Arc::new(self.compile(
-                    &key.1,
-                    &[&desc.entry],
-                    None,
-                    None,
-                    |layout, stages| {
+                let compiled =
+                    self.compile(&key.1, &[&desc.entry], None, None, |layout, stages| {
                         let info = vk::ComputePipelineCreateInfo::default()
                             .stage(stages[0])
                             .layout(layout);
-                        let created =
-                            unsafe { self.0.device.create_compute_pipelines(cache, &[info], None) };
+                        let created = unsafe {
+                            self.0
+                                .device
+                                .create_compute_pipelines(cache_handle, &[info], None)
+                        };
                         self.0.result_in(
                             created.map(|h| h[0]).map_err(|(_, error)| error),
                             &format!("compute pipeline: {}", desc.label),
                         )
-                    },
-                )?);
-                pipelines.compute.insert(key, compiled.clone());
-                compiled
+                    })?;
+                let mut pipelines = self.0.pipelines.lock().unwrap();
+                match pipelines.compute.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(existing) => {
+                        // SAFETY: this duplicate pipeline was never handed out or bound.
+                        unsafe { compiled.destroy(&self.0.device) };
+                        existing.get().clone()
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        let compiled = Arc::new(compiled);
+                        slot.insert(compiled.clone());
+                        compiled
+                    }
+                }
             }
         };
         Ok(crate::ComputePipeline {
@@ -930,7 +972,7 @@ impl Device {
         layout: vk::PipelineLayout,
         stages: &[vk::PipelineShaderStageCreateInfo<'_>],
         cache: vk::PipelineCache,
-        pipelines: &mut Pipelines,
+        render_pass: Option<vk::RenderPass>,
     ) -> Result<vk::Pipeline> {
         let context = &self.0;
         let modern = self.caps().modern;
@@ -1042,10 +1084,10 @@ impl Device {
             .color_blend_state(&blend)
             .dynamic_state(&dynamic)
             .layout(layout);
-        if modern.contains(Modern::DYNAMIC_RENDERING) && reads == 0 {
-            info = info.push_next(&mut rendering);
+        if let Some(pass) = render_pass {
+            info = info.render_pass(pass);
         } else {
-            info = info.render_pass(pipelines.compatible_pass(context, desc, slots, reads)?);
+            info = info.push_next(&mut rendering);
         }
         let created = unsafe {
             context
@@ -1149,12 +1191,15 @@ impl PipelineCache {
         }
     }
     pub(crate) fn serialize(&self) -> Result<Vec<u8>> {
-        let state = self.0.lock().unwrap();
-        let Some((context, handle)) = &state.device else {
-            return Ok(state.data.clone());
+        let (context, handle) = {
+            let state = self.0.lock().unwrap();
+            let Some((context, handle)) = &state.device else {
+                return Ok(state.data.clone());
+            };
+            (context.clone(), *handle)
         };
         let mut data = context.cache_prefix.to_vec();
-        data.extend(context.result(unsafe { context.device.get_pipeline_cache_data(*handle) })?);
+        data.extend(context.result(unsafe { context.device.get_pipeline_cache_data(handle) })?);
         Ok(data)
     }
 }

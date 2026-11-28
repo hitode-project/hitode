@@ -11,7 +11,7 @@ use gpu_allocator::vulkan::{
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::caps::*;
 use crate::encode::*;
@@ -95,6 +95,8 @@ pub(crate) struct Context {
     /// each may submit a use of an object dropped now.
     next: AtomicU64,
     open: AtomicU64,
+    completed: AtomicU64,
+    queue: OnceLock<Weak<queue::Shared>>,
     retired: Mutex<VecDeque<(u64, Retired)>>,
     passes: Mutex<HashMap<encode::PassKey, encode::LegacyPass>>,
     samplers: Mutex<HashMap<SamplerDesc, Weak<SamplerCore>>>,
@@ -102,6 +104,7 @@ pub(crate) struct Context {
     dynamic: ash::khr::dynamic_rendering::Device,
     sync2: ash::khr::synchronization2::Device,
     timeline: ash::khr::timeline_semaphore::Device,
+    timeline_semaphore: vk::Semaphore,
     api: u32,
     anisotropy: bool,
     max_anisotropy: f32,
@@ -239,6 +242,22 @@ impl Context {
             return Err(Error::DeviceLost(LOST.into()));
         }
         Ok(())
+    }
+    pub(super) fn poll_timeline(&self) -> Result<Option<u64>> {
+        if self.timeline_semaphore == vk::Semaphore::null() {
+            return Ok(None);
+        }
+        let completed = self.result(unsafe {
+            if self.api >= vk::API_VERSION_1_2 {
+                self.device
+                    .get_semaphore_counter_value(self.timeline_semaphore)
+            } else {
+                self.timeline
+                    .get_semaphore_counter_value(self.timeline_semaphore)
+            }
+        })?;
+        self.completed.fetch_max(completed, Ordering::Release);
+        Ok(Some(completed))
     }
     fn result<T>(&self, result: std::result::Result<T, vk::Result>) -> Result<T> {
         self.result_in(result, "")
@@ -472,6 +491,9 @@ impl Drop for Context {
         self.heap.take();
         self.allocator.get_mut().unwrap().take();
         unsafe {
+            if self.timeline_semaphore != vk::Semaphore::null() {
+                self.device.destroy_semaphore(self.timeline_semaphore, None);
+            }
             self.device.destroy_device(None);
             if let Some((debug, messenger)) = &self.debug {
                 debug.destroy_debug_utils_messenger(*messenger, None);

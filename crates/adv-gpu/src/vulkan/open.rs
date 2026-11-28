@@ -1252,6 +1252,15 @@ impl Device {
             let dynamic = ash::khr::dynamic_rendering::Device::new(instance, device);
             let sync2 = ash::khr::synchronization2::Device::new(instance, device);
             let timeline = ash::khr::timeline_semaphore::Device::new(instance, device);
+            let timeline_semaphore = if caps.modern.contains(Modern::TIMELINE_SEMAPHORES) {
+                let mut ty = vk::SemaphoreTypeCreateInfo::default()
+                    .semaphore_type(vk::SemaphoreType::TIMELINE);
+                device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ty), None)
+                    .map_err(vk_error)?
+            } else {
+                vk::Semaphore::null()
+            };
             #[cfg(target_os = "android")]
             let semaphore_fd = ash::khr::external_semaphore_fd::Device::new(instance, device);
 
@@ -1282,6 +1291,7 @@ impl Device {
                 dynamic,
                 sync2,
                 timeline,
+                timeline_semaphore,
                 #[cfg(target_os = "android")]
                 ahb,
                 #[cfg(target_os = "android")]
@@ -1303,6 +1313,8 @@ impl Device {
                 lost: AtomicBool::new(false),
                 next: AtomicU64::new(1),
                 open: AtomicU64::new(0),
+                completed: AtomicU64::new(0),
+                queue: OnceLock::new(),
                 retired: Mutex::new(VecDeque::new()),
                 passes: Mutex::new(HashMap::new()),
                 samplers: Mutex::new(HashMap::new()),
