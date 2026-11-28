@@ -2571,7 +2571,6 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         );
         let ready = state
             .take_ready(t0 + half + ARCHIVE_SAVE_DEBOUNCE)
-            .ok()
             .expect("coalesced save should become ready after quiet period");
         assert_eq!(ready.recipes.len(), 2);
         assert_eq!(state.writing.as_deref(), Some(path.as_path()));

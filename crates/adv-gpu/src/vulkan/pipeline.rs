@@ -9,7 +9,7 @@ fn entry_key(entry: &Entry) -> EntryKey {
     EntryKey(entry.shader.identity, entry.index, entry.stage)
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct RenderKey {
+pub(super) struct RenderKey {
     vertex: EntryKey,
     fragment: Option<EntryKey>,
     bindings: Vec<Binding>,
@@ -62,7 +62,7 @@ impl RenderKey {
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct ComputeKey(EntryKey, Vec<Binding>);
+pub(super) struct ComputeKey(EntryKey, Vec<Binding>);
 
 #[derive(PartialEq, Eq, Hash)]
 struct PipelinePassKey {

@@ -932,7 +932,9 @@ fn allowed_cpus() -> Option<Vec<u32>> {
             return None;
         }
         let mut cpus = Vec::new();
-        for cpu in 0..(libc::CPU_SETSIZE as usize) {
+        #[allow(clippy::unnecessary_cast)] // usize on Android Bionic, c_int on Linux glibc
+        let limit = libc::CPU_SETSIZE as usize;
+        for cpu in 0..limit {
             if libc::CPU_ISSET(cpu, &set) {
                 cpus.push(cpu as u32);
             }

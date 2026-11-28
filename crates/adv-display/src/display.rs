@@ -2196,10 +2196,12 @@ mod tests {
         mpsc,
     };
 
+    type SpawnedBuilds = Arc<Mutex<Vec<(Upscaler, (u32, u32))>>>;
+
     struct TestController {
         active: Arc<AtomicUsize>,
         max_concurrent: Arc<AtomicUsize>,
-        spawned: Arc<Mutex<Vec<(Upscaler, (u32, u32))>>>,
+        spawned: SpawnedBuilds,
         gates: Arc<Mutex<VecDeque<mpsc::SyncSender<()>>>>,
         finished: Arc<Mutex<VecDeque<mpsc::Receiver<()>>>>,
     }
