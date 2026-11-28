@@ -259,6 +259,8 @@ impl Queue {
         self.shared.context.check()?;
         let state = self.shared.state.lock().unwrap();
         if token.0 <= state.completed {
+            drop(state);
+            self.shared.poll()?;
             return Ok(true);
         }
         if token.0 >= state.next {
@@ -424,6 +426,7 @@ impl Shared {
     }
     fn poll(&self) -> Result<Token> {
         self.context.check()?;
+        let _reaping = self.context.reaping.lock().unwrap();
         let mut retired_resources = Vec::new();
         let completed = {
             let mut state = self.state.lock().unwrap();
@@ -479,7 +482,7 @@ impl Shared {
                 false
             }
         });
-        self.context.reap(completed);
+        self.context.reap_locked(completed);
         Ok(Token(completed))
     }
 }
