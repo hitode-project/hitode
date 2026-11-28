@@ -342,6 +342,9 @@ pub(crate) struct Saved {
     record: Record,
     samples: SmallVec<[Samples; 3]>,
 }
+/// Per write, the key and sampled base that depend on the version a draw
+/// retains from its destination.
+pub(crate) type Keys = SmallVec<[(u128, u128); 3]>;
 
 /// Scissors per write. A draw spanning several distant changes is submitted
 /// once per scissor it meets; past this many, coarser cells merge them.
@@ -459,7 +462,7 @@ impl Analysis {
         contents: &Contents,
         read_versions: &[Option<u128>],
         retain: bool,
-    ) -> Option<Arc<Saved>> {
+    ) -> Option<(Arc<Saved>, Keys)> {
         let mut demands = SmallVec::new();
         for &k in p.reads {
             let mut proven = p.samples.iter().filter(|r| r.source == k).peekable();
@@ -480,8 +483,8 @@ impl Analysis {
             clear: p.kind == Kind::Clear,
         };
         let mut observations = SmallVec::new();
+        let mut keys = Keys::new();
         for &(k, overwrite) in p.writes {
-            let current = self.histories.get(&k).and_then(History::current);
             let (full, format) = if k.2 == 0 {
                 (p.view, p.color_shape)
             } else {
@@ -489,19 +492,12 @@ impl Analysis {
             };
             let shape = hash((rect(full), format));
             let bounds = p.bounds.clipped(full);
-            let independent =
-                (overwrite && bounds == full) || current.is_some_and(|s| s.independent);
-            // Only drawing can depend on the old values inside its write bounds.
-            // Clears and copies overwrite that region even when the attachment is larger.
-            let retained = (p.kind == Kind::Draw && !independent)
-                .then(|| contents.get(&k).copied().unwrap_or(0));
-            let key = hash((
-                p.write_key(k, if k.2 == 0 { command } else { attachment }),
-                retained,
-            ));
+            let (key, base) =
+                self.retained_keys(p, (k, overwrite), [command, attachment], contents);
+            keys.push((key, base));
             let ignores_color = k.2 != 0 && p.ignores_sampled_color;
             let samples = Samples {
-                base: hash((p.key, retained)),
+                base,
                 reads: p
                     .reads
                     .iter()
@@ -523,10 +519,13 @@ impl Analysis {
             record.writes.push((k, key, bounds, full, shape, overwrite));
         }
         let saved = retain.then(|| {
-            Arc::new(Saved {
-                record: record.clone(),
-                samples: observations.clone(),
-            })
+            (
+                Arc::new(Saved {
+                    record: record.clone(),
+                    samples: observations.clone(),
+                }),
+                keys,
+            )
         });
         self.install(record, observations, p.slot, contents);
         saved
@@ -537,8 +536,50 @@ impl Analysis {
             .and_then(History::current)
             .is_some_and(|s| s.independent)
     }
-    pub fn replay(&mut self, saved: &Saved, slot: u128, contents: &Contents) {
-        self.install(saved.record.clone(), saved.samples.clone(), slot, contents);
+    /// A write's key and sampled base. Only drawing can depend on the old
+    /// values inside its write bounds; clears and copies overwrite that
+    /// region even when the attachment is larger.
+    fn retained_keys(
+        &self,
+        p: &Input<'_>,
+        (k, overwrite): (Content, bool),
+        [command, attachment]: [u128; 2],
+        contents: &Contents,
+    ) -> (u128, u128) {
+        let current = self.histories.get(&k).and_then(History::current);
+        let full = if k.2 == 0 {
+            p.view
+        } else {
+            p.attachment.unwrap().0
+        };
+        let independent =
+            (overwrite && p.bounds.clipped(full) == full) || current.is_some_and(|s| s.independent);
+        let retained =
+            (p.kind == Kind::Draw && !independent).then(|| contents.get(&k).copied().unwrap_or(0));
+        (
+            hash((
+                p.write_key(k, if k.2 == 0 { command } else { attachment }),
+                retained,
+            )),
+            hash((p.key, retained)),
+        )
+    }
+    pub fn keys(&self, p: &Input<'_>, commands: [u128; 2], contents: &Contents) -> Keys {
+        p.writes
+            .iter()
+            .map(|&write| self.retained_keys(p, write, commands, contents))
+            .collect()
+    }
+    /// Install a saved record with this occurrence's `keys`.
+    pub fn replay(&mut self, saved: &Saved, keys: &Keys, slot: u128, contents: &Contents) {
+        let mut record = saved.record.clone();
+        let mut samples = saved.samples.clone();
+        for ((write, sample), &(key, base)) in record.writes.iter_mut().zip(&mut samples).zip(keys)
+        {
+            write.1 = key;
+            sample.base = base;
+        }
+        self.install(record, samples, slot, contents);
     }
 
     fn install(

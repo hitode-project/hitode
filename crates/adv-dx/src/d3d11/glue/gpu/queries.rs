@@ -502,11 +502,11 @@ pub(super) fn count_indirect(
     let extent = extent_rect([1, 1, 1]);
     exec.recording.append(
         &mut exec.gpu,
-        Command::Dispatch {
+        Command::Dispatch(Box::new(crate::d3d11::recording::Compute {
             pipeline,
             bindings,
             arguments: DispatchArguments::Direct([1, 1, 1]),
-        },
+        })),
         Effects {
             extent,
             bounds: extent,
@@ -588,11 +588,11 @@ pub(super) fn gate_arguments(
     let extent = extent_rect([1, 1, 1]);
     exec.recording.append(
         &mut exec.gpu,
-        Command::Dispatch {
+        Command::Dispatch(Box::new(crate::d3d11::recording::Compute {
             pipeline,
             bindings,
             arguments: DispatchArguments::Direct([1, 1, 1]),
-        },
+        })),
         Effects {
             extent,
             bounds: extent,

@@ -4080,3 +4080,64 @@ fn device7_presenting_blt_reads_back_executed_cells() {
         assert_eq!([readbacks[1], readbacks[3], readbacks[5]], [0; 3]);
     }
 }
+
+// spec: GFX-D3D7-3, GFX-D3D7-8
+#[test]
+fn donotlight_draws_follow_state_changes_across_presented_frames() {
+    // Only the world matrix moves the unlit square, so a stale state key
+    // would keep the earlier frame's cells.
+    let mut f = Fixture::new(true);
+    let (primary, dev) = flip_device(&mut f, 1);
+    let projection: [f32; 16] = [
+        1. / 320.,
+        0.,
+        0.,
+        0.,
+        0.,
+        -1. / 240.,
+        0.,
+        0.,
+        0.,
+        0.,
+        1.,
+        0.,
+        -1.,
+        1.,
+        0.,
+        1.,
+    ];
+    f.write(DATA + 0x200, bytemuck::bytes_of(&projection));
+    assert_eq!(f.device_call(dev, "SetTransform", &[3, DATA + 0x200]), 0);
+    assert_eq!(f.device_call(dev, "SetRenderState", &[22, 1]), 0);
+    let square = |x: f32, y: f32| {
+        [(0., 0.), (32., 0.), (0., 32.), (32., 32.)]
+            .map(|(dx, dy)| [x + dx, y + dy, 0.5, 0., 0., -1., f32::from_bits(0xff336699)])
+    };
+    let mut vertices = square(0., 0.).to_vec();
+    vertices.extend(square(0., 240.));
+    f.write(VERTICES, bytemuck::cast_slice(&vertices));
+    for (frame, x) in [0u32, 64, 64, 128, 128, 0].into_iter().enumerate() {
+        let mut world = [0f32; 16];
+        for i in [0, 5, 10, 15] {
+            world[i] = 1.;
+        }
+        world[12] = x as f32;
+        f.write(DATA + 0x200, bytemuck::bytes_of(&world));
+        assert_eq!(f.device_call(dev, "SetTransform", &[1, DATA + 0x200]), 0);
+        assert_eq!(f.device_call(dev, "BeginScene", &[]), 0);
+        assert_eq!(f.device_call(dev, "Clear", &[0, 0, 1, 0xff400000, 0, 0]), 0);
+        // Lit without lights or ambient, the lower square is black.
+        for (at, flags) in [(VERTICES, 0x10), (VERTICES + 112, 0), (VERTICES, 0x10)] {
+            assert_eq!(
+                f.device_call(dev, "DrawPrimitive", &[5, 0x52, at, 4, flags]),
+                0
+            );
+        }
+        assert_eq!(f.device_call(dev, "EndScene", &[]), 0);
+        assert_eq!(f.call("IDirectDrawSurface7::Flip", &[primary, 0, 1]), 0);
+        let mut model = vec![0x400000; 640 * 480];
+        fill(&mut model, 640, [x, 0, 32, 32], 0x336699);
+        fill(&mut model, 640, [x, 240, 32, 32], 0);
+        assert_eq!(f.pixels(primary, 640, 480), model, "frame {frame}");
+    }
+}

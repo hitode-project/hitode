@@ -10,7 +10,7 @@ use crate::{
             recording::{self, Effects, Payload},
         },
     },
-    fixed::{self, Render, Rules, Sampler, Setting, Stage, VertexProgram, program::Legacy},
+    fixed::{self, Render, Rules, Sampler, Stage, VertexProgram, program::Legacy},
     record::key::hash,
 };
 use adv_abi::types::{D3DDP_PTRSTRIDE, D3DDRAWPRIMITIVESTRIDEDDATA, D3DVERTEXBUFFERDESC};
@@ -615,7 +615,7 @@ impl Calls<'_> {
             return Ok(0);
         }
         let state = device.state.as_ref().unwrap();
-        let mut fixed = state.fixed.clone();
+        let fixed = state.draw_state(flags & 0x10 == 0);
         let textures = state.textures;
         let kind = device.kind;
         let legacy_device = device.face != Face::Device7;
@@ -646,9 +646,6 @@ impl Calls<'_> {
         let weights = (fvf & 0xe).saturating_sub(4) / 2;
         if weights != 0 && kind != caps::Device::TnlHal {
             return Ok(0x80004005);
-        }
-        if flags & 0x10 != 0 {
-            fixed.apply(Setting::Render(Render::Lighting, 0));
         }
         let blend_weights = weights.min(fixed.render[&Render::VertexBlend]) as u8;
         if primitive == 6 {

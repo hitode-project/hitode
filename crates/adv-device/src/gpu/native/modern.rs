@@ -9,6 +9,7 @@ use adv_gpu::pipeline::{self as p, BindingKind, Stages};
 use adv_gpu::shader::{ShaderDesc, Source, Stage};
 use adv_gpu::{Buffer, ImageView, Rect, Sampler};
 use arrayvec::ArrayVec;
+use smallvec::SmallVec;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -50,22 +51,22 @@ pub struct SlotBindings {
     pub uniforms: Slots<BufferWindow>,
     pub images: Slots<ImageView>,
     pub samplers: Slots<Sampler>,
-    pub storage: Slots<StorageBinding>,
+    pub storage: Slots<StorageBinding, 1>,
 }
 
 /// Bound registers in register order. Stages bind a few registers spread over
 /// a wide range (pulled vertex streams sit above 192), so the table holds only
-/// the bound ones.
+/// the bound ones, the first `N` without an allocation.
 #[derive(Clone)]
-pub struct Slots<T>(Vec<(u32, T)>);
+pub struct Slots<T, const N: usize = 4>(SmallVec<[(u32, T); N]>);
 
-impl<T> Default for Slots<T> {
+impl<T, const N: usize> Default for Slots<T, N> {
     fn default() -> Self {
-        Self(Vec::new())
+        Self(SmallVec::new())
     }
 }
 
-impl<T> Slots<T> {
+impl<T, const N: usize> Slots<T, N> {
     fn find(&self, register: usize) -> Result<usize, usize> {
         self.0.binary_search_by_key(&register, |&(n, _)| n as usize)
     }
@@ -96,9 +97,9 @@ impl<T> Slots<T> {
     }
 }
 
-/// Registers `0..N` in order.
-impl<T, const N: usize> From<[T; N]> for Slots<T> {
-    fn from(values: [T; N]) -> Self {
+/// Registers `0..M` in order.
+impl<T, const N: usize, const M: usize> From<[T; M]> for Slots<T, N> {
+    fn from(values: [T; M]) -> Self {
         Self(values.into_iter().zip(0..).map(|(v, n)| (n, v)).collect())
     }
 }
@@ -234,7 +235,7 @@ impl ModernShader {
         self.bindings.iter().map(|&(_, binding)| binding)
     }
 
-    pub(super) fn compact(&self, slots: &SlotBindings) -> Result<Vec<BoundSlot>, Error> {
+    pub(super) fn compact(&self, slots: &SlotBindings) -> Result<BoundSlots, Error> {
         self.bindings
             .iter()
             .map(|&(register, binding)| {
@@ -387,6 +388,9 @@ pub(crate) struct BoundSlot {
     resource: Bound,
 }
 
+/// A stage's bound resources in slot order; draws bind a few.
+pub(crate) type BoundSlots = SmallVec<[BoundSlot; 4]>;
+
 impl BoundSlot {
     pub(super) fn retain_uniform(&self, windows: &mut Vec<UniformWindow>) {
         if let Bound::Uniform(window) | Bound::StorageBuffer(window) = &self.resource {
@@ -492,12 +496,13 @@ pub struct Predicate {
     pub inverted: bool,
 }
 
+/// A draw with its compacted bindings. The submitting thread fills it once;
+/// the worker adds the pipeline and passes the same allocation on.
 pub(crate) struct Render {
     pub draw: ModernDraw,
     pub statistics: Option<QuerySlot>,
-    pub pipeline: adv_gpu::RenderPipeline,
-    pub vertex: Vec<BoundSlot>,
-    pub fragment: Vec<BoundSlot>,
+    pub vertex: BoundSlots,
+    pub fragment: BoundSlots,
 }
 
 #[derive(Clone)]
@@ -508,7 +513,7 @@ pub struct Dispatch {
 
 pub(crate) struct Compute {
     pub pipeline: adv_gpu::ComputePipeline,
-    pub bindings: Vec<BoundSlot>,
+    pub bindings: BoundSlots,
     pub arguments: DispatchArguments,
 }
 
@@ -549,10 +554,12 @@ impl Gpu {
             .unwrap_or_default();
         self.enqueue_modern(super::record::WorkerItem::DrawModern {
             facade: self.facade_id,
-            draw: Box::new(draw),
-            statistics,
-            vertex,
-            fragment,
+            render: Box::new(Render {
+                draw,
+                statistics,
+                vertex,
+                fragment,
+            }),
         })
     }
 

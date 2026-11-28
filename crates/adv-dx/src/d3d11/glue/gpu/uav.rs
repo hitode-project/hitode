@@ -195,11 +195,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>,
         let width = groups.min(65535);
         let extent = extent_rect([range.len() as u32, 1, 1]);
         execution.append(
-            Command::Dispatch {
+            Command::Dispatch(Box::new(crate::d3d11::recording::Compute {
                 pipeline,
                 bindings,
                 arguments: DispatchArguments::Direct([width, groups.div_ceil(width), 1]),
-            },
+            })),
             extent,
             None,
             key,

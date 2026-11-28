@@ -1454,15 +1454,15 @@ pub(super) fn resolve(env: &mut Env<'_>) -> Result<(), Error> {
         use adv_device::gpu::{ModernDraw, SlotBindings};
         let draw = ModernDraw::packed_resolve(destination, maxima)?;
         return execution(env.ext)?.append(
-            Command::Draw {
-                draw: Box::new(draw),
+            Command::Draw(Box::new(crate::d3d11::recording::Draw {
+                draw,
                 vertex: SlotBindings::default(),
                 fragment: SlotBindings {
                     images: [source_view].into(),
                     ..Default::default()
                 },
                 statistics: None,
-            },
+            })),
             extent,
             Some(read),
             write,
@@ -1553,7 +1553,7 @@ fn filter_image(
     let volume = destination.image().desc().dimension == adv_gpu::resource::Dimension::D3;
     let group = if volume { 4 } else { 8 };
     execution.append(
-        Command::Dispatch {
+        Command::Dispatch(Box::new(crate::d3d11::recording::Compute {
             pipeline,
             bindings: SlotBindings {
                 images: [source].into(),
@@ -1569,7 +1569,7 @@ fn filter_image(
                     1
                 },
             ]),
-        },
+        })),
         extent_rect([size.width, size.height, 1]),
         Some(read),
         write,

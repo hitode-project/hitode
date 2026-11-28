@@ -1,5 +1,6 @@
 //! Ordered preparation reuse and backoff for unused target histories.
 use super::{Arc, HashMap, damage, passes};
+use smallvec::SmallVec;
 
 pub(crate) struct Cache<K, E> {
     targets: HashMap<K, Sequence<E>>,
@@ -30,14 +31,21 @@ struct Sequence<E> {
     cursor: usize,
     hits: u32,
 }
-#[derive(Clone)]
-pub(crate) struct Saved {
+/// The preparation of a command that holds for any destination versions.
+/// Occurrences meeting other destination versions share it.
+pub(crate) struct Core {
     pub command: u128,
     pub attachment: u128,
     pub damage: Arc<damage::Saved>,
     pub pass: passes::Effects,
-    pub destinations: Vec<Option<u128>>,
-    pub outputs: Vec<u128>,
+    pub reads: SmallVec<[Option<u128>; 4]>,
+}
+#[derive(Clone)]
+pub(crate) struct Saved {
+    pub core: Arc<Core>,
+    pub keys: damage::Keys,
+    pub destinations: SmallVec<[Option<u128>; 3]>,
+    pub outputs: SmallVec<[u128; 3]>,
 }
 impl<K: Copy + Eq + std::hash::Hash, E> Cache<K, E> {
     /// Drops all entries; this frame's draws record directly.

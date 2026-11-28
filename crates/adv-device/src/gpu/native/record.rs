@@ -222,10 +222,7 @@ pub(super) enum WorkerItem {
     },
     DrawModern {
         facade: u64,
-        draw: Box<super::modern::ModernDraw>,
-        statistics: Option<super::modern::QuerySlot>,
-        vertex: Vec<super::modern::BoundSlot>,
-        fragment: Vec<super::modern::BoundSlot>,
+        render: Box<super::modern::Render>,
     },
     Expand {
         facade: u64,
@@ -957,27 +954,14 @@ impl WorkerState {
                 )
                 .map_err(|error| (facade, error))?;
             }
-            WorkerItem::DrawModern {
-                facade,
-                draw,
-                statistics,
-                vertex,
-                fragment,
-            } => {
+            WorkerItem::DrawModern { facade, render } => {
                 if self.facade_failure(facade).is_none() {
                     let state = self.facades.get_mut(&facade).unwrap();
                     let pipeline = state
                         .pipelines
-                        .modern(&self.device, &draw)
+                        .modern(&self.device, &render.draw)
                         .map_err(|error| (facade, error))?;
-                    self.stream
-                        .push(Command::DrawModern(Box::new(super::modern::Render {
-                            draw: *draw,
-                            statistics,
-                            pipeline,
-                            vertex,
-                            fragment,
-                        })));
+                    self.stream.push(Command::DrawModern(render, pipeline));
                     state.stats.draws += 1;
                 }
             }

@@ -2489,3 +2489,19 @@ struct Output {{
         (expected as u32).to_le_bytes()
     );
 }
+
+#[test]
+fn slot_tables_hold_a_draws_registers_inline_in_register_order() {
+    // Four registers, here spread as pulled vertex streams are, need no
+    // allocation; a fifth spills.
+    let mut slots = Slots::<u32>::default();
+    for register in [200, 0, 3, 1, 3] {
+        slots.set(register, register as u32);
+    }
+    assert!(!slots.0.spilled());
+    assert_eq!(slots.iter().copied().collect::<Vec<_>>(), [0, 1, 3, 200]);
+    assert_eq!(slots.get(3), Some(&3));
+    slots.set(5, 5);
+    assert!(slots.0.spilled());
+    assert_eq!(slots.len(), 5);
+}

@@ -305,6 +305,7 @@ impl Calls<'_> {
         let state = dev.state.as_mut().unwrap();
         state.set(Setting::Viewport(view));
         state.fixed.lights.clear();
+        state.fixed.invalidate_key();
         for (i, value) in lights.into_iter().enumerate() {
             state.set(Setting::Light(i as u32, value));
             state.set(Setting::LightEnable(i as u32, true));

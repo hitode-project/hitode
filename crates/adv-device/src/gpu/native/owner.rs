@@ -550,7 +550,7 @@ impl State {
             Command::Target { colors, depth } => {
                 self.target = Some(Attachments { colors, depth });
             }
-            Command::DrawModern(draw) => self.draw_modern(*draw)?,
+            Command::DrawModern(render, pipeline) => self.draw_modern(&render, &pipeline)?,
             Command::Expand(work) => {
                 work.plan.retain_uniforms(&mut self.uniforms);
                 let device = self.queue.device().clone();
@@ -840,8 +840,12 @@ impl State {
         }
         Ok(())
     }
-    fn draw_modern(&mut self, render: modern::Render) -> adv_gpu::Result<()> {
-        let draw = render.draw;
+    fn draw_modern(
+        &mut self,
+        render: &modern::Render,
+        pipeline: &adv_gpu::RenderPipeline,
+    ) -> adv_gpu::Result<()> {
+        let draw = &render.draw;
         for binding in render.vertex.iter().chain(&render.fragment) {
             binding.retain_uniform(&mut self.uniforms);
         }
@@ -858,7 +862,7 @@ impl State {
         let arguments = predicated.as_ref().unwrap_or(&draw.arguments);
         draw_modern_pass(
             self.encoder(),
-            (&draw, &render.pipeline),
+            (draw, pipeline),
             (&render.vertex, &render.fragment),
             arguments,
             render.statistics.as_ref(),
