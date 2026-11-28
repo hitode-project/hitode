@@ -240,7 +240,21 @@ struct Building {
     result: std::sync::mpsc::Receiver<adv_gpu::Result<(Upscaled, Option<upscale::Check>)>>,
     checking: Option<(Upscaled, upscale::Check, Token)>,
     failed: bool,
+    /// True when the requested choice/canvas changed (or turned off) while this
+    /// build thread was still in flight; its result is discarded on arrival.
+    cancelled: bool,
 }
+#[cfg(test)]
+type UpscaleBuildResult = adv_gpu::Result<(Upscaled, Option<upscale::Check>)>;
+#[cfg(test)]
+type UpscaleSpawner = Box<
+    dyn FnMut(
+        Device,
+        (Upscaler, (u32, u32)),
+        bool,
+        Option<Wake>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<UpscaleBuildResult>>,
+>;
 /// The selected model at one canvas size; the output pass reads the doubled
 /// image it keeps complete.
 struct Upscaled {
@@ -277,6 +291,11 @@ pub struct Display {
     upscaled: Option<Upscaled>,
     /// The model being built off the owner thread, for this choice and canvas.
     building: Option<Building>,
+    /// Latest requested `(choice, canvas)` coalesced while another build thread
+    /// is still in flight; at most one `adv-upscale-build` thread runs at once.
+    pending_upscale: Option<(Upscaler, (u32, u32))>,
+    #[cfg(test)]
+    upscale_spawner: Option<UpscaleSpawner>,
     /// Models whose half forms this device computes wrongly; they build in
     /// Whether a check found this device computes half precision wrongly;
     /// every model then builds in single precision.
@@ -336,6 +355,9 @@ impl Display {
             converted: HashMap::new(),
             upscaled: None,
             building: None,
+            pending_upscale: None,
+            #[cfg(test)]
+            upscale_spawner: None,
             single: false,
             leases: HashMap::new(),
             windows: Default::default(),
@@ -399,7 +421,9 @@ impl Display {
         }
     }
     pub fn set_waker(&mut self, wake: Wake) {
-        self.compositor.as_mut().unwrap().set_waker(wake.clone());
+        if let Some(c) = &mut self.compositor {
+            c.set_waker(wake.clone());
+        }
         self.wake = Some(wake);
     }
     pub fn origin(&self) -> Instant {
@@ -432,6 +456,7 @@ impl Display {
             result,
             checking: None,
             failed: false,
+            cancelled: false,
         });
     }
     #[cfg(all(test, any(target_vendor = "apple", target_os = "android")))]
@@ -535,6 +560,9 @@ impl Display {
             c.set_scale(settings.scale);
         }
         self.settings = settings;
+        if self.settings.upscaler == Upscaler::Off {
+            self.cancel_upscaler();
+        }
         if redraw {
             self.pools.invalidate();
             self.invalid = true;
@@ -1109,14 +1137,101 @@ impl Display {
         }
         Ok(())
     }
+    /// Retires `self.building` if no build thread is still running; otherwise
+    /// marks the in-flight build cancelled so its result is discarded on arrival
+    /// without overlapping a second `adv-upscale-build` thread.
+    fn retire_or_cancel_building(&mut self) -> bool {
+        let still_running = match self.building.as_mut() {
+            Some(b) if !b.failed && b.checking.is_none() => match b.result.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    b.cancelled = true;
+                    true
+                }
+                Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+            },
+            _ => false,
+        };
+        if !still_running {
+            self.building = None;
+        }
+        still_running
+    }
+    fn cancel_upscaler(&mut self) {
+        self.upscaled = None;
+        self.pending_upscale = None;
+        self.retire_or_cancel_building();
+    }
+    fn start_upscale_build(&mut self, key: (Upscaler, (u32, u32))) {
+        let (choice, canvas) = key;
+        let (device, wake) = (self.device.clone(), self.wake.clone());
+        let half = device
+            .caps()
+            .features
+            .contains(adv_gpu::Features::SHADER_F16)
+            && !self.single;
+        #[cfg(test)]
+        if let Some(spawner) = self.upscale_spawner.as_mut() {
+            let (result, failed) = match spawner(device, key, half, wake) {
+                Ok(result) => (result, false),
+                Err(_) => (std::sync::mpsc::sync_channel(1).1, true),
+            };
+            self.building = Some(Building {
+                key,
+                half,
+                result,
+                checking: None,
+                failed,
+                cancelled: false,
+            });
+            return;
+        }
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("adv-upscale-build".into())
+            .spawn(move || {
+                let probe = format!("upscale:{choice:?}:{}", if half { "f16" } else { "f32" });
+                let built =
+                    device.guard_compile(&probe, || Upscaled::new(&device, choice, canvas, half));
+                let _ = send.send(built);
+                if let Some(wake) = wake {
+                    wake();
+                }
+            });
+        self.building = Some(Building {
+            key,
+            half,
+            result,
+            checking: None,
+            failed: spawned.is_err(),
+            cancelled: false,
+        });
+    }
+    fn start_pending_upscale(&mut self) {
+        let Some(mut next) = self.pending_upscale.take() else {
+            return;
+        };
+        if next.0 == Upscaler::Off || self.settings.upscaler == Upscaler::Off {
+            return;
+        }
+        if next.0 != self.settings.upscaler {
+            next.0 = self.settings.upscaler;
+        }
+        if self
+            .upscaled
+            .as_ref()
+            .is_some_and(|u| (u.choice, u.upscaling.size()) == next)
+        {
+            return;
+        }
+        self.start_upscale_build(next);
+    }
     /// The upscaler this frame can run: `choice` once its model is built for
     /// `canvas`, otherwise none while a build runs off the owner thread
     /// (pipeline creation blocks for long on mobile drivers).
     fn upscaler(&mut self, choice: Upscaler, canvas: (u32, u32)) -> Upscaler {
         let key = (choice, canvas);
         if choice == Upscaler::Off {
-            self.upscaled = None;
-            self.building = None;
+            self.cancel_upscaler();
             return choice;
         }
         if self
@@ -1124,34 +1239,24 @@ impl Display {
             .as_ref()
             .is_some_and(|u| (u.choice, u.upscaling.size()) == key)
         {
+            self.pending_upscale = None;
+            self.retire_or_cancel_building();
             return choice;
         }
-        if self.building.as_ref().is_none_or(|b| b.key != key) {
-            let (send, result) = std::sync::mpsc::sync_channel(1);
-            let (device, wake) = (self.device.clone(), self.wake.clone());
-            let half = device
-                .caps()
-                .features
-                .contains(adv_gpu::Features::SHADER_F16)
-                && !self.single;
-            let spawned = std::thread::Builder::new()
-                .name("adv-upscale-build".into())
-                .spawn(move || {
-                    let probe = format!("upscale:{choice:?}:{}", if half { "f16" } else { "f32" });
-                    let built = device
-                        .guard_compile(&probe, || Upscaled::new(&device, choice, canvas, half));
-                    let _ = send.send(built);
-                    if let Some(wake) = wake {
-                        wake();
-                    }
-                });
-            self.building = Some(Building {
-                key,
-                half,
-                result,
-                checking: None,
-                failed: spawned.is_err(),
-            });
+        if let Some(b) = self.building.as_mut()
+            && b.key == key
+        {
+            self.pending_upscale = None;
+            if !b.failed {
+                b.cancelled = false;
+            }
+            return Upscaler::Off;
+        }
+        if self.retire_or_cancel_building() {
+            self.pending_upscale = Some(key);
+        } else {
+            self.pending_upscale = None;
+            self.start_upscale_build(key);
         }
         Upscaler::Off
     }
@@ -1159,12 +1264,35 @@ impl Display {
     /// far is unscaled, so the next frame is whole. A disagreeing check drops
     /// the build; the next frame rebuilds it in single precision.
     fn install(&mut self, queue: &mut Queue) -> Result<bool, Error> {
-        let Some(building) = self.building.as_mut().filter(|b| !b.failed) else {
+        let Some(building) = self.building.as_mut() else {
+            self.start_pending_upscale();
             return Ok(false);
         };
-        let choice = building.key.0;
+        if building.failed {
+            if self.pending_upscale.is_some_and(|p| p != building.key) {
+                self.building = None;
+                self.start_pending_upscale();
+            }
+            return Ok(false);
+        }
+        let key = building.key;
+        let choice = key.0;
+        let half = building.half;
+        let stale = building.cancelled
+            || self.settings.upscaler == Upscaler::Off
+            || self.settings.upscaler != choice
+            || self.pending_upscale.is_some_and(|p| p != key);
         let upscaled = match building.checking.take() {
             Some((upscaled, check, token)) => {
+                if stale {
+                    self.building = None;
+                    if self.settings.upscaler == Upscaler::Off {
+                        self.pending_upscale = None;
+                    } else {
+                        self.start_pending_upscale();
+                    }
+                    return Ok(false);
+                }
                 if queue.poll()? < token {
                     building.checking = Some((upscaled, check, token));
                     return Ok(false);
@@ -1179,31 +1307,56 @@ impl Display {
                 upscaled
             }
             None => match building.result.try_recv() {
-                Ok(Ok((upscaled, None))) => upscaled,
-                Ok(Ok((upscaled, Some(check)))) => {
-                    let mut encoder = queue.encoder("upscale check");
-                    check.encode(&mut encoder, &mut self.ring)?;
-                    let token = queue.submit(encoder)?;
-                    building.checking = Some((upscaled, check, token));
-                    return Ok(false);
-                }
-                Ok(Err(error)) => {
-                    if building.half {
-                        eprintln!(
-                            "[display] {choice:?} half precision failed ({error:?}); using single"
-                        );
-                        self.single = true;
-                        self.building = None;
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.building = None;
+                    if self.settings.upscaler == Upscaler::Off {
+                        self.pending_upscale = None;
                     } else {
-                        eprintln!("[display] {choice:?} upscaler unavailable: {error:?}");
-                        building.failed = true;
+                        self.start_pending_upscale();
                     }
                     return Ok(false);
                 }
-                Err(_) => return Ok(false),
+                Ok(built) => {
+                    if stale {
+                        drop(built);
+                        self.building = None;
+                        if self.settings.upscaler == Upscaler::Off {
+                            self.pending_upscale = None;
+                        } else {
+                            self.start_pending_upscale();
+                        }
+                        return Ok(false);
+                    }
+                    match built {
+                        Ok((upscaled, None)) => upscaled,
+                        Ok((upscaled, Some(check))) => {
+                            let mut encoder = queue.encoder("upscale check");
+                            check.encode(&mut encoder, &mut self.ring)?;
+                            let token = queue.submit(encoder)?;
+                            self.building.as_mut().unwrap().checking =
+                                Some((upscaled, check, token));
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            if half {
+                                eprintln!(
+                                    "[display] {choice:?} half precision failed ({error:?}); using single"
+                                );
+                                self.single = true;
+                                self.building = None;
+                            } else {
+                                eprintln!("[display] {choice:?} upscaler unavailable: {error:?}");
+                                self.building.as_mut().unwrap().failed = true;
+                            }
+                            return Ok(false);
+                        }
+                    }
+                }
             },
         };
         self.building = None;
+        self.pending_upscale = None;
         self.upscaled = Some(upscaled);
         self.pools.invalidate();
         self.invalid = true;
@@ -2031,5 +2184,237 @@ fn stage_target(stage: &Stage) -> (PoolId, &Tiles) {
         | Stage::Video { into, tiles, .. }
         | Stage::Upscale { into, tiles, .. }
         | Stage::Output { into, tiles, .. } => (*into, tiles),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    struct TestController {
+        active: Arc<AtomicUsize>,
+        max_concurrent: Arc<AtomicUsize>,
+        spawned: Arc<Mutex<Vec<(Upscaler, (u32, u32))>>>,
+        gates: Arc<Mutex<VecDeque<mpsc::SyncSender<()>>>>,
+        finished: Arc<Mutex<VecDeque<mpsc::Receiver<()>>>>,
+    }
+
+    impl TestController {
+        fn release_next(&self) {
+            let gate = self
+                .gates
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("in-flight build gate");
+            let done = self
+                .finished
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("in-flight build completion");
+            gate.send(()).unwrap();
+            done.recv_timeout(Duration::from_secs(30))
+                .expect("build thread finished");
+        }
+    }
+
+    fn setup_display(upscaler: Upscaler) -> (Device, Queue, Display, TestController) {
+        let (device, queue) = Device::open(&adv_gpu::queue::DeviceOptions {
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+            validation: !cfg!(target_os = "android"),
+            disable: adv_gpu::Modern::from_test_env(),
+            ..Default::default()
+        })
+        .unwrap();
+        let caps = CompositorCaps {
+            fractional_crops: !cfg!(target_os = "android"),
+            scales: true,
+            nearest: true,
+            rotates: false,
+            yuv_layers: true,
+            solid_color_layers: true,
+            damage_hints: true,
+            presentable_compressed: false,
+            tile: (16, 16),
+        };
+        let settings = Settings {
+            placement: Placement::Fit,
+            scale: 1.,
+            view: (128, 96),
+            rotation: Rotation::None,
+            upscaler,
+            background: [0.; 3],
+            damage_overlay: false,
+        };
+        let mut display = Display::new(
+            device.clone(),
+            Box::new(HeadlessCompositor::new(caps)),
+            settings,
+        )
+        .unwrap();
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let spawned = Arc::new(Mutex::new(Vec::new()));
+        let gates = Arc::new(Mutex::new(VecDeque::new()));
+        let finished = Arc::new(Mutex::new(VecDeque::new()));
+
+        let controller = TestController {
+            active: active.clone(),
+            max_concurrent: max_concurrent.clone(),
+            spawned: spawned.clone(),
+            gates: gates.clone(),
+            finished: finished.clone(),
+        };
+
+        display.upscale_spawner = Some(Box::new(move |dev, key, _half, wake| {
+            let (gate_tx, gate_rx) = mpsc::sync_channel::<()>(1);
+            let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+            let (send, result) = mpsc::sync_channel(1);
+            gates.lock().unwrap().push_back(gate_tx);
+            finished.lock().unwrap().push_back(done_rx);
+            spawned.lock().unwrap().push(key);
+            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_concurrent.fetch_max(now_active, Ordering::SeqCst);
+            let active = active.clone();
+            std::thread::Builder::new()
+                .name("adv-upscale-build-test".into())
+                .spawn(move || {
+                    let _ = gate_rx.recv();
+                    let built = Upscaled::new(&dev, key.0, key.1, false);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let _ = send.send(built);
+                    if let Some(wake) = wake {
+                        wake();
+                    }
+                    let _ = done_tx.send(());
+                })?;
+            Ok(result)
+        }));
+
+        (device, queue, display, controller)
+    }
+
+    // spec: HOST-VIEW-7
+    #[test]
+    fn upscale_alternating_sizes_coalesce_to_latest_and_never_overlap_builds() {
+        let (_device, mut queue, mut display, ctl) = setup_display(Upscaler::Anime4k);
+
+        assert_eq!(display.upscaler(Upscaler::Anime4k, (64, 48)), Upscaler::Off);
+        assert_eq!(ctl.active.load(Ordering::SeqCst), 1);
+        assert_eq!(ctl.max_concurrent.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *ctl.spawned.lock().unwrap(),
+            vec![(Upscaler::Anime4k, (64, 48))]
+        );
+
+        // Rapidly alternate canvas sizes while the first build is still running.
+        for size in [(80, 60), (96, 72), (80, 60), (128, 96), (112, 84)] {
+            assert_eq!(display.upscaler(Upscaler::Anime4k, size), Upscaler::Off);
+            assert_eq!(ctl.active.load(Ordering::SeqCst), 1);
+            assert_eq!(ctl.max_concurrent.load(Ordering::SeqCst), 1);
+            assert_eq!(ctl.spawned.lock().unwrap().len(), 1);
+        }
+        assert_eq!(
+            display.pending_upscale,
+            Some((Upscaler::Anime4k, (112, 84)))
+        );
+        assert!(display.building.as_ref().unwrap().cancelled);
+
+        // Complete the stale first build: it must be discarded and trigger at most
+        // one new build for the latest coalesced key.
+        ctl.release_next();
+        assert!(!display.install(&mut queue).unwrap());
+        assert!(display.upscaled.is_none());
+        assert!(display.pending_upscale.is_none());
+        assert_eq!(ctl.max_concurrent.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *ctl.spawned.lock().unwrap(),
+            vec![
+                (Upscaler::Anime4k, (64, 48)),
+                (Upscaler::Anime4k, (112, 84))
+            ]
+        );
+
+        // Complete the coalesced build: it installs cleanly.
+        ctl.release_next();
+        assert!(display.install(&mut queue).unwrap());
+        assert_eq!(ctl.max_concurrent.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            display.upscaler(Upscaler::Anime4k, (112, 84)),
+            Upscaler::Anime4k
+        );
+    }
+
+    // spec: HOST-VIEW-7
+    #[test]
+    fn upscale_off_clears_pending_and_discards_inflight_without_overlapping() {
+        let (_device, mut queue, mut display, ctl) = setup_display(Upscaler::Anime4k);
+
+        assert_eq!(display.upscaler(Upscaler::Anime4k, (64, 48)), Upscaler::Off);
+        assert_eq!(display.upscaler(Upscaler::Anime4k, (80, 60)), Upscaler::Off);
+        assert_eq!(display.pending_upscale, Some((Upscaler::Anime4k, (80, 60))));
+
+        // Turning the upscaler off clears the pending slot without dropping the
+        // in-flight guard, preventing overlapping builds if toggled back on.
+        let mut off_settings = display.settings.clone();
+        off_settings.upscaler = Upscaler::Off;
+        display.settings(&mut queue, off_settings).unwrap();
+        assert!(display.pending_upscale.is_none());
+        assert!(display.upscaled.is_none());
+        assert!(display.building.as_ref().unwrap().cancelled);
+
+        // Re-enabling a different choice while build #1 still runs must queue, not spawn.
+        display.settings.upscaler = Upscaler::Cunny;
+        assert_eq!(display.upscaler(Upscaler::Cunny, (96, 72)), Upscaler::Off);
+        assert_eq!(ctl.spawned.lock().unwrap().len(), 1);
+        assert_eq!(ctl.max_concurrent.load(Ordering::SeqCst), 1);
+        assert_eq!(display.pending_upscale, Some((Upscaler::Cunny, (96, 72))));
+
+        // Turning off again clears pending_upscale; when build #1 finishes,
+        // nothing is installed and no follow-up build spawns.
+        display.settings.upscaler = Upscaler::Off;
+        assert_eq!(display.upscaler(Upscaler::Off, (96, 72)), Upscaler::Off);
+        assert!(display.pending_upscale.is_none());
+
+        ctl.release_next();
+        assert!(!display.install(&mut queue).unwrap());
+        assert!(display.upscaled.is_none());
+        assert!(display.building.is_none());
+        assert!(display.pending_upscale.is_none());
+        assert_eq!(ctl.spawned.lock().unwrap().len(), 1);
+        assert_eq!(ctl.max_concurrent.load(Ordering::SeqCst), 1);
+    }
+
+    // spec: HOST-VIEW-7
+    #[test]
+    fn upscale_returning_to_inflight_key_uncancels_without_respawning() {
+        let (_device, mut queue, mut display, ctl) = setup_display(Upscaler::Anime4k);
+
+        assert_eq!(display.upscaler(Upscaler::Anime4k, (64, 48)), Upscaler::Off);
+        assert_eq!(display.upscaler(Upscaler::Anime4k, (80, 60)), Upscaler::Off);
+        assert!(display.building.as_ref().unwrap().cancelled);
+        assert_eq!(display.pending_upscale, Some((Upscaler::Anime4k, (80, 60))));
+
+        // Returning to the in-flight key before it completes reuses it directly.
+        assert_eq!(display.upscaler(Upscaler::Anime4k, (64, 48)), Upscaler::Off);
+        assert!(!display.building.as_ref().unwrap().cancelled);
+        assert!(display.pending_upscale.is_none());
+        assert_eq!(ctl.spawned.lock().unwrap().len(), 1);
+
+        ctl.release_next();
+        assert!(display.install(&mut queue).unwrap());
+        assert_eq!(
+            display.upscaler(Upscaler::Anime4k, (64, 48)),
+            Upscaler::Anime4k
+        );
+        assert_eq!(ctl.spawned.lock().unwrap().len(), 1);
+        assert_eq!(ctl.max_concurrent.load(Ordering::SeqCst), 1);
     }
 }
