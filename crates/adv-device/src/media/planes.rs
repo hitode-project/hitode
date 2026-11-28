@@ -217,7 +217,8 @@ impl Output {
             pts_us,
             width: self.width,
             height: self.height,
-            picture: picture.clone(),
+            picture: Some(picture.clone()),
+            cpu: None,
         })
     }
 }
@@ -338,32 +339,124 @@ fn configure(scaler: &mut software::scaling::Context, color: YuvColor, destinati
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ScalerKey {
+    source: Pixel,
+    destination: Pixel,
+    width: u32,
+    height: u32,
+    color: YuvColor,
+}
+
+struct CachedScaler {
+    key: ScalerKey,
+    context: software::scaling::Context,
+}
+
+thread_local! {
+    static GUEST_SCALER: std::cell::RefCell<Option<CachedScaler>> = const { std::cell::RefCell::new(None) };
+}
+
+fn with_scaler<R>(
+    source: Pixel,
+    destination: Pixel,
+    width: u32,
+    height: u32,
+    color: YuvColor,
+    run: impl FnOnce(&mut software::scaling::Context) -> R,
+) -> Option<R> {
+    let key = ScalerKey {
+        source,
+        destination,
+        width,
+        height,
+        color,
+    };
+    GUEST_SCALER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|cached| cached.key != key) {
+            let mut context = software::scaling::Context::get(
+                source,
+                width,
+                height,
+                destination,
+                width,
+                height,
+                software::scaling::Flags::BILINEAR,
+            )
+            .ok()?;
+            configure(&mut context, color, true);
+            *slot = Some(CachedScaler { key, context });
+        }
+        Some(run(&mut slot.as_mut().unwrap().context))
+    })
+}
+
 /// The single guest-pixel conversion. swscale reads the retained decoder
 /// planes directly; no BGRA exists on the display path.
 pub(crate) fn bgra(source: &frame::Video, color: YuvColor) -> Vec<u8> {
     let (width, height) = (source.width(), source.height());
-    let mut scaler = software::scaling::Context::get(
+    let stride = width as usize * 4;
+    let mut out = vec![0; stride * height as usize];
+    assert!(
+        write_rgb(
+            source,
+            color,
+            super::RgbFormat::Bgra,
+            false,
+            stride,
+            &mut out
+        ),
+        "guest BGRA scaler"
+    );
+    out
+}
+
+/// Convert retained decoder planes directly into an RGB buffer with optional
+/// bottom-up row inversion, reusing a thread-local `SwsContext`.
+pub(crate) fn write_rgb(
+    source: &frame::Video,
+    color: YuvColor,
+    format: super::RgbFormat,
+    bottom_up: bool,
+    stride: usize,
+    out: &mut [u8],
+) -> bool {
+    let (width, height) = (source.width(), source.height());
+    let min_stride = width as usize * format.bytes_per_pixel();
+    if width == 0 || height == 0 || stride < min_stride || out.len() < stride * height as usize {
+        return false;
+    }
+    let destination = match format {
+        super::RgbFormat::Bgra => Pixel::BGRA,
+        super::RgbFormat::Bgrx => Pixel::BGRZ,
+        super::RgbFormat::Bgr24 => Pixel::BGR24,
+        super::RgbFormat::Rgb565 => Pixel::RGB565LE,
+        super::RgbFormat::Rgb555 => Pixel::RGB555LE,
+    };
+    let ok = with_scaler(
         source.format(),
+        destination,
         width,
         height,
-        Pixel::BGRA,
-        width,
-        height,
-        software::scaling::Flags::BILINEAR,
-    )
-    .expect("guest BGRA scaler");
-    configure(&mut scaler, color, true);
-    let mut out = vec![0; width as usize * height as usize * 4];
-    unsafe {
-        let src = &*source.as_ptr();
-        let mut dst = [
-            out.as_mut_ptr(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ];
-        let strides = [width as i32 * 4, 0, 0, 0];
-        assert_eq!(
+        color,
+        |scaler| unsafe {
+            let src = &*source.as_ptr();
+            let (base, line_stride) = if bottom_up && height > 1 {
+                (
+                    out.as_mut_ptr().add((height as usize - 1) * stride),
+                    -(stride as i32),
+                )
+            } else {
+                (out.as_mut_ptr(), stride as i32)
+            };
+            let mut dst = [
+                base,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ];
+            let strides = [line_stride, 0, 0, 0];
             ff::ffi::sws_scale(
                 scaler.as_mut_ptr(),
                 src.data.as_ptr().cast(),
@@ -371,12 +464,19 @@ pub(crate) fn bgra(source: &frame::Video, color: YuvColor) -> Vec<u8> {
                 0,
                 height as i32,
                 dst.as_mut_ptr(),
-                strides.as_ptr()
-            ),
-            height as i32
-        );
+                strides.as_ptr(),
+            ) == height as i32
+        },
+    )
+    .unwrap_or(false);
+    if ok && format == super::RgbFormat::Bgrx {
+        for row in out.chunks_mut(stride).take(height as usize) {
+            for pixel in row[..width as usize * 4].as_chunks_mut::<4>().0 {
+                pixel[3] = 0;
+            }
+        }
     }
-    out
+    ok
 }
 
 #[cfg(test)]
@@ -565,6 +665,75 @@ mod conversion_tests {
             }
         }
     }
+
+    #[test]
+    // spec: MEDIA-STREAM-1, MEDIA-VIDEO-7
+    fn direct_rgb_write_inverts_rows_and_preserves_padding() {
+        let mut source = frame::Video::new(Pixel::YUV420P, 18, 10);
+        for plane in 0..3 {
+            let (w, h) = if plane == 0 { (18, 10) } else { (9, 5) };
+            let stride = source.stride(plane);
+            for y in 0..h {
+                for x in 0..w {
+                    source.data_mut(plane)[y * stride + x] =
+                        (35 + (x * 13 + y * 9 + plane * 41) % 190) as u8;
+                }
+            }
+        }
+        let color = YuvColor::Bt709Limited;
+        let top_bgra = bgra(&source, color);
+
+        // BGRX bottom-up zeroes byte 3 and reverses row order.
+        let bgrx_stride = 18 * 4;
+        let mut bgrx = vec![0xaa; bgrx_stride * 10];
+        assert!(write_rgb(
+            &source,
+            color,
+            crate::media::RgbFormat::Bgrx,
+            true,
+            bgrx_stride,
+            &mut bgrx
+        ));
+        for y in 0..10 {
+            let dst = &bgrx[(9 - y) * bgrx_stride..][..bgrx_stride];
+            let src = &top_bgra[y * bgrx_stride..][..bgrx_stride];
+            for x in 0..18 {
+                assert_eq!(&dst[x * 4..x * 4 + 3], &src[x * 4..x * 4 + 3]);
+                assert_eq!(dst[x * 4 + 3], 0);
+            }
+        }
+
+        // BGR24 bottom-up preserves 4-byte row padding and matches BGR bytes.
+        let bgr24_stride = (18 * 3 + 3) & !3;
+        let mut bgr24 = vec![0u8; bgr24_stride * 10];
+        assert!(write_rgb(
+            &source,
+            color,
+            crate::media::RgbFormat::Bgr24,
+            true,
+            bgr24_stride,
+            &mut bgr24
+        ));
+        for y in 0..10 {
+            let dst = &bgr24[(9 - y) * bgr24_stride..][..bgr24_stride];
+            let src = &top_bgra[y * bgrx_stride..][..bgrx_stride];
+            for x in 0..18 {
+                assert_eq!(&dst[x * 3..x * 3 + 3], &src[x * 4..x * 4 + 3]);
+            }
+            assert!(dst[18 * 3..].iter().all(|&b| b == 0));
+        }
+
+        // RGB565 and RGB555 succeed on repeated cached-scaler calls.
+        for format in [
+            crate::media::RgbFormat::Rgb565,
+            crate::media::RgbFormat::Rgb555,
+        ] {
+            let stride = (18 * 2 + 3) & !3;
+            let mut out = vec![0u8; stride * 10];
+            assert!(write_rgb(&source, color, format, true, stride, &mut out));
+            assert!(out.iter().any(|&b| b != 0));
+        }
+    }
 }
 
 #[cfg(all(test, target_vendor = "apple"))]
@@ -585,11 +754,12 @@ mod ownership_tests {
             let Some(frame) = decoder.frame_at(time).unwrap().video else {
                 continue;
             };
-            ids.insert(frame.picture.image().id());
-            held.push((frame.picture.clone(), frame.picture.bgra()));
+            let picture = frame.picture.as_ref().unwrap();
+            ids.insert(picture.image().id());
+            held.push((picture.clone(), picture.bgra()));
             let plane = VideoPlane {
                 id: 7,
-                picture: frame.picture.clone(),
+                picture: picture.clone(),
                 geometry: VideoGeometry {
                     source: (frame.width, frame.height),
                     destination: adv_gpu::Rect {
@@ -634,7 +804,10 @@ mod ownership_tests {
         for time in (0..600_000).step_by(100_000) {
             if let Some(frame) = decoder.frame_at(time).unwrap().video {
                 assert_eq!((frame.width, frame.height), (64, 48));
-                assert_eq!(frame.picture.image().desc().format, adv_gpu::Format::Nv12);
+                assert_eq!(
+                    frame.picture.as_ref().unwrap().image().desc().format,
+                    adv_gpu::Format::Nv12
+                );
                 assert_eq!(frame.bgra().len(), 64 * 48 * 4);
                 frames += 1;
             }
@@ -673,6 +846,7 @@ mod ownership_tests {
             .unwrap_or_else(|| "ffmpeg".into());
         let tmp = std::env::temp_dir().join(format!("adv-vt-720p-{}.mp4", std::process::id()));
         if std::process::Command::new(&ffmpeg)
+            .stdin(std::process::Stdio::null())
             .args([
                 "-y",
                 "-loglevel",
@@ -695,7 +869,10 @@ mod ownership_tests {
             let mut hd = crate::media::Decoder::open_memory(bytes).unwrap();
             let frame = hd.frame_at(100_000).unwrap().video.expect("720p frame");
             assert_eq!((frame.width, frame.height), (1280, 720));
-            assert_eq!(frame.picture.image().desc().format, adv_gpu::Format::Nv12);
+            assert_eq!(
+                frame.picture.as_ref().unwrap().image().desc().format,
+                adv_gpu::Format::Nv12
+            );
         }
     }
 }
@@ -723,7 +900,10 @@ mod packet_tests {
                     panic!("video stream");
                 };
                 assert_eq!((frame.width, frame.height), (64, 48));
-                assert_eq!(frame.picture.image().desc().format, adv_gpu::Format::Nv12);
+                assert_eq!(
+                    frame.picture.as_ref().unwrap().image().desc().format,
+                    adv_gpu::Format::Nv12
+                );
                 assert_eq!(frame.bgra().len(), 64 * 48 * 4);
                 count += 1;
             }
@@ -733,6 +913,48 @@ mod packet_tests {
             count += 1;
         }
         assert_eq!(count, 10);
+    }
+
+    #[test]
+    // spec: MEDIA-STREAM-1, MEDIA-VIDEO-7
+    fn cpu_only_decoders_skip_presentable_buffers_with_identical_pixels() {
+        let movie =
+            include_bytes!("../../../adv-dx/src/dshow/graph/render/fixtures/guest_movie.mpg");
+        let mut gpu = crate::media::Decoder::open_memory(movie.to_vec()).unwrap();
+        let mut cpu = crate::media::Decoder::open_memory(movie.to_vec()).unwrap();
+        cpu.set_cpu_only(true).unwrap();
+        let gpu_frame = gpu.frame_at(100_000).unwrap().video.unwrap();
+        let cpu_frame = cpu.frame_at(100_000).unwrap().video.unwrap();
+        assert!(gpu_frame.picture.is_some());
+        assert!(cpu_frame.picture.is_none());
+        assert_eq!(cpu_frame.bgra(), gpu_frame.bgra());
+
+        let input = demux(include_bytes!("packets/ramp.wmv").to_vec()).unwrap();
+        let stream = input
+            .streams
+            .iter()
+            .find(|s| matches!(s.format, CodecFormat::Video { .. }))
+            .unwrap();
+        let mut gpu_pkt = PacketDecoder::open(&stream.format).unwrap();
+        let mut cpu_pkt = PacketDecoder::open_cpu(&stream.format).unwrap();
+        let mut compared = 0;
+        for packet in &stream.packets {
+            let gpu_frames = gpu_pkt
+                .decode(&packet.data, Some(packet.time_100ns))
+                .unwrap();
+            let cpu_frames = cpu_pkt
+                .decode(&packet.data, Some(packet.time_100ns))
+                .unwrap();
+            for (g, c) in gpu_frames.into_iter().zip(cpu_frames) {
+                if let (Decoded::Video(g), Decoded::Video(c)) = (g, c) {
+                    assert!(g.picture.is_some());
+                    assert!(c.picture.is_none());
+                    assert_eq!(c.bgra(), g.bgra());
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared >= 5);
     }
 
     #[test]
@@ -756,7 +978,7 @@ mod packet_tests {
             };
             let plane = VideoPlane {
                 id: 1,
-                picture: frame.picture.clone(),
+                picture: frame.picture.as_ref().unwrap().clone(),
                 geometry: VideoGeometry {
                     source: (frame.width, frame.height),
                     destination: rect,

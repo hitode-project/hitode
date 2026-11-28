@@ -204,6 +204,16 @@ impl DecodedPicture {
             unreachable!("decoded pictures require media")
         }
     }
+    #[cfg(feature = "media")]
+    pub(crate) fn write_rgb(
+        &self,
+        format: crate::media::RgbFormat,
+        bottom_up: bool,
+        stride: usize,
+        out: &mut [u8],
+    ) -> bool {
+        crate::media::planes::write_rgb(&self.source, self.color, format, bottom_up, stride, out)
+    }
     pub fn color(&self) -> adv_gpu::present::YuvColor {
         self.color
     }

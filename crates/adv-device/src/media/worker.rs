@@ -11,6 +11,7 @@ use super::{Error, ReadSeek, Stats, StreamInfo, Update};
 enum Request {
     At { media_us: u64, preroll: bool },
     Seek(u64),
+    CpuOnly(bool),
 }
 
 type Reply = (Result<Option<Update>, Error>, Stats);
@@ -128,12 +129,17 @@ impl Worker {
     pub fn seek(&mut self, media_us: u64) -> Result<(), Error> {
         self.call(Request::Seek(media_us)).map(drop)
     }
+
+    pub fn set_cpu_only(&mut self, cpu_only: bool) -> Result<(), Error> {
+        self.call(Request::CpuOnly(cpu_only)).map(drop)
+    }
 }
 
 fn serve(owned: Owned, inbox: &Receiver<Request>, outbox: &Sender<Reply>) {
     let Owned(mut native) = owned;
     // Ends when the `Worker` is dropped.
     while let Ok(request) = inbox.recv() {
+        let should_prefetch = !matches!(request, Request::CpuOnly(_));
         let result = match request {
             Request::At { media_us, preroll } => if preroll {
                 native.preroll_at(media_us)
@@ -142,12 +148,16 @@ fn serve(owned: Owned, inbox: &Receiver<Request>, outbox: &Sender<Reply>) {
             }
             .map(Some),
             Request::Seek(media_us) => native.seek(media_us).map(|()| None),
+            Request::CpuOnly(cpu_only) => {
+                native.set_cpu_only(cpu_only);
+                Ok(None)
+            }
         };
         let failed = result.is_err();
         if outbox.send((result, native.stats)).is_err() {
             return;
         }
-        if !failed {
+        if !failed && should_prefetch {
             native.prefetch();
         }
     }

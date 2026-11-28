@@ -927,7 +927,7 @@ mod tests {
         let video: Arc<[frame::VideoPlane]> = Arc::from([frame::VideoPlane {
             id: 12,
             geometry,
-            picture: picture.picture,
+            picture: picture.picture.unwrap(),
         }]);
         for changed in [true, false] {
             let slot =
