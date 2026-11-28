@@ -17,7 +17,6 @@ pub(crate) mod pacing;
 #[cfg(feature = "gpu")]
 pub(crate) mod record;
 pub mod shader;
-#[cfg(feature = "gpu")]
 pub(crate) mod text;
 pub mod wmvcore;
 pub mod xaudio2;

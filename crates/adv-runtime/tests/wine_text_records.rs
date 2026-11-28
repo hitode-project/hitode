@@ -5,7 +5,7 @@
 
 use adv_runtime::wine::session::{Config, Host, SessionOptions, Stop};
 use adv_runtime::wine::text_records::{
-    Code, DrawnLine, Map, MoveKind, MovedPixels, Store, TextRecord,
+    Code, DrawnLine, Map, MoveKind, MovedPixels, Store, TextBatch, TextRecord,
 };
 use std::{
     path::PathBuf,
@@ -286,30 +286,20 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied_child() {
     assert!(moves.iter().all(|moved| moved.thread == thread));
 }
 
-// spec: WINE-UNIX-8
-#[cfg(feature = "gpu")]
-#[test]
-fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window() {
-    in_child("text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child");
-}
-
-#[cfg(feature = "gpu")]
-#[test]
-#[ignore = "subprocess entry: Wine owns process-global server state"]
-fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child() {
+/// Run the authored probe `exe` to its exit in a session with text records
+/// on, with a GPU when `gpu`, and return the records it left.
+fn recorded(exe: &str, gpu: bool) -> TextBatch {
     use adv_runtime::wine::session::Session;
-    let Some(wine::Wine { dist, probes }) = wine::wine() else {
-        return;
-    };
+    let wine::Wine { dist, probes } = wine::wine().unwrap();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/text-records-d3d9")
+        .join("../../target/text-records-session")
         .join(std::process::id().to_string());
     if root.exists() {
         std::fs::remove_dir_all(&root).unwrap();
     }
     let game = root.join("game");
     std::fs::create_dir_all(&game).unwrap();
-    std::fs::copy(probes.join("d3d9.exe"), game.join("d3d9.exe")).unwrap();
+    std::fs::copy(probes.join(exe), game.join(exe)).unwrap();
     let output = root.join("stdout");
     let stdout = std::fs::File::create(&output).unwrap();
     let config = Config {
@@ -318,7 +308,7 @@ fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child() {
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: Some(&game.join("d3d9.exe")),
+        exe: Some(&game.join(exe)),
         width: 640,
         height: 480,
         jit: true,
@@ -326,11 +316,23 @@ fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child() {
         stdout: Some(std::os::fd::AsRawFd::as_raw_fd(&stdout)),
     };
     let wake = adv_sync::WakeEvent::new().unwrap();
-    let gpu_wake = wake.clone();
-    let gpu = adv_device::gpu::test_support::request(false).unwrap();
+    #[cfg(feature = "gpu")]
+    let gpu = gpu.then(|| {
+        (
+            adv_device::gpu::test_support::request(false).unwrap(),
+            wake.clone(),
+        )
+    });
+    #[cfg(not(feature = "gpu"))]
+    assert!(!gpu, "this build has no GPU");
     let mut session = Session::start(&config, wake, move |machine| {
-        machine.ext.insert(gpu.waker());
-        Session::attach_gpu(machine, gpu, gpu_wake)
+        #[cfg(feature = "gpu")]
+        if let Some((gpu, wake)) = gpu {
+            machine.ext.insert(gpu.waker());
+            return Session::attach_gpu(machine, gpu, wake);
+        }
+        let _ = machine;
+        Ok(())
     })
     .unwrap();
     session.set_text_records(true);
@@ -343,30 +345,90 @@ fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child() {
         "{stop:?}: {}",
         std::fs::read_to_string(output).unwrap()
     );
-
     assert_eq!(batch.dropped, 0);
-    let lines: Vec<_> = batch
+    batch
+}
+
+fn lines(batch: &TextBatch) -> Vec<&DrawnLine> {
+    batch
         .records
         .iter()
         .filter_map(|record| match record {
             TextRecord::Line(line) => Some(line),
             _ => None,
         })
-        .collect();
-    // "Hi" on the system-memory surface, then on the back buffer, then the
-    // static window's own caption as the window repaints.
-    assert_eq!(
-        lines.iter().map(|line| text(line)).collect::<Vec<_>>(),
-        ["Hi", "Hi", "probe"]
-    );
-    let moves: Vec<_> = batch
+        .collect()
+}
+
+fn moves(batch: &TextBatch) -> Vec<&MovedPixels> {
+    batch
         .records
         .iter()
         .filter_map(|record| match record {
             TextRecord::Move(moved) => Some(moved),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+// spec: WINE-UNIX-8
+#[test]
+fn text_drawn_on_a_directdraw_surface_is_recorded_up_to_the_window() {
+    in_child("text_drawn_on_a_directdraw_surface_is_recorded_up_to_the_window_child");
+}
+
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn text_drawn_on_a_directdraw_surface_is_recorded_up_to_the_window_child() {
+    let batch = recorded("ddraw.exe", false);
+    let lines = lines(&batch);
+    assert_eq!(
+        lines.iter().map(|line| text(line)).collect::<Vec<_>>(),
+        ["Hi"]
+    );
+    let moves = moves(&batch);
+    let kinds: Vec<_> = moves.iter().map(|moved| moved.kind).collect();
+    assert_eq!(kinds, [MoveKind::Copy, MoveKind::Present], "{moves:#?}");
+    let [blit, present] = [moves[0], moves[1]];
+    // The surface's DC pixels are its own, which the blit copies whole to the
+    // primary, which the window shows.
+    assert_eq!(
+        blit.source,
+        Store::Memory(lines[0].plane.unwrap()),
+        "{blit:?}"
+    );
+    assert_eq!(
+        (blit.rect, blit.map),
+        ([0, 0, 64, 32], Some(Map::offset(0, 0)))
+    );
+    assert_eq!(present.source, blit.destination);
+    assert!(matches!(present.destination, Store::Window(_)));
+    assert_eq!(
+        (present.rect, present.map),
+        ([0, 0, 64, 32], Some(Map::offset(0, 0)))
+    );
+}
+
+// spec: WINE-UNIX-8
+#[cfg(feature = "gpu")]
+#[test]
+fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window() {
+    in_child("text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child");
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child() {
+    let batch = recorded("d3d9.exe", true);
+    let lines = lines(&batch);
+    // "Hi" on the system-memory surface, then on the back buffer, then the
+    // static window's own caption as the window repaints.
+    assert_eq!(
+        lines.iter().map(|line| text(line)).collect::<Vec<_>>(),
+        ["Hi", "Hi", "probe"]
+    );
+    let moves = moves(&batch);
     let back = lines[1].plane.unwrap();
     let Some(upload) = moves.iter().find(|moved| moved.kind == MoveKind::Upload) else {
         panic!("{moves:#?}");
@@ -414,55 +476,8 @@ fn a_d3d9_draw_that_samples_a_text_texture_is_recorded_with_its_map() {
 #[test]
 #[ignore = "subprocess entry: Wine owns process-global server state"]
 fn a_d3d9_draw_that_samples_a_text_texture_is_recorded_with_its_map_child() {
-    use adv_runtime::wine::session::Session;
-    let Some(wine::Wine { dist, probes }) = wine::wine() else {
-        return;
-    };
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/text-records-d3d9-draw")
-        .join(std::process::id().to_string());
-    if root.exists() {
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-    let game = root.join("game");
-    std::fs::create_dir_all(&game).unwrap();
-    let exe = game.join("text-records-d3d9.exe");
-    std::fs::copy(probes.join("text-records-d3d9.exe"), &exe).unwrap();
-    let config = Config {
-        dist: &dist,
-        prefix: &root.join("prefix"),
-        drive: None,
-        locale: 0x409,
-        fonts: "",
-        exe: Some(&exe),
-        width: 640,
-        height: 480,
-        jit: true,
-        debug: "",
-        stdout: None,
-    };
-    let wake = adv_sync::WakeEvent::new().unwrap();
-    let gpu_wake = wake.clone();
-    let gpu = adv_device::gpu::test_support::request(false).unwrap();
-    let mut session = Session::start(&config, wake, move |machine| {
-        machine.ext.insert(gpu.waker());
-        Session::attach_gpu(machine, gpu, gpu_wake)
-    })
-    .unwrap();
-    session.set_text_records(true);
-    let stop = session.run(Instant::now() + Duration::from_secs(60));
-    let batch = session.take_text_records();
-    drop(session);
-    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}");
-
-    let moves: Vec<_> = batch
-        .records
-        .iter()
-        .filter_map(|record| match record {
-            TextRecord::Move(moved) => Some(moved),
-            _ => None,
-        })
-        .collect();
+    let batch = recorded("text-records-d3d9.exe", true);
+    let moves = moves(&batch);
     let kinds: Vec<_> = moves.iter().map(|moved| moved.kind).collect();
     assert_eq!(
         kinds,

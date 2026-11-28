@@ -1,15 +1,19 @@
 //! Text records (WINE-UNIX-8) for device work: uploads, draws and copies that
 //! move pixels holding text into device resources, and presents that show
-//! them in a window. Resources are named by the frame recorder's keys, which
-//! every frontend already computes for each operation.
+//! them in a window. Direct3D resources are named by the frame recorder's
+//! keys, which every frontend already computes for each operation;
+//! DirectDraw surfaces live in guest memory and are named by their pixels.
+#[cfg(feature = "gpu")]
 use crate::record::{Kind, ResourceKey, damage};
-use adv_device::surface::Rect;
+use adv_device::surface::{PixelFormat, Rect, Surface};
 use adv_machine::{
     Env,
-    text_records::{self, Map, MoveKind, Plane, Resource, Store},
+    text_records::{self, Map, MoveKind, Plane, Store},
 };
 
+#[cfg(feature = "gpu")]
 pub(crate) fn resource(key: ResourceKey) -> Store {
+    use adv_machine::text_records::Resource;
     Store::Resource(Resource {
         allocation: key.0,
         subresource: key.1,
@@ -26,6 +30,7 @@ pub(crate) fn on(env: &Env<'_>) -> bool {
 }
 
 /// What a recorded operation reads that its effects do not name.
+#[cfg(feature = "gpu")]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Origin {
     /// The guest pixels an upload reads, starting at the written rectangle.
@@ -35,6 +40,7 @@ pub(crate) struct Origin {
 }
 
 /// Note what a recorded operation moves into its color destinations.
+#[cfg(feature = "gpu")]
 pub(crate) fn recorded(env: &Env<'_>, effects: &damage::Input<'_>, origin: Origin) {
     if !on(env) {
         return;
@@ -85,6 +91,7 @@ pub(crate) fn recorded(env: &Env<'_>, effects: &damage::Input<'_>, origin: Origi
 }
 
 /// Note a present of `source` into `window`'s client area at `rect`.
+#[cfg(feature = "gpu")]
 pub(crate) fn presented(env: &Env<'_>, source: ResourceKey, window: u32, rect: Rect, map: Map) {
     let destination = Store::Window(window);
     let rect = corners(rect);
@@ -114,4 +121,95 @@ pub(crate) fn rect_map(destination: Rect, source: Rect) -> Option<Map> {
             f64::from(source.y) - f64::from(destination.y) * scale[1],
         ],
     })
+}
+
+/// The guest pixels of a DirectDraw surface, top row first.
+pub(crate) fn surface(surface: &Surface) -> Store {
+    let [pitch, rows] = [surface.pitch, surface.height].map(|v| v as i32);
+    let (bits, stride) = if surface.bottom_up {
+        let last = surface
+            .pixels
+            .wrapping_add((rows.max(1) - 1) as u32 * surface.pitch);
+        (last, -pitch)
+    } else {
+        (surface.pixels, pitch)
+    };
+    Store::Memory(Plane {
+        bits,
+        stride,
+        bpp: match surface.format {
+            PixelFormat::Indexed4 => 4,
+            PixelFormat::Indexed1 => 1,
+            format => format.bytes() * 8,
+        },
+        origin: [0, 0],
+        size: [surface.width as i32, rows],
+    })
+}
+
+/// A move a DirectDraw call made, which its front notes once the call returns.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SurfaceMove {
+    pub kind: MoveKind,
+    /// None for the screen, which the front names by the window it shows.
+    pub destination: Option<Store>,
+    pub rect: Rect,
+    pub source: Store,
+    pub map: Option<Map>,
+}
+
+impl SurfaceMove {
+    /// The screen showing `rect` of `surface`, the primary, unscaled.
+    pub(crate) fn shown(surface: &Surface, rect: Rect) -> Self {
+        Self {
+            kind: MoveKind::Present,
+            destination: None,
+            rect,
+            source: self::surface(surface),
+            map: Some(Map::offset(0, 0)),
+        }
+    }
+
+    /// Note the move, naming the screen by `window`; without one it is dropped.
+    pub(crate) fn note(self, env: &Env<'_>, window: Option<u32>) {
+        let Some(destination) = self.destination.or(window.map(Store::Window)) else {
+            return;
+        };
+        text_records::moved(
+            env,
+            self.kind,
+            destination,
+            corners(self.rect),
+            self.source,
+            self.map,
+        );
+    }
+}
+
+/// The moves of the DirectDraw call in progress, kept only while records are on.
+#[derive(Default)]
+pub(crate) struct SurfaceMoves(Option<Vec<SurfaceMove>>);
+
+impl SurfaceMoves {
+    /// Begin a call, keeping its moves only when records are on.
+    pub(crate) fn begin(&mut self, on: bool) {
+        self.0 = on.then(Vec::new);
+    }
+
+    pub(crate) fn on(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub(crate) fn push(&mut self, moved: SurfaceMove) {
+        if let Some(moves) = &mut self.0 {
+            moves.push(moved);
+        }
+    }
+
+    /// End the call: note its moves, naming the screen by `window`.
+    pub(crate) fn end(&mut self, env: &Env<'_>, window: Option<u32>) {
+        for moved in self.0.take().into_iter().flatten() {
+            moved.note(env, window);
+        }
+    }
 }

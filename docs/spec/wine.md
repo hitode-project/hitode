@@ -398,6 +398,7 @@ The pinned Wine source carries both through `tools/wine/patches`.
 - Each GetGlyphOutline or DirectWrite glyph bitmap that writes glyph bytes: its character or glyph index, font and written guest range.
 - Each completed copy_rect, blend_rects or convert_to whose source holds text: both DIBs, the destination rectangle and the source map. Its destination then holds text too.
 - Each Direct3D upload, draw, device copy or present whose source holds text: both stores, the destination rectangle and any affine source map. Its destination then holds text too.
+- Each DirectDraw blit, Direct3D 7 draw and primary present whose source holds text. DirectDraw surfaces are guest memory, so they are named as memory, and the screen as the window that shows the primary.
 
 A DIB is identified by its bits, stride, depth and rectangle origin, so every record locates its pixels in guest memory; a source holds text when its bytes overlap bytes that do. Each record's font is a session key, and `glyph_characters` maps a glyph index in that font back to its characters. Measurement keeps no record, and neither does a copy between DIBs that never held text. Text extraction reads these where characters lose their identity; the session takes them through `take_text_records` and maps window surfaces through `window_planes`.
 

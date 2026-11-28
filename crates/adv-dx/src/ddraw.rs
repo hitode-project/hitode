@@ -3,6 +3,7 @@
 //! arena, so a guest can read or patch them; every vtable slot points at a registry thunk.
 //! Pixels belong to the shared surface store; assembly lends a memory DC over them.
 use crate::argument::{Arguments, CallError};
+use adv_machine::text_records::MoveKind;
 use std::collections::BTreeMap;
 
 use adv_abi::com::{Com as CommonCom, ComIdentity, QueryError};
@@ -222,6 +223,8 @@ enum Loss {
 pub struct DirectDraw {
     pub(super) context: u32,
     submitted: Option<u32>,
+    /// Text records' surface moves for the call in progress (WINE-UNIX-8).
+    pub(crate) text: crate::text::SurfaceMoves,
     com: Option<CommonCom>,
     pending_guest: Vec<ComIdentity<ComState>>,
     #[cfg(feature = "gpu")]
@@ -289,6 +292,7 @@ impl DirectDraw {
         Self {
             context: 0,
             submitted: None,
+            text: Default::default(),
             com: None,
             pending_guest: Vec::new(),
             #[cfg(feature = "gpu")]
@@ -335,6 +339,7 @@ impl DirectDraw {
         m: &mut dyn SurfaceMemory,
         damage: Rect,
     ) -> Result<(), CallError> {
+        self.note_present(surfaces, sid, damage);
         #[cfg(feature = "gpu")]
         if let Some(d3d) = &mut self.d3d
             && surfaces.native_target(sid).is_some()
@@ -393,6 +398,7 @@ impl DirectDraw {
                     return Ok(0);
                 };
                 self.exchange(surfaces, chain);
+                self.note_present(surfaces, chain[0], surfaces[chain[0]].rect());
                 let d3d = self.d3d.as_mut().unwrap();
                 present_native(surfaces, &mut d3d.gpu, chain[0], m, damage)?;
                 let serial = surfaces.stats.presentations;
@@ -405,6 +411,15 @@ impl DirectDraw {
         self.exchange(surfaces, chain);
         self.present(surfaces, chain[0], m, surfaces[chain[0]].rect())?;
         Ok(0)
+    }
+
+    /// Note for text records that the screen shows `damage` of surface `sid`.
+    fn note_present<P: Presenter>(&mut self, surfaces: &Surfaces<P>, sid: u32, damage: Rect) {
+        let rect = damage.clipped(surfaces[sid].rect());
+        if self.text.on() && !rect.empty() {
+            self.text
+                .push(crate::text::SurfaceMove::shown(&surfaces[sid], rect));
+        }
     }
 
     fn exchange<P: Presenter>(&mut self, surfaces: &mut Surfaces<P>, chain: &[u32]) {
@@ -561,13 +576,29 @@ impl DirectDraw {
     }
 
     fn execute_blt<P: Presenter>(
+        &mut self,
         surfaces: &mut Surfaces<P>,
         destination: BltSurface,
         operation: Blt,
         m: &mut dyn SurfaceMemory,
     ) -> Result<Result<Rect, u32>, CallError> {
         match surfaces.blt(destination, operation, m) {
-            Ok(damage) => Ok(Ok(damage)),
+            Ok(damage) => {
+                if let Blt::Copy { source, mirror, .. } = operation
+                    && self.text.on()
+                {
+                    self.text.push(crate::text::SurfaceMove {
+                        kind: MoveKind::Copy,
+                        destination: Some(crate::text::surface(&surfaces[destination.id])),
+                        rect: destination.rect,
+                        source: crate::text::surface(&surfaces[source.id]),
+                        map: (mirror == [false; 2])
+                            .then(|| crate::text::rect_map(destination.rect, source.rect))
+                            .flatten(),
+                    });
+                }
+                Ok(Ok(damage))
+            }
             Err(BltFailure::Storage(error)) => Err(error.into()),
             Err(BltFailure::Rule(error)) => Ok(Err(match error {
                 BltError::InvalidRect => INVALID_RECT,
@@ -2462,7 +2493,7 @@ impl DirectDraw {
                 if d.locked.is_some() || surfaces[src].locked.is_some() {
                     return Ok(BUSY);
                 }
-                let damage = match Self::execute_blt(
+                let damage = match self.execute_blt(
                     surfaces,
                     self.blt_surface(dst, dr),
                     Blt::Copy {
@@ -2517,7 +2548,7 @@ impl DirectDraw {
                     for dr in dr {
                         let dr = dr.clipped(bounds);
                         if !dr.empty() {
-                            match Self::execute_blt(
+                            match self.execute_blt(
                                 surfaces,
                                 self.blt_surface(dst, dr),
                                 Blt::Fill(color),
@@ -2617,7 +2648,7 @@ impl DirectDraw {
                     if part.empty() {
                         continue;
                     }
-                    match Self::execute_blt(
+                    match self.execute_blt(
                         surfaces,
                         self.blt_surface(dst, part),
                         Blt::Copy {

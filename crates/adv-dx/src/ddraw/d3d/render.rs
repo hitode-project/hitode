@@ -1146,6 +1146,19 @@ impl Calls<'_> {
                 state_key: contents,
             },
         )?;
+        if self.draw.text.on() {
+            // Each texture the draw samples, with no map a vertex list states.
+            for read in &reads {
+                let texture = &self.store[read.0.0 as u32];
+                self.draw.text.push(crate::text::SurfaceMove {
+                    kind: adv_machine::text_records::MoveKind::Draw,
+                    destination: Some(crate::text::surface(&self.store[sid])),
+                    rect: bounds,
+                    source: crate::text::surface(texture),
+                    map: None,
+                });
+            }
+        }
         if legacy_device && execute.is_none() {
             let dev = ddraw::d3d::device_mut(self.draw, self.objects, this).unwrap();
             dev.legacy.stats[stats.0] += stats.1 as u32;

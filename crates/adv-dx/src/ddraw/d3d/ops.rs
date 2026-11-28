@@ -549,17 +549,21 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
     ) {
         return super::report::enumerate(env, face, method, args);
     }
-    let result = {
+    let recording = crate::text::on(env);
+    let (result, mut moves) = {
         let (state, store) = env.ext.get2_installed_mut::<front::State, SurfaceStore>();
         let mut memory = (state.provider.memory)(env.cpu);
-        Calls {
+        state.draw.text.begin(recording);
+        let result = Calls {
             draw: &mut state.draw,
             objects: &mut env.sys.objects,
             store,
             memory: &mut memory,
         }
-        .call(face, method, args)
+        .call(face, method, args);
+        (result, std::mem::take(&mut state.draw.text))
     };
+    moves.end(env, front::State::screen_window(env.ext));
     match result {
         Ok(hr) => Outcome::Return(hr),
         Err(error) => error.outcome(env),

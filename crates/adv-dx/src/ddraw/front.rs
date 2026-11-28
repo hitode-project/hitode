@@ -81,18 +81,27 @@ impl State {
         self.draw.configure_clipper(clipper, origin);
     }
 
+    /// The window that shows `surface`: its clipper's, else the bound one.
+    fn window(&self, surface: u32) -> Option<u32> {
+        self.draw
+            .surface_clippers
+            .get(&surface)
+            .and_then(|clipper| self.draw.clipper_windows.get(clipper))
+            .copied()
+            .filter(|&hwnd| hwnd != 0)
+            .or(self.binding.map(|(_, hwnd)| hwnd))
+    }
+
+    /// The window that shows the primary surface.
+    pub(super) fn screen_window(ext: &Ext) -> Option<u32> {
+        let primary = ext.get::<SurfaceStore>().primary_id()?;
+        ext.get::<State>().window(primary)
+    }
+
     fn submitted(ext: &mut Ext, surface: u32) {
         let state = ext.get_mut::<Self>();
         state.presented = state.binding.map(|(device, _)| (device, surface));
-        let hwnd = state
-            .draw
-            .surface_clippers
-            .get(&surface)
-            .and_then(|clipper| state.draw.clipper_windows.get(clipper))
-            .copied()
-            .filter(|&hwnd| hwnd != 0)
-            .or(state.binding.map(|(_, hwnd)| hwnd))
-            .unwrap_or(0);
+        let hwnd = state.window(surface).unwrap_or(0);
         let shared = !state.draw.is_exclusive_surface(surface);
         (state.provider.submitted)(ext, hwnd, surface, shared);
     }
@@ -310,7 +319,8 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
     let geometry = binding.and_then(|(window, clipper)| {
         (provider.window)(env.ext, &env.sys.objects, window).map(|geometry| (geometry, clipper))
     });
-    let (result, presented, changed, submitted, release_front) = {
+    let recording = crate::text::on(env);
+    let (result, presented, changed, submitted, release_front, mut moves) = {
         let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
         let mut memory = (provider.memory)(env.cpu);
         // Refresh for each operation; never retain an origin across movement,
@@ -339,6 +349,7 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
         let was_exclusive = state.draw.exclusive_owner;
         state.draw.context = env.context;
         let before = store.stats.presentations;
+        state.draw.text.begin(recording);
         let result = state
             .draw
             .call(id, words, store, &mut env.sys.objects, &mut memory);
@@ -377,8 +388,10 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
             store.stats.presentations != before,
             state.draw.submitted.take(),
             release_front,
+            std::mem::take(&mut state.draw.text),
         )
     };
+    moves.end(env, State::screen_window(env.ext));
     if let Some(surface) = release_front {
         (provider.released)(env.ext, surface);
     }
@@ -1106,6 +1119,11 @@ fn release_dc(env: &mut Env<'_>, object: u32, dc: u32) -> Outcome {
                         return Outcome::Return(INVALID);
                     }
                     env.ext.get_mut::<State>().draw.surface_dcs.remove(&dc);
+                    let store = env.ext.get::<SurfaceStore>();
+                    if store.primary_id() == Some(sid) && crate::text::on(env) {
+                        crate::text::SurfaceMove::shown(&store[sid], store[sid].rect())
+                            .note(env, State::screen_window(env.ext));
+                    }
                     let store = env.ext.get_mut::<SurfaceStore>();
                     if store.primary_id() == Some(sid) {
                         let memory = (provider.memory)(env.cpu);
