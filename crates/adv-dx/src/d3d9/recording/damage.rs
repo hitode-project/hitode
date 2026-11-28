@@ -96,10 +96,11 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
             let shader = shaders::bound(env, device.hot.borrow().shaders.vertex?)?;
             let translation = shader.translation.as_ref().ok()?;
             let program = shader.parsed.program()?;
+            let mut scratch = crate::shader::sm::Scratch::default();
             for n in 0..p.vertex_count {
                 let input = vertex_input(p, n)?;
                 let output = program
-                    .run(&input, &p.vertex_constants, &mut NoTextures)
+                    .run_in(&input, &p.vertex_constants, &mut NoTextures, &mut scratch)
                     .ok()?;
                 if point.is_some() && translation.writes_point_size {
                     margin = margin.max(1. + point_size(output.point_size)? * 0.5);
