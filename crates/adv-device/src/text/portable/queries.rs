@@ -13,19 +13,23 @@ impl Font {
         }
     }
     pub(in crate::text) fn signature(&self) -> Result<FontSignature, TextError> {
-        let os2 = self.primary.font()?.os2().map_err(font_error)?;
-        Ok(FontSignature {
-            unicode: [
-                os2.ul_unicode_range_1(),
-                os2.ul_unicode_range_2(),
-                os2.ul_unicode_range_3(),
-                os2.ul_unicode_range_4(),
-            ],
-            codepages: [
-                os2.ul_code_page_range_1().unwrap_or(0),
-                os2.ul_code_page_range_2().unwrap_or(0),
-            ],
-        })
+        let font = self.primary.font()?;
+        Ok(font
+            .os2()
+            .ok()
+            .map(|os2| FontSignature {
+                unicode: [
+                    os2.ul_unicode_range_1(),
+                    os2.ul_unicode_range_2(),
+                    os2.ul_unicode_range_3(),
+                    os2.ul_unicode_range_4(),
+                ],
+                codepages: [
+                    os2.ul_code_page_range_1().unwrap_or(0),
+                    os2.ul_code_page_range_2().unwrap_or(0),
+                ],
+            })
+            .unwrap_or_default())
     }
     pub(in crate::text) fn glyph_indices(
         &self,
