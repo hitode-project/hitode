@@ -72,8 +72,9 @@ impl State {
         })() else {
             return Ok(());
         };
+        let memory = (env.ext.get::<Self>().provider.memory)(env.cpu);
         let (state, store) = env.ext.get2_installed_mut::<Self, SurfaceStore>();
-        state.draw.sync_activation(store, active)
+        state.draw.sync_activation(store, &memory, active)
     }
 
     pub fn configure_clipper(&mut self, clipper: u32, origin: (i32, i32)) {

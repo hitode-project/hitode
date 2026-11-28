@@ -141,7 +141,8 @@ Execute buffers MUST provide a stable guest address, reject execution while lock
 
 ### GFX-D3D7-5 Shared surface access
 
-**Rule**: Device7 MUST admit immutable draw inputs and access shared surface residency for every texture read and render-target write. DirectDraw locks MUST see recorded GPU writes.
+**Rule**: Device7 MUST admit immutable draw inputs and access shared surface residency for every texture read and render-target write. DirectDraw locks MUST see recorded GPU writes. A recorded write MUST make the CPU copy stale only in the cells it executes.
+Flip MUST exchange each chain member's memory together with its GPU copy, so a flipped-in target presents what was drawn into it.
 Packed targets MUST use native blendable attachments where available. The BGRA fallback MUST convert to the packed precision at surface access. HAL MUST preserve the `DITHERENABLE` value without changing the packed blend result.
 **Verification**: Test
 
@@ -156,6 +157,15 @@ Packed targets MUST use native blendable attachments where available. The BGRA f
 **Rule**: HAL and T&L HAL creation MUST reject render targets with any dimension over 2048. The texture extent MUST be capped by the device class limit of 1024 for RGB and 16384 for HAL and T&L HAL.
 **Verification**: Test
 **Basis**: Windows DirectDraw desktop and Direct3D7 semantics probes
+
+### GFX-D3D7-8 Presentation damage
+
+**Rule**: Device7 MUST keep recorded commands queued across EndScene and DirectDraw queries, then plan them at presentation (GFX-REC-5). Flip MUST publish only the cells changed since the previous presentation. Frames with unknown damage MUST execute whole and publish the whole surface.
+**Verification**: Test
+
+A Flip of a chain with a recorded target presents. So does a Blt or BltFast of a recorded target to a nonflipping primary. Other DirectDraw calls execute the recording as a surface access.
+Draw identities change with every CPU write to sampled textures and their mip levels. A frame repeating the previous one skips execution once every chain image holds it. A Flip then also skips the exchange and publication.
+Damage is unknown when a Flip frame does not begin by overwriting its whole target, or writes another chain member. It is also unknown after a CPU write to a surface with damage history or to a chain member.
 
 ## Native programmable execution
 

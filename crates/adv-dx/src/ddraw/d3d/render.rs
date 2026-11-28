@@ -7,7 +7,7 @@ use crate::{
         d3d::{
             Face,
             desc::vertex,
-            recording::{self, Boundary, Effects, Payload},
+            recording::{self, Effects, Payload},
         },
     },
     fixed::{self, Render, Rules, Sampler, Setting, Stage, VertexProgram, program::Legacy},
@@ -186,9 +186,8 @@ impl Calls<'_> {
                 if !state.scene {
                     return Ok(SCENE_NOT_IN);
                 }
-                let d3d = self.draw.d3d.as_mut().unwrap();
-                recording::flush(&mut d3d.queue, &mut d3d.gpu, Boundary::EndScene)
-                    .map_err(gpu_error)?;
+                // Recorded writes stay queued until a surface access or
+                // presentation plans them.
                 ddraw::d3d::device_mut(self.draw, self.objects, args[0])
                     .unwrap()
                     .state
@@ -232,15 +231,19 @@ impl Calls<'_> {
                 let Some(next) = self.draw.surface_id(self.objects, args[1]) else {
                     return Ok(INVALID_OBJECT);
                 };
-                let surface = &self.store[next];
+                let (width, height) = (self.store[next].width, self.store[next].height);
                 if args[2] != 0
                     || self.draw.caps(next)[0] & creation::THREE_D_DEVICE == 0
-                    || surface.width > 2048
-                    || surface.height > 2048
+                    || width > 2048
+                    || height > 2048
                 {
                     return Ok(INVALID);
                 }
-                self.draw.d3d.as_mut().unwrap().flush()?;
+                self.draw
+                    .d3d
+                    .as_mut()
+                    .unwrap()
+                    .flush(self.store, self.memory)?;
                 ddraw::d3d::add_ref(self.draw, self.objects, args[1]);
                 let device = ddraw::d3d::device_mut(self.draw, self.objects, args[0]).unwrap();
                 device.target = args[1];
@@ -249,7 +252,7 @@ impl Calls<'_> {
                     .as_mut()
                     .unwrap()
                     .fixed
-                    .target_changed(surface.width, surface.height);
+                    .target_changed(width, height);
                 self.draw.release_com(self.objects, self.store, target);
             }
             "SetTexture" => {
@@ -373,12 +376,17 @@ impl Calls<'_> {
         let stencil = (flags & 4 != 0).then_some(args[6]);
         let extent = self.store[sid].rect();
         for rect in rects.into_iter().filter(|rect| !rect.empty()) {
-            let target = self.target(sid, rect, color.is_some(), z.as_ref())?;
+            let target = self.target(sid, rect, z.as_ref())?;
             let d3d = self.draw.d3d.as_mut().unwrap();
+            d3d.written.insert(sid);
+            d3d.written.extend(z.as_ref().map(|&(id, _)| id));
             recording::admit(
                 &mut d3d.queue,
                 &mut d3d.gpu,
+                self.store,
+                self.memory,
                 Payload::Clear {
+                    surface: sid,
                     target,
                     rect,
                     color,
@@ -394,8 +402,7 @@ impl Calls<'_> {
                     bytes: 0,
                     state_key: 0,
                 },
-            )
-            .map_err(gpu_error)?;
+            )?;
         }
         Ok(0)
     }
@@ -432,20 +439,16 @@ impl Calls<'_> {
         Ok(Some((id, depth)))
     }
 
+    /// The target with CPU writes in `area` uploaded. Execution marks the
+    /// cells it writes.
     fn target(
         &mut self,
         id: u32,
         area: Rect,
-        write: bool,
         depth: Option<&(u32, gpu::Depth)>,
     ) -> Result<Target, CallError> {
         self.store
-            .render_access(
-                id,
-                area,
-                if write { Access::Write } else { Access::Read },
-                self.memory,
-            )?
+            .render_access(id, area, Access::Read, self.memory)?
             .with_depth(depth.map(|(_, depth)| depth.clone()))
             .map_err(gpu_error)
     }
@@ -840,6 +843,9 @@ impl Calls<'_> {
         let mut parameters = [[0; 4]; 40];
         parameters[14][1] = pattern;
         let mut texture_words = [[0; 4]; 16];
+        // CPU writes change a texture's surface version and storage stamp,
+        // not a recorded version.
+        let mut texture_versions = [0u128; 8];
         for (n, &texture) in textures[..active].iter().enumerate() {
             let mut sampler = fixed
                 .program_sampler(n)
@@ -898,10 +904,31 @@ impl Calls<'_> {
                         ) << 3),
                     registers[&Sampler::MipLodBias],
                 ];
+                let mut levels = smallvec::SmallVec::<[u32; 12]>::from_elem(texture, 1);
                 if sampler.mip.is_some() && self.draw.caps(texture)[0] & creation::MIPMAP != 0 {
+                    while let Some(&level) = self
+                        .draw
+                        .complex
+                        .get(levels.last().unwrap())
+                        .and_then(|chain| chain.first())
+                    {
+                        levels.push(level);
+                    }
                     // Resolve prior writes before assembling the mip-level views.
-                    self.draw.d3d.as_mut().unwrap().flush()?;
+                    let d3d = self.draw.d3d.as_mut().unwrap();
+                    if levels
+                        .iter()
+                        .any(|&level| d3d.queue.observes(recording::key(level, 0), true))
+                    {
+                        d3d.flush(self.store, self.memory)?;
+                    }
                 }
+                texture_versions[n] = hash(
+                    levels
+                        .iter()
+                        .map(|&level| (self.store[level].version, self.store.cpu_stamp(level)))
+                        .collect::<smallvec::SmallVec<[_; 12]>>(),
+                );
                 Some(self.render_texture(texture, sampler.mip.is_some())?)
             } else {
                 None
@@ -1027,6 +1054,7 @@ impl Calls<'_> {
             fixed.key(),
             parameters,
             texture_words,
+            texture_versions,
             stipple,
         ));
         let draw_bytes = bytes.len() + stipple.len();
@@ -1068,15 +1096,21 @@ impl Calls<'_> {
             textures: bindings,
             parameters,
         });
-        let mut target = self.target(sid, bounds, true, z.as_ref())?;
+        let mut target = self.target(sid, bounds, z.as_ref())?;
         if masks[0] != 0 && masks[3] == 0 {
             target = target.with_alpha_mode(gpu::AlphaMode::Opaque);
         }
         let d3d = self.draw.d3d.as_mut().unwrap();
+        d3d.written.insert(sid);
+        d3d.written.extend(z.as_ref().map(|&(id, _)| id));
         recording::admit(
             &mut d3d.queue,
             &mut d3d.gpu,
+            self.store,
+            self.memory,
             Payload::Draw {
+                surface: sid,
+                area: bounds,
                 target,
                 draw,
                 state: lowered.state,
@@ -1091,8 +1125,7 @@ impl Calls<'_> {
                 bytes: draw_bytes,
                 state_key: contents,
             },
-        )
-        .map_err(gpu_error)?;
+        )?;
         if legacy_device && execute.is_none() {
             let dev = ddraw::d3d::device_mut(self.draw, self.objects, this).unwrap();
             dev.legacy.stats[stats.0] += stats.1 as u32;

@@ -60,12 +60,20 @@ impl Calls<'_> {
                 let Some(id) = self.draw.surface_id(self.objects, this) else {
                     return Ok(INVALID);
                 };
-                self.draw.d3d.as_mut().unwrap().flush()?;
+                self.draw
+                    .d3d
+                    .as_mut()
+                    .unwrap()
+                    .flush(self.store, self.memory)?;
                 self.store.evict_surface_image(id, self.memory)?;
                 0
             }
             "EvictManagedTextures" => {
-                self.draw.d3d.as_mut().unwrap().flush()?;
+                self.draw
+                    .d3d
+                    .as_mut()
+                    .unwrap()
+                    .flush(self.store, self.memory)?;
                 for (&id, desc) in &self.draw.described {
                     if desc.caps[1] & creation::MANAGED != 0 {
                         self.store.evict_surface_image(id, self.memory)?;
@@ -714,7 +722,11 @@ impl Calls<'_> {
                 h: (bottom - y) as u32,
             }
         };
-        self.draw.d3d.as_mut().unwrap().flush()?;
+        self.draw
+            .d3d
+            .as_mut()
+            .unwrap()
+            .flush(self.store, self.memory)?;
         for (level, (src, dst)) in src_members.zip(dst_members).enumerate() {
             let source = Rect {
                 x: source.x >> level,

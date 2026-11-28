@@ -493,6 +493,14 @@ impl<P> Recording<P> {
         self.last.is_none()
     }
 
+    pub fn holds(&self, key: ResourceKey, slot: u128) -> bool {
+        self.damage.holds(&key, slot)
+    }
+
+    pub fn overwritten(&self, key: ResourceKey) -> bool {
+        self.damage.overwritten(&key)
+    }
+
     pub fn rotatable(&self, slot: u128) -> bool {
         !self.force_present() && !self.partial && self.damage.rotatable(slot)
     }

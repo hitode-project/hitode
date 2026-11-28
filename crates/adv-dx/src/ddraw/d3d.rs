@@ -24,7 +24,7 @@ mod legacy {
     };
     use adv_device::surface::{Presenter, SurfaceMemory, Surfaces};
     use adv_machine::Objects;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     pub(in crate::ddraw) const INVALID: u32 = 0x80070057;
     pub(in crate::ddraw) const NO_INTERFACE: u32 = 0x80004002;
@@ -126,21 +126,112 @@ mod legacy {
         pub(super) programs: std::collections::HashMap<u128, adv_device::gpu::Program>,
         pub(super) queue: super::recording::Queue,
         pub(super) depths: BTreeMap<u32, adv_device::gpu::Depth>,
+        /// Surfaces recorded commands wrote since the last presentation.
+        pub(super) written: BTreeSet<u32>,
+        /// Surface versions and storage stamps at the last presentation, for
+        /// every surface whose damage history the recording keeps or that a
+        /// presented chain holds. CPU writes and exchanges change them.
+        pub(super) versions: BTreeMap<u32, (u64, (u64, u64))>,
+        pub counters: crate::record::Counters,
     }
 
     impl State {
         pub fn forget_surface(&mut self, id: u32) {
             self.depths.remove(&id);
+            self.written.remove(&id);
+            self.versions.remove(&id);
             self.queue.forget((u64::from(id), 0));
         }
 
-        pub fn flush(&mut self) -> Result<(), CallError> {
+        pub fn flush<P: Presenter>(
+            &mut self,
+            store: &mut Surfaces<P>,
+            memory: &dyn SurfaceMemory,
+        ) -> Result<(), CallError> {
             super::recording::flush(
                 &mut self.queue,
                 &mut self.gpu,
+                store,
+                memory,
                 super::recording::Boundary::SurfaceAccess,
             )
-            .map_err(|error| error.to_string().into())
+        }
+
+        /// Whether a recorded command still to run writes `surface`.
+        pub fn pending(&self, surface: u32) -> bool {
+            self.written.contains(&surface)
+                && self.queue.observes(super::recording::key(surface, 0), true)
+        }
+
+        /// Run the recording for presenting `target` (GFX-D3D7-8). `holders`
+        /// must hold its version for an unchanged frame to skip execution.
+        /// Under `rotation` the frame must overwrite all of `target` and
+        /// leave the other `holders` unwritten. Returns the cells changed
+        /// since the previous presentation, or `None` when nothing ran.
+        pub fn present<P: Presenter>(
+            &mut self,
+            store: &mut Surfaces<P>,
+            memory: &dyn SurfaceMemory,
+            (target, identity, serial): (u32, u128, u64),
+            holders: &[u32],
+            rotation: bool,
+        ) -> Result<Option<adv_device::surface::Region>, CallError> {
+            use crate::record::key::hash;
+            let content = super::recording::key(target, 0);
+            let external = self.versions.iter().any(|(&id, &version)| {
+                store.get(id).map(|s| s.version).zip(store.cpu_stamp(id)) != Some(version)
+            });
+            let unsupported = rotation
+                && (!self.queue.overwritten(content)
+                    || holders
+                        .iter()
+                        .any(|id| *id != target && self.written.contains(id)));
+            if external || unsupported {
+                self.queue.invalidate_damage();
+                self.versions.clear();
+            } else if self.queue.repeated(identity, Some(serial))
+                && holders.iter().all(|&id| {
+                    store
+                        .native_target(id)
+                        .is_some_and(|t| self.queue.holds(content, hash(t.image.id())))
+                })
+            {
+                self.queue.end(None);
+                self.counters.eliminated_frames += 1;
+                return Ok(None);
+            }
+            let image = store
+                .native_target(target)
+                .ok_or("presented Direct3D target has no image")?
+                .image;
+            let region = super::recording::present(
+                &mut self.queue,
+                &mut self.gpu,
+                store,
+                memory,
+                &mut self.counters,
+                (hash(image.id()), (image.width(), image.height())),
+            )?;
+            Ok(Some(region))
+        }
+
+        /// End the frame `present` began; `tracked` surfaces join the written
+        /// ones whose versions the next presentation checks.
+        pub fn presented<P: Presenter>(
+            &mut self,
+            store: &Surfaces<P>,
+            (identity, serial): (u128, u64),
+            tracked: &[u32],
+        ) {
+            self.queue.finish_metrics(&mut self.counters);
+            self.queue.finish(identity, Some(serial));
+            for &id in self.written.iter().chain(tracked) {
+                let version = store.get(id).map(|s| s.version);
+                if let Some(version) = version.zip(store.cpu_stamp(id)) {
+                    self.versions.insert(id, version);
+                }
+            }
+            self.written.clear();
         }
     }
 

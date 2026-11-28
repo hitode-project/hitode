@@ -844,6 +844,20 @@ impl Analysis {
         }
         needed
     }
+    /// Whether `slot` holds `content`'s current version everywhere.
+    pub fn holds(&self, content: &Content, slot: u128) -> bool {
+        self.histories
+            .get(content)
+            .and_then(|h| h.stale.get(&slot))
+            .is_some_and(Region::is_empty)
+    }
+    /// Whether this frame's first write of `content` overwrote all of it.
+    pub fn overwritten(&self, content: &Content) -> bool {
+        self.histories
+            .get(content)
+            .and_then(|h| h.next.first())
+            .is_some_and(|s| s.independent)
+    }
     pub fn rotatable(&self, slot: u128) -> bool {
         self.histories.iter().any(|(k, h)| {
             k.2 == 0

@@ -495,6 +495,9 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) -> Result<(), String> {
         queue: Default::default(),
         depths: Default::default(),
         programs: Default::default(),
+        written: Default::default(),
+        versions: Default::default(),
+        counters: Default::default(),
     };
     for face in Face::ALL {
         let slots = signature::com_signatures()
@@ -617,7 +620,11 @@ impl Calls<'_> {
             }
             "AddRef" => super::add_ref(self.draw, self.objects, this),
             "Release" => {
-                self.draw.d3d.as_mut().unwrap().flush()?;
+                self.draw
+                    .d3d
+                    .as_mut()
+                    .unwrap()
+                    .flush(self.store, self.memory)?;
                 super::release(self.draw, self.store, self.objects, this)
             }
             "CreateDevice" => return self.create_device(face, args),

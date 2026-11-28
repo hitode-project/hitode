@@ -19,6 +19,13 @@ pub struct Residency<I> {
     pub(super) gpu: Option<I>,
     cpu_stale: Region,
     gpu_stale: Region,
+    stamp: (u64, u64),
+}
+
+/// A storage identity, unique per process, and its CPU write count.
+fn stamp() -> (u64, u64) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    (NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), 0)
 }
 
 impl<I> Residency<I> {
@@ -28,7 +35,13 @@ impl<I> Residency<I> {
             gpu: None,
             cpu_stale: Region::default(),
             gpu_stale: Region::default(),
+            stamp: stamp(),
         }
+    }
+
+    /// Changes with every CPU write and with replaced storage.
+    pub fn cpu_stamp(&self) -> (u64, u64) {
+        self.stamp
     }
 
     pub fn has_cpu(&self) -> bool {
@@ -41,6 +54,7 @@ impl<I> Residency<I> {
             gpu: Some(gpu),
             cpu_stale: Region::default(),
             gpu_stale: Region::default(),
+            stamp: stamp(),
         }
     }
 
@@ -90,6 +104,9 @@ impl<I> Residency<I> {
         mode: Access,
         transfer: impl FnOnce(&I, &[Rect]) -> Result<(), E>,
     ) -> Result<(), E> {
+        if matches!((side, mode), (Side::Cpu, Access::Write)) {
+            self.stamp.1 += 1;
+        }
         let Some(gpu) = self.gpu.as_ref().filter(|_| self.cpu) else {
             return Ok(());
         };
@@ -191,6 +208,26 @@ impl std::ops::DerefMut for Entry {
 use super::{Presenter, SurfaceMemory, Surfaces};
 
 impl<P: Presenter> Surfaces<P> {
+    /// Move each `chain` surface's storage to the one before it and the
+    /// first's to the last. Memory and any GPU copy travel together, so a
+    /// flipped-in surface presents what was drawn into it.
+    pub fn rotate(&mut self, chain: &[u32]) {
+        for pair in chain.windows(2) {
+            let mut first = self.surfaces.remove(&pair[0]).unwrap();
+            let second = self.surfaces.get_mut(&pair[1]).unwrap();
+            std::mem::swap(&mut first.layout.pixels, &mut second.layout.pixels);
+            std::mem::swap(&mut first.residency, &mut second.residency);
+            #[cfg(feature = "gpu")]
+            std::mem::swap(&mut first.packed_color, &mut second.packed_color);
+            self.surfaces.insert(pair[0], first);
+        }
+    }
+
+    /// See [`Residency::cpu_stamp`]. It travels with the storage.
+    pub fn cpu_stamp(&self, id: u32) -> Option<(u64, u64)> {
+        Some(self.surfaces.get(&id)?.residency.cpu_stamp())
+    }
+
     #[cfg(feature = "gpu")]
     pub(super) fn is_native(&self, id: u32) -> bool {
         self.surfaces
