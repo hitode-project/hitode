@@ -15,8 +15,14 @@ mod installed;
 mod registry;
 pub use adv_cpu::backend::GuestExt;
 pub use adv_machine::exception::Checkpoint;
-pub use adv_nt::exception::{Record, StubGaps, WINE_STUB};
+pub use adv_nt::exception::{
+    DispatchFailure, ExceptionCounts, LastUnsupported, Record, StubGaps, WINE_STUB,
+};
 pub use adv_nt::identity::Images;
+pub use debug::{
+    RawDiagnostics, RawThreadSnapshot, current_stack_addresses, decode_fault_insn,
+    guest_stack_addresses,
+};
 pub use host::Host;
 pub use installed::Installed;
 pub use registry::{RegistryReport, RegistryWatch};
@@ -150,7 +156,9 @@ pub struct ControlMetrics {
 pub struct Session {
     pub machine: Machine<Cpu>,
     pub failed_process: Option<u32>,
+    pub processes_spawned: u32,
     pub stub_gaps: Rc<RefCell<adv_nt::exception::StubGaps>>,
+    pub wine_logs: Rc<RefCell<adv_nt::unix::WineLogCounts>>,
     links: Rc<RefCell<adv_nt::unix::Links>>,
     pub milestones: std::sync::Arc<adv_device::Milestones>,
     // Retires clients after the active machine releases its connection.
@@ -624,7 +632,7 @@ fn run(
         let deadline = match result {
             RunResult::HostRequest => continue,
             RunResult::Exited(code) => return Stop::Exited(code),
-            RunResult::Failed(error) => return Stop::Failed(format!("{error:?}")),
+            RunResult::Failed(error) => return Stop::Failed(error.message),
             RunResult::Idle { next_deadline } => {
                 if presented(machine) {
                     return Stop::Paused;
@@ -820,6 +828,8 @@ impl Session {
         machine.ext.insert(prepared.mounts);
         let stub_gaps = Rc::new(RefCell::new(adv_nt::exception::StubGaps::default()));
         machine.ext.insert(stub_gaps.clone());
+        let wine_logs = Rc::new(RefCell::new(adv_nt::unix::WineLogCounts::default()));
+        machine.ext.insert(wine_logs.clone());
         let links = Rc::new(RefCell::new(adv_nt::unix::Links::default()));
         machine.ext.insert(links.clone());
         let milestones = std::sync::Arc::new(adv_device::Milestones::default());
@@ -879,7 +889,9 @@ impl Session {
         Ok(Session {
             machine,
             failed_process: None,
+            processes_spawned: 1,
             stub_gaps,
+            wine_logs,
             links,
             milestones,
             _lease: lease,
@@ -1084,7 +1096,7 @@ impl Session {
                     }
                 }
                 SliceResult::Complete(RunResult::Failed(error)) => {
-                    return Stop::Failed(format!("{error:?}"));
+                    return Stop::Failed(error.message);
                 }
                 SliceResult::Complete(RunResult::Idle { .. }) if served => {
                     self.idle.remove(&id);
@@ -1284,6 +1296,7 @@ impl Session {
             return Ok(());
         }
         for child in std::mem::take(pending) {
+            self.processes_spawned = self.processes_spawned.saturating_add(1);
             // spec: PROC-CLOCK-2
             // This family stays in real time even after its children exit.
             self.machine.set_time_skip_source(None);
@@ -1389,6 +1402,7 @@ impl Session {
                 .insert(self.machine.ext.get::<process::Children>().fork());
             machine.ext.insert(shared.clone());
             machine.ext.insert(self.stub_gaps.clone());
+            machine.ext.insert(self.wine_logs.clone());
             machine.ext.insert(self.links.clone());
             self.shared
                 .driver

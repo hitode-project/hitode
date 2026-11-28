@@ -2,7 +2,7 @@
 
 ID prefix: REPORT
 
-This spec covers the compatibility report, schema `hitode.report/2`, that the launcher saves or opens in an issue. `adv-report` defines the format, and the launcher assembles it in `apps/adv-launcher/src/lib/report.ts` and `src-tauri/src/report.rs`. Diagnostic detail stays in the local `--report` output, which this spec does not cover.
+This spec covers the compatibility report, schema `hitode.report/3`, that the launcher saves or opens in an issue. `adv-report` defines the format, and the launcher assembles it in `apps/adv-launcher/src/lib/report.ts` and `src-tauri/src/report.rs`. Diagnostic detail stays in the local `--report` output, which this spec does not cover.
 
 > Warning: a report leaves the user's machine. Every rule here keeps private data out of it.
 
@@ -10,7 +10,7 @@ This spec covers the compatibility report, schema `hitode.report/2`, that the la
 
 ### REPORT-FMT-1 Strict schema
 
-**Rule**: A report MUST carry the schema `hitode.report/2`. Deserializing a report with unknown fields or another schema MUST fail. The launcher MUST validate a report this way before saving or opening an issue.
+**Rule**: A report MUST carry the schema `hitode.report/3`. Deserializing a report with unknown fields or another schema MUST fail. The launcher MUST validate a report this way before saving or opening an issue.
 **Verification**: Test
 
 ### REPORT-FMT-2 Shared wire format
@@ -27,10 +27,10 @@ This spec covers the compatibility report, schema `hitode.report/2`, that the la
 
 ### REPORT-ID-1 Game identity
 
-**Rule**: Game identity MUST include executable SHA-256, file size, code page, PE timestamp and image size, plus file version when present. The title block MUST appear only when the player keeps its row. Game filenames and all paths MUST NOT appear.
+**Rule**: Game identity MUST include executable SHA-256, file size, code page, PE timestamp, image size, and present static PE traits. The title block MUST appear only when the player keeps its row. Game filenames and all paths MUST NOT appear.
 **Verification**: Test
 
-The title block holds the library match’s VNDB ID and name, plus the player’s edition. VNDB IDs match `v` followed by digits; names contain 1–160 characters without control characters. Only edition is editable in that row.
+Static PE traits hold file version, architecture, subsystem, section count, overlay size, and allowlisted standard system DLL imports. The title block holds the library match’s VNDB ID and name, plus the player’s edition. VNDB IDs match `v` followed by digits; names contain 1–160 characters without control characters. Only edition is editable in that row.
 
 ### REPORT-ID-2 Deduplication key
 
@@ -47,8 +47,10 @@ The title block holds the library match’s VNDB ID and name, plus the player’
 
 ### REPORT-FAIL-1 Failure categories
 
-**Rule**: A failure MUST contain only its kind, API name or CPU fault site, and time bucket. Runtime messages, host paths and guest text MUST NOT enter the report.
+**Rule**: A failure MUST contain only its kind, structured path-free diagnostic tags, and time bucket. Raw runtime messages, host paths, guest code bytes, disassembly and guest text MUST NOT enter the report.
 **Verification**: Test
+
+Kinds are `api`, `nt_unsupported`, `missing_dll`, `cpu`, `host_error`, `host_panic`, and `runtime`. Structured tags include validated `module!name` entries, subsystem/operation/status tokens, bare missing DLL names, and anonymized crash sites. They may also hold a single `iced_x86::Code` enum name, anonymized stack frames or host offsets, and workspace-relative panic metadata.
 
 ### REPORT-FAIL-2 Time buckets
 
@@ -57,8 +59,10 @@ The title block holds the library match’s VNDB ID and name, plus the player’
 
 ### REPORT-FAIL-3 Host errors
 
-**Rule**: A host-side error MUST yield a summary classified by REPORT-FAIL-1 from terminal exception evidence and elapsed time. Errors without exception evidence MUST be runtime failures. Such summaries MUST NOT carry frame timing.
+**Rule**: A host-side error MUST yield a classified failure summary that preserves run metadata collected before the error. Errors without structured evidence MUST become runtime failures. Summaries from pre-session errors MUST NOT carry frame timing.
 **Verification**: Test
+
+Classification follows REPORT-FAIL-1 from terminal exception, missing DLL, panic, or classified host-error evidence and elapsed time.
 
 ### REPORT-GAP-1 API gaps
 
@@ -69,15 +73,24 @@ Both guest `EXCEPTION_WINE_STUB` records and host syscall stubs feed the same se
 
 ### REPORT-PERF-1 Frame time percentiles
 
-**Rule**: Performance data MUST be the 50th, 95th and 99th percentiles of frame time by nearest rank, rounded to 0.1 ms. Individual frame times MUST NOT be reported.
+**Rule**: Performance data MUST report 50th, 95th and 99th frame-time percentiles by nearest rank, rounded to 0.1 ms. Individual frame times MUST NOT be reported.
 **Verification**: Test
+
+Performance data may also include long-frame counts (`>= 50 ms`, `>= 250 ms`), CPU execution-form percentages, up to 8 top cliff counters, and peak heap MB.
+
+### REPORT-DIAG-1 Non-fatal diagnostics and hang snapshots
+
+**Rule**: Reports MAY include bounded path-free `hang` and `diagnostics` blocks without message bodies or guest text. Reports opened during play MUST capture a live snapshot from the running session. If the execution thread misses its timeout, the snapshot MUST record `exec_thread_responsive: false`.
+**Verification**: Test
+
+The `hang` block captures thread states, blocked APIs, up to 6 anonymized stack frames per thread, idle wait share, and top boundary counters. It is collected on live snapshots, force-closes, and stalls. The `diagnostics` block holds path-free capability warnings, rejected probes, `err`/`fixme` Wine channel counts without bodies, and detected export hook forms. It may also hold handled exception counts, active graphics/audio/video fronts, allowlisted standard-font substitutions, window counts, and non-fatal host panics.
 
 ### REPORT-SITE-1 Crash sites
 
-**Rule**: CPU failures MUST name the faulting PC and a cheaply available return address as `module+0xoffset`. Modules MUST be labeled `exe`, their Wine distribution filename, or `game#` followed by eight source-file SHA-256 hex digits. Absolute code addresses MUST appear only outside mapped modules.
+**Rule**: CPU failures MUST name the faulting PC and up to 12 anonymized stack frames as `module+0xoffset` or `module!function+0xoffset`. Modules MUST be labeled `exe`, their Wine filename, or `game#` plus eight source-file SHA-256 hex digits. Absolute addresses MUST appear only outside mapped modules.
 **Verification**: Test
 
-Game modules are hashed only while constructing a failure report. When source bytes cannot be read, their label is `game` without a hash. Access addresses use the same formatter. A saved frame-pointer caller is included when readable inside the guest stack.
+Wine distribution modules are symbolicated from identity tables when available. At most one `iced_x86::Code` enum name may identify the faulting instruction form without bytes or operands. Game modules are hashed only while constructing a failure report. When source bytes cannot be read, their label is `game` without a hash. Access addresses use the same formatter. Stack frames follow the EBP frame chain inside the guest stack and supplement with return addresses following CALL instructions in mapped images.
 
 ### REPORT-TIME-1 Run timeline
 
@@ -117,7 +130,7 @@ Symptoms are `no_start`, `freeze`, `crash`, `stutter`, `graphics`, `sound_video`
 **Rule**: Opening an issue MUST prefill its title and body from the validated report, including the symptoms and any included note. If the encoded URL exceeds 8000 characters, the launcher MUST save the full JSON under REPORT-SAVE-1 and keep the draft within the limit. The button label MUST remain the same for both cases.
 **Verification**: Test
 
-The launcher opens an editable issue draft through GitHub's `title` and `body` URL parameters. Short drafts include the JSON in the body. For longer drafts, the player attaches the saved file. The manual issue form is `game-issue.yml`.
+The launcher opens an editable issue draft through GitHub's `title` and `body` URL parameters. Short drafts include pretty JSON in the body, and larger reports fall back to single-line minified JSON to stay within 8000 encoded characters. When even minified JSON exceeds the limit, the draft embeds a triage summary while the launcher saves the file and copies the JSON block. The manual issue form is `game-issue.yml`.
 
 On Android and iOS, the launcher MUST open the issue URL in a browser rather than handing it to the GitHub app.
 

@@ -509,6 +509,33 @@ pub async fn set_game_filter(window: WebviewWindow, filter: String) -> Result<()
     .map_err(|error| error.to_string())?
 }
 
+/// Captures a live report snapshot from the currently running session, if any.
+#[tauri::command]
+pub async fn live_report_summary(
+    window: WebviewWindow,
+) -> Result<Option<adv_report::RunSummary>, String> {
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    window
+        .run_on_main_thread(move || {
+            let pending = HOST.with_borrow(|host| {
+                host.as_ref()
+                    .and_then(|host| host.session.as_ref())
+                    .map(|session| session.report_snapshot())
+            });
+            let _ = reply.send(pending);
+        })
+        .map_err(|error| error.to_string())?;
+    let pending = tauri::async_runtime::spawn_blocking(move || {
+        result.recv().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    match pending {
+        Some((rx, settings)) => Ok(Some(crate::play::live_summary_wait(rx, settings).await?)),
+        None => Ok(None),
+    }
+}
+
 /// Puts another of the game's disc images in drive `letter` while it runs.
 #[tauri::command]
 pub async fn change_disc(

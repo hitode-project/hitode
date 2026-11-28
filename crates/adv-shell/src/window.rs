@@ -38,6 +38,9 @@ pub enum Event {
         std::path::PathBuf,
         std::sync::mpsc::SyncSender<Result<(), String>>,
     ),
+    /// Captures a read-only live report snapshot while the game is running or paused.
+    #[cfg(host_view)]
+    ReportSnapshot(std::sync::mpsc::SyncSender<adv_report::RunSummary>),
     Repaint,
 }
 impl Event {

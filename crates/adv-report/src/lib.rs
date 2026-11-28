@@ -1,4 +1,4 @@
-//! The anonymous compatibility report (schema `hitode.report/2`) that the
+//! The anonymous compatibility report (schema `hitode.report/3`) that the
 //! launcher saves or opens in an issue, and the run summary the shell derives it from.
 //!
 //! Field names and order match `apps/adv-launcher/src/lib/report.ts`.
@@ -6,9 +6,33 @@
 //! chooses whether to include the matched title, edition and note.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
-pub const SCHEMA: &str = "hitode.report/2";
+pub const SCHEMA: &str = "hitode.report/3";
+/// Maximum anonymized stack frames a failure carries.
+pub const MAX_STACK_FRAMES: usize = 16;
+/// Maximum missing DLL names a failure carries.
+pub const MAX_MISSING_DLLS: usize = 16;
+/// Maximum standard system imports a game identity carries.
+pub const MAX_SYSTEM_IMPORTS: usize = 64;
+/// Maximum thread entries in a hang snapshot.
+pub const MAX_HANG_THREADS: usize = 16;
+/// Maximum boundary entries in a hang snapshot.
+pub const MAX_HANG_BOUNDARIES: usize = 12;
+/// Maximum diagnostic warnings or Wine error entries.
+pub const MAX_DIAG_ENTRIES: usize = 24;
+/// Maximum rejected probes, exception kinds, or font names.
+pub const MAX_PROBE_ENTRIES: usize = 16;
+/// Maximum performance cliff entries.
+pub const MAX_CLIFF_ENTRIES: usize = 8;
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,7 +53,13 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hang: Option<HangSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Diagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perf: Option<Perf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -38,7 +68,8 @@ pub struct Report {
     pub timeline: Option<Timeline>,
 }
 impl Report {
-    /// Checks bounded player text, title identifiers, the schema and API names.
+    /// Checks bounded player text, title identifiers, the schema, failure
+    /// diagnostics, PE import allowlist and API names.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != SCHEMA {
             return Err(format!("unsupported report schema {:?}", self.schema));
@@ -67,6 +98,22 @@ impl Report {
             if title.edition.chars().count() > 80 {
                 return Err("report edition exceeds 80 characters".into());
             }
+        }
+        self.game.validate()?;
+        if let Some(run) = &self.run {
+            run.validate()?;
+        }
+        if let Some(failure) = &self.failure {
+            failure.validate()?;
+        }
+        if let Some(hang) = &self.hang {
+            hang.validate()?;
+        }
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.validate()?;
+        }
+        if let Some(perf) = &self.perf {
+            perf.validate()?;
         }
         if let Some(gaps) = &self.api_gaps {
             gaps.validate()?;
@@ -144,21 +191,13 @@ impl AddressSpace {
     }
 
     fn validate(&self) -> Result<(), String> {
-        fn address(text: &str) -> bool {
-            text.strip_prefix("0x").is_some_and(|digits| {
-                (1..=16).contains(&digits.len())
-                    && digits
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
-        }
         let ranges = self.mapped.iter().all(|range| {
             range
                 .split_once('-')
-                .is_some_and(|(start, end)| address(start) && address(end))
+                .is_some_and(|(start, end)| is_hex_u64(start) && is_hex_u64(end))
         });
-        if !address(&self.max)
-            || !self.window.as_deref().is_none_or(address)
+        if !is_hex_u64(&self.max)
+            || !self.window.as_deref().is_none_or(is_hex_u64)
             || !ranges
             || self.mapped.len() > MAPPED_RANGES
         {
@@ -168,6 +207,24 @@ impl AddressSpace {
         }
         Ok(())
     }
+}
+
+fn is_hex_u64(text: &str) -> bool {
+    text.strip_prefix("0x").is_some_and(|digits| {
+        (1..=16).contains(&digits.len())
+            && digits
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn is_hex_u32(text: &str) -> bool {
+    text.strip_prefix("0x").is_some_and(|digits| {
+        (1..=8).contains(&digits.len())
+            && digits
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +372,22 @@ pub struct Title {
     pub edition: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeArch {
+    X86,
+    X64,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeSubsystem {
+    Gui,
+    Cui,
+    Other,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Game {
@@ -326,11 +399,45 @@ pub struct Game {
     pub image_size: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<PeArch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsystem: Option<PeSubsystem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_imports: Vec<String>,
 }
 impl Game {
     pub fn identify(exe: &Path, codepage: u32) -> std::io::Result<Self> {
         let bytes = std::fs::read(exe)?;
-        let pe = adv_pe::Pe::parse(&bytes).map_err(std::io::Error::other)?;
+        let exe_sha256 = sha256(&bytes);
+        let exe_size = bytes.len() as u64;
+        let pe = match adv_pe::Pe::parse(&bytes) {
+            Ok(pe) => pe,
+            Err(adv_pe::PeError::NotI386(machine)) => {
+                let arch = match machine {
+                    0x8664 => PeArch::X64,
+                    _ => PeArch::Other,
+                };
+                return Ok(Self {
+                    exe_sha256,
+                    exe_size,
+                    codepage,
+                    timestamp: 0,
+                    image_size: 0,
+                    file_version: None,
+                    arch: Some(arch),
+                    subsystem: None,
+                    sections: None,
+                    overlay_bytes: None,
+                    system_imports: Vec::new(),
+                });
+            }
+            Err(error) => return Err(std::io::Error::other(error)),
+        };
         let file_version = pe
             .resources()
             .map_err(std::io::Error::other)?
@@ -364,15 +471,184 @@ impl Game {
                     ))
                 })
             });
+        let subsystem = match pe.subsystem {
+            2 => PeSubsystem::Gui,
+            3 => PeSubsystem::Cui,
+            _ => PeSubsystem::Other,
+        };
+        let end_of_sections = pe
+            .sections
+            .iter()
+            .map(|s| u64::from(s.raw_offset) + u64::from(s.raw_size))
+            .max()
+            .unwrap_or(u64::from(pe.size_of_headers));
+        let overlay = exe_size.saturating_sub(end_of_sections);
+        let mut system_imports: Vec<String> = pe
+            .imports()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|module| module.dll.to_ascii_lowercase())
+            .filter(|dll| is_allowed_system_dll(dll))
+            .collect();
+        system_imports.sort();
+        system_imports.dedup();
+        system_imports.truncate(MAX_SYSTEM_IMPORTS);
         Ok(Self {
-            exe_sha256: sha256(&bytes),
-            exe_size: bytes.len() as u64,
+            exe_sha256,
+            exe_size,
             codepage,
             timestamp: pe.timestamp,
             image_size: pe.size_of_image,
             file_version,
+            arch: Some(PeArch::X86),
+            subsystem: Some(subsystem),
+            sections: u16::try_from(pe.sections.len()).ok(),
+            overlay_bytes: (overlay > 0).then_some(overlay),
+            system_imports,
         })
     }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.system_imports.len() > MAX_SYSTEM_IMPORTS {
+            return Err(format!(
+                "report lists over {MAX_SYSTEM_IMPORTS} system imports"
+            ));
+        }
+        if let Some(dll) = self
+            .system_imports
+            .iter()
+            .find(|dll| !is_allowed_system_dll(dll))
+        {
+            return Err(format!("report system import {dll:?} is not allowlisted"));
+        }
+        Ok(())
+    }
+}
+
+/// Notable standard Windows, DirectX, media and runtime DLLs; omits ubiquitous
+/// kernel/user/gdi/advapi/ntdll and never admits game-specific filenames.
+pub fn is_allowed_system_dll(name: &str) -> bool {
+    if !is_bare_dll_name(name) || !name.ends_with(".dll") {
+        return false;
+    }
+    let stem = &name[..name.len() - 4];
+    const EXACT: &[&str] = &[
+        "amstream",
+        "avicap32",
+        "avifil32",
+        "bcrypt",
+        "clr",
+        "comctl32",
+        "comdlg32",
+        "crypt32",
+        "d2d1",
+        "d3d8",
+        "d3d9",
+        "d3d10",
+        "d3d10_1",
+        "d3d11",
+        "d3d12",
+        "d3dim",
+        "d3dim700",
+        "dbghelp",
+        "ddraw",
+        "devenum",
+        "dinput",
+        "dinput8",
+        "dmime",
+        "dmloader",
+        "dmscript",
+        "dmstyle",
+        "dmsynth",
+        "dmusic",
+        "dplayx",
+        "dsdmo",
+        "dsound",
+        "dwmapi",
+        "dwrite",
+        "dxgi",
+        "dxva2",
+        "evr",
+        "gdiplus",
+        "glu32",
+        "imm32",
+        "iphlpapi",
+        "jscript",
+        "mf",
+        "mfplat",
+        "mfreadwrite",
+        "mpr",
+        "msacm32",
+        "mscoree",
+        "msdmo",
+        "mshtml",
+        "msimg32",
+        "msvfw32",
+        "msvcrt",
+        "ncrypt",
+        "netapi32",
+        "ole32",
+        "oleacc",
+        "oleaut32",
+        "opengl32",
+        "powrprof",
+        "propsys",
+        "psapi",
+        "quartz",
+        "riched20",
+        "riched32",
+        "rpcrt4",
+        "secur32",
+        "setupapi",
+        "shell32",
+        "shfolder",
+        "shlwapi",
+        "ucrtbase",
+        "uiautomationcore",
+        "urlmon",
+        "userenv",
+        "usp10",
+        "uxtheme",
+        "vbscript",
+        "version",
+        "vulkan-1",
+        "winhttp",
+        "wininet",
+        "winmm",
+        "winspool",
+        "wintrust",
+        "wmvcore",
+        "ws2_32",
+        "wsock32",
+        "wtsapi32",
+    ];
+    if EXACT.contains(&stem) {
+        return true;
+    }
+    const VERSIONED_PREFIXES: &[&str] = &[
+        "api-ms-win-",
+        "d3dcompiler_",
+        "d3dx9_",
+        "d3dx10_",
+        "d3dx11_",
+        "mfc",
+        "msvcp",
+        "msvcr",
+        "vcomp",
+        "vcruntime",
+        "x3daudio",
+        "xapofx",
+        "xaudio2_",
+        "xinput",
+    ];
+    VERSIONED_PREFIXES.iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|rest| {
+            !rest.is_empty()
+                && rest.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')
+                })
+        })
+    })
 }
 
 /// A key that lets the server merge repeated reports for one game from one
@@ -430,13 +706,60 @@ pub enum PerfIssue {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    LiveSnapshot,
+    GuestExit,
+    GuestFailure,
+    HostError,
+    Panic,
+    UserClose,
+    UserForceClose,
+}
+
+/// Execution mode and termination metadata for a single run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunInfo {
+    pub jit: bool,
+    pub stop: StopReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<String>,
+    pub processes: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed_is_child: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub dialogs_shown: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_size: Option<[u32; 2]>,
+}
+impl RunInfo {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(code) = &self.exit_code
+            && !is_hex_u32(code)
+        {
+            return Err(format!("report exit_code {code:?} is not 0x hex u32"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     /// The guest called an API the runtime does not implement.
     Api,
-    /// An unhandled guest CPU fault ended the game.
+    /// The NT, Unix or driver layer encountered an unsupported request or class.
+    NtUnsupported,
+    /// A required DLL could not be loaded (`STATUS_DLL_NOT_FOUND`).
+    MissingDll,
+    /// An unhandled guest CPU fault or terminal exception ended the game.
     Cpu,
-    /// Any other runtime failure; its message may name host paths, so only
-    /// the kind is reported.
+    /// A classified host-side error (address space, GPU, audio, server, loader).
+    HostError,
+    /// A Rust panic occurred in the runtime or a worker thread.
+    HostPanic,
+    /// Any other unclassified runtime failure; its message may name host paths,
+    /// so only the kind is reported.
     Runtime,
 }
 
@@ -463,24 +786,531 @@ impl FailureAfter {
     }
 }
 
+/// Sanitized metadata of a host Rust panic, without host paths or guest bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostPanic {
+    pub thread: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translating: Option<String>,
+}
+impl HostPanic {
+    fn validate(&self) -> Result<(), String> {
+        if self.thread.is_empty()
+            || self.thread.len() > 64
+            || !self
+                .thread
+                .bytes()
+                .all(|b| b.is_ascii_graphic() || b == b' ')
+            || self.thread.contains(['/', '\\'])
+        {
+            return Err("report panic thread must be bounded printable ASCII without paths".into());
+        }
+        if let Some(location) = &self.location {
+            let valid_prefix = location.starts_with("crates/") || location.starts_with("apps/");
+            if !valid_prefix
+                || location.len() > 160
+                || location.contains("..")
+                || location.contains('\\')
+                || !location.bytes().all(|b| b.is_ascii_graphic())
+            {
+                return Err(format!(
+                    "report panic location {location:?} must be a workspace-relative path"
+                ));
+            }
+        }
+        if let Some(reason) = &self.reason
+            && (reason.chars().count() > 200
+                || reason.chars().any(char::is_control)
+                || reason.contains(['/', '\\']))
+        {
+            return Err("report panic reason must be bounded text without paths".into());
+        }
+        if let Some(translating) = &self.translating
+            && !is_safe_token(translating, 96)
+        {
+            return Err(format!(
+                "report panic translating {translating:?} must be a safe ASCII token"
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Failure {
     pub kind: FailureKind,
     /// `module!name` of the unimplemented API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
-    /// Fault kind, address and guest PC, e.g. `read 0x00000000 at 0x00401a2c`.
+    /// Origin or subsystem tag, e.g. `wine_stub`, `nt_info`, `wineserver`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Operation or error tag, e.g. `NtQueryInformationToken`, `event_watcher_io`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// Status, exception, class or errno tag, e.g. `0xc0000005`, `class:3`, `errno:9`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Missing DLL names (bare ASCII filenames, no paths).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dlls: Vec<String>,
+    /// Fault kind, address and guest PC, e.g. `read 0x00000000 at exe+0x1a2c`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_fault: Option<String>,
+    /// Single `iced_x86::Code` enum name at the faulting PC; never bytes or disassembly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault_insn: Option<String>,
+    /// Anonymized guest call stack frames or relative host offsets (`+0x...`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stack: Vec<String>,
+    /// Sanitized host panic metadata when `kind == HostPanic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panic: Option<HostPanic>,
     pub after: FailureAfter,
 }
+impl Failure {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(api) = &self.api
+            && !api_name(api)
+        {
+            return Err(format!("report failure api {api:?} is not module!name"));
+        }
+        if let Some(source) = &self.source
+            && !is_safe_token(source, 64)
+        {
+            return Err(format!("report failure source {source:?} is invalid"));
+        }
+        if let Some(op) = &self.op
+            && !is_safe_token(op, 96)
+        {
+            return Err(format!("report failure op {op:?} is invalid"));
+        }
+        if let Some(code) = &self.code
+            && !is_safe_token(code, 64)
+        {
+            return Err(format!("report failure code {code:?} is invalid"));
+        }
+        if self.dlls.len() > MAX_MISSING_DLLS {
+            return Err(format!("report lists over {MAX_MISSING_DLLS} missing DLLs"));
+        }
+        if let Some(dll) = self.dlls.iter().find(|dll| !is_bare_dll_name(dll)) {
+            return Err(format!("report missing DLL {dll:?} is invalid"));
+        }
+        if let Some(fault) = &self.cpu_fault
+            && (fault.is_empty()
+                || fault.len() > 240
+                || !fault.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+                || fault.contains(['/', '\\']))
+        {
+            return Err("report cpu_fault must be bounded printable ASCII without paths".into());
+        }
+        if let Some(insn) = &self.fault_insn
+            && !is_safe_token(insn, 64)
+        {
+            return Err(format!("report fault_insn {insn:?} is invalid"));
+        }
+        if self.stack.len() > MAX_STACK_FRAMES {
+            return Err(format!("report lists over {MAX_STACK_FRAMES} stack frames"));
+        }
+        if let Some(frame) = self.stack.iter().find(|frame| !is_stack_frame(frame)) {
+            return Err(format!("report stack frame {frame:?} is invalid"));
+        }
+        if let Some(panic) = &self.panic {
+            panic.validate()?;
+        }
+        Ok(())
+    }
+}
 
-/// Guest execution time per presented frame, rounded to 0.1 ms.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Snapshot of guest threads and host boundaries captured when a run hangs,
+/// is force-closed, or is reported live from the pause menu.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HangSnapshot {
+    pub exec_thread_responsive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_wait_pct: Option<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<ThreadSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_boundaries: Vec<BoundaryStat>,
+}
+impl HangSnapshot {
+    fn validate(&self) -> Result<(), String> {
+        if self.idle_wait_pct.is_some_and(|pct| pct > 100) {
+            return Err("report idle_wait_pct must be 0..=100".into());
+        }
+        if self.threads.len() > MAX_HANG_THREADS {
+            return Err(format!("report lists over {MAX_HANG_THREADS} threads"));
+        }
+        for thread in &self.threads {
+            thread.validate()?;
+        }
+        if self.top_boundaries.len() > MAX_HANG_BOUNDARIES {
+            return Err(format!(
+                "report lists over {MAX_HANG_BOUNDARIES} boundary entries"
+            ));
+        }
+        for boundary in &self.top_boundaries {
+            boundary.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadSnapshot {
+    pub tid: u32,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_api: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stack: Vec<String>,
+}
+impl ThreadSnapshot {
+    fn validate(&self) -> Result<(), String> {
+        if !is_safe_token(&self.state, 32) {
+            return Err(format!("report thread state {:?} is invalid", self.state));
+        }
+        if let Some(api) = &self.blocked_api
+            && !(api_name(api) || is_safe_token(api, 96))
+        {
+            return Err(format!("report blocked_api {api:?} is invalid"));
+        }
+        if self.stack.len() > 8 {
+            return Err("report thread stack exceeds 8 frames".into());
+        }
+        if let Some(frame) = self.stack.iter().find(|f| !is_stack_frame(f)) {
+            return Err(format!("report thread stack frame {frame:?} is invalid"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundaryStat {
+    pub kind: String,
+    pub name: String,
+    pub calls: u64,
+    pub host_ms: u64,
+}
+impl BoundaryStat {
+    fn validate(&self) -> Result<(), String> {
+        if !matches!(self.kind.as_str(), "syscall" | "unix" | "server") {
+            return Err(format!("report boundary kind {:?} is invalid", self.kind));
+        }
+        if !is_safe_token(&self.name, 96) {
+            return Err(format!("report boundary name {:?} is invalid", self.name));
+        }
+        Ok(())
+    }
+}
+
+/// Non-fatal subsystem diagnostics, capability probes, Wine channel counts and
+/// detected hooks, strictly bounded and stripped of paths and guest text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Diagnostics {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<WarningStat>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_probes: Vec<ProbeRejection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wine_errors: Vec<WineLogStat>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooked_exports: Vec<HookedExport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exceptions_seen: Vec<ExceptionStat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphics: Option<GraphicsDiag>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_video: Option<AudioVideoDiag>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fonts: Option<FontDiag>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<WindowDiag>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_panics: Vec<HostPanic>,
+}
+impl Diagnostics {
+    pub fn is_empty(&self) -> bool {
+        self.warnings.is_empty()
+            && self.rejected_probes.is_empty()
+            && self.wine_errors.is_empty()
+            && self.hooked_exports.is_empty()
+            && self.exceptions_seen.is_empty()
+            && self.graphics.is_none()
+            && self.audio_video.is_none()
+            && self.fonts.is_none()
+            && self.windows.is_none()
+            && self.host_panics.is_empty()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.warnings.len() > MAX_DIAG_ENTRIES {
+            return Err(format!("report lists over {MAX_DIAG_ENTRIES} warnings"));
+        }
+        for w in &self.warnings {
+            if !(api_name(&w.api) || is_safe_token(&w.api, 96)) {
+                return Err(format!("report warning api {:?} is invalid", w.api));
+            }
+            if !is_safe_reason(&w.reason, 140) {
+                return Err("report warning reason must be bounded ASCII without paths".into());
+            }
+        }
+        if self.rejected_probes.len() > MAX_PROBE_ENTRIES {
+            return Err(format!(
+                "report lists over {MAX_PROBE_ENTRIES} rejected probes"
+            ));
+        }
+        for p in &self.rejected_probes {
+            if !(api_name(&p.api) || is_safe_token(&p.api, 96)) {
+                return Err(format!("report probe api {:?} is invalid", p.api));
+            }
+            if !is_safe_reason(&p.detail, 120) {
+                return Err("report probe detail must be bounded ASCII without paths".into());
+            }
+        }
+        if self.wine_errors.len() > MAX_DIAG_ENTRIES {
+            return Err(format!("report lists over {MAX_DIAG_ENTRIES} wine errors"));
+        }
+        for e in &self.wine_errors {
+            if !matches!(e.level.as_str(), "err" | "fixme")
+                || !is_safe_token(&e.channel, 32)
+                || !is_safe_token(&e.func, 64)
+            {
+                return Err("report wine_error entry is invalid".into());
+            }
+        }
+        if self.hooked_exports.len() > MAX_DIAG_ENTRIES {
+            return Err(format!(
+                "report lists over {MAX_DIAG_ENTRIES} hooked exports"
+            ));
+        }
+        for h in &self.hooked_exports {
+            if !api_name(&h.api) || !is_safe_token(&h.form, 32) {
+                return Err("report hooked_export entry is invalid".into());
+            }
+        }
+        if self.exceptions_seen.len() > MAX_PROBE_ENTRIES {
+            return Err(format!(
+                "report lists over {MAX_PROBE_ENTRIES} exception stats"
+            ));
+        }
+        for ex in &self.exceptions_seen {
+            if !is_hex_u32(&ex.code) || !ex.last_pc.as_deref().is_none_or(is_stack_frame) {
+                return Err("report exception stat is invalid".into());
+            }
+        }
+        if let Some(g) = &self.graphics
+            && (g.fronts.len() > 8 || g.fronts.iter().any(|f| !is_safe_token(f, 32)))
+        {
+            return Err("report graphics fronts are invalid".into());
+        }
+        if let Some(av) = &self.audio_video
+            && (av.audio_fronts.len() > 8
+                || av.audio_fronts.iter().any(|f| !is_safe_token(f, 32))
+                || av.video_fronts.len() > 8
+                || av.video_fronts.iter().any(|f| !is_safe_token(f, 32))
+                || av.dsound_create_failures.len() > MAX_PROBE_ENTRIES
+                || av
+                    .dsound_create_failures
+                    .keys()
+                    .any(|k| !is_safe_token(k, 64)))
+        {
+            return Err("report audio_video diagnostics are invalid".into());
+        }
+        if let Some(f) = &self.fonts
+            && (f.missing_standard.len() > MAX_PROBE_ENTRIES
+                || f.missing_standard
+                    .iter()
+                    .any(|name| !is_standard_font_family(name))
+                || f.charsets.len() > MAX_PROBE_ENTRIES
+                || f.gdi_codepages.len() > 8)
+        {
+            return Err("report font diagnostics are invalid".into());
+        }
+        if self.host_panics.len() > 4 {
+            return Err("report lists over 4 host panics".into());
+        }
+        for panic in &self.host_panics {
+            panic.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarningStat {
+    pub api: String,
+    pub reason: String,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeRejection {
+    pub api: String,
+    pub detail: String,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WineLogStat {
+    pub level: String,
+    pub channel: String,
+    pub func: String,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookedExport {
+    pub api: String,
+    pub form: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExceptionStat {
+    pub code: String,
+    pub count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pc: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphicsDiag {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fronts: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub d3d9_draws: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub d3d9_readback_kb: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudioVideoDiag {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_fronts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub video_fronts: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dsound_create_failures: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FontDiag {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_standard: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub substitutions: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub charsets: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gdi_codepages: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowDiag {
+    pub top_level: u32,
+    pub visible: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub dialogs: u32,
+}
+
+/// Standard Windows font family allowlist (ASCII canonical names) so reports
+/// can flag missing CJK/system faces without leaking custom font filenames.
+pub fn canonical_standard_font(face: &str) -> Option<&'static str> {
+    let trimmed = face.trim().trim_start_matches('@');
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "simsun" | "nsimsun" | "宋体" | "新宋体" => Some("SimSun"),
+        "simhei" | "黑体" => Some("SimHei"),
+        "fangsong" | "仿宋" => Some("FangSong"),
+        "kaiti" | "楷体" => Some("KaiTi"),
+        "microsoft yahei" | "微软雅黑" => Some("Microsoft YaHei"),
+        "ms gothic" | "ms pgothic" | "ms ui gothic" | "ｍｓ ゴシック" | "ｍｓ ｐゴシック" => {
+            Some("MS Gothic")
+        }
+        "ms mincho" | "ms pmincho" | "ｍｓ 明朝" | "ｍｓ ｐ明朝" => Some("MS Mincho"),
+        "meiryo" | "meiryo ui" | "メイリオ" => Some("Meiryo"),
+        "yu gothic" | "游ゴシック" => Some("Yu Gothic"),
+        "yu mincho" | "游明朝" => Some("Yu Mincho"),
+        "mingliu" | "pmingliu" | "細明體" | "新細明體" => Some("MingLiU"),
+        "microsoft jhenghei" | "微軟正黑體" => Some("Microsoft JhengHei"),
+        "gulim" | "batang" | "dotum" | "gungsuh" => Some("Gulim"),
+        "arial" => Some("Arial"),
+        "tahoma" => Some("Tahoma"),
+        "verdana" => Some("Verdana"),
+        "times new roman" => Some("Times New Roman"),
+        "courier new" => Some("Courier New"),
+        "segoe ui" => Some("Segoe UI"),
+        _ => None,
+    }
+}
+
+pub fn is_standard_font_family(name: &str) -> bool {
+    canonical_standard_font(name).is_some_and(|canon| canon == name)
+}
+
+fn is_safe_reason(text: &str, max_len: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= max_len
+        && text
+            .bytes()
+            .all(|b| (b.is_ascii_graphic() || b == b' ') && !matches!(b, b'/' | b'\\'))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CpuShare {
+    pub translated_pct: u8,
+    pub apply_pct: u8,
+    pub interpret_pct: u8,
+    pub interpreter_pct: u8,
+    pub rep_pct: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliffStat {
+    pub name: String,
+    pub count: u64,
+}
+
+/// Guest execution time per presented frame, rounded to 0.1 ms, plus optional
+/// low-cost execution attribution counters.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Perf {
     pub frame_ms_p50: f64,
     pub frame_ms_p95: f64,
     pub frame_ms_p99: f64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub long_frames_50ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub long_frames_250ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_share: Option<CpuShare>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_cliffs: Vec<CliffStat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_heap_mb: Option<u32>,
 }
 impl Perf {
     pub fn from_samples(samples: impl IntoIterator<Item = f64>) -> Option<Self> {
@@ -488,6 +1318,8 @@ impl Perf {
         if values.is_empty() {
             return None;
         }
+        let long_frames_50ms = values.iter().filter(|&&ms| ms >= 50.0).count() as u64;
+        let long_frames_250ms = values.iter().filter(|&&ms| ms >= 250.0).count() as u64;
         values.sort_by(f64::total_cmp);
         let at = |percent: usize| {
             let rank = (values.len() * percent).div_ceil(100).saturating_sub(1);
@@ -497,7 +1329,41 @@ impl Perf {
             frame_ms_p50: at(50),
             frame_ms_p95: at(95),
             frame_ms_p99: at(99),
+            long_frames_50ms,
+            long_frames_250ms,
+            cpu_share: None,
+            top_cliffs: Vec::new(),
+            peak_heap_mb: None,
         })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if let Some(share) = &self.cpu_share
+            && [
+                share.translated_pct,
+                share.apply_pct,
+                share.interpret_pct,
+                share.interpreter_pct,
+                share.rep_pct,
+            ]
+            .into_iter()
+            .any(|p| p > 100)
+        {
+            return Err("report cpu_share percentages must be 0..=100".into());
+        }
+        if self.top_cliffs.len() > MAX_CLIFF_ENTRIES {
+            return Err(format!(
+                "report lists over {MAX_CLIFF_ENTRIES} cliff entries"
+            ));
+        }
+        if let Some(cliff) = self
+            .top_cliffs
+            .iter()
+            .find(|c| !is_safe_reason(&c.name, 64))
+        {
+            return Err(format!("report cliff name {:?} is invalid", cliff.name));
+        }
+        Ok(())
     }
 }
 
@@ -551,19 +1417,57 @@ impl ApiGaps {
     }
 }
 
-/// `module!name` in printable ASCII, so a gap cannot carry free text.
-fn api_name(name: &str) -> bool {
+/// `module!name` in printable ASCII without path or debug-format characters.
+pub fn api_name(name: &str) -> bool {
     name.len() <= ApiGaps::MAX_NAME_BYTES
-        && name.bytes().all(|b| b.is_ascii_graphic())
+        && name.bytes().all(|b| {
+            b.is_ascii_graphic() && !matches!(b, b'/' | b'\\' | b'"' | b'\'' | b'{' | b'}' | b',')
+        })
         && name
             .split_once('!')
             .is_some_and(|(module, export)| !module.is_empty() && !export.is_empty())
 }
 
+/// Printable ASCII identifier token without whitespace, quotes or path separators.
+pub fn is_safe_token(text: &str, max_len: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= max_len
+        && text.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':' | b'+' | b'#')
+        })
+}
+
+/// Bare ASCII DLL filename without path separators.
+pub fn is_bare_dll_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 80
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+}
+
+/// Anonymized guest frame (`exe+0x12`, `ntdll.dll!Func+0x12`, `game#12345678+0x12`,
+/// `0x00401234`) or host offset (`+0x1234`, `crate::fn+0x12`).
+fn is_stack_frame(frame: &str) -> bool {
+    !frame.is_empty()
+        && frame.len() <= 160
+        && frame.bytes().all(|b| {
+            b.is_ascii_graphic() && !matches!(b, b'/' | b'\\' | b'"' | b'\'' | b'{' | b'}')
+        })
+}
+
 /// What a finished run contributes to a report, before the user describes it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
+    #[serde(default)]
+    pub run: Option<RunInfo>,
     pub failure: Option<Failure>,
+    #[serde(default)]
+    pub hang: Option<HangSnapshot>,
+    #[serde(default)]
+    pub diagnostics: Option<Diagnostics>,
     pub perf: Option<Perf>,
     #[serde(default)]
     pub api_gaps: Option<ApiGaps>,
@@ -646,22 +1550,50 @@ mod tests {
                 timestamp: 123,
                 image_size: 8192,
                 file_version: None,
+                arch: Some(PeArch::X86),
+                subsystem: Some(PeSubsystem::Gui),
+                sections: Some(4),
+                overlay_bytes: None,
+                system_imports: vec!["d3d9.dll".into()],
             },
             title: None,
             outcome: Outcome::Failed,
             issues: vec![],
             perf_issues: None,
             note: None,
+            run: Some(RunInfo {
+                jit: true,
+                stop: StopReason::GuestFailure,
+                exit_code: None,
+                processes: 1,
+                failed_is_child: false,
+                dialogs_shown: 0,
+                present_size: None,
+            }),
             failure: Some(Failure {
                 kind: FailureKind::Api,
                 api: Some("d3d9.dll!IDirect3DDevice9::CreateVolumeTexture".into()),
+                source: Some("abi_stub".into()),
+                op: None,
+                code: None,
+                dlls: vec![],
                 cpu_fault: None,
+                fault_insn: None,
+                stack: vec!["exe+0x1234".into()],
+                panic: None,
                 after: FailureAfter::Minutes,
             }),
+            hang: None,
+            diagnostics: None,
             perf: Some(Perf {
                 frame_ms_p50: 16.8,
                 frame_ms_p95: 41.2,
                 frame_ms_p99: 88.5,
+                long_frames_50ms: 0,
+                long_frames_250ms: 0,
+                cpu_share: None,
+                top_cliffs: vec![],
+                peak_heap_mb: None,
             }),
             timeline: None,
             api_gaps: ApiGaps::new(
@@ -679,12 +1611,16 @@ mod tests {
     fn wire_format_matches_the_launcher_schema() {
         let json = serde_json::to_string(&report()).unwrap();
         let expected = [
-            r#"{"schema":"hitode.report/2","dedupe_key":"0123456789abcdef","#,
+            r#"{"schema":"hitode.report/3","dedupe_key":"0123456789abcdef","#,
             r#""app":{"version":"0.1.0","build":"8c048ed6","channel":"preview"},"#,
             r#""platform":{"os":"macos","os_major":"26","model":"Example1,1","graphics":{"api":"metal","name":"Example GPU","vendor":"apple","device":"Example GPU","driver":"26","tier":"metal"},"settings":{"upscaler":"off","scaling":"fit","fast_forward":"hold","touch_mode":"direct","font_files":0,"font_overrides":0,"font_smoothing":null,"discs":0}},"#,
-            &format!(r#""game":{{"exe_sha256":"{}","exe_size":1887437,"codepage":932,"timestamp":123,"image_size":8192}},"#, "ab".repeat(32)),
+            &format!(
+                r#""game":{{"exe_sha256":"{}","exe_size":1887437,"codepage":932,"timestamp":123,"image_size":8192,"arch":"x86","subsystem":"gui","sections":4,"system_imports":["d3d9.dll"]}},"#,
+                "ab".repeat(32)
+            ),
             r#""outcome":"failed","issues":[],"#,
-            r#""failure":{"kind":"api","api":"d3d9.dll!IDirect3DDevice9::CreateVolumeTexture","cpu_fault":null,"after":"1m_10m"},"#,
+            r#""run":{"jit":true,"stop":"guest_failure","processes":1},"#,
+            r#""failure":{"kind":"api","api":"d3d9.dll!IDirect3DDevice9::CreateVolumeTexture","source":"abi_stub","stack":["exe+0x1234"],"after":"1m_10m"},"#,
             r#""perf":{"frame_ms_p50":16.8,"frame_ms_p95":41.2,"frame_ms_p99":88.5},"#,
             r#""api_gaps":{"called":["gdiplus.dll!GdipDrawCurve"],"imported":["ole32.dll!CoCreateGuid"]}}"#,
         ]
@@ -711,12 +1647,72 @@ mod tests {
         value["game"]["path"] = "C:\\Games\\AQUA.exe".into();
         assert!(serde_json::from_value::<Report>(value).is_err());
         let other = Report {
-            schema: "hitode.report/1".into(),
+            schema: "hitode.report/2".into(),
             ..report()
         };
         assert!(to_json(&other).is_err());
         assert!(serde_json::from_str::<Report>(&serde_json::to_string(&other).unwrap()).is_err());
         assert!(to_json(&report()).unwrap().starts_with("{\n  \"schema\""));
+    }
+
+    // spec: REPORT-FAIL-1
+    #[test]
+    fn structured_failures_reject_paths_and_debug_garbage() {
+        let mut polluted = report();
+        polluted.failure.as_mut().unwrap().api =
+            Some(r#"libc.so.6!__res_state", recent: [] }"#.into());
+        assert!(to_json(&polluted).is_err());
+
+        let mut panic_report = report();
+        panic_report.failure = Some(Failure {
+            kind: FailureKind::HostPanic,
+            api: None,
+            source: None,
+            op: None,
+            code: None,
+            dlls: vec![],
+            cpu_fault: None,
+            fault_insn: None,
+            stack: vec!["+0x1a4f20".into()],
+            panic: Some(HostPanic {
+                thread: "guest compile".into(),
+                location: Some("crates/adv-cpu-a64/src/encode.rs:412".into()),
+                reason: Some("index out of bounds".into()),
+                translating: Some("Cvttss2si_r32_xmmm32".into()),
+            }),
+            after: FailureAfter::LessThanMinute,
+        });
+        assert!(to_json(&panic_report).is_ok());
+
+        panic_report
+            .failure
+            .as_mut()
+            .unwrap()
+            .panic
+            .as_mut()
+            .unwrap()
+            .location = Some("/abs/path/crates/adv-cpu-a64/src/encode.rs:412".into());
+        assert!(to_json(&panic_report).is_err());
+
+        let mut bad_dll = report();
+        bad_dll.failure = Some(Failure {
+            kind: FailureKind::MissingDll,
+            api: None,
+            source: None,
+            op: None,
+            code: Some("0xc0000135".into()),
+            dlls: vec!["C:\\Windows\\mfc42.dll".into()],
+            cpu_fault: None,
+            fault_insn: None,
+            stack: vec![],
+            panic: None,
+            after: FailureAfter::LessThanMinute,
+        });
+        assert!(to_json(&bad_dll).is_err());
+
+        let mut bad_import = report();
+        bad_import.game.system_imports = vec!["my_secret_game_patch.dll".into()];
+        assert!(to_json(&bad_import).is_err());
     }
 
     // spec: REPORT-PLAT-1, IOS-MEM-5
@@ -882,7 +1878,12 @@ mod tests {
             Perf {
                 frame_ms_p50: 50.0,
                 frame_ms_p95: 95.0,
-                frame_ms_p99: 99.0
+                frame_ms_p99: 99.0,
+                long_frames_50ms: 51,
+                long_frames_250ms: 0,
+                cpu_share: None,
+                top_cliffs: vec![],
+                peak_heap_mb: None,
             }
         );
     }
@@ -933,9 +1934,151 @@ mod tests {
         assert_eq!(game.exe_size, fixture.len() as u64);
         assert_eq!((game.timestamp, game.image_size), (123, 8192));
         assert_eq!(game.file_version.as_deref(), Some("1.2.3.4"));
+        assert_eq!(game.arch, Some(PeArch::X86));
+        assert_eq!(game.sections, Some(1));
         let key = dedupe_key(&[1; 32], &game.exe_sha256);
         assert_eq!(key.len(), 16);
         assert_eq!(key, dedupe_key(&[1; 32], &game.exe_sha256));
         assert_ne!(key, dedupe_key(&[2; 32], &game.exe_sha256));
+    }
+
+    #[test]
+    fn legacy_v2_run_summary_still_deserializes_for_library_compatibility() {
+        let legacy = r#"{
+            "failure": {"kind": "api", "api": "d3d9.dll!Foo", "cpu_fault": null, "after": "lt_1m"},
+            "perf": {"frame_ms_p50": 16.0, "frame_ms_p95": 20.0, "frame_ms_p99": 25.0}
+        }"#;
+        let summary: RunSummary = serde_json::from_str(legacy).unwrap();
+        assert_eq!(summary.failure.unwrap().kind, FailureKind::Api);
+        assert!(summary.run.is_none());
+    }
+
+    // spec: REPORT-DIAG-1, REPORT-PERF-1
+    #[test]
+    fn diagnostics_hang_and_perf_cliffs_validate_and_reject_paths() {
+        let mut r = report();
+        r.hang = Some(HangSnapshot {
+            exec_thread_responsive: true,
+            idle_wait_pct: Some(98),
+            threads: vec![ThreadSnapshot {
+                tid: 1,
+                state: "waiting".into(),
+                blocked_api: Some("ntdll.dll!NtWaitForMultipleObjects".into()),
+                stack: vec![
+                    "ntdll.dll!NtWaitForMultipleObjects+0xc".into(),
+                    "exe+0x1234".into(),
+                ],
+            }],
+            top_boundaries: vec![BoundaryStat {
+                kind: "syscall".into(),
+                name: "NtWaitForSingleObject".into(),
+                calls: 5000,
+                host_ms: 420,
+            }],
+        });
+        r.diagnostics = Some(Diagnostics {
+            warnings: vec![WarningStat {
+                api: "d3d9.dll!IDirect3DDevice9::Reset".into(),
+                reason: "device_lost".into(),
+                count: 2,
+            }],
+            rejected_probes: vec![ProbeRejection {
+                api: "d3d9.dll!IDirect3D9::CheckDeviceFormat".into(),
+                detail: "fmt:21:usage:1:type:3".into(),
+                count: 1,
+            }],
+            wine_errors: vec![WineLogStat {
+                level: "err".into(),
+                channel: "module".into(),
+                func: "import_dll".into(),
+                count: 3,
+            }],
+            hooked_exports: vec![HookedExport {
+                api: "gdi32.dll!CreateFontIndirectA".into(),
+                form: "jmp_rel32".into(),
+            }],
+            exceptions_seen: vec![ExceptionStat {
+                code: "0xc0000005".into(),
+                count: 4,
+                last_pc: Some("exe+0x1234".into()),
+            }],
+            graphics: Some(GraphicsDiag {
+                fronts: vec!["d3d9".into()],
+                d3d9_draws: 100,
+                d3d9_readback_kb: 256,
+            }),
+            audio_video: Some(AudioVideoDiag {
+                audio_fronts: vec!["dsound".into()],
+                video_fronts: vec!["dshow".into()],
+                dsound_create_failures: BTreeMap::from([("DSERR_UNSUPPORTED".into(), 1)]),
+            }),
+            fonts: Some(FontDiag {
+                missing_standard: vec!["MS Gothic".into()],
+                substitutions: 2,
+                charsets: vec![128],
+                gdi_codepages: vec![932],
+            }),
+            windows: Some(WindowDiag {
+                top_level: 1,
+                visible: 1,
+                dialogs: 0,
+            }),
+            host_panics: vec![],
+        });
+        r.perf = Some(Perf {
+            frame_ms_p50: 16.5,
+            frame_ms_p95: 33.1,
+            frame_ms_p99: 60.2,
+            long_frames_50ms: 3,
+            long_frames_250ms: 0,
+            cpu_share: Some(CpuShare {
+                translated_pct: 70,
+                apply_pct: 5,
+                interpret_pct: 10,
+                interpreter_pct: 10,
+                rep_pct: 5,
+            }),
+            top_cliffs: vec![CliffStat {
+                name: "x87_exact:fpatan".into(),
+                count: 1024,
+            }],
+            peak_heap_mb: Some(512),
+        });
+        let json = to_json(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Report>(&json).unwrap(), r);
+
+        // Non-allowlisted requested font is rejected.
+        let mut bad_font = r.clone();
+        bad_font
+            .diagnostics
+            .as_mut()
+            .unwrap()
+            .fonts
+            .as_mut()
+            .unwrap()
+            .missing_standard = vec!["MyCustomGameFont".into()];
+        assert!(to_json(&bad_font).is_err());
+
+        // Unexpected Wine log level is rejected.
+        let mut bad_wine = r.clone();
+        bad_wine.diagnostics.as_mut().unwrap().wine_errors[0].level = "trace".into();
+        assert!(to_json(&bad_wine).is_err());
+
+        // Path separator in warning reason is rejected.
+        let mut bad_warn = r.clone();
+        bad_warn.diagnostics.as_mut().unwrap().warnings[0].reason = "C:\\Games\\x.dat".into();
+        assert!(to_json(&bad_warn).is_err());
+
+        // Percentage over 100 in cpu_share is rejected.
+        let mut bad_perf = r;
+        bad_perf
+            .perf
+            .as_mut()
+            .unwrap()
+            .cpu_share
+            .as_mut()
+            .unwrap()
+            .translated_pct = 101;
+        assert!(to_json(&bad_perf).is_err());
     }
 }

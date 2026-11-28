@@ -86,6 +86,10 @@ pub trait Engine: Backend + Sized {
     ) -> Result<(), String>;
     fn background_sender(&mut self) -> Result<adv_sync::background::LocalSender, String>;
     fn counters(&self) -> EngineCounters;
+    /// Top execution slow-path cliffs (`label`, count), ranked most frequent first.
+    fn top_cliffs(&self, _limit: usize) -> Vec<(String, u64)> {
+        Vec::new()
+    }
     /// Per-frame accounting while frame timing is enabled.
     fn frame_counters(&self) -> Option<FrameCounters> {
         Backend::frame_counters(self)

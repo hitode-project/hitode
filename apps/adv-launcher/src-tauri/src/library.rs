@@ -61,8 +61,16 @@ pub struct PlaySession {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LastRun {
     pub ended: u64,
+    #[serde(default, deserialize_with = "deserialize_summary_lossy")]
     pub summary: Option<adv_report::RunSummary>,
     pub error: Option<String>,
+}
+
+fn deserialize_summary_lossy<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<adv_report::RunSummary>, D::Error> {
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 type Offline = &'static str;
 #[derive(Serialize, Deserialize)]

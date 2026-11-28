@@ -1,6 +1,6 @@
 //! A game session driven by the host main loop.
 use crate::{
-    Finished, Options, frontend,
+    Finished, Options, RunError, frontend,
     window::{Event, GameView},
 };
 use adv_runtime::{DialogEvent, DialogSet, MenuBar, MenuEvent, MenuItem};
@@ -30,7 +30,7 @@ pub struct Session {
     #[cfg(target_os = "macos")]
     timer: CFRetained<CFRunLoopTimer>,
 }
-type OnFinished = Box<dyn FnOnce(Result<Finished, String>)>;
+type OnFinished = Box<dyn FnOnce(Result<Finished, RunError>)>;
 
 #[cfg(target_os = "android")]
 struct OwnedNativeWindow(std::ptr::NonNull<ndk_sys::ANativeWindow>);
@@ -156,8 +156,8 @@ struct Driver {
     display_init: RefCell<Option<AndroidDisplayInit>>,
     #[cfg(target_os = "macos")]
     damage_hud: adv_display::display::DamageHud,
-    done: RefCell<spsc::Consumer<Result<Finished, String>>>,
-    pending: RefCell<Option<Result<Finished, String>>>,
+    done: RefCell<spsc::Consumer<Result<Finished, RunError>>>,
+    pending: RefCell<Option<Result<Finished, RunError>>>,
     execution: RefCell<Option<crate::execution::Task>>,
     service: RefCell<adv_sync::background::Service>,
     on_finished: RefCell<Option<OnFinished>>,
@@ -189,7 +189,7 @@ impl Session {
     pub fn new(
         view: View,
         options: Options,
-        on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
+        on_finished: Box<dyn FnOnce(Result<Finished, RunError>)>,
     ) -> Result<Self, String> {
         Self::new_inner(view, options, on_finished, None)
     }
@@ -198,7 +198,7 @@ impl Session {
     pub fn new_with_execution(
         view: View,
         mut options: Options,
-        on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
+        on_finished: Box<dyn FnOnce(Result<Finished, RunError>)>,
         execution: &crate::Execution,
     ) -> Result<Self, String> {
         options.wine = Some(execution.distribution.clone());
@@ -253,7 +253,7 @@ impl Session {
     fn start(
         view: View,
         options: Options,
-        on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
+        on_finished: Box<dyn FnOnce(Result<Finished, RunError>)>,
         execution: Option<&crate::Execution>,
         #[cfg(target_os = "macos")] projection: Rc<RefCell<Projection>>,
         #[cfg(target_os = "android")] android_surface: Option<(OwnedNativeWindow, (u32, u32))>,
@@ -334,6 +334,7 @@ impl Session {
             &mut adv_runtime::wine::session::Host,
             &std::path::Path,
         )>| {
+            let started = Instant::now();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 #[cfg(target_os = "android")]
                 if let Some((latest_window, view_size, display_tx, display_wake)) = android_display
@@ -350,11 +351,14 @@ impl Session {
                         &latest_window,
                         view_size,
                         display_wake.clone(),
-                    )?;
+                    )
+                    .map_err(|e| RunError::from_message(e, started.elapsed()))?;
                     if built_window.is_none() {
                         // Start suspended until the UI thread delivers a live surface.
                         unsafe {
-                            display_ui.replace_window(None)?;
+                            display_ui
+                                .replace_window(None)
+                                .map_err(|e| RunError::from_message(e, started.elapsed()))?;
                         }
                     }
                     worker.display = Some(startup);
@@ -387,7 +391,12 @@ impl Session {
                     ),
                 }
             }))
-            .unwrap_or_else(|_| Err("execution worker panicked".into()));
+            .unwrap_or_else(|_| {
+                Err(RunError::from_message(
+                    "execution worker panicked",
+                    started.elapsed(),
+                ))
+            });
             let _ = tx.push(result);
             completion_wake.signal();
         };
@@ -641,6 +650,31 @@ impl Session {
             .push(Event::Disc(letter, image, reply));
         result
     }
+
+    /// Requests a live read-only report snapshot from the execution thread
+    /// along with the current host display and input settings.
+    pub fn report_snapshot(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<adv_report::RunSummary>,
+        adv_report::Settings,
+    ) {
+        let display = self
+            .driver
+            .ui
+            .borrow()
+            .as_ref()
+            .and_then(frontend::Ui::report_settings);
+        let fast_forward = if self.driver.view.fast_forward_toggle() {
+            adv_report::FastForward::Toggle
+        } else {
+            adv_report::FastForward::Hold
+        };
+        let settings = crate::report_settings(&self.driver.options, display, Some(fast_forward));
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.driver.view.hub().push(Event::ReportSnapshot(reply));
+        (result, settings)
+    }
     pub fn set_volume(&self, percent: u8) {
         self.driver.view.hub().push(Event::Volume(percent.min(100)));
     }
@@ -850,25 +884,23 @@ impl Driver {
         }
         false
     }
-    fn finish(&self, mut result: Result<Finished, String>) {
+    fn finish(&self, mut result: Result<Finished, RunError>) {
         #[cfg(target_os = "android")]
         let _ = self.install_pending_display();
-        if let Ok(finished) = &mut result {
-            let display = self
-                .ui
-                .borrow()
-                .as_ref()
-                .and_then(frontend::Ui::report_settings);
-            let fast_forward = if self.view.fast_forward_toggle() {
-                adv_report::FastForward::Toggle
-            } else {
-                adv_report::FastForward::Hold
-            };
-            finished.summary.settings = Some(crate::report_settings(
-                &self.options,
-                display,
-                Some(fast_forward),
-            ));
+        let display = self
+            .ui
+            .borrow()
+            .as_ref()
+            .and_then(frontend::Ui::report_settings);
+        let fast_forward = if self.view.fast_forward_toggle() {
+            adv_report::FastForward::Toggle
+        } else {
+            adv_report::FastForward::Hold
+        };
+        let settings = crate::report_settings(&self.options, display, Some(fast_forward));
+        match &mut result {
+            Ok(finished) => finished.summary.settings = Some(settings),
+            Err(error) => error.summary.settings = Some(settings),
         }
         drop(self.ui.borrow_mut().take());
         // Retires guest menus and dialogs unless a nested loop still holds them.
@@ -877,7 +909,7 @@ impl Driver {
         if let Some(execution) = self.execution.borrow_mut().take()
             && execution.join().is_err()
         {
-            result = Err("execution worker panicked".into());
+            result = Err(RunError::from("execution worker panicked".to_owned()));
         }
         self.service.borrow_mut().shutdown();
         if let Some(callback) = self.on_finished.borrow_mut().take() {
@@ -893,7 +925,9 @@ impl Driver {
         let next = match self.tick() {
             Ok(next) => next,
             Err(error) => {
-                self.pending.borrow_mut().get_or_insert(Err(error));
+                self.pending
+                    .borrow_mut()
+                    .get_or_insert_with(|| Err(RunError::from(error)));
                 self.finish_pending();
                 None
             }
@@ -911,7 +945,7 @@ impl Driver {
                 }
             });
             if let Some(Err(error)) = result {
-                self.finish(Err(error));
+                self.finish(Err(RunError::from(error)));
             }
         }
         #[cfg(target_os = "macos")]
@@ -948,7 +982,7 @@ unsafe extern "C-unwind" fn wake_callback(
             unsafe { &*fd }.enable_call_backs(kCFFileDescriptorReadCallBack);
             driver.drive();
         }
-        Err(error) => driver.finish(Err(error.to_string())),
+        Err(error) => driver.finish(Err(RunError::from(error.to_string()))),
     }
 }
 #[cfg(target_os = "macos")]
@@ -1028,6 +1062,11 @@ pub(crate) fn run_cli(options: Options) -> Result<u8, String> {
     result
         .borrow_mut()
         .take()
-        .unwrap_or_else(|| Err("application run loop stopped before the game finished".into()))
+        .unwrap_or_else(|| {
+            Err(RunError::from(
+                "application run loop stopped before the game finished".to_owned(),
+            ))
+        })
         .map(|finished| finished.exit_code)
+        .map_err(|error| error.message)
 }

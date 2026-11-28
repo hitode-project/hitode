@@ -16,15 +16,18 @@ const base: ReportBase = {
 const input: ReportInput = {
   situation: "crash", title: { vndb: "v123", name: "Example", edition: "1.2 patch" }, keepTitle: true,
   perfIssues: [], note: null,
-  failure: { kind: "api", api: "d3d9.dll!IDirect3DDevice9::CreateVolumeTexture", cpu_fault: null, after: "1m_10m" },
+  run: { jit: true, stop: "guest_failure", processes: 1 },
+  failure: { kind: "api", api: "d3d9.dll!IDirect3DDevice9::CreateVolumeTexture", source: "abi_stub", stack: ["exe+0x1234"], after: "1m_10m" },
+  hang: null,
+  diagnostics: null,
   perf: { frame_ms_p50: 16.8, frame_ms_p95: 41.2, frame_ms_p99: 88.5 },
   apiGaps: { called: ["gdiplus.dll!GdipDrawCurve"], imported: ["ole32.dll!CoCreateGuid"] }, timeline: null,
 };
 // spec: REPORT-FMT-2
-test("report uses /2 and Rust wire order", { timeout: 1000 }, () => {
+test("report uses /3 and Rust wire order", { timeout: 1000 }, () => {
   const report = buildReport(base, { ...input, keepTitle: false, situation: "no_start" });
   assert.equal(report.schema, REPORT_SCHEMA);
-  assert.deepEqual(Object.keys(report), ["schema", "dedupe_key", "app", "platform", "game", "outcome", "issues", "failure", "perf", "api_gaps"]);
+  assert.deepEqual(Object.keys(report), ["schema", "dedupe_key", "app", "platform", "game", "outcome", "issues", "run", "failure", "perf", "api_gaps"]);
   assert.deepEqual(JSON.parse(JSON.stringify(report)), report);
   assert.equal(report.outcome, "failed");
   assert.deepEqual(report.issues, ["no_start"]);
@@ -71,19 +74,34 @@ test("manual issue template and launcher drafts share symptom labels", { timeout
 });
 
 // spec: REPORT-SAVE-2
-test("issue URL keeps reports through 8000 encoded characters and omits larger reports", { timeout: 1000 }, () => {
+test("issue URL keeps reports through 8000 encoded characters, compacts when needed, and omits larger reports", { timeout: 1000 }, () => {
   const report = buildReport(base, { ...input, note: "A note to keep in the issue" });
-  const json = JSON.stringify(report, null, 2);
-  const room = 8000 - issueDraft(report, json).url.length;
-  const exact = issueDraft(report, json + " ".repeat(room));
+  const compact = JSON.stringify(report);
+  const room = 8000 - issueDraft(report, compact).url.length;
+  const exact = issueDraft(report, compact.replace("Example1,1", "Example1,1" + "x".repeat(room)));
   assert.equal(exact.url.length, 8000);
   assert.equal(exact.attachReport, false);
-  const oversized = issueDraft(report, json + " ".repeat(room + 1));
+
+  // Pretty JSON that exceeds 8000 chars compacts to single-line JSON so the full report stays inline.
+  const padded = JSON.stringify(report, null, 2) + " ".repeat(room + 50);
+  const compacted = issueDraft(report, padded);
+  assert.equal(compacted.attachReport, false);
+  assert.ok(compacted.url.length <= 8000);
+  const compactedBody = new URL(compacted.url).searchParams.get("body")!;
+  assert.deepEqual(JSON.parse(compactedBody.split("\n```json\n")[1].split("\n```")[0]), report);
+
+  // When even compact JSON exceeds 8000 chars, fall back to triage summary + saved file.
+  const hugeGaps = Array.from({ length: 200 }, (_, i) => `mod${i}.dll!LongExportName_${i.toString().padStart(3, "0")}`);
+  const huge = buildReport(base, { ...input, note: "A note to keep in the issue", apiGaps: { called: hugeGaps, imported: [] } });
+  const oversized = issueDraft(huge, JSON.stringify(huge, null, 2));
   const body = new URL(oversized.url).searchParams.get("body")!;
   assert.equal(oversized.attachReport, true);
+  assert.ok(oversized.url.length <= 8000);
   assert.ok(!body.includes("```json"));
-  assert.ok(body.includes(report.note!));
+  assert.ok(body.includes(huge.note!));
   assert.ok(body.includes(ISSUES.crash));
+  assert.ok(body.includes("kind=api"));
+  assert.ok(body.includes("exe+0x1234"));
   const unicode = buildReport(base, { ...input, note: "𠮷".repeat(2000) });
   const shortened = issueDraft(unicode, JSON.stringify(unicode, null, 2));
   assert.equal(shortened.attachReport, true);

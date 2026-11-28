@@ -17,7 +17,8 @@ use adv_sync::background::LocalSender;
 use adv_sync::input::KeyState;
 
 use super::{
-    Finished, Options, control, frontend, json, record::Recorder, save_frame, window, window_json,
+    Finished, Options, RunError, control, frontend, json, record::Recorder, save_frame, window,
+    window_json,
 };
 
 /// How long the guest runs between looks at the host's events.
@@ -51,19 +52,22 @@ pub(crate) fn import_registry(
 
 /// Runs `run`, which ends its session, between the registry watch and settle
 /// of the script `options` start (WINE-SES-11), and returns what it wrote.
-fn watching_registry<R>(
+fn watching_registry<R, E: From<String>>(
     environment: &mut WineHost,
     options: &Options,
     dist: &Path,
-    run: impl FnOnce(&mut WineHost) -> Result<R, String>,
-) -> Result<(R, Option<adv_runtime::wine::session::RegistryReport>), String> {
-    let (prefix, debug, codepage) = facts(options)?;
+    run: impl FnOnce(&mut WineHost) -> Result<R, E>,
+) -> Result<(R, Option<adv_runtime::wine::session::RegistryReport>), E> {
+    let (prefix, debug, codepage) = facts(options).map_err(E::from)?;
     let config = config(options, dist, &prefix, &debug, codepage, "", None);
-    let watch = environment.watch_registry(&config, &session_options(options))?;
+    let watch = environment
+        .watch_registry(&config, &session_options(options))
+        .map_err(E::from)?;
     let result = run(environment)?;
     let report = watch
         .map(|watch| environment.settle_registry(&config, &watch))
-        .transpose()?;
+        .transpose()
+        .map_err(E::from)?;
     Ok((result, report))
 }
 
@@ -244,13 +248,18 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
         let debugger = super::debug::start(options, false, wake.clone(), debug_display);
         let keys = Arc::new(KeyState::default());
         let started = Instant::now();
-        let ((code, frames), registry) =
-            watching_registry(&mut WineHost::default(), options, dist, |environment| {
+        let ((code, frames), registry) = watching_registry::<_, String>(
+            &mut WineHost::default(),
+            options,
+            dist,
+            |environment| {
                 let session = start(environment, options, dist, wake.clone(), &keys, host)?;
                 let (code, session, _) =
-                    drive(options, session, None, &keys, &wake, debugger, started)?;
+                    drive(options, session, None, &keys, &wake, debugger, started)
+                        .map_err(|e| e.message)?;
                 Ok((code, session.presented_frames()))
-            })?;
+            },
+        )?;
         eprintln!(
             "wine: exit {code} after {:.2}s, {frames} frames presented",
             started.elapsed().as_secs_f64(),
@@ -277,7 +286,9 @@ pub(super) fn run_execution(
     wake: WakeEvent,
     keys: Arc<KeyState>,
     background: adv_sync::background::Sender,
-) -> Result<Finished, String> {
+) -> Result<Finished, RunError> {
+    let started = Instant::now();
+    super::panic_report::watch(options, true);
     let debug_display = super::debug::requested(options.debug)
         .then(|| {
             worker
@@ -295,7 +306,8 @@ pub(super) fn run_execution(
             }
             startup.start()
         })
-        .transpose()?;
+        .transpose()
+        .map_err(|e| RunError::from_message(e, started.elapsed()))?;
     let pacer = super::frame_pacer::HostPacer {
         vsync: worker.vsync.take(),
         keys: keys.clone(),
@@ -309,12 +321,11 @@ pub(super) fn run_execution(
 
         pacer: Some(pacer),
     };
-    let started = Instant::now();
-    super::panic_report::watch(options, true);
     let debugger = super::debug::start(options, true, wake.clone(), debug_display);
     let ((exit_code, summary), registry) =
-        watching_registry(environment, options, dist, |environment| {
-            let session = start(environment, options, dist, wake.clone(), &keys, host)?;
+        watching_registry::<_, RunError>(environment, options, dist, |environment| {
+            let session = start(environment, options, dist, wake.clone(), &keys, host)
+                .map_err(|e| RunError::from_message(e, started.elapsed()))?;
             // The session ends before the registry settles.
             let (exit_code, _, summary) = drive(
                 options,
@@ -807,7 +818,7 @@ fn drive(
     wake: &WakeEvent,
     mut debugger: Option<super::debug::Debugger>,
     started: Instant,
-) -> Result<(u8, Session, adv_report::RunSummary), String> {
+) -> Result<(u8, Session, adv_report::RunSummary), RunError> {
     let mut metrics = Metrics::new(super::audio::AudioOutput::from_stream(
         options.audio,
         worker.is_none(),
@@ -825,8 +836,10 @@ fn drive(
     let mut control = options
         .control_stdin
         .then(|| control::Control::start(wake.clone(), keys.clone()))
-        .transpose()?;
-    let mut recorder = Recorder::open(options.record_input.as_deref(), started)?;
+        .transpose()
+        .map_err(|e| RunError::from_message(e, started.elapsed()))?;
+    let mut recorder = Recorder::open(options.record_input.as_deref(), started)
+        .map_err(|e| RunError::from_message(e, started.elapsed()))?;
     let auto_delay = options
         .auto_dialog_ms
         .map(|ms| Duration::from_millis(u64::from(ms)));
@@ -835,6 +848,9 @@ fn drive(
     let mut close_at: Option<Instant> = None;
     let mut minimized = false;
     let mut suspension = super::Suspension::default();
+    let mut user_closed = false;
+    let mut user_force_closed = false;
+    let mut dialogs_seen = std::collections::HashSet::<u32>::new();
     let mut outcome = Outcome {
         reason: "host_window_closed",
         ..Default::default()
@@ -897,6 +913,7 @@ fn drive(
                         let _ = reply.send(session.text(&text));
                     }
                     window::Event::Close => {
+                        user_closed = true;
                         Recorder::record(&mut recorder, format_args!("close"));
                         suspension.apply(&mut metrics.audio, None, Some(false), |paused| {
                             session.set_suspended(paused);
@@ -904,7 +921,10 @@ fn drive(
                         session.close();
                     }
 
-                    window::Event::ForceClose => break 'run,
+                    window::Event::ForceClose => {
+                        user_force_closed = true;
+                        break 'run;
+                    }
 
                     window::Event::AudioSuspended(sleeping) => {
                         suspension.apply(&mut metrics.audio, Some(sleeping), None, |paused| {
@@ -923,6 +943,22 @@ fn drive(
                     }
                     window::Event::Disc(letter, image, reply) => {
                         let _ = reply.send(session.change_disc(letter, &image));
+                    }
+                    window::Event::ReportSnapshot(reply) => {
+                        let snapshot = build_run_summary(
+                            options,
+                            &session,
+                            &metrics,
+                            None,
+                            None,
+                            false,
+                            false,
+                            true,
+                            dialogs_seen.len() as u32,
+                            session.milestones.elapsed_ms(),
+                            worker.is_none(),
+                        );
+                        let _ = reply.send(snapshot);
                     }
                     window::Event::Repaint => {}
                     window::Event::FocusLost => {
@@ -1116,7 +1152,11 @@ fn drive(
                 if worker.needs_menu(bar.key) {
                     worker.publish_menu(bar);
                 }
-                worker.publish_dialogs(session.dialogs());
+                let dialogs = session.dialogs();
+                for dialog in &dialogs.dialogs {
+                    dialogs_seen.insert(dialog.target.hwnd);
+                }
+                worker.publish_dialogs(dialogs);
                 // A guest minimizing itself (a boss key) minimizes the host
                 // window; restoring that window restores the guest.
                 let now_minimized = session.minimized();
@@ -1146,7 +1186,7 @@ fn drive(
         .sys
         .schedule_trace
         .flush()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| RunError::from_message(e.to_string(), started.elapsed()))?;
     if let Err(error) = session.machine.cpu.persist() {
         eprintln!("warning: {error}");
     }
@@ -1161,9 +1201,12 @@ fn drive(
     }
     if let Some(path) = &options.report {
         let snapshot = report(options, &session, &metrics, started, Some(&outcome));
-        super::write_report(path, &snapshot, &session.machine.cpu)?;
+        super::write_report(path, &snapshot, &session.machine.cpu)
+            .map_err(|e| RunError::from_message(e, started.elapsed()))?;
     }
-    options.write_profiles(&session.machine)?;
+    options
+        .write_profiles(&session.machine)
+        .map_err(|e| RunError::from_message(e, started.elapsed()))?;
     if let Some(error) = &outcome.failure {
         eprintln!("wine: {error}");
     }
@@ -1172,28 +1215,345 @@ fn drive(
     } else {
         outcome.exit_code.unwrap_or(0) as u8
     };
+    let missing_dll = (outcome.exit_code == Some(STATUS_DLL_NOT_FOUND))
+        .then(|| session.missing_import())
+        .flatten();
+    let summary = build_run_summary(
+        options,
+        &session,
+        &metrics,
+        Some(&outcome),
+        missing_dll.as_deref(),
+        user_closed,
+        user_force_closed,
+        false,
+        dialogs_seen.len() as u32,
+        ended,
+        worker.is_none(),
+    );
+    if let Some(error) = outcome.screenshot_error {
+        return Err(RunError::new(error, summary));
+    }
+    if let Some(module) = missing_dll {
+        return Err(RunError::new(format!("{MISSING_DLL}{module}"), summary));
+    }
+    Ok((code, session, summary))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_run_summary(
+    options: &Options,
+    session: &Session,
+    metrics: &Metrics,
+    outcome: Option<&Outcome>,
+    missing_dll: Option<&str>,
+    user_closed: bool,
+    user_force_closed: bool,
+    is_live_snapshot: bool,
+    dialogs_shown: u32,
+    ended: u64,
+    headless: bool,
+) -> adv_report::RunSummary {
     session.sync_api_diagnostics();
     let process = session.failed_process.unwrap_or(session.machine.sys.pid);
+    let failed_is_child = session
+        .failed_process
+        .is_some_and(|failed| failed != session.machine.sys.pid);
     let mut failure = None;
-    session.debug_processes(|machine| {
-        if machine.sys.pid == process {
-            failure = super::report_machine_failure(
-                machine,
-                outcome.failure.as_deref(),
-                outcome.exit_code,
-                &session.stub_gaps.borrow(),
-                Duration::from_millis(ended),
-            );
+    if let Some(outcome) = outcome {
+        session.debug_processes(|machine| {
+            if machine.sys.pid == process {
+                failure = super::report_machine_failure(
+                    machine,
+                    outcome.failure.as_deref(),
+                    outcome.exit_code,
+                    missing_dll,
+                    &session.stub_gaps.borrow(),
+                    Duration::from_millis(ended),
+                );
+            }
+        });
+    }
+    let stop = if is_live_snapshot {
+        adv_report::StopReason::LiveSnapshot
+    } else if user_force_closed {
+        adv_report::StopReason::UserForceClose
+    } else if failure
+        .as_ref()
+        .is_some_and(|f| f.kind == adv_report::FailureKind::HostPanic)
+    {
+        adv_report::StopReason::Panic
+    } else if outcome.is_some_and(|o| o.failure.is_some()) {
+        if failure
+            .as_ref()
+            .is_some_and(|f| f.kind == adv_report::FailureKind::HostError)
+        {
+            adv_report::StopReason::HostError
+        } else {
+            adv_report::StopReason::GuestFailure
+        }
+    } else if user_closed || outcome.is_some_and(|o| o.reason == "host_window_closed") {
+        adv_report::StopReason::UserClose
+    } else {
+        adv_report::StopReason::GuestExit
+    };
+    let present_size = {
+        let frame = session.frame();
+        (frame.width > 0 && frame.height > 0).then_some([frame.width, frame.height])
+    };
+    let last_frame = metrics
+        .performance
+        .run_last_frame
+        .map(|at| at.duration_since(session.milestones.started).as_millis() as u64);
+    let frames = metrics.performance.run_frames;
+    let should_capture_hang = is_live_snapshot
+        || user_force_closed
+        || (frames == 0 && ended >= 5_000)
+        || last_frame.is_some_and(|lf| ended.saturating_sub(lf) >= 5_000);
+    let hang = should_capture_hang.then(|| {
+        let control = session.control_metrics();
+        let total = control.run_time + control.wait_time;
+        let idle_wait_pct = (!total.is_zero())
+            .then(|| ((control.wait_time.as_secs_f64() / total.as_secs_f64()) * 100.0).round())
+            .map(|pct| pct.clamp(0.0, 100.0) as u8);
+        let threads = session
+            .collect_thread_snapshots(adv_report::MAX_HANG_THREADS)
+            .into_iter()
+            .map(|t| adv_report::ThreadSnapshot {
+                tid: t.tid,
+                state: t.state.to_owned(),
+                blocked_api: t
+                    .blocked_api
+                    .filter(|api| adv_report::api_name(api) || adv_report::is_safe_token(api, 96)),
+                stack: t
+                    .stack
+                    .into_iter()
+                    .take(6)
+                    .map(|addr| super::anonymize_site(&session.machine, addr))
+                    .collect(),
+            })
+            .collect();
+        let top_boundaries = session
+            .boundaries()
+            .top_entries(adv_report::MAX_HANG_BOUNDARIES)
+            .into_iter()
+            .filter(|(_, name, _, _)| adv_report::is_safe_token(name, 96))
+            .map(|(kind, name, calls, host_ms)| adv_report::BoundaryStat {
+                kind: kind.to_owned(),
+                name,
+                calls,
+                host_ms,
+            })
+            .collect();
+        adv_report::HangSnapshot {
+            exec_thread_responsive: true,
+            idle_wait_pct,
+            threads,
+            top_boundaries,
         }
     });
+
+    let raw = session.collect_diagnostics_raw();
+    let warnings: Vec<_> = raw
+        .warnings
+        .into_iter()
+        .filter_map(|(api, reason, count)| {
+            let api_ok = adv_report::api_name(&api) || adv_report::is_safe_token(&api, 96);
+            let reason = super::sanitize_diag_reason(&reason, 140)?;
+            api_ok.then_some(adv_report::WarningStat { api, reason, count })
+        })
+        .take(adv_report::MAX_DIAG_ENTRIES)
+        .collect();
+    let rejected_probes: Vec<_> = raw
+        .rejected_probes
+        .into_iter()
+        .filter_map(|(api, detail, count)| {
+            let api_ok = adv_report::api_name(&api) || adv_report::is_safe_token(&api, 96);
+            let detail = super::sanitize_diag_reason(&detail, 120)?;
+            api_ok.then_some(adv_report::ProbeRejection { api, detail, count })
+        })
+        .take(adv_report::MAX_PROBE_ENTRIES)
+        .collect();
+    let wine_errors: Vec<_> = raw
+        .wine_errors
+        .into_iter()
+        .filter(|(level, channel, func, _)| {
+            matches!(level.as_str(), "err" | "fixme")
+                && adv_report::is_safe_token(channel, 32)
+                && adv_report::is_safe_token(func, 64)
+        })
+        .take(adv_report::MAX_DIAG_ENTRIES)
+        .map(|(level, channel, func, count)| adv_report::WineLogStat {
+            level,
+            channel,
+            func,
+            count,
+        })
+        .collect();
+    let hooked_exports: Vec<_> = raw
+        .hooked_exports
+        .into_iter()
+        .filter(|(api, form)| adv_report::api_name(api) && adv_report::is_safe_token(form, 32))
+        .take(adv_report::MAX_DIAG_ENTRIES)
+        .map(|(api, form)| adv_report::HookedExport {
+            api,
+            form: form.to_owned(),
+        })
+        .collect();
+    let exceptions_seen: Vec<_> = raw
+        .exceptions_seen
+        .into_iter()
+        .take(adv_report::MAX_PROBE_ENTRIES)
+        .map(|(code, count, last_pc)| adv_report::ExceptionStat {
+            code: format!("{code:#010x}"),
+            count,
+            last_pc: (last_pc != 0).then(|| super::anonymize_site(&session.machine, last_pc)),
+        })
+        .collect();
+    #[cfg(feature = "gpu")]
+    let (d3d9_draws, d3d9_readback_kb) = adv_runtime::d3d9_counters(&session.machine.ext)
+        .map_or((0, 0), |c| (c.gpu_draws, c.readback_bytes / 1024));
+    #[cfg(not(feature = "gpu"))]
+    let (d3d9_draws, d3d9_readback_kb) = (0u64, 0u64);
+    let graphics_diag = (!raw.graphics_fronts.is_empty() || d3d9_draws > 0 || d3d9_readback_kb > 0)
+        .then(|| adv_report::GraphicsDiag {
+            fronts: raw
+                .graphics_fronts
+                .into_iter()
+                .take(8)
+                .map(str::to_owned)
+                .collect(),
+            d3d9_draws,
+            d3d9_readback_kb,
+        });
+    let dsound_failures: std::collections::BTreeMap<String, u64> = session
+        .directsound_create_failures()
+        .into_iter()
+        .filter(|(k, _)| adv_report::is_safe_token(k, 64))
+        .take(adv_report::MAX_PROBE_ENTRIES)
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+    let audio_video_diag = (!raw.audio_fronts.is_empty()
+        || !raw.video_fronts.is_empty()
+        || !dsound_failures.is_empty())
+    .then(|| adv_report::AudioVideoDiag {
+        audio_fronts: raw
+            .audio_fronts
+            .into_iter()
+            .take(8)
+            .map(str::to_owned)
+            .collect(),
+        video_fronts: raw
+            .video_fronts
+            .into_iter()
+            .take(8)
+            .map(str::to_owned)
+            .collect(),
+        dsound_create_failures: dsound_failures,
+    });
+    let mut missing_standard: Vec<String> = raw
+        .font_events
+        .missing_faces
+        .iter()
+        .filter_map(|face| adv_report::canonical_standard_font(face).map(str::to_owned))
+        .collect();
+    missing_standard.sort();
+    missing_standard.dedup();
+    missing_standard.truncate(adv_report::MAX_PROBE_ENTRIES);
+    let font_diag = (!missing_standard.is_empty()
+        || raw.font_events.substitutions > 0
+        || !raw.font_events.charsets.is_empty()
+        || !raw.font_events.gdi_codepages.is_empty())
+    .then(|| adv_report::FontDiag {
+        missing_standard,
+        substitutions: raw.font_events.substitutions,
+        charsets: raw
+            .font_events
+            .charsets
+            .into_iter()
+            .take(adv_report::MAX_PROBE_ENTRIES)
+            .collect(),
+        gdi_codepages: raw.font_events.gdi_codepages.into_iter().take(8).collect(),
+    });
+    let (top_level, visible, live_dialogs) = raw.windows;
+    let windows_diag =
+        (top_level > 0 || visible > 0 || live_dialogs > 0).then_some(adv_report::WindowDiag {
+            top_level,
+            visible,
+            dialogs: live_dialogs,
+        });
+    let host_panics = if failure
+        .as_ref()
+        .is_some_and(|f| f.kind == adv_report::FailureKind::HostPanic)
+    {
+        Vec::new()
+    } else {
+        super::panic_report::session_panics()
+    };
+    let diagnostics = adv_report::Diagnostics {
+        warnings,
+        rejected_probes,
+        wine_errors,
+        hooked_exports,
+        exceptions_seen,
+        graphics: graphics_diag,
+        audio_video: audio_video_diag,
+        fonts: font_diag,
+        windows: windows_diag,
+        host_panics,
+    };
+    let diagnostics = (!diagnostics.is_empty()).then_some(diagnostics);
+
+    let mut perf = adv_report::Perf::from_samples(metrics.performance.frame_samples());
+    if let Some(perf) = &mut perf {
+        let counters = session.debug_counters();
+        let forms = &counters[3..8];
+        let total: u64 = forms.iter().sum();
+        if total > 0 {
+            let pct = |n: u64| {
+                ((n as f64 / total as f64) * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as u8
+            };
+            perf.cpu_share = Some(adv_report::CpuShare {
+                translated_pct: pct(forms[0]),
+                apply_pct: pct(forms[1]),
+                interpret_pct: pct(forms[2]),
+                interpreter_pct: pct(forms[3]),
+                rep_pct: pct(forms[4]),
+            });
+        }
+        perf.top_cliffs = raw
+            .top_cliffs
+            .into_iter()
+            .filter_map(|(name, count)| {
+                let name = super::sanitize_diag_reason(&name, 64)?;
+                Some(adv_report::CliffStat { name, count })
+            })
+            .take(adv_report::MAX_CLIFF_ENTRIES)
+            .collect();
+        perf.peak_heap_mb = crate::heap::usage().map(|(_, peak)| (peak / (1024 * 1024)) as u32);
+    }
+
     let adapter = session
         .machine
         .ext
         .get::<adv_device::surface::SurfaceStore>()
         .device()
         .adapter_identity();
-    let summary = adv_report::RunSummary {
+    adv_report::RunSummary {
+        run: Some(adv_report::RunInfo {
+            jit: options.jit,
+            stop,
+            exit_code: outcome.and_then(|o| o.exit_code).map(|c| format!("{c:#x}")),
+            processes: session.processes_spawned,
+            failed_is_child,
+            dialogs_shown,
+            present_size,
+        }),
         failure,
+        hang,
+        diagnostics,
         graphics: Some(adv_report::Graphics {
             api: if adapter.api == "metal" {
                 adv_report::GraphicsApi::Metal
@@ -1206,11 +1566,9 @@ fn drive(
             driver: adapter.driver,
             tier: adapter.tier,
         }),
-        settings: worker
-            .is_none()
-            .then(|| super::report_settings(options, None, None)),
+        settings: headless.then(|| super::report_settings(options, None, None)),
         api_gaps: adv_report::ApiGaps::new(session.stub_gaps.borrow().called.iter().cloned(), []),
-        perf: adv_report::Perf::from_samples(metrics.performance.frame_samples()),
+        perf,
         timeline: Some(adv_report::Timeline {
             window: session.milestones.window.get().copied(),
             frame: metrics
@@ -1220,23 +1578,11 @@ fn drive(
             audio: session.milestones.audio.get().copied(),
             video: session.milestones.video.get().copied(),
             input: session.milestones.input.get().copied(),
-            frames: metrics.performance.run_frames,
-            last_frame: metrics
-                .performance
-                .run_last_frame
-                .map(|at| at.duration_since(session.milestones.started).as_millis() as u64),
+            frames,
+            last_frame,
             end: ended,
         }),
-    };
-    if let Some(error) = outcome.screenshot_error {
-        return Err(error);
     }
-    if outcome.exit_code == Some(STATUS_DLL_NOT_FOUND)
-        && let Some(module) = session.missing_import()
-    {
-        return Err(format!("{MISSING_DLL}{module}"));
-    }
-    Ok((code, session, summary))
 }
 
 /// Only read back the latest GPU frame on exit when a consumer actually uses
@@ -1628,7 +1974,10 @@ mod tests {
                 issues: vec![adv_report::Issue::Crash],
                 perf_issues: None,
                 note: None,
+                run: summary.run,
                 failure: summary.failure,
+                hang: summary.hang,
+                diagnostics: summary.diagnostics,
                 perf: summary.perf,
                 api_gaps: summary.api_gaps,
                 timeline: summary.timeline,

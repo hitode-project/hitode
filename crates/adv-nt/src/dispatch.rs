@@ -384,17 +384,81 @@ fn syscall(env: &mut Env<'_>) -> Outcome {
     outcome
 }
 
+fn extract_numeric_code(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    for (needle, prefix) in [
+        ("class ", "class:"),
+        ("level ", "level:"),
+        ("type ", "type:"),
+        ("code ", "code:"),
+        ("os error ", "errno:"),
+    ] {
+        if let Some((_, tail)) = lower.split_once(needle) {
+            let token: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit() || *c == 'x')
+                .collect();
+            if !token.is_empty() && token.len() <= 16 {
+                return Some(format!("{prefix}{token}"));
+            }
+        }
+    }
+    None
+}
+
+fn note_unsupported(
+    env: &mut Env<'_>,
+    subsystem: &'static str,
+    op: String,
+    code: Option<String>,
+    outcome: &Outcome,
+) {
+    if let Outcome::Fail(message) = outcome
+        && env.ext.try_get::<crate::exception::Record>().is_none()
+    {
+        env.ext.insert(crate::exception::LastUnsupported {
+            subsystem,
+            op,
+            code: code.or_else(|| extract_numeric_code(message)),
+        });
+    }
+}
+
 fn dispatch_syscall(env: &mut Env<'_>, number: usize) -> Outcome {
     if number >= WIN32K_FIRST {
         kuser::refresh(env);
         server::set_time(env);
-        return win32k::call(env, number as u32);
+        let outcome = win32k::call(env, number as u32);
+        note_unsupported(
+            env,
+            "win32k_syscall",
+            format!("win32k_{number:#x}"),
+            None,
+            &outcome,
+        );
+        return outcome;
     }
     let Some(&(name, bytes)) = SYSCALLS.get(number) else {
-        return Outcome::Fail(format!("unknown system call {number:#x}"));
+        let outcome = Outcome::Fail(format!("unknown system call {number:#x}"));
+        note_unsupported(
+            env,
+            "nt_syscall",
+            format!("syscall_{number:#x}"),
+            Some("unknown_syscall".into()),
+            &outcome,
+        );
+        return outcome;
     };
     let Some(call) = TABLE[number] else {
-        return Outcome::Fail(format!("system call {name} is not implemented"));
+        let outcome = Outcome::Fail(format!("system call {name} is not implemented"));
+        note_unsupported(
+            env,
+            "nt_syscall",
+            name.to_owned(),
+            Some("not_implemented".into()),
+            &outcome,
+        );
+        return outcome;
     };
     crate::file::invalidate_syscall(name);
     kuser::refresh(env);
@@ -405,7 +469,9 @@ fn dispatch_syscall(env: &mut Env<'_>, number: usize) -> Outcome {
         *arg = env.arg(index as u32 + 1);
     }
     let outcome = call(env, &args[..count]);
-    server::boundary(env, outcome)
+    let outcome = server::boundary(env, outcome);
+    note_unsupported(env, "nt_syscall", name.to_owned(), None, &outcome);
+    outcome
 }
 
 fn unix_call(env: &mut Env<'_>) -> Outcome {
@@ -419,5 +485,23 @@ fn unix_call(env: &mut Env<'_>) -> Outcome {
         _ => Outcome::Return(crate::status::INVALID_HANDLE),
     };
     counters::unix(env, handle, code, since);
-    server::boundary(env, outcome)
+    let outcome = server::boundary(env, outcome);
+    if matches!(outcome, Outcome::Fail(_)) {
+        let lib = if handle == NTDLL_UNIXLIB {
+            "ntdll.so".to_owned()
+        } else {
+            env.ext
+                .try_get::<crate::unixlib::Names>()
+                .and_then(|names| names.0.get(&handle).cloned())
+                .unwrap_or_else(|| "unixlib".to_owned())
+        };
+        note_unsupported(
+            env,
+            "unix_call",
+            format!("{lib}:{code}"),
+            Some(format!("code:{code}")),
+            &outcome,
+        );
+    }
+    outcome
 }

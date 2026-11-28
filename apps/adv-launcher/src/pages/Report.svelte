@@ -8,11 +8,12 @@
   import { prefs } from "../lib/prefs.svelte";
   import { PERF_ISSUES } from "../lib/report";
   import { ISSUE_LABELS, ReportForm, SITUATIONS } from "../lib/report-form.svelte";
+  import { canReveal, reveal } from "../lib/reveal";
 
   let { gameId }: { gameId: string } = $props();
 
   const game = $derived(library.get(gameId));
-  const form = new ReportForm(() => game, () => runs.summaryOf(gameId), false);
+  const form = new ReportForm(() => game, () => runs.summaryOf(gameId), false, () => runs.running === gameId);
   const ctx = $derived(form.context);
 
   // A report opened during play (from the pause menu) keeps the game paused.
@@ -186,8 +187,14 @@
           <svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v7.5M4.8 7l3.2 3.2L11.2 7"></path><path d="M3 12.5h10"></path></svg>
         {/snippet}
         <div class="path mono">{form.savedPath}</div>
-        {#if form.attachReport}<p>{t("把文件附到问题中")}</p>{/if}
+        {#if form.attachReport}
+          <p>{form.copied ? t("已复制报告内容，可直接粘贴到问题中或附上此文件") : t("把文件附到问题中")}</p>
+        {/if}
         <div class="acts">
+          <button class="secondary big" onclick={() => form.copy()}>{form.copied ? t("已复制") : t("复制报告")}</button>
+          {#if canReveal() && form.savedPath}
+            <button class="reveal" onclick={() => reveal(form.savedPath)}>{t("在访达中显示")}</button>
+          {/if}
           <button class="primary big" data-autofocus onclick={() => nav.back()} style="min-width: 96px">{t("完成")}</button>
         </div>
       </ReportResult>

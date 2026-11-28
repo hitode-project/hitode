@@ -420,7 +420,9 @@ impl Ui {
                     self.execution_wake.signal_frontend();
                     continue;
                 }
-                window::Event::Menu(_) | window::Event::Dialog(_) => {}
+                window::Event::Menu(_)
+                | window::Event::Dialog(_)
+                | window::Event::ReportSnapshot(_) => {}
             }
             had_input = true;
             self.deliver(Delivery::Input(event))?;

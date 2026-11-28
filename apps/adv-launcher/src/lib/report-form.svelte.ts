@@ -6,8 +6,8 @@ import { prefs } from "./prefs.svelte";
 import { gameFilter } from "./upscaling.svelte";
 import { fakeReportBase, fakeSavedPath, fakeSubmit } from "./fake-report";
 import { codepageLabel } from "./format";
-import type { RunSummary } from "./host";
-import { buildReport, issueDraft, PERF_ISSUES, type PerfIssue, type Report, type ReportBase, type ReportApiGaps, type ReportFailure, type ReportPerf, type Situation, type ReportTitle, type ReportTimeline, type ReportSettings } from "./report";
+import { liveReportSummary, type RunSummary } from "./host";
+import { buildReport, issueDraft, PERF_ISSUES, type PerfIssue, type Report, type ReportBase, type ReportApiGaps, type ReportDiagnostics, type ReportFailure, type ReportHang, type ReportPerf, type ReportRun, type Situation, type ReportTitle, type ReportTimeline, type ReportSettings } from "./report";
 import type { Game } from "./types";
 
 // The report form shared by the desktop and phone report screens: what the
@@ -38,6 +38,7 @@ export const ISSUE_LABELS: Record<PerfIssue, string> = {
 export interface ReportContext {
   base: ReportBase;
   title: ReportTitle | null;
+  run: ReportRun | null;
   timeline: ReportTimeline | null;
   /** Header line under the game title. */
   build: string;
@@ -49,6 +50,8 @@ export interface ReportContext {
   failureLabel: string;
   /** From the last run this session; null when it recorded none. */
   failure: ReportFailure | null;
+  hang: ReportHang | null;
+  diagnostics: ReportDiagnostics | null;
   perfLabel: string;
   perf: ReportPerf | null;
   /** Null when the last run met no unimplemented API. */
@@ -63,7 +66,20 @@ function failureLabel(summary: RunSummary | null | undefined): string {
   const f = summary.failure;
   if (!f) return t("没有记录到失败");
   if (f.kind === "api") return t("未实现 · {0}", f.api ?? t("未知接口"));
-  if (f.kind === "cpu") return t("CPU 异常 · {0}", f.cpu_fault ?? t("未知"));
+  if (f.kind === "nt_unsupported") {
+    const detail = [f.op ?? f.source, f.code].filter(Boolean).join(" ");
+    return t("未支持 · {0}", detail || t("系统调用"));
+  }
+  if (f.kind === "missing_dll") return t("缺少组件 · {0}", f.dlls?.join(", ") || f.code || "DLL");
+  if (f.kind === "cpu") return t("CPU 异常 · {0}", f.cpu_fault ?? f.code ?? t("未知"));
+  if (f.kind === "host_error") {
+    const detail = [f.source, f.op, f.code].filter(Boolean).join(" ");
+    return t("宿主错误 · {0}", detail || t("未知"));
+  }
+  if (f.kind === "host_panic") {
+    const detail = f.panic?.location ?? f.panic?.thread ?? t("内部异常");
+    return t("内部异常 · {0}", detail);
+  }
   return t("运行时错误");
 }
 
@@ -83,7 +99,16 @@ function gapsLabel(gaps: ReportApiGaps): string {
  * main program (report_base), and the failure and frame timing come from the
  * game's last run this session (`summary`; missing when it has not run).
  */
-export async function loadReportContext(game: Game, summary: RunSummary | null | undefined, phone: boolean): Promise<ReportContext> {
+export async function loadReportContext(
+  game: Game,
+  summary: RunSummary | null | undefined,
+  phone: boolean,
+  liveRunning = false,
+): Promise<ReportContext> {
+  if (liveRunning) {
+    const live = await liveReportSummary().catch(() => null);
+    if (live) summary = live;
+  }
   const played = playback(game.id);
   const recorded = summary?.settings;
   const settings: ReportSettings = recorded
@@ -112,6 +137,7 @@ export async function loadReportContext(game: Game, summary: RunSummary | null |
   return {
     base,
     title: game.vndb ? { vndb: game.vndb.id, name: game.vndb.title, edition: base.game.file_version ?? "" } : null,
+    run: summary?.run ?? null,
     timeline: summary?.timeline ?? null,
     build: `hitode ${app.version} · ${platformName}`,
     exeLabel: `sha256 ${sha.slice(0, 4)}…${sha.slice(-4)} · ${(base.game.exe_size / 1048576).toFixed(1)} MB`,
@@ -120,6 +146,8 @@ export async function loadReportContext(game: Game, summary: RunSummary | null |
     codepageLabel: `${base.game.codepage} ${codepageLabel(base.game.codepage)}`,
     failureLabel: failureLabel(summary),
     failure: summary?.failure ?? null,
+    hang: summary?.hang ?? null,
+    diagnostics: summary?.diagnostics ?? null,
     perfLabel: perfLabel(summary),
     perf: summary?.perf ?? null,
     apiGaps: summary?.api_gaps ?? null,
@@ -149,6 +177,8 @@ export class ReportForm {
   off = $state<Record<Optional, boolean>>({ title: false, failure: false, perf: false, gaps: false, note: false });
   rawOpen = $state(false);
   savedPath = $state("");
+  savedJson = $state("");
+  copied = $state(false);
   sharing = $state(false);
   shareError = $state(false);
   /** Null while loading. */
@@ -159,17 +189,30 @@ export class ReportForm {
   #ctx = (): ReportContext | null => this.context;
 
   /** Create during component initialisation: loads the context of the game `game()` returns. */
-  constructor(game: () => Game | undefined, summary: () => RunSummary | null | undefined, phone: boolean) {
+  constructor(
+    game: () => Game | undefined,
+    summary: () => RunSummary | null | undefined,
+    phone: boolean,
+    isRunning: () => boolean = () => false,
+  ) {
     $effect(() => {
       const g = game();
       const s = summary();
+      const running = isRunning();
       this.context = null;
       this.loadError = "";
       if (!g) return;
       let live = true;
-      loadReportContext(g, s, phone).then(
+      loadReportContext(g, s, phone, running).then(
         (ctx) => {
-          if (live) { this.context = ctx; this.edition = ctx.title?.edition ?? ""; }
+          if (live) {
+            this.context = ctx;
+            this.edition = ctx.title?.edition ?? "";
+            const frames = ctx.timeline?.frames ?? 0;
+            if (ctx.failure) this.situation = frames === 0 ? "no_start" : "crash";
+            else if (ctx.run?.stop === "user_force_close" || ctx.hang?.exec_thread_responsive === false)
+              this.situation = "freeze";
+          }
         },
         (error: unknown) => {
           if (live) this.loadError = String(error);
@@ -196,10 +239,10 @@ export class ReportForm {
       { id: "cp", label: t("编码"), value: ctx.codepageLabel, locked: true },
     ];
     if (ctx.title) list.push({ id: "title", label: t("作品与版本"), value: ctx.title.name, txt: true, locked: false, optional: "title" });
-    // A launch failure is the point of the report, so it cannot be left out.
-    if (this.hasFail)
+    // Keep observed failures and performance regardless of which symptom tile the player picks.
+    if (ctx.failure || this.hasFail)
       list.push({ id: "fail", label: t("失败信息"), value: ctx.failureLabel, locked: this.situation === "no_start", optional: "failure" });
-    if (this.isPerf) list.push({ id: "perf", label: t("性能"), value: ctx.perfLabel, locked: false, optional: "perf" });
+    if (ctx.perf || this.isPerf) list.push({ id: "perf", label: t("性能"), value: ctx.perfLabel, locked: false, optional: "perf" });
     // Gaps the game survived matter in every situation.
     if (ctx.apiGaps) list.push({ id: "gaps", label: t("未实现接口"), value: gapsLabel(ctx.apiGaps), locked: false, optional: "gaps" });
     if (this.trimmed) list.push({ id: "note", label: t("备注"), value: this.trimmed, txt: true, locked: false, optional: "note" });
@@ -209,17 +252,20 @@ export class ReportForm {
   readonly report = $derived.by((): Report | null => {
     const ctx = this.#ctx();
     if (!ctx) return null;
-    const { situation, hasFail, isPerf, trimmed, off } = this;
-    const keepFailure = hasFail && (situation === "no_start" || !off.failure);
+    const { situation, trimmed, off } = this;
+    const keepFailure = situation === "no_start" || !off.failure;
     return buildReport(ctx.base, {
       situation,
       title: ctx.title ? { ...ctx.title, edition: this.edition.trim() } : null,
       keepTitle: !off.title,
+      run: ctx.run,
       timeline: ctx.timeline,
       perfIssues: PERF_ISSUES.filter((k) => this.issues[k]),
       note: trimmed && !off.note ? trimmed : null,
       failure: keepFailure ? ctx.failure : null,
-      perf: isPerf && !off.perf ? ctx.perf : null,
+      hang: ctx.hang,
+      diagnostics: ctx.diagnostics,
+      perf: !off.perf ? ctx.perf : null,
       apiGaps: off.gaps ? null : ctx.apiGaps,
     });
   });
@@ -243,12 +289,14 @@ export class ReportForm {
     if (!report || this.sending) return;
     this.deliveryError = "";
     this.attachReport = false;
+    this.copied = false;
     try {
       const json = await call<string>("report_json", { report }, JSON.stringify(report, null, 2));
       const { url, attachReport } = issueDraft(report, json);
       if (attachReport) {
-        if (!(await this.save())) return;
+        if (!(await this.save(json))) return;
         this.attachReport = true;
+        await this.copy();
       }
       if (!inTauri) window.open(url, "_blank", "noopener");
       else if (device.platform === "android") await invokeHost("open_issue_in_browser", { url });
@@ -259,16 +307,49 @@ export class ReportForm {
     }
   }
 
-  async save(): Promise<boolean> {
+  async save(validatedJson?: string): Promise<boolean> {
     const report = this.report;
     if (!report || this.sending) return false;
     try {
+      const json = validatedJson ?? (await call<string>("report_json", { report }, JSON.stringify(report, null, 2)));
       this.savedPath = await call<string>("save_report", { report }, fakeSavedPath());
+      this.savedJson = json;
+      this.copied = false;
       this.shareError = false;
       this.view = "saved";
       return true;
     } catch (error) {
       console.error("save_report failed", error);
+      return false;
+    }
+  }
+
+  async copy(): Promise<boolean> {
+    const json = this.savedJson || this.raw;
+    if (!json) return false;
+    const block = `\`\`\`json\n${json}\n\`\`\``;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(block);
+        this.copied = true;
+        return true;
+      }
+    } catch {
+      // Fall through to legacy selection copy when clipboard permission is unavailable.
+    }
+    try {
+      const area = document.createElement("textarea");
+      area.value = block;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(area);
+      this.copied = ok;
+      return ok;
+    } catch {
       return false;
     }
   }

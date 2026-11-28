@@ -47,22 +47,16 @@ export interface GamePatch {
   folder?: string; exe?: string;
 }
 export interface RunSummary {
+  run?: import("./report").ReportRun | null;
   graphics?: import("./report").ReportGraphics | null;
   settings?: import("./report").ReportSettings | null;
   timeline?: import("./report").ReportTimeline | null;
-  failure: {
-    kind: "api" | "cpu" | "runtime";
-    api: string | null;
-    cpu_fault: string | null;
-    after: "lt_1m" | "1m_10m" | "10m_1h" | "gt_1h";
-  } | null;
-  perf: {
-    frame_ms_p50: number;
-    frame_ms_p95: number;
-    frame_ms_p99: number;
-  } | null;
+  failure: import("./report").ReportFailure | null;
+  hang?: import("./report").ReportHang | null;
+  diagnostics?: import("./report").ReportDiagnostics | null;
+  perf: import("./report").ReportPerf | null;
   /** Missing in summaries saved before API gaps were recorded. */
-  api_gaps?: { called: string[]; imported: string[] } | null;
+  api_gaps?: import("./report").ReportApiGaps | null;
 }
 export type GameFinished =
   | { gameId: string; exitCode: number; summary: RunSummary; registry?: RegistryImportResult }
@@ -123,6 +117,10 @@ export function startGame(id: string, exe?: string): Promise<void> {
 /** Pause or resume the running game, e.g. while the pause menu or report page is open. */
 export function pauseGame(paused: boolean): Promise<void> {
   return call("pause_game", { paused }, undefined);
+}
+/** Captures a live read-only report snapshot from the currently running session, if any. */
+export function liveReportSummary(): Promise<RunSummary | null> {
+  return call("live_report_summary", {}, null);
 }
 /** Asks the running game to close, or with `force` ends it at once. */
 export function stopGame(force = false): Promise<void> {
