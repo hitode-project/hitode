@@ -4,7 +4,7 @@ use super::*;
 use adv_device::gpu::ImageId;
 use smallvec::SmallVec;
 
-pub(super) use crate::record::reuse::Saved;
+pub(super) use crate::record::reuse::{Core, Saved};
 pub(super) type Cache = crate::record::reuse::Cache<Id, Entry>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,8 +30,10 @@ pub(super) struct Entry {
     index_key: u128,
     indices: Arc<[u32]>,
     prepared: Arc<key::Prepared>,
-    spans: fixed::CapturedSpans,
+    spans: Arc<fixed::CapturedSpans>,
     pub saved: std::sync::OnceLock<Saved>,
+    /// The preparation of an earlier occurrence with other destination versions.
+    pub core: Option<Arc<Core>>,
 }
 #[cfg(test)]
 impl Entry {
@@ -299,6 +301,11 @@ fn draw(
                 if same_destination && let Some(old) = entry.saved.get() {
                     let _ = saved.set(old.clone());
                 }
+                let core = entry
+                    .saved
+                    .get()
+                    .map(|old| old.core.clone())
+                    .or_else(|| entry.core.clone());
                 Arc::new(Entry {
                     signature: entry.signature.clone(),
                     index_key: entry.index_key,
@@ -306,6 +313,7 @@ fn draw(
                     prepared,
                     spans: entry.spans.clone(),
                     saved,
+                    core,
                 })
             } else {
                 entry
@@ -338,8 +346,9 @@ fn draw(
                 index_key,
                 indices: indices.into(),
                 prepared: Arc::new(prepared),
-                spans,
+                spans: Arc::new(spans),
                 saved: Default::default(),
+                core: None,
             })
         };
     let owner = com(env)

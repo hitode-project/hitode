@@ -14,7 +14,7 @@ pub(crate) mod trace;
 pub(crate) use contents::Contents;
 pub use contents::ResourceKey;
 
-pub(crate) use planner::{Cursor, Op, Plan, Reason, Recording};
+pub(crate) use planner::{Cursor, Op, Plan, Reason, Recording, Reuse};
 
 /// The adapter supplies the executable payload and maps its flush boundaries.
 pub(crate) trait Front {

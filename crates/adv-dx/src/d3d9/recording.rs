@@ -472,7 +472,10 @@ fn append(
         effects,
         bytes: p.bytes,
         fresh: matches!(&p.operation, Operation::Upload { pixels, .. } if matches!(pixels.key(), UploadKey::Admission(_))),
-        reuse: entry.map(|entry| &entry.saved),
+        reuse: entry.map(|entry| record::Reuse {
+            saved: &entry.saved,
+            core: entry.core.as_ref(),
+        }),
         trace: trace::capturing().then_some(&detail as &dyn Fn(_, _, &crate::record::Contents)),
     });
     if let Some((resource, level)) = upload {

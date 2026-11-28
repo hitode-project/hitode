@@ -627,3 +627,56 @@ fn targets_whose_entries_every_readback_drops_rest() {
         [0, 0, 2, 0, 2, 2, 0]
     );
 }
+
+#[test]
+// spec: GFX-REC-11
+fn a_changed_destination_keeps_the_preparation_of_later_draws() {
+    let builds = std::cell::Cell::new(0);
+    let mut runs = Vec::new();
+    for uncached in [false, true] {
+        let (mut f, _) = reuse_fixture();
+        let owner = id(&mut f);
+        let corner = f.packet([12u32, 8, 4, 4, 0, 1f32.to_bits()]);
+        let whole = f.packet([0u32, 0, 16, 12, 0, 1f32.to_bits()]);
+        let mut frames = Vec::new();
+        let mut steady = Vec::new();
+        for n in 0..6 {
+            let start = f.m.ext.get::<State>().frames;
+            clear(&mut f, 0xff000000);
+            // A changing fill first gives every later draw another destination version.
+            let color = [0xff00ff00u32, 0xff0000ff][n % 2];
+            f.okay("IDirect3DDevice9::SetViewport", &[f.device, corner]);
+            clear(&mut f, color);
+            f.okay("IDirect3DDevice9::SetViewport", &[f.device, whole]);
+            for cull in [1, 2, 1] {
+                f.okay("IDirect3DDevice9::SetRenderState", &[f.device, 22, cull]);
+                if uncached {
+                    frame(&mut env(&mut f), owner).reuse = Default::default();
+                }
+                reuse_draw(&mut f, &[0, 1, 2], &builds);
+            }
+            f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+            present(&mut f);
+            f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+            let image = f.image(f.back);
+            frames.push(f.pixels(&image));
+            let end = f.m.ext.get::<State>().frames;
+            steady.push((
+                end.reused_draws - start.reused_draws,
+                end.recorded_draws - start.recorded_draws,
+                end.draw_key_hashes - start.draw_key_hashes,
+            ));
+        }
+        assert_ne!(frames[0], frames[1]);
+        runs.push((frames, steady));
+    }
+    assert_eq!(runs[0].0, runs[1].0, "reuse changed the pixels");
+    if cfg!(feature = "d3d9-counters") {
+        // Each draw keeps its preparation although its destination changed:
+        // it records nothing and hashes no command. Recording them again
+        // would count (3, 3, 14).
+        for &counts in &runs[0].1[1..] {
+            assert_eq!(counts, (3, 0, 11), "{:?}", runs[0].1);
+        }
+    }
+}

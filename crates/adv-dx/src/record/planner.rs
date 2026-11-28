@@ -10,8 +10,16 @@ pub(crate) struct Op<'a, P> {
     pub effects: damage::Input<'a>,
     pub bytes: usize,
     pub fresh: bool,
-    pub reuse: Option<&'a OnceLock<reuse::Saved>>,
+    pub reuse: Option<Reuse<'a>>,
     pub trace: Option<&'a AdmissionTrace<'a>>,
+}
+
+/// A command's retained preparation: the slot this occurrence fills, and the
+/// core of an earlier occurrence that met other destination versions.
+#[derive(Clone, Copy)]
+pub(crate) struct Reuse<'a> {
+    pub saved: &'a OnceLock<reuse::Saved>,
+    pub core: Option<&'a Arc<reuse::Core>>,
 }
 
 type AdmissionTrace<'a> = dyn Fn(usize, bool, &Contents) + 'a;
@@ -28,6 +36,7 @@ struct Undo {
 }
 impl Admitted {
     #[cfg(feature = "d3d9-counters")]
+    /// Whether the admission reused an earlier preparation instead of recording.
     pub fn reused(&self) -> bool {
         self.reused
     }
@@ -202,7 +211,7 @@ impl<P> Recording<P> {
 
     pub fn admit(&mut self, op: Op<'_, P>) -> Admitted {
         let p = &op.effects;
-        let retained = op.reuse.and_then(OnceLock::get);
+        let retained = op.reuse.and_then(|r| r.saved.get());
         let shared = retained.filter(|saved| {
             p.writes
                 .iter()
@@ -211,7 +220,15 @@ impl<P> Recording<P> {
                     self.damage.independent(key) || self.contents.get(key).copied() == *old
                 })
         });
-        let bytes = if retained.is_some() { 0 } else { op.bytes };
+        // Retained preparations share the payload of an earlier frame.
+        let bytes = if op
+            .reuse
+            .is_some_and(|r| retained.is_some() || r.core.is_some())
+        {
+            0
+        } else {
+            op.bytes
+        };
         if let Some(trace) = op.trace {
             trace(self.commands.len(), shared.is_some(), &self.contents);
         }
@@ -229,12 +246,13 @@ impl<P> Recording<P> {
                 })
                 .collect(),
         });
-        let destinations = op.reuse.filter(|entry| entry.get().is_none()).map(|_| {
-            p.writes
-                .iter()
-                .map(|(key, _)| self.contents.get(key).copied())
-                .collect()
-        });
+        let destinations: Option<SmallVec<[_; 3]>> =
+            op.reuse.filter(|r| r.saved.get().is_none()).map(|_| {
+                p.writes
+                    .iter()
+                    .map(|(key, _)| self.contents.get(key).copied())
+                    .collect()
+            });
         let read_versions: SmallVec<[Option<u128>; 4]> = if shared.is_none() {
             p.reads
                 .iter()
@@ -243,10 +261,28 @@ impl<P> Recording<P> {
         } else {
             SmallVec::new()
         };
+        // An earlier occurrence's core holds while this one reads the same versions.
+        let core = if shared.is_some() {
+            None
+        } else {
+            op.reuse
+                .and_then(|r| r.core.or(retained.map(|saved| &saved.core)))
+                .filter(|core| core.reads == read_versions)
+        };
         let mut key_hashes = 0;
+        let mut keys = None;
         let (command, attachment, damage) = if let Some(saved) = shared {
-            self.damage.replay(&saved.damage, p.slot, &self.contents);
-            (saved.command, saved.attachment, None)
+            self.damage
+                .replay(&saved.core.damage, &saved.keys, p.slot, &self.contents);
+            (saved.core.command, saved.core.attachment, None)
+        } else if let Some(core) = core {
+            let occurrence = self
+                .damage
+                .keys(p, [core.command, core.attachment], &self.contents);
+            self.damage
+                .replay(&core.damage, &occurrence, p.slot, &self.contents);
+            keys = Some(occurrence);
+            (core.command, core.attachment, None)
         } else {
             key_hashes += 1;
             let mut command = xxhash_rust::xxh3::Xxh3::new();
@@ -264,9 +300,13 @@ impl<P> Recording<P> {
                 &read_versions,
                 destinations.is_some(),
             );
+            let damage = damage.map(|(damage, occurrence)| {
+                keys = Some(occurrence);
+                damage
+            });
             (command, attachment, damage)
         };
-        let mut outputs = Vec::new();
+        let mut outputs = SmallVec::new();
         for (n, &(key, overwrite)) in p.writes.iter().enumerate() {
             let command = p.write_key(key, if key.2 == 0 { command } else { attachment });
             let slot = self.contents.resolve(key);
@@ -299,8 +339,19 @@ impl<P> Recording<P> {
             }
         }
         if let Some(saved) = shared {
-            self.passes.replay(saved.pass.clone());
+            self.passes.replay(saved.core.pass.clone());
+        } else if let Some(core) = core {
+            self.passes.replay(core.pass.clone());
+            if let (Some(r), Some(destinations)) = (op.reuse, destinations) {
+                let _ = r.saved.set(reuse::Saved {
+                    core: core.clone(),
+                    keys: keys.unwrap(),
+                    destinations,
+                    outputs,
+                });
+            }
         } else {
+            let reads = destinations.is_some().then(|| read_versions.clone());
             let pass = self.passes.record(
                 p.kind,
                 SmallVec::from_slice(p.reads),
@@ -309,12 +360,16 @@ impl<P> Recording<P> {
                 p.bounds,
                 destinations.is_some(),
             );
-            if let (Some(entry), Some(destinations)) = (op.reuse, destinations) {
-                let _ = entry.set(reuse::Saved {
-                    command,
-                    attachment,
-                    damage: damage.unwrap(),
-                    pass: pass.unwrap(),
+            if let (Some(r), Some(destinations)) = (op.reuse, destinations) {
+                let _ = r.saved.set(reuse::Saved {
+                    core: Arc::new(reuse::Core {
+                        command,
+                        attachment,
+                        damage: damage.unwrap(),
+                        pass: pass.unwrap(),
+                        reads: reads.unwrap(),
+                    }),
+                    keys: keys.unwrap(),
                     destinations,
                     outputs,
                 });
@@ -328,7 +383,7 @@ impl<P> Recording<P> {
         Admitted {
             key_hashes,
             #[cfg(feature = "d3d9-counters")]
-            reused: shared.is_some(),
+            reused: shared.is_some() || core.is_some(),
             undo,
         }
     }
