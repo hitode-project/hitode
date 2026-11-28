@@ -2125,3 +2125,143 @@ fn storage_binding_limits(indexed: bool) {
         }
     }
 }
+
+#[test]
+fn dropped_pipelines_evict_from_cache_and_retire_after_gpu_completion() {
+    let (device, mut queue) = gpu!(Modern::empty());
+    let draw_wgsl = "
+        @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+            let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+            return vec4<f32>(p * 2.0 - 1.0, 0.5, 1.0);
+        }
+        @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }
+    ";
+    let draw_shader = device
+        .create_shader(ShaderDesc {
+            source: Source::Wgsl(draw_wgsl),
+            identity: 190,
+            label: "evict draw",
+        })
+        .unwrap();
+    let render_desc = RenderPipelineDesc {
+        vertex: draw_shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: Some(draw_shader.entry("fs", Stage::Fragment).unwrap()),
+        bindings: vec![],
+        primitive: Primitive {
+            topology: Topology::Triangles,
+            cull: Cull::None,
+            front_ccw: false,
+            wireframe: false,
+            unclipped_depth: false,
+        },
+        colors: [ColorTarget {
+            format: Format::Rgba8Unorm,
+            blend: None,
+            write_mask: 15,
+        }]
+        .into_iter()
+        .collect(),
+        depth_stencil: None,
+        samples: 1,
+        sample_mask: u32::MAX,
+        alpha_to_coverage: false,
+        label: "evict draw",
+    };
+    let compute_shader = device
+        .create_shader(ShaderDesc {
+            source: Source::Wgsl(
+                "@group(3) @binding(0) var<storage, read_write> out: array<u32>;
+                 @compute @workgroup_size(1) fn main() { out[0] = 42u; }",
+            ),
+            identity: 191,
+            label: "evict compute",
+        })
+        .unwrap();
+    let compute_desc = ComputePipelineDesc {
+        entry: compute_shader.entry("main", Stage::Compute).unwrap(),
+        bindings: vec![Binding {
+            slot: 0,
+            kind: BindingKind::StorageBuffer { writable: true },
+            stages: Stages::COMPUTE,
+        }],
+        label: "evict compute",
+    };
+    let render = device.create_render_pipeline(&render_desc, None).unwrap();
+    let render_dup = device.create_render_pipeline(&render_desc, None).unwrap();
+    assert!(Arc::ptr_eq(
+        &render.inner.compiled,
+        &render_dup.inner.compiled
+    ));
+    drop(render_dup);
+    let compute = device.create_compute_pipeline(&compute_desc, None).unwrap();
+    {
+        let pipelines = device.inner.0.pipelines.lock().unwrap();
+        assert_eq!(pipelines.render.len(), 1);
+        assert_eq!(pipelines.compute.len(), 1);
+    }
+
+    let size = Extent {
+        width: 4,
+        height: 4,
+        depth_or_layers: 1,
+    };
+    let target = create_image(&device, Format::Rgba8Unorm, size, 1, 1);
+    let pixels = readback(&device, 64);
+    let values = device
+        .create_buffer(&BufferDesc {
+            size: 16,
+            usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC,
+            memory: Memory::Readback,
+            label: "evict values",
+        })
+        .unwrap();
+
+    let mut encoder = queue.encoder("drop pipelines before submit");
+    {
+        let mut rpass = encoder.render_pass(&pass(
+            target.view(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            },
+            Load::Clear([0.0; 4]),
+            Store::Store,
+            None,
+        ));
+        rpass.set_pipeline(&render);
+        rpass.draw(0..3, 0..1);
+    }
+    read_image(&mut encoder, &target, 0, 0, size, &pixels);
+    {
+        let mut cpass = encoder.compute_pass(&ComputePassDesc {
+            timestamps: None,
+            label: "evict compute",
+        });
+        cpass.set_pipeline(&compute);
+        cpass.bind(0, Bind::StorageBuffer(values.slice(0..16)));
+        cpass.dispatch(1, 1, 1);
+    }
+
+    // Dropping the last handles removes weak cache entries immediately and queues
+    // Vulkan destruction behind the open encoder's completion token.
+    drop(render);
+    drop(compute);
+    {
+        let pipelines = device.inner.0.pipelines.lock().unwrap();
+        assert!(pipelines.render.is_empty());
+        assert!(pipelines.compute.is_empty());
+    }
+    assert!(device.inner.0.retired.lock().unwrap().len() >= 2);
+
+    finish(&mut queue, encoder);
+    assert!(device.inner.0.retired.lock().unwrap().is_empty());
+    for pixel in bytes(&pixels).as_chunks::<4>().0 {
+        assert_eq!(*pixel, [0, 255, 0, 255]);
+    }
+    assert_eq!(
+        u32::from_le_bytes(bytes(&values)[..4].try_into().unwrap()),
+        42
+    );
+}

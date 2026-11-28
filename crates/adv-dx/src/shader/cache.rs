@@ -5,8 +5,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, mpsc};
+use std::time::{Duration, Instant, SystemTime};
 const MAX_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_QUEUED_WRITES: usize = 64;
+const MAX_WRITES_BETWEEN_SCANS: usize = 64;
+const RESCAN_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 static TMP_NONCE: AtomicU64 = AtomicU64::new(1);
 
 enum WriterMsg {
@@ -16,12 +19,56 @@ enum WriterMsg {
         bytes: Vec<u8>,
     },
     #[cfg(test)]
+    Sync(mpsc::SyncSender<()>),
+    #[cfg(test)]
     Flush(mpsc::SyncSender<()>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DirFingerprint {
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    len: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+impl DirFingerprint {
+    fn of(directory: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(directory).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self {
+                modified: meta.modified().ok(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                len: meta.len(),
+                ctime: meta.ctime(),
+                ctime_nsec: meta.ctime_nsec(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Some(Self {
+                modified: meta.modified().ok(),
+            })
+        }
+    }
 }
 
 struct DirIndex {
     entries: VecDeque<(PathBuf, u64)>,
     total: u64,
+    fingerprint: Option<DirFingerprint>,
+    last_write: Instant,
+    writes_since_scan: usize,
 }
 
 impl DirIndex {
@@ -52,21 +99,37 @@ impl DirIndex {
             .into_iter()
             .map(|(_, size, path)| (path, size))
             .collect();
-        Self { entries, total }
+        Self {
+            entries,
+            total,
+            fingerprint: None,
+            last_write: Instant::now(),
+            writes_since_scan: 0,
+        }
     }
 
-    fn record_and_prune(&mut self, path: &Path, size: u64) {
-        if let Some(pos) = self.entries.iter().position(|(p, _)| p == path) {
-            let (_, old_size) = self.entries.remove(pos).unwrap();
-            self.total = self.total.saturating_sub(old_size);
+    fn is_stale(&self, directory: &Path) -> bool {
+        self.fingerprint.is_none()
+            || DirFingerprint::of(directory) != self.fingerprint
+            || self.writes_since_scan >= MAX_WRITES_BETWEEN_SCANS
+            || self.last_write.elapsed() >= RESCAN_IDLE_INTERVAL
+    }
+
+    fn refresh(&mut self, directory: &Path) {
+        self.fingerprint = DirFingerprint::of(directory);
+        self.last_write = Instant::now();
+    }
+
+    fn prune_keeping(&mut self, keep: &Path) {
+        if let Some(pos) = self.entries.iter().position(|(p, _)| p == keep) {
+            let entry = self.entries.remove(pos).unwrap();
+            self.entries.push_back(entry);
         }
-        self.entries.push_back((path.to_path_buf(), size));
-        self.total = self.total.saturating_add(size);
         while self.total > MAX_CACHE_BYTES {
             let Some((old, old_size)) = self.entries.pop_front() else {
                 break;
             };
-            if old == path {
+            if old == keep {
                 self.entries.push_back((old, old_size));
                 break;
             }
@@ -78,6 +141,17 @@ impl DirIndex {
                 Err(_) => {}
             }
         }
+    }
+
+    fn record_and_prune(&mut self, path: &Path, size: u64) {
+        if let Some(pos) = self.entries.iter().position(|(p, _)| p == path) {
+            let (_, old_size) = self.entries.remove(pos).unwrap();
+            self.total = self.total.saturating_sub(old_size);
+        }
+        self.entries.push_back((path.to_path_buf(), size));
+        self.total = self.total.saturating_add(size);
+        self.writes_since_scan += 1;
+        self.prune_keeping(path);
     }
 }
 
@@ -98,6 +172,10 @@ fn writer() -> Option<&'static mpsc::SyncSender<WriterMsg>> {
                                 bytes,
                             } => {
                                 let _ = write_entry(&mut dirs, &directory, &path, &bytes);
+                            }
+                            #[cfg(test)]
+                            WriterMsg::Sync(done) => {
+                                let _ = done.send(());
                             }
                             #[cfg(test)]
                             WriterMsg::Flush(done) => {
@@ -123,9 +201,9 @@ fn write_entry(
         dirs.remove(directory);
     }
     std::fs::create_dir_all(directory)?;
-    let index = dirs
-        .entry(directory.to_path_buf())
-        .or_insert_with(|| DirIndex::scan(directory));
+    let need_scan = dirs
+        .get(directory)
+        .is_none_or(|index| index.is_stale(directory));
     let nonce = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
     let result = (|| {
@@ -141,8 +219,27 @@ fn write_entry(
         let _ = std::fs::remove_file(&temporary);
     }
     result?;
-    index.record_and_prune(path, bytes.len() as u64);
+    if need_scan {
+        let mut index = DirIndex::scan(directory);
+        index.prune_keeping(path);
+        index.refresh(directory);
+        dirs.insert(directory.to_path_buf(), index);
+    } else {
+        let index = dirs.get_mut(directory).unwrap();
+        index.record_and_prune(path, bytes.len() as u64);
+        index.refresh(directory);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+fn sync_writer() {
+    if let Some(tx) = writer() {
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        if tx.send(WriterMsg::Sync(done_tx)).is_ok() {
+            let _ = done_rx.recv();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +476,59 @@ mod tests {
             .sum();
         assert!(total <= MAX_CACHE_BYTES);
         assert!(unrelated.is_file());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    // spec: GFX-CACHE-3
+    fn external_writes_into_shared_cache_dir_resync_and_enforce_cap() {
+        let first =
+            Shader::parse(&[0xffff0200, 0x02000001, 0x800f0800, 0xa0e40000, 0xffff]).unwrap();
+        let second =
+            Shader::parse(&[0xffff0200, 0x02000001, 0x800f0800, 0xa0e40001, 0xffff]).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "adv-wgsl-shared-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Initialize the worker's DirIndex for `dir` without clearing it afterward.
+        first.translate_cached(&dir, false).unwrap();
+        sync_writer();
+
+        // Advance past coarse mtime granularity on non-Apple filesystems before
+        // simulating external writes from another process sharing `dir`.
+        #[cfg(not(target_vendor = "apple"))]
+        std::thread::sleep(Duration::from_millis(20));
+
+        for n in 10..12 {
+            std::fs::File::create(dir.join(format!("{n:064x}.wgsl-cache")))
+                .unwrap()
+                .set_len(MAX_CACHE_BYTES)
+                .unwrap();
+        }
+        let unrelated = dir.join("keep.bin");
+        std::fs::File::create(&unrelated)
+            .unwrap()
+            .set_len(MAX_CACHE_BYTES * 2)
+            .unwrap();
+
+        second.translate_cached(&dir, false).unwrap();
+        sync_writer();
+        let second_path = dir.join(format!("{}.wgsl-cache", key(&second, false)));
+        assert!(second_path.is_file());
+        let total: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|v| v == "wgsl-cache"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert!(total <= MAX_CACHE_BYTES);
+        assert!(unrelated.is_file());
+        flush_writer();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

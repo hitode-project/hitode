@@ -4,6 +4,12 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct EntryKey(u64, u32, Stage);
+fn entry_key(entry: &Entry) -> EntryKey {
+    EntryKey(entry.shader.identity, entry.index, entry.stage)
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ColorKey {
     format: MTLPixelFormat,
@@ -11,9 +17,9 @@ struct ColorKey {
     write_mask: u8,
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct RenderKey {
-    vertex: Entry,
-    fragment: Option<Entry>,
+pub(super) struct RenderKey {
+    vertex: EntryKey,
+    fragment: Option<EntryKey>,
     colors: Vec<ColorKey>,
     color_slots: u8,
     depth: MTLPixelFormat,
@@ -28,8 +34,8 @@ impl RenderKey {
             .and_then(|d| caps::pixel_format(d.format))
             .unwrap_or(MTLPixelFormat::Invalid);
         Self {
-            vertex: desc.vertex.clone(),
-            fragment: desc.fragment.clone(),
+            vertex: entry_key(&desc.vertex),
+            fragment: desc.fragment.as_ref().map(entry_key),
             colors: desc
                 .colors
                 .iter()
@@ -87,16 +93,52 @@ impl DepthKey {
         )
     }
 }
+pub(super) struct RenderState {
+    pub raw: Object<dyn MTLRenderPipelineState>,
+    device: Weak<DeviceState>,
+    key: RenderKey,
+}
+impl Drop for RenderState {
+    fn drop(&mut self) {
+        if let Some(device) = self.device.upgrade() {
+            let mut pipelines = device.pipelines.lock().unwrap();
+            if let std::collections::hash_map::Entry::Occupied(entry) =
+                pipelines.render.entry(self.key.clone())
+                && entry.get().strong_count() == 0
+            {
+                entry.remove();
+            }
+        }
+    }
+}
+pub(super) struct ComputeState {
+    pub raw: Object<dyn MTLComputePipelineState>,
+    device: Weak<DeviceState>,
+    key: EntryKey,
+}
+impl Drop for ComputeState {
+    fn drop(&mut self) {
+        if let Some(device) = self.device.upgrade() {
+            let mut pipelines = device.pipelines.lock().unwrap();
+            if let std::collections::hash_map::Entry::Occupied(entry) =
+                pipelines.compute.entry(self.key)
+                && entry.get().strong_count() == 0
+            {
+                entry.remove();
+            }
+        }
+    }
+}
 #[derive(Default)]
 pub(super) struct Pipelines {
-    render: HashMap<RenderKey, Object<dyn MTLRenderPipelineState>>,
+    pub(super) render: HashMap<RenderKey, Weak<RenderState>>,
     depth: HashMap<DepthKey, Object<dyn MTLDepthStencilState>>,
-    compute: HashMap<Entry, Object<dyn MTLComputePipelineState>>,
+    pub(super) compute: HashMap<EntryKey, Weak<ComputeState>>,
 }
 #[derive(Clone)]
 pub(crate) struct RenderPipeline(pub(super) Arc<RenderData>);
 pub(super) struct RenderData {
-    pub raw: Object<dyn MTLRenderPipelineState>,
+    pub state: Arc<RenderState>,
     pub depth: Object<dyn MTLDepthStencilState>,
     pub raster: Raster,
     pub topology: MTLPrimitiveType,
@@ -152,7 +194,7 @@ impl Raster {
 #[derive(Clone)]
 pub(crate) struct ComputePipeline(pub(super) Arc<ComputeData>);
 pub(super) struct ComputeData {
-    pub raw: Object<dyn MTLComputePipelineState>,
+    pub state: Arc<ComputeState>,
     pub workgroup: MTLSize,
     pub threadgroup: Box<[u32]>,
     pub used: shader::Used,
@@ -192,10 +234,10 @@ impl Device {
             ];
             let key = RenderKey::new(desc, slots);
             let depth_key = DepthKey::new(desc.depth_stencil);
-            let (cached_raw, cached_depth) = {
+            let (cached_state, cached_depth) = {
                 let pipelines = self.0.pipelines.lock().unwrap();
                 (
-                    pipelines.render.get(&key).cloned(),
+                    pipelines.render.get(&key).and_then(Weak::upgrade),
                     pipelines.depth.get(&depth_key).cloned(),
                 )
             };
@@ -207,7 +249,7 @@ impl Device {
                     .as_ref()
                     .is_some_and(|a| !a.added_render.contains(&key))
             });
-            let descriptor = (cached_raw.is_none() || need_archive).then(|| {
+            let descriptor = (cached_state.is_none() || need_archive).then(|| {
                 let d = MTLRenderPipelineDescriptor::new();
                 d.setLabel(Some(&NSString::from_str(desc.label)));
                 d.setVertexFunction(Some(&vertex.raw));
@@ -252,8 +294,8 @@ impl Device {
                     a.added_render.insert(key.clone());
                 }
             }
-            let raw = match cached_raw {
-                Some(raw) => raw,
+            let state = match cached_state {
+                Some(state) => state,
                 None => {
                     let d = descriptor.as_ref().unwrap();
                     let raw = {
@@ -267,7 +309,19 @@ impl Device {
                             .map_err(|e| shader::compile_error("render pipeline", e))?
                     };
                     let mut pipelines = self.0.pipelines.lock().unwrap();
-                    pipelines.render.entry(key).or_insert(raw).clone()
+                    if let Some(existing) = pipelines.render.get(&key).and_then(Weak::upgrade) {
+                        drop(pipelines);
+                        drop(raw);
+                        existing
+                    } else {
+                        let state = Arc::new(RenderState {
+                            raw,
+                            device: Arc::downgrade(&self.0),
+                            key: key.clone(),
+                        });
+                        pipelines.render.insert(key, Arc::downgrade(&state));
+                        state
+                    }
                 }
             };
             let depth = match cached_depth {
@@ -303,7 +357,7 @@ impl Device {
             };
             Ok(crate::RenderPipeline {
                 inner: RenderPipeline(Arc::new(RenderData {
-                    raw,
+                    state,
                     depth,
                     raster: Raster::new(
                         desc.primitive,
@@ -337,21 +391,22 @@ impl Device {
                 ));
             }
             let used = self.used(&desc.bindings, Stages::COMPUTE, entry)?;
+            let key = entry_key(&desc.entry);
             let cached = self
                 .0
                 .pipelines
                 .lock()
                 .unwrap()
                 .compute
-                .get(&desc.entry)
-                .cloned();
+                .get(&key)
+                .and_then(Weak::upgrade);
             let need_archive = cache.is_some_and(|c| {
                 c.inner
                     .0
                     .read()
                     .unwrap()
                     .as_ref()
-                    .is_some_and(|a| !a.added_compute.contains(&desc.entry))
+                    .is_some_and(|a| !a.added_compute.contains(&key))
             });
             let descriptor = (cached.is_none() || need_archive).then(|| {
                 let d = MTLComputePipelineDescriptor::new();
@@ -362,16 +417,16 @@ impl Device {
             if need_archive && let (Some(cache), Some(d)) = (cache, descriptor.as_ref()) {
                 let mut archive = cache.inner.0.write().unwrap();
                 if let Some(a) = archive.as_mut()
-                    && !a.added_compute.contains(&desc.entry)
+                    && !a.added_compute.contains(&key)
                 {
                     a.raw
                         .addComputePipelineFunctionsWithDescriptor_error(d)
                         .map_err(|e| shader::compile_error("compute archive", e))?;
-                    a.added_compute.insert(desc.entry.clone());
+                    a.added_compute.insert(key);
                 }
             }
-            let raw = match cached {
-                Some(raw) => raw,
+            let state = match cached {
+                Some(state) => state,
                 None => {
                     let d = descriptor.as_ref().unwrap();
                     let raw = {
@@ -389,17 +444,25 @@ impl Device {
                             .map_err(|e| shader::compile_error("compute pipeline", e))?
                     };
                     let mut pipelines = self.0.pipelines.lock().unwrap();
-                    pipelines
-                        .compute
-                        .entry(desc.entry.clone())
-                        .or_insert(raw)
-                        .clone()
+                    if let Some(existing) = pipelines.compute.get(&key).and_then(Weak::upgrade) {
+                        drop(pipelines);
+                        drop(raw);
+                        existing
+                    } else {
+                        let state = Arc::new(ComputeState {
+                            raw,
+                            device: Arc::downgrade(&self.0),
+                            key,
+                        });
+                        pipelines.compute.insert(key, Arc::downgrade(&state));
+                        state
+                    }
                 }
             };
             let [width, height, depth] = entry.workgroup.map(|n| n as usize);
             Ok(crate::ComputePipeline {
                 inner: ComputePipeline(Arc::new(ComputeData {
-                    raw,
+                    state,
                     workgroup: MTLSize {
                         width,
                         height,
@@ -509,7 +572,7 @@ struct Archive {
     /// current contents. A loaded archive starts from its source file.
     last: Option<Arc<TemporaryFile>>,
     added_render: HashSet<RenderKey>,
-    added_compute: HashSet<Entry>,
+    added_compute: HashSet<EntryKey>,
 }
 const MAGIC: &[u8; 8] = b"ADVMTL\0\x01";
 fn header(device: &ProtocolObject<dyn MTLDevice>) -> Vec<u8> {

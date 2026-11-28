@@ -397,6 +397,13 @@ impl Compiler {
 }
 
 impl Pipelines {
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        let mut pipelines = Self::default();
+        pipelines.entries = LruCache::new(capacity);
+        pipelines.modern_lru = LruCache::new(capacity);
+        pipelines
+    }
     pub fn modern(
         &mut self,
         device: &Device,
@@ -2416,5 +2423,64 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         assert!(cache.contains_key(&0));
         assert!(!cache.contains_key(&1));
         assert!(cache.contains_key(&MAX_PIPELINES));
+    }
+
+    // spec: GFX-CACHE-1
+    #[test]
+    fn lru_eviction_releases_evicted_pipeline_jobs_and_handles() {
+        let Some((gpu, _queue, _consumer)) = open() else {
+            return;
+        };
+        let mut pipelines = Pipelines::with_capacity(2);
+        let state_for = |mask: u8| {
+            let mut state = DrawState::new(1, 1);
+            state.color_write = mask;
+            state
+        };
+        drop(
+            pipelines
+                .fixed(&gpu.device, &state_for(1), &[Format::Bgra8Unorm], None, 0)
+                .unwrap(),
+        );
+        drop(
+            pipelines
+                .fixed(&gpu.device, &state_for(2), &[Format::Bgra8Unorm], None, 0)
+                .unwrap(),
+        );
+        // Touch mask 1 so mask 2 becomes the least recently used entry.
+        drop(
+            pipelines
+                .fixed(&gpu.device, &state_for(1), &[Format::Bgra8Unorm], None, 0)
+                .unwrap(),
+        );
+        assert_eq!(pipelines.cache_hits, 1);
+        assert_eq!(pipelines.misses, 2);
+
+        // Inserting a third variant evicts mask 2 from both `entries` and `jobs`.
+        drop(
+            pipelines
+                .fixed(&gpu.device, &state_for(4), &[Format::Bgra8Unorm], None, 0)
+                .unwrap(),
+        );
+        assert_eq!(pipelines.entries.len(), 2);
+        assert_eq!(pipelines.jobs.lock().unwrap().len(), 2);
+        assert_eq!(pipelines.misses, 3);
+
+        // Mask 1 still hits; requesting evicted mask 2 must recompile instead of
+        // finding a lingering job or entry.
+        drop(
+            pipelines
+                .fixed(&gpu.device, &state_for(1), &[Format::Bgra8Unorm], None, 0)
+                .unwrap(),
+        );
+        assert_eq!(pipelines.cache_hits, 2);
+        drop(
+            pipelines
+                .fixed(&gpu.device, &state_for(2), &[Format::Bgra8Unorm], None, 0)
+                .unwrap(),
+        );
+        assert_eq!(pipelines.misses, 4);
+        assert_eq!(pipelines.entries.len(), 2);
+        assert_eq!(pipelines.jobs.lock().unwrap().len(), 2);
     }
 }

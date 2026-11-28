@@ -899,35 +899,63 @@ fn performance_cores() -> Option<usize> {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux", test))]
-fn performance_cores_from_frequencies(frequencies: &[u64]) -> Option<usize> {
-    let mut iter = frequencies.iter().copied().filter(|&freq| freq > 0);
-    let first = iter.next()?;
-    let (mut min, mut max, mut total) = (first, first, 1usize);
-    for freq in iter {
+fn performance_cores_from_cpu_frequencies(
+    cpus: &[(u32, u64)],
+    allowed: Option<&[u32]>,
+) -> Option<usize> {
+    let mut iter = cpus.iter().copied().filter(|&(_, freq)| freq > 0);
+    let (_, first) = iter.next()?;
+    let (mut min, mut max) = (first, first);
+    for (_, freq) in iter {
         min = min.min(freq);
         max = max.max(freq);
-        total += 1;
     }
-    if min == max {
-        Some(total)
-    } else {
-        Some(frequencies.iter().filter(|&&freq| freq > min).count())
+    let count = cpus
+        .iter()
+        .filter(|&&(cpu, freq)| {
+            freq > 0 && (min == max || freq > min) && allowed.is_none_or(|mask| mask.contains(&cpu))
+        })
+        .count();
+    (count > 0).then_some(count)
+}
+
+/// Read-only query of the calling thread's allowed CPU set (`sched_getaffinity`).
+/// Never pins threads or calls `sched_setaffinity` (AND-APP-8).
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn allowed_cpus() -> Option<Vec<u32>> {
+    // SAFETY: `set` is zero-initialized and passed with its exact byte size to
+    // the read-only `sched_getaffinity` query for the calling thread (pid 0).
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return None;
+        }
+        let mut cpus = Vec::new();
+        for cpu in 0..(libc::CPU_SETSIZE as usize) {
+            if libc::CPU_ISSET(cpu, &set) {
+                cpus.push(cpu as u32);
+            }
+        }
+        (!cpus.is_empty()).then_some(cpus)
     }
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn performance_cores() -> Option<usize> {
-    let frequencies: Vec<u64> = std::fs::read_dir("/sys/devices/system/cpu")
+    let cpus: Vec<(u32, u64)> = std::fs::read_dir("/sys/devices/system/cpu")
         .ok()?
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name();
-            name.to_str()?.strip_prefix("cpu")?.parse::<u32>().ok()?;
+            let cpu = name.to_str()?.strip_prefix("cpu")?.parse::<u32>().ok()?;
             let path = entry.path().join("cpufreq/cpuinfo_max_freq");
-            std::fs::read_to_string(path).ok()?.trim().parse().ok()
+            let freq = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+            Some((cpu, freq))
         })
         .collect();
-    performance_cores_from_frequencies(&frequencies)
+    let allowed = allowed_cpus();
+    performance_cores_from_cpu_frequencies(&cpus, allowed.as_deref())
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "android", target_os = "linux")))]
@@ -3120,41 +3148,98 @@ mod tests {
     // spec: A64-TR-9
     #[test]
     fn performance_core_sizing_excludes_little_clusters_without_pinning() {
-        assert_eq!(performance_cores_from_frequencies(&[]), None);
-        assert_eq!(performance_cores_from_frequencies(&[0, 0]), None);
-        // Homogeneous SoCs keep all cores.
-        assert_eq!(performance_cores_from_frequencies(&[2_000_000; 4]), Some(4));
-        assert_eq!(performance_cores_from_frequencies(&[2_400_000; 8]), Some(8));
-        // 4 big + 4 little -> 4 performance cores (3 helpers + owner).
+        let indexed = |freqs: &[u64]| -> Vec<(u32, u64)> {
+            freqs
+                .iter()
+                .enumerate()
+                .map(|(cpu, &freq)| (cpu as u32, freq))
+                .collect()
+        };
+        assert_eq!(performance_cores_from_cpu_frequencies(&[], None), None);
         assert_eq!(
-            performance_cores_from_frequencies(&[
-                1_800_000, 1_800_000, 1_800_000, 1_800_000, 2_400_000, 2_400_000, 2_400_000,
-                2_400_000,
-            ]),
+            performance_cores_from_cpu_frequencies(&indexed(&[0, 0]), None),
+            None
+        );
+        // Homogeneous SoCs keep all allowed cores.
+        assert_eq!(
+            performance_cores_from_cpu_frequencies(&indexed(&[2_000_000; 4]), None),
             Some(4)
         );
+        assert_eq!(
+            performance_cores_from_cpu_frequencies(&indexed(&[2_400_000; 8]), None),
+            Some(8)
+        );
+        assert_eq!(
+            performance_cores_from_cpu_frequencies(&indexed(&[2_400_000; 8]), Some(&[0, 2, 4])),
+            Some(3)
+        );
+        // 4 big + 4 little -> 4 performance cores (3 helpers + owner).
+        let four_big_four_little = indexed(&[
+            1_800_000, 1_800_000, 1_800_000, 1_800_000, 2_400_000, 2_400_000, 2_400_000, 2_400_000,
+        ]);
+        assert_eq!(
+            performance_cores_from_cpu_frequencies(&four_big_four_little, None),
+            Some(4)
+        );
+        // Affinity restricting to 4 little + 2 of the 4 big cores counts only those 2 perf cores.
+        assert_eq!(
+            performance_cores_from_cpu_frequencies(
+                &four_big_four_little,
+                Some(&[0, 1, 2, 3, 4, 5])
+            ),
+            Some(2)
+        );
+        assert_eq!(worker_limit(6, Some(2)), 1);
+        // Affinity restricting to only 2 big cores counts 2 perf cores.
+        assert_eq!(
+            performance_cores_from_cpu_frequencies(&four_big_four_little, Some(&[4, 5])),
+            Some(2)
+        );
+        // Affinity restricting exclusively to homogeneous little cores falls back to parallelism.
+        assert_eq!(
+            performance_cores_from_cpu_frequencies(&four_big_four_little, Some(&[0, 1, 2, 3])),
+            None
+        );
+        assert_eq!(worker_limit(4, None), 3);
+
         // 2 big + 6 little -> 2 performance cores (1 helper + owner).
         assert_eq!(
-            performance_cores_from_frequencies(&[
-                1_800_000, 1_800_000, 1_800_000, 1_800_000, 1_800_000, 1_800_000, 2_200_000,
-                2_200_000,
-            ]),
+            performance_cores_from_cpu_frequencies(
+                &indexed(&[
+                    1_800_000, 1_800_000, 1_800_000, 1_800_000, 1_800_000, 1_800_000, 2_200_000,
+                    2_200_000,
+                ]),
+                None
+            ),
             Some(2)
         );
         // 1 prime + 3 big + 4 little -> 4 performance cores (excludes little, keeps prime+big).
+        let one_three_four = indexed(&[
+            2_000_000, 2_000_000, 2_000_000, 2_000_000, 2_800_000, 2_800_000, 2_800_000, 3_200_000,
+        ]);
         assert_eq!(
-            performance_cores_from_frequencies(&[
-                2_000_000, 2_000_000, 2_000_000, 2_000_000, 2_800_000, 2_800_000, 2_800_000,
-                3_200_000,
-            ]),
+            performance_cores_from_cpu_frequencies(&one_three_four, None),
             Some(4)
+        );
+        // Affinity with 2 big + 1 prime still counts all 3 allowed performance cores.
+        assert_eq!(
+            performance_cores_from_cpu_frequencies(&one_three_four, Some(&[4, 5, 7])),
+            Some(3)
+        );
+        // Affinity with 2 little + 1 big + 1 prime counts only the 2 allowed performance cores.
+        assert_eq!(
+            performance_cores_from_cpu_frequencies(&one_three_four, Some(&[0, 1, 4, 7])),
+            Some(2)
         );
         // 1 prime + 3 big + 2 mid + 2 little -> 6 non-little cores.
         assert_eq!(
-            performance_cores_from_frequencies(&[
-                2_270_000, 2_270_000, 2_960_000, 2_960_000, 3_150_000, 3_150_000, 3_150_000,
-                3_300_000,
-            ]),
+            performance_cores_from_cpu_frequencies(
+                &indexed(&[
+                    2_270_000, 2_270_000, 2_960_000, 2_960_000, 3_150_000, 3_150_000, 3_150_000,
+                    3_300_000,
+                ]),
+                None
+            ),
             Some(6)
         );
 
