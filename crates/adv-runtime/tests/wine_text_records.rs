@@ -481,10 +481,15 @@ fn a_d3d9_draw_that_samples_a_text_texture_is_recorded_with_its_map_child() {
     let kinds: Vec<_> = moves.iter().map(|moved| moved.kind).collect();
     assert_eq!(
         kinds,
-        [MoveKind::Upload, MoveKind::Draw, MoveKind::Present],
+        [
+            MoveKind::Upload,
+            MoveKind::Draw,
+            MoveKind::Present,
+            MoveKind::Readback
+        ],
         "{moves:#?}"
     );
-    let [upload, draw, present] = [moves[0], moves[1], moves[2]];
+    let [upload, draw, present, read] = [moves[0], moves[1], moves[2], moves[3]];
     // The texture's DC pixels reach the texture, the quad samples it 1:1 at
     // (8, 4) on the back buffer, and the back buffer reaches the window.
     assert_eq!(draw.source, upload.destination);
@@ -501,4 +506,70 @@ fn a_d3d9_draw_that_samples_a_text_texture_is_recorded_with_its_map_child() {
     assert_eq!(present.source, draw.destination);
     assert!(matches!(present.destination, Store::Window(_)));
     assert_eq!(present.rect, [0, 0, 128, 64]);
+    // The back buffer comes back to the system-memory surface's pixels.
+    assert_eq!(read.source, draw.destination);
+    let Store::Memory(copy) = read.destination else {
+        panic!("{read:?}");
+    };
+    assert_eq!((copy.bpp, copy.size), (32, [128, 64]), "{read:?}");
+    assert_eq!(read.map, Some(Map::offset(0, 0)));
+}
+
+// spec: WINE-UNIX-8
+#[cfg(feature = "gpu")]
+#[test]
+fn text_moved_through_direct3d11_is_recorded_up_to_the_window_and_back() {
+    in_child("text_moved_through_direct3d11_is_recorded_up_to_the_window_and_back_child");
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn text_moved_through_direct3d11_is_recorded_up_to_the_window_and_back_child() {
+    let batch = recorded("text-records-d3d11.exe", true);
+    let lines = lines(&batch);
+    assert_eq!(
+        lines.iter().map(|line| text(line)).collect::<Vec<_>>(),
+        ["Hi"]
+    );
+    let moves = moves(&batch);
+    let kinds: Vec<_> = moves.iter().map(|moved| moved.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            MoveKind::Upload,
+            MoveKind::DeviceCopy,
+            MoveKind::Present,
+            MoveKind::DeviceCopy,
+            MoveKind::Readback
+        ],
+        "{moves:#?}"
+    );
+    let [upload, placed, present, copied, read] =
+        [moves[0], moves[1], moves[2], moves[3], moves[4]];
+    // The DIB's bits go up whole, the texture lands at (8, 4) on the back
+    // buffer, which the window shows and the staging texture reads back.
+    assert_eq!(upload.source, Store::Memory(lines[0].plane.unwrap()));
+    assert_eq!(
+        (upload.rect, upload.map),
+        ([0, 0, 64, 32], Some(Map::offset(0, 0)))
+    );
+    assert_eq!(placed.source, upload.destination);
+    assert_eq!(
+        (placed.rect, placed.map),
+        ([8, 4, 72, 36], Some(Map::offset(-8, -4)))
+    );
+    assert_eq!(present.source, placed.destination);
+    assert!(matches!(present.destination, Store::Window(_)));
+    assert_eq!(
+        (present.rect, present.map),
+        ([0, 0, 128, 64], Some(Map::offset(0, 0)))
+    );
+    assert_eq!(copied.source, placed.destination);
+    assert_eq!(read.source, copied.destination);
+    let Store::Memory(shadow) = read.destination else {
+        panic!("{read:?}");
+    };
+    assert_eq!((shadow.bpp, shadow.size), (32, [128, 64]));
+    assert_eq!(read.rect, [0, 0, 128, 64]);
 }

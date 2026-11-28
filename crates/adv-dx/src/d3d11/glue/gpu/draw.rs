@@ -2450,6 +2450,9 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             retained_bytes: capture.bytes,
         },
     )?;
+    // The recorder has no affine map for a D3D11 draw's samples.
+    let draw = adv_machine::text_records::MoveKind::Draw;
+    crate::text::drew(env, draw, scissor, &writes, &reads, |_| None);
     Ok(())
 }
 

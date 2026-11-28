@@ -1,11 +1,16 @@
 //! Text records (WINE-UNIX-8) for device work: uploads, draws and copies that
-//! move pixels holding text into device resources, and presents that show
-//! them in a window. Direct3D resources are named by the frame recorder's
-//! keys, which every frontend already computes for each operation;
-//! DirectDraw surfaces live in guest memory and are named by their pixels.
+//! move pixels holding text into device resources, presents that show them
+//! in a window, and readbacks that return them to guest memory. Direct3D
+//! resources are named by the content keys every frontend already computes;
+//! DirectDraw surfaces and Direct3D 11 map shadows live in guest memory and
+//! are named by their pixels. Where a path has no `Env`, a [`Noter`] taken
+//! at its entry, or a DirectDraw [`SurfaceMoves`] queue drained by its front,
+//! carries the notes.
 #[cfg(feature = "gpu")]
 use crate::record::{Kind, ResourceKey, damage};
 use adv_device::surface::{PixelFormat, Rect, Surface};
+#[cfg(feature = "gpu")]
+use adv_machine::Ext;
 use adv_machine::{
     Env,
     text_records::{self, Map, MoveKind, Plane, Store},
@@ -45,64 +50,113 @@ pub(crate) fn recorded(env: &Env<'_>, effects: &damage::Input<'_>, origin: Origi
     if !on(env) {
         return;
     }
-    let rect = corners(effects.bounds);
-    for &(target, _) in effects.writes.iter().filter(|(key, _)| key.2 == 0) {
-        let destination = resource(target);
-        match effects.kind {
-            Kind::Upload => {
-                if let Some(plane) = origin.upload {
-                    let map = Map::offset(-rect[0], -rect[1]);
-                    let source = Store::Memory(plane);
-                    text_records::moved(
-                        env,
-                        MoveKind::Upload,
-                        destination,
-                        rect,
-                        source,
-                        Some(map),
-                    );
+    let kind = match effects.kind {
+        Kind::Upload => {
+            if let Some(plane) = origin.upload {
+                for &(target, _) in effects.writes.iter().filter(|(key, _)| key.2 == 0) {
+                    uploaded(env, plane, target, effects.bounds);
                 }
             }
-            Kind::Draw | Kind::Copy => {
-                let kind = if effects.kind == Kind::Draw {
-                    MoveKind::Draw
-                } else {
-                    MoveKind::DeviceCopy
-                };
-                // A draw that blends reads its own target; that moves nothing.
-                for &source in effects
-                    .reads
-                    .iter()
-                    .filter(|key| key.2 == 0 && **key != target)
-                {
-                    let sampled = effects.samples.iter().find(|read| read.source == source);
-                    let map = sampled
-                        .map(|read| Map {
-                            scale: read.mapping.scale,
-                            offset: read.mapping.offset,
-                        })
-                        .or(origin.copy);
-                    text_records::moved(env, kind, destination, rect, resource(source), map);
-                }
-            }
-            Kind::Clear => {}
+            return;
+        }
+        Kind::Draw => MoveKind::Draw,
+        Kind::Copy => MoveKind::DeviceCopy,
+        Kind::Clear => return,
+    };
+    drew(
+        env,
+        kind,
+        effects.bounds,
+        effects.writes,
+        effects.reads,
+        |source| {
+            effects
+                .samples
+                .iter()
+                .find(|read| read.source == source)
+                .map(|read| Map {
+                    scale: read.mapping.scale,
+                    offset: read.mapping.offset,
+                })
+                .or(origin.copy)
+        },
+    );
+}
+
+/// Note an upload of guest `plane`, from its origin, to `bounds` of `target`.
+#[cfg(feature = "gpu")]
+pub(crate) fn uploaded(env: &Env<'_>, plane: Plane, target: ResourceKey, bounds: Rect) {
+    let rect = corners(bounds);
+    text_records::moved(
+        env,
+        MoveKind::Upload,
+        resource(target),
+        rect,
+        Store::Memory(plane),
+        Some(Map::offset(-rect[0], -rect[1])),
+    );
+}
+
+/// Note a draw or device copy within `bounds` from each color resource it
+/// reads into each one it writes, through `map` of that source.
+#[cfg(feature = "gpu")]
+pub(crate) fn drew(
+    env: &Env<'_>,
+    kind: MoveKind,
+    bounds: Rect,
+    writes: &[(ResourceKey, bool)],
+    reads: &[ResourceKey],
+    map: impl Fn(ResourceKey) -> Option<Map>,
+) {
+    if !on(env) {
+        return;
+    }
+    let rect = corners(bounds);
+    for &(target, _) in writes.iter().filter(|(key, _)| key.2 == 0) {
+        // A draw that blends reads its own target; that moves nothing.
+        for &source in reads.iter().filter(|key| key.2 == 0 && **key != target) {
+            let destination = resource(target);
+            text_records::moved(env, kind, destination, rect, resource(source), map(source));
         }
     }
 }
 
 /// Note a present of `source` into `window`'s client area at `rect`.
-#[cfg(feature = "gpu")]
-pub(crate) fn presented(env: &Env<'_>, source: ResourceKey, window: u32, rect: Rect, map: Map) {
+pub(crate) fn presented(env: &Env<'_>, source: Store, window: u32, rect: Rect, map: Map) {
     let destination = Store::Window(window);
     let rect = corners(rect);
-    text_records::moved(
-        env,
-        MoveKind::Present,
-        destination,
-        rect,
-        resource(source),
-        Some(map),
-    );
+    text_records::moved(env, MoveKind::Present, destination, rect, source, Some(map));
+}
+
+/// Text records' handle where a handler has split its `Env`: the calling
+/// guest thread, taken only while records are on.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Noter {
+    thread: u32,
+}
+
+#[cfg(feature = "gpu")]
+impl Noter {
+    pub(crate) fn new(env: &Env<'_>) -> Option<Self> {
+        on(env).then(|| Self {
+            thread: text_records::thread(env),
+        })
+    }
+
+    pub(crate) fn moved(
+        self,
+        ext: &Ext,
+        kind: MoveKind,
+        destination: Store,
+        rect: Rect,
+        source: Store,
+        map: Option<Map>,
+    ) {
+        if let Some(mut records) = text_records::records(ext) {
+            records.moved(self.thread, kind, destination, corners(rect), source, map);
+        }
+    }
 }
 
 /// The map from a destination rectangle to the source rectangle it reads.

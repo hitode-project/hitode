@@ -20,7 +20,10 @@ use adv_gpu::{
     Buffer, Extent, ImageView,
     resource::{BufferDesc, BufferUsage, Memory},
 };
-use adv_machine::{Ext, Object as WaitObject, Wait};
+use adv_machine::{
+    Ext, Object as WaitObject, Wait,
+    text_records::{Map, MoveKind, Plane, Store},
+};
 pub(super) use draw::{
     dispatch, dispatch_indirect, draw, draw_auto, draw_indexed, draw_indexed_indirect,
     draw_indexed_instanced, draw_indirect, draw_instanced,
@@ -540,6 +543,69 @@ pub(super) struct Shadow {
     pub base: u32,
     pub layout: map::Layout,
     pub slice: u32,
+    /// How text records name the transfer, while they are on.
+    pub text: Option<ShadowText>,
+}
+
+/// What text records (WINE-UNIX-8) need to name a shadow transfer: who made
+/// it and the subresource the shadow mirrors.
+#[derive(Clone, Copy)]
+pub(super) struct ShadowText {
+    noter: crate::text::Noter,
+    key: ResourceKey,
+}
+
+pub(super) fn shadow_text(env: &Env<'_>, pointer: u32, subresource: u32) -> Option<ShadowText> {
+    Some(ShadowText {
+        noter: crate::text::Noter::new(env)?,
+        key: key(env, pointer, subresource),
+    })
+}
+
+/// Guest memory a texture subresource is laid out in at `bits`, when its
+/// format addresses single pixels.
+fn texture_plane(texture: Texture, subresource: u32, bits: u32, row_pitch: u32) -> Option<Plane> {
+    let format = texture.format();
+    if format.alignment[..2] != [1, 1] {
+        return None;
+    }
+    let [width, height, _] = texture.extent(subresource % texture.levels());
+    Some(Plane {
+        bits,
+        stride: row_pitch as i32,
+        bpp: u32::from(format.aligned_unit_bytes) * 8,
+        origin: [0, 0],
+        size: [width as i32, height as i32],
+    })
+}
+
+impl Shadow {
+    /// Note that `parts` moved between this shadow and its subresource.
+    fn noted(
+        &self,
+        ext: &Ext,
+        resource: Resource,
+        subresource: u32,
+        parts: &[Rect],
+        kind: MoveKind,
+    ) {
+        let (Some(text), Resource::Texture(texture)) = (self.text, resource) else {
+            return;
+        };
+        let bits = self.layout.slice(self.base, self.slice);
+        let Some(plane) = texture_plane(texture, subresource, bits, self.layout.row_pitch()) else {
+            return;
+        };
+        let (memory, device) = (Store::Memory(plane), crate::text::resource(text.key));
+        let (destination, source) = match kind {
+            MoveKind::Upload => (device, memory),
+            _ => (memory, device),
+        };
+        for &rect in parts {
+            let map = Some(Map::offset(0, 0));
+            text.noter.moved(ext, kind, destination, rect, source, map);
+        }
+    }
 }
 
 pub(super) fn download(
@@ -555,6 +621,7 @@ pub(super) fn download(
         base,
         layout,
         slice,
+        ..
     } = shadow;
     let execution = execution(ext)?;
     execution.barrier(Boundary::Map)?;
@@ -691,6 +758,7 @@ pub(super) fn download(
             cpu.write(dst, row).map_err(|_| Error::InvalidArgument)?;
         }
     }
+    shadow.noted(ext, resource, subresource, parts, MoveKind::Readback);
     Ok(())
 }
 
@@ -708,6 +776,7 @@ pub(super) fn staging_access(
         return Ok(());
     }
     let key = key(env, pointer, subresource);
+    let text = shadow_text(env, pointer, subresource);
     let table = table(env);
     let store = table
         .get_mut(&mut env.sys.objects, pointer)
@@ -735,6 +804,7 @@ pub(super) fn staging_access(
                     base,
                     layout,
                     slice,
+                    text,
                 },
                 parts,
             )
@@ -806,6 +876,7 @@ fn upload_shadow(
         };
         execution.gpu.transfer(transfer)?;
     }
+    shadow.noted(ext, resource, subresource, parts, MoveKind::Upload);
     Ok(())
 }
 
@@ -842,6 +913,7 @@ impl Location {
             if self.resource.usage() == Usage::Dynamic
                 && !self.resource.bind().contains(Bind::CONSTANT)
             {
+                let text = shadow_text(env, self.pointer, self.subresource);
                 let table = table(env);
                 let shadow = table
                     .get_mut(&mut env.sys.objects, self.pointer)
@@ -860,6 +932,7 @@ impl Location {
                             base,
                             layout,
                             slice,
+                            text,
                         },
                         parts,
                     )
@@ -1095,8 +1168,44 @@ pub(super) fn copy_resource(env: &mut Env<'_>) -> Result<(), Error> {
             return Err(Error::InvalidArgument);
         }
         submit_copy(env, source, destination, [0; 3], [0; 3], size)?;
+        note_copy(env, source, destination, [0; 3], [0; 3], size);
     }
     Ok(())
+}
+
+/// Note for text records a completed copy of `size` from `origin` in
+/// `source` to `at` in `destination`.
+fn note_copy(
+    env: &Env<'_>,
+    source: Location,
+    destination: Location,
+    origin: [u32; 3],
+    at: [u32; 3],
+    size: [u32; 3],
+) {
+    if !crate::text::on(env) || !matches!(destination.resource, Resource::Texture(_)) {
+        return;
+    }
+    let read = key(env, source.pointer, source.subresource);
+    let write = key(env, destination.pointer, destination.subresource);
+    let rect = Rect {
+        x: at[0],
+        y: at[1],
+        w: size[0],
+        h: size[1],
+    };
+    let offset = Map::offset(
+        origin[0] as i32 - at[0] as i32,
+        origin[1] as i32 - at[1] as i32,
+    );
+    crate::text::drew(
+        env,
+        MoveKind::DeviceCopy,
+        rect,
+        &[(write, false)],
+        &[read],
+        |_| Some(offset),
+    );
 }
 
 pub(super) fn write_dynamic(
@@ -1160,6 +1269,12 @@ pub(super) fn write_dynamic(
     if let Some(transfer) = transfer {
         let write = key(env, pointer, subresource);
         execution(env.ext)?.append(Command::Transfer(transfer), extent_rect(size), None, write)?;
+        if let Resource::Texture(texture) = location.resource
+            && crate::text::on(env)
+            && let Some(plane) = texture_plane(texture, subresource, base, layout.row_pitch())
+        {
+            crate::text::uploaded(env, plane, write, extent_rect(size));
+        }
     }
     table
         .get_mut(&mut env.sys.objects, pointer)
@@ -1202,10 +1317,47 @@ pub(super) fn copy_region(env: &mut Env<'_>) -> Result<(), Error> {
     } else {
         box_extent(read(env, area)?)
     };
-    submit_copy(env, source, destination, origin, at, size)
+    submit_copy(env, source, destination, origin, at, size)?;
+    note_copy(env, source, destination, origin, at, size);
+    Ok(())
 }
 
 pub(super) fn update_resource(env: &mut Env<'_>) -> Result<(), Error> {
+    update_pixels(env)?;
+    if crate::text::on(env) {
+        note_update(env)?;
+    }
+    Ok(())
+}
+
+/// Note for text records the guest pixels a completed UpdateSubresource
+/// read, rereading its arguments.
+fn note_update(env: &Env<'_>) -> Result<(), Error> {
+    let destination = Location::new(env, env.arg(1), env.arg(2))?;
+    let Resource::Texture(texture) = destination.resource else {
+        return Ok(());
+    };
+    let (area, data, row_pitch) = (env.arg(3), env.arg(4), env.arg(5));
+    let (origin, size) = if area == 0 {
+        ([0; 3], destination.extent())
+    } else {
+        box_extent(read(env, area)?)
+    };
+    if let Some(mut plane) = texture_plane(texture, destination.subresource, data, row_pitch) {
+        plane.size = [size[0] as i32, size[1] as i32];
+        let write = key(env, destination.pointer, destination.subresource);
+        let rect = Rect {
+            x: origin[0],
+            y: origin[1],
+            w: size[0],
+            h: size[1],
+        };
+        crate::text::uploaded(env, plane, write, rect);
+    }
+    Ok(())
+}
+
+fn update_pixels(env: &mut Env<'_>) -> Result<(), Error> {
     if null_device(env)? {
         return Ok(());
     }
@@ -1620,6 +1772,11 @@ pub(super) fn caps(ext: &Ext) -> Option<&adv_gpu::Caps> {
         .execution
         .as_ref()
         .map(|execution| execution.gpu.device().caps())
+}
+
+/// How text records name `buffer`'s first subresource.
+pub(super) fn text_store(env: &Env<'_>, buffer: u32) -> Store {
+    crate::text::resource(key(env, buffer, 0))
 }
 
 pub(super) fn present(

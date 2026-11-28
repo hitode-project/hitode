@@ -935,6 +935,17 @@ pub(super) fn cancel(env: &mut Env<'_>, operation: &Operation) {
         }
     }
 }
+/// Who reads `resource` back and its content, while text records are on.
+pub(super) fn text_source(
+    env: &Env<'_>,
+    resource: Id,
+) -> Option<(crate::text::Noter, crate::record::ResourceKey)> {
+    Some((
+        crate::text::Noter::new(env)?,
+        key::content(env, resource, None, 0),
+    ))
+}
+
 /// What an operation reads that its damage effects do not name.
 fn text_origin(operation: &Operation) -> crate::text::Origin {
     match operation {
@@ -1004,6 +1015,7 @@ fn note_present(env: &Env<'_>, owner: Id, copy: Option<presentation::Copy>) {
         return;
     };
     let source = key::content(env, back_buffer, None, 0);
+    let source = crate::text::resource(source);
     crate::text::presented(env, source, p.hDeviceWindow, destination, map);
 }
 

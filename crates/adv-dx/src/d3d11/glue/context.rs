@@ -1206,6 +1206,8 @@ pub(super) fn map_subresource(
     }
     #[cfg(not(feature = "gpu"))]
     let _ = request;
+    #[cfg(feature = "gpu")]
+    let text = gpu::shadow_text(env, pointer, subresource);
     let object = table.get_mut(&mut env.sys.objects, pointer).unwrap();
     #[cfg(feature = "gpu")]
     let backing = object.backing().and_then(|backing| backing.clone());
@@ -1226,6 +1228,7 @@ pub(super) fn map_subresource(
                     base,
                     layout,
                     slice,
+                    text,
                 },
                 parts,
             )

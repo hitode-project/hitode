@@ -189,6 +189,11 @@ pub trait Buffers: Sync {
         first: bool,
         composition: bool,
     ) -> Result<(bool, Option<u64>), Error>;
+    /// How text records (WINE-UNIX-8) name a buffer's pixels, if they can.
+    fn text_store(&self, env: &Env<'_>, buffer: u32) -> Option<adv_machine::text_records::Store> {
+        let _ = (env, buffer);
+        None
+    }
     #[cfg(feature = "gpu")]
     fn present_wake_generation(&self, ext: &Ext) -> Option<u64>;
     #[cfg(feature = "gpu")]

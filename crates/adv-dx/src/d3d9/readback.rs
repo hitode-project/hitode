@@ -30,6 +30,8 @@ pub(super) struct PendingTransfer {
     /// GetRenderTargetData into a plain surface returned before the copy
     /// finished. CPU readers of the destination settle it first.
     detached: bool,
+    /// Who reads which resource back, while text records are on.
+    text: Option<(crate::text::Noter, crate::record::ResourceKey)>,
 }
 impl PendingTransfer {
     pub(super) fn detached(&self) -> bool {
@@ -302,6 +304,7 @@ pub(super) fn lock_internal(
             result: None,
             lock_output: Some(output),
             detached: false,
+            text: recording::text_source(env, id),
         },
         false,
     )
@@ -619,6 +622,7 @@ fn enqueue_readback(
         vec![full(&image)]
     };
     let tracked = source.map(|_| image.id());
+    let text = source.and_then(|source| recording::text_source(env, source));
     let transfer = PendingTransfer {
         context: env.context,
         event,
@@ -635,6 +639,7 @@ fn enqueue_readback(
         result: None,
         lock_output: None,
         detached: false,
+        text,
     };
     start(env, transfer, detach)
 }
@@ -943,6 +948,24 @@ fn publish_pixels(env: &mut Env<'_>, transfer: &PendingTransfer, pixels: &[u8]) 
                     return INVALID;
                 }
             }
+        }
+    }
+    if let Some((noter, source)) = transfer.text {
+        let plane = adv_machine::text_records::Plane {
+            bits: transfer.storage,
+            stride: pitch as i32,
+            bpp: bytes * 8,
+            origin: [0, 0],
+            size: [transfer.image.width(), transfer.image.height()].map(|v| v as i32),
+        };
+        let (destination, source) = (
+            adv_machine::text_records::Store::Memory(plane),
+            crate::text::resource(source),
+        );
+        let map = Some(adv_machine::text_records::Map::offset(0, 0));
+        for &rect in &transfer.regions {
+            let readback = adv_machine::text_records::MoveKind::Readback;
+            noter.moved(env.ext, readback, destination, rect, source, map);
         }
     }
     0

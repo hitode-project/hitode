@@ -707,6 +707,16 @@ impl dxgi::swap::Buffers for SwapBuffers {
         })
     }
 
+    fn text_store(&self, env: &Env<'_>, buffer: u32) -> Option<adv_machine::text_records::Store> {
+        #[cfg(feature = "gpu")]
+        return Some(gpu::text_store(env, buffer));
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (env, buffer);
+            None
+        }
+    }
+
     fn latency(&self, env: &Env<'_>, device: u32) -> u32 {
         device_state(env, device).unwrap().latency
     }

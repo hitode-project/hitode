@@ -1,7 +1,8 @@
 /* Authored text record oracle (WINE-UNIX-8) for Direct3D 9: GDI draws "Hi"
  * into a managed texture through its surface's DC, a pre-transformed quad
- * draws the texture unscaled at (8, 4) on a 128 x 64 back buffer, and the
- * device presents. Exits with 0 when every call succeeds.
+ * draws the texture unscaled at (8, 4) on a 128 x 64 back buffer, the device
+ * presents, and GetRenderTargetData reads the back buffer back into system
+ * memory. Exits with 0 when every call succeeds.
  * Build: i686-w64-mingw32-gcc -O2 -Wall text-records-d3d9.c -o text-records-d3d9.exe -ld3d9 -lgdi32 -luser32 */
 #define COBJMACROS
 #include <windows.h>
@@ -60,5 +61,15 @@ int main(void)
         FAILED(IDirect3DDevice9_EndScene(device)) ||
         FAILED(IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL)))
         return 5;
+
+    IDirect3DSurface9 *back, *copy;
+    D3DLOCKED_RECT locked;
+    if (FAILED(IDirect3DDevice9_GetBackBuffer(device, 0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) ||
+        FAILED(IDirect3DDevice9_CreateOffscreenPlainSurface(device, 128, 64, D3DFMT_X8R8G8B8,
+                                                            D3DPOOL_SYSTEMMEM, &copy, NULL)) ||
+        FAILED(IDirect3DDevice9_GetRenderTargetData(device, back, copy)) ||
+        FAILED(IDirect3DSurface9_LockRect(copy, &locked, NULL, D3DLOCK_READONLY)))
+        return 6;
+    IDirect3DSurface9_UnlockRect(copy);
     return 0;
 }
