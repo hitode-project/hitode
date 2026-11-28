@@ -1143,10 +1143,9 @@ fn prepare_native(env: &mut Env<'_>, this: u32, bytes: Vec<u8>) -> Outcome {
 
 fn spawn_decoded(media: Arc<Demuxed>, index: usize, start_100ns: u64) -> DecodedStream {
     let (tx, rx) = mpsc::sync_channel(DECODE_AHEAD);
-    let device = media::VideoDevice::current();
     std::thread::spawn(move || {
         let input = &media.streams[index];
-        let mut decoder = match media::PacketDecoder::open_on(&input.format, device) {
+        let mut decoder = match media::PacketDecoder::open_cpu(&input.format) {
             Ok(decoder) => decoder,
             Err(error) => {
                 log::warn!("IWMSyncReader::GetNextSample: {error}");

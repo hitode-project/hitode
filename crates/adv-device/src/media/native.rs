@@ -232,12 +232,18 @@ pub(super) struct Native {
     audio: Option<Audio>,
     video_packets: VecDeque<ff::Packet>,
     video_packet_bytes: usize,
+    /// Audio packets encountered while decoding video ahead, drained by
+    /// `read_ahead_audio` so prefetching never shifts audio delivery.
+    audio_packets: VecDeque<ff::Packet>,
+    audio_packet_bytes: usize,
     /// Decoded future frames in pts order; `prefetch` keeps [`AHEAD`] of them.
     next: VecDeque<(u64, frame::Video)>,
     /// The front of `next`, already converted by `prefetch`.
     converted: Option<VideoFrame>,
     #[cfg(feature = "gpu")]
     free_video: Vec<frame::Video>,
+    /// Skip GPU presentable YUV buffers when pictures are consumed on CPU only.
+    cpu_only: bool,
     /// A decode error `prefetch` hit; the request that needs that frame reports it.
     deferred: Option<Error>,
     audio_out: Vec<AudioFrame>,
@@ -261,11 +267,13 @@ const AUDIO_LEAD_US: u64 = 100_000;
 /// ahead as quartz's DirectSound renderer buffers (one second), so a busy
 /// execution thread during a load does not drain music that just started.
 const AUDIO_ONLY_LEAD_US: u64 = 1_000_000;
-/// Decoded frames `prefetch` holds, so a request finds its frame and the one
-/// after it ready.
-const AHEAD: usize = 2;
+/// Decoded frames `prefetch` holds, absorbing keyframe spikes and mobile
+/// scheduler jitter.
+const AHEAD: usize = 4;
 const MAX_QUEUED_VIDEO_PACKETS: usize = 180;
 const MAX_QUEUED_VIDEO_BYTES: usize = 8 << 20;
+const MAX_QUEUED_AUDIO_PACKETS: usize = 256;
+const MAX_QUEUED_AUDIO_BYTES: usize = 4 << 20;
 
 fn micros(pts: i64, tb: Rational) -> i64 {
     ((i128::from(pts) * i128::from(tb.numerator()) * 1_000_000)
@@ -286,7 +294,13 @@ pub(super) fn configure_video_context(context: &mut codec::Context) {
             let raw = context.as_ptr();
             ((*raw).width.max(0) as u64, (*raw).height.max(0) as u64)
         };
-        if w * h >= 1280 * 720 { 4 } else { 1 }
+        if w * h >= 1280 * 720 {
+            4
+        } else if w * h >= 640 * 360 || (w == 0 && h == 0) {
+            2
+        } else {
+            1
+        }
     };
     context.set_threading(codec::threading::Config::count(threads));
 }
@@ -376,9 +390,11 @@ pub(super) fn transfer_hardware(decoded: &mut frame::Video) -> Result<(), Error>
 #[cfg(not(feature = "gpu"))]
 fn convert(
     video: &mut Video,
+    cpu_only: bool,
     pts_us: u64,
     decoded: &mut frame::Video,
 ) -> Result<VideoFrame, Error> {
+    let _ = cpu_only;
     transfer_hardware(decoded)?;
     let (pixel, w, h) = (decoded.format(), decoded.width(), decoded.height());
     if video.scaler.as_ref().is_none_or(|(p, _)| *p != pixel) {
@@ -412,10 +428,24 @@ fn convert(
 #[cfg(feature = "gpu")]
 fn convert(
     video: &mut Video,
+    cpu_only: bool,
     pts_us: u64,
     decoded: &mut frame::Video,
 ) -> Result<VideoFrame, Error> {
     transfer_hardware(decoded)?;
+    if cpu_only {
+        let width = decoded.width();
+        let height = decoded.height();
+        let color = super::planes::color(video.decoder.color_space(), video.decoder.color_range());
+        let frame = std::mem::replace(decoded, frame::Video::empty());
+        return Ok(VideoFrame {
+            pts_us,
+            width,
+            height,
+            picture: None,
+            cpu: Some(super::CpuFrame { frame, color }),
+        });
+    }
     if video.output.is_none() {
         video.output = Some(super::planes::Output::new(
             &video.device,
@@ -581,6 +611,8 @@ impl Native {
             audio,
             video_packets: VecDeque::new(),
             video_packet_bytes: 0,
+            audio_packets: VecDeque::new(),
+            audio_packet_bytes: 0,
             next: {
                 #[cfg(feature = "gpu")]
                 {
@@ -594,6 +626,7 @@ impl Native {
             converted: None,
             #[cfg(feature = "gpu")]
             free_video: (0..AHEAD + 1).map(|_| frame::Video::empty()).collect(),
+            cpu_only: false,
             deferred: None,
             audio_out: Vec::new(),
             origin_us,
@@ -744,13 +777,13 @@ impl Native {
                         .as_ref()
                         .is_some_and(|a| a.stream == packet.stream())
                     {
-                        self.send_audio_packet(&packet)?;
+                        self.audio_packet_bytes += packet.size();
+                        self.audio_packets.push_back(packet);
                     }
                 }
                 None if !self.eof_sent => {
                     self.eof_sent = true;
                     self.video.as_mut().unwrap().decoder.send_eof()?;
-                    self.finish_audio()?;
                 }
                 None => {
                     self.eof = true;
@@ -822,9 +855,16 @@ impl Native {
             .audio
             .as_ref()
             .is_some_and(|audio| audio.next_us.min(audio.pcm_next_us) < target)
-            && self.video_packets.len() < MAX_QUEUED_VIDEO_PACKETS
-            && self.video_packet_bytes < MAX_QUEUED_VIDEO_BYTES
+            && (!self.audio_packets.is_empty()
+                || self.input_eof
+                || (self.video_packets.len() < MAX_QUEUED_VIDEO_PACKETS
+                    && self.video_packet_bytes < MAX_QUEUED_VIDEO_BYTES))
         {
+            if let Some(packet) = self.audio_packets.pop_front() {
+                self.audio_packet_bytes -= packet.size();
+                self.send_audio_packet(&packet)?;
+                continue;
+            }
             let Some(packet) = self.read_source_packet()? else {
                 self.finish_audio()?;
                 break;
@@ -849,6 +889,18 @@ impl Native {
             }
         }
         Ok(())
+    }
+
+    pub fn set_cpu_only(&mut self, cpu_only: bool) {
+        if self.cpu_only == cpu_only {
+            return;
+        }
+        self.cpu_only = cpu_only;
+        self.converted = None;
+        #[cfg(feature = "gpu")]
+        if cpu_only && let Some(video) = self.video.as_mut() {
+            video.output = None;
+        }
     }
 
     pub fn seek(&mut self, media_us: u64) -> Result<(), Error> {
@@ -878,6 +930,8 @@ impl Native {
         self.deferred = None;
         self.video_packets.clear();
         self.video_packet_bytes = 0;
+        self.audio_packets.clear();
+        self.audio_packet_bytes = 0;
         self.audio_out.clear();
         self.discard_audio_before = media_us;
         self.eof_sent = false;
@@ -960,7 +1014,12 @@ impl Native {
         let video = if let Some((pts_us, mut decoded)) = due {
             let result = match ready {
                 Some(frame) => Ok(frame),
-                None => convert(self.video.as_mut().unwrap(), pts_us, &mut decoded),
+                None => convert(
+                    self.video.as_mut().unwrap(),
+                    self.cpu_only,
+                    pts_us,
+                    &mut decoded,
+                ),
             };
             #[cfg(feature = "gpu")]
             self.free_video.push(decoded);
@@ -979,7 +1038,7 @@ impl Native {
         Ok(Update {
             video,
             audio: std::mem::take(&mut self.audio_out),
-            ended: self.eof && media_us >= end,
+            ended: self.eof && self.audio_packets.is_empty() && media_us >= end,
         })
     }
 
@@ -990,7 +1049,11 @@ impl Native {
         if self.video.is_none() || self.seek_pending || self.deferred.is_some() {
             return;
         }
-        while self.next.len() < AHEAD && !self.eof {
+        while self.next.len() < AHEAD
+            && !self.eof
+            && self.audio_packets.len() < MAX_QUEUED_AUDIO_PACKETS
+            && self.audio_packet_bytes < MAX_QUEUED_AUDIO_BYTES
+        {
             match self.next_video() {
                 Ok(next) => self.next.extend(next),
                 Err(error) => {
@@ -999,11 +1062,12 @@ impl Native {
                 }
             }
         }
-        if self.converted.is_none()
+        if !self.cpu_only
+            && self.converted.is_none()
             && let Some((pts_us, decoded)) = self.next.front_mut()
         {
             // A failed conversion is retried, and reported, by the request.
-            self.converted = convert(self.video.as_mut().unwrap(), *pts_us, decoded).ok();
+            self.converted = convert(self.video.as_mut().unwrap(), false, *pts_us, decoded).ok();
         }
     }
 

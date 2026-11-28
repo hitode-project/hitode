@@ -38,6 +38,7 @@ class BuildTests(unittest.TestCase):
         self.assertTrue({'asf', 'avi', 'mpegps', 'wav'} <= set(profile['demuxers']))
         self.assertIn('mpeg4video', profile['parsers'])
         self.assertFalse(any('--enable-lib' in arg or '--enable-encoder=' in arg for arg in args))
+        self.assertNotIn('--enable-small', args)
         self.assertEqual(len(profile['sha256']), 64)
 
     # spec: HOST-PKG-1
@@ -49,6 +50,7 @@ class BuildTests(unittest.TestCase):
         self.assertIn('--cc=/ndk/toolchains/llvm/prebuilt/darwin-x86_64/bin/'
                       f"aarch64-linux-android{profile['minimum_android']}-clang", args)
         self.assertIn('--disable-shared', args)
+        self.assertNotIn('--enable-small', args)
 
 
 if __name__ == '__main__':

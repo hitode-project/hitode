@@ -229,7 +229,7 @@ pub(super) fn object_pin_method(env: &mut Env<'_>, pin: u32, method: &str) -> Op
 /// Whether the input pin can decode `mt`.
 pub(crate) fn accepts_input(mt: &MediaType) -> Option<CodecFormat> {
     let format = mt.codec_format()?;
-    PacketDecoder::open(&format).ok().map(|_| format)
+    PacketDecoder::open_cpu(&format).ok().map(|_| format)
 }
 
 /// Bind the decoder for a new input connection.
@@ -237,7 +237,7 @@ pub(crate) fn connect_input(env: &mut Env<'_>, pin: u32, mt: &MediaType) -> bool
     let Some(format) = mt.codec_format() else {
         return false;
     };
-    let decoder = match PacketDecoder::open(&format) {
+    let decoder = match PacketDecoder::open_cpu(&format) {
         Ok(decoder) => decoder,
         Err(error) => {
             log::warn!("DirectShow DMO: {error}");

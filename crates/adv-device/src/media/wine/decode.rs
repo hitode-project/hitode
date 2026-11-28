@@ -244,6 +244,61 @@ fn pixel(id: u32) -> Result<format::Pixel, Error> {
         _ => return Err(Error::Decode(format!("unsupported pixel layout {id}"))),
     })
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WineScalerKey {
+    src_w: u32,
+    src_h: u32,
+    src_pixel: format::Pixel,
+    dst_w: u32,
+    dst_h: u32,
+    dst_pixel: format::Pixel,
+}
+
+struct CachedWineScaler {
+    key: WineScalerKey,
+    context: ff::software::scaling::Context,
+}
+
+thread_local! {
+    static WINE_SCALER: std::cell::RefCell<Option<CachedWineScaler>> = const { std::cell::RefCell::new(None) };
+}
+
+fn with_wine_scaler<R>(
+    src_w: u32,
+    src_h: u32,
+    src_pixel: format::Pixel,
+    dst_w: u32,
+    dst_h: u32,
+    dst_pixel: format::Pixel,
+    run: impl FnOnce(&mut ff::software::scaling::Context) -> R,
+) -> Result<R, Error> {
+    let key = WineScalerKey {
+        src_w,
+        src_h,
+        src_pixel,
+        dst_w,
+        dst_h,
+        dst_pixel,
+    };
+    WINE_SCALER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|cached| cached.key != key) {
+            let context = ff::software::scaling::Context::get(
+                src_pixel,
+                src_w,
+                src_h,
+                dst_pixel,
+                dst_w,
+                dst_h,
+                ff::software::scaling::Flags::BILINEAR,
+            )
+            .map_err(|_| Error::Decode("video conversion failed".into()))?;
+            *slot = Some(CachedWineScaler { key, context });
+        }
+        Ok(run(&mut slot.as_mut().unwrap().context))
+    })
+}
+
 fn audio(id: u32) -> Result<format::Sample, Error> {
     use format::sample::Type::Packed;
     Ok(match id {
@@ -349,32 +404,26 @@ impl Sample {
                     );
                     lines[0] = -lines[0];
                 }
-                let context = ff::ffi::sws_getContext(
-                    frame.width() as i32,
-                    frame.height() as i32,
-                    frame.format().into(),
-                    width as i32,
-                    height.unsigned_abs() as i32,
-                    pixel.into(),
-                    ff::software::scaling::Flags::BILINEAR.bits(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                );
-                if context.is_null() {
-                    return Err(Error::Decode("video conversion failed".into()));
-                }
-                let source = &*frame.as_ptr();
-                let result = ff::ffi::sws_scale(
-                    context,
-                    source.data.as_ptr().cast(),
-                    source.linesize.as_ptr(),
-                    0,
-                    frame.height() as i32,
-                    data.as_ptr(),
-                    lines.as_ptr(),
-                );
-                ff::ffi::sws_freeContext(context);
+                let result = with_wine_scaler(
+                    frame.width(),
+                    frame.height(),
+                    frame.format(),
+                    width,
+                    height.unsigned_abs(),
+                    pixel,
+                    |context| {
+                        let source = &*frame.as_ptr();
+                        ff::ffi::sws_scale(
+                            context.as_mut_ptr(),
+                            source.data.as_ptr().cast(),
+                            source.linesize.as_ptr(),
+                            0,
+                            frame.height() as i32,
+                            data.as_ptr(),
+                            lines.as_ptr(),
+                        )
+                    },
+                )?;
                 if result < 0 {
                     return Err(ff::Error::from(result).into());
                 }

@@ -59,6 +59,47 @@ pub struct AudioInfo {
     pub mpeg_header: Option<[u8; 4]>,
 }
 
+/// Uncompressed RGB target layout for guest pixel delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RgbFormat {
+    Bgra,
+    Bgrx,
+    Bgr24,
+    Rgb565,
+    Rgb555,
+}
+
+impl RgbFormat {
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Bgra | Self::Bgrx => 4,
+            Self::Bgr24 => 3,
+            Self::Rgb565 | Self::Rgb555 => 2,
+        }
+    }
+}
+
+#[cfg(all(feature = "gpu", feature = "media"))]
+pub(crate) struct CpuFrame {
+    pub(crate) frame: ffmpeg_next::frame::Video,
+    pub(crate) color: adv_gpu::present::YuvColor,
+}
+
+#[cfg(all(feature = "gpu", feature = "media"))]
+impl std::fmt::Debug for CpuFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CpuFrame")
+            .field("color", &self.color)
+            .finish()
+    }
+}
+
+// SAFETY: `AVFrame` has no thread affinity and is owned exclusively here.
+#[cfg(all(feature = "gpu", feature = "media"))]
+unsafe impl Send for CpuFrame {}
+#[cfg(all(feature = "gpu", feature = "media"))]
+unsafe impl Sync for CpuFrame {}
+
 /// A decoded picture. GPU display retains YUV; CPU-only builds retain BGRA.
 #[derive(Debug)]
 pub struct VideoFrame {
@@ -68,7 +109,9 @@ pub struct VideoFrame {
     #[cfg(not(feature = "gpu"))]
     pub bgra: Vec<u8>,
     #[cfg(feature = "gpu")]
-    pub picture: std::sync::Arc<crate::frame::DecodedPicture>,
+    pub picture: Option<std::sync::Arc<crate::frame::DecodedPicture>>,
+    #[cfg(all(feature = "gpu", feature = "media"))]
+    pub(crate) cpu: Option<CpuFrame>,
 }
 
 impl VideoFrame {
@@ -80,7 +123,14 @@ impl VideoFrame {
         }
         #[cfg(feature = "gpu")]
         {
-            std::borrow::Cow::Owned(self.picture.bgra())
+            if let Some(picture) = &self.picture {
+                return std::borrow::Cow::Owned(picture.bgra());
+            }
+            #[cfg(feature = "media")]
+            if let Some(cpu) = &self.cpu {
+                return std::borrow::Cow::Owned(planes::bgra(&cpu.frame, cpu.color));
+            }
+            unreachable!("video frame has neither GPU picture nor CPU planes")
         }
     }
 
@@ -91,25 +141,70 @@ impl VideoFrame {
         }
         #[cfg(feature = "gpu")]
         {
-            self.picture.bgra()
+            self.bgra().into_owned()
+        }
+    }
+
+    /// Convert directly from decoded YUV planes into a caller-supplied RGB buffer
+    /// (with optional bottom-up row inversion). Returns `false` when no native
+    /// YUV planes are retained and callers should fall back to [`Self::bgra`].
+    pub fn write_rgb(
+        &self,
+        format: RgbFormat,
+        bottom_up: bool,
+        stride: usize,
+        out: &mut [u8],
+    ) -> bool {
+        #[cfg(all(feature = "gpu", feature = "media"))]
+        {
+            if let Some(picture) = &self.picture {
+                return picture.write_rgb(format, bottom_up, stride, out);
+            }
+            if let Some(cpu) = &self.cpu {
+                return planes::write_rgb(&cpu.frame, cpu.color, format, bottom_up, stride, out);
+            }
+            false
+        }
+        #[cfg(not(all(feature = "gpu", feature = "media")))]
+        {
+            let _ = (format, bottom_up, stride, out);
+            false
         }
     }
 
     pub fn into_surface(self) -> crate::surface::VideoFrame {
-        crate::surface::VideoFrame {
-            width: self.width,
-            height: self.height,
-            pitch: self.width * 4,
-            #[cfg(not(feature = "gpu"))]
-            bgra: self.bgra.into(),
-            #[cfg(feature = "gpu")]
-            bgra: {
+        #[cfg(not(feature = "gpu"))]
+        {
+            crate::surface::VideoFrame {
+                width: self.width,
+                height: self.height,
+                pitch: self.width * 4,
+                bgra: self.bgra.into(),
+            }
+        }
+        #[cfg(feature = "gpu")]
+        {
+            if let Some(picture) = self.picture {
                 static EMPTY: std::sync::OnceLock<std::sync::Arc<[u8]>> =
                     std::sync::OnceLock::new();
-                EMPTY.get_or_init(|| std::sync::Arc::from([])).clone()
-            },
-            #[cfg(feature = "gpu")]
-            picture: Some(self.picture),
+                crate::surface::VideoFrame {
+                    width: self.width,
+                    height: self.height,
+                    pitch: self.width * 4,
+                    bgra: EMPTY.get_or_init(|| std::sync::Arc::from([])).clone(),
+                    picture: Some(picture),
+                }
+            } else {
+                let (width, height) = (self.width, self.height);
+                let bgra = self.into_bgra();
+                crate::surface::VideoFrame {
+                    width,
+                    height,
+                    pitch: width * 4,
+                    bgra: bgra.into(),
+                    picture: None,
+                }
+            }
         }
     }
 }
@@ -271,11 +366,27 @@ impl PacketDecoder {
         Self::open_on(format, VideoDevice::current())
     }
 
+    /// Open a decoder whose pictures will only be read on the CPU (for guest
+    /// pixel delivery), skipping presentable GPU buffer allocation and copies.
+    pub fn open_cpu(format: &CodecFormat) -> Result<Self, Error> {
+        #[cfg(feature = "media")]
+        {
+            Ok(Self {
+                inner: packets::Decoder::open(format, None)?,
+            })
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = format;
+            Err(Error::Unavailable)
+        }
+    }
+
     pub fn open_on(format: &CodecFormat, device: VideoDevice) -> Result<Self, Error> {
         #[cfg(feature = "media")]
         {
             Ok(Self {
-                inner: packets::Decoder::open(format, device)?,
+                inner: packets::Decoder::open(format, Some(device))?,
             })
         }
         #[cfg(not(feature = "media"))]
@@ -437,6 +548,20 @@ impl Decoder {
         #[cfg(not(feature = "media"))]
         {
             let _ = media_us;
+            Err(Error::Unavailable)
+        }
+    }
+
+    /// Skip GPU presentable YUV buffer allocation and copies when pictures are
+    /// consumed only on the CPU (e.g. guest DirectShow renderers).
+    pub fn set_cpu_only(&mut self, cpu_only: bool) -> Result<(), Error> {
+        #[cfg(feature = "media")]
+        {
+            self.inner.set_cpu_only(cpu_only)
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = cpu_only;
             Err(Error::Unavailable)
         }
     }

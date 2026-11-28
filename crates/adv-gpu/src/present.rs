@@ -113,6 +113,47 @@ impl Shared {
                     })
             })
     }
+
+    /// CPU YUV writers overwrite every pixel and never use buffer age, so
+    /// prefer an unfenced free slot (or a vacant slot) before waiting on a
+    /// compositor release fence; when every free slot carries a fence, pick
+    /// the oldest stamp because its fence has aged longest.
+    fn available_cpu(&self, limit: u32) -> Option<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                Slot::Free(b) if b.release.is_none() => Some((i, b.stamp)),
+                _ => None,
+            })
+            .max_by_key(|(_, stamp)| *stamp)
+            .map(|(i, _)| i)
+            .or_else(|| {
+                (self
+                    .slots
+                    .iter()
+                    .filter(|s| !matches!(s, Slot::Vacant))
+                    .count()
+                    < limit as usize)
+                    .then(|| {
+                        self.slots
+                            .iter()
+                            .position(|s| matches!(s, Slot::Vacant))
+                            .unwrap_or(self.slots.len())
+                    })
+            })
+            .or_else(|| {
+                self.slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| match s {
+                        Slot::Free(b) => Some((i, b.stamp)),
+                        _ => None,
+                    })
+                    .min_by_key(|(_, stamp)| *stamp)
+                    .map(|(i, _)| i)
+            })
+    }
 }
 struct Buffer {
     index: usize,
@@ -165,7 +206,7 @@ impl PresentPool {
     pub fn acquire_cpu(&mut self) -> Option<PresentImage> {
         debug_assert!(matches!(self.desc.format, Format::Nv12 | Format::Nv21));
         let mut shared = self.shared.lock().unwrap();
-        let index = shared.available(self.desc.count)?;
+        let index = shared.available_cpu(self.desc.count)?;
         let mut buffer = self
             .take_buffer(&mut shared, index)
             .expect("allocate CPU presentable buffer")

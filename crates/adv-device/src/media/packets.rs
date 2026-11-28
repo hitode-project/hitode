@@ -175,7 +175,7 @@ fn codec_id(format: &CodecFormat) -> codec::Id {
 }
 
 impl Decoder {
-    pub fn open(format: &CodecFormat, device: super::VideoDevice) -> Result<Self, Error> {
+    pub fn open(format: &CodecFormat, device: Option<super::VideoDevice>) -> Result<Self, Error> {
         ff::init()?;
         let id = codec_id(format);
         if id == codec::Id::None {
@@ -274,7 +274,7 @@ impl Decoder {
             kind,
             #[cfg(feature = "gpu")]
             device: if matches!(format, CodecFormat::Video { .. }) {
-                Some(device.resolve()?)
+                device.map(super::VideoDevice::resolve).transpose()?
             } else {
                 None
             },
@@ -343,23 +343,40 @@ impl Decoder {
                     match decoder.receive_frame(decoded) {
                         Ok(()) => {
                             transfer_hardware(decoded)?;
-                            #[cfg(feature = "gpu")]
-                            if output.is_none() {
-                                *output = Some(super::planes::Output::new(
-                                    self.device.as_ref().unwrap(),
-                                    decoder,
-                                    decoded.format(),
-                                )?);
-                            }
-
                             #[cfg(not(feature = "gpu"))]
                             let result = convert_video(scaler, decoded);
                             #[cfg(feature = "gpu")]
                             let result: Result<_, ff::Error> =
-                                Ok(output.as_mut().unwrap().convert(
-                                    decoded.timestamp().map_or(0, |t| (t.max(0) / 10) as u64),
-                                    decoded,
-                                )?);
+                                if let Some(device) = self.device.as_ref() {
+                                    if output.is_none() {
+                                        *output = Some(super::planes::Output::new(
+                                            device,
+                                            decoder,
+                                            decoded.format(),
+                                        )?);
+                                    }
+                                    Ok(output.as_mut().unwrap().convert(
+                                        decoded.timestamp().map_or(0, |t| (t.max(0) / 10) as u64),
+                                        decoded,
+                                    )?)
+                                } else {
+                                    let pts_us =
+                                        decoded.timestamp().map_or(0, |t| (t.max(0) / 10) as u64);
+                                    let width = decoded.width();
+                                    let height = decoded.height();
+                                    let color = super::planes::color(
+                                        decoder.color_space(),
+                                        decoder.color_range(),
+                                    );
+                                    let frame = std::mem::replace(decoded, frame::Video::empty());
+                                    Ok(super::VideoFrame {
+                                        pts_us,
+                                        width,
+                                        height,
+                                        picture: None,
+                                        cpu: Some(super::CpuFrame { frame, color }),
+                                    })
+                                };
                             result.map(|f| Some(Decoded::Video(f)))
                         }
                         Err(error) => Err(error),

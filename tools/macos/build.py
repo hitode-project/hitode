@@ -63,7 +63,7 @@ def configure(profile: dict, prefix: Path, mobile: str | None = None) -> list[st
                   '--enable-hwaccel=h264_videotoolbox,hevc_videotoolbox,mpeg2_videotoolbox,mpeg4_videotoolbox']
     return [f'--prefix={prefix}', '--enable-static', '--disable-shared', '--enable-pic',
             '--disable-everything', '--disable-autodetect', '--disable-programs', '--disable-doc',
-            '--disable-network', '--disable-debug', '--enable-small', '--disable-avdevice',
+            '--disable-network', '--disable-debug', '--disable-avdevice',
             '--disable-avfilter', '--disable-encoders', '--disable-muxers',
             '--disable-gpl', '--disable-nonfree', '--disable-version3', *target, *media,
             '--enable-demuxer=' + ','.join(profile['demuxers']),

@@ -149,6 +149,13 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
     if video.is_none() && !audio_renderer && audio_guest.is_none() {
         return 0;
     }
+    if let Some(decoder) = state(env)
+        .filters
+        .get_mut(&filter)
+        .and_then(|f| f.source.as_mut()?.decoder.as_mut())
+    {
+        let _ = decoder.set_cpu_only(matches!(video, Some(VideoTarget::Guest(_))));
+    }
     let audio = audio_renderer
         .then(|| env.ext.try_get_mut::<Sound>())
         .flatten()
@@ -1169,6 +1176,25 @@ fn deliver(
 
 /// Top-down BGRA into the negotiated RGB layout (bottom-up for positive heights).
 pub(crate) fn convert(frame: &VideoFrame, mt: &MediaType) -> Vec<u8> {
+    if let Some((width, height, bits)) = mt.video_geometry() {
+        let rows = height.unsigned_abs();
+        if width == frame.width && rows == frame.height {
+            let format = match bits {
+                32 => Some(adv_device::media::RgbFormat::Bgrx),
+                24 => Some(adv_device::media::RgbFormat::Bgr24),
+                16 if mt.sub == MEDIASUBTYPE_RGB565 => Some(adv_device::media::RgbFormat::Rgb565),
+                16 => Some(adv_device::media::RgbFormat::Rgb555),
+                _ => None,
+            };
+            if let Some(format) = format {
+                let stride = ((width as usize * format.bytes_per_pixel()) + 3) & !3;
+                let mut out = vec![0u8; stride * rows as usize];
+                if frame.write_rgb(format, height > 0, stride, &mut out) {
+                    return out;
+                }
+            }
+        }
+    }
     convert_bgra(frame.width, frame.height, &frame.bgra(), mt)
 }
 
