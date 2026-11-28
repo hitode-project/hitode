@@ -176,6 +176,8 @@ unsafe extern "C" {
     fn hitode_event_unwatch(watch: *mut c_void);
     static mut master_socket_timeout: i64;
     fn flush_registry();
+    fn hitode_registry_wait();
+    fn hitode_registry_shutdown();
 }
 
 /// Advances after every server host call that may create, remove, rename or
@@ -299,6 +301,9 @@ impl Server {
                 break;
             }
         }
+        // SAFETY: wait until every offloaded registry write completes atomically
+        // on disk before returning (WINE-SES-10, HOST-SES-5).
+        unsafe { hitode_registry_wait() };
     }
 
     /// Starts the server and runs it until it first waits.
@@ -427,6 +432,8 @@ impl Drop for Server {
             // SAFETY: stop joins the watcher before its callback storage is freed.
             unsafe { hitode_event_unwatch(self.watch) };
         }
+        // SAFETY: drain pending background registry writes and join the writer thread.
+        unsafe { hitode_registry_shutdown() };
         if !self.coroutine.done() {
             // SAFETY: the server's frames are C code with nothing to unwind;
             // its globals stay behind, which is why it never runs again.

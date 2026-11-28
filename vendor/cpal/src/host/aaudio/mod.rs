@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::cmp;
 use std::convert::TryInto;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::vec::IntoIter as VecIntoIter;
 
@@ -386,12 +387,56 @@ impl DeviceTrait for Device {
     }
 
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        let mut configs: Vec<_> = self.supported_output_configs().unwrap().collect();
+        static DEFAULT_OUTPUT_CONFIG: Mutex<Option<SupportedStreamConfig>> = Mutex::new(None);
+        if self.0.is_none() {
+            if let Some(cached) = DEFAULT_OUTPUT_CONFIG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                return Ok(cached.clone());
+            }
+        }
         // Prefer Android's native mixer rate (typically 48 kHz) over cpal's
         // 44.1 kHz default heuristic so AAudio can select FastTrack/MMAP
         // instead of falling back to Legacy deep-buffer resampling.
         let preferred_rate =
             SampleRate(java_interface::native_output_sample_rate().unwrap_or(48_000));
+        if self.0.is_none() {
+            // Probe preferred configurations in priority order before falling
+            // back to the 52-call brute-force enumeration over all formats and rates.
+            let rates = [preferred_rate.0 as i32, 48_000, 44_100];
+            for (channels, channel_mask) in [
+                (2u16, android_media::CHANNEL_OUT_STEREO),
+                (1u16, android_media::CHANNEL_OUT_MONO),
+            ] {
+                for (sample_format, android_format) in [
+                    (SampleFormat::F32, android_media::ENCODING_PCM_FLOAT),
+                    (SampleFormat::I16, android_media::ENCODING_PCM_16BIT),
+                ] {
+                    for (idx, &rate) in rates.iter().enumerate() {
+                        if rate <= 0 || rates[..idx].contains(&rate) {
+                            continue;
+                        }
+                        if let SupportedBufferSize::Range { min, max } =
+                            buffer_size_range_for_params(true, rate, channel_mask, android_format)
+                        {
+                            let config = SupportedStreamConfig::new(
+                                channels,
+                                SampleRate(rate as u32),
+                                SupportedBufferSize::Range { min, max },
+                                sample_format,
+                            );
+                            *DEFAULT_OUTPUT_CONFIG
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(config.clone());
+                            return Ok(config);
+                        }
+                    }
+                }
+            }
+        }
+        let mut configs: Vec<_> = self.supported_output_configs().unwrap().collect();
         configs.sort_by(|a, b| {
             let cmp_channels = (b.channels == 2)
                 .cmp(&(a.channels == 2))
@@ -426,6 +471,11 @@ impl DeviceTrait for Device {
             .next()
             .ok_or(DefaultStreamConfigError::StreamTypeNotSupported)?
             .with_max_sample_rate();
+        if self.0.is_none() {
+            *DEFAULT_OUTPUT_CONFIG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(config.clone());
+        }
         Ok(config)
     }
 

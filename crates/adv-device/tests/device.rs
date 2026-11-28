@@ -3,11 +3,11 @@
 use adv_device::Output;
 use adv_device::mixer::PcmBlock;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 #[ignore = "opens the host audio device and emits a generated quiet sine"]
-fn real_device_stops_callbacks_while_silent_and_restarts() {
+fn real_device_stops_callbacks_on_suspend_and_restarts() {
     let mixer = adv_device::AudioControl::new(true);
     let mut output = Output::new(mixer.stream());
     let metrics = output.metrics();
@@ -32,17 +32,26 @@ fn real_device_stops_callbacks_while_silent_and_restarts() {
             );
             m.end_pcm(1);
         }
-        output.update();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !output.is_running() && Instant::now() < deadline {
+            output.update();
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(output.is_running(), "default output device must open");
         std::thread::sleep(Duration::from_millis(250));
         output.update();
+        assert!(
+            output.is_running(),
+            "brief silence stays open within idle hysteresis"
+        );
+        output.suspend();
         assert!(!output.is_running());
         let before = metrics.callbacks.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(250));
         assert_eq!(
             before,
             metrics.callbacks.load(Ordering::Relaxed),
-            "silent output must have zero callbacks"
+            "suspended output must have zero callbacks"
         );
     }
     assert_eq!(metrics.starts.load(Ordering::Relaxed), 2);

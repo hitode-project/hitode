@@ -111,15 +111,22 @@ int hitode_asprintf( char **str, const char *format, ... )
 /* Counts host calls that may create, remove, rename or change a name, so
  * cached name probes end with them (WINE-SYS-14). */
 static _Atomic uint64_t names_revision;
+static int registry_saving;
 
 uint64_t hitode_names_revision( void )
 {
     return atomic_load_explicit( &names_revision, memory_order_acquire );
 }
 
+void hitode_registry_saving( int active )
+{
+    registry_saving = active;
+}
+
 static int names_changed( int ret )
 {
-    atomic_fetch_add_explicit( &names_revision, 1, memory_order_release );
+    if (!registry_saving)
+        atomic_fetch_add_explicit( &names_revision, 1, memory_order_release );
     return ret;
 }
 
@@ -127,7 +134,242 @@ static int names_changed( int ret )
  * drive link between sessions. */
 void hitode_names_changed( void )
 {
-    names_changed( 0 );
+    atomic_fetch_add_explicit( &names_revision, 1, memory_order_release );
+}
+
+/* Background registry branch writer: keeps periodic registry disk writes and
+ * atomic renames off adv-execution while preserving synchronous finalization
+ * on flush_registry() / server shutdown (WINE-SES-10, HOST-SES-5). */
+#define REGISTRY_MAX_BRANCHES 3
+
+struct registry_slot
+{
+    int pending;
+    int dir_fd;
+    const char *filename;
+    char *data;
+    size_t size;
+};
+
+struct registry_writer
+{
+    pthread_mutex_t lock;
+    pthread_cond_t work_cv;
+    pthread_cond_t done_cv;
+    pthread_t thread;
+    int started;
+    int stopping;
+    int busy;
+    unsigned int failed_mask;
+    uint64_t async_writes;
+    struct registry_slot slots[REGISTRY_MAX_BRANCHES];
+};
+
+static struct registry_writer reg_writer = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .work_cv = PTHREAD_COND_INITIALIZER,
+    .done_cv = PTHREAD_COND_INITIALIZER,
+};
+
+static int registry_has_pending_locked( void )
+{
+    int i;
+    for (i = 0; i < REGISTRY_MAX_BRANCHES; i++)
+        if (reg_writer.slots[i].pending) return 1;
+    return 0;
+}
+
+static int write_all_fd( int fd, const char *data, size_t size )
+{
+    size_t written = 0;
+    while (written < size)
+    {
+        ssize_t n = write( fd, data + written, size - written );
+        if (n < 0)
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        written += (size_t)n;
+    }
+    return 0;
+}
+
+static int write_registry_file( int dir_fd, const char *filename,
+                                const char *data, size_t size )
+{
+    struct stat st;
+    char tmp[48];
+    int fd, ret = 0;
+    unsigned int count = 0;
+
+    tmp[0] = 0;
+    /* Match Wine's save_branch: write directly into non-regular or multi-link
+     * destinations; otherwise write a sibling temp file and rename atomically. */
+    if ((fd = openat( dir_fd, filename, O_WRONLY | O_CLOEXEC )) != -1)
+    {
+        if (!fstatat( dir_fd, filename, &st, AT_SYMLINK_NOFOLLOW ) &&
+            (!S_ISREG(st.st_mode) || st.st_nlink > 1))
+        {
+            if (ftruncate( fd, 0 ) == -1)
+            {
+                close( fd );
+                return 0;
+            }
+            goto write_data;
+        }
+        close( fd );
+    }
+
+    while (count < 0x10000)
+    {
+        snprintf( tmp, sizeof(tmp), "reg%lx%04x.tmp", (unsigned long)getpid(), count++ );
+        if ((fd = openat( dir_fd, tmp, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0666 )) != -1)
+            break;
+        if (errno != EEXIST) return 0;
+    }
+    if (fd == -1) return 0;
+
+write_data:
+    ret = (write_all_fd( fd, data, size ) == 0);
+    if (close( fd ) != 0) ret = 0;
+
+    if (tmp[0])
+    {
+        if (ret) ret = (renameat( dir_fd, tmp, dir_fd, filename ) == 0);
+        if (!ret) unlinkat( dir_fd, tmp, 0 );
+    }
+    return ret;
+}
+
+static void *registry_writer_thread( void *arg )
+{
+    (void)arg;
+    pthread_mutex_lock( &reg_writer.lock );
+    for (;;)
+    {
+        int found = -1;
+        int i;
+        for (i = 0; i < REGISTRY_MAX_BRANCHES; i++)
+        {
+            if (reg_writer.slots[i].pending)
+            {
+                found = i;
+                break;
+            }
+        }
+        if (found == -1)
+        {
+            if (reg_writer.stopping) break;
+            pthread_cond_wait( &reg_writer.work_cv, &reg_writer.lock );
+            continue;
+        }
+        struct registry_slot job = reg_writer.slots[found];
+        reg_writer.slots[found].pending = 0;
+        reg_writer.slots[found].data = NULL;
+        reg_writer.slots[found].dir_fd = -1;
+        reg_writer.busy = 1;
+        pthread_mutex_unlock( &reg_writer.lock );
+
+        int ok = write_registry_file( job.dir_fd, job.filename, job.data, job.size );
+        close( job.dir_fd );
+        free( job.data );
+
+        pthread_mutex_lock( &reg_writer.lock );
+        reg_writer.busy = 0;
+        if (ok)
+        {
+            reg_writer.async_writes++;
+            reg_writer.failed_mask &= ~(1u << found);
+        }
+        else
+            reg_writer.failed_mask |= (1u << found);
+        if (!registry_has_pending_locked())
+            pthread_cond_broadcast( &reg_writer.done_cv );
+    }
+    pthread_mutex_unlock( &reg_writer.lock );
+    return NULL;
+}
+
+int hitode_registry_enqueue( int dir_fd, const char *filename, char *data,
+                             size_t size, unsigned int branch )
+{
+    int dup_fd;
+
+    if (branch >= REGISTRY_MAX_BRANCHES || dir_fd < 0) return 0;
+    if ((dup_fd = fcntl( dir_fd, F_DUPFD_CLOEXEC, 0 )) == -1) return 0;
+
+    pthread_mutex_lock( &reg_writer.lock );
+    if (!reg_writer.started)
+    {
+        reg_writer.stopping = 0;
+        if (pthread_create( &reg_writer.thread, NULL, registry_writer_thread, NULL ) != 0)
+        {
+            pthread_mutex_unlock( &reg_writer.lock );
+            close( dup_fd );
+            return 0;
+        }
+        reg_writer.started = 1;
+    }
+    if (reg_writer.slots[branch].pending)
+    {
+        close( reg_writer.slots[branch].dir_fd );
+        free( reg_writer.slots[branch].data );
+    }
+    reg_writer.slots[branch].pending = 1;
+    reg_writer.slots[branch].dir_fd = dup_fd;
+    reg_writer.slots[branch].filename = filename;
+    reg_writer.slots[branch].data = data;
+    reg_writer.slots[branch].size = size;
+    reg_writer.failed_mask &= ~(1u << branch);
+    pthread_cond_signal( &reg_writer.work_cv );
+    pthread_mutex_unlock( &reg_writer.lock );
+    return 1;
+}
+
+void hitode_registry_wait( void )
+{
+    pthread_mutex_lock( &reg_writer.lock );
+    while (reg_writer.started && (reg_writer.busy || registry_has_pending_locked()))
+        pthread_cond_wait( &reg_writer.done_cv, &reg_writer.lock );
+    pthread_mutex_unlock( &reg_writer.lock );
+}
+
+unsigned int hitode_registry_take_failed( void )
+{
+    unsigned int mask;
+    pthread_mutex_lock( &reg_writer.lock );
+    mask = reg_writer.failed_mask;
+    reg_writer.failed_mask = 0;
+    pthread_mutex_unlock( &reg_writer.lock );
+    return mask;
+}
+
+uint64_t hitode_registry_async_writes( void )
+{
+    uint64_t count;
+    pthread_mutex_lock( &reg_writer.lock );
+    count = reg_writer.async_writes;
+    pthread_mutex_unlock( &reg_writer.lock );
+    return count;
+}
+
+void hitode_registry_shutdown( void )
+{
+    pthread_t thread;
+    int join = 0;
+
+    pthread_mutex_lock( &reg_writer.lock );
+    if (reg_writer.started)
+    {
+        reg_writer.stopping = 1;
+        pthread_cond_broadcast( &reg_writer.work_cv );
+        thread = reg_writer.thread;
+        reg_writer.started = 0;
+        join = 1;
+    }
+    pthread_mutex_unlock( &reg_writer.lock );
+    if (join) pthread_join( thread, NULL );
 }
 
 int hitode_chdir( const char *path )
