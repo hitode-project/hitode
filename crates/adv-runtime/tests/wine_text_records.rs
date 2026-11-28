@@ -4,7 +4,9 @@
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use adv_runtime::wine::session::{Config, Host, SessionOptions, Stop};
-use adv_runtime::wine::text_records::{Code, CopiedPixels, CopyKind, DrawnLine, TextRecord};
+use adv_runtime::wine::text_records::{
+    Code, DrawnLine, Map, MoveKind, MovedPixels, Store, TextBatch, TextRecord,
+};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -28,9 +30,28 @@ fn text(line: &DrawnLine) -> String {
         .collect()
 }
 
+/// Run the test `child` alone in a new test process, as Wine keeps one
+/// server per process.
+fn in_child(child: &str) {
+    if wine::wine().is_none() {
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", child, "--nocapture"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "{child}");
+}
+
 // spec: WINE-UNIX-8
 #[test]
 fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
+    in_child("drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied_child");
+}
+
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied_child() {
     let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
@@ -48,6 +69,8 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
     )
     .unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../adv-device/tests/fixtures");
+    let cff = fixtures.join("font-resource-japanese-cff.otf");
+    std::fs::copy(cff, game.join("cff.otf")).unwrap();
     let font_path = format!(r"\??\unix{}", fixtures.to_string_lossy().replace('/', "\\"));
     let output = root.join("stdout");
     let stdout = std::fs::File::create(&output).unwrap();
@@ -87,7 +110,7 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
     let words: Vec<u32> = loop {
         let stop = session.run(Instant::now() + Duration::from_millis(50));
         let bytes = std::fs::read(&report).unwrap_or_default();
-        if bytes.len() == 24 {
+        if bytes.len() == 28 {
             break bytes
                 .chunks(4)
                 .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
@@ -99,12 +122,39 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
             std::fs::read_to_string(&output).unwrap()
         );
     };
-    let [buffer, bytes, first, second, hwnd, converted] = words[..] else {
+    let [buffer, bytes, first, second, hwnd, converted, dwrite] = words[..] else {
         panic!("{words:?}");
     };
     let batch = session.take_text_records();
     let windows = session.window_planes();
+    // Glyph indices turn back into characters through the recorded fonts.
+    let mut characters = |font, code| match code {
+        Code::Index(glyph) => session.glyph_characters(font, glyph),
+        other => panic!("{other:?}"),
+    };
+    let indexed: Vec<_> = batch
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TextRecord::Line(line) if matches!(line.glyphs[0].code, Code::Index(_)) => Some(
+                line.glyphs
+                    .iter()
+                    .map(|glyph| characters(line.font, glyph.code))
+                    .collect::<Vec<_>>(),
+            ),
+            TextRecord::Glyph(glyph) if glyph.dc.is_none() => {
+                Some(vec![characters(glyph.font, glyph.code)])
+            }
+            _ => None,
+        })
+        .collect();
     drop(session);
+    assert_eq!(indexed[0], [[0x3042], [0x20]]);
+    assert!(
+        indexed[1..].iter().all(|glyphs| glyphs == &[[0x3042]]),
+        "{indexed:?}"
+    );
+    assert!(indexed.len() > 1, "{indexed:?}");
 
     assert_eq!(batch.dropped, 0);
     let sequences: Vec<_> = batch.records.iter().map(TextRecord::sequence).collect();
@@ -165,16 +215,17 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
             _ => None,
         })
         .collect();
-    assert_eq!(glyphs.len(), 1, "{glyphs:#?}");
+    // GetGlyphOutline's glyph, then the one DirectWrite rasterized.
+    let (outline, directwrite) = glyphs.split_first().unwrap();
     assert_eq!(
-        (
-            glyphs[0].code,
-            glyphs[0].buffer,
-            glyphs[0].len,
-            glyphs[0].dc
-        ),
-        (Code::Unicode(0x3042), buffer, bytes, lines[0].dc)
+        (outline.code, outline.buffer, outline.len, outline.dc),
+        (Code::Unicode(0x3042), buffer, bytes, Some(lines[0].dc))
     );
+    assert!(!directwrite.is_empty(), "{glyphs:#?}");
+    for glyph in directwrite {
+        assert_eq!((glyph.code, glyph.dc), (Code::Index(dwrite), None));
+        assert_ne!(glyph.len, 0);
+    }
 
     // The window's surface holds the copied text and the line drawn on it.
     let window = windows
@@ -184,36 +235,341 @@ fn drawn_text_is_recorded_where_it_is_drawn_and_wherever_it_is_copied() {
     assert_eq!(window.client, Some([0, 0, 200, 120]));
     assert_eq!(lines[5].plane.unwrap().bits, window.bits);
 
-    // Only copies out of planes that hold text are kept: not the plain blit.
-    let copies: Vec<&CopiedPixels> = batch
+    // Only moves out of stores that hold text are kept: not the plain blit.
+    let moves: Vec<&MovedPixels> = batch
         .records
         .iter()
         .filter_map(|record| match record {
-            TextRecord::Copy(copy) => Some(copy),
+            TextRecord::Move(moved) => Some(moved),
             _ => None,
         })
         .collect();
-    let moved: Vec<_> = copies
+    let memory = |store: Store| match store {
+        Store::Memory(plane) => plane,
+        other => panic!("{other:?}"),
+    };
+    let summary: Vec<_> = moves
         .iter()
-        .map(|copy| (copy.kind, copy.source.bits, copy.rect, copy.offset))
+        .map(|moved| (moved.kind, memory(moved.source).bits, moved.rect, moved.map))
         .collect();
     assert_eq!(
-        moved,
+        summary,
         [
-            (CopyKind::Copy, dib.bits, [10, 4, 170, 100], [-10, -4]),
-            (CopyKind::Blend, dib.bits, [0, 0, 64, 32], [2, 2]),
-            (CopyKind::Convert, dib.bits, [0, 0, 160, 96], [0, 0]),
+            (
+                MoveKind::Copy,
+                dib.bits,
+                [10, 4, 170, 100],
+                Some(Map::offset(-10, -4))
+            ),
+            (
+                MoveKind::Blend,
+                dib.bits,
+                [0, 0, 64, 32],
+                Some(Map::offset(2, 2))
+            ),
+            (
+                MoveKind::Convert,
+                dib.bits,
+                [0, 0, 160, 96],
+                Some(Map::offset(0, 0))
+            ),
         ],
-        "{copies:#?}"
+        "{moves:#?}"
     );
+    let [window_copy, blended, converted_copy] = [0, 1, 2].map(|n| memory(moves[n].destination));
     assert_eq!(
-        (copies[0].destination.bits, copies[0].destination.stride),
+        (window_copy.bits, window_copy.stride),
         (window.bits, window.stride as i32)
     );
-    assert_ne!(copies[1].destination.bits, dib.bits);
-    assert_eq!(
-        (copies[2].destination.bits, copies[2].destination.bpp),
-        (converted, 24)
+    assert_ne!(blended.bits, dib.bits);
+    assert_eq!((converted_copy.bits, converted_copy.bpp), (converted, 24));
+    assert!(moves.iter().all(|moved| moved.thread == thread));
+}
+
+/// Run the authored probe `exe` to its exit in a session with text records
+/// on, with a GPU when `gpu`, and return the records it left.
+fn recorded(exe: &str, gpu: bool) -> TextBatch {
+    use adv_runtime::wine::session::Session;
+    let wine::Wine { dist, probes } = wine::wine().unwrap();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/text-records-session")
+        .join(std::process::id().to_string());
+    if root.exists() {
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    let game = root.join("game");
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::copy(probes.join(exe), game.join(exe)).unwrap();
+    let output = root.join("stdout");
+    let stdout = std::fs::File::create(&output).unwrap();
+    let config = Config {
+        dist: &dist,
+        prefix: &root.join("prefix"),
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: Some(&game.join(exe)),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: Some(std::os::fd::AsRawFd::as_raw_fd(&stdout)),
+    };
+    let wake = adv_sync::WakeEvent::new().unwrap();
+    #[cfg(feature = "gpu")]
+    let gpu = gpu.then(|| {
+        (
+            adv_device::gpu::test_support::request(false).unwrap(),
+            wake.clone(),
+        )
+    });
+    #[cfg(not(feature = "gpu"))]
+    assert!(!gpu, "this build has no GPU");
+    let mut session = Session::start(&config, wake, move |machine| {
+        #[cfg(feature = "gpu")]
+        if let Some((gpu, wake)) = gpu {
+            machine.ext.insert(gpu.waker());
+            return Session::attach_gpu(machine, gpu, wake);
+        }
+        let _ = machine;
+        Ok(())
+    })
+    .unwrap();
+    session.set_text_records(true);
+    let stop = session.run(Instant::now() + Duration::from_secs(60));
+    let batch = session.take_text_records();
+    drop(session);
+    drop(stdout);
+    assert!(
+        matches!(stop, Stop::Exited(0)),
+        "{stop:?}: {}",
+        std::fs::read_to_string(output).unwrap()
     );
-    assert!(copies.iter().all(|copy| copy.thread == thread));
+    assert_eq!(batch.dropped, 0);
+    batch
+}
+
+fn lines(batch: &TextBatch) -> Vec<&DrawnLine> {
+    batch
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TextRecord::Line(line) => Some(line),
+            _ => None,
+        })
+        .collect()
+}
+
+fn moves(batch: &TextBatch) -> Vec<&MovedPixels> {
+    batch
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TextRecord::Move(moved) => Some(moved),
+            _ => None,
+        })
+        .collect()
+}
+
+// spec: WINE-UNIX-8
+#[test]
+fn text_drawn_on_a_directdraw_surface_is_recorded_up_to_the_window() {
+    in_child("text_drawn_on_a_directdraw_surface_is_recorded_up_to_the_window_child");
+}
+
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn text_drawn_on_a_directdraw_surface_is_recorded_up_to_the_window_child() {
+    let batch = recorded("ddraw.exe", false);
+    let lines = lines(&batch);
+    assert_eq!(
+        lines.iter().map(|line| text(line)).collect::<Vec<_>>(),
+        ["Hi"]
+    );
+    let moves = moves(&batch);
+    let kinds: Vec<_> = moves.iter().map(|moved| moved.kind).collect();
+    assert_eq!(kinds, [MoveKind::Copy, MoveKind::Present], "{moves:#?}");
+    let [blit, present] = [moves[0], moves[1]];
+    // The surface's DC pixels are its own, which the blit copies whole to the
+    // primary, which the window shows.
+    assert_eq!(
+        blit.source,
+        Store::Memory(lines[0].plane.unwrap()),
+        "{blit:?}"
+    );
+    assert_eq!(
+        (blit.rect, blit.map),
+        ([0, 0, 64, 32], Some(Map::offset(0, 0)))
+    );
+    assert_eq!(present.source, blit.destination);
+    assert!(matches!(present.destination, Store::Window(_)));
+    assert_eq!(
+        (present.rect, present.map),
+        ([0, 0, 64, 32], Some(Map::offset(0, 0)))
+    );
+}
+
+// spec: WINE-UNIX-8
+#[cfg(feature = "gpu")]
+#[test]
+fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window() {
+    in_child("text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child");
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn text_drawn_on_a_d3d9_surface_is_recorded_up_to_the_window_child() {
+    let batch = recorded("d3d9.exe", true);
+    let lines = lines(&batch);
+    // "Hi" on the system-memory surface, then on the back buffer, then the
+    // static window's own caption as the window repaints.
+    assert_eq!(
+        lines.iter().map(|line| text(line)).collect::<Vec<_>>(),
+        ["Hi", "Hi", "probe"]
+    );
+    let moves = moves(&batch);
+    let back = lines[1].plane.unwrap();
+    let Some(upload) = moves.iter().find(|moved| moved.kind == MoveKind::Upload) else {
+        panic!("{moves:#?}");
+    };
+    // The back buffer's DC pixels go up to the back buffer resource whole.
+    let Store::Memory(read) = upload.source else {
+        panic!("{upload:?}");
+    };
+    assert_eq!((read.bits, read.size), (back.bits, [64, 32]), "{upload:?}");
+    assert_eq!(
+        (upload.rect, upload.map),
+        ([0, 0, 64, 32], Some(Map::offset(0, 0)))
+    );
+    assert!(matches!(upload.destination, Store::Resource(_)));
+    // Each present shows that resource across the 64 × 32 window.
+    let presents: Vec<_> = moves
+        .iter()
+        .filter(|moved| moved.kind == MoveKind::Present)
+        .collect();
+    assert!(!presents.is_empty(), "{moves:#?}");
+    for present in &presents {
+        assert_eq!(present.source, upload.destination);
+        assert!(matches!(present.destination, Store::Window(_)));
+        assert_eq!(
+            (present.rect, present.map),
+            ([0, 0, 64, 32], Some(Map::offset(0, 0)))
+        );
+    }
+    // Nothing moved out of the system-memory surface, which no copy reads.
+    let [start, end] = lines[0].plane.unwrap().span();
+    assert!(moves.iter().all(|moved| match moved.source {
+        Store::Memory(plane) => plane.span()[1] <= start || plane.span()[0] >= end,
+        _ => true,
+    }));
+}
+
+// spec: WINE-UNIX-8
+#[cfg(feature = "gpu")]
+#[test]
+fn a_d3d9_draw_that_samples_a_text_texture_is_recorded_with_its_map() {
+    in_child("a_d3d9_draw_that_samples_a_text_texture_is_recorded_with_its_map_child");
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn a_d3d9_draw_that_samples_a_text_texture_is_recorded_with_its_map_child() {
+    let batch = recorded("text-records-d3d9.exe", true);
+    let moves = moves(&batch);
+    let kinds: Vec<_> = moves.iter().map(|moved| moved.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            MoveKind::Upload,
+            MoveKind::Draw,
+            MoveKind::Present,
+            MoveKind::Readback
+        ],
+        "{moves:#?}"
+    );
+    let [upload, draw, present, read] = [moves[0], moves[1], moves[2], moves[3]];
+    // The texture's DC pixels reach the texture, the quad samples it 1:1 at
+    // (8, 4) on the back buffer, and the back buffer reaches the window.
+    assert_eq!(draw.source, upload.destination);
+    // Draw bounds are the damage planner's, which may pad a pixel.
+    let [l, t, r, b] = draw.rect;
+    assert!(
+        (7..=8).contains(&l)
+            && (3..=4).contains(&t)
+            && (72..=73).contains(&r)
+            && (36..=37).contains(&b),
+        "{draw:?}"
+    );
+    assert_eq!(draw.map, Some(Map::offset(-8, -4)), "{draw:?}");
+    assert_eq!(present.source, draw.destination);
+    assert!(matches!(present.destination, Store::Window(_)));
+    assert_eq!(present.rect, [0, 0, 128, 64]);
+    // The back buffer comes back to the system-memory surface's pixels.
+    assert_eq!(read.source, draw.destination);
+    let Store::Memory(copy) = read.destination else {
+        panic!("{read:?}");
+    };
+    assert_eq!((copy.bpp, copy.size), (32, [128, 64]), "{read:?}");
+    assert_eq!(read.map, Some(Map::offset(0, 0)));
+}
+
+// spec: WINE-UNIX-8
+#[cfg(feature = "gpu")]
+#[test]
+fn text_moved_through_direct3d11_is_recorded_up_to_the_window_and_back() {
+    in_child("text_moved_through_direct3d11_is_recorded_up_to_the_window_and_back_child");
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn text_moved_through_direct3d11_is_recorded_up_to_the_window_and_back_child() {
+    let batch = recorded("text-records-d3d11.exe", true);
+    let lines = lines(&batch);
+    assert_eq!(
+        lines.iter().map(|line| text(line)).collect::<Vec<_>>(),
+        ["Hi"]
+    );
+    let moves = moves(&batch);
+    let kinds: Vec<_> = moves.iter().map(|moved| moved.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            MoveKind::Upload,
+            MoveKind::DeviceCopy,
+            MoveKind::Present,
+            MoveKind::DeviceCopy,
+            MoveKind::Readback
+        ],
+        "{moves:#?}"
+    );
+    let [upload, placed, present, copied, read] =
+        [moves[0], moves[1], moves[2], moves[3], moves[4]];
+    // The DIB's bits go up whole, the texture lands at (8, 4) on the back
+    // buffer, which the window shows and the staging texture reads back.
+    assert_eq!(upload.source, Store::Memory(lines[0].plane.unwrap()));
+    assert_eq!(
+        (upload.rect, upload.map),
+        ([0, 0, 64, 32], Some(Map::offset(0, 0)))
+    );
+    assert_eq!(placed.source, upload.destination);
+    assert_eq!(
+        (placed.rect, placed.map),
+        ([8, 4, 72, 36], Some(Map::offset(-8, -4)))
+    );
+    assert_eq!(present.source, placed.destination);
+    assert!(matches!(present.destination, Store::Window(_)));
+    assert_eq!(
+        (present.rect, present.map),
+        ([0, 0, 128, 64], Some(Map::offset(0, 0)))
+    );
+    assert_eq!(copied.source, placed.destination);
+    assert_eq!(read.source, copied.destination);
+    let Store::Memory(shadow) = read.destination else {
+        panic!("{read:?}");
+    };
+    assert_eq!((shadow.bpp, shadow.size), (32, [128, 64]));
+    assert_eq!(read.rect, [0, 0, 128, 64]);
 }

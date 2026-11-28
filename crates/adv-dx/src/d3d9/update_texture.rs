@@ -40,6 +40,7 @@ struct Upload {
     pixels: Pixels,
     pitch: u32,
     rectangle: Rect,
+    guest: Option<adv_machine::text_records::Plane>,
     commit: Commit,
 }
 struct Commit {
@@ -209,6 +210,7 @@ fn prepare(
             env.cpu.read(source, &mut raw).map_err(|_| INVALID)?;
         }
         let raw_pitch = pitch;
+        let guest = format::plane(s.desc.Format, source, pitch, (rectangle.w, rectangle.h));
         let state = env.ext.get_mut::<State>();
         let (pixels, pitch) = format::snapshot(
             env.cpu,
@@ -227,6 +229,7 @@ fn prepare(
             pixels,
             pitch,
             rectangle,
+            guest,
             commit: Commit {
                 pitch: raw_pitch,
                 row,
@@ -287,6 +290,7 @@ fn next(env: &mut Env<'_>, destination: Id) -> Outcome {
             pixels: upload.pixels,
             pitch: upload.pitch,
             rectangle: upload.rectangle,
+            guest: upload.guest,
         },
     );
     uploaded(env, destination, outcome)

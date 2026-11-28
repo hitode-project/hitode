@@ -9,6 +9,18 @@ pub(super) struct Copy {
     transfer: Option<Transfer>,
 }
 impl Copy {
+    /// The window rectangle the copy writes and the back buffer one it reads.
+    pub(super) fn rects(self) -> Option<(Rect, Rect)> {
+        self.transfer.map(|t| {
+            let destination = Rect {
+                x: t.x,
+                y: t.y,
+                ..t.source
+            };
+            (destination, t.source)
+        })
+    }
+
     pub(super) fn key(self) -> u128 {
         super::recording::hash((
             self.width,

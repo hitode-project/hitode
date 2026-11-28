@@ -427,6 +427,8 @@ enum Operation {
         pixels: Pixels,
         pitch: u32,
         rectangle: adv_device::surface::Rect,
+        /// The guest pixels the upload read, for text records.
+        guest: Option<adv_machine::text_records::Plane>,
     },
     Copy {
         source: adv_device::gpu::Image,
@@ -1655,6 +1657,7 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             pixels,
             pitch,
             rectangle,
+            guest: _,
         } => match pixels {
             Pixels::Host(pixels, _) => {
                 gpu.upload_arc(&target.image, *rectangle, *pitch, Arc::clone(pixels))

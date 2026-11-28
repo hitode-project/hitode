@@ -1383,6 +1383,7 @@ fn intermittent_uploads_keep_texture_and_depth_composition_local() {
                                 pixels: Pixels::Host(Arc::new(bytes), UploadKey::Admission(key)),
                                 pitch: rectangle.w * 4,
                                 rectangle,
+                                guest: None,
                             }
                         ),
                         Outcome::Return(0)
@@ -1485,6 +1486,7 @@ fn repeated_full_upload_keeps_cursor_damage_local() {
                     w: 64,
                     h: 48,
                 },
+                guest: None,
             },
         );
         assert_eq!(f.finish(result), 0);

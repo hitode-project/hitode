@@ -1,7 +1,7 @@
 //! `--text-log`: the session's text records (WINE-UNIX-8) as JSON lines, for
 //! checking text extraction locally. The file holds game text, so it stays local.
 use adv_runtime::wine::session::WindowPlane;
-use adv_runtime::wine::text_records::{Code, CopyKind, Plane, TextBatch, TextRecord};
+use adv_runtime::wine::text_records::{Code, Map, Plane, Store, TextBatch, TextRecord};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
@@ -81,6 +81,23 @@ fn plane(plane: Option<Plane>) -> String {
     })
 }
 
+fn store(store: Store) -> String {
+    match store {
+        Store::Memory(p) => format!("{{\"memory\": {}}}", plane(Some(p))),
+        Store::Resource(r) => format!(
+            "{{\"resource\": [{}, {}, {}]}}",
+            r.allocation.0, r.allocation.1, r.subresource
+        ),
+        Store::Window(hwnd) => format!("{{\"window\": {hwnd}}}"),
+    }
+}
+
+fn map(map: Option<Map>) -> String {
+    map.map_or("null".into(), |m| {
+        format!("{{\"scale\": {:?}, \"offset\": {:?}}}", m.scale, m.offset)
+    })
+}
+
 fn line(record: &TextRecord) -> String {
     match record {
         TextRecord::Line(line) => {
@@ -107,12 +124,13 @@ fn line(record: &TextRecord) -> String {
                 .join(", ");
             format!(
                 "{{\"sequence\": {}, \"kind\": \"line\", \"thread\": {}, \"dc\": {}, \
-                 \"plane\": {}, \"face\": {}, \"height\": {}, \"clip\": {}, \
+                 \"plane\": {}, \"font\": {}, \"face\": {}, \"height\": {}, \"clip\": {}, \
                  \"text\": {}, \"glyphs\": [{glyphs}]}}",
                 line.sequence,
                 line.thread,
                 line.dc,
                 plane(line.plane),
+                line.font,
                 super::json(&line.face),
                 line.height,
                 line.clip.map_or("null".into(), |c| format!("{c:?}")),
@@ -121,30 +139,27 @@ fn line(record: &TextRecord) -> String {
         }
         TextRecord::Glyph(glyph) => format!(
             "{{\"sequence\": {}, \"kind\": \"glyph\", \"thread\": {}, \"dc\": {}, \
-             \"face\": {}, \"height\": {}, \"code\": {}, \"buffer\": {}, \"len\": {}}}",
+             \"font\": {}, \"face\": {}, \"height\": {}, \"code\": {}, \"buffer\": {}, \"len\": {}}}",
             glyph.sequence,
             glyph.thread,
-            glyph.dc,
+            glyph.dc.map_or("null".into(), |dc| dc.to_string()),
+            glyph.font,
             super::json(&glyph.face),
             glyph.height,
             code(glyph.code),
             glyph.buffer,
             glyph.len
         ),
-        TextRecord::Copy(copy) => format!(
-            "{{\"sequence\": {}, \"kind\": \"copy\", \"thread\": {}, \"op\": \"{}\", \
-             \"destination\": {}, \"rect\": {:?}, \"source\": {}, \"offset\": {:?}}}",
-            copy.sequence,
-            copy.thread,
-            match copy.kind {
-                CopyKind::Copy => "copy",
-                CopyKind::Blend => "blend",
-                CopyKind::Convert => "convert",
-            },
-            plane(Some(copy.destination)),
-            copy.rect,
-            plane(Some(copy.source)),
-            copy.offset
+        TextRecord::Move(moved) => format!(
+            "{{\"sequence\": {}, \"kind\": \"move\", \"thread\": {}, \"by\": \"{:?}\", \
+             \"destination\": {}, \"rect\": {:?}, \"source\": {}, \"map\": {}}}",
+            moved.sequence,
+            moved.thread,
+            moved.kind,
+            store(moved.destination),
+            moved.rect,
+            store(moved.source),
+            map(moved.map)
         ),
     }
 }
@@ -152,7 +167,9 @@ fn line(record: &TextRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adv_runtime::wine::text_records::{CopiedPixels, DrawnGlyph, DrawnLine, ProducedGlyph};
+    use adv_runtime::wine::text_records::{
+        DrawnGlyph, DrawnLine, MoveKind, MovedPixels, ProducedGlyph, Resource,
+    };
 
     // spec: WINE-UNIX-8
     #[test]
@@ -179,6 +196,7 @@ mod tests {
                         thread: 9,
                         dc: 16,
                         plane: Some(surface),
+                        font: 0,
                         face: "Face \"A\"".into(),
                         height: -16,
                         clip: None,
@@ -187,24 +205,25 @@ mod tests {
                     TextRecord::Glyph(ProducedGlyph {
                         sequence: 5,
                         thread: 9,
-                        dc: 16,
+                        dc: None,
+                        font: 1,
                         face: "Face".into(),
                         height: -16,
                         code: Code::Encoded(0xf041),
                         buffer: 4096,
                         len: 64,
                     }),
-                    TextRecord::Copy(CopiedPixels {
+                    TextRecord::Move(MovedPixels {
                         sequence: 6,
                         thread: 9,
-                        kind: CopyKind::Blend,
-                        destination: Plane {
-                            bits: 64,
-                            ..surface
-                        },
+                        kind: MoveKind::Upload,
+                        destination: Store::Resource(Resource {
+                            allocation: (1, 2),
+                            subresource: 3,
+                        }),
                         rect: [0, 1, 2, 3],
-                        source: surface,
-                        offset: [-4, 5],
+                        source: Store::Memory(surface),
+                        map: Some(Map::offset(-4, 5)),
                     }),
                 ],
                 dropped: 3,
@@ -228,16 +247,15 @@ mod tests {
                 r#"{"kind": "dropped", "count": 3}"#,
                 "{\"sequence\": 4, \"kind\": \"line\", \"thread\": 9, \"dc\": 16, \
                  \"plane\": {\"bits\": 32, \"stride\": -64, \"bpp\": 32, \"origin\": [1, 2], \"size\": [16, 8]}, \
-                 \"face\": \"Face \\\"A\\\"\", \"height\": -16, \"clip\": null, \"text\": \"\u{3042}\", \
+                 \"font\": 0, \"face\": \"Face \\\"A\\\"\", \"height\": -16, \"clip\": null, \"text\": \"\u{3042}\", \
                  \"glyphs\": [{\"code\": {\"unicode\": 12354}, \"x\": 2, \"y\": 7}, \
                  {\"code\": {\"index\": 5}, \"x\": 18, \"y\": 7}]}",
-                r#"{"sequence": 5, "kind": "glyph", "thread": 9, "dc": 16, "face": "Face", "height": -16, "code": {"encoded": 61505}, "buffer": 4096, "len": 64}"#,
+                r#"{"sequence": 5, "kind": "glyph", "thread": 9, "dc": null, "font": 1, "face": "Face", "height": -16, "code": {"encoded": 61505}, "buffer": 4096, "len": 64}"#,
                 concat!(
-                    r#"{"sequence": 6, "kind": "copy", "thread": 9, "op": "blend", "#,
-                    r#""destination": {"bits": 64, "stride": -64, "bpp": 32, "origin": [1, 2], "size": [16, 8]}, "#,
-                    r#""rect": [0, 1, 2, 3], "#,
-                    r#""source": {"bits": 32, "stride": -64, "bpp": 32, "origin": [1, 2], "size": [16, 8]}, "#,
-                    r#""offset": [-4, 5]}"#
+                    r#"{"sequence": 6, "kind": "move", "thread": 9, "by": "Upload", "#,
+                    r#""destination": {"resource": [1, 2, 3]}, "rect": [0, 1, 2, 3], "#,
+                    r#""source": {"memory": {"bits": 32, "stride": -64, "bpp": 32, "origin": [1, 2], "size": [16, 8]}}, "#,
+                    r#""map": {"scale": [1.0, 1.0], "offset": [-4.0, 5.0]}}"#
                 ),
             ]
         );

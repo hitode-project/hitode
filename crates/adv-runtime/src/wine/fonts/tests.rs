@@ -217,7 +217,7 @@ fn produced_glyph_bytes_are_recorded_only_while_records_are_on() {
     } = glyphs[0];
     assert_eq!(
         (sequence, recorded, code, at, len),
-        (0, dc, Code::Unicode(65), buffer, written)
+        (0, Some(dc), Code::Unicode(65), buffer, written)
     );
     assert_eq!((face.as_str(), height), ("Arial", -24));
     assert_eq!((glyphs[1].sequence, glyphs[1].code), (1, Code::Unicode(67)));

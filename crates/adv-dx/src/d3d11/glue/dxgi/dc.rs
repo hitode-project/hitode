@@ -23,6 +23,7 @@ pub(super) fn get(env: &mut Env<'_>) -> Outcome {
             return Err(dxgi::Error::InvalidCall.into());
         }
         let backing = gpu::backing(env, pointer, resource)?;
+        let text = gpu::shadow_text(env, pointer, 0);
         let storage = table
             .get_mut(&mut env.sys.objects, pointer)
             .unwrap()
@@ -42,6 +43,7 @@ pub(super) fn get(env: &mut Env<'_>) -> Outcome {
                         base,
                         layout,
                         slice,
+                        text,
                     },
                     parts,
                 )?;

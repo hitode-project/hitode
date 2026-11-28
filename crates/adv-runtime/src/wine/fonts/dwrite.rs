@@ -183,6 +183,10 @@ pub(super) fn run(env: &mut Env<'_>, name: &str, a: &[u32]) -> Outcome {
                 }
             }
             env.cpu.write(target, &bytes).unwrap();
+            if !bytes.is_empty() {
+                let character = Character::GlyphIndex(glyph);
+                record_glyph(env, None, &request, character, target, bytes.len());
+            }
             put(env, word(env, p, 64), u32::from(mono));
         }
         "get_glyph_outline" => {

@@ -38,6 +38,7 @@ pub mod service;
 #[cfg(test)]
 mod spawn_tests;
 pub mod stats;
+pub mod text_records;
 pub mod thunk;
 pub mod trace;
 pub mod vm;

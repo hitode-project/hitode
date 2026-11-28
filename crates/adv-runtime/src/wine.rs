@@ -31,7 +31,7 @@ pub mod session;
 /// Codec library acceleration on the image-mapping path.
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub use adv_drv::codec;
-pub use adv_nt::native::text_records;
+pub use adv_machine::text_records;
 mod sound;
 mod video;
 pub mod winmm;

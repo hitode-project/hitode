@@ -2,7 +2,7 @@
 use super::{Calls, Face, INVALID, Object, caps, creation, decode, read, write};
 use crate::{
     argument::{Arguments, CallError},
-    ddraw::{self, DirectDraw},
+    ddraw,
     fixed::{self, Render, Sampler, Setting, Stage, tnl},
 };
 use adv_abi::types::*;
@@ -753,7 +753,7 @@ impl Calls<'_> {
                 },
             );
             let source_surface = self.draw.blt_surface(src, source);
-            if let Err(hr) = DirectDraw::execute_blt(
+            if let Err(hr) = self.draw.execute_blt(
                 self.store,
                 dest,
                 Blt::Copy {

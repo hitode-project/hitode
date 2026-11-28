@@ -46,6 +46,16 @@ impl Font {
             })
             .collect())
     }
+    /// The characters the primary cmap maps to `glyph`, in code order.
+    pub(in crate::text) fn glyph_characters(&self, glyph: u32) -> Result<Vec<u32>, TextError> {
+        let font = self.primary.font()?;
+        Ok(font
+            .charmap()
+            .mappings()
+            .filter(|(_, mapped)| mapped.to_u32() == glyph)
+            .map(|(code, _)| code)
+            .collect())
+    }
     pub(in crate::text) fn width_info(&self) -> Result<[i32; 2], TextError> {
         let font = self.primary.font()?;
         let hhea = font.hhea().map_err(font_error)?;

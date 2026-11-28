@@ -147,6 +147,7 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
         (Some(prev), Some(now)) => prev == now,
         _ => true,
     };
+    let guest = format::plane(format, address, pitch, (rectangle.w, rectangle.h));
     let Some((pixels, pitch)) = format::snapshot_with_hash(
         env.cpu,
         state.gpu.as_mut().unwrap(),
@@ -180,6 +181,7 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
             pixels,
             pitch,
             rectangle,
+            guest,
         },
     );
     uploaded(env, id, index, rectangle, outcome)

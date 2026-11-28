@@ -415,6 +415,15 @@ fn present_call(env: &mut Env<'_>, this: u32, interval: u32, flags: u32) -> Outc
                 }
                 Err(error) => return Err(error),
             };
+        if crate::text::on(env)
+            && let Some(store) = backend.text_store(env, buffer)
+        {
+            let rect = |[w, h]: [u32; 2]| adv_device::surface::Rect { x: 0, y: 0, w, h };
+            let (client, read) = (rect(window.client), rect(source));
+            if let Some(map) = crate::text::rect_map(client, read) {
+                crate::text::presented(env, store, hwnd, client, map);
+            }
+        }
         let chain = chain_mut(env, this)?;
         chain.queue.submit(now, interval, hz);
         chain.generation = serial;

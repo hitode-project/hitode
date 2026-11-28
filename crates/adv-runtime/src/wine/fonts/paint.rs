@@ -373,7 +373,8 @@ fn record_line(
     run: &Run,
     codes: &[Code],
 ) {
-    let thread = super::thread_id(env);
+    let thread = text_records::thread(env);
+    let font = super::recorded_font(env, request);
     let mut records = text_records::records(env.ext).unwrap();
     let sequence = records.sequence();
     records.push(TextRecord::Line(DrawnLine {
@@ -381,6 +382,7 @@ fn record_line(
         thread,
         dc: hdc,
         plane,
+        font,
         face: request.face.clone(),
         height: request.height,
         clip: run.clip,
