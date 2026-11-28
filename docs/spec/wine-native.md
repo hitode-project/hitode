@@ -48,6 +48,8 @@ Field offsets match the pinned module's DWARF. The mixer runs as a host-call bod
 **Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic and interpolation rounding. They MUST cover every format, palette depth, brush and floating-point control their primitive accepts. Field offsets MUST match the pinned Unix module's DWARF.
 **Verification**: Test
 
+After copy_rect, blend_rects or convert_to completes, it also keeps a text record while records are on (WINE-UNIX-8); recording rereads inputs the body has read and never changes its result.
+
 ### NAT-BODY-6 CRT bodies
 
 **Rule**: Locale-independent CRT string and memory bodies MUST return the results and write the bytes the Windows CRT does, for every length and overlap. Inaccessible memory MUST follow A64-CALL-4.

@@ -118,6 +118,8 @@ pub struct Services {
     pub thread_state: *const std::ffi::c_void,
     pub user_state: *const std::ffi::c_void,
     pub d3d9_state: *const std::ffi::c_void,
+    /// Text records while a host consumer takes them, else null (WINE-UNIX-8).
+    pub text_state: *const std::ffi::c_void,
 }
 
 impl Default for Services {
@@ -132,6 +134,7 @@ impl Default for Services {
             thread_state: std::ptr::null(),
             user_state: std::ptr::null(),
             d3d9_state: std::ptr::null(),
+            text_state: std::ptr::null(),
         }
     }
 }

@@ -21,7 +21,7 @@ pub mod input;
 pub mod project;
 mod surface;
 pub use display::DESKTOP;
-pub use surface::flush_on_wait;
+pub use surface::{WindowPlane, flush_on_wait, window_planes};
 
 /// The driver's file name, the display device's `GraphicsDriver`.
 pub const MODULE: &str = "wineadv.drv";

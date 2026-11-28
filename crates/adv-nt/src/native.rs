@@ -107,6 +107,7 @@ mod own_calls;
 mod pixels;
 mod png;
 mod services;
+pub mod text_records;
 mod zlib;
 
 /// The module the bodies' thunks are registered under.

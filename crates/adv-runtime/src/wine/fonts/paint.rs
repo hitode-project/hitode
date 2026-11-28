@@ -1,5 +1,5 @@
 //! Position once in logical coordinates, compose our cached glyphs on DIBs.
-use super::super::text_records::{Code, DrawnGlyph, DrawnLine, TextRecord};
+use super::super::text_records::{self, Code, DrawnGlyph, DrawnLine, Plane, TextRecord};
 use super::*;
 use std::sync::Arc;
 
@@ -306,8 +306,9 @@ pub(super) fn render(
         return Outcome::Return(0);
     };
     let dib = env.cpu.read_u32(dev).unwrap() == data(env, |l| l.dib_driver).unwrap();
-    if env.ext.get::<Fonts>().records.is_some() {
-        record_line(env, hdc, &request, dib.then_some(dev), &run, &drawn);
+    if text_records::records(env.ext).is_some() {
+        let plane = dib_device(env, dev).map(|dib| plane(env, dib + layout::dibdev::dib));
+        record_line(env, hdc, &request, plane, &run, &drawn);
     }
     if dib {
         return compose(env, dev, &run);
@@ -368,18 +369,18 @@ fn record_line(
     env: &mut Env<'_>,
     hdc: u32,
     request: &FontRequest,
-    surface: Option<u32>,
+    plane: Option<Plane>,
     run: &Run,
     codes: &[Code],
 ) {
     let thread = super::thread_id(env);
-    let records = env.ext.get_mut::<Fonts>().records.as_mut().unwrap();
+    let mut records = text_records::records(env.ext).unwrap();
     let sequence = records.sequence();
     records.push(TextRecord::Line(DrawnLine {
         sequence,
         thread,
         dc: hdc,
-        surface,
+        plane,
         face: request.face.clone(),
         height: request.height,
         clip: run.clip,
@@ -392,6 +393,30 @@ fn record_line(
             })
             .collect(),
     }));
+}
+/// The DIB device a line drawn through `dev` lands in: `dev` itself, or the
+/// one beneath a driver that forwards to it, such as a window surface's.
+fn dib_device(env: &Env<'_>, mut dev: u32) -> Option<u32> {
+    let driver = data(env, |l| l.dib_driver)?;
+    while dev != 0 {
+        if env.cpu.read_u32(dev).ok()? == driver {
+            return Some(dev);
+        }
+        dev = env.cpu.read_u32(dev + layout::physdev::next).ok()?;
+    }
+    None
+}
+/// The DIB at `dib` as compose addresses it.
+fn plane(env: &Env<'_>, dib: u32) -> Plane {
+    let get = |at| env.cpu.read_u32(dib + at).unwrap() as i32;
+    let origin = rect(env, dib + layout::dib::rect);
+    Plane {
+        bits: get(layout::dib::bits) as u32,
+        stride: get(layout::dib::stride),
+        bpp: get(layout::dib::bit_count) as u32,
+        origin: [origin[0], origin[1]],
+        size: [get(layout::dib::width), get(layout::dib::height)],
+    }
 }
 pub(super) fn output(env: &mut Env<'_>, a: &[u32]) -> Outcome {
     let units = match placement::read(env, a[5], a[6] * 2, false) {

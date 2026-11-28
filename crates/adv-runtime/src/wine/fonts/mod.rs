@@ -40,8 +40,6 @@ pub(super) struct Fonts {
     apis: Registry,
     dwrite: std::collections::BTreeMap<u32, (text::FontResourceId, u32)>,
     realizations: std::collections::BTreeMap<u32, FontRequest>,
-    /// Text records while a host consumer has enabled them (WINE-UNIX-8).
-    pub records: Option<super::text_records::TextRecords>,
 }
 
 pub(super) fn install<B: adv_cpu::backend::Backend>(
@@ -75,7 +73,6 @@ pub(super) fn install<B: adv_cpu::backend::Backend>(
         eudc: None,
         dwrite: Default::default(),
         realizations: Default::default(),
-        records: None,
     });
     machine
         .ext
@@ -795,6 +792,15 @@ fn glyph(
     }
 }
 
+fn code(character: Character) -> super::text_records::Code {
+    use super::text_records::Code;
+    match character {
+        Character::Unicode(c) => Code::Unicode(c),
+        Character::Encoded(c) => Code::Encoded(c),
+        Character::GlyphIndex(i) => Code::Index(i),
+    }
+}
+
 /// The drawing guest thread's ID, from its TEB client ID.
 fn thread_id(env: &Env<'_>) -> u32 {
     let teb = env.sys.contexts[env.context as usize].teb;
@@ -809,7 +815,7 @@ fn record_glyph(
     len: usize,
 ) {
     let thread = thread_id(env);
-    let Some(records) = env.ext.get_mut::<Fonts>().records.as_mut() else {
+    let Some(mut records) = super::text_records::records(env.ext) else {
         return;
     };
     let sequence = records.sequence();
@@ -820,7 +826,7 @@ fn record_glyph(
             dc,
             face: font.face.clone(),
             height: font.height,
-            code: character.into(),
+            code: code(character),
             buffer,
             len: len as u32,
         },

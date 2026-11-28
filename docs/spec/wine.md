@@ -391,13 +391,14 @@ The pinned Wine source carries both through `tools/wine/patches`.
 
 ### WINE-UNIX-8 Text records
 
-**Rule**: While text records are on, the host font frontend MUST keep exactly the records listed below. While records are off, it MUST NOT keep any. Records beyond capacity MUST be counted as dropped.
+**Rule**: While text records are on, the host font frontend and the DIB copy bodies MUST keep exactly the records listed below, in one sequence. While records are off, they MUST NOT keep any. Records beyond capacity MUST be counted as dropped.
 **Verification**: Test
 
-- Each drawn line, before composition: its thread, DC, target DIB device, font, clip, and each glyph's code and device origin. Glyph-index text keeps its indices.
+- Each drawn line, before composition: its thread, DC, font, clip, target DIB, and each glyph's code and device origin. The target is also found beneath a forwarding driver, such as a window's. Glyph-index text keeps its indices.
 - Each successful GetGlyphOutline that writes glyph bytes: its character and the written guest range.
+- Each completed copy_rect, blend_rects or convert_to whose source DIB has held text: both DIBs, the destination rectangle and the source offset. Its destination then holds text too.
 
-Measurement keeps no record. Text extraction reads these where characters lose their identity; the session takes them through `take_text_records`.
+A DIB is identified by its bits, stride, depth and rectangle origin, so every record locates its pixels in guest memory. Measurement keeps no record, and neither does a copy between DIBs that never held text. Text extraction reads these where characters lose their identity; the session takes them through `take_text_records` and maps window surfaces through `window_planes`.
 
 ## Threads
 
