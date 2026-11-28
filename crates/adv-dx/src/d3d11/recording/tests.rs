@@ -53,14 +53,14 @@ fn recorded_dispatch_finishes_before_the_draw_reads_its_image() {
         Stage::Compute,
         1,
     );
-    let dispatch = Command::Dispatch {
+    let dispatch = Command::Dispatch(Box::new(crate::d3d11::recording::Compute {
         pipeline: Arc::new(gpu.prepare_dispatch(compute).unwrap()),
         bindings: SlotBindings {
             storage: [StorageBinding::Image(storage.view().clone())].into(),
             ..Default::default()
         },
         arguments: DispatchArguments::Direct([2, 2, 1]),
-    };
+    }));
     let vertex = shader(
         "@vertex fn main(@builtin(vertex_index) id: u32) -> @builtin(position) vec4<f32> {
              let p = array(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
@@ -77,8 +77,8 @@ fn recorded_dispatch_finishes_before_the_draw_reads_its_image() {
         Stage::Fragment,
         3,
     );
-    let draw = Command::Draw {
-        draw: Box::new(ModernDraw {
+    let draw = Command::Draw(Box::new(crate::d3d11::recording::Draw {
+        draw: ModernDraw {
             color_slots: None,
             state_ids: [0; 4],
             vertex,
@@ -117,14 +117,14 @@ fn recorded_dispatch_finishes_before_the_draw_reads_its_image() {
             index: None,
             occlusion: None,
             predicate: None,
-        }),
+        },
         statistics: None,
         vertex: SlotBindings::default(),
         fragment: SlotBindings {
             images: [storage.view().clone()].into(),
             ..Default::default()
         },
-    };
+    }));
 
     let mut recording = Recording::default();
     for (command, key, reads, writes) in [

@@ -16,24 +16,30 @@ use std::{
 };
 
 pub enum Command {
-    Draw {
-        draw: Box<ModernDraw>,
-        vertex: SlotBindings,
-        fragment: SlotBindings,
-        statistics: Option<QuerySlot>,
-    },
+    Draw(Box<Draw>),
     Expand(Box<Expand>),
-    Dispatch {
-        pipeline: Arc<Dispatch>,
-        bindings: SlotBindings,
-        arguments: DispatchArguments,
-    },
+    Dispatch(Box<Compute>),
     Resolve {
         source: ImageView,
         destination: ImageView,
     },
     GenerateMips(ImageView),
     Transfer(ModernTransfer),
+}
+
+/// A draw with the registers of both stages; bindings sit inline, so one
+/// allocation holds the command.
+pub struct Draw {
+    pub draw: ModernDraw,
+    pub vertex: SlotBindings,
+    pub fragment: SlotBindings,
+    pub statistics: Option<QuerySlot>,
+}
+
+pub struct Compute {
+    pub pipeline: Arc<Dispatch>,
+    pub bindings: SlotBindings,
+    pub arguments: DispatchArguments,
 }
 
 #[derive(Clone, Copy)]
@@ -54,26 +60,29 @@ impl record::Front for Front {
 
     fn encode(gpu: &mut Gpu, command: &Command) -> Result<(), Error> {
         match command {
-            Command::Draw {
-                draw,
-                vertex,
-                fragment,
-                statistics,
-            } => match statistics {
-                Some(statistics) => gpu.draw_modern_statistics(
-                    (**draw).clone(),
+            Command::Draw(command) => {
+                let Draw {
+                    draw,
                     vertex,
                     fragment,
-                    statistics.clone(),
-                ),
-                None => gpu.draw_modern((**draw).clone(), vertex, fragment),
-            },
+                    statistics,
+                } = &**command;
+                match statistics {
+                    Some(statistics) => gpu.draw_modern_statistics(
+                        draw.clone(),
+                        vertex,
+                        fragment,
+                        statistics.clone(),
+                    ),
+                    None => gpu.draw_modern(draw.clone(), vertex, fragment),
+                }
+            }
             Command::Expand(expansion) => gpu.expand((**expansion).clone()),
-            Command::Dispatch {
-                pipeline,
-                bindings,
-                arguments,
-            } => gpu.dispatch(pipeline, bindings, arguments.clone()),
+            Command::Dispatch(compute) => gpu.dispatch(
+                &compute.pipeline,
+                &compute.bindings,
+                compute.arguments.clone(),
+            ),
             Command::Resolve {
                 source,
                 destination,
@@ -149,9 +158,9 @@ impl Recording {
     ) -> Result<(), Error> {
         let op = |payload| {
             let kind = match &payload {
-                Command::Draw { .. } | Command::Expand(_) => record::Kind::Draw,
+                Command::Draw(_) | Command::Expand(_) => record::Kind::Draw,
                 Command::Resolve { .. } => record::Kind::Copy,
-                Command::Dispatch { .. } | Command::GenerateMips(_) | Command::Transfer(_) => {
+                Command::Dispatch(_) | Command::GenerateMips(_) | Command::Transfer(_) => {
                     record::Kind::Upload
                 }
             };

@@ -214,11 +214,11 @@ pub(in crate::d3d11::glue) fn draw_auto(env: &mut Env<'_>) -> Result<(), Error> 
     let extent = extent_rect([1, 1, 1]);
     exec.recording.append(
         &mut exec.gpu,
-        Command::Dispatch {
+        Command::Dispatch(Box::new(crate::d3d11::recording::Compute {
             pipeline: Arc::new(pipeline),
             bindings: slots,
             arguments: DispatchArguments::Direct([1, 1, 1]),
-        },
+        })),
         Effects {
             extent,
             bounds: extent,
@@ -2425,17 +2425,17 @@ fn render(env: &mut Env<'_>, indexed: bool, mut args: DrawRange) -> Result<(), E
             .parameters(indexed)
             .upload(&execution(env.ext)?.gpu, &fetches)?;
         expand::bind_draw_state(&mut vertex_bindings, state);
-        Command::Draw {
-            draw: Box::new(make_draw(
+        Command::Draw(Box::new(crate::d3d11::recording::Draw {
+            draw: make_draw(
                 vertex_shader.unwrap(),
                 raster_bins[0].1,
                 raster_bins[0].2,
                 occlusion,
-            )),
+            ),
             vertex: vertex_bindings,
             fragment: fragment_bindings,
             statistics,
-        }
+        }))
     };
     let execution = execution(env.ext)?;
     execution.recording.append(
@@ -2676,11 +2676,11 @@ fn compute(
     let extent = extent_rect([1, 1, 1]);
     execution.recording.append(
         &mut execution.gpu,
-        Command::Dispatch {
+        Command::Dispatch(Box::new(crate::d3d11::recording::Compute {
             pipeline: pipeline.clone(),
             bindings,
             arguments,
-        },
+        })),
         Effects {
             extent,
             bounds: extent,

@@ -92,7 +92,7 @@ pub(crate) enum Command {
     },
     /// `Chunk::draws[index]`.
     Draw(u32),
-    DrawModern(Box<super::modern::Render>),
+    DrawModern(Box<super::modern::Render>, adv_gpu::RenderPipeline),
     Dispatch(Box<super::modern::Compute>),
     Expand(Box<super::expand::Work>),
     Resolve {
